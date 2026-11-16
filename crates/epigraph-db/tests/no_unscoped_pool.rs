@@ -800,7 +800,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 192 -> 191 (backlog 01e0b839, #885, merged on staging batch 4):
 /// `themes_expand` holds a `Viewer` and runs every read on the caller's
 /// stamped read (`routes/graph.rs` 2 -> 1). No file reached zero.
-const HIGH_WATER: usize = 191;
+/// 191 -> 187 (backlog fe75ef36, ported from #891): `list_papers` reads its
+/// four registry statements on the caller's stamped connection, the one its
+/// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
+/// reached zero.
+const HIGH_WATER: usize = 187;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1113,16 +1117,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // deleted — see `routes/search.rs` and `routes/voids.rs` below — which is
     // what makes it the first multi-file shard in the series.
     //
-    // `routes/papers.rs` is UNCHANGED at 8, deliberately. Shard 4 was sized to
-    // include this file and then measured it: two of the eight sites write,
-    // neither handler holds a `Viewer`, and adding one to both `#[cfg]` arms is
-    // a callable behaviour change. A schema measurement taken in the same pass
-    // is registered as `F-SHARD4-A3` and is not restated here; its operational
-    // conclusion is that converting the remaining six would move this counter
-    // and change no row the endpoint returns. That file's module doc carries
-    // the reasoning. This row is the series' example of a file that is COUNTED
-    // and not convertible.
-    ("routes/papers.rs", 8),
+    // `routes/papers.rs` was 8. Shard 4 measured it and converted nothing:
+    // two of the eight sites write, and neither handler held a `Viewer`.
+    // Backlog fe75ef36 / b7354adc then gave `GET /api/v1/papers` per-viewer
+    // fields (authors, claim count, ingests), so `list_papers` took a
+    // `ViewerExtractor`, and its four registry reads moved onto the same
+    // `AppState::read_as` connection. The four that remain are
+    // `create_paper`'s, two of them writes.
+    ("routes/papers.rs", 4),
     // 5 before conversion shard 5, which moved `list_perspectives`,
     // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
     // 2 before `set_source_reliability` (an `UPDATE`) moved onto

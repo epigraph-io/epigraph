@@ -6,38 +6,19 @@
 //! - `POST /api/v1/papers` — Create or upsert a paper by DOI
 //! - `GET  /api/v1/papers` — List papers with optional `?doi=` filter
 //!
-//! # Tenancy: shard 4 measured this file and converted NOTHING
+//! # Tenancy
 //!
-//! That is the result of the measurement, not an omission from it.
+//! `list_papers` takes a `ViewerExtractor` (its items carry per-viewer
+//! authors, claim counts and ingests) and runs every statement, the registry
+//! rows included, on the caller's stamped connection.
 //!
-//! `epigraph-db/tests/no_unscoped_pool.rs` records 8 sites here, and the recon
-//! that sized conversion shard 4 classified all 8 as reads. Re-measured against
-//! the tree and the schema, neither half of that holds, and the register keeps
-//! its row at 8:
-//!
-//! * **Two of the eight are writes** (`create_paper`'s `UPDATE papers` and its
-//!   `INSERT ... RETURNING`, the latter issued as a `fetch_one` so a needle
-//!   looking for `execute` misses it). `read_as` is read-only by construction;
-//!   see `routes/belief.rs`'s module doc for why routing a write through it is a
-//!   silent rollback rather than a compile error.
-//! * **Neither handler holds a `Viewer`**, so all eight sites would need an
-//!   extractor added to BOTH `#[cfg]` arms before any of them could be
-//!   converted. Both routes already sit on the authenticated router, so that is
-//!   not an anonymous-access change — but `ViewerExtractor` additionally refuses
-//!   a token that carries no agent id, which IS a callable behaviour change and
-//!   needs its own evidence.
-//! * **Converting the remaining six would have moved `HIGH_WATER` by 6 and
-//!   changed no row this endpoint returns.** That is the operational
-//!   conclusion of a schema measurement taken at migration head 092; the
-//!   measurement itself is registered as `F-SHARD4-A3` and is not restated
-//!   here. The ratchet counts these sites because its needle is textual.
-//!
-//! So converting this file would have cost a real behaviour change and bought
-//! a counter movement — the exact trade the ratchet's own module doc warns a
-//! shard against ("check the CONTROL before the counter").
-//!
-//! `F-SHARD4-A3` needs an operator decision and this batch is not positioned to
-//! make it. Analysis held outside this repository.
+//! `create_paper` holds no `Viewer` and keeps its four pool sites
+//! (`epigraph-db/tests/no_unscoped_pool.rs`): two of them write (its
+//! `UPDATE papers` and its `INSERT ... RETURNING`, the latter issued as a
+//! `fetch_one`), and `read_as` is read-only by construction (see
+//! `routes/belief.rs`'s module doc for why routing a write through it is a
+//! silent rollback rather than a compile error). Shard 4's schema measurement
+//! of this file is registered as `F-SHARD4-A3`.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -428,10 +409,12 @@ pub async fn create_paper(
 /// Each item carries its authors, its claim count and its ingests
 /// ([`PaperListing`]) as the caller may read them; each ingest names its
 /// agent, that agent's human and, for a caller the prompt-history gate admits,
-/// the model it ran ([`PaperIngestView`]). The registry row itself
-/// (`papers` has no row security: it is keyed on the document) is read from
-/// the pool; everything derived from claims and edges is read on the caller's
-/// stamped connection.
+/// the model it ran ([`PaperIngestView`]). Every read, the registry rows
+/// included (`papers` has no row security: it is keyed on the document), runs
+/// on the caller's one stamped connection, so the page is one snapshot under
+/// `SessionGucMode::Transaction`. The full list is ordered `created_at DESC,
+/// id DESC`, so `offset` paging is stable across papers registered in the
+/// same instant.
 #[cfg(feature = "db")]
 pub async fn list_papers(
     State(state): State<AppState>,
@@ -442,6 +425,18 @@ pub async fn list_papers(
     let offset = params.offset.max(0);
 
     use sqlx::Row;
+
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "list_papers",
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })?;
 
     let (rows, total): (Vec<sqlx::postgres::PgRow>, i64) = if let Some(ref doi) = params.doi {
         // DOI lookup under every spelling of the document key (the same
@@ -454,7 +449,7 @@ pub async fn list_papers(
         .bind(&spellings)
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db_pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
@@ -462,7 +457,7 @@ pub async fn list_papers(
 
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = ANY($1)")
             .bind(&spellings)
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to count papers: {e}"),
@@ -471,18 +466,19 @@ pub async fn list_papers(
     } else {
         // Full list
         let rows = sqlx::query(
-            "SELECT id, doi, title, journal, created_at FROM papers ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT id, doi, title, journal, created_at FROM papers \
+             ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
         .bind(offset)
-        .fetch_all(&state.db_pool)
+        .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
         })?;
 
         let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *read)
             .await
             .map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to count papers: {e}"),
@@ -491,22 +487,8 @@ pub async fn list_papers(
     };
 
     let keys: Vec<(Uuid, String)> = rows.iter().map(|r| (r.get("id"), r.get("doi"))).collect();
-    let listings = if keys.is_empty() {
-        Vec::new()
-    } else {
-        let mut read = state.read_as(&viewer).await.map_err(|e| {
-            tracing::error!(
-                target: "tenancy.scoped_read",
-                error = %e,
-                handler = "list_papers",
-                "could not acquire a viewer-stamped connection"
-            );
-            ApiError::InternalError {
-                message: "Failed to acquire a scoped connection".to_string(),
-            }
-        })?;
-        paper_listings(&mut read, &viewer, &keys).await?
-    };
+    let listings = paper_listings(&mut read, &viewer, &keys).await?;
+    crate::routes::finish_scoped_read(read, "list_papers").await?;
 
     let items = rows
         .iter()

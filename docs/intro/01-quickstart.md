@@ -66,9 +66,9 @@ docker exec epigraph-db psql -U epigraph -d epigraph -tAc \
 ### Option B: a PostgreSQL 16 server you already run
 
 You need pgvector 0.8.0 or newer installed on the server
-(<https://github.com/pgvector/pgvector#installation>). To see which version
-the server offers, run
-`SELECT default_version FROM pg_available_extensions WHERE name = 'vector';`.
+(<https://github.com/pgvector/pgvector#installation>); `epigraph-migrate`
+and the server refuse an older one. To see which version the server offers,
+run `SELECT default_version FROM pg_available_extensions WHERE name = 'vector';`.
 For a trial, create a
 superuser login and a database it owns:
 
@@ -452,6 +452,7 @@ If the claim comes back, your install works end to end.
 | The build dies while linking (`SIGBUS`, killed, out of memory), or `No space left on device` | Set `CARGO_BUILD_JOBS=2` and free disk. |
 | `Connection refused (os error 111)` on port 5432 | PostgreSQL is not running. `docker start epigraph-db`, or start your server, and check with `pg_isready`. |
 | `extension "vector" is not available` | pgvector is not installed on the server. Use the `pgvector/pgvector:pg16` image, or see <https://github.com/pgvector/pgvector#installation>. |
+| `migrations: FAILED: migrations were applied, but pgvector 0.6.0 is installed but 0.8.0 or newer is required ...` (or another version below 0.8.0) | The server's pgvector is too old for semantic search. Use the `pgvector/pgvector:pg16` image, or install pgvector 0.8.0 or newer on the server, run `ALTER EXTENSION vector UPDATE;` in the database as a superuser, and migrate again. |
 | `permission denied to create extension`, or a migration NOTICE `Cannot CREATE ROLE ...: provision it out of band` | The migration login is not a superuser. Use a superuser for `MIGRATION_DATABASE_URL` (step 1), or provision the extensions and roles in advance (`docs/deploy.md`). |
 | `migrations: FAILED: sqlx::migrate failed: ...` mentioning a checksum or a previously applied migration | An applied migration file was edited. Migrations are append-only (`migrations/README.md`). Check out the file as it was when it was applied, or start from a fresh database. |
 | `migrations: FAILED: REFUSING: the database has N applied migration version(s) this binary does not embed: ...` | A newer build migrated this database. Build from that revision. For a deliberate rollback only, re-run with `--allow-db-ahead` or `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1`. |
@@ -484,6 +485,8 @@ claude mcp remove epigraph        # if you registered it with claude mcp add
 - [`02-concepts.md`](02-concepts.md): what claims, edges, agents,
   perspectives and Dempster-Shafer beliefs mean in the schema you just
   migrated.
+- [`03-walkthroughs.md`](03-walkthroughs.md): one domain set up end to end,
+  a repository's commit and PR history ingested with `ingest_git`.
 - [`04-glossary.md`](04-glossary.md): term lookups.
 - [`docs/deploy.md`](../deploy.md): running an instance for other people,
   with separate database logins, the maintenance timers, TLS, and upgrades.
@@ -493,7 +496,9 @@ claude mcp remove epigraph        # if you registered it with claude mcp add
 Newest first. Each line gives the commit that changed this file. Where a
 commit reached `main` through a merge, the PR is given as "via #N".
 
-- 2026-11-04 (this revision, PR #764): rewrote the file for a reader new to the
+- 2026-11-14 (backlog 2c2b335d): linked `03-walkthroughs.md` from "Where to
+  go next".
+- 2026-11-04 (PR #764): rewrote the file for a reader new to the
   project, checked against `main` at 5fcd75087.
   - The Rust floor goes from 1.75 to 1.88, the version the locked dependency
     graph needs.

@@ -72,6 +72,102 @@ pub const ALLOW_DB_AHEAD_FLAG: &str = "--allow-db-ahead";
 /// in.
 pub const KNOWN_FOREIGN_VERSIONS: &[i64] = &[35];
 
+/// The migration DSN's variable. Migrating needs DDL privilege, which the
+/// application role (`DATABASE_URL`) must not have.
+pub const MIGRATION_DATABASE_URL_ENV: &str = "MIGRATION_DATABASE_URL";
+
+/// The application DSN's variable, the migration DSN's fallback.
+pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
+
+/// Logged (WARN) whenever [`select_migration_dsn`] falls back.
+pub const MIGRATION_DSN_FALLBACK_WARNING: &str =
+    "MIGRATION_DATABASE_URL is unset; falling back to DATABASE_URL. Migrations need DDL \
+     privilege, which the application role must not have -- see docs/deploy.md.";
+
+/// The DSN a migration runs on, and which variable supplied it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDsn {
+    /// The connection string. Never log it: it carries the password.
+    pub url: String,
+    /// [`MIGRATION_DATABASE_URL_ENV`], or [`DATABASE_URL_ENV`] on the fallback.
+    pub var: &'static str,
+}
+
+impl MigrationDsn {
+    /// The migration DSN was unset and the application DSN is used instead.
+    #[must_use]
+    pub fn fell_back(&self) -> bool {
+        self.var == DATABASE_URL_ENV
+    }
+}
+
+/// Pick the migration DSN: `MIGRATION_DATABASE_URL`, falling back to
+/// `DATABASE_URL` (the caller warns, with [`MIGRATION_DSN_FALLBACK_WARNING`]).
+/// One rule for every entry point that migrates, `epigraph-migrate` and the
+/// server's `EPIGRAPH_MIGRATE_ON_BOOT` path alike (backlog e1b96df7).
+///
+/// A blank value is unset, as for `MAINTENANCE_DATABASE_URL`'s boot check: an
+/// exported-but-empty variable holds no credential, and treating it as set
+/// would try to connect to `""` instead of falling back.
+pub fn select_migration_dsn(
+    migration: Option<&str>,
+    database: Option<&str>,
+) -> Result<MigrationDsn, String> {
+    let present = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(url) = present(migration) {
+        return Ok(MigrationDsn {
+            url,
+            var: MIGRATION_DATABASE_URL_ENV,
+        });
+    }
+    present(database)
+        .map(|url| MigrationDsn {
+            url,
+            var: DATABASE_URL_ENV,
+        })
+        .ok_or_else(|| {
+            format!(
+                "{MIGRATION_DATABASE_URL_ENV} or {DATABASE_URL_ENV} environment variable required"
+            )
+        })
+}
+
+/// [`select_migration_dsn`] over the process environment.
+pub fn migration_dsn_from_env() -> Result<MigrationDsn, String> {
+    select_migration_dsn(
+        std::env::var(MIGRATION_DATABASE_URL_ENV).ok().as_deref(),
+        std::env::var(DATABASE_URL_ENV).ok().as_deref(),
+    )
+}
+
+/// Open a pool on the migration DSN. The one place a migration pool is built,
+/// for every entry point that migrates: `epigraph-migrate` and the server's
+/// `EPIGRAPH_MIGRATE_ON_BOOT` path.
+///
+/// Keeping the construction here, and out of the binaries, keeps
+/// `bin/server.rs` under `no_unmaintained_dsn.rs`'s per-file scan: the
+/// request-serving binary then builds no raw pool of its own, so a second one
+/// added later is a finding rather than hidden behind a whole-file exemption.
+///
+/// # Errors
+/// The connect error. It does not carry the URL; the caller names
+/// [`MigrationDsn::var`] and never prints [`MigrationDsn::url`].
+pub async fn connect_migration_pool(
+    dsn: &MigrationDsn,
+) -> Result<epigraph_db::PgPool, sqlx::Error> {
+    // MAINTENANCE-DSN-EXEMPT: migrating needs DDL privilege on every tier-A
+    // table, a different and strictly stronger role than
+    // `epigraph_maintenance` (SELECT/INSERT/UPDATE, no DDL: migration 070's
+    // grant block), so a maintenance constructor would be the WRONG credential,
+    // not a safer one. Pinned with this reason in
+    // `crates/epigraph-db/tests/no_unmaintained_dsn.rs`.
+    epigraph_db::PgPool::connect(&dsn.url).await
+}
+
 /// Caller policy for [`run_migrations`].
 ///
 /// `Default` is the strict policy: a database carrying migrations this binary
@@ -558,15 +654,20 @@ impl fmt::Display for PgvectorVersionError {
             Self::Query(e) => write!(f, "reading the pgvector version failed: {e}"),
             Self::NotInstalled => write!(
                 f,
-                "the pgvector extension (`vector`) is not installed in this database;                  {major}.{minor}.{patch} or newer is required"
+                "the pgvector extension (`vector`) is not installed in this database; \
+                 {major}.{minor}.{patch} or newer is required"
             ),
             Self::Unparseable { found } => write!(
                 f,
-                "cannot read the pgvector version {found:?}; {major}.{minor}.{patch} or newer                  is required"
+                "cannot read the pgvector version {found:?}; {major}.{minor}.{patch} or newer \
+                 is required"
             ),
             Self::TooOld { found } => write!(
                 f,
-                "pgvector {found} is installed but {major}.{minor}.{patch} or newer is                  required (semantic search sets hnsw.iterative_scan, added in 0.8.0). Install                  a newer pgvector on the server, then run `ALTER EXTENSION vector UPDATE` in                  this database."
+                "pgvector {found} is installed but {major}.{minor}.{patch} or newer is \
+                 required (semantic search sets hnsw.iterative_scan, added in 0.8.0). Install \
+                 a newer pgvector on the server, then run `ALTER EXTENSION vector UPDATE` in \
+                 this database."
             ),
         }
     }
@@ -642,6 +743,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_migration_dsn_is_preferred_and_the_fallback_is_flagged() {
+        let both = select_migration_dsn(Some("postgres://mig@h/db"), Some("postgres://app@h/db"))
+            .expect("both set");
+        assert_eq!(both.url, "postgres://mig@h/db");
+        assert_eq!(both.var, MIGRATION_DATABASE_URL_ENV);
+        assert!(!both.fell_back());
+
+        let fallback = select_migration_dsn(None, Some("postgres://app@h/db")).expect("fallback");
+        assert_eq!(fallback.url, "postgres://app@h/db");
+        assert_eq!(fallback.var, DATABASE_URL_ENV);
+        assert!(fallback.fell_back());
+    }
+
+    #[test]
+    fn a_blank_migration_dsn_is_unset_and_neither_is_an_error() {
+        for blank in ["", "   "] {
+            let dsn = select_migration_dsn(Some(blank), Some("postgres://app@h/db"))
+                .expect("blank falls back");
+            assert!(
+                dsn.fell_back(),
+                "{blank:?} must fall back, not connect to it"
+            );
+        }
+        for (m, d) in [(None, None), (Some(""), Some("")), (None, Some(" "))] {
+            let err = select_migration_dsn(m, d).expect_err("nothing to connect to");
+            assert!(
+                err.contains(MIGRATION_DATABASE_URL_ENV) && err.contains(DATABASE_URL_ENV),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn pgvector_below_0_8_0_is_refused_and_newer_is_accepted() {
         for old in ["0.6.0", "0.7.4", "0.7"] {
             assert!(
@@ -676,6 +810,19 @@ mod tests {
         // The refusal names what was found and what is required.
         let msg = require_supported_pgvector("0.6.0").unwrap_err().to_string();
         assert!(msg.contains("0.6.0") && msg.contains("0.8.0"), "{msg}");
+        // Each refusal is one readable line: the server prints it on refusing
+        // to serve and docs/deploy.md quotes it, so a mangled continuation
+        // (a run of spaces mid-sentence) breaks the operator's search for it.
+        for e in [
+            PgvectorVersionError::NotInstalled,
+            PgvectorVersionError::Unparseable { found: "x".into() },
+            PgvectorVersionError::TooOld {
+                found: "0.6.0".into(),
+            },
+        ] {
+            let msg = e.to_string();
+            assert!(!msg.contains("  ") && !msg.contains('\n'), "{msg:?}");
+        }
     }
 
     const EMBEDDED: &[i64] = &[1, 2, 3, 36, 37, 38, 59, 60, 101];

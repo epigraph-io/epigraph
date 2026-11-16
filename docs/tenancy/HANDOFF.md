@@ -73,7 +73,7 @@ Settled by the repository owner. §0 of the plan carries the reasoning.
 |---|----------|
 | D1 | Ownership is **required**. `public` must be explicitly declared; nothing is public by absence, omission, or default-on-error. Enforce at the **database** layer, not just the repo layer. |
 | D2 | Legacy backfill sets **explicit `public`**, owner derived from `claims.agent_id`. Those rows were already world-readable, so declaring it is a no-op, not a new disclosure. |
-| D3 | `public` means **any authenticated agent**. Unauthenticated callers get **nothing**. There is no anonymous read path. |
+| D3 | `public` means **any authenticated agent**. Unauthenticated callers get **nothing**. There is no anonymous read path. *Amended by backlog `1deb9dbf`: the four `GET /api/v1/guest/*` reads serve public rows to signed-out callers, only while `EPIGRAPH_GUEST_READS=on` (see `docs/tenancy.md`).* |
 | D4 | There must be an **admin surface to privatize a subgraph** (`restrict` mode, and `seal` mode for encryption). |
 | Q1 | `/metrics` → separate internal listener. **Done in PR-03** (`EPIGRAPH_METRICS_ADDR`, default `127.0.0.1:9090`). |
 | Q2 | Keep the `epigraph_seed` escape hatch for rollout; delete in a follow-up. |

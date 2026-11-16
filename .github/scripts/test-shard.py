@@ -133,6 +133,8 @@ WALKERS = {
         "crates/epigraph-auth/src/*",
     ),
     "crates/epigraph-api/tests/delegated_run_token_viewer.rs": ("crates/epigraph-mcp/src/*",),
+    # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
+    "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
     # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
     # renamed is only caught by a full run (main, staging, `ci:full`).

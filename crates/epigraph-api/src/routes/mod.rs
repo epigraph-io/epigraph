@@ -97,6 +97,9 @@ pub mod graph_query;
 pub mod graph_query_utils;
 #[cfg(feature = "db")]
 pub mod groups;
+/// The guest read surface: anonymous, public-only reads (backlog `1deb9dbf`).
+#[cfg(feature = "db")]
+pub mod guest;
 pub mod harvest;
 pub mod health;
 #[cfg(feature = "db")]
@@ -315,7 +318,8 @@ async fn oauth_response_headers(mut res: axum::response::Response) -> axum::resp
 }
 
 /// Response headers for a route whose every response is viewer-scoped
-/// (`POST /api/v1/search/semantic`): its body depends on who asks, so no
+/// (`POST /api/v1/search/semantic`, `GET /api/v1/papers`,
+/// `GET /api/v1/sources/overview`): its body depends on who asks, so no
 /// shared cache may store it, and a private cache must key on the credential.
 ///
 /// * `Cache-Control: private, no-store`.
@@ -339,6 +343,19 @@ async fn viewer_scoped_cache_headers(
     res
 }
 
+/// The body limit on the two anonymous routers (`public` and `oauth`): 64 KiB.
+///
+/// The global limit (`ApiConfig::max_request_size`, 10 MiB by default) exists
+/// for authenticated evidence uploads that carry base64 figures. Nothing an
+/// anonymous caller sends needs that: an OAuth token, registration,
+/// revocation or introspection request, a consent form, and a passkey
+/// ceremony's attestation or assertion (a few KiB, a certificate chain
+/// included) all fit in 64 KiB with room to spare. Without this, every
+/// anonymous endpoint, the brute-force targets included, read up to 10 MiB
+/// per request before authenticating anyone. Over the limit the extractor
+/// answers 413.
+pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
+
 /// Create the main application router with all routes.
 ///
 /// # Route structure — authenticated by default
@@ -354,10 +371,13 @@ async fn viewer_scoped_cache_headers(
 /// token, with 401 and an RFC 6750 `WWW-Authenticate: Bearer …,
 /// error="invalid_token"` challenge.
 ///
-/// ## `public` — the anonymous ALLOWLIST, fourteen routes
+/// ## `public` — the anonymous ALLOWLIST, eighteen routes
 ///
 /// - `GET /health` — static, stateless
 /// - `GET /api/v1/openapi.json` — static schema document
+/// - four `GET /api/v1/guest/*` public-only reads (backlog `1deb9dbf`): a
+///   public claim's card, its ego, and the theme overview and layout without
+///   stored labels, each read as `Viewer::public_only()` (`routes/guest.rs`)
 /// - twelve `/elevate/*` ceremony routes, anonymous by design (the ceremony's
 ///   id and the passkey are its credentials): passkey enrollment
 ///   (`/elevate/enroll/:id` with its `challenge` and `finish`), the elevation
@@ -393,8 +413,17 @@ async fn viewer_scoped_cache_headers(
 ///
 /// # Rate limiting
 ///
-/// All routes (except health endpoints) are subject to rate limiting when a
-/// rate limiter is configured in `AppState`.
+/// When `AppState` carries a rate limiter, every routed request except the
+/// health endpoints is rate limited. Each of the three routers installs the
+/// limiter itself, inside its bearer layer, so an authenticated request is
+/// charged to its principal and an anonymous one to its client address
+/// (`middleware::rate_limit`). A request to a protected route without a valid
+/// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries none but carries `AppState::guest_rate_limiter` (guest
+/// reads on, no limiter configured: the operator's ruling of 2026-11-16), the
+/// four `/api/v1/guest/*` routes alone are limited, by client address, and
+/// every other route is not.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -869,7 +898,8 @@ pub fn create_router_with_extensions(
     //
     // The rule is not "audit N handlers" — it is invert the split. `public` is
     // now an ALLOWLIST (built below: two routes when PR-03 landed, fourteen
-    // with the `/elevate/*` ceremonies); every other registration is
+    // with the `/elevate/*` ceremonies, eighteen with the public-only
+    // `/api/v1/guest/*` reads); every other registration is
     // appended to `protected` and inherits `bearer_auth_middleware`.
     //
     // Axum permits repeated `.route()` calls on the same path with different
@@ -943,10 +973,17 @@ pub fn create_router_with_extensions(
             get(cross_source::get_cross_source_matches),
         )
         .route("/api/v1/edges", get(edges::list_edges))
-        .route("/api/v1/papers", get(papers::list_papers))
+        .route(
+            "/api/v1/papers",
+            get(papers::list_papers).layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         // Who said what: the sources of the claims the caller may read, with
         // the caller's own counts (backlog da4a8bc1).
-        .route("/api/v1/sources/overview", get(sources::sources_overview))
+        .route(
+            "/api/v1/sources/overview",
+            get(sources::sources_overview)
+                .layer(middleware::map_response(viewer_scoped_cache_headers)),
+        )
         .route(
             "/api/v1/claims/:id/neighborhood",
             get(edges::claim_neighborhood),
@@ -1212,10 +1249,19 @@ pub fn create_router_with_extensions(
     // Embedder extensions (`extensions::mount_all`) are nested HERE, before
     // either layer: `route_layer` and `layer` wrap only routes that already
     // exist, so a mount below them would be unauthenticated.
+    //
+    // THE RATE LIMITER (backlog bd5c0f40) sits between the two: inside the
+    // bearer layer, so it charges each request to its verified principal
+    // rather than to an address many principals may share; outside the
+    // recorder, so a refused request is never served and never recorded.
     let protected = extensions::mount_all(protected, extensions, &state)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::middleware::elevated_access::record_elevated_access,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1267,6 +1313,28 @@ pub fn create_router_with_extensions(
     // that one act through migration 130's ceremony definers, the challenge
     // commits to the act's stored args digest, and nothing here executes an
     // act (the maintenance CLI's `--act` does).
+    //
+    // The GUEST read surface (backlog `1deb9dbf`) is anonymous BY DESIGN: a
+    // signed-out visitor, or a link-card fetcher with no user token, reads the
+    // PUBLIC graph. Four GETs under `/api/v1/guest/`, each reading as
+    // `Viewer::public_only()` (no group), so they serve `visibility = 'public'`
+    // rows only, answer a non-public id exactly as an absent one, and withhold
+    // the stored theme and region labels (see `routes/guest.rs`). They sit here
+    // to carry this router's anonymous body limit and, when the operator
+    // configured one, its rate limiter. They are routed always but answer only
+    // when `AppState::guest_reads` is on (`EPIGRAPH_GUEST_READS=on`); off, each
+    // is a bare 404.
+    //
+    // Each guest route also carries `guest_limit`, the guest reads' DEFAULT
+    // limiter (the operator's ruling of 2026-11-16): with guest reads on and
+    // no limiter configured, `bin/server.rs` sets `AppState::guest_rate_limiter`
+    // (#841's default limit, keyed on the client address), and these four
+    // routes, and no other, are limited by it. With a limiter configured that
+    // layer is a no-op, so a guest request is charged once, by the router's.
+    let guest_limit = middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::guest_rate_limit_middleware,
+    );
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
@@ -1290,7 +1358,23 @@ pub fn create_router_with_extensions(
         .route("/elevate/act/:id", get(elevate::act_page))
         .route("/elevate/act/:id/challenge", post(elevate::act_challenge))
         .route("/elevate/act/:id/assert", post(elevate::act_assert))
-        .route("/elevate/assets/elevate.js", get(elevate::elevate_js));
+        .route("/elevate/assets/elevate.js", get(elevate::elevate_js))
+        .route(
+            "/api/v1/guest/claims/:id",
+            get(guest::claim_card).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/claims/:id/ego",
+            get(guest::claim_ego).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/graph/themes/overview",
+            get(guest::themes_overview).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/graph/themes/layout",
+            get(guest::themes_layout).layer(guest_limit),
+        );
 
     // Layered on the allowlist: a request with no Authorization
     // header passes through, a request with a present-but-invalid token still
@@ -1303,10 +1387,22 @@ pub fn create_router_with_extensions(
     // premise is gone: those handlers are no longer reachable without a
     // credential at all. The remaining work — deriving a `Viewer` on every read
     // path rather than an `Option<AuthContext>` — is PR-07.
-    let public = public.layer(middleware::from_fn_with_state(
-        state.clone(),
-        optional_bearer_auth_middleware,
-    ));
+    //
+    // The rate limiter sits inside it: a caller that presents a token is
+    // charged to its principal, an anonymous one to its address.
+    //
+    // The anonymous body limit (`ANONYMOUS_BODY_LIMIT`) is innermost, so it
+    // overrides the global limit the merged router sets below.
+    let public = public
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            optional_bearer_auth_middleware,
+        ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
@@ -1336,19 +1432,26 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
+        // global limit the merged router sets below.
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
+        // Anonymous by construction, so charged to the client address
+        // (`/oauth/token` and `/oauth/register` are the brute-force targets).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // The body limit is the outermost layer. Rate limiting is NOT layered
+    // here: each of the three routers above installs it where it can see the
+    // principal (inside the bearer layers), so a merged-router layer could
+    // only ever key on the address. Health endpoints bypass it internally.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
         .with_state(state)
 }
 
@@ -1375,8 +1478,12 @@ pub fn create_router_with_extensions(
 ///
 /// # Rate limiting
 ///
-/// All routes (except health endpoints) are subject to rate limiting when a
-/// rate limiter is configured in `AppState`.
+/// When `AppState` carries a rate limiter, every routed request except the
+/// health endpoints is rate limited. Each of the three routers installs the
+/// limiter itself, inside its bearer layer, so an authenticated request is
+/// charged to its principal and an anonymous one to its client address
+/// (`middleware::rate_limit`). A request to a protected route without a valid
+/// token is refused 401 by the bearer layer before it reaches the limiter.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1771,9 +1878,17 @@ pub fn create_router_with_extensions(
     // Embedder extensions (`extensions::mount_all`) are nested HERE, before
     // the bearer layer: `layer` wraps only routes that already exist, so a
     // mount below it would be unauthenticated.
-    let protected = extensions::mount_all(protected, extensions, &state).layer(
-        middleware::from_fn_with_state(state.clone(), bearer_auth_middleware),
-    );
+    // The rate limiter sits inside the bearer layer, so it charges each
+    // request to its verified principal (backlog bd5c0f40).
+    let protected = extensions::mount_all(protected, extensions, &state)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            bearer_auth_middleware,
+        ));
 
     // The anonymous allowlist. Adding a route here is a security decision;
     // `crates/epigraph-api/tests/public_router_allowlist.rs` fails the build
@@ -1803,10 +1918,22 @@ pub fn create_router_with_extensions(
     // header passes through, a request with a present-but-invalid token still
     // 401s. Retained rather than dropped so an allowlisted handler can still
     // see who is calling when a token happens to be supplied.
-    let public = public.layer(middleware::from_fn_with_state(
-        state.clone(),
-        optional_bearer_auth_middleware,
-    ));
+    //
+    // The rate limiter sits inside it: a caller that presents a token is
+    // charged to its principal, an anonymous one to its address.
+    //
+    // The anonymous body limit (`ANONYMOUS_BODY_LIMIT`) is innermost, so it
+    // overrides the global limit the merged router sets below.
+    let public = public
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            optional_bearer_auth_middleware,
+        ));
 
     // OAuth2 endpoints (public, no auth required)
     let oauth = Router::new()
@@ -1831,19 +1958,26 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
+        // global limit the merged router sets below.
+        .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
+        // Anonymous by construction, so charged to the client address
+        // (`/oauth/token` and `/oauth/register` are the brute-force targets).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // Apply rate limiting and body limit as outermost layers
-    // Rate limiting bypasses health endpoints internally
+    // The body limit is the outermost layer. Rate limiting is NOT layered
+    // here: each of the three routers above installs it where it can see the
+    // principal (inside the bearer layers), so a merged-router layer could
+    // only ever key on the address. Health endpoints bypass it internally.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
         .with_state(state)
 }
 

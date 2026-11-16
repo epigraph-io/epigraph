@@ -94,7 +94,14 @@ const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
 /// the act's stored args digest, nothing here executes an act, and all of it
 /// answers 503 when no relying party is configured.
 ///
-/// Fourteen application routes + the 11 OAuth/discovery routes = 25 paths
+/// The GUEST reads (backlog `1deb9dbf`) are anonymous by design: a signed-out
+/// visitor or a link-card fetcher reads the public graph. Four GETs, each read
+/// as `Viewer::public_only()` (no group), so they serve public rows only and
+/// answer a non-public id exactly as an absent one. They answer only on a
+/// server started with `EPIGRAPH_GUEST_READS=on` (a bare 404 otherwise).
+/// Their own tests are `tests/guest_public_reads.rs`.
+///
+/// Eighteen application routes + the 11 OAuth/discovery routes = 29 paths
 /// reachable with no `Authorization` header.
 const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/health",
@@ -111,6 +118,10 @@ const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/elevate/act/:id/challenge",
     "/elevate/act/:id/assert",
     "/elevate/assets/elevate.js",
+    "/api/v1/guest/claims/:id",
+    "/api/v1/guest/claims/:id/ego",
+    "/api/v1/guest/graph/themes/overview",
+    "/api/v1/guest/graph/themes/layout",
 ];
 
 /// The OAuth/discovery router, `db` variant. Anonymous by construction —
@@ -617,6 +628,28 @@ async fn allowlisted_routes_still_answer_anonymously() {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
     let (addr, _shutdown) = common::spawn_app(&url).await;
     let client = reqwest::Client::new();
+
+    for path in [
+        "/api/v1/guest/graph/themes/overview",
+        "/api/v1/guest/graph/themes/layout",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        // The test app is built without `EPIGRAPH_GUEST_READS=on`, so the
+        // guest route answers its switched-off 404. A bearer-wrapped route
+        // would answer 401 instead; the switched-on answers are
+        // `tests/guest_public_reads.rs`.
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "GET {path} is a guest read (backlog 1deb9dbf), off by default; it \
+             must reach its handler for a signed-out caller, so the bearer \
+             layer must not wrap it (a 401)"
+        );
+    }
 
     for path in ["/health", "/api/v1/openapi.json"] {
         let resp = client

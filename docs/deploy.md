@@ -142,6 +142,20 @@ only raise a NOTICE ("Cannot CREATE ROLE ...: provision it out of band"),
 and 161 then skips the attestor grant (section 9 has the recipe). That path
 is not exercised by CI.
 
+On an older pgvector every semantic search fails with SQLSTATE 42602, and
+distribution packages often ship 0.6. `epigraph-migrate` applies the
+migrations, then refuses (exit 1, no `migrations: ok` marker); the server
+refuses to start. To see what you have:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'vector';             -- installed in this database
+SELECT default_version FROM pg_available_extensions WHERE name = 'vector'; -- what the server can install
+```
+
+If the installed version is older, install pgvector 0.8.0 or newer on the
+server, then run `ALTER EXTENSION vector UPDATE;` in the database as its owner
+or a superuser, and restart the API.
+
 **Check:** `psql "<migration DSN>" -c 'SELECT 1'` connects.
 
 ### Step 3 — Migrate
@@ -259,6 +273,8 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host>
 EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
 # OPENAI_API_KEY=<key>            # semantic search and embedding on write
 # EPIGRAPH_METRICS_ADDR=127.0.0.1:9090
+# EPIGRAPH_TRUSTED_PROXIES=127.0.0.0/8,::1/128  # the reverse proxy in front of the API
+# EPIGRAPH_RATE_LIMIT_RPM=600
 ```
 
 - **TLS.** Either build with `--features epigraph-api/tls` and set both `EPIGRAPH_TLS_CERT`
@@ -266,6 +282,37 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   that terminates TLS. `EPIGRAPH_PUBLIC_BASE_URL` must be the public origin
   either way. It is used in OAuth discovery documents and consent links, and
   it defaults to `http://localhost:8080`.
+- **Rate limiting** is off unless configured: with none of
+  `EPIGRAPH_RATE_LIMIT`, `EPIGRAPH_RATE_LIMIT_RPM` and
+  `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` set, the API applies **no** rate limit
+  (logged at boot as `rate limiter OFF`); set one, or limit at the reverse
+  proxy. The one exception is the guest reads: with `EPIGRAPH_GUEST_READS=on`
+  and none of those three variables set, the four `/api/v1/guest/*` routes,
+  and no other, are limited at 600 requests a minute per client address
+  (keyed as below), logged at boot as `guest routes are rate limited by
+  default`. Setting a limit replaces that default with the configured limiter
+  on every route; `EPIGRAPH_RATE_LIMIT=off` removes it too, and then the boot
+  log warns that the guest reads are UNLIMITED. Once on, the limit is `EPIGRAPH_RATE_LIMIT_RPM` (600 when only
+  `EPIGRAPH_RATE_LIMIT=on` or a global limit is given) requests a minute per
+  bucket, after a burst of the same size. An
+  authenticated request is charged to its principal (the token's agent, else
+  its client); an anonymous one (`/oauth/*`, `/.well-known/*`, `/elevate/*`,
+  the allowlist without a token) to its client address. The address is the
+  TCP peer unless the peer is in `EPIGRAPH_TRUSTED_PROXIES`, in which case it
+  is the right-most `X-Forwarded-For` hop that is not itself a trusted proxy.
+  **Set `EPIGRAPH_TRUSTED_PROXIES` to the address your reverse proxy connects
+  from** (the default, loopback, fits a proxy on the same host). Otherwise
+  every client behind the proxy is charged to the proxy's one bucket. The
+  proxy must APPEND the client address to `X-Forwarded-For` (Caddy and
+  nginx's `$proxy_add_x_forwarded_for` do). Never list an address that
+  untrusted clients can connect from: whatever they write in the header is
+  then believed. A request to a protected route without a valid token is
+  refused 401 before the limiter. A 429 carries `Retry-After`, and one
+  refusal per bucket per minute is recorded as a `rate_limit_exceeded` event
+  in the in-memory security audit log. Its database copy is best-effort:
+  `security_events.agent_id` references `agents`, so a refusal keyed on a
+  client address (or on an agentless token's client) is not persisted and
+  logs `Failed to persist security event` instead.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
@@ -276,7 +323,10 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   out for a `.env` file in its working directory too: the server loads one if
   it exists.
 
-**Check.** The log contains `Session-GUC probe passed`,
+**Check.** The log contains `rate limiter ON` (with the effective
+`per_key_rpm`, `global_rpm` and `trusted_proxies`) when you configured a limit,
+`rate limiter OFF` otherwise (with guest reads on, `rate limiter OFF except on
+the guest reads` and `guest routes are rate limited by default`), `Session-GUC probe passed`,
 `entity_types registry cache loaded`, `Internal metrics listener started`
 and `Server listening on 0.0.0.0:<port>`. An operator-binding line is also
 logged: `operator binding is NOT ARMED on this database: ...` until you arm it
@@ -418,11 +468,19 @@ For the others, anything else is off.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |
 | `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
-| `EPIGRAPH_PORT` | `8080` | The application port. The bind address is `0.0.0.0`. |
+| `EPIGRAPH_PORT` | `8080` | The application port. |
+| `EPIGRAPH_BIND_ADDR` | `0.0.0.0` | The IP address the application listener binds (for example `127.0.0.1` behind a reverse proxy on the same host, or `::`). An IP address only; the port is `EPIGRAPH_PORT`. Not an IP address → exit 1. |
+| `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
+| `EPIGRAPH_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM or SIGINT the server stops accepting connections and lets in-flight requests finish for at most this long, then exits 0. Keep it below the unit's `TimeoutStopSec` (systemd's default is 90 s). Not a whole number → exit 1. |
+| `EPIGRAPH_MAX_REQUEST_BYTES` | `10485760` (10 MiB) | The request-body limit on authenticated routes; over it the request is answered 413. The anonymous routes (`/oauth/*`, `/.well-known/*`, `/health`, `/api/v1/openapi.json`, `/elevate/*`) are held to 64 KiB whatever this says. Not a positive whole number → exit 1. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
+| `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
-| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
+| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot, on a short-lived pool on `MIGRATION_DATABASE_URL` (falling back to `DATABASE_URL` with a WARN, as `epigraph-migrate` does), closed before it serves. A migration DSN it cannot reach → exit 1, naming the variable; a failed migration panics. The DDL credential is then in the server's environment for as long as it runs, so the supported path is `epigraph-migrate`. |
 | `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` | off | The deliberate-rollback opt-in, for any entry point that migrates (section 4). |
 | `EPIGRAPH_REQUIRE_SIGNATURES` | off | Enforces Ed25519 payload signatures on `POST /api/v1/submit/packet` only (section 7). |
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
@@ -436,9 +494,8 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
-| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Requests per minute allowed to one client, enforced in-process on every route except the health probes. Unset → the API applies **no** rate limit (logged at boot as `Rate limiting: OFF`); limit at the reverse proxy instead, or set this. The client is its IP, taken from `X-Forwarded-For` / `X-Real-IP` when present, so set it only where a trusted proxy writes those headers, and remember that agents sharing one address share one allowance. An unusable value → exit 1. |
-| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global ceiling) | Requests per minute across all clients together. Read only with `EPIGRAPH_RATE_LIMIT_RPM`, and must not be below it. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
+| `EPIGRAPH_GUEST_READS` | `off` | `on` serves every `visibility = 'public'` claim, edge and theme count to signed-out callers under `GET /api/v1/guest/*` (`docs/tenancy.md`); off, each answers 404. Any other value stays off and is warned about. With no rate limit configured, the guest routes are limited at 600 a minute per client address (Step 8, "Rate limiting"). |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
 | `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart. |
@@ -484,7 +541,7 @@ not to the API.
 
 | Flag / variable | Meaning |
 |---|---|
-| `MIGRATION_DATABASE_URL` | The migration DSN. Unset → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
+| `MIGRATION_DATABASE_URL` | The migration DSN, for `epigraph-migrate` and the server's `EPIGRAPH_MIGRATE_ON_BOOT`. Unset or blank → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
 | `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` | The deliberate-rollback opt-in (section 4). |
 
 ### `drain_jobs` and `replay_deferred_cascades`
@@ -511,7 +568,7 @@ not to the API.
 | `MAINTENANCE_DATABASE_URL` | the maintenance CLIs | Preferred over `DATABASE_URL`. The fallback WARNs, and some binaries refuse it (section 5). |
 | `EPIGRAPH_API` | `decompose_claims` and the belief-mode check in `recompute_betp`, `backfill_factors` and `refresh_truth_mirrors` (read before `EPIGRAPH_API_URL`); `epigraph-privatize` (the only API variable it reads); `scripts/reconcile_backlog_labels.py` (`--base-url` default) | The API's base URL, explicit override. |
 | `EPIGRAPH_API_URL` | among them `dekg`, `decompose_claims`, `recompute_betp`, `backfill_factors`, `refresh_truth_mirrors`, `scripts/maintain_themes.py`, `scripts/run_assessment_worker.py` | The API's base URL, for CLIs that call the HTTP API. |
-| `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
+| `EPIGRAPH_TOKEN` | among them `dekg`, `decompose_claims`, `ingest_literature`, `ingest_git` (when `--token` is not given; the git-ingest reconciler hands its token over this way), `epigraph-privatize`, `scripts/reconcile_backlog_labels.py`, `scripts/cleanup_backlog_labels.py`, `scripts/maintain_themes.py`, `scripts/fuzzy_dedup_claims.py` | A Bearer token. The listed scripts exit when it is unset (`fuzzy_dedup_claims.py` only with `--execute`). |
 | `EPIGRAPH_SERVICE_CLIENT_ID`, `EPIGRAPH_SERVICE_SECRET`, `EPIGRAPH_OAUTH_TOKEN_URL` | `decompose_claims`, `scripts/_api_client.py` (section 7) | Mint a token with `client_credentials` instead of passing `EPIGRAPH_TOKEN`. |
 | `RECALL_EVENTS_RETENTION_DAYS` | `prune_recall_events` | Retention in days, default 90. |
 | `CALIBRATION_PATH` | `scripts/run_assessment_worker.py` and `scripts/lib/tiered_enrichment.py::auto_tier` | The file whose `[conformal.quantiles]` Tier-1 routing reads; unset, the repository's `calibration.toml`. Unlike the Rust binaries, the scripts have no compiled-in copy to fall back to: a missing file or one without `[conformal.quantiles]` is an error, and the worker exits at startup (also under `--dry-run`). |
@@ -531,7 +588,8 @@ at a time.
 | `EPIGRAPH_LLM_PROVIDER` | the API server, in a build with the `genai` feature | `anthropic` | The provider behind `POST /api/v1/analyze/unconstrained`: `anthropic`, `epigraph` (the first active registered provider), `mock`, or the name of a registered extension. The request's question is sent to it. A build without `genai` answers that route 503. |
 | `ENRICHMENT_LLM_PROVIDER` | `ingest_git --enricher llm` | `epigraph` | The provider selector for the commit enricher; same values. |
 | `ENRICHMENT_WINDOW_SIZE`, `ENRICHMENT_WINDOW_OVERLAP` | `ingest_git --enricher llm` | `20`, `5` | Commits per enrichment window, and how many of them overlap the next window. |
-| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer in the PR body or commits names one. |
+| `EPIGRAPH_GIT_AUTHOR_KEY_FILE` | `ingest_git` (when `--author-key-file` is not given), the git-ingest reconciler (when its config has no `author_key_file`) | unset | A file holding 64 hex characters (32 bytes, e.g. `openssl rand -hex 32`, mode 0600). Every git-author agent key, and the repository node's system agent key, is derived from this secret, so the key is not computable from the public `git log`. A live `--pr-ingest` or `--agent-key per-author` run without it is refused; a dry run uses a random secret. Changing it changes every author agent. |
+| `EPIGRAPH_DEFAULT_ORCHESTRATOR_ID` | `ingest_git` | unset | The orchestrator agent's UUID when neither `--orchestrator-id` nor an `Epigraph-Orchestrator-Id` trailer (in the PR body, or in a commit message's trailer block) names one. A value that is not a UUID is refused. The git-ingest reconciler sets it from its `default_orchestrator_id`, so that key is a fallback too. |
 | `API_ENDPOINT` | `embed_bridge` | `http://localhost:8080` | The API's base URL for that CLI. |
 | `NLI_SERVICE_URL` | `NliClient::from_env` (`epigraph-cli`, `enrichment::nli_client`) | unset | The URL of an NLI classification service, which is POSTed `{premise, hypothesis}`. No binary in this tree calls `from_env` at the time of writing, so setting the variable changes nothing yet. |
 
@@ -553,7 +611,9 @@ the empty string, skips. Booting without migrating logs
 Several migrations (074, 075 and 084 among them) `RAISE` when their
 preconditions do not hold, and the boot-time call site panics on failure, so
 an unattended boot-time apply turns a precondition failure into a crash loop.
-Keep migration an explicit step.
+Keep migration an explicit step. When it is set, the server migrates on the
+migration DSN by the same rule as `epigraph-migrate` below (not on its request
+pool, whose role has no DDL privilege), on a pool it closes before serving.
 
 `epigraph-migrate` reads `MIGRATION_DATABASE_URL`, falling back to
 `DATABASE_URL` with a `WARN`. That WARN is shown only when `RUST_LOG` enables
@@ -4544,6 +4604,10 @@ Do not improvise it against a live database without that entry's context.
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
+| `ERROR: refusing to serve: pgvector <v> is installed but 0.8.0 or newer is required ...` | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2), and restart. |
+| ``ERROR: refusing to serve: the pgvector extension (`vector`) is not installed in this database ...`` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
+| `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
+| `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
 | `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
 | `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at the `epigraph_app` login. |

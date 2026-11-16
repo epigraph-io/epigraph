@@ -299,12 +299,19 @@ pub async fn bearer_auth_middleware(
 /// is allowed through with no `AuthContext` and no 401. A request WITH a
 /// `Bearer` token that is revoked, malformed, or expired is rejected 401.
 ///
-/// Since PR-03 this layers on the **anonymous allowlist router only** — the two
-/// routes (`/health`, `/api/v1/openapi.json`) that are legitimately reachable
-/// without a credential, plus the OAuth/discovery router which must precede
-/// authentication by construction. Every route that returns claim content,
-/// claim-derived structure, ACLs, embeddings or aggregates now sits behind
-/// [`bearer_auth_middleware`] instead.
+/// Since PR-03 this layers on the **anonymous allowlist router only**: the
+/// routes legitimately reachable without a credential (`/health`,
+/// `/api/v1/openapi.json`, the `/elevate/*` ceremonies, and the four
+/// public-only `/api/v1/guest/*` reads of backlog `1deb9dbf`). The
+/// OAuth/discovery router, which must precede authentication by construction,
+/// carries no bearer layer at all. Every other route that returns claim
+/// content, claim-derived structure, ACLs, embeddings or aggregates sits
+/// behind [`bearer_auth_middleware`] instead.
+///
+/// The guest reads never take a viewer from this layer: they read as
+/// `Viewer::public_only()` (`routes/guest.rs`) whether or not a token is
+/// present, so a guest answer is the public graph for every caller. They
+/// answer only while `EPIGRAPH_GUEST_READS=on` (a bare 404 otherwise).
 ///
 /// It is still `optional` rather than absent because an allowlisted route may
 /// legitimately want to know *who* is calling when a token happens to be

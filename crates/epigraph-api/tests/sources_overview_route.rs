@@ -567,3 +567,150 @@ async fn paging_by_one_walks_every_source_exactly_once(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+async fn show_statement_timeout(conn: &mut sqlx::PgConnection) -> String {
+    sqlx::query_scalar("SHOW statement_timeout")
+        .fetch_one(conn)
+        .await
+        .expect("SHOW statement_timeout")
+}
+
+/// The unthemed overview aggregates every readable current claim per request,
+/// so each page runs under its own `statement_timeout`. Pinned
+/// deterministically by a lock wait (a `statement_timeout` covers time spent
+/// waiting on a lock): while another session holds `claims` exclusively, the
+/// page gives up at its bound with `57014` instead of waiting, the route maps
+/// that to a 503, and the connection's own `statement_timeout` is put back
+/// afterwards, on the error path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_overview_gives_up_at_its_time_bound_and_restores_the_connection(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (filer, _) = agent(&pool, "bounded filer").await;
+    let t = theme(&pool, "bounded theme").await;
+    let c = viewer_fixture::seed_public_claim(&pool, filer, "a bounded claim").await;
+    set_theme(&pool, c, t).await;
+    // Resolved on the superuser pool (an unstamped downgraded session would
+    // resolve an empty group set).
+    let viewer = epigraph_db::Viewer::resolve(&pool, filer)
+        .await
+        .expect("resolve the filer");
+
+    let mut read = state.read_as(&viewer).await.expect("stamped read");
+    let before = show_statement_timeout(&mut read).await;
+
+    let mut locker = pool.begin().await.expect("locker tx");
+    sqlx::query("LOCK TABLE claims IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *locker)
+        .await
+        .expect("hold claims");
+
+    let bounded = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        epigraph_db::SourceOverviewRepository::page_bounded(
+            &mut read,
+            &viewer,
+            Some(t),
+            None,
+            None,
+            50,
+            std::time::Duration::from_millis(300),
+        ),
+    )
+    .await
+    .expect("the overview waited on the lock past its bound: no statement_timeout applied");
+    let err = bounded.expect_err("the overview cannot read claims while they are locked");
+    let code = match &err {
+        epigraph_db::DbError::QueryFailed { source } => source
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.to_string()),
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("57014"), "{err:?}");
+    assert!(
+        matches!(
+            epigraph_api::routes::sources::overview_read_failed(&err),
+            epigraph_api::errors::ApiError::ServiceUnavailable { .. }
+        ),
+        "a timed-out overview answers 503"
+    );
+    assert_eq!(
+        show_statement_timeout(&mut read).await,
+        before,
+        "the connection's own statement_timeout is restored after a timeout"
+    );
+
+    locker.rollback().await.expect("release claims");
+    let page = epigraph_db::SourceOverviewRepository::page_bounded(
+        &mut read,
+        &viewer,
+        Some(t),
+        None,
+        None,
+        50,
+        epigraph_db::SOURCES_OVERVIEW_STATEMENT_TIMEOUT,
+    )
+    .await
+    .expect("unlocked, the same connection reads the overview");
+    assert!(!page.sources.is_empty(), "the theme has a source");
+    assert_eq!(show_statement_timeout(&mut read).await, before);
+    read.commit().await.expect("finish the read");
+}
+
+/// Any other read failure stays an opaque 500.
+#[test]
+fn a_failed_overview_read_that_did_not_time_out_is_a_500() {
+    let err = epigraph_db::DbError::QueryFailed {
+        source: sqlx::Error::RowNotFound,
+    };
+    assert!(matches!(
+        epigraph_api::routes::sources::overview_read_failed(&err),
+        epigraph_api::errors::ApiError::InternalError { .. }
+    ));
+}
+
+/// The overview and `GET /api/v1/papers` answer each caller with its own
+/// counts, so neither may be stored by a shared cache, and a private cache
+/// must key on the credential: `Cache-Control: private, no-store` and
+/// `Vary: Authorization`, on a refusal as well as on a 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_viewer_scoped_reads_are_not_cacheable_across_callers(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (caller, _) = agent(&pool, "cache caller").await;
+    let token = common::mint_token_with_agent(&["claims:read"], caller);
+    for (uri, want) in [
+        ("/api/v1/sources/overview", StatusCode::OK),
+        ("/api/v1/papers", StatusCode::OK),
+        (
+            "/api/v1/sources/overview?kind=book",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), want, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Authorization"),
+            "{uri}"
+        );
+    }
+}
