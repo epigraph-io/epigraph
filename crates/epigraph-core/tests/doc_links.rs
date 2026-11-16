@@ -4,8 +4,10 @@
 //! The onboarding path is `README.md` plus the numbered `docs/intro/` tree a
 //! new reader follows in order. A relative link there that points at a file
 //! nobody wrote renders as a 404 on GitHub at exactly the step the reader was
-//! sent to — `README.md` once listed `docs/intro/03-walkthroughs.md`, which
-//! never existed, between `02-concepts` and `04-glossary`.
+//! sent to — `README.md` once listed `docs/intro/03-walkthroughs.md` before
+//! anyone wrote it, between `02-concepts` and `04-glossary`. The second test
+//! pins the other half of that defect: the numbered tree must have no gap and
+//! README must list every page, so a page cannot be dropped or left unlisted.
 //!
 //! Scope is deliberately narrow: `docs/superpowers/` holds plans and specs
 //! that name files *to be created* and absolute paths on a developer's
@@ -122,6 +124,71 @@ fn every_relative_link_in_the_onboarding_path_resolves() {
         "relative links in the onboarding path point at files that do not exist:\n  {}",
         broken.join("\n  ")
     );
+}
+
+/// `NN-name.md` → `NN`, for the numbered `docs/intro/` pages.
+fn intro_page_number(name: &str) -> Option<u32> {
+    let (num, rest) = name.split_once('-')?;
+    if num.len() != 2 || !rest.ends_with(".md") {
+        return None;
+    }
+    num.parse().ok()
+}
+
+#[test]
+fn the_intro_tree_is_numbered_without_a_gap_and_readme_lists_every_page() {
+    let root = repo_root();
+    let intro = root.join("docs/intro");
+    let mut pages: Vec<(u32, String)> = std::fs::read_dir(&intro)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", intro.display()))
+        .map(|entry| {
+            entry
+                .expect("docs/intro entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter_map(|name| intro_page_number(&name).map(|n| (n, name)))
+        .collect();
+    pages.sort();
+
+    assert!(
+        pages.len() >= 4,
+        "expected at least 4 numbered docs/intro pages, found {pages:?}; the \
+         page scan is broken"
+    );
+    let numbers: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
+    let expected: Vec<u32> = (1..=pages.len() as u32).collect();
+    assert_eq!(
+        numbers, expected,
+        "docs/intro pages must be numbered 01..N with no gap or repeat \
+         (a reader follows them in order); found {pages:?}"
+    );
+
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+    let readme_targets = relative_link_targets(&readme);
+    let unlisted: Vec<&str> = pages
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .filter(|name| {
+            !readme_targets
+                .iter()
+                .any(|t| t == &format!("docs/intro/{name}"))
+        })
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "README.md must link every docs/intro page; it does not link: {unlisted:?}"
+    );
+}
+
+#[test]
+fn intro_page_numbers_parse_only_the_numbered_form() {
+    assert_eq!(intro_page_number("03-walkthroughs.md"), Some(3));
+    assert_eq!(intro_page_number("10-later.md"), Some(10));
+    assert_eq!(intro_page_number("README.md"), None);
+    assert_eq!(intro_page_number("3-short.md"), None);
+    assert_eq!(intro_page_number("03-notes.txt"), None);
 }
 
 #[test]
