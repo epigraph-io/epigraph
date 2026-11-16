@@ -1726,9 +1726,13 @@ pub async fn do_ingest_document_reporting(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(edge_key),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
@@ -2724,9 +2728,13 @@ pub async fn do_ingest_document_spine(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(edge_key),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;

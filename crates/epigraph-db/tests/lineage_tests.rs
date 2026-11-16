@@ -277,19 +277,31 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
 
     // Add evidence to each claim
     let ev_root_1 = make_evidence(agent.id, root_claim.id, "Root evidence 1");
-    let ev_root_1 = EvidenceRepository::create(&pool, &ev_root_1).await.unwrap();
+    let ev_root_1 =
+        EvidenceRepository::create(&pool, &ev_root_1, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_root_1: Uuid = ev_root_1.id.as_uuid();
 
     let ev_root_2 = make_evidence(agent.id, root_claim.id, "Root evidence 2");
-    let ev_root_2 = EvidenceRepository::create(&pool, &ev_root_2).await.unwrap();
+    let ev_root_2 =
+        EvidenceRepository::create(&pool, &ev_root_2, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_root_2: Uuid = ev_root_2.id.as_uuid();
 
     let ev_middle = make_evidence(agent.id, middle_claim.id, "Middle evidence");
-    let ev_middle = EvidenceRepository::create(&pool, &ev_middle).await.unwrap();
+    let ev_middle =
+        EvidenceRepository::create(&pool, &ev_middle, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_middle: Uuid = ev_middle.id.as_uuid();
 
     let ev_leaf = make_evidence(agent.id, leaf_claim.id, "Leaf evidence");
-    let ev_leaf = EvidenceRepository::create(&pool, &ev_leaf).await.unwrap();
+    let ev_leaf =
+        EvidenceRepository::create(&pool, &ev_leaf, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_leaf: Uuid = ev_leaf.id.as_uuid();
 
     // Execute: Query lineage from leaf

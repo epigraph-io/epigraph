@@ -175,6 +175,7 @@ pub mod dcr_sweep;
 pub mod default_group;
 pub mod delete_frames;
 pub mod elevation;
+pub mod evidence_edges;
 pub mod group_role;
 pub mod hide;
 pub mod human;

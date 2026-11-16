@@ -281,7 +281,11 @@ const fn site(file: &'static str, func: &'static str, count: usize, status: Stat
 // 27: the analysis bundle (`persist_bundle`, 2) signs with the API's key.
 // 25: the staged-edge promotion: its two bulk copies became one signed
 // per-row site.
-const UNSIGNED_SITES_HIGH_WATER: usize = 25;
+// 26: the bug-report intake's evidence -> claim edge (migration 211, a
+// database function with no key; backlog 2d60f619, merged on staging batch 4).
+// The evidence -> claim edge backfill writes through the signed
+// `EvidenceRepository::link_to_claims_signed_conn`, so it adds no site.
+const UNSIGNED_SITES_HIGH_WATER: usize = 26;
 
 /// A database-side edge writer: the migration holding the function's LIVE
 /// definition, the function, and its `INSERT INTO edges` count.
@@ -294,6 +298,14 @@ struct DbSite {
 
 /// The database-side inventory, measured from `migrations/*.sql`.
 const DB_REGISTER: &[DbSite] = &[
+    // The bug-report intake's evidence -> claim edge (migration 211, backlog
+    // 2d60f619): a database function, so no transport key.
+    DbSite {
+        migration: "211_bug_report_evidence_edge.sql",
+        function: "epigraph_submit_bug_report",
+        count: 1,
+        status: Unsigned(NO_KEY_DB_FUNCTION),
+    },
     // The legacy-author OPERATED_BY backfill (custodian role).
     DbSite {
         migration: "123_custodian_role.sql",
@@ -358,13 +370,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/conventions.rs",
         "learn_convention",
-        4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/conventions.rs",
-        "forget_convention",
-        1,
+        3,
         Signed,
     ),
     site(
@@ -448,7 +454,7 @@ const REGISTER: &[Site] = &[
     site(
         "crates/epigraph-api/src/routes/submit.rs",
         "persist_packet",
-        5,
+        4,
         Signed,
     ),
     // The legacy ingest-marker backfill's creation records: written on the
@@ -505,6 +511,14 @@ const REGISTER: &[Site] = &[
     ),
     // The ingest record's insert primitive: the key is the caller's (both
     // document walks pass theirs, checked per site above).
+    // The evidence -> claim edges an evidence write creates in its own
+    // transaction (backlog 2d60f619), signed with the transport's key.
+    site(
+        "crates/epigraph-db/src/repos/evidence.rs",
+        "link_to_claims_signed_conn",
+        1,
+        Signed,
+    ),
     site(
         "crates/epigraph-db/src/repos/claim_ingest.rs",
         "record_signed_conn",
