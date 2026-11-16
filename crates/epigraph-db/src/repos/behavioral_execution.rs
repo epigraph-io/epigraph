@@ -39,6 +39,24 @@ pub struct BehavioralExecutionRow {
     pub run_label: Option<String>,
 }
 
+/// One recurring `deviation_reason` of one step lineage, as
+/// [`BehavioralExecutionRepository::deviation_summary`] rolls it up.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow, serde::Serialize)]
+pub struct DeviationReasonSummary {
+    /// The step's `claims.step_lineage_id`, or the step claim's own id for a
+    /// legacy step with no lineage (it is then its own lineage).
+    pub step_lineage_id: Uuid,
+    /// The step claim of the NEWEST run that gave this reason: the claim an
+    /// `evolve_step` on this lineage would start from (or its head's
+    /// predecessor, if the lineage moved on since).
+    pub latest_step_claim_id: Uuid,
+    /// The reason, trimmed. Reasons are grouped by exact trimmed text.
+    pub deviation_reason: String,
+    pub occurrences: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
 /// Repository for `behavioral_executions` table operations.
 ///
 /// All methods are static async and take a `&PgPool`. The goal embedding is
@@ -246,6 +264,68 @@ impl BehavioralExecutionRepository {
         );
         let mut q = sqlx::query_as::<_, BehavioralExecutionRow>(&sql)
             .bind(workflow_id)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Roll up a hierarchical workflow's per-step `deviation_reason`
+    /// telemetry by STEP LINEAGE over the last `window_days` days: each
+    /// distinct (lineage, trimmed reason) with how often and when it was
+    /// reported, most frequent first, at most `limit` groups (backlog
+    /// 0a2ed32d). A reason that recurs on one lineage is an `evolve_step`
+    /// candidate; this reads, and writes nothing.
+    ///
+    /// Counts only step rows a hierarchical report wrote (`step_claim_id` set)
+    /// that are marked `deviated` with a non-blank reason. A flat workflow
+    /// claim's rows carry no step claim, so they never appear.
+    ///
+    /// # Tenancy
+    ///
+    /// The same parent filter as [`Self::recent_executions`] (a hidden
+    /// workflow answers like an unknown id: no groups), and the step claim
+    /// itself must be one `viewer` reads, so a lineage whose step the caller
+    /// cannot read is never named. Run it on `viewer`'s STAMPED connection.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn deviation_summary<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+        window_days: i32,
+        limit: i64,
+    ) -> Result<Vec<DeviationReasonSummary>, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT COALESCE(c.step_lineage_id, c.id) AS step_lineage_id,
+                   (array_agg(c.id ORDER BY be.created_at DESC, be.id DESC))[1]
+                       AS latest_step_claim_id,
+                   btrim(be.step_beliefs->>'deviation_reason') AS deviation_reason,
+                   count(*) AS occurrences,
+                   min(be.created_at) AS first_seen,
+                   max(be.created_at) AS last_seen
+            FROM behavioral_executions be
+            JOIN claims c ON c.id = be.step_claim_id /* {VISIBILITY:c} */
+            WHERE be.workflow_id = $1
+              AND be.created_at >= now() - make_interval(days => $2)
+              AND jsonb_typeof(be.step_beliefs->'deviated') = 'boolean'
+              AND (be.step_beliefs->>'deviated')::boolean
+              AND btrim(COALESCE(be.step_beliefs->>'deviation_reason', '')) <> ''
+              AND EXISTS (SELECT 1 FROM workflows w
+                           WHERE w.id = $1 /* {VISIBILITY:w} */)
+            GROUP BY 1, 3
+            ORDER BY occurrences DESC, last_seen DESC, 1, 3
+            LIMIT $3
+            "#,
+            4,
+        );
+        let mut q = sqlx::query_as::<_, DeviationReasonSummary>(&sql)
+            .bind(workflow_id)
+            .bind(window_days)
             .bind(limit);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);

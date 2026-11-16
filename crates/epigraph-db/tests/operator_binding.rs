@@ -923,6 +923,7 @@ async fn supersede_is_bound_on_the_writer_once_armed(pool: PgPool) {
                     let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
                     let r = epigraph_db::ClaimRepository::supersede_act_conn(
                         &mut tx,
+                        None,
                         epigraph_core::ClaimId::from_uuid(old),
                         &format!("revision of {old}"),
                         epigraph_core::TruthValue::new(0.6).expect("truth"),
@@ -1152,6 +1153,7 @@ async fn an_inherited_author_is_one_retired_predecessor_restated_in_its_group(po
             let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
             let r = epigraph_db::ClaimRepository::supersede_act_conn(
                 &mut tx,
+                None,
                 epigraph_core::ClaimId::from_uuid(l1),
                 "a revision of l1",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
@@ -1403,6 +1405,7 @@ async fn supersede_on(
             .unwrap_or_else(uuid::Uuid::nil);
     let r = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("custodial revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),

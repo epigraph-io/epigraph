@@ -272,17 +272,21 @@ impl TokenBucket {
     }
 }
 
-/// `on` (default) or `off`: whether the server installs a rate limiter.
+/// `on` or `off`: whether the server installs a rate limiter. Unset, the
+/// limiter is installed only when a limit variable is set (OFF by default).
 pub const RATE_LIMIT_ENV: &str = "EPIGRAPH_RATE_LIMIT";
-/// Requests per minute per bucket (principal or client address).
+/// Requests per minute per bucket (principal or client address). Setting it
+/// turns rate limiting on.
 pub const RATE_LIMIT_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_RPM";
 /// Requests per minute across all buckets; unset or `off` disables the
-/// global limit.
+/// global limit. A number turns rate limiting on.
 pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
 /// The reverse proxies whose `X-Forwarded-For` is believed ([`TrustedProxies`]).
+/// Read only to key an installed limiter; it never turns one on.
 pub const TRUSTED_PROXIES_ENV: &str = "EPIGRAPH_TRUSTED_PROXIES";
-/// [`RATE_LIMIT_RPM_ENV`]'s default: 10 requests a second sustained, with a
-/// burst of a full minute's worth.
+/// [`RATE_LIMIT_RPM_ENV`]'s value when rate limiting is on but no per-bucket
+/// limit was given (`EPIGRAPH_RATE_LIMIT=on`, or only a global limit): 10
+/// requests a second sustained, with a burst of a full minute's worth.
 pub const DEFAULT_RATE_LIMIT_RPM: u32 = 600;
 
 /// A blank value is treated as unset.
@@ -297,10 +301,15 @@ fn blank_is_unset(value: Option<&str>) -> Option<&str> {
 /// process environment; [`Self::from_env`] reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitSettings {
-    /// Whether a limiter is installed at all.
+    /// Whether a limiter is installed at all. False unless the operator
+    /// configured one: none of [`RATE_LIMIT_ENV`], [`RATE_LIMIT_RPM_ENV`] and
+    /// [`RATE_LIMIT_GLOBAL_RPM_ENV`] set means OFF.
     pub enabled: bool,
+    /// True when [`RATE_LIMIT_ENV`] was explicitly `off` (as opposed to off
+    /// because nothing was configured), so the boot log can say which.
+    pub switched_off: bool,
     /// True when [`RATE_LIMIT_ENV`] held a value that is neither `on` nor
-    /// `off` (the limiter stays ON; the caller should warn).
+    /// `off` (the limiter is ON; the caller should warn).
     pub unrecognised_switch: bool,
     /// Requests per minute per bucket.
     pub per_key_rpm: u32,
@@ -314,6 +323,14 @@ pub struct RateLimitSettings {
 impl RateLimitSettings {
     /// Parse the raw variable values (`None` = unset; blank = unset).
     ///
+    /// Rate limiting is OFF unless configured (the operator's ruling on #841,
+    /// matching the opt-in installer #829 shipped): with the switch unset it
+    /// is on only when [`RATE_LIMIT_RPM_ENV`] or a numeric
+    /// [`RATE_LIMIT_GLOBAL_RPM_ENV`] is set. `on` turns it on at the default
+    /// limit; `off` keeps it off whatever else is set; any other switch value
+    /// turns it on and is warned about. [`TRUSTED_PROXIES_ENV`] only keys a
+    /// limiter that is on.
+    ///
     /// A number or proxy list that does not parse is an error rather than a
     /// default: a typo in a limit or a proxy list should refuse to boot, not
     /// silently serve a different limit or collapse every client behind the
@@ -324,27 +341,29 @@ impl RateLimitSettings {
         global_rpm: Option<&str>,
         trusted_proxies: Option<&str>,
     ) -> Result<Self, String> {
-        let (enabled, unrecognised_switch) = match blank_is_unset(switch) {
-            None => (true, false),
-            Some(v) if v.eq_ignore_ascii_case("on") => (true, false),
-            Some(v) if v.eq_ignore_ascii_case("off") => (false, false),
-            Some(_) => (true, true),
-        };
-
         let rpm = |name: &str, raw: &str| {
             raw.parse::<u32>()
                 .ok()
                 .filter(|n| *n >= 1)
                 .ok_or_else(|| format!("{name}={raw:?} is not a positive whole number"))
         };
-        let per_key_rpm = match blank_is_unset(per_key_rpm) {
-            None => DEFAULT_RATE_LIMIT_RPM,
-            Some(v) => rpm(RATE_LIMIT_RPM_ENV, v)?,
+        let given_per_key_rpm = match blank_is_unset(per_key_rpm) {
+            None => None,
+            Some(v) => Some(rpm(RATE_LIMIT_RPM_ENV, v)?),
         };
         let global_rpm = match blank_is_unset(global_rpm) {
             None => None,
             Some(v) if v.eq_ignore_ascii_case("off") => None,
             Some(v) => Some(rpm(RATE_LIMIT_GLOBAL_RPM_ENV, v)?),
+        };
+        let per_key_rpm = given_per_key_rpm.unwrap_or(DEFAULT_RATE_LIMIT_RPM);
+        let limit_given = given_per_key_rpm.is_some() || global_rpm.is_some();
+
+        let (enabled, switched_off, unrecognised_switch) = match blank_is_unset(switch) {
+            None => (limit_given, false, false),
+            Some(v) if v.eq_ignore_ascii_case("on") => (true, false, false),
+            Some(v) if v.eq_ignore_ascii_case("off") => (false, true, false),
+            Some(_) => (true, false, true),
         };
         let trusted_proxies = match blank_is_unset(trusted_proxies) {
             None => TrustedProxies::loopback(),
@@ -355,6 +374,7 @@ impl RateLimitSettings {
 
         Ok(Self {
             enabled,
+            switched_off,
             unrecognised_switch,
             per_key_rpm,
             global_rpm,
@@ -1003,20 +1023,55 @@ mod tests {
         assert!(!limiter.should_record_rejection(&g));
     }
 
+    /// The operator's ruling: no deployment that sets none of the variables
+    /// rate limits. Unset (or blank) everywhere installs no limiter.
     #[test]
-    fn settings_default_to_on_with_loopback_proxies_and_no_global_limit() {
+    fn settings_default_to_off_when_nothing_is_configured() {
         let s = RateLimitSettings::parse(None, None, None, None).unwrap();
-        assert!(s.enabled && !s.unrecognised_switch);
-        assert_eq!(s.per_key_rpm, DEFAULT_RATE_LIMIT_RPM);
-        assert_eq!(s.global_rpm, None);
-        assert_eq!(s.trusted_proxies, TrustedProxies::loopback());
-        let limiter = s.build().expect("on by default");
-        assert_eq!(limiter.config().default_rpm, DEFAULT_RATE_LIMIT_RPM);
-        assert!(!limiter.config().enable_global_limit);
+        assert!(!s.enabled && !s.switched_off && !s.unrecognised_switch);
+        assert!(s.build().is_none(), "off unless configured");
         // Blank is unset.
         assert_eq!(
             RateLimitSettings::parse(Some(" "), Some(""), Some(""), Some("")).unwrap(),
             s
+        );
+        // A trusted-proxy list alone keys a limiter; it does not install one,
+        // and neither does a global limit of `off`.
+        assert!(
+            RateLimitSettings::parse(None, None, None, Some("192.0.2.0/24"))
+                .unwrap()
+                .build()
+                .is_none()
+        );
+        assert!(RateLimitSettings::parse(None, None, Some("off"), None)
+            .unwrap()
+            .build()
+            .is_none());
+    }
+
+    /// Once a limit is set the limiter is on, with loopback proxies trusted
+    /// and no global limit unless one is given.
+    #[test]
+    fn settings_turn_on_when_a_limit_is_set() {
+        let s = RateLimitSettings::parse(None, Some("120"), None, None).unwrap();
+        assert!(s.enabled && !s.switched_off && !s.unrecognised_switch);
+        assert_eq!(s.global_rpm, None);
+        assert_eq!(s.trusted_proxies, TrustedProxies::loopback());
+        let limiter = s.build().expect("a per-key limit turns it on");
+        assert_eq!(limiter.config().default_rpm, 120);
+        assert!(!limiter.config().enable_global_limit);
+
+        // A global limit alone turns it on at the default per-key limit.
+        let g = RateLimitSettings::parse(None, None, Some("5000"), None).unwrap();
+        let limiter = g.build().expect("a global limit turns it on");
+        assert_eq!(limiter.config().default_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert_eq!(limiter.config().global_rpm, 5000);
+
+        // `on` alone turns it on at the default per-key limit.
+        let on = RateLimitSettings::parse(Some("on"), None, None, None).unwrap();
+        assert_eq!(
+            on.build().expect("on").config().default_rpm,
+            DEFAULT_RATE_LIMIT_RPM
         );
     }
 
@@ -1036,11 +1091,12 @@ mod tests {
             .trusted_proxies()
             .contains("127.0.0.1".parse().unwrap()));
 
-        let off = RateLimitSettings::parse(Some("off"), None, None, None).unwrap();
-        assert!(!off.enabled);
+        // `off` wins over a configured limit, and is told apart from unset.
+        let off = RateLimitSettings::parse(Some("off"), Some("30"), None, None).unwrap();
+        assert!(!off.enabled && off.switched_off);
         assert!(off.build().is_none());
 
-        // An unrecognised switch stays ON (fail safe) and says so.
+        // An unrecognised switch turns it ON (fail safe) and says so.
         let odd = RateLimitSettings::parse(Some("disabled"), None, None, None).unwrap();
         assert!(odd.enabled && odd.unrecognised_switch);
 

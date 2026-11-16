@@ -24,7 +24,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, CreatedWindow};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -98,10 +98,19 @@ async fn range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     // is the *oldest* row, so a fetch-recent-then-filter strategy never sees it.
     seed_claim(&pool, agent, 0.50, "2026-01-01T00:00:00Z").await;
 
-    let results =
-        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 0.75, None, 20, 0, false)
-            .await
-            .unwrap();
+    let results = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.0,
+        0.75,
+        None,
+        20,
+        0,
+        false,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
 
     // The low-truth claim must be returned despite being outside the 20 newest.
     assert_eq!(
@@ -119,9 +128,19 @@ async fn range_filter_finds_matches_outside_recent_window(pool: PgPool) {
     assert!((score - claim.truth_value.value()).abs() < 1e-12);
 
     // And a high-range query still excludes it.
-    let high = ClaimRepository::list_by_belief_range(&pool, &viewer, 0.9, 1.0, None, 20, 0, false)
-        .await
-        .unwrap();
+    let high = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.9,
+        1.0,
+        None,
+        20,
+        0,
+        false,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert!(
         high.iter().all(|(_, s)| *s >= 0.9),
         "high-range query leaked a sub-0.9 claim"
@@ -148,13 +167,22 @@ async fn the_range_is_on_the_belief_score_not_the_stale_truth_value(pool: PgPool
         .await
         .unwrap();
 
-    let low: Vec<(Uuid, f64)> =
-        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 0.4, None, 20, 0, false)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|(c, s)| (c.id.as_uuid(), s))
-            .collect();
+    let low: Vec<(Uuid, f64)> = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.0,
+        0.4,
+        None,
+        20,
+        0,
+        false,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(c, s)| (c.id.as_uuid(), s))
+    .collect();
     let low_ids: Vec<Uuid> = low.iter().map(|(id, _)| *id).collect();
     assert!(
         low_ids.contains(&refuted),
@@ -187,9 +215,19 @@ async fn the_range_is_on_the_belief_score_not_the_stale_truth_value(pool: PgPool
         );
     }
 
-    let high = ClaimRepository::list_by_belief_range(&pool, &viewer, 0.8, 1.0, None, 20, 0, false)
-        .await
-        .unwrap();
+    let high = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.8,
+        1.0,
+        None,
+        20,
+        0,
+        false,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert!(high.iter().any(|(c, _)| c.id.as_uuid() == vindicated));
     assert!(!high.iter().any(|(c, _)| c.id.as_uuid() == refuted));
 }
@@ -210,10 +248,19 @@ async fn paging_breaks_created_at_ties_by_id(pool: PgPool) {
 
     let mut paged = Vec::new();
     for offset in 0..3 {
-        let page =
-            ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 1.0, None, 1, offset, false)
-                .await
-                .unwrap();
+        let page = ClaimRepository::list_by_belief_range(
+            &pool,
+            &viewer,
+            0.0,
+            1.0,
+            None,
+            1,
+            offset,
+            false,
+            CreatedWindow::ANY,
+        )
+        .await
+        .unwrap();
         assert_eq!(page.len(), 1, "offset {offset}");
         paged.push(page[0].0.id.as_uuid());
     }
@@ -276,10 +323,19 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
     let plain = seed_claim(&pool, agent, 0.30, "2026-08-01T00:00:00Z").await;
 
     // ---- The single slot goes to the atom, not the newer paragraph ----
-    let one =
-        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 0.4, Some(true), 1, 0, true)
-            .await
-            .unwrap();
+    let one = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.0,
+        0.4,
+        Some(true),
+        1,
+        0,
+        true,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&one),
         vec![atom],
@@ -289,10 +345,19 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
     );
 
     // ---- Default unchanged: off means the paragraph still takes the slot ----
-    let off =
-        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 0.4, Some(true), 1, 0, false)
-            .await
-            .unwrap();
+    let off = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.0,
+        0.4,
+        Some(true),
+        1,
+        0,
+        false,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&off),
         vec![para],
@@ -300,10 +365,19 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
     );
 
     // ---- Every spine level goes; atoms and unleveled claims stay ----
-    let wide =
-        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 0.4, Some(true), 10, 0, true)
-            .await
-            .unwrap();
+    let wide = ClaimRepository::list_by_belief_range(
+        &pool,
+        &viewer,
+        0.0,
+        0.4,
+        Some(true),
+        10,
+        0,
+        true,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         ids(&wide),
         vec![atom, plain],
@@ -321,10 +395,19 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
     let grouped = epigraph_db::visibility::Viewer::resolve(&pool, member)
         .await
         .unwrap();
-    let wide_grouped =
-        ClaimRepository::list_by_belief_range(&pool, &grouped, 0.0, 0.4, Some(true), 10, 0, true)
-            .await
-            .unwrap();
+    let wide_grouped = ClaimRepository::list_by_belief_range(
+        &pool,
+        &grouped,
+        0.0,
+        0.4,
+        Some(true),
+        10,
+        0,
+        true,
+        CreatedWindow::ANY,
+    )
+    .await
+    .unwrap();
     assert_eq!(ids(&wide_grouped), vec![atom, plain]);
 
     // ---- A bind-less viewer: the group bind must stay LAST ----
@@ -335,14 +418,178 @@ async fn exclude_spine_drops_paragraphs_before_limit_so_an_older_atom_is_reached
     // `$7`, that is exactly right; were the group spliced at `$6` and the flag
     // moved to `$7`, this call would be one bind short and fail.
     let (_scoped, bypass) = fixture::bypass(&pool).await;
-    let wide_bypass =
-        ClaimRepository::list_by_belief_range(&pool, &bypass, 0.0, 0.4, Some(true), 10, 0, true)
-            .await
-            .expect("a bind-less viewer must bind exclude_spine at $6 with no group bind");
+    let wide_bypass = ClaimRepository::list_by_belief_range(
+        &pool,
+        &bypass,
+        0.0,
+        0.4,
+        Some(true),
+        10,
+        0,
+        true,
+        CreatedWindow::ANY,
+    )
+    .await
+    .expect("a bind-less viewer must bind exclude_spine at $6 with no group bind");
     assert_eq!(
         ids(&wide_bypass),
         vec![atom, plain],
         "a bypass viewer sees every row, so exactly [atom, plain] also pins that no \
          spine or workflow level-0/1/2 row leaks through the bind-less path"
     );
+}
+
+fn at(ts: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .expect("rfc3339")
+        .with_timezone(&chrono::Utc)
+}
+
+/// Backlog `24caecaa`: a COMPLETE listing of the claims created in a window.
+///
+/// Five claims straddle the window `[10:00, 12:00]`: one before it, one on
+/// each (inclusive) bound, one inside, one after. The window must return the
+/// three in it, newest first, and nothing else; each open-ended half must cut
+/// on its own bound only. Then `limit = 1` pages through the window with
+/// `offset`, every in-window row exactly once: the property `recall`'s
+/// semantic `since` (a capped top-k) does not have.
+#[sqlx::test(migrations = "../../migrations")]
+async fn created_window_lists_every_row_in_the_window_inclusively(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+
+    let before = seed_claim(&pool, agent, 0.5, "2026-06-01T09:59:59Z").await;
+    let on_lower = seed_claim(&pool, agent, 0.5, "2026-06-01T10:00:00Z").await;
+    let inside = seed_claim(&pool, agent, 0.5, "2026-06-01T11:00:00Z").await;
+    let on_upper = seed_claim(&pool, agent, 0.5, "2026-06-01T12:00:00Z").await;
+    let after = seed_claim(&pool, agent, 0.5, "2026-06-01T12:00:01Z").await;
+
+    let window = CreatedWindow {
+        after: Some(at("2026-06-01T10:00:00Z")),
+        before: Some(at("2026-06-01T12:00:00Z")),
+    };
+    let page =
+        ClaimRepository::list_by_belief_range(&pool, &viewer, 0.0, 1.0, None, 50, 0, false, window)
+            .await
+            .unwrap();
+    assert_eq!(
+        ids(&page),
+        vec![on_upper, inside, on_lower],
+        "both bounds are inclusive and nothing outside them is listed \
+         (before {before}, after {after})"
+    );
+
+    let lower_only = CreatedWindow {
+        after: window.after,
+        before: None,
+    };
+    let page = ClaimRepository::list_by_belief_range(
+        &pool, &viewer, 0.0, 1.0, None, 50, 0, false, lower_only,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), vec![after, on_upper, inside, on_lower]);
+
+    let upper_only = CreatedWindow {
+        after: None,
+        before: window.before,
+    };
+    let page = ClaimRepository::list_by_belief_range(
+        &pool, &viewer, 0.0, 1.0, None, 50, 0, false, upper_only,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), vec![on_upper, inside, on_lower, before]);
+
+    // Paging: limit 1, offset 0..=3. The fourth page is empty, so a caller
+    // knows the listing is complete.
+    let mut paged = Vec::new();
+    for offset in 0..4 {
+        let page = ClaimRepository::list_by_belief_range(
+            &pool, &viewer, 0.0, 1.0, None, 1, offset, false, window,
+        )
+        .await
+        .unwrap();
+        paged.extend(ids(&page));
+    }
+    assert_eq!(paged, vec![on_upper, inside, on_lower]);
+
+    // A bind-less (bypass) viewer: the group bind must still be LAST, after
+    // the two window binds.
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let page =
+        ClaimRepository::list_by_belief_range(&pool, &bypass, 0.0, 1.0, None, 50, 0, false, window)
+            .await
+            .expect("a bind-less viewer binds the window at $7/$8 with no group bind");
+    assert_eq!(ids(&page), vec![on_upper, inside, on_lower]);
+}
+
+/// The window narrows the viewer-filtered set; it never widens it. A
+/// group-private claim created inside the window is absent for a non-member
+/// and present for a member of the owning group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn created_window_stays_viewer_scoped(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "b41win").await;
+    let private = fixture::seed_group_claim(&pool, member, group, "private in window").await;
+    let public = fixture::seed_public_claim(&pool, member, "public in window").await;
+    sqlx::query("UPDATE claims SET created_at = '2026-06-02T10:00:00Z' WHERE id = ANY($1)")
+        .bind(vec![private, public])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let window = CreatedWindow {
+        after: Some(at("2026-06-02T00:00:00Z")),
+        before: Some(at("2026-06-02T23:59:59Z")),
+    };
+
+    let stranger = fixture::public_viewer(&pool).await;
+    let page = ClaimRepository::list_by_belief_range(
+        &pool, &stranger, 0.0, 1.0, None, 50, 0, false, window,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(&page), vec![public], "the private row stays hidden");
+
+    let member_viewer = epigraph_db::visibility::Viewer::resolve(&pool, member)
+        .await
+        .unwrap();
+    let mut page = ids(&ClaimRepository::list_by_belief_range(
+        &pool,
+        &member_viewer,
+        0.0,
+        1.0,
+        None,
+        50,
+        0,
+        false,
+        window,
+    )
+    .await
+    .unwrap());
+    page.sort();
+    let mut want = vec![private, public];
+    want.sort();
+    assert_eq!(page, want, "a member sees its group's row in the window");
+}
+
+#[test]
+fn an_inverted_window_is_detected_and_an_open_or_equal_one_is_not() {
+    let t = at("2026-06-01T10:00:00Z");
+    let later = at("2026-06-01T10:00:01Z");
+    assert!(CreatedWindow {
+        after: Some(later),
+        before: Some(t)
+    }
+    .is_inverted());
+    assert!(!CreatedWindow {
+        after: Some(t),
+        before: Some(t)
+    }
+    .is_inverted());
+    assert!(!CreatedWindow {
+        after: Some(later),
+        before: None
+    }
+    .is_inverted());
+    assert!(!CreatedWindow::ANY.is_inverted());
 }

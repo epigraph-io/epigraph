@@ -148,7 +148,165 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
                                     AND properties->>'plan_index' ~ '^[0-9]{1,9}$' \
                                THEN (properties->>'plan_index')::bigint END)";
 
+/// The rolling counters a hierarchical outcome report keeps on
+/// `workflows.metadata` (`use_count`, `success_count`, `failure_count`,
+/// `avg_variance`), as [`WorkflowRepository::record_hierarchical_outcome`]
+/// leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HierarchicalOutcomeCounters {
+    pub use_count: i64,
+    pub success_count: i64,
+    pub failure_count: i64,
+    /// Running mean of the per-report `variance`.
+    pub avg_variance: f64,
+}
+
+impl HierarchicalOutcomeCounters {
+    /// The counters after one more report on a row whose metadata is
+    /// `metadata`: a missing or non-numeric counter counts as zero.
+    #[must_use]
+    pub fn after_report(metadata: &serde_json::Value, success: bool, variance: f64) -> Self {
+        let int = |k: &str| {
+            metadata
+                .get(k)
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0)
+        };
+        let use_count = int("use_count") + 1;
+        let prev_avg_var = metadata
+            .get("avg_variance")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        #[allow(clippy::cast_precision_loss)]
+        let avg_variance = (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64;
+        Self {
+            use_count,
+            success_count: int("success_count") + i64::from(success),
+            failure_count: int("failure_count") + i64::from(!success),
+            avg_variance,
+        }
+    }
+
+    /// Write these counters into `metadata`, leaving every other key alone.
+    pub fn write_into(&self, metadata: &mut serde_json::Value) {
+        if !metadata.is_object() {
+            *metadata = serde_json::json!({});
+        }
+        metadata["use_count"] = serde_json::json!(self.use_count);
+        metadata["success_count"] = serde_json::json!(self.success_count);
+        metadata["failure_count"] = serde_json::json!(self.failure_count);
+        metadata["avg_variance"] = serde_json::json!(self.avg_variance);
+    }
+}
+
+/// A hierarchical outcome report's `variance`: the fraction of its step rows
+/// marked `deviated`, `0.0` for a report with no step rows.
+#[must_use]
+pub fn hierarchical_outcome_variance(deviated: impl IntoIterator<Item = bool>) -> f64 {
+    let (n, dev) = deviated
+        .into_iter()
+        .fold((0_usize, 0_usize), |(n, d), x| (n + 1, d + usize::from(x)));
+    if n == 0 {
+        0.0
+    } else {
+        #[allow(clippy::cast_precision_loss)]
+        let v = dev as f64 / n as f64;
+        v
+    }
+}
+
+/// Longest `idempotency_key` a hierarchical outcome report accepts, in
+/// characters (migration 221's CHECK counts the same way).
+pub const OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS: usize = 200;
+
+/// Longest `outcome_details` a hierarchical outcome report stores, in bytes
+/// (migration 221's CHECK).
+pub const OUTCOME_DETAILS_MAX_BYTES: usize = 65_536;
+
+/// Refuse an `idempotency_key` migration 221 would refuse: blank (empty or
+/// only whitespace) or longer than [`OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS`]. The
+/// message names the rule, for both transports to hand back as a 400 /
+/// invalid-params error before anything is written.
+///
+/// # Errors
+/// The reason the key is refused.
+pub fn validate_outcome_idempotency_key(key: &str) -> Result<(), String> {
+    if key.trim().is_empty() {
+        return Err("`idempotency_key` must not be blank".to_string());
+    }
+    let n = key.chars().count();
+    if n > OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS {
+        return Err(format!(
+            "`idempotency_key` is {n} characters; the limit is {OUTCOME_IDEMPOTENCY_KEY_MAX_CHARS}"
+        ));
+    }
+    Ok(())
+}
+
+/// What one hierarchical outcome report produced, transport-neutral: the
+/// counters after it, its own variance, and what happened to its step rows.
+/// Stored on the report's `workflow_outcome_reports` row (migration 221) so a
+/// retry with the same idempotency key is answered with exactly this, on
+/// either transport.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HierarchicalOutcomeResult {
+    #[serde(flatten)]
+    pub counters: HierarchicalOutcomeCounters,
+    /// The fraction of this report's step rows marked `deviated`.
+    pub variance: f64,
+    /// Step rows this report wrote (all of them: the report is all or nothing).
+    pub step_executions_written: usize,
+    /// The `step_index` values written with a NULL `step_claim_id`, in
+    /// request order.
+    pub unresolved_step_indices: Vec<usize>,
+}
+
+/// What [`WorkflowRepository::record_hierarchical_outcome`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HierarchicalOutcomeRecord {
+    /// No readable workflow row with this id, or the viewer reads none of the
+    /// plan's steps. Nothing was written; answer as an unknown id.
+    NotFound,
+    /// This reporter already reported on this workflow under this
+    /// idempotency key. Nothing was written; answer with the stored result.
+    Replayed {
+        report_id: Uuid,
+        result: HierarchicalOutcomeResult,
+    },
+    /// The counters moved. The caller writes the step rows and then the
+    /// report row ([`WorkflowRepository::insert_hierarchical_outcome_report`])
+    /// on the same transaction.
+    Recorded(HierarchicalOutcomeCounters),
+}
+
+/// One `workflow_outcome_reports` row to write; see
+/// [`WorkflowRepository::insert_hierarchical_outcome_report`].
+#[derive(Debug, Clone, Copy)]
+pub struct NewHierarchicalOutcomeReport<'a> {
+    pub workflow_id: Uuid,
+    pub idempotency_key: Option<&'a str>,
+    pub success: bool,
+    pub quality: Option<f64>,
+    pub run_label: Option<&'a str>,
+    pub outcome_details: &'a str,
+    pub result: &'a HierarchicalOutcomeResult,
+}
+
 pub struct WorkflowRepository;
+
+/// A legacy flat workflow: a `claims` row labelled `workflow`, as
+/// [`WorkflowRepository::flat_workflow_claim`] returns it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FlatWorkflowClaim {
+    /// `claims.id`.
+    pub id: Uuid,
+    /// `claims.content` (often JSON text).
+    pub content: String,
+    /// `claims.truth_value`.
+    pub truth_value: Option<f64>,
+    /// `claims.properties` (the outcome counters live here).
+    pub properties: Option<serde_json::Value>,
+}
 
 impl WorkflowRepository {
     /// Insert a row into the `workflows` table (added in migration 020) with
@@ -516,12 +674,12 @@ impl WorkflowRepository {
     /// in-query viewer predicate could only remove workflows from the set the
     /// caller must hold authority over. It runs on the caller's own write
     /// transaction, so the one filter left is the row security that session is
-    /// held to. Residual, stated: a lineage member or `executes` edge that
-    /// row security hides from the caller is not counted. Every claim of a
-    /// lineage takes its parent's tenancy at `evolve_step`, and an `executes`
-    /// edge takes its step's, so a caller who can lock the parent can normally
-    /// see them all; a lineage whose members were later split across tenancies
-    /// out of band is the case this does not cover.
+    /// held to: a lineage member or `executes` edge that row security hides
+    /// from the caller is not in the set. Since migration 219 an `executes`
+    /// edge takes its PLAN's tenancy too, so a group plan's edge onto a public
+    /// step is hidden from a non-member. The gates therefore also read
+    /// [`Self::step_lineage_executors`], the same set read unfiltered, and
+    /// check every workflow in it that this read did not return.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -550,6 +708,33 @@ impl WorkflowRepository {
         .bind(claim_id)
         .fetch_all(&mut *conn)
         .await
+    }
+
+    /// Every workflow that executes the step lineage of `claim_id`, read
+    /// UNFILTERED: the set [`Self::workflows_executing_step_lineage`] returns
+    /// to a session that reads every row (same lineage, same edges, retracted
+    /// ones included, no join to `workflows`), through migration 219's
+    /// definer `epigraph_step_lineage_executors`.
+    ///
+    /// Exists for the `evolve_step` authority gates (REST
+    /// `routes/workflows.rs::require_api_lineage_authority`, MCP
+    /// `tools/evolve_step.rs::require_lineage_authority`), which need
+    /// authority over every such workflow, including one whose `executes`
+    /// edge, lineage member or row the caller cannot see. The ids are the
+    /// SERVER's: a gate must answer any refusal over an id the caller's own
+    /// read did not return exactly as a missing parent, and never hand the id
+    /// to the caller.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn step_lineage_executors(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        sqlx::query_scalar("SELECT w FROM public.epigraph_step_lineage_executors($1) AS w")
+            .bind(claim_id)
+            .fetch_all(&mut *conn)
+            .await
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
@@ -597,14 +782,7 @@ impl WorkflowRepository {
         min_truth: f64,
         limit: i64,
     ) -> Result<Vec<WorkflowRecallResult>, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            query_embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(query_embedding);
 
         // `find_workflow`'s semantic path lands here. Workflow steps ARE
         // claims, so an unfiltered read returns another tenant's playbook text
@@ -1170,6 +1348,167 @@ impl WorkflowRepository {
         Ok(q.fetch_one(&mut *conn).await?)
     }
 
+    /// Record one hierarchical outcome report's COUNTERS on `workflows.metadata`:
+    /// lock the row, check that `viewer` reads the plan, answer a repeated
+    /// idempotency key with the stored result, else recompute the rolling
+    /// counters and write them back. See [`HierarchicalOutcomeRecord`] for the
+    /// three answers; only `Recorded` wrote anything.
+    ///
+    /// The one implementation of the counter half of `report_hierarchical_outcome`,
+    /// shared by the MCP tool and the HTTP route (backlog c34a0643), which each
+    /// used to carry their own copy of this SQL.
+    ///
+    /// # Serialized by the row lock
+    ///
+    /// The read takes `FOR UPDATE`, so two concurrent reports on one workflow
+    /// serialize: the second waits for the first to commit and then reads ITS
+    /// counters, instead of both reading `use_count = n` and writing `n + 1`.
+    /// The lock is held until the caller's transaction ends, so a caller that
+    /// writes the run's step rows on the same transaction keeps the report all
+    /// or nothing.
+    ///
+    /// # Idempotency (backlog 9928b61f)
+    ///
+    /// With `idempotency_key`, the key lookup runs AFTER the lock, on a fresh
+    /// statement: a retry that raced the original waits for it and then finds
+    /// its committed report row, so it is answered `Replayed` and moves no
+    /// counter. The key is scoped to (workflow, reporting principal); it runs
+    /// after the plan check too, so a caller that cannot read the plan learns
+    /// nothing about which keys exist. A key names ONE report: a reuse is
+    /// answered with the first report's result whatever else it says.
+    ///
+    /// # Visibility
+    ///
+    /// Run it on the caller's STAMPED transaction. The lock read carries the
+    /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
+    /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
+    /// requires a readable STEP. The `UPDATE` is by primary key on the row the
+    /// predicate just admitted, and the report rows are admitted by migration
+    /// 221's policies only through that same row.
+    ///
+    /// # Errors
+    /// Returns `DbError` if a query fails, and `DbError::InvalidData` for a
+    /// stored result that does not decode.
+    pub async fn record_hierarchical_outcome(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        workflow_id: Uuid,
+        success: bool,
+        variance: f64,
+        idempotency_key: Option<&str>,
+    ) -> Result<HierarchicalOutcomeRecord, DbError> {
+        let sql = viewer.splice(
+            "SELECT w.metadata FROM workflows w \
+             WHERE w.id = $1 /* {VISIBILITY:w} */ \
+             FOR UPDATE OF w",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, serde_json::Value>(&sql).bind(workflow_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
+            return Ok(HierarchicalOutcomeRecord::NotFound);
+        };
+        if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
+            return Ok(HierarchicalOutcomeRecord::NotFound);
+        }
+
+        if let Some(key) = idempotency_key {
+            let sql = viewer.splice(
+                "SELECT r.id, r.result FROM workflow_outcome_reports r \
+                 JOIN workflows w ON w.id = r.workflow_id \
+                 WHERE r.workflow_id = $1 \
+                   AND r.reporter_id IS NOT DISTINCT FROM $2 \
+                   AND r.idempotency_key = $3 \
+                   /* {VISIBILITY:w} */",
+                4,
+            );
+            let mut q = sqlx::query_as::<_, (Uuid, serde_json::Value)>(&sql)
+                .bind(workflow_id)
+                .bind(viewer.principal())
+                .bind(key);
+            if let Some(g) = viewer.group_bind() {
+                q = q.bind(g);
+            }
+            if let Some((report_id, stored)) = q.fetch_optional(&mut *conn).await? {
+                let result: HierarchicalOutcomeResult =
+                    serde_json::from_value(stored).map_err(|e| DbError::InvalidData {
+                        reason: format!(
+                            "workflow_outcome_reports {report_id}: stored result does not \
+                             decode: {e}"
+                        ),
+                    })?;
+                return Ok(HierarchicalOutcomeRecord::Replayed { report_id, result });
+            }
+        }
+
+        let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
+        counters.write_into(&mut metadata);
+        sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
+            .bind(&metadata)
+            .bind(workflow_id)
+            .execute(&mut *conn)
+            .await?;
+        Ok(HierarchicalOutcomeRecord::Recorded(counters))
+    }
+
+    /// Write the `workflow_outcome_reports` row (migration 221) of a report
+    /// [`Self::record_hierarchical_outcome`] answered `Recorded`, on the SAME
+    /// transaction, after its step rows: what the report said (`success`,
+    /// `quality`, `run_label`, `outcome_details`, its idempotency key) and its
+    /// [`HierarchicalOutcomeResult`]. The reporter is `viewer`'s principal, the
+    /// same one the key lookup matched on. Returns the row id.
+    ///
+    /// The row is admitted by migration 221's policies only while the session
+    /// reads the workflow row; the caller has just locked that row through the
+    /// same viewer.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the insert fails, including a duplicate key (which
+    /// the row lock rules out for callers that hold it).
+    pub async fn insert_hierarchical_outcome_report(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        report: NewHierarchicalOutcomeReport<'_>,
+    ) -> Result<Uuid, DbError> {
+        let result = serde_json::to_value(report.result).map_err(|e| DbError::InvalidData {
+            reason: format!("hierarchical outcome result does not encode: {e}"),
+        })?;
+        // The insert names the workflow by id; the row's own policy (migration
+        // 221) requires the session to read it, and the in-query predicate
+        // states the same rule so a reader of this function need not know it.
+        let sql = viewer.splice(
+            "INSERT INTO workflow_outcome_reports \
+                 (workflow_id, reporter_id, idempotency_key, success, quality, run_label, \
+                  outcome_details, result) \
+             SELECT w.id, $2, $3, $4, $5, $6, $7, $8 FROM workflows w \
+             WHERE w.id = $1 /* {VISIBILITY:w} */ \
+             RETURNING id",
+            9,
+        );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(report.workflow_id)
+            .bind(viewer.principal())
+            .bind(report.idempotency_key)
+            .bind(report.success)
+            .bind(report.quality)
+            .bind(report.run_label)
+            .bind(report.outcome_details)
+            .bind(result);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| DbError::InvalidData {
+                reason: format!(
+                    "workflow {} is not readable on this transaction; no outcome report written",
+                    report.workflow_id
+                ),
+            })
+    }
+
     /// Resolve `(canonical_name, step_index)` to a single step claim UUID for the
     /// name+index addressing mode of `evolve_step` / `update_with_evidence`
     /// (issue #352). Targets the **latest generation** of the named workflow and
@@ -1623,14 +1962,7 @@ impl WorkflowRepository {
         limit: i64,
         resolve_to_latest: bool,
     ) -> Result<Vec<HierarchicalWorkflowRow>, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            query_embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(query_embedding);
         // For embedding-based search, semantic distance is the primary signal —
         // sorting by canonical_name first (as the ILIKE path does for heads-walk
         // dedup) would defeat that. Always sort by distance first; when
@@ -1945,14 +2277,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         embedding: &[f32],
     ) -> Result<u64, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(embedding);
         let r = sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2")
             .bind(&vec_str)
             .bind(workflow_id)
@@ -2090,6 +2415,38 @@ impl WorkflowRepository {
             2,
         );
         let mut q = sqlx::query_as::<_, FrozenPlanRow>(&sql).bind(id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// The LEGACY flat workflow `id` — a `claims` row labelled `workflow` — as
+    /// `viewer` reads it; `None` for a claim `viewer` may not read, exactly as
+    /// for an unknown id or a claim without the label. Run it on `viewer`'s
+    /// STAMPED connection (a `ScopedRead` or a `ScopedTx`), so the in-query
+    /// predicate and the row security agree.
+    ///
+    /// Moved here from two inline statements in `epigraph-api`'s
+    /// `routes/workflows.rs`: `get_workflow`'s flat fallback, which already
+    /// spliced the same predicate in the route layer, and `report_outcome`'s
+    /// counter read on its write transaction, which had no predicate of its own
+    /// and relied on the handler's earlier viewer-filtered existence check plus
+    /// the transaction's row security.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn flat_workflow_claim(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        id: Uuid,
+    ) -> Result<Option<FlatWorkflowClaim>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.properties \
+             FROM claims c WHERE c.id = $1 AND 'workflow' = ANY(c.labels) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, FlatWorkflowClaim>(&sql).bind(id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -2747,6 +3104,47 @@ impl WorkflowRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counter arithmetic both transports used to carry inline (backlog
+    /// c34a0643): a missing counter starts at zero, success and failure are
+    /// mutually exclusive increments, `avg_variance` is the running mean, and
+    /// every other metadata key survives the write.
+    #[test]
+    fn hierarchical_outcome_counters_accumulate_and_keep_other_keys() {
+        let mut meta = serde_json::json!({"prerequisites": ["x"]});
+        let first = HierarchicalOutcomeCounters::after_report(&meta, true, 0.5);
+        assert_eq!(
+            first,
+            HierarchicalOutcomeCounters {
+                use_count: 1,
+                success_count: 1,
+                failure_count: 0,
+                avg_variance: 0.5,
+            }
+        );
+        first.write_into(&mut meta);
+        let second = HierarchicalOutcomeCounters::after_report(&meta, false, 0.0);
+        assert_eq!(second.use_count, 2);
+        assert_eq!(second.success_count, 1);
+        assert_eq!(second.failure_count, 1);
+        assert!((second.avg_variance - 0.25).abs() < 1e-12);
+        second.write_into(&mut meta);
+        assert_eq!(meta["prerequisites"], serde_json::json!(["x"]));
+        assert_eq!(meta["use_count"], serde_json::json!(2));
+
+        // A NULL metadata column counts from zero and becomes an object.
+        let mut null = serde_json::Value::Null;
+        let c = HierarchicalOutcomeCounters::after_report(&null, false, 1.0);
+        c.write_into(&mut null);
+        assert_eq!(null["failure_count"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn hierarchical_outcome_variance_is_the_deviated_fraction() {
+        assert!(hierarchical_outcome_variance(std::iter::empty()).abs() < f64::EPSILON);
+        assert!((hierarchical_outcome_variance([true, false, false, true]) - 0.5).abs() < 1e-12);
+        assert!((hierarchical_outcome_variance([true]) - 1.0).abs() < 1e-12);
+    }
 
     fn row(level: &str, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
         (Uuid::new_v4(), Some(level.to_string()), plan_index)

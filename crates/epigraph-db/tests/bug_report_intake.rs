@@ -386,6 +386,54 @@ async fn a_repeated_report_is_a_new_row(pool: PgPool) {
     assert_eq!(claims_by(&pool, w.reporter).await, 2);
 }
 
+/// The report's evidence carries its stored `evidence -> claim` `supports`
+/// edge (migration 211, backlog 2d60f619), owned exactly like the evidence
+/// and the claim (the intake group, `group`): the reporter reads it no more
+/// than the evidence, and an intake member reads it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reports_evidence_carries_a_private_supports_edge(pool: PgPool) {
+    let w = world(&pool).await;
+    let r = submit_as(&pool, w.reporter, &report("edge to the claim"))
+        .await
+        .expect("filed");
+    let ev: Uuid = sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1")
+        .bind(r.claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the report's evidence");
+    let edges: Vec<(Uuid, String, Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT target_id, relationship, owner_group_id, visibility::text, co_owner_group_id \
+           FROM edges WHERE source_type = 'evidence' AND source_id = $1",
+    )
+    .bind(ev)
+    .fetch_all(&pool)
+    .await
+    .expect("the evidence's edges");
+    assert_eq!(
+        edges,
+        vec![(
+            r.claim_id,
+            "supports".to_string(),
+            w.intake,
+            "group".to_string(),
+            None
+        )],
+        "one supports edge, as private as the report"
+    );
+    for (who, expect) in [(w.reporter, 0_i64), (w.ops, 1_i64)] {
+        let viewer = Viewer::resolve(&pool, who).await.expect("resolve");
+        let scoped = app(&pool).await;
+        let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE source_id = $1")
+            .bind(ev)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("row-security read");
+        assert_eq!(n, expect, "{who} reading the evidence's edge");
+        tx.rollback().await.expect("rollback");
+    }
+}
+
 // ─── the read side ──────────────────────────────────────────────────────
 
 /// The reporter reads nothing of its report: not the claim, its trace or its

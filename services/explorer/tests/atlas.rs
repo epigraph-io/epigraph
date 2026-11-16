@@ -476,7 +476,23 @@ async fn atlas_page_signed_in_is_a_shell_without_inline_script_or_style() {
         .unwrap()
         .contains("script-src 'self'"));
     assert_eq!(res.header("cache-control"), Some("private, no-store"));
-    assert!(app.upstream.received_requests().await.unwrap().is_empty());
+    // The page's one upstream call is the per-team map list (backlog W10).
+    // This upstream lists no map (404), so the page carries no
+    // `data-atlas-maps` and the Atlas behaves as it did before the nested
+    // levels.
+    let calls: Vec<String> = app
+        .upstream
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(calls, vec!["GET /api/v1/atlas/maps".to_string()]);
+    assert!(
+        !body.contains("data-atlas-maps"),
+        "no map list without maps"
+    );
 
     // Every other page keeps the header search byte for byte.
     let other = app.get_as("/explorer/no-such-page", &sid).await;

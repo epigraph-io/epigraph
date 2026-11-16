@@ -109,16 +109,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// `evidence_type_valid`'s seven values (migration 001's CHECK).
-pub const EVIDENCE_TYPES: &[&str] = &[
-    "document",
-    "observation",
-    "testimony",
-    "computation",
-    "reference",
-    "figure",
-    "conversational",
-];
+/// `evidence_type_valid`'s values (migration 001's seven, plus migration
+/// 229's `dataset`), from their one Rust copy.
+pub const EVIDENCE_TYPES: &[&str] = epigraph_core::STORED_EVIDENCE_TYPES;
 
 /// The `operation` a hide manifest's header carries, which `reown-reverse`
 /// dispatches on.
@@ -852,6 +845,8 @@ async fn apply_in(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = tables::app_readable(conn, specs, in_scope, &keys).await?;
     let counters_before = tables::xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
     // ---- the write: pin, then hide ----
     let pinned = sqlx::query(
@@ -932,6 +927,15 @@ async fn apply_in(
     let mut expect: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     expect.insert("evidence".into(), (0, n64, 0));
     expect.insert("evidence_visibility_pins".into(), (n64, 0, 0));
+    // Migration 210's map epochs: each evidence row's one change.
+    if let Some(me) = map_epochs.as_mut() {
+        for (k, a) in &s0 {
+            if let Some(got) = s2.get(k) {
+                me.row(&k.0, &a.tenancy, &got.tenancy);
+            }
+        }
+        me.expect_into(conn, &mut expect).await?;
+    }
     v.extend(super::reown::counter_violations(
         &super::reown::counter_delta(&counters_before, &counters_after),
         &expect,
@@ -1159,6 +1163,8 @@ pub async fn reverse_manifest(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = tables::app_readable(conn, &specs, &claims, &keys).await?;
     let counters_before = tables::xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
     let ids: Vec<Uuid> = restore
         .iter()
         .filter_map(|(pk, _)| Uuid::parse_str(pk).ok())
@@ -1220,6 +1226,15 @@ pub async fn reverse_manifest(
     let mut expect: BTreeMap<String, (i64, i64, i64)> = BTreeMap::new();
     expect.insert("evidence".into(), (0, n64, 0));
     expect.insert("evidence_visibility_pins".into(), (0, 0, n64));
+    // Migration 210's map epochs: each evidence row's one change.
+    if let Some(me) = map_epochs.as_mut() {
+        for (k, a) in &s0 {
+            if let Some(got) = s2.get(k) {
+                me.row(&k.0, &a.tenancy, &got.tenancy);
+            }
+        }
+        me.expect_into(conn, &mut expect).await?;
+    }
     v.extend(super::reown::counter_violations(
         &super::reown::counter_delta(&counters_before, &counters_after),
         &expect,

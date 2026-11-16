@@ -158,14 +158,7 @@ async fn create(
 
     // 2. Create claim
     let content_hash = epigraph_crypto::ContentHasher::hash(statement.as_bytes());
-    let embedding_str = format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let embedding_str = epigraph_db::pgvector_literal(&embedding);
 
     // Tenancy declaration (PR-16). `--public` owns the row with the AUTHOR's
     // personal group, not the world group: §8.2 A4 asserts no claim is

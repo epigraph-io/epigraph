@@ -198,6 +198,16 @@ are usable.
 
 ## Step 2 — rewire the nightly (NOT DONE — the wipe path is still intact)
 
+> **Update (Atlas W9, backlog 1da9ed16):** the replacement is
+> `atlas_nightly` on `epigraph-atlas-nightly.timer` (`deploy/systemd/`,
+> runbook `docs/runbooks/atlas-nightly.md`). It assigns unthemed embedded
+> claims to their nearest theme (the same statement as
+> `assign_unthemed_batch`), reports themes over the cap without splitting
+> them, and refreshes the Atlas maps incrementally, all on the maintenance
+> DSN with no UMAP. Once its timer is enabled, retire the `theme-maintenance`
+> task instead of re-enabling it. It does not recompute theme centroids or
+> reassign misplaced claims, which `maintain_themes.py` did.
+
 > **Update (backlog a0ed0180):** the k-means `theme_cluster` path is retired.
 > The MCP tool name stays registered only to refuse (JSON-RPC -32600,
 > `data.status = "retired"`) with a pointer to `scripts/maintain_themes.py`, so a

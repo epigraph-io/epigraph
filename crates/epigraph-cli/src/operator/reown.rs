@@ -772,6 +772,9 @@ pub async fn run_batch(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = app_readable(conn, ctx.specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    // A public-to-public re-own changes no signature, so it expects none.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
     let moved = sqlx::query(
         "UPDATE claims SET owner_group_id = $2 \
@@ -900,6 +903,21 @@ pub async fn run_batch(
         expect_counts.entry(t.clone()).or_default().1 += n;
     }
     expect_counts.retain(|_, d| *d != (0, 0, 0));
+    if let Some(me) = map_epochs.as_mut() {
+        for a in &after_claims {
+            if let Some(b) = before_claims.get(&a.id) {
+                me.claim((&b.visibility, b.owner), (&a.visibility, a.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            let (Some(mid), Some(got)) = (s1.get(k), s2.get(k)) else {
+                continue;
+            };
+            me.row(&k.0, &a.tenancy, mid);
+            me.row(&k.0, mid, got);
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
+    }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
         &expect_counts,

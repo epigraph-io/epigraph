@@ -38,30 +38,40 @@ fn evolve_step_description_names_the_supersede_cascade_and_what_stays() {
     }
 }
 
-/// Operator ruling R-21 (backlog c0ab097a, part 1): the lineage authority gate
-/// reads the workflows executing a lineage under the caller's row security, so
-/// a workflow the caller cannot see is not checked. The ruling ACCEPTS that
-/// residual and requires it to be stated where agents choose the tool.
+/// Backlog c0ab097a (part 1), as migration 219 changes it: the lineage
+/// authority gate read the workflows executing a lineage under the caller's
+/// row security, so a workflow whose `executes` edge or lineage member the
+/// caller could not see was not checked (the residual the old description
+/// stated, and the one 219 would have widened: a group plan's `executes`
+/// edge onto a public step is hidden from a non-member). The gates now also
+/// read the whole set unfiltered through 219's definer and check every
+/// workflow in it, so the residual is CLOSED (pinned by
+/// `epigraph-api/tests/workflow_hidden_id_masking.rs`, the split-lineage
+/// test), and the description states the rule where agents choose the tool.
 #[test]
-fn evolve_step_description_states_the_accepted_lineage_split_residual() {
+fn evolve_step_description_states_that_every_executing_workflow_is_checked() {
     let tools = EpiGraphMcpFull::all_tools_json();
     let description = tools
         .as_array()
-        .expect("all_tools_json must return an array")
+        .expect("tools array")
         .iter()
-        .find(|t| t.get("name").and_then(serde_json::Value::as_str) == Some("evolve_step"))
-        .and_then(|t| t["description"].as_str().map(str::to_string))
+        .find(|t| t["name"] == "evolve_step")
+        .and_then(|t| t["description"].as_str())
         .expect("evolve_step is registered with a description");
 
     for needle in [
-        "Accepted residual",
-        "caller's own row security",
-        "is not authority-checked",
+        "Every workflow that executes the lineage is checked",
+        "whose `executes` edge, lineage member or row you cannot see",
+        "never naming it",
     ] {
         assert!(
             description.contains(needle),
-            "evolve_step's description must state the lineage-split residual ({needle:?}): \
-             {description}"
+            "evolve_step's description must state that every executing workflow is checked \
+             ({needle:?}): {description}"
         );
     }
+    assert!(
+        !description.contains("Accepted residual"),
+        "the residual is closed; the description must not still state it: {description}"
+    );
 }

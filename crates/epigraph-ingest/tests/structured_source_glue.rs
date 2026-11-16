@@ -1,5 +1,5 @@
-use epigraph_ingest::builder::build_ingest_plan;
-use epigraph_ingest::schema::{DocumentExtraction, SourceType};
+use epigraph_ingest::document::builder::build_ingest_plan;
+use epigraph_ingest::document::schema::{DocumentExtraction, SourceType};
 use std::collections::HashSet;
 
 /// Regression guard for backlog b5518801: every planned claim must have a
@@ -10,7 +10,7 @@ use std::collections::HashSet;
 /// onto the SAME UUID — a self-loop `decomposes_to(section, section)` and a
 /// duplicate-id insert. Claim/edge COUNTS are blind to this (the builder pushes
 /// both colliding claims regardless), so we assert id distinctness directly.
-fn assert_no_collisions(plan: &epigraph_ingest::builder::IngestPlan) {
+fn assert_no_collisions(plan: &epigraph_ingest::common::plan::IngestPlan) {
     let ids: HashSet<uuid::Uuid> = plan.claims.iter().map(|c| c.id).collect();
     assert_eq!(
         ids.len(),

@@ -90,6 +90,7 @@ async fn execute_is_idempotent(pool: PgPool) {
 
     let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -107,6 +108,7 @@ async fn execute_is_idempotent(pool: PgPool) {
 
     let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -155,6 +157,7 @@ async fn execute_smoke(pool: PgPool) {
 
     let r = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -193,6 +196,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let parent_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&parent_extraction);
     let parent = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &parent_plan,
         &parent_extraction,
     )
@@ -204,6 +208,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     let variant_plan = epigraph_ingest::workflow::builder::build_ingest_plan(&variant_extraction);
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &variant_plan,
         &variant_extraction,
     )
@@ -232,6 +237,7 @@ async fn execute_creates_variant_of_edge_for_hierarchical_workflow(pool: PgPool)
     // Step 4: re-ingest must be idempotent — still exactly one edge.
     let _result2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &variant_plan,
         &variant_extraction,
     )
@@ -288,6 +294,7 @@ async fn a_kind_with_shell_syntax_costs_its_label_not_the_whole_ingest(pool: PgP
 
     let result = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -336,6 +343,7 @@ async fn exec(
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(extraction);
     epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         extraction,
     )

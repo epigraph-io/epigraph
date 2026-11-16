@@ -133,6 +133,21 @@ pub fn not_claim_writer_message(claim_id: Uuid, action: &str) -> String {
 /// supersede, the session does not write the claims' owning group.
 pub const CASCADE_DEFERRAL_REFUSAL_CODE: &str = "CX03";
 
+/// Whether a database refusal, by its SQLSTATE and message, is the
+/// cascade-deferral definer's CX03 (SQLSTATE `42501`, message opening
+/// `CX03:`). Both transports' supersede refusal mappers ask this one
+/// question, so CX03 is recognised by the same rule on MCP and HTTP; each
+/// then answers it as its own error type with
+/// [`supersede_not_recorded_message`]. Taking the two strings, not a database
+/// error, keeps this crate free of the database layer.
+#[must_use]
+pub fn is_cascade_deferral_refusal(sqlstate: Option<&str>, message: &str) -> bool {
+    sqlstate == Some("42501")
+        && message
+            .strip_prefix(CASCADE_DEFERRAL_REFUSAL_CODE)
+            .is_some_and(|rest| rest.starts_with(':'))
+}
+
 /// The caller-facing text both transports answer a supersede's CX03 with
 /// (supersede SPEC K5): the definer's own words ("not recorded as one this
 /// session made") describe its check, not the caller's remedy, so the denial
@@ -171,6 +186,39 @@ mod tests {
         ClaimActTarget {
             author: Uuid::new_v4(),
             owner_group: Uuid::new_v4(),
+        }
+    }
+
+    /// The CX03 predicate both transports share: the code at the very start,
+    /// followed by a colon, on SQLSTATE 42501 and no other.
+    #[test]
+    fn the_cascade_deferral_refusal_is_cx03_on_42501_only() {
+        assert!(is_cascade_deferral_refusal(
+            Some("42501"),
+            "CX03: the act is not recorded as one this session made"
+        ));
+        assert!(is_cascade_deferral_refusal(Some("42501"), "CX03:"));
+        for (code, message) in [
+            // Another SQLSTATE with the same text.
+            (Some("P0001"), "CX03: the act"),
+            (None, "CX03: the act"),
+            // Not at the start, no colon, another code, lower case.
+            (Some("42501"), " CX03: leading space"),
+            (Some("42501"), "CX03 no colon"),
+            (Some("42501"), "CX031: a longer code"),
+            (Some("42501"), "CX04: a sibling code"),
+            (Some("42501"), "cx03: lower case"),
+            // Row security's uncoded refusal.
+            (
+                Some("42501"),
+                "new row violates row-level security policy for table \"claims\"",
+            ),
+            (Some("42501"), ""),
+        ] {
+            assert!(
+                !is_cascade_deferral_refusal(code, message),
+                "{code:?} {message:?} is not CX03"
+            );
         }
     }
 
