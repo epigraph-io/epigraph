@@ -242,31 +242,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-engine/src/recall.rs",
-        "annotate_disputes",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "effective_beliefs",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "log_recall_event",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
         "recall",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "text_search_fallback",
         1,
         ENGINE_POOL_PARAM,
     ),
@@ -597,7 +573,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 ];
 
 /// The never-raised ceiling on the register's total site count.
-const HIGH_WATER: usize = 83;
+const HIGH_WATER: usize = 79;
 
 // ===========================================================================
 // The scanner.

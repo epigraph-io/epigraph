@@ -28,7 +28,7 @@
 //! - **Hierarchical** is the System-2 leg alone: the query's nearest themes
 //!   by centroid ([`ClaimThemeRepository::find_similar_themes_at_dim`]), then
 //!   those themes' current members ranked by similarity
-//!   ([`ClaimThemeRepository::claims_in_themes_at_dim`], viewer-scoped).
+//!   ([`ClaimThemeRepository::claims_in_themes_at_dim_since`], viewer-scoped).
 //! - **Auto** runs the ANN leg and adds the theme leg only when the ANN page
 //!   is sparse ([`ann_page_is_sparse`]): fewer than
 //!   [`SPARSE_MIN_HITS`] hits (capped at `limit`), or a best similarity
@@ -37,18 +37,31 @@
 //!
 //! A theme leg hit is a claim the ANN page did not rank this high: its theme
 //! sits near the query even though the claim itself does not. Both legs read
-//! on `pool` under the caller's `viewer`, so the merge cannot widen what the
-//! viewer may see; theme rows carry no tenancy, and only their ids are used.
+//! on the same connection under the caller's `viewer`, so the merge cannot
+//! widen what the viewer may see; theme rows carry no tenancy, and only their
+//! ids are used.
 //! A failed theme leg degrades to the ANN page on Auto, and to the text
 //! fallback on Hierarchical, the same way a failed ANN leg does. A query
 //! vector at a dimension other than 1536 fails the 1536-d ANN read first, so
 //! Auto and Similarity drop to the text fallback before the theme leg runs;
 //! on Hierarchical the theme read refuses any dimension but 1536 or 3072 and
 //! drops to the text fallback the same way.
+//!
+//! # Which connection the reads run on
+//!
+//! [`recall`] reads on the `pool` its caller passes, as it always has (the
+//! episcience worker passes its application pool). [`recall_routed`] takes no
+//! pool: it opens the caller's own stamped read, `ScopedPool::read_as(viewer)`,
+//! and runs every leg on it (ANN, theme traversal, beliefs, disputes and the
+//! text fallback), so row security agrees with the in-query viewer predicate
+//! and the theme leg reads exactly what the viewer may read. A `Bypass` viewer
+//! has no stamp; `read_as` refuses it, so the theme routes are not served to
+//! one (a maintenance caller uses [`recall`] on its maintenance pool).
 
 use epigraph_core::ClaimId;
 use epigraph_db::{ClaimListFilter, ClaimRepository, ClaimThemeRepository, PgPool, ScopedPool};
 use epigraph_embeddings::EmbeddingService;
+use sqlx::PgConnection;
 use thiserror::Error;
 
 /// Errors from the library-level `recall` function.
@@ -230,9 +243,39 @@ pub fn rrf_merge(
 }
 
 /// The theme-traversal leg: the query's nearest themes, then their current
-/// members visible to `viewer`, best first.
+/// members visible to `viewer`, best first, on the recall's own connection.
+///
+/// Runs in a nested transaction (a savepoint when `conn` is already in one,
+/// as a `SessionGucMode::Transaction` read is), the way
+/// `diverse_retrieval::run_diverse_pipeline_conn` brackets its probe: a
+/// failed theme read is rolled back rather than aborting the caller's
+/// transaction, whose next statement is the ANN page's materialisation or the
+/// text fallback.
 async fn theme_leg(
-    pool: &PgPool,
+    conn: &mut PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    pgvec: &str,
+    dim: usize,
+    limit: usize,
+) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
+    let mut bracket = sqlx::Connection::begin(&mut *conn).await?;
+    let got = theme_leg_reads(&mut bracket, viewer, pgvec, dim, limit).await;
+    match got {
+        Ok(members) => {
+            bracket.commit().await?;
+            Ok(members)
+        }
+        Err(e) => {
+            // The theme read's error is the one worth reporting; a failed
+            // rollback here would only repeat it.
+            let _ = bracket.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn theme_leg_reads(
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     pgvec: &str,
     dim: usize,
@@ -240,15 +283,15 @@ async fn theme_leg(
 ) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
     let dim = u32::try_from(dim).unwrap_or(0);
     let themes =
-        ClaimThemeRepository::find_similar_themes_at_dim(pool, pgvec, THEME_LEG_THEMES, dim)
+        ClaimThemeRepository::find_similar_themes_at_dim(&mut *conn, pgvec, THEME_LEG_THEMES, dim)
             .await?;
     if themes.is_empty() {
         return Ok(Vec::new());
     }
     let theme_ids: Vec<uuid::Uuid> = themes.iter().map(|t| t.0).collect();
     let page = i32::try_from(limit).unwrap_or(i32::MAX);
-    let members = ClaimThemeRepository::claims_in_themes_at_dim(
-        pool, viewer, &theme_ids, pgvec, page, dim, false,
+    let members = ClaimThemeRepository::claims_in_themes_at_dim_since(
+        conn, viewer, &theme_ids, pgvec, page, dim, false, None,
     )
     .await?;
     Ok(members.into_iter().map(|(id, _, sim)| (id, sim)).collect())
@@ -264,7 +307,8 @@ async fn theme_leg(
 /// embeddings disabled, no API key).
 ///
 /// # Parameters
-/// - `pool`      — live database connection pool the recall READS on
+/// - `pool`      — live database connection pool the recall READS on (one
+///   connection, held for the whole recall)
 /// - `scoped`    — the caller's tenancy-aware pool, which the audit row is
 ///   WRITTEN through (backlog 41841f7b). Required, not optional: as the
 ///   application role `recall_events_tenancy` admits an audit row only on a
@@ -286,8 +330,9 @@ async fn theme_leg(
 ///   (backlog `14b98adc`).
 ///
 /// # Errors
-/// Returns `RecallError::Db` if the fallback text search fails.
-/// Embedding errors cause silent fallback, not a returned error.
+/// Returns `RecallError::Db` if no connection can be taken from `pool` or the
+/// fallback text search fails. Embedding errors cause silent fallback, not a
+/// returned error.
 pub async fn recall(
     pool: &PgPool,
     scoped: &ScopedPool,
@@ -297,8 +342,9 @@ pub async fn recall(
     limit: usize,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
-    recall_routed(
-        pool,
+    let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
+    recall_on(
+        &mut conn,
         scoped,
         viewer,
         embedder,
@@ -310,13 +356,43 @@ pub async fn recall(
     .await
 }
 
-/// [`recall`] with an explicit [`RecallRoute`] (backlog a47df8ed).
+/// [`recall`] with an explicit [`RecallRoute`] (backlog a47df8ed), read on
+/// the caller's own stamped connection.
 ///
-/// Same parameters, errors and fallback as [`recall`], which is this function
-/// at [`RecallRoute::Similarity`].
+/// Takes no raw pool: every leg runs on `scoped.read_as(viewer)`, so the theme
+/// traversal, like the ANN leg, the belief and dispute batches and the text
+/// fallback, reads exactly what `viewer` may read under row security as well as
+/// under the in-query predicate. The audit row is written as in [`recall`].
+/// Otherwise the same parameters, fallback and page as [`recall`] at
+/// [`RecallRoute::Similarity`].
+///
+/// # Errors
+/// `RecallError::Db` when the stamped read cannot be opened, which includes a
+/// `Bypass` viewer (`ScopedPool::read_as` refuses one: a maintenance caller
+/// uses [`recall`] on its maintenance pool), or when the fallback text search
+/// fails.
 #[allow(clippy::too_many_arguments)]
 pub async fn recall_routed(
-    pool: &PgPool,
+    scoped: &ScopedPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    embedder: &dyn EmbeddingService,
+    query: &str,
+    limit: usize,
+    min_truth: f64,
+    route: RecallRoute,
+) -> Result<Vec<RecallResult>, RecallError> {
+    let mut read = scoped.read_as(viewer).await?;
+    recall_on(
+        &mut read, scoped, viewer, embedder, query, limit, min_truth, route,
+    )
+    .await
+}
+
+/// The recall body, every read on `conn`: [`recall`]'s connection from its
+/// pool, or [`recall_routed`]'s stamped read.
+#[allow(clippy::too_many_arguments)]
+async fn recall_on(
+    conn: &mut PgConnection,
     scoped: &ScopedPool,
     viewer: &epigraph_db::visibility::Viewer,
     embedder: &dyn EmbeddingService,
@@ -337,16 +413,20 @@ pub async fn recall_routed(
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
         // downstream callers (episcience synthesis stage-1 seeding).
+        // `search_by_embedding_scoped` with no scope filters is
+        // `search_by_embedding_current` on a caller's connection.
         let ann = match route {
             RecallRoute::Hierarchical => Ok(Vec::new()),
             RecallRoute::Auto | RecallRoute::Similarity => {
-                ClaimRepository::search_by_embedding_current(pool, viewer, &pgvec, limit_i64)
-                    .await
-                    .map(|hits| {
-                        hits.into_iter()
-                            .map(|h| (h.claim_id, h.similarity))
-                            .collect::<Vec<_>>()
-                    })
+                ClaimRepository::search_by_embedding_scoped(
+                    &mut *conn, viewer, &pgvec, limit_i64, None, None,
+                )
+                .await
+                .map(|hits| {
+                    hits.into_iter()
+                        .map(|h| (h.claim_id, h.similarity))
+                        .collect::<Vec<_>>()
+                })
             }
         };
         let candidates = match ann {
@@ -364,7 +444,7 @@ pub async fn recall_routed(
                     Some(rrf_merge(&ann, &[], limit))
                 } else {
                     theme_leg_ran = true;
-                    match theme_leg(pool, viewer, &pgvec, embedding.len(), limit).await {
+                    match theme_leg(&mut *conn, viewer, &pgvec, embedding.len(), limit).await {
                         Ok(theme) => Some(rrf_merge(&ann, &theme, limit)),
                         // Auto still holds a valid ANN page: serve it.
                         Err(e) if route == RecallRoute::Auto => {
@@ -385,18 +465,18 @@ pub async fn recall_routed(
             }
         };
         match candidates {
-            Some(candidates) => materialize(pool, viewer, candidates, min_truth).await,
-            None => text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?,
+            Some(candidates) => materialize(&mut *conn, viewer, candidates, min_truth).await,
+            None => text_search_fallback(&mut *conn, viewer, query, limit_i64, min_truth).await?,
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
         // to the current-only text search. The theme leg needs the query
         // vector too, so no route has anything else to run.
-        text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
+        text_search_fallback(&mut *conn, viewer, query, limit_i64, min_truth).await?
     };
 
     let mut results = results;
-    annotate_disputes(pool, viewer, &mut results).await;
+    annotate_disputes(&mut *conn, viewer, &mut results).await;
 
     // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path —
     // episcience synthesis calls it directly, with no MCP request — but not a
@@ -404,7 +484,7 @@ pub async fn recall_routed(
     // that principal owns the row (backlog 41841f7b). `tool` distinguishes it
     // from the MCP surfaces.
     log_recall_event(
-        pool,
+        conn,
         scoped,
         viewer,
         query,
@@ -428,7 +508,7 @@ pub async fn recall_routed(
 /// Resolve a fused page into results: one batched DS-belief read, then the
 /// `min_truth` gate per claim, in fused order.
 async fn materialize(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     candidates: Vec<MergedCandidate>,
     min_truth: f64,
@@ -437,7 +517,7 @@ async fn materialize(
     // (backlog 14b98adc). Per-hit would re-introduce an N+1 on top of the
     // get_by_id this loop already does.
     let scores = effective_beliefs(
-        pool,
+        &mut *conn,
         viewer,
         &candidates.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
     )
@@ -445,7 +525,7 @@ async fn materialize(
     let mut results = Vec::new();
     for hit in candidates {
         if let Ok(Some(claim)) =
-            ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(hit.claim_id)).await
+            ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(hit.claim_id)).await
         {
             let tv = claim.truth_value.value();
             // Absent key == not visible to this viewer / deleted mid-page.
@@ -460,7 +540,7 @@ async fn materialize(
                     belief_score: score,
                     similarity: hit.similarity,
                     // Annotated by the batched dispute post-pass in
-                    // `recall_routed`, keyed by claim_id.
+                    // `recall_on`, keyed by claim_id.
                     dispute_count: 0,
                     is_contested: false,
                     contesting_claim_ids: Vec::new(),
@@ -511,7 +591,9 @@ enum AuditNotWritten {
 /// group it lost.
 ///
 /// A `Bypass` viewer has no principal: its row stays agent-less and
-/// instance-wide, written on `pool`. That is the only agent-less row this path
+/// instance-wide, written on `conn`, the connection [`recall`] took from its
+/// `pool` (only [`recall`] reaches this with one: [`recall_routed`]'s stamped
+/// read refuses a `Bypass` viewer). That is the only agent-less row this path
 /// writes, and it is admitted only through the bypass arm, so it lands only
 /// when the caller honours [`recall`]'s contract and passes the maintenance
 /// pool with a `Bypass` viewer. It is not routed through `scoped` instead:
@@ -519,7 +601,7 @@ enum AuditNotWritten {
 /// lease inside this library would grant a bypass the caller never asked for.
 #[allow(clippy::too_many_arguments)]
 async fn log_recall_event(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     scoped: &ScopedPool,
     viewer: &epigraph_db::visibility::Viewer,
     query: &str,
@@ -550,7 +632,7 @@ async fn log_recall_event(
             })
             .await
         }
-        None => epigraph_db::RecallEventRepository::log(pool, event(None, None))
+        None => epigraph_db::RecallEventRepository::log(conn, event(None, None))
             .await
             .map(|_| ())
             .map_err(AuditNotWritten::Write),
@@ -600,7 +682,7 @@ async fn write_as_principal(
 /// unannotated rather than failing a recall that already has its results. The
 /// signal informs the caller; it never re-ranks and never gates retrieval.
 async fn annotate_disputes(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     results: &mut [RecallResult],
 ) {
@@ -608,7 +690,7 @@ async fn annotate_disputes(
         .iter()
         .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
         .collect();
-    match ClaimRepository::dispute_batch(pool, viewer, &claim_ids).await {
+    match ClaimRepository::dispute_batch(conn, viewer, &claim_ids).await {
         Ok(mut by_claim) => {
             for r in results.iter_mut() {
                 let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -639,11 +721,11 @@ async fn annotate_disputes(
 /// before this change. Failing the recall instead would trade a stale filter
 /// for no results at all.
 async fn effective_beliefs(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_ids: &[uuid::Uuid],
 ) -> std::collections::HashMap<uuid::Uuid, f64> {
-    match ClaimRepository::effective_belief_batch(pool, viewer, claim_ids).await {
+    match ClaimRepository::effective_belief_batch(conn, viewer, claim_ids).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
@@ -667,7 +749,7 @@ async fn effective_beliefs(
 /// `ClaimRepository::list`, which this used to call, has no currency
 /// predicate at all.
 async fn text_search_fallback(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     limit: i64,
@@ -678,11 +760,11 @@ async fn text_search_fallback(
         is_current: Some(true),
         ..ClaimListFilter::default()
     };
-    let claims = ClaimRepository::list_filtered(pool, viewer, &filter, limit, 0).await?;
+    let claims = ClaimRepository::list_filtered(&mut *conn, viewer, &filter, limit, 0).await?;
     // Same one-round-trip DS resolution the semantic leg does, so the two legs
     // cannot gate on different columns (backlog 14b98adc).
     let scores = effective_beliefs(
-        pool,
+        conn,
         viewer,
         &claims.iter().map(|c| c.id.as_uuid()).collect::<Vec<_>>(),
     )

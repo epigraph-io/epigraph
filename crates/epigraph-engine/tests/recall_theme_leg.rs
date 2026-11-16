@@ -135,6 +135,7 @@ struct Corpus {
     ann_b: Uuid,
     member: Uuid,
     private_member: Uuid,
+    author: Uuid,
     outsider: Uuid,
 }
 
@@ -165,6 +166,7 @@ async fn seed(pool: &PgPool) -> Corpus {
         ann_b,
         member,
         private_member,
+        author,
         outsider,
     }
 }
@@ -186,7 +188,6 @@ async fn similarity_route_is_ann_only(pool: PgPool) {
         .await
         .expect("viewer");
     let routed = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -224,7 +225,6 @@ async fn auto_route_merges_theme_member_when_ann_is_weak(pool: PgPool) {
         .await
         .expect("viewer");
     let got = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -283,7 +283,7 @@ async fn theme_leg_never_returns_a_claim_the_viewer_cannot_read(pool: PgPool) {
         .await
         .expect("viewer");
     for route in [RecallRoute::Auto, RecallRoute::Hierarchical] {
-        let got = recall_routed(&pool, &scoped, &viewer, &embedder(), "q", 10, 0.0, route)
+        let got = recall_routed(&scoped, &viewer, &embedder(), "q", 10, 0.0, route)
             .await
             .expect("recall");
         let got = ids(&got);
@@ -297,7 +297,6 @@ async fn theme_leg_never_returns_a_claim_the_viewer_cannot_read(pool: PgPool) {
         );
     }
     let one = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -315,6 +314,105 @@ async fn theme_leg_never_returns_a_claim_the_viewer_cannot_read(pool: PgPool) {
     );
 }
 
+/// The same property AS THE APPLICATION ROLE, where it is decided by the
+/// connection and not only by the in-query predicate (operator ruling
+/// 2026-11-16 on the raw-pool register).
+///
+/// `recall_routed` takes no raw pool: every leg runs on
+/// `ScopedPool::read_as(viewer)`. Two halves pin that:
+///
+/// - the outsider never receives the group-private member, on either theme
+///   route, and its one-slot hierarchical page goes to the visible member;
+/// - the AUTHOR, a member of that group, does receive it. On `epigraph_app`
+///   an unstamped connection admits public rows only, so a theme leg still
+///   reading on a raw pool would hide the author's own private member: its
+///   presence is what shows the leg read on the caller's stamp.
+///
+/// Both GUC modes: under `Transaction` the stamped read is a transaction, and
+/// the theme leg's savepoint is what keeps a theme-read failure from aborting
+/// it (`failed_theme_leg_degrades_per_route` covers the failure itself).
+#[sqlx::test(migrations = "../../migrations")]
+async fn theme_leg_reads_on_the_callers_stamp_as_the_app_role(pool: PgPool) {
+    let c = seed(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    for mode in [
+        epigraph_db::SessionGucMode::Session,
+        epigraph_db::SessionGucMode::Transaction,
+    ] {
+        let scoped =
+            epigraph_db::ScopedPool::connect_downgraded_for_tests(&url, mode, "epigraph_app")
+                .await
+                .expect("app-role ScopedPool");
+        let app = scoped.inner();
+        let role: String = sqlx::query_scalar("SELECT session_user::text")
+            .fetch_one(app)
+            .await
+            .unwrap();
+        assert_eq!(role, "epigraph_app", "precondition: the app role");
+        let outsider = epigraph_db::Viewer::resolve(app, c.outsider)
+            .await
+            .expect("outsider viewer");
+        let author = epigraph_db::Viewer::resolve(app, c.author)
+            .await
+            .expect("author viewer");
+
+        for route in [RecallRoute::Auto, RecallRoute::Hierarchical] {
+            let got = recall_routed(&scoped, &outsider, &embedder(), "q", 10, 0.0, route)
+                .await
+                .expect("recall");
+            let got = ids(&got);
+            assert!(
+                !got.contains(&c.private_member.to_string()),
+                "{mode:?}/{route:?} leaked a group-private theme member to an outsider: {got:?}"
+            );
+            assert!(
+                got.contains(&c.member.to_string()),
+                "{mode:?}/{route:?} must still serve the public member: {got:?}"
+            );
+        }
+        let one = recall_routed(
+            &scoped,
+            &outsider,
+            &embedder(),
+            "q",
+            1,
+            0.0,
+            RecallRoute::Hierarchical,
+        )
+        .await
+        .expect("recall");
+        assert_eq!(
+            ids(&one),
+            vec![c.member.to_string()],
+            "{mode:?}: the one theme slot goes to the visible member"
+        );
+
+        let mine = recall_routed(
+            &scoped,
+            &author,
+            &embedder(),
+            "q",
+            10,
+            0.0,
+            RecallRoute::Hierarchical,
+        )
+        .await
+        .expect("recall");
+        let private = mine
+            .iter()
+            .find(|r| r.claim_id == c.private_member.to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{mode:?}: the author's own group-private theme member is missing, so the \
+                     theme leg did not read on the author's stamp: {:?}",
+                    ids(&mine)
+                )
+            });
+        assert!(private.via_theme_traversal, "{mode:?}");
+        assert!(ids(&mine).contains(&c.member.to_string()), "{mode:?}");
+    }
+}
+
 /// The hierarchical route is the theme leg ALONE: the ANN-nearest claims carry
 /// no theme, so they cannot appear.
 #[sqlx::test(migrations = "../../migrations")]
@@ -325,7 +423,6 @@ async fn hierarchical_route_serves_only_theme_members(pool: PgPool) {
         .await
         .expect("viewer");
     let got = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -359,7 +456,6 @@ async fn auto_route_skips_theme_leg_when_ann_is_strong(pool: PgPool) {
         .await
         .expect("viewer");
     let got = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -406,7 +502,6 @@ async fn failed_theme_leg_degrades_per_route(pool: PgPool) {
     break_theme_read(&pool).await;
 
     let auto = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -424,7 +519,6 @@ async fn failed_theme_leg_degrades_per_route(pool: PgPool) {
     assert!(auto.iter().all(|r| !r.via_theme_traversal), "{got:?}");
 
     let hier = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &embedder(),
@@ -459,7 +553,6 @@ async fn hierarchical_unsupported_dimension_falls_back_to_text(pool: PgPool) {
         MockProvider::new(EmbeddingConfig::openai(768)),
     );
     let got = recall_routed(
-        &pool,
         &scoped,
         &viewer,
         &narrow,
