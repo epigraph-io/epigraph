@@ -601,7 +601,8 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "NO_ROW_SECURITY: finds or creates the `--allow-unauthenticated-http` reader agent by its \
          public key (AgentRepository::get_by_public_key / create, twice for the lost-race \
          lookup); `agents` carries no tenancy row security, and there is no caller to stamp \
-         from because this IS the identity the listener reads as.",
+         from because this IS the identity the listener reads as. Registered under the \
+         operator's 2026-11-16 approval, the one HIGH_WATER raise.",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
@@ -611,15 +612,19 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
          GroupMembershipRepository::list_live_for_agent, the `epigraph_live_memberships` \
          SECURITY DEFINER read that answers without a stamp (the same read Viewer::resolve \
          makes); it runs before the zero-membership viewer exists, so stamping would be \
-         circular.",
+         circular. Registered under the operator's 2026-11-16 approval, the one HIGH_WATER \
+         raise.",
     ),
 ];
 
 /// The never-raised ceiling on the register's total site count.
 ///
-/// 83 -> 86 when `unauthenticated_reader.rs` (security(mcp): read the
-/// unauthenticated listener as a zero-membership principal) added its three
-/// registered pre-viewer identity sites; none is a viewer-filtered read.
+/// ONE APPROVED EXCEPTION to "never raised": 83 -> 86 for the three
+/// `unauthenticated_reader.rs` sites above, which resolve the zero-membership
+/// identity the `--allow-unauthenticated-http` listener reads as, so there is
+/// no caller to stamp them from. The operator approved exactly that raise on
+/// 2026-11-16 and no other; every other new site is converted, not registered
+/// against a higher ceiling.
 const HIGH_WATER: usize = 86;
 
 // ===========================================================================
