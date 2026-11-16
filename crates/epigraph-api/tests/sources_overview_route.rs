@@ -668,3 +668,49 @@ fn a_failed_overview_read_that_did_not_time_out_is_a_500() {
         epigraph_api::errors::ApiError::InternalError { .. }
     ));
 }
+
+/// The overview and `GET /api/v1/papers` answer each caller with its own
+/// counts, so neither may be stored by a shared cache, and a private cache
+/// must key on the credential: `Cache-Control: private, no-store` and
+/// `Vary: Authorization`, on a refusal as well as on a 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_viewer_scoped_reads_are_not_cacheable_across_callers(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (caller, _) = agent(&pool, "cache caller").await;
+    let token = common::mint_token_with_agent(&["claims:read"], caller);
+    for (uri, want) in [
+        ("/api/v1/sources/overview", StatusCode::OK),
+        ("/api/v1/papers", StatusCode::OK),
+        (
+            "/api/v1/sources/overview?kind=book",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = create_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status(), want, "{uri}");
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private, no-store"),
+            "{uri}"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Authorization"),
+            "{uri}"
+        );
+    }
+}
