@@ -59,7 +59,9 @@ pub enum EdgeFactorOutcome {
     NonEpistemic,
     /// Restriction produced a vacuous interval (no information transfer).
     Vacuous,
-    /// BBA materialized and target belief recomputed.
+    /// BBA materialized. The target's cache is refolded on `binary_truth`
+    /// when that frame owns it (`cache_owner_frame_for_claim`); a compound,
+    /// or a claim whose cache another frame owns, keeps its cache.
     Wired,
 }
 
@@ -146,16 +148,40 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(
-        &mut *conn,
-        viewer,
-        target_id,
-        frame_id,
-        &frame,
-        crate::belief_profile::overrides_in(&frame_row.properties),
-        VacateGate::ClaimWide,
-    )
-    .await?;
+    // Refold the target's cache ONLY WHEN `binary_truth` OWNS IT (backlog
+    // d33a5c9f). The cache is ONE frame's fold, the one
+    // `MassFunctionRepository::cache_owner_frame_for_claim` names for every
+    // other recomputer. Folding `binary_truth` unconditionally here wrote a
+    // COMPOUND's cache (which has no owner: its belief is a query over its
+    // leaves) from its own `binary_truth` inputs, and nothing undid it: a
+    // retraction of the edge's BBA, or of the edge, neither refolds nor
+    // vacates a claim with no owner. It also let an edge whose BBA the
+    // derivation scope rule keeps out of the cache vacate a cache another
+    // frame owns. The owner is resolved after the BBA is stored, so a claim
+    // whose only input is this BBA gets `binary_truth`. The BBA is stored
+    // either way, so the outcome is still `Wired`.
+    let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, target_id)
+        .await
+        .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
+    if owner == Some(frame_id) {
+        recompute_combined_belief(
+            &mut *conn,
+            viewer,
+            target_id,
+            frame_id,
+            &frame,
+            crate::belief_profile::overrides_in(&frame_row.properties),
+            VacateGate::ClaimWide,
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            edge = %edge_id,
+            target = %target_id,
+            owner = ?owner,
+            "edge BBA stored; the target's cache is not binary_truth's to refold"
+        );
+    }
     Ok(EdgeFactorOutcome::Wired)
 }
 
@@ -562,8 +588,10 @@ pub async fn auto_wire_edge_if_epistemic(
 
 /// Re-fetch all BBAs on (claim, binary frame), discount by source_strength,
 /// combine, and write the resulting Bel/Pl/BetP/conflict/missing to the
-/// claim's row. Public so other belief-recompute paths (e.g. HTTP
-/// `propagate_to_dependents`) can share the cascade.
+/// claim's row, re-pointing the cache to `binary_truth`. It does NOT apply
+/// the cache-owner rule; a caller refreshing a claim's cache wants
+/// [`recompute_claim_cached_belief`] instead (HTTP `propagate_to_dependents`
+/// switched to it, backlog d33a5c9f).
 pub async fn recompute_claim_belief_binary(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,

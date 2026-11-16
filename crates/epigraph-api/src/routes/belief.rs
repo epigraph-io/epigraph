@@ -1663,25 +1663,46 @@ pub async fn submit_evidence(
             })?;
     let (old_belief, old_plausibility) = old_row.unwrap_or((None, None));
 
-    // 13. Combine every BBA on (claim, frame) and write the claim's cache with
-    //     `belief_frame_id = frame_id`, through the shared pipeline. A
-    //     non-owner's write follows migration 114: it refreshes the cache only
-    //     on the frame the cache already carries (or seeds `binary_truth`).
-    epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
-        &mut tx,
+    // 13. When this frame owns the claim's cache, combine every BBA on (claim,
+    //     frame) and write the cache with `belief_frame_id = frame_id`, through
+    //     the shared pipeline (backlog d33a5c9f). A claim's cache is ONE
+    //     frame's fold, the one `MassFunctionRepository::cache_owner_frame_for_claim`
+    //     names for every other recomputer; folding whatever frame was posted
+    //     re-pointed an owner's `binary_truth` cache to, say, one
+    //     `claim_validity` BBA, until the next owner-rule recompute put it back.
+    //     The owner is resolved after this request's BBA is stored, so a claim
+    //     whose only input is this BBA gets this frame. A compound has no owner
+    //     and is not refolded. A non-owner's write of the claim row follows
+    //     migration 114: it refreshes the cache only on the frame the cache
+    //     already carries (or seeds `binary_truth`).
+    let cache_owner = epigraph_db::MassFunctionRepository::cache_owner_frame_for_claim(
+        &mut *tx,
         &viewer,
         request.claim_id,
-        frame_id,
     )
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Belief recompute failed: {e}"),
+    .map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to resolve the claim's cache-owner frame: {e}"),
     })?;
+    let cache_written = if cache_owner == Some(frame_id) {
+        epigraph_engine::edge_factor::recompute_claim_belief_on_frame(
+            &mut tx,
+            &viewer,
+            request.claim_id,
+            frame_id,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Belief recompute failed: {e}"),
+        })?
+    } else {
+        false
+    };
 
     // 13a. This frame's combination, by the same pipeline, for the response
-    //      and the events. When the cache now carries another frame (a
-    //      non-owner may not re-point it), say so instead of implying that the
-    //      claim's belief moved.
+    //      and the events. When step 13 did not write the cache (another frame
+    //      owns it, the claim has no owner, or a non-owner may not re-point
+    //      it), say so instead of implying that the claim's belief moved.
     let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
         &mut tx,
         &viewer,
@@ -1729,15 +1750,37 @@ pub async fn submit_evidence(
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
     }
-    if cache_frame != Some(frame_id) {
-        warnings.push(format!(
-            "claim {}'s cached belief was NOT updated by this call: it carries another frame \
-             (or an older cache with no recorded frame, or none on a frame other than \
-             binary_truth), which a non-owner does not re-point or seed. updated_belief, \
-             updated_plausibility and pignistic_prob here are this frame's combination, not \
-             the claim's cache.",
-            request.claim_id
-        ));
+    // Whether the claim's cache now holds this frame's combination: the
+    // condition for the "NOT updated" warning below and for step 18's
+    // `belief.updated` event.
+    let cache_updated = cache_written && cache_frame == Some(frame_id);
+    if !cache_updated {
+        let claim_id = request.claim_id;
+        warnings.push(match cache_owner {
+            Some(owner) if owner != frame_id => format!(
+                "claim {claim_id}'s cached belief was NOT updated by this call: the claim's \
+                 cache is the fold of its cache-owner frame {owner}, not of frame {frame_id} (a \
+                 frame with an input at least as widely readable as the claim ranks first, \
+                 then binary_truth, then claim_validity, then the frame the cache already \
+                 records, then the frame of the earliest input). This BBA is stored on frame \
+                 {frame_id}. updated_belief, updated_plausibility and pignistic_prob here are \
+                 this frame's combination, not the claim's cache."
+            ),
+            None => format!(
+                "claim {claim_id}'s cached belief was NOT updated by this call: the claim has \
+                 no cache-owner frame (a compound, whose belief is derived from the claims it \
+                 decomposes into, has none), so no BBA of its own is folded into its cache. \
+                 updated_belief, updated_plausibility and pignistic_prob here are this frame's \
+                 combination, not the claim's cache."
+            ),
+            Some(_) => format!(
+                "claim {claim_id}'s cached belief was NOT updated by this call: this frame owns \
+                 the cache, but the cache carries another frame (or an older cache with no \
+                 recorded frame, or none on a frame other than binary_truth), which a non-owner \
+                 of the claim does not re-point or seed. updated_belief, updated_plausibility \
+                 and pignistic_prob here are this frame's combination, not the claim's cache."
+            ),
+        });
     }
 
     // 13b. Parallel Beta-Bernoulli update
@@ -2121,25 +2164,33 @@ pub async fn submit_evidence(
         )
         .await;
 
-    // 18. Emit belief.updated event
-    event_store
-        .push(
-            "belief.updated".to_string(),
-            request.agent_id,
-            serde_json::json!({
-                "claim_id": request.claim_id,
-                "frame_id": frame_id,
-                "old_belief": old_belief,
-                "new_belief": final_bel,
-                "old_plausibility": old_plausibility,
-                "new_plausibility": final_pl,
-                "pignistic_prob": final_betp,
-                "combination_method": final_method,
-                "total_sources": total_sources,
-                "perspective_id": request.perspective_id,
-            }),
-        )
-        .await;
+    // 18. Emit belief.updated event, ONLY when step 13 moved the claim's
+    //     cache to this frame's combination. `old_belief` is the claim's cache
+    //     before this call and `new_belief` this frame's combination, so when
+    //     the cache was not written (another frame owns it, the claim is a
+    //     compound, or migration 114 declined a non-owner's write) the event
+    //     reported a move that did not happen (backlog d33a5c9f).
+    //     `evidence.submitted` above still records the submission.
+    if cache_updated {
+        event_store
+            .push(
+                "belief.updated".to_string(),
+                request.agent_id,
+                serde_json::json!({
+                    "claim_id": request.claim_id,
+                    "frame_id": frame_id,
+                    "old_belief": old_belief,
+                    "new_belief": final_bel,
+                    "old_plausibility": old_plausibility,
+                    "new_plausibility": final_pl,
+                    "pignistic_prob": final_betp,
+                    "combination_method": final_method,
+                    "total_sources": total_sources,
+                    "perspective_id": request.perspective_id,
+                }),
+            )
+            .await;
+    }
 
     // 18b. Confidence velocity check — detect monotonic belief increase
     //      Reconstruct recent belief trajectory from scoped_belief snapshots.

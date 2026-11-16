@@ -3,30 +3,30 @@
 //!
 //! `update_with_evidence` files its BBA on `binary_truth`, and the cache owner
 //! rule (`MassFunctionRepository::cache_owner_frame_for_claim`) ranks
-//! `binary_truth` first, so the rule itself already says `binary_truth` owns
-//! this claim's cache. `submit_ds_evidence` does not consult the rule: it
-//! folds the frame it was handed (`recompute_claim_belief_on_frame`) and, for
-//! a session that may write the claim row, re-points the cache to that frame.
-//! The claim's served belief then becomes the one `claim_validity` BBA's
-//! fold, while `truth_value` keeps the `update_with_evidence` value.
+//! `binary_truth` first, so the rule says `binary_truth` owns this claim's
+//! cache. `submit_ds_evidence` used to fold the frame it was handed
+//! (`recompute_claim_belief_on_frame`) and, for a session that may write the
+//! claim row, re-point the cache to that frame: the claim's served belief
+//! became the one `claim_validity` BBA's fold while `truth_value` kept the
+//! `update_with_evidence` value. It now refolds only when the filed frame is
+//! the owner frame.
 //!
 //! What is pinned:
 //!
-//! * `submit_ds_evidence_on_claim_validity_replaces_an_update_with_evidence_cache`:
-//!   the replacement, as a KNOWN RESIDUAL. Routing this request path through
-//!   the cache owner rule changes what the tool writes and is held for an
-//!   operator decision; flip this pin with that change.
+//! * `submit_ds_evidence_on_claim_validity_keeps_the_update_with_evidence_cache`:
+//!   the cache stays on `binary_truth` with its value, and the response
+//!   reports the `claim_validity` combination with a warning that names the
+//!   owner frame.
 //! * `retracting_that_bba_restores_the_owner_frame_fold`: `retract_bba` on the
 //!   `claim_validity` BBA recomputes the cache from the BBAs that remain (the
 //!   `binary_truth` fold) and says so (`belief_recomputed`).
-//! * `on_a_compound_the_retracted_value_stays_cached`: the one shape found on
-//!   this tree in which the retraction answers `belief_recomputed: false`
-//!   and the cache keeps the retracted BBA's value: a COMPOUND (an in-force
-//!   `decomposes_to` out-edge). The owner rule gives a compound no owner (its
-//!   belief is a query over its leaves), so neither the recompute nor the
-//!   vacate runs, but `submit_ds_evidence`'s named-frame fold wrote its cache
-//!   all the same. Pinned as a KNOWN RESIDUAL of the same request path as the
-//!   first test.
+//! * `on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache`: a
+//!   COMPOUND (an in-force `decomposes_to` out-edge) has no cache owner (its
+//!   belief is a query over its leaves). `submit_ds_evidence` used to write
+//!   its cache from the named frame all the same, and the retraction, which
+//!   neither refolds nor vacates a claim with no owner, then left the
+//!   retracted BBA's value cached. Now the submit leaves the cache alone, so
+//!   there is nothing for the retraction to leave behind.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -171,7 +171,7 @@ async fn world(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn submit_ds_evidence_on_claim_validity_replaces_an_update_with_evidence_cache(pool: PgPool) {
+async fn submit_ds_evidence_on_claim_validity_keeps_the_update_with_evidence_cache(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let server = make_server(pool.clone()).await;
     let (claim, binary, validity, before, out) = world(&pool, &server, &viewer).await;
@@ -188,33 +188,36 @@ async fn submit_ds_evidence_on_claim_validity_replaces_an_update_with_evidence_c
     assert_eq!(
         owner,
         Some(binary),
-        "the cache owner rule already gives binary_truth this claim's cache"
+        "PREMISE: the cache owner rule gives binary_truth this claim's cache"
+    );
+    assert!(
+        (validity_fold.pignistic_prob - before.0.expect("a cached BetP")).abs() > 1e-3,
+        "PREMISE: the claim_validity fold differs from the cache, so a replacement would show \
+         ({validity_fold:?} vs {before:?})"
     );
 
     let after = cache(&pool, claim).await;
-    // KNOWN RESIDUAL (d33a5c9f (1)), not intended behaviour: the one
-    // claim_validity BBA's fold replaced the cache the owner frame holds, and
-    // truth_value kept the update_with_evidence value, so the two disagree.
-    // The fix routes this request path through the owner rule (refold only
-    // when the filed frame is the owner frame), which is an operator decision.
     assert_eq!(
-        after.1,
-        Some(validity),
-        "KNOWN RESIDUAL changed: submit_ds_evidence no longer re-points an owner's cache to \
-         the frame it was handed; flip this pin with that change ({after:?}, before {before:?}, \
-         response {out})"
+        after, before,
+        "submit_ds_evidence on a frame that does not own the cache must leave the owner frame's \
+         cache (frame, BetP and truth_value) as it was (response {out})"
     );
+    let reported = out["pignistic_prob"].as_f64();
     assert!(
-        near(after.0, validity_fold.pignistic_prob),
-        "the cache holds the claim_validity fold {validity_fold:?}: {after:?}"
+        near(reported, validity_fold.pignistic_prob),
+        "the response reports the claim_validity combination {validity_fold:?}, not the cache: \
+         {out}"
     );
+    let warned = out["warnings"].as_array().is_some_and(|ws| {
+        ws.iter().any(|w| {
+            w.as_str().is_some_and(|w| {
+                w.contains("cached belief was NOT updated") && w.contains(&binary.to_string())
+            })
+        })
+    });
     assert!(
-        (after.2 - before.2).abs() < 1e-12
-            && after
-                .0
-                .is_some_and(|p| (p - before.0.unwrap_or(p)).abs() > 1e-3),
-        "truth_value kept the update_with_evidence value while the cached BetP moved: \
-         {after:?}, before {before:?}"
+        warned,
+        "the response must say the cache was not updated and name the owner frame: {out}"
     );
 }
 
@@ -270,31 +273,28 @@ async fn retracting_that_bba_restores_the_owner_frame_fold(pool: PgPool) {
     );
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn on_a_compound_the_retracted_value_stays_cached(pool: PgPool) {
-    let viewer = fixture::public_viewer(&pool).await;
-    let server = make_server(pool.clone()).await;
-    let (claim, _binary, validity, before, _out) = world(&pool, &server, &viewer).await;
-    // The claim decomposes into a current leaf: from now on it is a compound.
+/// The claim decomposes into a current leaf: from now on it is a compound,
+/// with no cache owner although it holds `binary_truth` inputs.
+async fn decompose(pool: &PgPool, viewer: &epigraph_db::visibility::Viewer, claim: Uuid) {
     let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
         .bind(claim)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await
         .expect("the claim's author");
-    let leaf = fixture::seed_public_claim(&pool, author, "d33a5c9f compound leaf").await;
+    let leaf = fixture::seed_public_claim(pool, author, "d33a5c9f compound leaf").await;
     sqlx::query(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
          VALUES ($1, 'claim', $2, 'claim', 'decomposes_to')",
     )
     .bind(claim)
     .bind(leaf)
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("decompose the claim");
     assert_eq!(
         MassFunctionRepository::cache_owner_frame_for_claim(
             &mut *pool.acquire().await.expect("acquire"),
-            &viewer,
+            viewer,
             claim
         )
         .await
@@ -302,6 +302,14 @@ async fn on_a_compound_the_retracted_value_stays_cached(pool: PgPool) {
         None,
         "PREMISE: a compound has no cache owner"
     );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_a_compound_neither_the_submit_nor_the_retract_writes_the_cache(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let (claim, _binary, validity, before, _out) = world(&pool, &server, &viewer).await;
+    decompose(&pool, &viewer, claim).await;
     // The agent's claim_validity BBA, re-stated with other masses (it replaces
     // the first one) while the claim is a compound.
     let second = first_text(
@@ -322,9 +330,9 @@ async fn on_a_compound_the_retracted_value_stays_cached(pool: PgPool) {
     );
     let written = cache(&pool, claim).await;
     assert_eq!(
-        written.1,
-        Some(validity),
-        "PREMISE: the named-frame fold wrote the compound's cache ({written:?}, {second})"
+        written, before,
+        "a compound has no cache owner, so submit_ds_evidence must not fold its own BBAs into \
+         its cache ({written:?}, before {before:?}, response {second})"
     );
 
     let retracted = first_text(
@@ -344,20 +352,91 @@ async fn on_a_compound_the_retracted_value_stays_cached(pool: PgPool) {
         .expect("retract_bba"),
     );
     let after = cache(&pool, claim).await;
-    // KNOWN RESIDUAL (d33a5c9f (2)), not intended behaviour: the cache still
-    // holds the fold that included the retracted BBA.
+    // A compound has no owner, so the retraction neither refolds nor vacates,
+    // and with the submit no longer writing its cache that is now harmless:
+    // the cache holds no fold of the retracted BBA.
     assert_eq!(
         (
             &retracted["belief_recomputed"],
             &retracted["belief_vacated"]
         ),
         (&serde_json::json!(false), &serde_json::json!(false)),
-        "KNOWN RESIDUAL changed: a compound's retraction now recomputes or vacates; flip this \
-         pin with that change ({retracted})"
+        "a compound's retraction neither refolds nor vacates its cache ({retracted})"
     );
     assert_eq!(
-        after, written,
-        "KNOWN RESIDUAL changed: the compound's cache moved on the retraction ({after:?}, \
-         written {written:?}, before {before:?})"
+        after, before,
+        "the compound's cache must hold no fold of the retracted BBA ({after:?}, before \
+         {before:?})"
+    );
+}
+
+/// The edge-wire twin of the compound case: `link_epistemic` into a compound
+/// stores the edge's BBA (`belief_wired`) but leaves the compound's cache. The
+/// engine's wire (`edge_factor::auto_wire_ds_for_edge`) used to fold
+/// `binary_truth` unconditionally, writing the compound's cache from its own
+/// inputs, and a retraction of that BBA, which neither refolds nor vacates a
+/// claim with no owner, then left the value cached.
+#[sqlx::test(migrations = "../../migrations")]
+async fn on_a_compound_link_epistemic_stores_the_bba_but_leaves_the_cache(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    let (claim, binary, _validity, before, _out) = world(&pool, &server, &viewer).await;
+    decompose(&pool, &viewer, claim).await;
+    let author: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("the claim's author");
+    let source = fixture::seed_public_claim(&pool, author, "d33a5c9f edge source").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.8, plausibility = 0.9, pignistic_prob = 0.85 \
+         WHERE id = $1",
+    )
+    .bind(source)
+    .execute(&pool)
+    .await
+    .expect("give the source an interval");
+
+    let out = first_text(
+        &tools::link_epistemic::link_epistemic(
+            &server,
+            &viewer,
+            epigraph_mcp::types::LinkEpistemicParams {
+                source_claim_id: source.to_string(),
+                target_claim_id: claim.to_string(),
+                relationship: "supports".to_string(),
+                properties: None,
+            },
+            None,
+        )
+        .await
+        .expect("link_epistemic into the compound"),
+    );
+    assert_eq!(
+        out["belief_wired"],
+        serde_json::json!(true),
+        "the edge's BBA is stored on the compound: {out}"
+    );
+    let edge_bbas: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
+           AND perspective_id = $3",
+    )
+    .bind(claim)
+    .bind(binary)
+    .bind(
+        out["edge_id"]
+            .as_str()
+            .expect("edge_id")
+            .parse::<Uuid>()
+            .expect("uuid"),
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count the edge's BBAs");
+    assert_eq!(edge_bbas, 1, "the edge's BBA is on binary_truth: {out}");
+    assert_eq!(
+        cache(&pool, claim).await,
+        before,
+        "the wire must not fold a compound's own binary_truth inputs into its cache ({out})"
     );
 }

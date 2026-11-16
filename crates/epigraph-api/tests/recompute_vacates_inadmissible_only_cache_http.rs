@@ -6,7 +6,9 @@
 //!
 //! The REST path is `POST /api/v1/edges`' dependent propagation
 //! (`routes/edges.rs::propagate_to_dependents` -> `recompute_claim_belief` ->
-//! `edge_factor::recompute_claim_belief_binary`): an epistemic edge into T
+//! `edge_factor::recompute_claim_cached_belief`, the owner-rule fold, which on
+//! a claim whose only frame is `binary_truth` is `recompute_claim_belief_binary`):
+//! an epistemic edge into T
 //! recomputes every claim whose reasoning trace takes T as an input. That
 //! recompute runs on an UNSTAMPED connection from the raw pool, a session
 //! state neither MCP twin (a viewer-stamped application session, the
@@ -329,18 +331,21 @@ async fn an_edge_write_vacates_a_dependent_whose_every_bba_is_inadmissible(pool:
     assert_served_ignorance(&state, &pool, w.stranger, dependent).await;
 }
 
-/// The propagation's own recompute (`recompute_claim_belief_binary`, as
-/// `routes/edges.rs::recompute_claim_belief` calls it) on an UNSTAMPED
+/// The propagation's fold (`recompute_claim_belief_binary`, the fold
+/// `routes/edges.rs::recompute_claim_belief` reaches through the owner rule
+/// for a claim whose only frame is `binary_truth`) on an UNSTAMPED
 /// application-role connection, where row security hides the narrowed
 /// evidence from the session altogether. The R-80 decision reads run under
 /// that session state and decide to vacate: the write-free preview, which
 /// runs the same decision, is full ignorance.
 ///
-/// KNOWN RESIDUAL, pinned as it stands: that session cannot write the cache
-/// at all. `update_claim_belief` is refused by row security there (as it is
-/// for an ordinary fold on that session; `routes/edges.rs` is still
-/// unstamped), the route logs the failure and continues, and the claim keeps
-/// its old cache until a stamped or maintenance recompute vacates it.
+/// KNOWN RESIDUAL of the ENGINE on that session, pinned as it stands: it
+/// cannot write the cache at all. `update_claim_belief` is refused by row
+/// security there (as it is for an ordinary fold on that session), and the
+/// claim keeps its old cache until a stamped or maintenance recompute vacates
+/// it. `routes/edges.rs` no longer reaches this session: its propagation runs
+/// on the caller's stamped transaction (backlog 8d720490 (5),
+/// `edge_auto_wire_stamped_http.rs`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_unstamped_application_session_decides_to_vacate(pool: PgPool) {
     let raw = unstamped_app_pool(&pool).await;
