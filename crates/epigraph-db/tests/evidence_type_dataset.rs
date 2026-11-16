@@ -46,7 +46,7 @@ async fn write_dataset_evidence(pool: &PgPool, claim: Uuid, body: &str, root: &s
         Some(body.to_string()),
         ClaimId::from_uuid(claim),
     );
-    EvidenceRepository::create(pool, &evidence)
+    EvidenceRepository::create(pool, &evidence, epigraph_db::EvidenceEdge::supports(None))
         .await
         .expect("a dataset evidence row must be admitted")
 }
