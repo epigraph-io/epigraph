@@ -283,7 +283,7 @@ async fn seeded_generation(
     .bind(goal)
     .bind(visibility)
     .bind(owner)
-    .bind(epigraph_mcp::embed::format_pgvector(&goal_vector(goal)))
+    .bind(epigraph_db::pgvector_literal(&goal_vector(goal)))
     .execute(pool)
     .await
     .expect("seed workflows row");

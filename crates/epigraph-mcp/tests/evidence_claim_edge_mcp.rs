@@ -296,6 +296,7 @@ async fn report_workflow_outcome_stores_the_outcomes_direction(pool: PgPool) {
                 outcome_details: "ran".to_string(),
                 quality: Some(0.8),
                 goal_text: None,
+                idempotency_key: None,
             },
             None,
         )
@@ -305,7 +306,7 @@ async fn report_workflow_outcome_stores_the_outcomes_direction(pool: PgPool) {
     }
 }
 
-fn extraction(tag: &str) -> epigraph_ingest::schema::DocumentExtraction {
+fn extraction(tag: &str) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("2d60f619 {tag}: Evidence Edges"),

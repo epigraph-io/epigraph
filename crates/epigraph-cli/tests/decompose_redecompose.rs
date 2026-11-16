@@ -126,7 +126,7 @@ async fn persist(
     d: &Decomposition,
 ) -> Result<epigraph_cli::decompose::PersistOutcome, String> {
     let p = pool.clone();
-    persist_decomposition(pool, viewer, parent, d, None, move |text, _g| {
+    persist_decomposition(pool, viewer, parent, d, move |text, _g| {
         let p = p.clone();
         async move { Ok(claim_if_not_exists(&p, agent, &text).await) }
     })
@@ -145,7 +145,7 @@ async fn persist_counting(
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let p = pool.clone();
     let c = calls.clone();
-    let out = persist_decomposition(pool, viewer, parent, d, None, move |text, _g| {
+    let out = persist_decomposition(pool, viewer, parent, d, move |text, _g| {
         let p = p.clone();
         c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move { Ok(claim_if_not_exists(&p, agent, &text).await) }
@@ -337,7 +337,6 @@ async fn an_atom_that_would_close_a_cycle_is_refused(pool: PgPool) {
                 vec!["The backup stalled.".into(), "It never restarted.".into()],
             ),
         ],
-        None,
         None,
         &submit,
     )
