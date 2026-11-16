@@ -444,6 +444,53 @@ pub struct ResolveClaimIdPrefixParams {
     pub limit: Option<i64>,
 }
 
+/// Parameters for MCP `screen_claim_atomicity` (backlog `72850d43`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ScreenClaimAtomicityParams {
+    #[schemars(description = "The UUIDs of the claims to screen (1 to 200)")]
+    pub claim_ids: Vec<String>,
+}
+
+/// Parameters for MCP `query_compound_claims` (backlog `c4a8436b`).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct QueryCompoundClaimsParams {
+    #[schemars(
+        description = "Which claims to walk: \"atoms\" (default) for the targets of an in-force \
+                       decomposes_to edge, \"all\" for every current claim whatever its edges."
+    )]
+    #[serde(default)]
+    pub population: Option<String>,
+
+    #[schemars(
+        description = "Only claims with no in-force decomposes_to children (default true): the \
+                       compound claims nothing has split yet, which is what \
+                       decompose_claims --redecompose takes. false also returns compound claims \
+                       that already have children."
+    )]
+    #[serde(default)]
+    pub leaves_only: Option<bool>,
+
+    #[schemars(description = "Smallest conjunct_count to return (default 2, at least 2).")]
+    #[serde(default)]
+    pub min_conjuncts: Option<u32>,
+
+    #[schemars(description = "Most claims to return (default 50, at most 200).")]
+    #[serde(default)]
+    pub limit: Option<u32>,
+
+    #[schemars(
+        description = "Most claims of the population to screen in this call (default 2000, \
+                       at most 10000). The walk stops at the first of limit hits or max_scan \
+                       screened; next_cursor resumes it."
+    )]
+    #[serde(default)]
+    pub max_scan: Option<u32>,
+
+    #[schemars(description = "A previous call's next_cursor, to continue the walk.")]
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
 /// Parameters for MCP `lint_claim_id_citations` (backlog `30d8b667`).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct LintClaimIdCitationsParams {
@@ -1570,6 +1617,42 @@ pub struct SubmitClaimResponse {
     /// of another visibility was returned unchanged (D-V4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_note: Option<String>,
+    /// Present ONLY when the submitted text screens compound. A warning: the
+    /// claim was handled exactly as without it. See [`AtomicityWarning`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomicity: Option<AtomicityWarning>,
+}
+
+/// The warn-only atomicity gate on `submit_claim`, `batch_submit_claims` and
+/// `memorize` (backlog `72850d43`): the submitted text appears to assert
+/// several independent things (`epigraph_core::atomicity::conjunct_screen`).
+/// Nothing is refused on it, because narrative protocol and postmortem claims
+/// are legitimately long; it tells the caller that a partial dispute of this
+/// claim would have no atomic target to attach to.
+#[derive(Debug, Clone, Serialize)]
+pub struct AtomicityWarning {
+    #[serde(flatten)]
+    pub screen: epigraph_core::atomicity::ConjunctScreen,
+    pub note: &'static str,
+}
+
+/// The [`AtomicityWarning::note`] every warning carries.
+pub const ATOMICITY_WARNING_NOTE: &str =
+    "This text appears to assert several independent things (conjunct_count >= 2). The call \
+     was handled exactly as it would be without this warning; nothing was refused. Consider \
+     submitting each assertion as its own claim, so a later dispute can target the one it \
+     disputes.";
+
+impl AtomicityWarning {
+    /// The warning for `content`, or `None` when it does not screen compound.
+    #[must_use]
+    pub fn for_content(content: &str) -> Option<Self> {
+        let screen = epigraph_core::atomicity::conjunct_screen(content);
+        screen.is_compound().then_some(Self {
+            screen,
+            note: ATOMICITY_WARNING_NOTE,
+        })
+    }
 }
 
 /// Which dedup path answered a write with an EXISTING claim.
@@ -1868,6 +1951,9 @@ pub struct MemorizeResponse {
     /// of another visibility was returned unchanged (D-V4).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility_note: Option<String>,
+    /// See [`SubmitClaimResponse::atomicity`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub atomicity: Option<AtomicityWarning>,
 }
 
 #[derive(Debug, Serialize)]

@@ -17,6 +17,7 @@ pub mod analysis;
 pub mod assertion_nonce;
 pub mod atlas_layout;
 pub mod atom_axiom;
+pub mod atomicity_screen;
 pub mod authored_by;
 pub mod authorization_code;
 pub mod authorize_session;
@@ -136,6 +137,7 @@ pub use atlas_layout::{
     UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
 };
+pub use atomicity_screen::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
     LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngest, PaperRef, PromptSnapshotAt,

@@ -166,6 +166,13 @@ pub enum Ineligible {
     /// The model already answered this exact text with one atom (recorded in
     /// the [`SingletonLedger`]); asking again would buy the same answer.
     JudgedAtomic,
+    /// `--redecompose` only: `epigraph_core::atomicity::conjunct_screen` does
+    /// not call the claim compound, so there is nothing to split.
+    NotCompound { conjunct_count: usize },
+    /// `--redecompose` only: the claim already has in-force `decomposes_to`
+    /// children. Splitting it again would add a second set of atoms beside
+    /// them; its compound CHILDREN are what to re-decompose.
+    AlreadySplit { children: i64 },
 }
 
 impl std::fmt::Display for Ineligible {
@@ -189,6 +196,17 @@ impl std::fmt::Display for Ineligible {
                 f,
                 "the model already judged this text atomic (singleton ledger; pass \
                  --include-judged-atomic to ask again)"
+            ),
+            Self::NotCompound { conjunct_count } => write!(
+                f,
+                "does not screen compound (conjunct_count={conjunct_count}; pass \
+                 --include-short to decompose it anyway)"
+            ),
+            Self::AlreadySplit { children } => write!(
+                f,
+                "already has {children} in-force decomposes_to children (re-decompose its \
+                 compound children instead, or pass --include-decomposed to add atoms beside \
+                 them)"
             ),
         }
     }
@@ -648,8 +666,9 @@ pub(crate) fn strip_code_fence(raw: &str) -> String {
 pub use db_writes::{
     persist_decomposition, persist_planned, plan_decomposition_batches,
     plan_decomposition_batches_with_gaps, run_decomposition_batches, select_candidates,
-    verify_plan, visible_claim_count, writer_group, BatchClaim, BatchTotals, DecomposeDb,
-    DecomposeRead, DecomposeTx, PersistOutcome, PlanDrift, PlanGaps, Priority, Selection,
+    select_redecompose_candidates, verify_plan, verify_plan_for, visible_claim_count, writer_group,
+    BatchClaim, BatchTotals, DecomposeDb, DecomposeRead, DecomposeTx, PersistOutcome, PlanDrift,
+    PlanGaps, Population, Priority, Selection,
 };
 
 #[cfg(feature = "db")]
@@ -820,6 +839,16 @@ mod db_writes {
         pub atom_claim_ids: Vec<Uuid>,
         pub edges_created: usize,
         pub skipped_singletons: usize,
+        /// Set to the parent or `decomposes_to` ancestor an atom would have
+        /// resolved to: wiring it would close a cycle, so NO edge was written
+        /// for this parent and `atom_claim_ids` is empty. In the usual case
+        /// (an atom text whose hash equals the parent's or an ancestor's) it
+        /// is caught BEFORE any atom is POSTed and nothing at all is written.
+        /// Only the backstop after the POSTs (an id the hash check could not
+        /// predict) leaves the posted atoms, and their derivation rows,
+        /// behind unwired. A deterministic refusal, not a failure: re-running
+        /// the same answer refuses again.
+        pub refused_cycle: Option<Uuid>,
     }
 
     /// Persist one compound claim's atoms as child claims and wire
@@ -859,6 +888,7 @@ mod db_writes {
                 atom_claim_ids: vec![],
                 edges_created: 0,
                 skipped_singletons: 1,
+                refused_cycle: None,
             });
         }
         // Guard: parent must still be current (never wire onto a retired claim).
@@ -866,6 +896,36 @@ mod db_writes {
             .await?
         {
             return Err(format!("parent claim {parent_id} is not current").into());
+        }
+        // Cycle guard, BEFORE any atom is POSTed (review M2). The atom POST
+        // dedups on `(content_hash, agent_id)` and records the atom's
+        // derivation on BOTH arms, so an atom text identical to the parent's
+        // or an ancestor's would hand back that claim AND write a derivation
+        // naming its own descendant as its source, with the sibling atoms
+        // left behind as orphans, before any id check could run. So every
+        // atom's hash is compared with the parent's and each visible
+        // ancestor's first, whatever their author (an atom equal to an
+        // ancestor's text is a degenerate answer even where the author
+        // differs and the API would not dedup it), and the whole answer is
+        // refused with nothing written. Likeliest under `--redecompose`,
+        // where the parent is itself an atom.
+        {
+            use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
+            let lineage =
+                R::decomposes_to_lineage_hashes(&mut *db.read(viewer).await?, viewer, parent_id)
+                    .await?;
+            for atom in &decomp.atoms {
+                let h = epigraph_crypto::ContentHasher::hash(atom.as_bytes());
+                if let Some((hit, _)) = lineage.iter().find(|(_, lh)| lh.as_slice() == h.as_slice())
+                {
+                    return Ok(PersistOutcome {
+                        atom_claim_ids: vec![],
+                        edges_created: 0,
+                        skipped_singletons: 0,
+                        refused_cycle: Some(*hit),
+                    });
+                }
+            }
         }
         // Phase 1: submit EVERY atom before wiring ANY edge. The
         // `decomposes_to` edges are what take the parent out of the
@@ -895,6 +955,31 @@ mod db_writes {
             atom_ids.push(atom_id);
             gens.push(gen);
         }
+        // Backstop for the guard above: a `decomposes_to` edge onto the
+        // parent itself or onto one of its ancestors would close a cycle, and
+        // the submit can still hand back such an id when the hash check above
+        // could not see it coming (a submit path that rewrites the text, or a
+        // lineage row the read missed). By then the atoms ARE posted, and the
+        // API has recorded their derivations, so this refuses only the EDGES:
+        // the posted atoms (and, for the matching one, its derivation row)
+        // stay. Reported as `refused_cycle` rather than as an error, so one
+        // such answer does not abort a scheduled run. Both walks see only
+        // edges the viewer can see: on the `--as-agent` path a cycle through
+        // an edge hidden from the agent is not caught.
+        {
+            use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
+            let mut above =
+                R::decomposes_to_ancestors(&mut *db.read(viewer).await?, viewer, parent_id).await?;
+            above.push(parent_id);
+            if let Some(&bad) = atom_ids.iter().find(|a| above.contains(a)) {
+                return Ok(PersistOutcome {
+                    atom_claim_ids: vec![],
+                    edges_created: 0,
+                    skipped_singletons: 0,
+                    refused_cycle: Some(bad),
+                });
+            }
+        }
         // Phase 2: every edge in ONE transaction, so the parent goes from
         // "no decomposition" to "all atoms" with nothing in between. On the
         // `--as-agent` path the transaction is stamped for the acting agent,
@@ -923,6 +1008,7 @@ mod db_writes {
             atom_claim_ids: atom_ids,
             edges_created: edges,
             skipped_singletons: 0,
+            refused_cycle: None,
         })
     }
 
@@ -948,6 +1034,10 @@ mod db_writes {
         /// Parents the model answered with one atom (already atomic), so
         /// nothing was written for them.
         pub singletons: Vec<Uuid>,
+        /// `(parent, atom)`: parents left unwired because the atom is the
+        /// parent or one of its `decomposes_to` ancestors (see
+        /// [`PersistOutcome::refused_cycle`]). Not a failure: the run goes on.
+        pub cycles: Vec<(Uuid, Uuid)>,
         /// Claims sent to the LLM that got no plan line (normal runs only;
         /// `--apply-plan` makes no LLM call and leaves this empty).
         pub gaps: PlanGaps,
@@ -995,6 +1085,7 @@ mod db_writes {
             totals.atoms += chunk_totals.atoms;
             totals.edges += chunk_totals.edges;
             totals.singletons.extend(chunk_totals.singletons);
+            totals.cycles.extend(chunk_totals.cycles);
             // A normal run still ABORTS on a persist failure (after finishing
             // the chunk): the next chunk would spend another LLM call on an
             // API that is probably down. `--apply-plan` makes no LLM call and
@@ -1176,6 +1267,11 @@ mod db_writes {
             )
             .await
             {
+                Ok(outcome) if outcome.refused_cycle.is_some() => {
+                    if let Some(atom) = outcome.refused_cycle {
+                        totals.cycles.push((plan.claim_id, atom));
+                    }
+                }
                 Ok(outcome) => {
                     totals.atoms += outcome.atom_claim_ids.len();
                     totals.edges += outcome.edges_created;
@@ -1242,6 +1338,42 @@ mod db_writes {
         ),
         Box<dyn std::error::Error>,
     > {
+        verify_plan_for(db, viewer, planned, Population::Undecomposed).await
+    }
+
+    /// Which claims a decomposition run may write atoms for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Population {
+        /// Claims with no `decomposes_to` edge in either direction: every
+        /// mode but `--redecompose`.
+        Undecomposed,
+        /// `--redecompose` (backlog `c4a8436b`): current claims whatever
+        /// their `decomposes_to` edges, so a compound ATOM can be split. A
+        /// claim that already has in-force children is refused unless
+        /// `include_decomposed`.
+        Redecompose { include_decomposed: bool },
+    }
+
+    /// [`verify_plan`] for `population`. Under
+    /// [`Population::Redecompose`] a line's parent must be current and
+    /// unchanged as usual, may be the target of a `decomposes_to` edge, and
+    /// must not have gained in-force children since the plan was made (unless
+    /// `include_decomposed`); such a line is [`PlanDrift::NoLongerUndecomposed`].
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn verify_plan_for(
+        db: &dyn DecomposeDb,
+        viewer: &epigraph_db::visibility::Viewer,
+        planned: Vec<super::PlannedDecomposition>,
+        population: Population,
+    ) -> Result<
+        (
+            Vec<super::PlannedDecomposition>,
+            Vec<(super::PlannedDecomposition, PlanDrift)>,
+        ),
+        Box<dyn std::error::Error>,
+    > {
         use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
         let mut lines_per_parent: std::collections::HashMap<Uuid, usize> =
             std::collections::HashMap::new();
@@ -1251,9 +1383,28 @@ mod db_writes {
         let ids: Vec<Uuid> = lines_per_parent.keys().copied().collect();
         let mut live = std::collections::HashMap::new();
         for chunk in ids.chunks(1000) {
-            for c in
-                R::list_undecomposed_by_ids(&mut *db.read(viewer).await?, viewer, chunk).await?
-            {
+            let mut read = db.read(viewer).await?;
+            let rows = match population {
+                Population::Undecomposed => {
+                    R::list_undecomposed_by_ids(&mut *read, viewer, chunk).await?
+                }
+                Population::Redecompose { include_decomposed } => {
+                    let rows = R::list_redecompose_by_ids(&mut *read, viewer, chunk).await?;
+                    let split: std::collections::HashSet<Uuid> = if include_decomposed {
+                        std::collections::HashSet::new()
+                    } else {
+                        R::count_in_force_children(&mut *read, viewer, chunk)
+                            .await?
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .collect()
+                    };
+                    rows.into_iter()
+                        .filter(|r| !split.contains(&r.id))
+                        .collect()
+                }
+            };
+            for c in rows {
                 live.insert(c.id, (c.content, c.agent_id));
             }
         }
@@ -1435,6 +1586,93 @@ mod db_writes {
             }
             if (n as i64) < PAGE {
                 break;
+            }
+        }
+        Ok(sel)
+    }
+
+    /// `--redecompose`'s selection (backlog `c4a8436b`): the `ids` named
+    /// explicitly, in file order, WHATEVER their `decomposes_to` edges, so a
+    /// compound atom (the target of such an edge, which [`select_candidates`]
+    /// can never reach) is chosen.
+    ///
+    /// The rules, in reporting order: public only (not overridable);
+    /// `backlog`-labelled skipped unless `filters.skip_backlog` is off;
+    /// [`super::Ineligible::AlreadySplit`] for a claim with in-force children
+    /// unless `include_decomposed`; [`super::Ineligible::NotCompound`] when
+    /// `epigraph_core::atomicity::conjunct_screen` does not call it compound,
+    /// unless `filters.skip_short` is off (`--include-short`); the singleton
+    /// ledger last. Ids that are absent, retired, invisible, telemetry or of
+    /// 10 characters or fewer are in `not_undecomposed`.
+    ///
+    /// Atoms are then written exactly as for any parent
+    /// ([`persist_decomposition`]): `if_not_exists` atom POSTs, so a re-apply
+    /// returns the same atom ids, and `create_if_absent` edges, so existing
+    /// edges are kept and none is written twice. The parent's own conflict
+    /// edges are moved onto the new atoms by `--retarget`, which selects any
+    /// current claim with an in-force `decomposes_to` child.
+    ///
+    /// # Errors
+    /// Database failure.
+    pub async fn select_redecompose_candidates(
+        db: &dyn DecomposeDb,
+        viewer: &epigraph_db::visibility::Viewer,
+        ids: &[Uuid],
+        filters: super::EligibilityFilters,
+        judged_atomic: Option<&super::SingletonLedger>,
+        limit: usize,
+        include_decomposed: bool,
+    ) -> Result<Selection, Box<dyn std::error::Error>> {
+        use epigraph_db::repos::decomposition_priority::DecompositionPriorityRepository as R;
+        let mut rows = Vec::new();
+        let mut children: std::collections::HashMap<Uuid, i64> = std::collections::HashMap::new();
+        for chunk in ids.chunks(1000) {
+            let mut read = db.read(viewer).await?;
+            rows.extend(R::list_redecompose_by_ids(&mut *read, viewer, chunk).await?);
+            children.extend(R::count_in_force_children(&mut *read, viewer, chunk).await?);
+        }
+        let mut sel = Selection {
+            scanned: rows.len(),
+            ..Selection::default()
+        };
+        let present: std::collections::HashSet<Uuid> = rows.iter().map(|r| r.id).collect();
+        let mut seen = std::collections::HashSet::new();
+        sel.not_undecomposed = ids
+            .iter()
+            .copied()
+            .filter(|id| !present.contains(id) && seen.insert(*id))
+            .collect();
+        let verdict = |r: &epigraph_db::repos::decomposition_priority::DecomposeCandidate|
+         -> Result<(), super::Ineligible> {
+            super::check_publicly_decomposable(&r.visibility)?;
+            if filters.skip_backlog && r.labels.iter().any(|l| l == "backlog") {
+                return Err(super::Ineligible::Backlog);
+            }
+            if !include_decomposed {
+                if let Some(&n) = children.get(&r.id).filter(|n| **n > 0) {
+                    return Err(super::Ineligible::AlreadySplit { children: n });
+                }
+            }
+            let screen = epigraph_core::atomicity::conjunct_screen(&r.content);
+            if filters.skip_short && !screen.is_compound() {
+                return Err(super::Ineligible::NotCompound {
+                    conjunct_count: screen.conjunct_count,
+                });
+            }
+            if judged_atomic.is_some_and(|l| l.contains(r.id, &r.content)) {
+                return Err(super::Ineligible::JudgedAtomic);
+            }
+            Ok(())
+        };
+        let mut taken = std::collections::HashSet::new();
+        for r in rows {
+            if !taken.insert(r.id) {
+                continue;
+            }
+            match verdict(&r) {
+                Ok(()) if sel.chosen.len() >= limit => sel.over_limit.push(r.id),
+                Ok(()) => sel.chosen.push(r),
+                Err(why) => sel.skipped.push((r.id, why)),
             }
         }
         Ok(sel)

@@ -226,8 +226,12 @@ pub async fn ingest_document(
         choice,
     )
     .await?;
+    // Warn-only, from the payload, before the walk detaches (backlog 72850d43).
+    let atomicity = extraction_atomicity(&extraction);
     if params.wait.unwrap_or(false) {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice)
+            .await
+            .map(|r| with_atomicity(r, atomicity));
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
@@ -259,7 +263,7 @@ pub async fn ingest_document(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id))
+    success_json(&queued_response(&doi, &title, paper_id, atomicity))
 }
 
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
@@ -375,8 +379,12 @@ pub async fn ingest_document_inline(
         choice,
     )
     .await?;
+    // Warn-only, from the payload, before the walk detaches (backlog 72850d43).
+    let atomicity = extraction_atomicity(&extraction);
     if wait {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice)
+            .await
+            .map(|r| with_atomicity(r, atomicity));
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
@@ -400,7 +408,7 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id))
+    success_json(&queued_response(&doi, &title, paper_id, atomicity))
 }
 
 /// The `wait: true` arm of the two detached ingest handlers: run the walk IN
@@ -483,7 +491,90 @@ async fn ensure_paper_node(
 }
 
 /// Shared response body for the two queued ingest entry points.
-fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value {
+/// Examples [`extraction_atomicity`] lists; the counts cover every atom.
+const ATOMICITY_EXAMPLES: usize = 10;
+/// Characters of an example atom's text the warning quotes.
+const ATOMICITY_EXAMPLE_CHARS: usize = 200;
+
+/// The warn-only atomicity gate at document ingest (backlog `72850d43`):
+/// every `sections[].paragraphs[].atoms[]` entry is run through
+/// `epigraph_core::atomicity::conjunct_screen`, and the ones that screen
+/// compound are reported. `None` when none does. Paragraph text is not
+/// screened: a paragraph is compound by design, its atoms are not.
+///
+/// Computed from the payload before the walk detaches, so the queued
+/// response carries it too; nothing is refused on it.
+fn extraction_atomicity(extraction: &DocumentExtraction) -> Option<serde_json::Value> {
+    let mut screened = 0usize;
+    let mut compound = 0usize;
+    let mut examples = Vec::new();
+    for (si, section) in extraction.sections.iter().enumerate() {
+        for (pi, paragraph) in section.paragraphs.iter().enumerate() {
+            for (ai, atom) in paragraph.atoms.iter().enumerate() {
+                screened += 1;
+                let screen = epigraph_core::atomicity::conjunct_screen(atom);
+                if !screen.is_compound() {
+                    continue;
+                }
+                compound += 1;
+                if examples.len() < ATOMICITY_EXAMPLES {
+                    examples.push(serde_json::json!({
+                        "section": si,
+                        "paragraph": pi,
+                        "atom": ai,
+                        "sentences": screen.sentences,
+                        "clause_joins": screen.clause_joins,
+                        "quantities": screen.quantities,
+                        "conjunct_count": screen.conjunct_count,
+                        "text": atom.chars().take(ATOMICITY_EXAMPLE_CHARS).collect::<String>(),
+                    }));
+                }
+            }
+        }
+    }
+    (compound > 0).then(|| {
+        serde_json::json!({
+            "atoms_screened": screened,
+            "compound_atoms": compound,
+            "examples": examples,
+            "note": "These atoms appear to assert several independent things (conjunct_count \
+                     >= 2). The ingest proceeds exactly as it would without this warning; \
+                     nothing is refused. Split them \
+                     in the extraction, or later with decompose_claims --redecompose, so a \
+                     dispute can target the one assertion it disputes.",
+        })
+    })
+}
+
+/// `result` with `atomicity` added to its JSON body under `"atomicity"`.
+/// A body that is not one JSON object is returned unchanged.
+fn with_atomicity(
+    mut result: CallToolResult,
+    atomicity: Option<serde_json::Value>,
+) -> CallToolResult {
+    let Some(atomicity) = atomicity else {
+        return result;
+    };
+    let body = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+    if let Some(serde_json::Value::Object(mut map)) = body {
+        map.insert("atomicity".to_string(), atomicity);
+        if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+            result.content[0] = ContentBlock::text(text);
+        }
+    }
+    result
+}
+
+fn queued_response(
+    doi: &str,
+    title: &str,
+    paper_id: Uuid,
+    atomicity: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut note = String::from(
         "DB writes are running as a detached background task; confirm they landed by \
          query_paper(`document_key`)'s claim_count rising, not with check_already_ingested, \
@@ -497,7 +588,7 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
              to pin the key to your own run id so re-ingests converge on this same node.",
         );
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "status": "queued",
         // `paper_id` is the addressable node; `document_key` is what `papers.doi`,
         // the `doi:<key>` claim label, and check_already_ingested are keyed on.
@@ -508,7 +599,11 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
         "doi": doi,
         "title": title,
         "note": note,
-    })
+    });
+    if let (Some(a), Some(map)) = (atomicity, body.as_object_mut()) {
+        map.insert("atomicity".to_string(), a);
+    }
+    body
 }
 
 /// Gate check: returns `Some(paper_id)` iff a paper with `doi` exists AND has
@@ -3278,5 +3373,74 @@ mod tests {
         assert!(key_slug(&long).len() <= 48);
         assert_eq!(key_slug("Hello   World -- Again"), "hello-world-again");
         assert_eq!(key_slug("  leading and trailing  "), "leading-and-trailing");
+    }
+
+    // --- the warn-only atomicity gate at ingest (backlog 72850d43) ---
+
+    fn extraction_with_atoms(atoms: &[&[&str]]) -> DocumentExtraction {
+        serde_json::from_value(serde_json::json!({
+            "source": {"title": "b42 atomicity"},
+            "sections": [{
+                "title": "s",
+                "paragraphs": atoms.iter().map(|a| serde_json::json!({
+                    // Compound by design: the paragraph is never screened.
+                    "text": "One. Two. Three; four.",
+                    "atoms": a,
+                })).collect::<Vec<_>>(),
+            }],
+        }))
+        .expect("extraction")
+    }
+
+    #[test]
+    fn ingest_atomicity_reports_only_compound_atoms() {
+        let none = extraction_with_atoms(&[&["The pump failed.", "The backup took over."]]);
+        assert!(
+            extraction_atomicity(&none).is_none(),
+            "atomic atoms: no field"
+        );
+
+        let mixed = extraction_with_atoms(&[
+            &["The pump failed."],
+            &[
+                "The pump failed, but the backup took over.",
+                "The alarm rang.",
+            ],
+        ]);
+        let a = extraction_atomicity(&mixed).expect("a compound atom is reported");
+        assert_eq!(a["atoms_screened"], 3);
+        assert_eq!(a["compound_atoms"], 1);
+        let ex = &a["examples"][0];
+        assert_eq!(
+            (
+                ex["section"].clone(),
+                ex["paragraph"].clone(),
+                ex["atom"].clone()
+            ),
+            (0.into(), 1.into(), 0.into())
+        );
+        assert_eq!(ex["conjunct_count"], 2);
+    }
+
+    #[test]
+    fn ingest_atomicity_is_added_to_the_response_body() {
+        let body = queued_response(
+            "10.1/b42",
+            "t",
+            Uuid::nil(),
+            Some(serde_json::json!({"compound_atoms": 1})),
+        );
+        assert_eq!(body["atomicity"]["compound_atoms"], 1);
+        assert_eq!(body["status"], "queued");
+        assert!(queued_response("10.1/b42", "t", Uuid::nil(), None)
+            .get("atomicity")
+            .is_none());
+
+        let result = CallToolResult::success(vec![ContentBlock::text(r#"{"status":"ok"}"#)]);
+        let out = with_atomicity(result, Some(serde_json::json!({"compound_atoms": 2})));
+        let text = out.content[0].as_text().unwrap().text.clone();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["atomicity"]["compound_atoms"], 2);
     }
 }

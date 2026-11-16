@@ -522,6 +522,8 @@ async fn prepare_submission(
                         visibility: None,
                         owner_group_id: None,
                         visibility_note: None,
+                        // About the SUBMITTED text, on every path.
+                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
                     },
                 )));
             }
@@ -953,6 +955,8 @@ async fn finish_submission(
         visibility: Some(tenancy.visibility.to_string()),
         owner_group_id: Some(tenancy.owner_group_id.to_string()),
         visibility_note: tenancy.note,
+        // Warn-only (backlog 72850d43): the claim above is already committed.
+        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
     })
 }
 

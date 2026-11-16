@@ -153,6 +153,11 @@ path = "src/bin/decompose_claims.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "atomicity_sweep"
+path = "src/bin/atomicity_sweep.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "prune_recall_events"
 path = "src/bin/prune_recall_events.rs"
 required-features = ["db"]
