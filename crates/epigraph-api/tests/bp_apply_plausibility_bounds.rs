@@ -41,22 +41,23 @@ use uuid::Uuid;
 
 mod common;
 
-/// Frame fixture: binary frame matching `epigraph_engine::cdst_bp::BINARY_FRAME`
-/// (`{"supported", "unsupported"}`). Stored in `frames` so `mass_functions.frame_id`
-/// FK is satisfied. Idempotent across test runs.
+/// Frame fixture: the canonical `binary_truth` frame, the only frame whose
+/// BBAs seed CDST BP (index 0 = TRUE, BP's `supported`). Stored in `frames` so
+/// the `mass_functions.frame_id` FK is satisfied. Get-or-create by name, so
+/// repeated runs on one database reuse the row.
 async fn ensure_binary_frame(pool: &PgPool) -> Uuid {
-    // Deterministic UUID so repeated test runs reuse the same row.
-    let frame_id = Uuid::parse_str("00000000-0000-0000-0000-00000000bf01").expect("constant uuid");
     sqlx::query(
-        "INSERT INTO frames (id, name, hypotheses) \
-         VALUES ($1, 'bp_apply_test_binary', ARRAY['supported','unsupported']::text[]) \
-         ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO frames (name, hypotheses) \
+         VALUES ('binary_truth', ARRAY['TRUE','FALSE']::text[]) \
+         ON CONFLICT (name) DO NOTHING",
     )
-    .bind(frame_id)
     .execute(pool)
     .await
     .expect("seed binary frame");
-    frame_id
+    sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+        .fetch_one(pool)
+        .await
+        .expect("read binary frame")
 }
 
 /// Seed a claim with explicit belief/plausibility/BetP. Mirrors the helper in

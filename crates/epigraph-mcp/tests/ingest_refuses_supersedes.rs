@@ -28,7 +28,7 @@ mod common;
 
 use common::build_scoped_test_server;
 use epigraph_auth::{AuthContext, ClientType};
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_ingest::workflow::WorkflowExtraction;
 use epigraph_mcp::errors::McpError;
 use epigraph_mcp::tools;

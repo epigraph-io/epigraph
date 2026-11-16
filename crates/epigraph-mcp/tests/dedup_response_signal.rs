@@ -34,6 +34,7 @@ fn submit(content: &str, evidence: &str, labels: &[&str]) -> SubmitClaimParams {
         novelty_threshold: None,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

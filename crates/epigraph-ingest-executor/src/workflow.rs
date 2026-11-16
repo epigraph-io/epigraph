@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use epigraph_core::TruthValue;
+use epigraph_db::repos::EdgeSigningKey;
 use epigraph_db::{AgentRepository, ClaimRepository, EdgeRepository, WorkflowRepository};
 use epigraph_ingest::common::plan::IngestPlan;
 use epigraph_ingest::workflow::builder::root_workflow_id;
@@ -429,12 +430,16 @@ async fn reused_with_another_tenancy(
 /// So an idempotent re-ingest reports `executes_edges_created: 0`: the only
 /// count it could read is the stamp's, and the stamp is not the caller. A
 /// caller-facing entry point uses [`execute_workflow_ingest_plan_in_group`].
+///
+/// `key` attests every edge the walk INSERTS (see `execute_plan`); `None`
+/// writes them unsigned.
 pub async fn execute_workflow_ingest_plan(
     conn: &mut sqlx::PgConnection,
+    key: Option<EdgeSigningKey<'_>>,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
-    execute_plan(conn, plan, extraction, None, None, None).await
+    execute_plan(conn, key, plan, extraction, None, None, None).await
 }
 
 /// Execute a workflow ingest plan AS THE CALLER: every row the walk creates
@@ -488,6 +493,9 @@ pub async fn execute_workflow_ingest_plan(
 /// if the caller is admitted, calls again with `admitted: Some(row)`. Pass
 /// `None` on the first call.
 ///
+/// `key` attests every edge the walk INSERTS (see `execute_plan`): the entry
+/// point's own key, never the caller's.
+///
 /// # Errors
 /// As [`execute_workflow_ingest_plan`], plus
 /// [`IngestExecutorError::CallerUnidentified`] for a viewer with no principal,
@@ -497,6 +505,7 @@ pub async fn execute_workflow_ingest_plan(
 /// [`IngestExecutorError::ExistingWorkflowNeedsAuthority`].
 pub async fn execute_workflow_ingest_plan_in_group(
     conn: &mut sqlx::PgConnection,
+    key: Option<EdgeSigningKey<'_>>,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
     caller: &epigraph_db::visibility::Viewer,
@@ -510,7 +519,16 @@ pub async fn execute_workflow_ingest_plan_in_group(
     sqlx::query("SAVEPOINT epigraph_workflow_ingest_attempt")
         .execute(&mut *conn)
         .await?;
-    let out = execute_plan(conn, plan, extraction, Some(caller), declared, admitted).await;
+    let out = execute_plan(
+        conn,
+        key,
+        plan,
+        extraction,
+        Some(caller),
+        declared,
+        admitted,
+    )
+    .await;
     match &out {
         Err(IngestExecutorError::ExistingWorkflowNeedsAuthority { .. }) => {
             sqlx::query("ROLLBACK TO SAVEPOINT epigraph_workflow_ingest_attempt")
@@ -582,9 +600,15 @@ async fn inherited_generation_tenancy(
 
 /// The walk both entry points share. `caller` is `None` only for
 /// [`execute_workflow_ingest_plan`], which never declares a group.
+///
+/// Every edge the walk writes (`variant_of`, `executes`, the plan edges) is
+/// attested at INSERT by `key`: the entry point's own signing
+/// key (the MCP server's, the API's), never the caller's. With `None` they are
+/// written unsigned; a dedup hit writes nothing onto the existing row.
 #[allow(clippy::too_many_lines)]
 async fn execute_plan(
     conn: &mut sqlx::PgConnection,
+    key: Option<EdgeSigningKey<'_>>,
     plan: &IngestPlan,
     extraction: &WorkflowExtraction,
     caller: Option<&epigraph_db::visibility::Viewer>,
@@ -883,8 +907,9 @@ async fn execute_plan(
     // can still see the lineage. Idempotent on re-ingest via
     // create_if_not_exists.
     let variant_of_edge_created = if let Some(parent_id_uuid) = parent_id {
-        EdgeRepository::create_if_absent_including_retracted_conn(
+        EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut *conn,
+            key,
             workflow_id,
             "workflow",
             parent_id_uuid,
@@ -1118,21 +1143,23 @@ async fn execute_plan(
     // same clock tick, which is why `c.id ASC` was there at all.
     let mut executes_edges = 0_usize;
     for (plan_index, planned) in plan.claims.iter().enumerate() {
-        let (_row, _was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
-            &mut *conn,
-            workflow_id,
-            "workflow",
-            planned.id,
-            "claim",
-            "executes",
-            Some(serde_json::json!({
-                "level": planned.level,
-                "plan_index": plan_index,
-            })),
-            None,
-            None,
-        )
-        .await?;
+        let (_row, _was_created) =
+            EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                &mut *conn,
+                key,
+                workflow_id,
+                "workflow",
+                planned.id,
+                "claim",
+                "executes",
+                Some(serde_json::json!({
+                    "level": planned.level,
+                    "plan_index": plan_index,
+                })),
+                None,
+                None,
+            )
+            .await?;
         executes_edges += 1;
     }
 
@@ -1158,8 +1185,9 @@ async fn execute_plan(
             .copied()
             .unwrap_or(edge.target_id);
 
-        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_conn(
+        let (row, was_created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
             &mut *conn,
+            key,
             src,
             &src_type,
             tgt,

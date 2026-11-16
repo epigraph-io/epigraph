@@ -4,7 +4,7 @@ This is the net-new glue for backlog b5518801. The fetch/parse layer
 (extract_html.py, extract_textbook.py) recovers source structure
 (title/authors/sections/paragraphs). This module maps that recovered structure
 onto the schema the live MCP `ingest_document` tool parses:
-`epigraph_ingest::schema::DocumentExtraction` (crates/epigraph-ingest/src/document/schema.rs).
+`epigraph_ingest::document::schema::DocumentExtraction` (crates/epigraph-ingest/src/document/schema.rs).
 
 IMPORTANT — emit the RUST shape, not the SKILL.md example shape:
   * paragraph key is `text` (a String, the FAITHFUL full recovered text — Tier 2,

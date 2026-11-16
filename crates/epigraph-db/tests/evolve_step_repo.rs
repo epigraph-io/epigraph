@@ -240,6 +240,7 @@ async fn evolve_step_supersedes_refuses_when_the_predecessor_cannot_be_retired(p
     let mut tx = pool.begin().await.unwrap();
     let r = ClaimRepository::evolve_step_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(parent),
         "successor of an unretirable step",
         "supersedes",
@@ -338,6 +339,7 @@ async fn evolve_step_revises_refuses_when_the_lineage_back_fill_changes_no_row(p
     let mut tx = pool.begin().await.unwrap();
     let r = ClaimRepository::evolve_step_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(parent),
         content,
         "revises",
@@ -616,6 +618,7 @@ async fn plain_supersede_of_a_lineage_step_moves_executes_but_leaves_asserts(poo
     let mut tx = pool.begin().await.unwrap();
     let (new_id, _) = ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         ClaimId::from_uuid(step),
         "a plain restatement",
         epigraph_core::TruthValue::clamped(0.6),

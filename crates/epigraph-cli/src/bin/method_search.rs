@@ -261,14 +261,7 @@ Return 3-8 claims."#,
                 .generate(content)
                 .await
                 .map_err(|e| format!("Embedding failed: {e}"))?;
-            let embedding_str = format!(
-                "[{}]",
-                embedding
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let embedding_str = epigraph_db::pgvector_literal(&embedding);
 
             // Insert claim
             let new_claim = WebSearchClaim {

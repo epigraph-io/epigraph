@@ -52,6 +52,7 @@ async fn e2e_empty_thesis_rejected_before_db_write() {
 
     let result = execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )

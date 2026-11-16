@@ -2493,9 +2493,14 @@ pub async fn seal_commit(
                 message: "Failed to encode the reseal check job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
-            .map_err(plan_write_error)?;
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+        )
+        .await
+        .map_err(plan_write_error)?;
     }
 
     tx.commit()
@@ -2858,9 +2863,14 @@ pub async fn unseal_commit(
                 message: "Failed to encode the re-embedding job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
-            .map_err(plan_write_error)?;
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::EMBEDDING_RESTORE_JOB_ATTEMPTS,
+        )
+        .await
+        .map_err(plan_write_error)?;
     }
 
     // Unsealing is the OTHER way a group answers a rotation: a claim whose
@@ -2882,9 +2892,14 @@ pub async fn unseal_commit(
                 message: "Failed to encode the reseal check job".to_string(),
             }
         })?;
-        PrivatizationRepository::enqueue_job_conn(&mut tx, job.job_type(), &payload)
-            .await
-            .map_err(plan_write_error)?;
+        PrivatizationRepository::enqueue_job_conn(
+            &mut tx,
+            job.job_type(),
+            &payload,
+            epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+        )
+        .await
+        .map_err(plan_write_error)?;
     }
 
     PrivatizationRepository::record_seal_audit_conn(
@@ -3489,9 +3504,14 @@ async fn dispatch(
     )
     .await?;
 
-    let job_id = PrivatizationRepository::enqueue_job_conn(&mut tx, &job_type, &payload)
-        .await
-        .map_err(plan_write_error)?;
+    let job_id = PrivatizationRepository::enqueue_job_conn(
+        &mut tx,
+        &job_type,
+        &payload,
+        epigraph_db::repos::privatization::PRIVATIZATION_JOB_ATTEMPTS,
+    )
+    .await
+    .map_err(plan_write_error)?;
 
     tx.commit()
         .await

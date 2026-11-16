@@ -77,6 +77,8 @@ fn find_extraction_script() -> Option<PathBuf> {
 /// - `400 Bad Request` — Invalid source format
 /// - `500 Internal Server Error` — Pipeline execution failed
 pub async fn ingest_paper(
+    // `claims:admin`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeAdmin,
     State(_state): State<AppState>,
     Json(request): Json<IngestPaperRequest>,
 ) -> Result<(StatusCode, Json<IngestPaperResponse>), ApiError> {

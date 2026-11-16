@@ -342,3 +342,72 @@ def compute_betp(masses: dict) -> tuple[float, float, float]:
     betp_unsup = m_unsup + m_theta / 2
 
     return betp_sup, betp_unsup, m_theta
+
+
+# ── Runtime prediction set (auto_tier routing) ──────────────────────────────
+#
+# scripts/calibrate_conformal.py fits per-class quantiles q_c on the SciFact
+# fixtures under exactly this score: the directed BBA at the peer-reviewed
+# open-world fraction, with no section / journal / uncertainty discount, then
+# compute_betp (NOT renormalized). Any other score here would compare against
+# quantiles fit on a different quantity, so these helpers mirror it one for
+# one; calibrate_conformal.py keeps its own copy as the independent oracle the
+# routing tests compare against.
+
+CONFORMAL_CLASSES = ("supported", "contradicted", "not_enough_info")
+CONFORMAL_OPEN_WORLD_FRACTION = OPEN_WORLD_FRACTIONS["peer_reviewed"]
+
+
+def conformal_scores(masses: dict) -> dict[str, float]:
+    """Nonconformity score per class: 1 - BetP_c, and 1 - theta for NEI."""
+    betp_sup, betp_unsup, theta = compute_betp(masses)
+    return {
+        "supported": 1.0 - betp_sup,
+        "contradicted": 1.0 - betp_unsup,
+        "not_enough_info": 1.0 - theta,
+    }
+
+
+def conformal_prediction_set(
+    evidence_type: str,
+    methodology: str,
+    confidence: float,
+    supports: bool,
+    quantiles: dict[str, float],
+) -> list[str]:
+    """Classes c with score_c <= q_c (inclusive), in CONFORMAL_CLASSES order.
+
+    An empty set is a legitimate abstention (no class conforms); a set of two
+    or more is ambiguity. Only a singleton is a confident label.
+    """
+    masses = build_bba_directed(
+        evidence_type=evidence_type,
+        methodology=methodology,
+        confidence=confidence,
+        supports=supports,
+        open_world_fraction=CONFORMAL_OPEN_WORLD_FRACTION,
+    )
+    scores = conformal_scores(masses)
+    return [c for c in CONFORMAL_CLASSES if scores[c] <= quantiles[c]]
+
+
+def load_conformal_quantiles(path) -> dict[str, float]:
+    """Read `[conformal.quantiles]` from a calibration.toml.
+
+    Raises ValueError when the section or a class is missing. There is no
+    include-always fallback (q_c = 1.0, the Rust ConformalConfig default): for
+    routing it would make every set non-singleton and silently send every
+    claim to the more expensive tier.
+    """
+    import tomllib
+
+    with open(path, "rb") as fh:
+        data = tomllib.load(fh)
+    quantiles = (data.get("conformal") or {}).get("quantiles")
+    if not isinstance(quantiles, dict):
+        raise ValueError(f"{path} has no [conformal.quantiles] section "
+                         "(fit it with scripts/calibrate_conformal.py)")
+    missing = [c for c in CONFORMAL_CLASSES if c not in quantiles]
+    if missing:
+        raise ValueError(f"{path} [conformal.quantiles] is missing {missing}")
+    return {c: float(quantiles[c]) for c in CONFORMAL_CLASSES}

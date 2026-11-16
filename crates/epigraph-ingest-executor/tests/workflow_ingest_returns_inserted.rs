@@ -53,6 +53,7 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     // First run: every planned claim is newly inserted and must be surfaced.
     let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -78,6 +79,7 @@ async fn returns_inserted_claim_ids_and_content(pool: PgPool) {
     // Second run: idempotency gate fires; no new surfacing.
     let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -114,6 +116,7 @@ async fn returns_empty_inserted_on_partial_dedup(pool: PgPool) {
     // First run: writes workflow row + claims + executes edges normally.
     let r1 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )
@@ -145,6 +148,7 @@ async fn returns_empty_inserted_on_partial_dedup(pool: PgPool) {
     // falls through to claim-walk where every claim hits was_new=false.
     let r2 = epigraph_ingest_executor::execute_workflow_ingest_plan(
         &mut pool.acquire().await.expect("acquire"),
+        None,
         &plan,
         &extraction,
     )

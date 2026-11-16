@@ -322,6 +322,7 @@ main.board {
 .c-top { display: flex; align-items: center; gap: 6px; min-height: 20px; }
 .cid { color: var(--text-3); font-size: 11px; }
 .elapsed { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.corr { color: var(--text-3); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .c-title {
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
   background: none; border: 0; padding: 0; margin: 0; text-align: left; color: var(--text);
@@ -769,6 +770,8 @@ var STATUS = {
   awaiting_review: ['Awaiting review', 'purple'], merging: ['Merging', 'teal'], merged: ['Merged', 'green'],
   failed: ['Failed', 'red'], stopped: ['Stopped', '']
 };
+// The claim's own backlog:* status label (server.py backlog_status), not the board's agent-run STATUS above.
+var BACKLOG_STATUS = { pending: ['pending', 'outline'], working: ['working', 'blue'], completed: ['completed', 'green'] };
 var QUICK = ['bug', 'feature-request'];
 
 var S = null;
@@ -1097,7 +1100,7 @@ function elapsedOf(c) {
   return e ? dur(e - s) : '';
 }
 function cardSig(c) {
-  return JSON.stringify([c.column, c.status, c.stale, titleOf(c), c.labels,
+  return JSON.stringify([c.column, c.status, c.stale, titleOf(c), c.labels, c.backlog_status, c.corroboration_count,
     c.blockers.map(function (b) { return [b.id, b.resolved, b.severity]; }),
     c.pr_url, c.pr_number, c.last_activity, elapsedOf(c), selected.has(c.id), drawer.id === c.id]);
 }
@@ -1125,6 +1128,18 @@ function flagBadges(c) {
   if (nb) out.push(h('span', { class: 'flag', title: nb + ' open blocker' + (nb > 1 ? 's' : '') }, icon('flag', 11), String(nb)));
   if (nw) out.push(h('span', { class: 'flag warn', title: nw + ' open warning' + (nw > 1 ? 's' : '') }, icon('flag', 11), String(nw)));
   return out;
+}
+function backlogStatusPill(c) {
+  var m = BACKLOG_STATUS[c.backlog_status];
+  if (!m) return null;
+  return h('span', { class: 'pill ' + m[1], title: 'Backlog status label: backlog:' + c.backlog_status, text: m[0] });
+}
+function corroborationBadge(c) {
+  // null = not counted (claude source, or the count failed); 0 is a real zero
+  var n = c.corroboration_count;
+  var known = typeof n === 'number';
+  return h('span', { class: 'corr', title: known ? n + ' other claim' + (n === 1 ? '' : 's') + ' corroborate' + (n === 1 ? 's' : '') + ' this item'
+    : 'Corroboration count unavailable (the http backlog source counts corroborates edges)', text: (known ? String(n) : '\u2014') + ' corr' });
 }
 function labelChips(labels, max) {
   var ls = labels.filter(function (l) { return l !== 'backlog'; });
@@ -1173,8 +1188,10 @@ function buildCard(c) {
   top.appendChild(h('span', { class: 'cid mono', text: short(c.id) }));
   if (c.status && c.status !== 'idle') top.appendChild(statusPill(c.status));
   if (c.stale) top.appendChild(h('span', { class: 'pill', text: 'stale', title: 'No longer in the EpiGraph backlog source' }));
+  append(top, backlogStatusPill(c));
   top.appendChild(h('span', { class: 'grow' }));
   append(top, flagBadges(c));
+  top.appendChild(corroborationBadge(c));
   var el2 = elapsedOf(c);
   if (el2) top.appendChild(h('span', { class: 'elapsed', text: el2, title: 'Started ' + fmtDate(c.started_at) + (c.finished_at ? '\nFinished ' + fmtDate(c.finished_at) : '') }));
   el.appendChild(top);
@@ -1448,13 +1465,15 @@ function renderDrawer() {
   $('#drShort').textContent = short(c.id);
   $('#drTitle').textContent = titleOf(c);
 
-  section('pills', $('#drPills'), JSON.stringify([c.status, c.column, c.stale, c.blockers, c.truth_value]), function () {
+  section('pills', $('#drPills'), JSON.stringify([c.status, c.column, c.stale, c.blockers, c.truth_value, c.backlog_status, c.corroboration_count]), function () {
     return [
       h('span', { class: 'pill accent', text: COLNAME[c.column] || c.column }),
       c.status !== 'idle' ? statusPill(c.status) : null,
       c.stale ? h('span', { class: 'pill', text: 'stale', title: 'No longer in the EpiGraph backlog source' }) : null,
+      backlogStatusPill(c),
       flagBadges(c),
-      c.truth_value != null ? h('span', { class: 'pill outline', title: 'Claim truth value', text: 'truth ' + Number(c.truth_value).toFixed(2) }) : null
+      c.truth_value != null ? h('span', { class: 'pill outline', title: 'Claim truth value', text: 'truth ' + Number(c.truth_value).toFixed(2) }) : null,
+      corroborationBadge(c)
     ];
   });
 
@@ -1958,6 +1977,7 @@ function createDemo() {
   function mk(o) {
     var c = {
       id: uid(), labels: ['backlog'], truth_value: 0.6, created_at: ago(60 * 24), column: 'backlog', status: 'idle', stale: false,
+      backlog_status: null, corroboration_count: 0,
       blockers: [], branch: null, worktree: null, pr_url: null, pr_number: null, session_id: null, integration_branch: null,
       summary: null, verification: null, started_at: null, finished_at: null, cost_usd: null, last_activity: null, history: []
     };
@@ -1977,8 +1997,8 @@ function createDemo() {
   function withPr(c, n) { c.pr_number = n; c.pr_url = 'https://github.com/example/epigraph/pull/' + n; return c; }
 
   // Backlog
-  mk({ content: 'BUG: recall_with_context surfaces superseded claims when the supersede path skipped the embedding null.\n\nRepro: supersede a claim via supersede_claim, then recall() with the old wording; the stale row ranks first. Expected: only is_current rows carry embeddings (see CLAUDE.md embedding policy).', labels: ['bug', 'embeddings', 'recall'], truth_value: 0.82, created_at: ago(60 * 30) });
-  mk({ content: 'Expose live_missing / stale_present embedding-gap counters in system_stats so the embedding invariant is observable without ad-hoc SQL.', labels: ['feature-request', 'observability', 'embeddings'], truth_value: 0.71, created_at: ago(60 * 24 * 5) });
+  mk({ content: 'BUG: recall_with_context surfaces superseded claims when the supersede path skipped the embedding null.\n\nRepro: supersede a claim via supersede_claim, then recall() with the old wording; the stale row ranks first. Expected: only is_current rows carry embeddings (see CLAUDE.md embedding policy).', labels: ['bug', 'embeddings', 'recall', 'backlog:working'], backlog_status: 'working', corroboration_count: 3, truth_value: 0.82, created_at: ago(60 * 30) });
+  mk({ content: 'Expose live_missing / stale_present embedding-gap counters in system_stats so the embedding invariant is observable without ad-hoc SQL.', labels: ['feature-request', 'observability', 'embeddings', 'backlog:pending'], backlog_status: 'pending', corroboration_count: null, truth_value: 0.71, created_at: ago(60 * 24 * 5) });
   mk({ content: 'Switch /api/v1/claims/by-labels pagination from OFFSET to keyset (created_at, id). Offset scans dominate latency past 180k claims.', labels: ['perf', 'api', 'db'], truth_value: 0.64, created_at: ago(60 * 24 * 9) });
   mk({ content: 'theme_cluster: bound cluster-run memory. The 200k-claim run OOMs the API process at roughly 6 GiB.', labels: ['bug', 'clustering', 'perf'], truth_value: 0.77, created_at: ago(60 * 20) });
   mk({ content: 'Add a coverage test asserting federated tools never appear in SCOPE_MAP; they are gated by the scope= in EPIGRAPH_MCP_EXTENSIONS instead.', labels: ['test', 'mcp', 'federation'], truth_value: 0.55, created_at: ago(60 * 24 * 20), stale: true });
