@@ -82,6 +82,12 @@ pub const DEFAULT_NOVELTY_THRESHOLD: f64 = 0.05;
 /// * The bare forms the same reporters used before their labels were prefixed
 ///   (`gen-status`, `generator-summary`, `review-status`, `revise-status`,
 ///   `research-scan`).
+/// * `journal-status`: the dated daily-journal summary (backlog `ea5fdd7f`).
+///   Day N+1's summary is templated on day N's, so without its own status label
+///   it was answered with the earlier day's claim id and never written. The
+///   journal's TOPIC label, `daily-journal`, is deliberately NOT exempt: the
+///   journal also stamps it on the backlog items it files, and those must stay
+///   deduplicated against each other.
 ///
 /// Matching is EXACT (no prefix, suffix or case folding). Deliberately excluded
 /// although they co-occur with status claims: TOPIC labels such as
@@ -89,7 +95,7 @@ pub const DEFAULT_NOVELTY_THRESHOLD: f64 = 0.05;
 /// not that it is a periodic report, and exempting one would silently disable
 /// dedup for genuine content on that topic. A new recurring reporter adds its
 /// summary label here.
-pub const STATUS_CLAIM_LABELS: [&str; 13] = [
+pub const STATUS_CLAIM_LABELS: [&str; 14] = [
     "telemetry",
     "gen-status",
     "generator-summary",
@@ -103,6 +109,7 @@ pub const STATUS_CLAIM_LABELS: [&str; 13] = [
     "grant-gen-status",
     "grant-run-status",
     "grant-dedup-status",
+    "journal-status",
 ];
 
 /// `true` when any of `labels` is in [`STATUS_CLAIM_LABELS`].
@@ -587,6 +594,10 @@ mod tests {
             "norcal-rfp-gen-status-v2",
             "rfp-gen-status",
             "per-exit-status",
+            // The journal's topic label stays armed; only its status label is
+            // exempt (backlog ea5fdd7f).
+            "daily-journal",
+            "journal",
         ] {
             assert!(
                 !is_status_claim(&[lookalike.to_string()]),

@@ -116,7 +116,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("revoke_signature.rs", 6),
     ("search.rs", 4),
     ("submit.rs", 5),
-    ("workflows.rs", 4),
+    ("workflows.rs", 2),
 ];
 
 /// Total of [`REGISTER`]. Never raise this.
@@ -132,9 +132,13 @@ const REGISTER: &[(&str, usize)] = &[
 /// into `MassFunctionRepository::frame_conflict_summary` (`belief.rs` 10 -> 9)
 /// and the compound neighbourhood's graph reads into `GraphViewRepository`
 /// (`graph_neighborhood.rs` 7 -> 1).
-/// Lowered to 103 on staging batch 3, where the B08 / B22 / B23 stack meets
-/// the rest of the batch: `belief.rs` measures 7 on the combined tree.
-const HIGH_WATER: usize = 103;
+/// Lowered to 103 on staging batch 3a (#922), where the B08 / B22 stack met
+/// the rest of that batch: `belief.rs` measures 7 on the combined tree.
+/// Lowered to 101 on staging batch 4 when the hierarchical outcome report's
+/// counter write (its `SELECT metadata .. FOR UPDATE` and
+/// `UPDATE workflows SET metadata`) moved into `WorkflowRepository`, shared
+/// with the MCP tool (`workflows.rs` 4 -> 2, backlog batch B31).
+const HIGH_WATER: usize = 101;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

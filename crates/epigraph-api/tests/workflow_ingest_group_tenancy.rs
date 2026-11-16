@@ -2178,6 +2178,7 @@ async fn mcp_reports(
         &w.c_server,
         &viewer,
         epigraph_mcp::types::ReportHierarchicalOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             step_executions: Vec::new(),
@@ -2192,6 +2193,7 @@ async fn mcp_reports(
         &w.c_server,
         &viewer,
         epigraph_mcp::types::ReportWorkflowOutcomeParams {
+            idempotency_key: None,
             workflow_id: workflow_id.to_string(),
             success: true,
             execution_log: Vec::new(),
