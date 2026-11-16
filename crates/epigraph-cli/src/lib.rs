@@ -1,4 +1,5 @@
 pub mod atlas_layout;
+pub mod atlas_meaning;
 #[cfg(feature = "db")]
 pub mod atomicity_sweep;
 #[cfg(feature = "db")]

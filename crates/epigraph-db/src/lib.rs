@@ -198,6 +198,8 @@ pub use repos::AtlasMapRepository;
 pub use repos::{id_prefix_bounds, ID_PREFIX_CONTENT_CHARS, MIN_ID_PREFIX_HEX};
 // The Atlas leaf node sets (Atlas W3).
 pub use repos::AtlasLeafRepository;
+// The Atlas "by meaning" hierarchy's reads (Atlas W4).
+pub use repos::AtlasMeaningRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
