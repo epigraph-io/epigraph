@@ -72,7 +72,7 @@ clap = { workspace = true, features = ["derive", "env"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-# HTTP client (for embedding service)
+# HTTP client (federation client; embedding goes through epigraph-embeddings)
 reqwest = { workspace = true }
 
 # Crypto primitives
@@ -104,6 +104,8 @@ futures = { workspace = true }
 # events emitted from src/ (different crate target). Without it, the macro's
 # default env filter scopes capture to the test crate only.
 tracing-test = { version = "0.2", features = ["no-env-filter"] }
+# HTTP fixture for `embed::tests`: which model each dim's provider sends.
+wiremock = "0.6"
 
 [features]
 default = []

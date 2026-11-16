@@ -16,7 +16,7 @@
 //! Version 1 signs a TAGGED message, never the digest itself:
 //!
 //! ```text
-//! b"epigraph-sig-v1:" || <kind> || b":" || digest      kind ∈ {claim, evidence, edge}
+//! b"epigraph-sig-v1:" || <kind> || b":" || digest      kind ∈ {claim, evidence, edge, dataset}
 //! ```
 //!
 //! Only the signed message changes. The stored `content_hash`, every content
@@ -48,6 +48,12 @@ pub enum SignedEntity {
     /// An `edges` row; the digest is its `content_hash` (the edge attestation
     /// digest, see `epigraph_db::repos::edge_signature`).
     Edge,
+    /// The structured fields of a `dataset` evidence row (root, manifest
+    /// digest, counts), bound to that row's evidence and claim ids; the digest
+    /// is `EvidenceType::dataset_attestation_digest` in epigraph-core
+    /// (backlog c8beb101). A kind of its own, so the evidence row's signature
+    /// over its `content_hash` is exactly what it was.
+    Dataset,
 }
 
 impl SignedEntity {
@@ -58,6 +64,7 @@ impl SignedEntity {
             Self::Claim => "claim",
             Self::Evidence => "evidence",
             Self::Edge => "edge",
+            Self::Dataset => "dataset",
         }
     }
 }
@@ -156,6 +163,7 @@ mod tests {
             SignedEntity::Claim,
             SignedEntity::Evidence,
             SignedEntity::Edge,
+            SignedEntity::Dataset,
         ];
         for signed_as in kinds {
             let sig = s.sign_entity(signed_as, &h);
@@ -224,6 +232,10 @@ mod tests {
         let mut want = b"epigraph-sig-v1:edge:".to_vec();
         want.extend_from_slice(&h);
         assert_eq!(signing_message(SignedEntity::Edge, &h), want);
+
+        let mut want = b"epigraph-sig-v1:dataset:".to_vec();
+        want.extend_from_slice(&h);
+        assert_eq!(signing_message(SignedEntity::Dataset, &h), want);
     }
 
     #[test]

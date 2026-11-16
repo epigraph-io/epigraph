@@ -130,6 +130,12 @@ async fn call(router: &axum::Router, uri: &str, token: &str, body: &Value) -> (S
 
 /// An app-role MCP server whose own (stdio) agent is keyed by `seed`, with a
 /// fixed-vector generator so its post-commit embeds run without a provider.
+///
+/// Its own agent is resolved here, as a deployed server's already exists: the
+/// workflow tools resolve the server's edge signing key on every
+/// call, and the FIRST resolution of a brand-new key registers its agent (an
+/// `agent.registered` event), which the "nothing was announced" arms below
+/// would otherwise count against the caller's call.
 async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMcpFull {
     let scoped = app_scoped(pool).await;
     let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
@@ -137,8 +143,13 @@ async fn mcp_server(pool: &PgPool, seed: u8) -> epigraph_mcp::server::EpiGraphMc
     let embedder = epigraph_mcp::embed::McpEmbedder::new(plain.clone(), None)
         .with_scoped_pool(scoped.clone())
         .with_generator(std::sync::Arc::new(|_text: &str| Ok(vec![0.5_f32; 1536])));
-    epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
-        .with_scoped_pool(scoped)
+    let server = epigraph_mcp::server::EpiGraphMcpFull::new(plain, signer, embedder, false)
+        .with_scoped_pool(scoped);
+    server
+        .server_agent_id()
+        .await
+        .expect("resolve the server's own agent");
+    server
 }
 
 /// The stdio server's own agent, created by its first viewer resolution.
@@ -806,7 +817,7 @@ async fn world(pool: &PgPool) -> World {
             serde_json::from_value(extraction(LEGACY, 0, 2)).expect("legacy extraction");
         let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
         let mut tx = scoped.begin_as(&authority.viewer).await.expect("stamp");
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &extraction)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, None, &plan, &extraction)
             .await
             .expect("the legacy ingest");
         tx.commit().await.expect("commit the legacy ingest");
@@ -1222,6 +1233,7 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
         .expect("stamp from the stale viewer");
     let refused = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
         &mut tx,
+        None,
         &plan,
         &x,
         &stale,
@@ -1246,7 +1258,7 @@ async fn a_membership_ended_after_the_viewer_resolved_is_refused_live(pool: PgPo
         .await
         .expect("stamp from the stale viewer");
     let out = epigraph_ingest_executor::execute_workflow_ingest_plan_in_group(
-        &mut tx, &plan, &x, &stale, None, None,
+        &mut tx, None, &plan, &x, &stale, None, None,
     )
     .await
     .expect("an undeclared ingest still lands");
@@ -1443,7 +1455,7 @@ async fn an_ingest_into_an_existing_row_with_no_plan_needs_authority_over_it(poo
             serde_json::from_value(extraction(name, 0, 1)).expect("extraction");
         let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&x);
         let mut tx = scoped.begin_as(&authority.viewer).await.expect("stamp");
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, &plan, &x)
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut tx, None, &plan, &x)
             .await
             .expect("the system ingest");
         tx.commit().await.expect("commit");

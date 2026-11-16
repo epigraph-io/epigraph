@@ -30,7 +30,7 @@ mod fixture;
 use epigraph_crypto::AgentSigner;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{AgentRepository, ScopedPool, SessionGucMode};
-use epigraph_ingest::schema::DocumentExtraction;
+use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
@@ -587,6 +587,7 @@ async fn a_document_repeating_a_directly_filed_claim_leaves_the_filer_its_author
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

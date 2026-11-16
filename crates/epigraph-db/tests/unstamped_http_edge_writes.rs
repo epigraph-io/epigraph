@@ -49,7 +49,6 @@
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
 //! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
-//! | crud.rs | create_reasoning_trace | claim -> trace HAS_TRACE | no |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
 //! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
@@ -73,18 +72,39 @@
 //! moved onto the stamped claim-write transaction (operator-binding delta
 //! review), and since ruling R-50 `persist_packet`'s five and
 //! `experiment_loop.rs`'s four write through `EdgeRepository`'s signed
-//! primitive (the latter now counted in [`UNSTAMPED`]). What remains:
+//! primitive (the latter now counted in [`UNSTAMPED`]). None remains: the
+//! register is empty and stays empty, so any new route-layer raw
+//! edge INSERT fails [`the_route_layer_raw_edge_inserts_are_exactly_the_register`].
 //!
-//! | file | handler | endpoints -> relationship | executor | in D8 scope |
+//! # The third register: unstamped raw-pool TRANSACTIONS that write edges
+//!
+//! `crud.rs::promote_staged_edges` (claims:admin) left the second register
+//! (backlog `dae795f8`) when its two raw `INSERT INTO edges` statements became
+//! one `EdgeRepository::create_signed_conn` per staged row, each on a SAVEPOINT
+//! of one transaction. That transaction is still begun on `state.db_pool`
+//! with no principal stamped, so every copy lands world-owned exactly as
+//! before: the copies are SIGNED now, not STAMPED. The [`UNSTAMPED`] scanner
+//! does not see it (its executor is the savepoint handle `&mut sp`, not the
+//! raw pool), so it is named in [`UNSTAMPED_TRANSACTIONS`], and
+//! [`the_unstamped_edge_transactions_are_still_unstamped`] checks each named
+//! handler still begins its transaction on the raw pool and still writes
+//! through `EdgeRepository`. Delete a row when its handler is stamped.
+//!
+//! | file | handler | endpoints -> relationship | executor | in migration 120's scope |
 //! |---|---|---|---|---|
-//! | crud.rs | promote_staged_edges (claims:admin) | any staged pair (x2 statements) | `state.db_pool` | when the staged pair is claim/evidence at both ends |
+//! | crud.rs | promote_staged_edges (claims:admin) | any staged pair (one signed insert per row) | a savepoint of a `state.db_pool` transaction | when the staged pair is claim/evidence at both ends |
+//!
+//! `no_unscoped_pool.rs`'s per-file count for `routes/crud.rs` counts the same
+//! raw-pool `begin()`.
 //!
 //! # What this file does NOT see
 //!
 //! An edge INSERT inside another repo function that a raw-pool handler reaches
-//! (for example `ClaimRepository`, `AnalysisRepository`, `WorkflowRepository`,
-//! `SemanticLinkRepository` writing edges of their own) is not counted here.
-//! That now includes `cross_source.rs::decide_candidate`'s promote, which left
+//! (for example `ClaimRepository`, `AnalysisRepository` or `WorkflowRepository`
+//! writing edges of their own) is not counted here. On the request paths those
+//! repo edges are now signed at INSERT (backlog `dae795f8`); signing does not
+//! stamp them.
+//! The unseen set includes `cross_source.rs::decide_candidate`'s promote, which left
 //! this register in U012 WITHOUT being stamped: its matcher edge (claim -> claim,
 //! in D8 scope) is written inside `MatchCandidateRepo::promote_if_pending`, on
 //! the same transaction as the candidate's status flip, still on the raw pool
@@ -135,11 +155,13 @@ const UNSTAMPED: &[(&str, usize)] = &[
     ("community.rs", 1),
     // 6 before the W12b revise, which stamped `share_skill`'s and
     // `forget_convention`'s in-scope edge statements.
-    ("conventions.rs", 4),
+    ("conventions.rs", 3),
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
-    ("crud.rs", 2),
+    // 2 before backlog f64cf9c6: `create_reasoning_trace` writes its HAS_TRACE
+    // edge on the caller's stamped `AppState::write_as` transaction.
+    ("crud.rs", 1),
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
@@ -154,16 +176,32 @@ const UNSTAMPED: &[(&str, usize)] = &[
 ///
 /// 31 -> 27: `provenance.rs::set_provenance` writes its four edges on the
 /// caller's stamped transaction and left the register.
-const HIGH_WATER: usize = 27;
+///
+/// 27 -> 26 (backlog f64cf9c6): `create_reasoning_trace` was stamped and its
+/// `crud.rs` row fell 2 -> 1.
+/// 26 -> 25 (backlog 2d60f619, merged on staging batch 4): `learn_convention`'s
+/// evidence -> claim edge moved into the evidence write (`conventions.rs` 4 -> 3).
+const HIGH_WATER: usize = 25;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo
 /// layer on a stamped transaction; delete it at zero. Never raise one.
-const RAW_INSERTS: &[(&str, usize)] = &[("crud.rs", 2)];
+///
+/// Empty: `crud.rs::promote_staged_edges`'s two statements (the last row)
+/// moved onto the signed repo primitive, still unstamped (it is now in
+/// [`UNSTAMPED_TRANSACTIONS`]).
+const RAW_INSERTS: &[(&str, usize)] = &[];
 
-/// The total [`RAW_INSERTS`] may never exceed. 11 before R-50 moved
-/// `submit.rs`'s five and `experiment_loop.rs`'s four onto the signed primitive.
-const RAW_HIGH_WATER: usize = 2;
+// Its high water was 11 before `submit.rs`'s five and `experiment_loop.rs`'s
+// four moved onto the signed primitive, then 2, and 0 since
+// `crud.rs::promote_staged_edges` did (backlog `dae795f8`): the register stays
+// empty, which the register test asserts.
+
+/// Route handlers that write edges through `EdgeRepository` on a handle
+/// derived from a transaction begun on the UNSTAMPED raw pool (a savepoint, a
+/// `&mut *tx`), which [`UNSTAMPED`]'s executor scan cannot see. Per (file,
+/// handler). Delete a row when its handler moves onto a stamped transaction.
+const UNSTAMPED_TRANSACTIONS: &[(&str, &str)] = &[("crud.rs", "promote_staged_edges")];
 
 /// Whether `line` (trimmed) opens with a test-gating `cfg` attribute.
 fn is_cfg_test(line: &str) -> bool {
@@ -543,10 +581,9 @@ fn the_route_layer_raw_edge_inserts_are_exactly_the_register() {
          and run it on a transaction stamped with the caller's viewer \
          (`AppState::write_as`). A statement that went away: lower its row."
     );
-    let total: usize = RAW_INSERTS.iter().map(|(_, n)| n).sum();
     assert!(
-        total <= RAW_HIGH_WATER,
-        "the raw-insert register grew past its high-water mark ({total} > {RAW_HIGH_WATER})"
+        RAW_INSERTS.is_empty(),
+        "the raw-insert register reached zero and stays empty: never add a row"
     );
 }
 
@@ -562,10 +599,90 @@ fn the_raw_insert_scanner_skips_comments_and_every_test_region_spelling() {
     assert_eq!(count_raw_inserts(src), 2);
     let plain = "fn a() {}\n#[cfg(test)]\nmod t { const S: &str = \"INSERT INTO edges\"; }\n";
     assert_eq!(count_raw_inserts(plain), 0);
+    // No live-tree `> 0` check: the register is empty by design. The extent
+    // test below proves the scanner reads the real route files.
+}
+
+/// The body of the first `fn <handler>(` in `src` (the `cfg(feature = "db")`
+/// definition precedes its no-db stub in every route file), outside test code.
+fn handler_body<'a>(src: &'a str, handler: &str) -> Option<&'a str> {
+    let (mask, _) = test_lines(src);
+    let needle = format!("fn {handler}(");
+    let mut offset = 0usize;
+    for (i, line) in src.lines().enumerate() {
+        if !mask[i] && !line.trim_start().starts_with("//") && line.contains(&needle) {
+            let rest = &src[offset..];
+            let span = block_line_span(rest)?;
+            let end = rest
+                .match_indices('\n')
+                .nth(span)
+                .map_or(rest.len(), |(k, _)| k);
+            return Some(&rest[..end]);
+        }
+        offset += line.len() + 1;
+    }
+    None
+}
+
+/// Whether a handler body still writes an edge through `EdgeRepository` on a
+/// transaction begun on the raw, unstamped pool.
+fn writes_edges_on_an_unstamped_transaction(body: &str) -> bool {
+    let code: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    code.contains("state.db_pool.begin()") && code.contains("EdgeRepository::create")
+}
+
+#[test]
+fn the_unstamped_edge_transactions_are_still_unstamped() {
+    let dir = repo_root().join(ROUTES);
+    for (file, handler) in UNSTAMPED_TRANSACTIONS {
+        let src = std::fs::read_to_string(dir.join(file)).expect("read route file");
+        let body = handler_body(&src, handler)
+            .unwrap_or_else(|| panic!("{file}: no `fn {handler}(` outside test code"));
+        assert!(
+            writes_edges_on_an_unstamped_transaction(body),
+            "{file}::{handler} no longer writes edges on a transaction begun on \
+             `state.db_pool`. If it is stamped now, delete its row from \
+             UNSTAMPED_TRANSACTIONS and the module doc's third register."
+        );
+    }
+}
+
+#[test]
+fn the_unstamped_transaction_check_tells_a_stamped_handler_apart() {
+    let raw = "pub async fn h(\n) {\n\
+               let mut tx = state.db_pool.begin().await?;\n\
+               let mut sp = sqlx::Acquire::begin(&mut *tx).await?;\n\
+               EdgeRepository::create_signed_conn(&mut sp, key, a);\n\
+               }\n\
+               pub async fn h(\n) { stub() }\n";
+    let body = handler_body(raw, "h").expect("found");
+    assert!(writes_edges_on_an_unstamped_transaction(body));
     assert!(
-        measure_raw_inserts().values().sum::<usize>() > 0,
-        "the raw-insert scanner is vacuous"
+        !body.contains("stub"),
+        "only the first definition: {body:?}"
     );
+    let stamped = "pub async fn h(\n) {\n\
+                   let mut tx = state.write_as(&viewer).await?;\n\
+                   EdgeRepository::create_signed_conn(&mut *tx, key, a);\n\
+                   }\n";
+    assert!(!writes_edges_on_an_unstamped_transaction(
+        handler_body(stamped, "h").expect("found")
+    ));
+    let commented = "fn h() {\n\
+                     // was: state.db_pool.begin()\n\
+                     let mut tx = state.write_as(&viewer).await?;\n\
+                     EdgeRepository::create_conn(&mut *tx, a);\n}\n";
+    assert!(!writes_edges_on_an_unstamped_transaction(
+        handler_body(commented, "h").expect("found")
+    ));
+    let no_edge = "fn h() {\nlet tx = state.db_pool.begin().await?;\n}\n";
+    assert!(!writes_edges_on_an_unstamped_transaction(
+        handler_body(no_edge, "h").expect("found")
+    ));
 }
 
 /// A test region is a gated MODULE's extent, never "the rest of the file".

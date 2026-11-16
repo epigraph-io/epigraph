@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://epigraph.io/contract/atlas_claim_leaf/v1/schema.json",
+  "title": "Atlas claim-to-leaf lookup, v1",
+  "description": "Which leaf of one map and hierarchy holds a claim the viewer can read, in that map's latest served run: enough for the client to fetch the leaf (<level_url><hierarchy>/<level_id>) and its breadcrumb chain. Asked as <data-atlas-claim-leaf-url><map key>/<hierarchy>/<claim id>. A claim the viewer cannot read, a claim on no leaf of the map, a map the viewer is not a member of and a run something left are one not-found answer. Rules a schema cannot express (the map and hierarchy are the ones asked for, the claim is the one asked for) are checked by epigraph_atlas_contract::check::check_claim_leaf_body and the Explorer's tests/common/atlas_claim_leaf.rs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "claim_id", "map_scope", "map_group_id", "hierarchy", "theme_id", "level_id"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "claim_id": { "$ref": "#/$defs/uuid" },
+    "map_scope": { "enum": ["team", "public"] },
+    "map_group_id": { "anyOf": [{ "$ref": "#/$defs/uuid" }, { "type": "null" }] },
+    "hierarchy": { "enum": ["meaning", "links"] },
+    "theme_id": { "$ref": "#/$defs/uuid" },
+    "level_id": { "$ref": "#/$defs/uuid" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "map_scope": { "const": "team" } } },
+      "then": { "properties": { "map_group_id": { "$ref": "#/$defs/uuid" } } },
+      "else": { "properties": { "map_group_id": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "kernel_not_found": {
+      "description": "The kernel's one answer for every refusal: no leaf, no hint which case it was.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message", "details"],
+      "properties": {
+        "error": { "const": "NotFound" },
+        "message": { "type": "string", "pattern": "^atlas_claim_leaf with ID [^ ]+ not found$" },
+        "details": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entity", "id"],
+          "properties": {
+            "entity": { "const": "atlas_claim_leaf" },
+            "id": { "type": "string" }
+          }
+        }
+      }
+    },
+    "bff_not_found": {
+      "description": "The Explorer BFF's answer for the same cases.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "message"],
+      "properties": {
+        "error": { "const": "not_found" },
+        "message": { "const": "We could not find that claim on this map." }
+      }
+    }
+  }
+}

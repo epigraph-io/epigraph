@@ -682,6 +682,61 @@ async fn apply_then_reverse_restores_every_row_byte_for_byte(pool: PgPool) {
     assert_same(&before, &snapshot(&pool, true).await, "second reverse");
 }
 
+/// Backlog e7a58564: a run that crashed mid-append leaves its manifest ending
+/// in a torn line with no newline. `reown-reverse` refuses the file as it
+/// stands; with `--allow-truncated-tail` it drops that one line, says so on a
+/// WARN line, and the dry run and the apply reverse every whole record.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_manifest_with_a_torn_tail_reverses_only_with_the_flag(pool: PgPool) {
+    use std::io::Write as _;
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let moved = snapshot(&pool, true).await;
+    // The torn start of one more record, as a crash during its write leaves it.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&mf)
+        .and_then(|mut f| f.write_all(br#"{"table":"evidence","id":"0000"#))
+        .expect("tear the tail");
+
+    let strict = reverse(&pool, &[&mf], &[], false).await;
+    assert_eq!(strict.code, 1, "{}", strict.show());
+    assert!(
+        strict.stderr.contains("not JSON"),
+        "the strict read names the bad line: {}",
+        strict.show()
+    );
+
+    let dry = reverse(&pool, &[&mf], &["--allow-truncated-tail"], false).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("WARN\ttruncated-tail") && dry.stdout.contains("DROPPED"),
+        "the dropped line is reported: {}",
+        dry.show()
+    );
+    assert_same(&moved, &snapshot(&pool, true).await, "dry reverse");
+
+    let rv = reverse(&pool, &[&mf], &["--allow-truncated-tail"], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
+}
+
 /// Migration 168 (ruling R-CH1): an OUTSIDER's challenge on A (the stranger's,
 /// owned by the stranger's group, public, writer-owned) is not dragged into the
 /// target when A is restricted: the cascade leaves it exactly as it was, the
@@ -885,6 +940,84 @@ async fn a_non_world_owned_claim_is_held_unless_allowed(pool: PgPool) {
     .await;
     assert_eq!(r.code, 0, "{}", r.show());
     assert_eq!(row(&pool, "claims", personal).await, grp(fx.target));
+}
+
+/// Backlog 57e9be7a. A public claim the TARGET group already owns (what
+/// MCP/HTTP creation leaves in its author's personal group) is narrowed in
+/// place: visibility `public` -> `group`, owner unchanged, and its derived rows
+/// follow as for a move. The plan counted such a claim eligible while the
+/// UPDATE's `owner_group_id IS DISTINCT FROM target` skipped it, so the batch
+/// rolled back on "moved 0 row(s), the batch planned 1" and a claim could only
+/// be made private by moving it into a DIFFERENT group. The reversal restores
+/// every row byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_claim_the_target_already_owns_is_narrowed_in_place(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let own = fixture::seed_public_claim(&pool, fx.operator, "target-owned, public").await;
+    exec(
+        &pool,
+        &format!(
+            "UPDATE claims SET owner_group_id = '{}' WHERE id = '{own}'",
+            fx.target
+        ),
+    )
+    .await;
+    let ev = evidence(&pool, own, "evidence of the target-owned claim").await;
+    assert_eq!(row(&pool, "claims", own).await, publ(fx.target));
+    assert_eq!(row(&pool, "evidence", ev).await, publ(fx.target));
+
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[own]);
+    let mf = dir.join("m.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &["--allow-non-world-owner"],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "claims", own).await, grp(fx.target));
+    assert_eq!(
+        row(&pool, "evidence", ev).await,
+        grp(fx.target),
+        "the claim's evidence narrows with it"
+    );
+
+    // A re-run counts it done rather than eligible.
+    let mf2 = dir.join("m2.jsonl");
+    let again = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf2,
+            apply_count: Some(0),
+            extra: &["--allow-non-world-owner"],
+        },
+    )
+    .await;
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again.stdout.contains("0 eligible, 0 held, 1 already"),
+        "{}",
+        again.show()
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(
+        &before,
+        &snapshot(&pool, true).await,
+        "in-place restrict then reverse",
+    );
 }
 
 /// A target that does not exist, is not active, or that the operator does not

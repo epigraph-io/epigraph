@@ -1138,18 +1138,28 @@ pub(crate) async fn create_claim_core(
         // two branches serialize against each other too) is held on `tx` until
         // this handler commits, so a racer's find runs after this row is
         // visible and answers 409 (backlog 00f1a517).
-        ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
-            .await?;
-        if ClaimRepository::find_by_content_hash_and_agent(
-            &mut tx,
-            viewer,
-            content_hash.as_slice(),
-            agent_uuid,
-        )
-        .await?
-        .is_some()
-        {
-            return Err(dup_conflict());
+        //
+        // NOT for the `fully_private` tier (backlog 55c12085). Its stored
+        // content is the constant "[private]" (set above), so every such claim
+        // by one author has the SAME `(content_hash, agent_id)`: the check
+        // answered 409 to an author's second private claim, and
+        // `if_not_exists=true` is refused for this tier, so there was no way to
+        // write one. The digest of a placeholder says nothing about whether the
+        // ciphertexts are duplicates, and the server cannot compare those.
+        if privacy_tier != "fully_private" {
+            ClaimRepository::lock_content_hash_agent(&mut tx, content_hash.as_slice(), agent_uuid)
+                .await?;
+            if ClaimRepository::find_by_content_hash_and_agent(
+                &mut tx,
+                viewer,
+                content_hash.as_slice(),
+                agent_uuid,
+            )
+            .await?
+            .is_some()
+            {
+                return Err(dup_conflict());
+            }
         }
         match ClaimRepository::create_strict(&mut tx, &claim, decl).await {
             Ok(c) => (c, true),
@@ -1227,7 +1237,12 @@ pub(crate) async fn create_claim_core(
     // exist without the claim (nor the claim, on this request, without it).
     if let Some(ref d) = request.derived_from {
         match epigraph_db::EvidenceRepository::record_derivation_conn(
-            &mut tx, viewer, claim_uuid, d.claim_id, &d.method,
+            &mut tx,
+            viewer,
+            state.edge_signing_key(),
+            claim_uuid,
+            d.claim_id,
+            &d.method,
         )
         .await?
         {
@@ -1304,17 +1319,10 @@ pub(crate) async fn create_claim_core(
     // claims have placeholder or ciphertext content that wouldn't yield a
     // useful semantic vector.
     if privacy_tier == "public" && was_created {
-        if let Some(embedder) = state.embedding_service() {
+        if let Some(embedder) = state.storing_embedding_service() {
             match embedder.generate(&request.content).await {
                 Ok(embedding) => {
-                    let pgvector_str = format!(
-                        "[{}]",
-                        embedding
-                            .iter()
-                            .map(|v| v.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
+                    let pgvector_str = epigraph_db::pgvector_literal(&embedding);
                     // On the authority that wrote the claim (the caller's
                     // stamp), never the unstamped `db_pool`, where row
                     // security refused this UPDATE for every writer
@@ -2110,6 +2118,9 @@ pub async fn list_claim_evidence(
                 }
                 EvidenceType::Consensus { .. } => ("statistical".to_string(), None),
                 EvidenceType::Figure { doi, .. } => ("figure".to_string(), Some(doi.clone())),
+                EvidenceType::Dataset { root_uri, .. } => {
+                    ("dataset".to_string(), Some(root_uri.clone()))
+                }
             };
 
             EvidenceResponse {
@@ -2328,15 +2339,7 @@ pub async fn update_claim(
 
     // Update embedding if provided (used by backfill_embeddings.py)
     if let Some(ref embedding) = request.embedding {
-        // Convert Vec<f32> to pgvector literal format: "[0.1,0.2,...]"
-        let pgvector = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let pgvector = epigraph_db::pgvector_literal(embedding);
         ClaimRepository::store_embedding(&state.db_pool, id, &pgvector)
             .await
             .map_err(|e| ApiError::DatabaseError {
@@ -2450,32 +2453,13 @@ pub async fn patch_claim(
     let claim_id = ClaimId::from_uuid(id);
 
     // ── 4. Ownership / admin gate ────────────────────────────────────────────
-    // Fetch agent_id before opening the transaction so 404 fires before 403.
-    let claim_agent_id: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
-        .bind(id)
-        .fetch_optional(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("DB error fetching claim owner: {e}"),
-        })?
-        .ok_or_else(|| ApiError::NotFound {
-            entity: "Claim".to_string(),
-            id: id.to_string(),
-        })?;
-    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
-
-    // ── 4a. THE AUDITED ADMIN PATH (batch H-b, D2; review finding) ───────────
-    // A `claims:admin` caller whose own writable set does not hold the claim's
-    // owning group goes through migration 111's definer, exactly as
-    // `PATCH /api/v1/claims/:id/labels` and MCP `patch_claim` do. Measured by
-    // the review on config B before this: an admin `PATCH /api/v1/claims/:id`
-    // with `add_labels: [.., "resolved"]` on a world-owned public claim landed
-    // (200, label on the row) through the orphan policy with NO audit row and
-    // no admin principal, bypassing D2 on the one route it had not reached.
-    // The owning group is read through the CALLER's viewer; a claim the admin
-    // cannot read is 404, as on the labels route. Every other caller keeps the
-    // pre-existing (unstamped) path, which R3 item 2 still lists.
-    let admin_path = if auth.has_scope("claims:admin") {
+    // The write target, read through the CALLER's viewer, as `update_labels`
+    // does. This was `SELECT agent_id FROM claims WHERE id = $1` on the raw
+    // pool (backlog 4073bbb6): a non-admin caller got 403 for a claim it
+    // cannot read and 404 for one that does not exist, which told it the
+    // unreadable claim exists. An unreadable claim is now 404, exactly like a
+    // missing one, and 404 still fires before the 403 below.
+    let (claim_agent_id, owner_group_id) = {
         let mut read = state.read_as(&viewer).await.map_err(|e| {
             tracing::error!(
                 target: "tenancy.scoped_read",
@@ -2487,7 +2471,7 @@ pub async fn patch_claim(
                 message: "Failed to acquire a scoped connection".to_string(),
             }
         })?;
-        let (_, owner_group_id) = ClaimRepository::write_target_of(&mut *read, &viewer, id)
+        ClaimRepository::write_target_of(&mut *read, &viewer, id)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("DB error fetching claim owner: {e}"),
@@ -2495,11 +2479,23 @@ pub async fn patch_claim(
             .ok_or_else(|| ApiError::NotFound {
                 entity: "Claim".to_string(),
                 id: id.to_string(),
-            })?;
-        !viewer.writable_groups().contains(&owner_group_id)
-    } else {
-        false
+            })?
     };
+    crate::middleware::scopes::require_owner_or_admin(&auth, claim_agent_id)?;
+
+    // ── 4a. THE AUDITED ADMIN PATH (batch H-b, D2; review finding) ───────────
+    // A `claims:admin` caller whose own writable set does not hold the claim's
+    // owning group goes through migration 111's definer, exactly as
+    // `PATCH /api/v1/claims/:id/labels` and MCP `patch_claim` do. Measured by
+    // the review on config B before this: an admin `PATCH /api/v1/claims/:id`
+    // with `add_labels: [.., "resolved"]` on a world-owned public claim landed
+    // (200, label on the row) through the orphan policy with NO audit row and
+    // no admin principal, bypassing D2 on the one route it had not reached.
+    // The owning group comes from the viewer-scoped read above. Every other
+    // caller keeps the pre-existing (unstamped) path, which R3 item 2 still
+    // lists.
+    let admin_path =
+        auth.has_scope("claims:admin") && !viewer.writable_groups().contains(&owner_group_id);
 
     // ── 5. Open transaction — all mutations + provenance are atomic ──────────
     // The admin path runs on a transaction stamped from the ADMIN's own viewer
@@ -3464,6 +3460,35 @@ mod db_tests {
         .expect("upsert oauth_client");
     }
 
+    /// `AppState` on a `ScopedPool`, for the `patch_claim` tests.
+    ///
+    /// `patch_claim` reads its write target through `AppState::read_as`, which
+    /// REFUSES (500) on a state built with `AppState::with_db`: that state has
+    /// no `ScopedPool`, and a fallback to the raw pool would be an unstamped
+    /// read. The server binary and `tests/common` build their state this way
+    /// for the same reason. The pool the tests seed with stays the plain
+    /// `try_test_pool` one; both connect to `DATABASE_URL`.
+    async fn scoped_test_state() -> AppState {
+        let url = std::env::var("DATABASE_URL").expect("DATABASE_URL (the pool connected)");
+        let scoped = epigraph_db::ScopedPool::connect_with_options(
+            &url,
+            epigraph_db::SessionGucMode::Session,
+            epigraph_db::ScopedPoolOptions {
+                max_connections: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("scoped pool connect");
+        AppState::with_scoped_pool(
+            scoped,
+            ApiConfig {
+                require_packet_signatures: false,
+                ..Default::default()
+            },
+        )
+    }
+
     /// Build a test router with patch_claim + an injected AuthContext.
     fn test_router(state: AppState, auth: AuthContext) -> Router {
         Router::new()
@@ -3518,13 +3543,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3567,13 +3586,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3611,13 +3624,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Sending truth_value alongside a real patchable field: truth_value is silently dropped,
@@ -3678,13 +3685,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3723,13 +3724,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.5, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Patch two fields at once
@@ -3776,13 +3771,7 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // Patch properties with a value that is already set → no actual change
@@ -3820,13 +3809,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3842,17 +3825,12 @@ mod db_tests {
 
     #[tokio::test]
     async fn test_patch_requires_auth_401() {
-        let pool = test_pool_or_skip!();
+        // Only the skip matters here: the request is refused before any read.
+        let _pool = test_pool_or_skip!();
         let claim_id = Uuid::new_v4();
 
         // Router WITHOUT injected AuthContext extension
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = Router::new()
             .route("/api/v1/claims/:id", patch(patch_claim))
             .with_state(state);
@@ -3894,13 +3872,7 @@ mod db_tests {
             delegated_by: None,
         };
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth);
 
         let resp = router
@@ -3925,13 +3897,7 @@ mod db_tests {
         let claim_id = Uuid::new_v4();
         insert_test_claim(&pool, claim_id, client_id, 0.7, serde_json::json!({}), &[]).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         // truth_value is an unknown field; after deserialization nothing to patch → 400
@@ -3955,13 +3921,7 @@ mod db_tests {
         let client_id = Uuid::new_v4();
         insert_oauth_client(&pool, client_id).await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
-        );
+        let state = scoped_test_state().await;
         let router = test_router(state, auth_ctx(client_id));
 
         let resp = router
@@ -3994,13 +3954,25 @@ mod db_tests {
         )
         .await;
 
-        let state = AppState::with_db(
-            pool.clone(),
-            ApiConfig {
-                require_packet_signatures: false,
-                ..Default::default()
-            },
+        let state = scoped_test_state().await;
+
+        // Calibration: this state serves the route's scoped read, so the 500
+        // asserted below comes from a later step. On a state with no
+        // `ScopedPool` every request dies at that read with the same 500, and
+        // this test then passes without reaching the provenance write.
+        let probe = test_router(state.clone(), auth_ctx(bad_client_id))
+            .oneshot(patch_request(
+                Uuid::new_v4(),
+                serde_json::json!({"properties": {"mutated": true}}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            probe.status(),
+            StatusCode::NOT_FOUND,
+            "an unknown claim is 404 on this state, so the scoped read works"
         );
+
         let router = test_router(state, auth_ctx(bad_client_id));
 
         let resp = router

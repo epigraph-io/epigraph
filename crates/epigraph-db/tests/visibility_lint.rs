@@ -711,6 +711,17 @@ fn the_exemption_set_is_exactly_what_was_reviewed() {
 /// count `43 → 54` the same way.
 const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
+        "edge.rs",
+        "reaches_in_force_conn",
+        "READ of `edges` only, returning one boolean: whether one node reaches another along \
+         in-force edges of the named relationships (backlog 41d7b27a, the cycle guard for \
+         MCP `link_hierarchical`'s `invokes` / `depends_on`). It returns no row. Its caller \
+         runs it on the writer's STAMPED transaction, after both endpoints were read as the \
+         viewer, so `edges_tenancy` bounds the walk to edges that session reads; an edge it \
+         cannot see does not count toward a cycle, and the answer reveals nothing beyond \
+         what the session could already traverse.",
+    ),
+    (
         "admin_act.rs",
         "get",
         "READ of one `pending_admin_acts` row by id for the maintenance CLI (migration 130): an \
@@ -1096,6 +1107,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement with no row to filter; the SQL is unchanged.",
     ),
     (
+        "claim_theme.rs",
+        "begin_iterative_hnsw",
+        "NO ROW READ. A private helper that opens a savepoint and sets two transaction-local \
+         pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the viewer-spliced theme \
+         read its caller runs next (backlog a507966d); it reads and writes no table, so there is \
+         nothing to filter.",
+    ),
+    (
         "claim.rs",
         "update_labels_conn",
         "WRITE. Label mutation on a claim the caller has already fetched under a viewer predicate \
@@ -1172,6 +1191,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          only the new id. The read side of `events` is where tenancy is enforced \
          (EventRepository::list, and hidden_claim_ids for the Rust-callable half); an append has \
          no rows to filter.",
+    ),
+    (
+        "evidence.rs",
+        "link_to_claims_signed_conn",
+        "WRITE (backlog 2d60f619): the evidence row's `evidence -> claim` edge, inside the \
+         caller's evidence-write transaction (or the maintenance backfill's batch). It delegates \
+         to EdgeRepository::create_if_absent_including_retracted_signed_conn, itself exempt here, \
+         and returns only the edge id it wrote or found. The edge's tenancy is the edges \
+         trigger's meet of its endpoints, so there is nothing for a viewer to filter.",
     ),
     (
         "evidence.rs",
@@ -1927,6 +1955,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          the principal's home group and its writable teams, all or nothing, audited.",
     ),
     (
+        "claim_visibility.rs",
+        "claims_not_writable_on_session",
+        "READ, on the widening act's own caller-STAMPED transaction, of which of the ids the act \
+         just moved the SESSION cannot write: row security on the stamped connection is the \
+         read filter and `epigraph_writable_groups()` the write test, so the question is what \
+         the stamp may do, not what a viewer may see. Returns only ids the caller passed; its \
+         one caller (`epigraph_engine::visibility_act`) refuses the act on any id it returns.",
+    ),
+    (
         "security_event.rs",
         "workflow_caller_write",
         "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \
@@ -1950,6 +1987,32 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `perspectives`' own row security decides the UPDATE with the stamp's write authority, \
          and the MCP caller has already read the row through its viewer on the same \
          transaction; the returned count lets it refuse a write that changed nothing.",
+    ),
+    (
+        "policy.rs",
+        "lock_challenge_create",
+        "Takes the transaction-scoped advisory lock `pg_advisory_xact_lock(hashtext(..), \
+         hashtext(content))` that serializes concurrent `create_challenge` calls (moved verbatim \
+         from `routes/policies.rs`). It reads and writes no table, so there is nothing for a \
+         viewer to filter; the caller's STAMPED transaction carries the identity.",
+    ),
+    (
+        "policy.rs",
+        "find_challenge_by_hash",
+        "READ of the oldest `claims` id labelled `policy:challenge` for a (content_hash, \
+         agent_id) pair, moved verbatim from `create_challenge`, on the caller's STAMPED write \
+         transaction. It is an idempotency probe for a challenge the SYSTEM agent authors \
+         instance-wide and it answers an id only; the stamp's row security decides visibility, \
+         exactly as when the statement ran inline in the handler.",
+    ),
+    (
+        "policy.rs",
+        "insert_challenge",
+        "WRITE (INSERT) of one pending `policy:challenge` claim authored by the SYSTEM agent \
+         with a tenancy declaration the handler resolved (`default_decl_for_author_pool`), moved \
+         verbatim from `create_challenge` onto the caller's STAMPED write transaction, where \
+         migration 122's claims trigger binds the caller. An INSERT has no read to filter, and \
+         the write-gate lint watches UPDATE/DELETE only.",
     ),
     (
         "workflow.rs",
@@ -1994,9 +2057,20 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          spliced viewer predicate could only DROP workflows from that set, which makes the gate \
          fail open, never safer. Both callers run it on the caller's own stamped write \
          transaction (MCP `begin_author_stamped_tx`, REST `begin_claim_write`), before the act \
-         it gates, so row security on that connection still applies; the residual it leaves \
-         (lineage members split across tenancies out of band) is stated on the function. \
-         Returns workflow ids only, never content.",
+         it gates, so row security on that connection still applies. What it cannot see (since \
+         migration 219 a group plan's `executes` edge onto a public step) the gates read through \
+         `step_lineage_executors`. Returns workflow ids only, never content.",
+    ),
+    (
+        "workflow.rs",
+        "step_lineage_executors",
+        "AUTHORITY READ through migration 219's definer \
+         `epigraph_step_lineage_executors(claim)`: every workflow that executes the claim's step \
+         lineage, read UNFILTERED (the edges and lineage members, no join to `workflows`), for \
+         the `evolve_step` gates, which must hold workflow authority over each one. A spliced \
+         viewer predicate could only DROP workflows from the set, which makes the gate fail \
+         open. The ids stay in the server: a gate answers every refusal over an id the caller's \
+         own read did not return as a missing parent. Returns workflow ids only, never content.",
     ),
     (
         "agent_lookup.rs",
@@ -2493,6 +2567,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "edge.rs",
+        "create_symmetric_if_absent_signed_conn",
+        "WRITE. `create_symmetric_if_absent_conn` (which delegates here with no key) attested \
+         at INSERT by the caller's key (backlog dae795f8): the same any-state dedup and bare \
+         ON CONFLICT DO NOTHING, on the caller's connection; authorised by edges_tenancy's \
+         WITH CHECK. It reads no row back to a caller.",
+    ),
+    (
+        "edge.rs",
         "create_symmetric_if_absent_returning_conn",
         "WRITE. `create_symmetric_if_absent_returning` on a caller's connection, for \
          `link_alternative`'s author-stamped transaction. Same argument as \
@@ -2756,6 +2838,97 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          (migration 197), its child rows going by the FK cascade; a corpus-wide maintenance \
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
          column to name (the shape of claim_theme.rs `delete_all_conn`).",
+    ),
+    // Atlas W2 (migration 210): the nightly's writes of a team or public map.
+    (
+        "atlas_map.rs",
+        "write_run",
+        "WRITE. Opens one unfinished `atlas_map_runs` row of one map, declared ('group', T) for a \
+         team map or ('public', world) for the public map; the nightly calls it on the \
+         maintenance connection, the application role holds SELECT only on the table, and its \
+         `atlas_map_runs_tenancy` WITH CHECK would hold any other writer to its writable groups. \
+         The one read is the `groups` kind check of the declared owner.",
+    ),
+    (
+        "atlas_map.rs",
+        "put_level",
+        "WRITE. Upserts one `atlas_map_levels` document into an unfinished run, copying the \
+         run's own tenancy columns (pinned by the composite FK); the nightly calls it on the \
+         maintenance connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "finish_run",
+        "WRITE. Stamps one unfinished `atlas_map_runs` row finished with its level count, \
+         counted over the run's own documents; the nightly calls it on the maintenance \
+         connection and the application role holds SELECT only on the table.",
+    ),
+    (
+        "atlas_map.rs",
+        "fix_repeatable_read",
+        "NO ROW READ. Private first half of `begin_build_snapshot`: runs `SET TRANSACTION \
+         ISOLATION LEVEL REPEATABLE READ` and reads back `current_setting('transaction_isolation')`; \
+         it touches no table. `begin_build_snapshot` then reads the epochs through `map_epochs`, \
+         which splices the viewer.",
+    ),
+    // Atlas W9: the nightly's housekeeping of one map.
+    (
+        "atlas_map.rs",
+        "prune_runs",
+        "WRITE. Deletes one map's old `atlas_map_runs` rows (finished runs past the newest N, \
+         unfinished runs older than the newest finished one), their levels going by the FK \
+         cascade; every statement is scoped by the map's own tenancy columns, the nightly calls \
+         it on the maintenance connection and the application role holds SELECT only on the \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_publish",
+        "NO ROW READ. Takes `pg_advisory_xact_lock` on a hash of the map's tenancy key so the \
+         nightly and the naming step's write serialise their publish of one map; it touches no \
+         table.",
+    ),
+    (
+        "atlas_map.rs",
+        "lock_map_for_build",
+        "NO ROW READ. Takes the session-level `pg_advisory_lock` on the same key as \
+         lock_map_for_publish, so an operator build and the nightly's publish of one map \
+         serialise; it touches no table.",
+    ),
+    (
+        "atlas_map.rs",
+        "unlock_map_for_build",
+        "NO ROW READ. Releases lock_map_for_build's session advisory lock; it touches no table.",
+    ),
+    // Backlog b7354adc: the three reads `AuthoredByRepository::for_claim` ran inline, split
+    // out unchanged so `for_paper_ingests` (which takes the viewer and spends it on
+    // `PaperRepository::ingest_principals`) shares them instead of copying them.
+    (
+        "authored_by.rs",
+        "bound_at",
+        "READ through migration 199's `epigraph_operator_bound_at` SECURITY DEFINER function: the \
+         human an agent was bound to at an instant, from `operator_links` and \
+         `author_binding_clients`, neither of which has `visibility` / `owner_group_id`. The \
+         binding is shown to every reader of a claim (the ruled audience). Private; its callers \
+         `for_claim` and `for_paper_ingests` take the viewer and pass only agents of rows the \
+         viewer already read.",
+    ),
+    (
+        "authored_by.rs",
+        "snapshot_at",
+        "READ through migration 199's PRINCIPAL-BOUND `epigraph_agent_prompt_snapshot_at` \
+         SECURITY DEFINER function, the one spelling of the prompt-snapshot gate: it reads the \
+         stamped session's principal and returns a row of `agent_prompt_snapshots` (no \
+         `visibility` / `owner_group_id`) only to the agent's linked human and to admins. The \
+         viewer is spent on the stamp; an in-query predicate has nothing to name.",
+    ),
+    (
+        "authored_by.rs",
+        "display_names",
+        "READ of `id, display_name` from the untenanted `agents` table (077's `agents_identity` \
+         policy shows every session every row; no `visibility` / `owner_group_id`), the two \
+         fields `GET /api/v1/agents/:id` answers for any id. Private; called only with ids its \
+         viewer-taking callers already resolved.",
     ),
 ];
 
@@ -3870,6 +4043,39 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          edge it read is public, so the index discloses nothing a reader of the new public \
          edge could not read; the caller's authority is the workflow authority rule, not read \
          visibility, so no caller viewer is spliced.",
+    ),
+    // Backlog 8a168dd6 (F-PR18a-B1): the security-event read moved onto the
+    // caller's stamped connection, so the repo fn became executor-generic.
+    (
+        "security_event.rs",
+        "query",
+        "READ of `security_events` with optional agent / type / time / failures filters. The \
+         table has no visibility or owner_group_id column: its rows are decided by row security, \
+         `security_events_read` (migration 169), which admits a session's own events (minus the \
+         cascade-audit types) or an elevated / instance-admin session, keyed on the principal of \
+         the connection passed in. `routes/audit.rs` passes the caller's stamped `read_as` \
+         connection, so the policy filters for that caller; `routes/timeline.rs` still passes the \
+         unstamped pool and stays on no_unscoped_pool's register. A Viewer would have nothing to \
+         add to the policy.",
+    ),
+    // The assess route's writer record (backlog batch B19).
+    (
+        "event.rs",
+        "insert_on",
+        "WRITE, append-only, of one `events` row on the caller's executor (the assess route's \
+         transaction), so the event commits or rolls back with the write it records. `events` has \
+         no visibility or owner_group_id column and this function reads nothing, so there is no \
+         predicate a Viewer could be spent on; reads of `events` go through `list_events`, which \
+         applies the viewer.",
+    ),
+    (
+        "paper.rs",
+        "licence",
+        "READ of `papers.licence` for one paper id (migration 226). `papers` carries no tenancy \
+         (127): there is no visibility or owner_group_id column and no policy, so there is \
+         nothing to filter, and the answer is one operator-set licence string, never claim \
+         content. Ingest only reads it, to decide whether a source may be treated as \
+         open-licensed; `None` means all rights reserved.",
     ),
 ];
 

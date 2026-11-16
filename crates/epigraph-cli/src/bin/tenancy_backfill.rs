@@ -1126,18 +1126,22 @@ async fn backfill_agent_keyed(
 /// (no inflated `rows_done`), a seed fragment on a WORLD claim is never stamped
 /// with the other sentinel, and a world fragment on a seed claim still moves as
 /// it always has. [`harvester_fragment_residual`] counts exactly the rows this
-/// statement can move (finding `F-089-D`).
+/// statement can move (finding `F-089-D`): both read [`fragment_restampable`].
+///
+/// # Several citing claims: the most restrictive wins (migration 218)
+///
+/// A fragment cited by more than one claim takes [`FRAGMENT_WINNER`], the same
+/// order migration 218 gives the provenance trigger: group before public, a
+/// real owner before the seed sentinel, then the lowest `owner_group_id`. The
+/// former `UPDATE … FROM` over the provenance join applied whichever joined row
+/// the plan produced first (finding `F-089-A`).
 async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
-    let n = sqlx::query(
-        "UPDATE harvester_fragments f
-            SET owner_group_id = c.owner_group_id, visibility = c.visibility
-           FROM harvester_claim_provenance p
-           JOIN claims c ON c.id = p.claim_id
-          WHERE f.id = p.fragment_id
-            AND f.owner_group_id IN ($1, $2)
-            AND c.owner_group_id <> $1
-            AND (f.owner_group_id, f.visibility) IS DISTINCT FROM (c.owner_group_id, c.visibility)",
-    )
+    let n = sqlx::query(&format!(
+        "UPDATE harvester_fragments t \
+            SET (owner_group_id, visibility) = (SELECT w.g, w.v FROM ({FRAGMENT_WINNER}) w) \
+          WHERE {}",
+        fragment_restampable()
+    ))
     .bind(WORLD)
     .bind(SEED)
     .execute(pool)
@@ -1145,6 +1149,27 @@ async fn backfill_harvester_fragments(pool: &PgPool) -> anyhow::Result<()> {
     .rows_affected();
     finish_entity(pool, "harvester_fragments", n as i64).await?;
     Ok(())
+}
+
+/// The citing claim whose tenancy the fragment `t` inherits (binding `$1` =
+/// [`WORLD`], `$2` = [`SEED`]): the most restrictive of its non-world citing
+/// claims, by migration 218's order. No row when every citer is world-owned
+/// (089's source side: the world group has no tenancy to donate).
+const FRAGMENT_WINNER: &str = "SELECT c.owner_group_id AS g, c.visibility AS v \
+       FROM harvester_claim_provenance p JOIN claims c ON c.id = p.claim_id \
+      WHERE p.fragment_id = t.id AND c.owner_group_id <> $1 \
+      ORDER BY (c.visibility = 'group') DESC, (c.owner_group_id = $2) ASC, \
+               c.owner_group_id ASC \
+      LIMIT 1";
+
+/// The `harvester_fragments t` rows [`backfill_harvester_fragments`] moves:
+/// sentinel-owned (089's target side) and not already on their
+/// [`FRAGMENT_WINNER`]'s tuple.
+fn fragment_restampable() -> String {
+    format!(
+        "(t.owner_group_id IN ($1, $2) AND EXISTS (SELECT 1 FROM ({FRAGMENT_WINNER}) w \
+           WHERE (t.owner_group_id, t.visibility) IS DISTINCT FROM (w.g, w.v)))"
+    )
 }
 
 // `transcribe_legacy_ownership` lived here until PR-22.
@@ -1465,6 +1490,8 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// only to name the migration in the NOTE an operator reads.
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
+    // Last redefined by migration 219 (the `workflow` arm; CREATE OR REPLACE
+    // keeps the owner, and 219 re-sets it regardless).
     "epigraph_node_tenancy",
     // Last redefined by migration 120 (writer-owned edges: CREATE OR REPLACE,
     // re-owned in its section 9). Kept HERE, unconditional, rather than moved
@@ -1473,9 +1500,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
-    // Last redefined by migration 122 (120's body with the edges meet made
-    // set-based: two equi-joins and inlined endpoint reads, OB6); see the note
-    // above.
+    // Last redefined by migration 219 (168's body, itself 122's set-based
+    // edges meet plus one IF, with a `workflows` join per endpoint); see the
+    // note above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1699,10 +1726,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // It fails SILENTLY for an incident edge outside the caller's writable
     // groups: 117's restrictive `edges_update_owner` filters that row out, so
     // the claim goes public and the edge stays group-only.
+    // 215 re-states it (and the share below) and adds, under the same owner:
+    // the re-meet of edges on the moved claims' evidence (as above, LOUD or
+    // SILENT); a `harvester_sources` tenancy change, which the 115
+    // owner-immutable guard 173 attached refuses LOUD outside a privileged
+    // frame; and the deletes of the moved claims' `ds_combined_beliefs` and
+    // `ds_bayesian_divergence` rows, which row security filters SILENTLY to
+    // the rows the owner can see, leaving stale scoped folds behind.
     ("epigraph_publicize_claims", 206),
     // 206's private -> team share changes `claims.owner_group_id`, which 115's
     // `claims_owner_immutable` refuses outside a privileged frame: every share
-    // fails LOUD (42501) with nothing moved.
+    // fails LOUD (42501) with nothing moved. 215 adds the same three steps as
+    // publicize, with the same failure modes.
     ("epigraph_share_claims_with_team", 206),
     // 209, an agent's private default and the operator's setter. The READ
     // `epigraph_default_private` reads only `agents` (readable to every role),
@@ -1716,6 +1751,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the UPDATE moves; a foreign row would move 0 rows, which the body
     // refuses (VIS06) rather than auditing a change that did not happen.
     ("epigraph_set_agent_default_group", 209),
+    // 212 (backlog f78526ad), the sealed-row vector guards on `claims` and
+    // `evidence`. Both fail OPEN and QUIETLY under a non-member owner: their
+    // only read is of the FORCEd `claim_encryption` / `evidence_encryption`,
+    // which 077's policy then filters exactly as the writing session's own
+    // read would, so a sealed row whose group the owner cannot see reads as
+    // unsealed and its vector is admitted with no error. The owner is the
+    // control here.
+    ("epigraph_refuse_sealed_claim_vector", 212),
+    ("epigraph_refuse_sealed_evidence_vector", 212),
     // 207, the bug-report intake. The write fails LOUD under a non-member
     // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
     // `evidence` are refused by their WITH CHECK (the owner no longer passes
@@ -1749,6 +1793,41 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
+    // 210 (Atlas W2, backlog 77f4bf09), the per-team Atlas map staleness
+    // epochs. The bump is the only writer of the FORCEd `atlas_map_epochs`
+    // (the application role holds SELECT only), and the two triggers call it
+    // on every claims, edges and evidence UPDATE that changes a row's
+    // signature. Under an owner without the epochs grant (the application
+    // role) every such UPDATE (a share, a publicize, a narrowing, a
+    // re-tenant) fails LOUD with 42501, an outage of those writes; so does a
+    // trigger whose owner cannot EXECUTE the bump (210 revokes it from
+    // PUBLIC). Under a non-member owner that holds the grant the definer
+    // bypass is false: the bump's `groups` join is filtered to the session's
+    // read set, so a departure from a group the session cannot read bumps
+    // nothing and that map keeps being served as current with a row its
+    // viewers lost (fails OPEN, silently); a readable group the session
+    // cannot write is refused by the epochs WITH CHECK (loud).
+    ("epigraph_atlas_map_bump", 210),
+    ("epigraph_atlas_map_stale", 210),
+    ("epigraph_atlas_map_stale_row", 210),
+    // 217, the two factor triggers (backlog a2c5f714): the application role
+    // holds no INSERT / DELETE on `factors`, so they write it as their owner.
+    // Under a non-member owner without the `factors` grant the edge mint
+    // fails LOUD (every claim-claim edge INSERT is refused 42501 at the
+    // factor INSERT, an outage of edge writes), and the retirement clear the
+    // same way (every retirement refused). Under one that holds the grant the
+    // mint's `claims` read is RLS-filtered, so an edge to a superseded claim
+    // the owner cannot see is minted over, silently.
+    ("auto_create_factor_from_edge", 217),
+    ("deactivate_superseded_factors", 217),
+    // 219, the `evolve_step` gate's unfiltered read of every workflow that
+    // executes a step's lineage. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a group plan's `executes` edge a
+    // non-member cannot see is not returned, its authority is never checked,
+    // and the gate admits an evolve of a step a hidden plan runs. That is the
+    // stake this entry reports.
+    ("epigraph_step_lineage_executors", 219),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -2228,6 +2307,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // read is filtered to the session principal's own rows: fail CLOSED,
     // fewer roles shown, never more.
     ("epigraph_disclosed_role_assignments", 198),
+    // 213 (backlog 950696a1), single use of an agent's client_credentials
+    // assertion: the ONLY write path into `oauth_assertion_nonces`, whose
+    // application-role DML 213 revokes. Under an APP-owned body it fails
+    // CLOSED with 42501 (every agent client_credentials and refresh grant
+    // answers 500 and nothing is minted, loud); under the migration runner's
+    // superuser it keeps working with more authority than intended (083's
+    // case). The table has no row security, so a non-member owner changes
+    // nothing else.
+    ("epigraph_oauth_assertion_nonce_consume", 213),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -2865,6 +2953,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
             false,
         ),
+        // 213: every agent client_credentials and refresh grant records its
+        // assertion nonce on the request DSN; a missing grant refuses every
+        // agent mint (500).
+        (
+            "epigraph_oauth_assertion_nonce_consume",
+            "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
+            true,
+        ),
         (
             "epigraph_confirm_admin_act",
             "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
@@ -3108,6 +3204,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
             true,
         ),
+        // 219: the `evolve_step` gate calls it on the request DSN (REST and
+        // MCP); without the grant every evolve of an executed step is 42501.
+        (
+            "epigraph_step_lineage_executors",
+            "public.epigraph_step_lineage_executors(uuid)",
+            true,
+        ),
     ];
 
     let app_exists: bool =
@@ -3231,7 +3334,8 @@ async fn residual_for(
 /// `harvester_fragments` rows that SHOULD have moved: the rows
 /// [`backfill_harvester_fragments`] can repair, which is migration 089's
 /// predicate over rows already on disk (a sentinel-owned fragment linked to a
-/// non-world claim whose tenancy differs from it).
+/// non-world claim) with migration 218's winner (the most restrictive such
+/// claim, whose tenancy differs from the fragment's): [`fragment_restampable`].
 ///
 /// * `platform`: exactly those rows.
 /// * `None` / `operator` (strict): every world-owned fragment, as [`residual`]
@@ -3258,16 +3362,11 @@ async fn harvester_fragment_residual(
 /// [`print_offenders`]' id listing, so the ids a strict `verify` prints are the
 /// rows it counted.
 fn harvester_fragment_residual_filter(mode: Option<LegacyOwner>) -> String {
-    const REPAIRABLE: &str = "EXISTS (SELECT 1 FROM harvester_claim_provenance p \
-                                JOIN claims c ON c.id = p.claim_id \
-                               WHERE p.fragment_id = t.id \
-                                 AND c.owner_group_id <> $1 \
-                                 AND (t.owner_group_id, t.visibility) \
-                                     IS DISTINCT FROM (c.owner_group_id, c.visibility))";
+    let repairable = fragment_restampable();
     if mode == Some(LegacyOwner::Platform) {
-        format!("t.owner_group_id IN ($1, $2) AND {REPAIRABLE}")
+        repairable
     } else {
-        format!("t.owner_group_id = $1 OR (t.owner_group_id = $2 AND {REPAIRABLE})")
+        format!("t.owner_group_id = $1 OR {repairable}")
     }
 }
 

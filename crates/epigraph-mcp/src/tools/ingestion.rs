@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_imports)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use rmcp::model::*;
 use uuid::Uuid;
@@ -19,12 +18,13 @@ use epigraph_crypto::ContentHasher;
 use epigraph_db::{
     ClaimRepository, EdgeRepository, EvidenceRepository, PaperRepository, ReasoningTraceRepository,
 };
-use epigraph_ingest::builder::{build_ingest_plan, PlannedClaim};
+use epigraph_ingest::common::plan::PlannedClaim;
+use epigraph_ingest::document::builder::build_ingest_plan;
 use epigraph_ingest::document::schema::ByteSpan;
+use epigraph_ingest::document::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 use epigraph_ingest::document::structure::{
     parse_structure, slice_segmentation, SourceFormat, StructuredDoc,
 };
-use epigraph_ingest::schema::{DocumentExtraction, DocumentSource, Paragraph, Section};
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -185,7 +185,7 @@ pub async fn ingest_document(
     let choice = parse_ingest_visibility(params.visibility.as_deref(), params.group_id.as_deref())?;
 
     // The ingest is handed to a task DETACHED from this request, so it needs an
-    // owned viewer: `tokio::spawn` is `'static` and cannot borrow the caller's.
+    // owned viewer: a spawned task is `'static` and cannot borrow the caller's.
     // `Viewer` is not `Clone`; `detach_scoped` is the narrow replacement, and
     // what it yields is the caller's own scoped read authority and nothing
     // wider. THAT IS THE WHOLE OF THE CLAIM, said narrowly because the obvious
@@ -226,8 +226,12 @@ pub async fn ingest_document(
         choice,
     )
     .await?;
+    // Warn-only, from the payload, before the walk detaches (backlog 72850d43).
+    let atomicity = extraction_atomicity(&extraction);
     if params.wait.unwrap_or(false) {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice)
+            .await
+            .map(|r| with_atomicity(r, atomicity));
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
@@ -247,7 +251,9 @@ pub async fn ingest_document(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -257,13 +263,13 @@ pub async fn ingest_document(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id))
+    success_json(&queued_response(&doi, &title, paper_id, atomicity))
 }
 
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
 /// points, run before `ensure_paper_node` writes anything.
 ///
-/// `do_ingest_document` runs in a `tokio::spawn`ed task, so a refusal inside it
+/// `do_ingest_document` runs in a spawned task, so a refusal inside it
 /// reaches no caller — the caller has already been told `queued`. The walk is
 /// now one author-stamped transaction, so such a refusal leaves nothing behind
 /// (and no `processed_by` edge, which is what `check_already_ingested` reports),
@@ -373,8 +379,12 @@ pub async fn ingest_document_inline(
         choice,
     )
     .await?;
+    // Warn-only, from the payload, before the walk detaches (backlog 72850d43).
+    let atomicity = extraction_atomicity(&extraction);
     if wait {
-        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice).await;
+        return ingest_in_request(server, &viewer, &extraction, auth, &doi, choice)
+            .await
+            .map(|r| with_atomicity(r, atomicity));
     }
     let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
@@ -386,7 +396,9 @@ pub async fn ingest_document_inline(
     // authors as the request's principal (batch H-b, D1), so it needs the
     // request's token, not a borrow of it.
     let auth = auth.cloned();
-    tokio::spawn(async move {
+    // Tracked, so a stdio process waits for the walk before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
         if let Err(e) = do_ingest_document(&bg, &viewer, &extraction, auth.as_ref(), choice).await {
             tracing::error!(
                 target: "tenancy.scoped_write",
@@ -396,7 +408,7 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id))
+    success_json(&queued_response(&doi, &title, paper_id, atomicity))
 }
 
 /// The `wait: true` arm of the two detached ingest handlers: run the walk IN
@@ -479,7 +491,90 @@ async fn ensure_paper_node(
 }
 
 /// Shared response body for the two queued ingest entry points.
-fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value {
+/// Examples [`extraction_atomicity`] lists; the counts cover every atom.
+const ATOMICITY_EXAMPLES: usize = 10;
+/// Characters of an example atom's text the warning quotes.
+const ATOMICITY_EXAMPLE_CHARS: usize = 200;
+
+/// The warn-only atomicity gate at document ingest (backlog `72850d43`):
+/// every `sections[].paragraphs[].atoms[]` entry is run through
+/// `epigraph_core::atomicity::conjunct_screen`, and the ones that screen
+/// compound are reported. `None` when none does. Paragraph text is not
+/// screened: a paragraph is compound by design, its atoms are not.
+///
+/// Computed from the payload before the walk detaches, so the queued
+/// response carries it too; nothing is refused on it.
+fn extraction_atomicity(extraction: &DocumentExtraction) -> Option<serde_json::Value> {
+    let mut screened = 0usize;
+    let mut compound = 0usize;
+    let mut examples = Vec::new();
+    for (si, section) in extraction.sections.iter().enumerate() {
+        for (pi, paragraph) in section.paragraphs.iter().enumerate() {
+            for (ai, atom) in paragraph.atoms.iter().enumerate() {
+                screened += 1;
+                let screen = epigraph_core::atomicity::conjunct_screen(atom);
+                if !screen.is_compound() {
+                    continue;
+                }
+                compound += 1;
+                if examples.len() < ATOMICITY_EXAMPLES {
+                    examples.push(serde_json::json!({
+                        "section": si,
+                        "paragraph": pi,
+                        "atom": ai,
+                        "sentences": screen.sentences,
+                        "clause_joins": screen.clause_joins,
+                        "quantities": screen.quantities,
+                        "conjunct_count": screen.conjunct_count,
+                        "text": atom.chars().take(ATOMICITY_EXAMPLE_CHARS).collect::<String>(),
+                    }));
+                }
+            }
+        }
+    }
+    (compound > 0).then(|| {
+        serde_json::json!({
+            "atoms_screened": screened,
+            "compound_atoms": compound,
+            "examples": examples,
+            "note": "These atoms appear to assert several independent things (conjunct_count \
+                     >= 2). The ingest proceeds exactly as it would without this warning; \
+                     nothing is refused. Split them \
+                     in the extraction, or later with decompose_claims --redecompose, so a \
+                     dispute can target the one assertion it disputes.",
+        })
+    })
+}
+
+/// `result` with `atomicity` added to its JSON body under `"atomicity"`.
+/// A body that is not one JSON object is returned unchanged.
+fn with_atomicity(
+    mut result: CallToolResult,
+    atomicity: Option<serde_json::Value>,
+) -> CallToolResult {
+    let Some(atomicity) = atomicity else {
+        return result;
+    };
+    let body = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t.text).ok());
+    if let Some(serde_json::Value::Object(mut map)) = body {
+        map.insert("atomicity".to_string(), atomicity);
+        if let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+            result.content[0] = ContentBlock::text(text);
+        }
+    }
+    result
+}
+
+fn queued_response(
+    doi: &str,
+    title: &str,
+    paper_id: Uuid,
+    atomicity: Option<serde_json::Value>,
+) -> serde_json::Value {
     let mut note = String::from(
         "DB writes are running as a detached background task; confirm they landed by \
          query_paper(`document_key`)'s claim_count rising, not with check_already_ingested, \
@@ -493,7 +588,7 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
              to pin the key to your own run id so re-ingests converge on this same node.",
         );
     }
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "status": "queued",
         // `paper_id` is the addressable node; `document_key` is what `papers.doi`,
         // the `doi:<key>` claim label, and check_already_ingested are keyed on.
@@ -504,7 +599,11 @@ fn queued_response(doi: &str, title: &str, paper_id: Uuid) -> serde_json::Value 
         "doi": doi,
         "title": title,
         "note": note,
-    })
+    });
+    if let (Some(a), Some(map)) = (atomicity, body.as_object_mut()) {
+        map.insert("atomicity".to_string(), a);
+    }
+    body
 }
 
 /// Gate check: returns `Some(paper_id)` iff a paper with `doi` exists AND has
@@ -642,6 +741,108 @@ fn parse_ingest_visibility(
     group_id: Option<&str>,
 ) -> Result<epigraph_core::VisibilityChoice, McpError> {
     epigraph_core::VisibilityChoice::parse_str(visibility, group_id).map_err(invalid_params)
+}
+
+/// Whether a source under `licence` may have its verbatim text republished in
+/// `evidence.raw_content` (backlog 8709d128). An exact allowlist, matched
+/// case-insensitively with spaces and underscores read as hyphens:
+/// `PUBLIC-DOMAIN`, `PD`, `CC0`, `CC0-1.0`, the bare `CC-BY` / `CC-BY-SA`,
+/// and the SPDX ids `CC-BY-<d.d>` / `CC-BY-SA-<d.d>` with an optional
+/// jurisdiction port (`CC-BY-3.0-IGO`). Everything else is
+/// all-rights-reserved for this purpose: `None` (unknown), every
+/// non-commercial or no-derivatives variant however it is spelled, and any
+/// free text. The graph is exported as a unit, so a licence that restricts
+/// reuse cannot ride along. An unrecognised spelling fails closed.
+#[must_use]
+pub fn passage_retention_permitted(licence: Option<&str>) -> bool {
+    let Some(licence) = licence else {
+        return false;
+    };
+    let id = licence.trim().to_ascii_uppercase().replace([' ', '_'], "-");
+    if matches!(
+        id.as_str(),
+        "PUBLIC-DOMAIN" | "PD" | "CC0" | "CC0-1.0" | "CC-BY" | "CC-BY-SA"
+    ) {
+        return true;
+    }
+    let Some(rest) = id
+        .strip_prefix("CC-BY-SA-")
+        .or_else(|| id.strip_prefix("CC-BY-"))
+    else {
+        return false;
+    };
+    let (version, port) = match rest.split_once('-') {
+        Some((version, port)) => (version, Some(port)),
+        None => (rest, None),
+    };
+    is_cc_licence_version(version)
+        && match port {
+            None => true,
+            Some(port) => is_cc_jurisdiction_port(port),
+        }
+}
+
+/// A Creative Commons licence version as SPDX writes it: `<digit>.<digit>`.
+fn is_cc_licence_version(version: &str) -> bool {
+    matches!(version.as_bytes(), [major, b'.', minor] if major.is_ascii_digit() && minor.is_ascii_digit())
+}
+
+/// A CC jurisdiction port suffix (`US`, `IGO`, `AU`): 2-4 letters, and never
+/// a licence element (`NC`, `ND`, `SA`) misplaced after the version.
+fn is_cc_jurisdiction_port(port: &str) -> bool {
+    (2..=4).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_uppercase())
+        && !matches!(port, "NC" | "ND" | "SA")
+}
+
+/// The `raw_content` of the evidence row a document ingest writes for one
+/// planned claim. Always the citation, the passage's locator and the BLAKE3
+/// hash of the passage; the passage text itself only when the source's
+/// licence permits retention ([`passage_retention_permitted`]).
+///
+/// For a Tier-1 extraction (one carrying `source_text` and byte spans) a
+/// reader who holds the source re-derives the quote from the locator's span
+/// and checks it against the hash. For a Tier-2 extraction the locator names
+/// the extractor's section/paragraph path and section title only, and the
+/// hash covers the extracted text, which need not match the source byte for
+/// byte; there the hash pins what was extracted, not a reproducible span.
+///
+/// This removes the passage from the evidence row only. A level-2 paragraph
+/// claim's own `content` is still the paragraph text (see
+/// `epigraph_ingest::document::builder::build_ingest_plan`), which is a
+/// separate decision.
+///
+/// The evidence row's `content_hash` is the hash of THIS string, so two
+/// different passages on one claim still produce two different rows.
+#[must_use]
+pub fn literature_evidence_body(
+    paper_title: &str,
+    doi: &str,
+    planned: &PlannedClaim,
+    licence: Option<&str>,
+) -> String {
+    let passage = planned
+        .supporting_text
+        .as_deref()
+        .unwrap_or(&planned.content);
+    let passage_hash = ContentHasher::to_hex(&ContentHasher::hash(passage.as_bytes()));
+    let locator = planned
+        .supporting_locator
+        .clone()
+        .unwrap_or_else(|| format!("level_{}", planned.level));
+    let mut body = format!(
+        "Source: {paper_title} (DOI: {doi}). Locator: {locator}. Passage BLAKE3: {passage_hash}."
+    );
+    match licence {
+        Some(licence) if passage_retention_permitted(Some(licence)) => {
+            body.push_str(&format!(" Licence: {licence}. Passage: '{passage}'"));
+        }
+        Some(licence) => {
+            body.push_str(&format!(" Passage not retained (licence: {licence})."));
+        }
+        None => body.push_str(" Passage not retained (licence unknown)."),
+    }
+    body
 }
 
 /// Resolve an ingest's visibility for its author: whose the claims are, and
@@ -1040,6 +1241,100 @@ impl IngestTx<'_> {
     }
 }
 
+/// Embed the claims a document ingest just CREATED, in a detached task, and
+/// store each vector as the ingest wrote the claim: stamped from the
+/// ingesting `author`, widened by the ingest's team-write `grant`.
+///
+/// The claims used to go through `McpEmbedder::embed_and_store`, whose store
+/// path resolves a claim's author by reading the row as PUBLIC. A document
+/// ingest's claims have gone to the author's team (or stayed private) by
+/// default since the 2026-11-10 visibility ruling, never silently public, so
+/// for a default ingest that read found nothing and every background embed
+/// was refused with only a WARN (backlog 46902f71). `submit_claim`, `memorize`
+/// and workflow ingest were each moved off that path for this reason; the two
+/// document walkers were not.
+///
+/// `embed_queue` holds only claims this ingest inserted (a dedup-converged
+/// claim never enters it), so the ingesting author is the writer of every
+/// row. A server on a DECLARED privileged pool has no `ScopedPool` to stamp;
+/// there the embedder's own store path (the privileged pool) is the right one,
+/// as before.
+///
+/// Best-effort (CLAUDE.md "Embedding policy"): a failure is warned with its
+/// cause and the claim stays stored.
+///
+/// Returns how many embeddings were QUEUED, which is what the walk's response
+/// reports (backlog fdacc14f): a stored count is unknowable when the response
+/// is built. 0 when the queue is empty or this server has no embedding
+/// provider (`McpEmbedder::embeddings_disabled`); then no task is spawned,
+/// because every provider call would fail, and one WARN says so.
+fn spawn_ingest_embeds(
+    server: &EpiGraphMcpFull,
+    author: Uuid,
+    grant: Option<epigraph_db::TeamWriteGrant>,
+    embed_queue: Vec<(Uuid, String)>,
+    tool_name: &'static str,
+) -> usize {
+    if embed_queue.is_empty() {
+        return 0;
+    }
+    if server.embedder.embeddings_disabled() {
+        tracing::warn!(
+            tool = tool_name,
+            claims = embed_queue.len(),
+            "embeddings are disabled on this server (no provider key), so the claims this \
+             ingest created carry no vector until the maintenance backfill reaches them"
+        );
+        return 0;
+    }
+    let queued = embed_queue.len();
+    // The whole server, as the detached walk takes it: the stamped store needs
+    // its `ScopedPool` and its embedder, and reaches the pool only inside
+    // `claim_helper`, where every author-stamped store already does.
+    let bg = server.clone();
+    // Tracked, so a stdio process waits for the vectors before it exits
+    // (`crate::background`, backlog b928ccc1).
+    server.background.spawn(async move {
+        let (mut stored, total) = (0usize, embed_queue.len());
+        for (id, content) in embed_queue {
+            let embedded = if bg.scoped.is_some() {
+                crate::claim_helper::embed_claim_author_stamped_for(
+                    &bg,
+                    author,
+                    id,
+                    &content,
+                    None,
+                    tool_name,
+                    grant.as_ref(),
+                )
+                .await
+            } else {
+                // A DECLARED privileged pool: no stamp to take; the embedder's
+                // own store path is that pool.
+                bg.embedder.embed_and_store(id, &content).await
+            };
+            if embedded {
+                stored += 1;
+            } else {
+                tracing::warn!(
+                    tool = tool_name,
+                    "background embedding failed for claim {id}"
+                );
+            }
+        }
+        if stored < total {
+            tracing::warn!(
+                tool = tool_name,
+                stored,
+                queued = total,
+                "document ingest embedded fewer claims than it queued; the rest are current \
+                 claims with no vector until a backfill reaches them"
+            );
+        }
+    });
+    queued
+}
+
 async fn begin_ingest_tx<'p>(
     server: &'p EpiGraphMcpFull,
     author: crate::write_identity::WriteIdentity,
@@ -1241,6 +1536,12 @@ pub async fn do_ingest_document_reporting(
     // task was spawned, so the call above is an idempotent read of it.
     let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
     let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
+    // The source's recorded licence decides whether evidence may keep the
+    // verbatim passage (backlog 8709d128). Read once, from the row, never
+    // from the extraction.
+    let licence = PaperRepository::licence(&mut *tx, paper_id)
+        .await
+        .map_err(internal_error)?;
 
     // ── 3. Ensure author agents + agent --authored--> paper ──
     // An author with an `agent_id` IS that existing agent (backlog 94cc12db).
@@ -1492,12 +1793,8 @@ pub async fn do_ingest_document_reporting(
         .map_err(internal_error)?;
 
         // New claim: write the supporting evidence and reasoning trace.
-        let evidence_text = planned
-            .supporting_text
-            .as_deref()
-            .unwrap_or(&planned.content);
         let formatted_evidence =
-            format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
+            literature_evidence_body(&paper_title, &doi, planned, licence.as_deref());
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
             signer_typed,
@@ -1533,9 +1830,13 @@ pub async fn do_ingest_document_reporting(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(edge_key),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
@@ -1770,19 +2071,16 @@ pub async fn do_ingest_document_reporting(
 
     // ── 8. Detach embeddings so the MCP response returns immediately after commit ──
     // All DB writes are done. Embed in the background so the caller is not blocked
-    // by N × ~0.8 s OpenAI calls. The response reports the number queued; the
-    // invariant (every is_current claim has an embedding) is satisfied eventually.
-    let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    // by N × ~0.8 s OpenAI calls. The response reports the number QUEUED (0 when
+    // this server has no embedding provider), never a number stored: nothing has
+    // been stored when it is built. The task logs stored against queued.
+    let queued = spawn_ingest_embeds(
+        server,
+        agent_id,
+        resolution.grant().cloned(),
+        embed_queue,
+        "ingest_document",
+    );
 
     let tenancy = IngestTenancy {
         visibility: resolution.label(),
@@ -1801,6 +2099,7 @@ pub async fn do_ingest_document_reporting(
         authors: author_responses,
         ingested_by: agent_id.to_string(),
         claims_ingested: claim_ids.len() - dedup_count,
+        claims_embedding_queued: queued,
         claims_embedded: queued,
         claims_skipped_dedup: dedup_count,
         relationships_created,
@@ -1811,45 +2110,6 @@ pub async fn do_ingest_document_reporting(
         already_ingested: claim_ids.len() == dedup_count && dedup_count > 0,
     })?;
     Ok((result, tenancy))
-}
-
-/// Convert a DOI into a slug form safe for use as a URL path segment or
-/// canonical name: every `/` becomes `-`. Casing is left untouched.
-///
-/// # Why this has no caller, and must NOT be wired into the label write
-///
-/// It looks like the missing half of backlog 00ad6fee ("Step 14's
-/// `recompute_beliefs(labels=[doi_slug])` is a no-op — ingest writes
-/// `doi:<doi>`, not the slug"), and the obvious repair is to emit
-/// `doi_to_slug(doi)` alongside `doi:{doi}` at both ingest sites. **Do not.**
-/// That backlog was resolved on the WORKFLOW side and this spelling is now the
-/// one the canonical workflow explicitly warns against.
-///
-/// MEASURED against prod on 2026-09-22: workflow
-/// `48c58117-4c96-5e72-805a-cb1ce7193012`
-/// (`ingest-papers-into-epigraph-knowledge-graph-via-hierarchical-extraction`),
-/// step_index 14, lineage `b5bb0b73-…`. The step claim the backlog quotes —
-/// `1ad33d15-e517-5e73-b3dd-c6ff00a0e2d3`, "`recompute_beliefs(labels=[doi_slug]`
-/// … DOI with slashes replaced by hyphens" — is `is_current: false`. Its head
-/// is `d079cc79-1ba2-4aa2-8705-05a072764c77` (2026-09-02):
-///
-/// > The label is the literal prefix 'doi:' joined to the DOI with slashes
-/// > INTACT … VERIFIED 2026-09-02 across 24 papers … The hyphen-slug form
-/// > previously documented here … and the bare DOI without the 'doi:' prefix
-/// > BOTH match zero claims.
-///
-/// So `doi:{doi}` (what `do_ingest_document` and the spine path already write,
-/// pinned by `ingest_document_smoke::ingested_claims_carry_doi_label_for_recompute`)
-/// is the canonical spelling on both sides. Adding a second, hyphenated label
-/// to every ingested claim would re-legitimise a form the workflow head calls a
-/// silent no-op, and `check_already_ingested` is keyed on the `doi:<key>`
-/// spelling besides.
-///
-/// Kept, not deleted: the doc comment above describes a URL/path-segment use
-/// that is unrelated to labels, and the unit tests below pin the transform.
-#[allow(dead_code)] // deliberately uncalled — see the doc comment above, not a gap
-fn doi_to_slug(doi: &str) -> String {
-    doi.replace('/', "-")
 }
 
 /// URN prefix for a synthesized (non-DOI) document identity key.
@@ -2305,6 +2565,12 @@ pub async fn do_ingest_document_spine(
     let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
     let mut tx =
         begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
+    // The source's recorded licence decides whether evidence may keep the
+    // verbatim passage (backlog 8709d128). Read once, from the row, never
+    // from the extraction.
+    let licence = PaperRepository::licence(&mut *tx, paper_id)
+        .await
+        .map_err(internal_error)?;
 
     // ── 2. Ensure author agents + authored edges ──
     let mut author_responses = Vec::new();
@@ -2531,12 +2797,8 @@ pub async fn do_ingest_document_spine(
         .await
         .map_err(internal_error)?;
 
-        let evidence_text = planned
-            .supporting_text
-            .as_deref()
-            .unwrap_or(&planned.content);
         let formatted_evidence =
-            format!("Source: {paper_title} (DOI: {doi}). Passage: '{evidence_text}'");
+            literature_evidence_body(&paper_title, &doi, planned, licence.as_deref());
         let evidence_hash = ContentHasher::hash(formatted_evidence.as_bytes());
         let mut evidence = Evidence::new(
             signer_typed,
@@ -2572,9 +2834,13 @@ pub async fn do_ingest_document_spine(
         ReasoningTraceRepository::create(&mut *tx, &trace, claim.id)
             .await
             .map_err(internal_error)?;
-        EvidenceRepository::create(&mut *tx, &evidence)
-            .await
-            .map_err(internal_error)?;
+        EvidenceRepository::create(
+            &mut *tx,
+            &evidence,
+            epigraph_db::EvidenceEdge::supports(edge_key),
+        )
+        .await
+        .map_err(internal_error)?;
         ClaimRepository::update_trace_id_conn(&mut tx, claim.id, trace.id)
             .await
             .map_err(internal_error)?;
@@ -2700,18 +2966,15 @@ pub async fn do_ingest_document_spine(
         crate::errors::internal_error_logged("ingest_document_spine: could not commit", e)
     })?;
 
-    // ── 6. Detach embeddings ──
-    let queued = embed_queue.len();
-    if !embed_queue.is_empty() {
-        let embedder = Arc::clone(&server.embedder);
-        tokio::spawn(async move {
-            for (id, content) in embed_queue {
-                if !embedder.embed_and_store(id, &content).await {
-                    tracing::warn!("background embedding failed for claim {id}");
-                }
-            }
-        });
-    }
+    // ── 6. Detach embeddings (the response reports the number queued; see step 8
+    // of `do_ingest_document_reporting`) ──
+    let queued = spawn_ingest_embeds(
+        server,
+        agent_id,
+        resolution.grant().cloned(),
+        embed_queue,
+        "ingest_document_spine",
+    );
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
@@ -2722,6 +2985,7 @@ pub async fn do_ingest_document_spine(
         ingested_by: agent_id.to_string(),
         paragraphs_new: para_new_count,
         paragraphs_deduped: para_dedup_count,
+        paragraphs_embedding_queued: queued,
         paragraphs_embedded: queued,
         new_paragraph_paths,
         converged_claims_unlabelled: converged_unlabelled,
@@ -2851,19 +3115,6 @@ mod tests {
         .await
         .expect("gate query");
         assert_eq!(hit, Some(paper_id));
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_slash() {
-        assert_eq!(
-            doi_to_slug("10.48550/arXiv.2606.04990"),
-            "10.48550-arXiv.2606.04990"
-        );
-    }
-
-    #[test]
-    fn doi_to_slug_replaces_all_slashes() {
-        assert_eq!(doi_to_slug("10.1000/xyz/123/abc"), "10.1000-xyz-123-abc");
     }
 
     // ── Document identity keying (issue #356) ──────────────────────────────
@@ -3236,5 +3487,74 @@ mod tests {
         assert!(key_slug(&long).len() <= 48);
         assert_eq!(key_slug("Hello   World -- Again"), "hello-world-again");
         assert_eq!(key_slug("  leading and trailing  "), "leading-and-trailing");
+    }
+
+    // --- the warn-only atomicity gate at ingest (backlog 72850d43) ---
+
+    fn extraction_with_atoms(atoms: &[&[&str]]) -> DocumentExtraction {
+        serde_json::from_value(serde_json::json!({
+            "source": {"title": "b42 atomicity"},
+            "sections": [{
+                "title": "s",
+                "paragraphs": atoms.iter().map(|a| serde_json::json!({
+                    // Compound by design: the paragraph is never screened.
+                    "text": "One. Two. Three; four.",
+                    "atoms": a,
+                })).collect::<Vec<_>>(),
+            }],
+        }))
+        .expect("extraction")
+    }
+
+    #[test]
+    fn ingest_atomicity_reports_only_compound_atoms() {
+        let none = extraction_with_atoms(&[&["The pump failed.", "The backup took over."]]);
+        assert!(
+            extraction_atomicity(&none).is_none(),
+            "atomic atoms: no field"
+        );
+
+        let mixed = extraction_with_atoms(&[
+            &["The pump failed."],
+            &[
+                "The pump failed, but the backup took over.",
+                "The alarm rang.",
+            ],
+        ]);
+        let a = extraction_atomicity(&mixed).expect("a compound atom is reported");
+        assert_eq!(a["atoms_screened"], 3);
+        assert_eq!(a["compound_atoms"], 1);
+        let ex = &a["examples"][0];
+        assert_eq!(
+            (
+                ex["section"].clone(),
+                ex["paragraph"].clone(),
+                ex["atom"].clone()
+            ),
+            (0.into(), 1.into(), 0.into())
+        );
+        assert_eq!(ex["conjunct_count"], 2);
+    }
+
+    #[test]
+    fn ingest_atomicity_is_added_to_the_response_body() {
+        let body = queued_response(
+            "10.1/b42",
+            "t",
+            Uuid::nil(),
+            Some(serde_json::json!({"compound_atoms": 1})),
+        );
+        assert_eq!(body["atomicity"]["compound_atoms"], 1);
+        assert_eq!(body["status"], "queued");
+        assert!(queued_response("10.1/b42", "t", Uuid::nil(), None)
+            .get("atomicity")
+            .is_none());
+
+        let result = CallToolResult::success(vec![ContentBlock::text(r#"{"status":"ok"}"#)]);
+        let out = with_atomicity(result, Some(serde_json::json!({"compound_atoms": 2})));
+        let text = out.content[0].as_text().unwrap().text.clone();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert_eq!(v["atomicity"]["compound_atoms"], 2);
     }
 }

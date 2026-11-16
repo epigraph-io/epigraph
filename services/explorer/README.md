@@ -98,6 +98,108 @@ The Atlas draws on a canvas with a few d3 modules (`d3-color`,
 and served from this origin like every other asset, so the CSP stays
 `script-src 'self'`.
 
+### Atlas nested levels and the fixture preview
+
+Below a theme the Atlas can open onto nested group levels and leaf subgraphs (the
+`atlas_level` v1 contract in `contract/atlas_level/v1/`). The page needs one input
+that contract does not define: `data-atlas-maps`, the map list (contract
+`atlas_maps` v1, `contract/atlas_maps/v1/schema.json`, Rust types in
+`src/atlas_maps.rs`). For each map the viewer may pick, first the default, it
+gives:
+- its `key`, `scope` (`team` or `public`), team `group_id` and picker `label`;
+- its own `level_url`, a same-origin prefix ending in `/`;
+- each theme it draws, with the theme's name and claim count **on that map** and
+  its root level in each hierarchy.
+
+A level is fetched from `<level_url><hierarchy>/<level id>` (`hierarchy` is
+`meaning` or `links`) and answered with a v1 level document of that map and
+hierarchy, or the contract's not-found body. So every request names the map, the
+hierarchy and the level, and the server reads one row. The client knows each
+level's hierarchy: a root's from the map entry, a switch names its own, and
+children, breadcrumbs and link targets stay in the hierarchy of the level that
+lists them.
+
+What the producer and the page must keep (W10, and the nightly builder):
+- A route test checks the rendered attribute with
+  `tests/common/atlas_maps.rs::check_atlas_maps_attr`, as it checks level bodies
+  with `check_level_body`: one URL per map, at most one public map, one map per
+  team, unique keys and themes, distinct roots. Which maps a viewer sees is the
+  route test's to assert.
+- A link target or breadcrumb pointing at a level that awaits (re)naming carries a
+  null `name` (those objects have no `needs_naming` flag).
+- Search and `#c-` links into a nested theme land on the claim's leaf only once
+  that leaf has been fetched. The claim-to-leaf lookup now exists (contract
+  `atlas_claim_leaf` v1, `contract/atlas_claim_leaf/v1/schema.json`, checker
+  `tests/common/atlas_claim_leaf.rs`): `GET <data-atlas-claim-leaf-url><map
+  key>/<hierarchy>/<claim id>` answers which leaf holds a claim the viewer can
+  read. `atlas.js` does not call it yet.
+
+With a map list, the picked map sets each theme's name and count, and a theme the
+map does not draw shows "Not on this map" and opens onto nothing. Theme and region
+positions, region names and the links between themes stay on the viewer's own
+layout. The drawing rules live in
+`static/atlas_nested.js`. They are pure functions, tested with
+`node --test js-tests/atlas_nested.test.cjs` (no dependencies).
+
+**The real routes (backlog W10).** `/atlas` asks the kernel which maps the viewer
+can see (`GET /api/v1/atlas/maps`, then each map's themes and roots) and renders
+them as `data-atlas-maps`: team maps first, then the public map, each keyed
+`team-<32 hex>` or `public`, with `level_url` `/bff/atlas/maps/<key>/`. When the
+kernel lists no map, or the calls fail, the attribute is left out and the regions
+and themes behave exactly as before. The whole map list runs under one budget, a
+third of `EPIGRAPH_EXPLORER_UPSTREAM_TIMEOUT_MS` capped at 3 s (2.67 s at the default), so a
+slow or hung API delays the page by that much at most; past it the page renders
+without the list and logs a warning with the elapsed time. The level route
+`/bff/atlas/maps/{key}/{hierarchy}/{id}` passes the kernel's answer through (the
+kernel filters each leaf for the viewer's own session) and:
+- compresses it, gzip or br as the client accepts: the reverse proxy does not, and
+  the 150 KB level budget is gzip bytes;
+- answers `Cache-Control: private, no-cache`, `Vary: Cookie` and a weak ETag
+  `W/"<run id>.<level id>.<digest of the bytes served>"`, and a matching
+  `If-None-Match` gets a 304 only after the kernel has answered 200 for this
+  viewer;
+- answers the contract's `bff_not_found` body for an absent, unreadable or
+  forbidden level and for a key, hierarchy or id that names nothing.
+
+**Fixture preview.** To try the nested levels with no API and no database:
+
+```sh
+# from services/explorer; the one argument is the port (always 127.0.0.1)
+cargo run --release --locked -- --atlas-fixture-preview 8097
+# or, with a built binary
+epigraph-explorer --atlas-fixture-preview 8097
+```
+
+Then open `http://127.0.0.1:8097/atlas/preview`. On a remote host, forward the port
+first: `ssh -L 8097:127.0.0.1:8097 <host>`. Never give it a port a reverse proxy
+forwards: loopback keeps it off the network, not out of a proxy.
+
+What it serves:
+- The synthetic preview set in `contract/atlas_level/v1/preview/`: two maps, three
+  theme trees per hierarchy, and one 100-node leaf.
+- The contract fixtures, under their own map and hierarchy.
+- All of it compiled into the binary and served byte for byte.
+
+Its guards:
+- **Off by default.** Only the command-line flag turns it on; no environment variable
+  does.
+- **Loopback only.** It refuses any address that is not an IP-literal loopback (a bare
+  port means `127.0.0.1:<port>`, and `[::1]:<port>` also works). `0.0.0.0`, LAN
+  addresses and host names are refused, with exit code 2, and `serve` checks again
+  before it binds.
+- **No real routes.** It mounts only `/atlas/preview`,
+  `/bff/atlas/preview/maps/{map}/{hierarchy}/{id}`, `/health` and `/static/*`. A
+  level asked for under another map or hierarchy is not found, as on the real
+  route. No page or BFF route that calls the API exists in it, and
+  its API URL is a dead loopback port.
+- **Clearly marked.** It logs a warning at start, the page carries a banner, and every
+  response carries `x-atlas-preview: synthetic-fixtures`.
+
+To regenerate the preview set after changing the generator
+(`crates/epigraph-atlas-contract/src/preview.rs`), run
+`ATLAS_CONTRACT_BLESS=1 cargo test -p epigraph-atlas-contract _are_current` from the
+repository root.
+
 ## Configuration
 
 All configuration comes from environment variables, read once at startup

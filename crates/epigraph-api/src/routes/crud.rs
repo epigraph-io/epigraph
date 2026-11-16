@@ -54,9 +54,9 @@ pub struct ListEvidenceQuery {
     pub claim_id: Option<Uuid>,
     /// Exact match on the stored `evidence_type` column. Vocabulary:
     /// `document`, `observation`, `testimony`, `computation`, `reference`,
-    /// `figure`, `conversational` (the `evidence_type_valid` CHECK
-    /// constraint). Note `Literature` is stored as `reference` and
-    /// `Consensus` as `computation`.
+    /// `figure`, `conversational`, `dataset` (the `evidence_type_valid` CHECK
+    /// constraint, `epigraph_core::STORED_EVIDENCE_TYPES`). Note `Literature`
+    /// is stored as `reference` and `Consensus` as `computation`.
     pub evidence_type: Option<String>,
     /// Case-insensitive substring match on `raw_content`. Rows with a NULL
     /// `raw_content` never match this predicate.
@@ -288,14 +288,17 @@ pub async fn create_evidence(
     use epigraph_core::{AgentId, ClaimId, Evidence, EvidenceType};
     use epigraph_db::EvidenceRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        // Accept either evidence:write or evidence:submit (naming inconsistency)
-        if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
-            return Err(crate::errors::ApiError::Forbidden {
-                reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
-            });
-        }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    // Accept either evidence:write or evidence:submit (naming inconsistency)
+    if !auth.has_scope("evidence:write") && !auth.has_scope("evidence:submit") {
+        return Err(crate::errors::ApiError::Forbidden {
+            reason: "Missing required scope: evidence:write or evidence:submit".to_string(),
+        });
     }
 
     // Parse evidence_type from JSON
@@ -304,6 +307,33 @@ pub async fn create_evidence(
             field: "evidence_type".to_string(),
             reason: format!("Invalid evidence_type JSON: {e}"),
         })?;
+    // A dataset's own invariants (digest form and length, bounded text). The
+    // shape check above admits any strings; without this a malformed manifest
+    // digest would be stored and no reader could verify against it.
+    evidence_type
+        .validate()
+        .map_err(|e| ApiError::ValidationError {
+            field: format!("evidence_type.{}", e.field),
+            reason: e.reason,
+        })?;
+    // A dataset's attestation is a server's signature over its fields, written
+    // by the MCP writer that signs the row. This route signs nothing, so a
+    // body's attestation would be a caller-planted claim of a signature: a
+    // reader verifying it against the row's signer would be misled, or, if
+    // the caller copied a real one from another row, at best refused.
+    if matches!(
+        &evidence_type,
+        EvidenceType::Dataset {
+            attestation: Some(_),
+            ..
+        }
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "evidence_type.attestation".to_string(),
+            reason: "is written by the server that signs a dataset; a request may not supply one"
+                .to_string(),
+        });
+    }
 
     // Compute content hash from raw_content (or use provided hash).
     //
@@ -357,7 +387,14 @@ pub async fn create_evidence(
         ClaimId::from_uuid(request.claim_id),
     );
 
-    let created = EvidenceRepository::create(&state.db_pool, &evidence).await?;
+    // With its `evidence -> claim` edge, in the evidence's own transaction
+    // (backlog 2d60f619). The request names no direction: `supports`.
+    let created = EvidenceRepository::create(
+        &state.db_pool,
+        &evidence,
+        epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
+    )
+    .await?;
     let evidence_id: Uuid = created.id.into();
 
     // Materialize claim --DERIVED_FROM--> evidence edge
@@ -401,6 +438,7 @@ pub async fn create_evidence(
         EvidenceType::Literature { .. } => "literature",
         EvidenceType::Consensus { .. } => "consensus",
         EvidenceType::Figure { .. } => "figure",
+        EvidenceType::Dataset { .. } => "dataset",
     };
 
     Ok((
@@ -556,8 +594,10 @@ pub async fn update_evidence(
 pub struct CreateReasoningTraceRequest {
     /// ID of the claim this trace explains
     pub claim_id: Uuid,
-    /// Agent that produced the reasoning
-    pub agent_id: Uuid,
+    /// Agent that produced the reasoning. Omitted, it is the authenticated
+    /// caller; named, it must BE the caller (backlog f64cf9c6).
+    #[serde(default)]
+    pub agent_id: Option<Uuid>,
     /// Methodology: deductive, inductive, abductive, statistical
     pub methodology: String,
     /// Confidence in [0.0, 1.0]
@@ -583,8 +623,24 @@ pub struct ReasoningTraceResponse {
 /// Create a new reasoning trace
 ///
 /// POST /api/v1/reasoning-traces
+///
+/// The author is the authenticated caller (backlog f64cf9c6,
+/// `experiment_loop.rs::caller_author`): an omitted `agent_id` is the caller's
+/// own, a named one that is not the caller is `403`, and an absent
+/// `AuthContext` is a refusal, not a pass. The trace and its `HAS_TRACE` edge
+/// are written on ONE transaction stamped with the caller's viewer
+/// (`AppState::write_as`), so the database decides the trace's owner from the
+/// caller's writable groups.
+///
+/// The claim is read as the caller on that transaction first: a claim the
+/// caller cannot read gets the same `404` as one that does not exist, so the
+/// route is no existence oracle (as `belief.rs::submit_evidence` step 5a). A
+/// readable claim the database refuses the trace on is `403` with nothing
+/// written. The edge stays best-effort, as it was, under a savepoint so a
+/// refused edge does not roll the trace back.
 #[cfg(feature = "db")]
 pub async fn create_reasoning_trace(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<CreateReasoningTraceRequest>,
@@ -592,10 +648,17 @@ pub async fn create_reasoning_trace(
     use epigraph_core::{AgentId, ClaimId, Methodology, ReasoningTrace, TraceInput};
     use epigraph_db::ReasoningTraceRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
+    let author = crate::routes::experiment_loop::caller_author(
+        &viewer,
+        request.agent_id,
+        "a reasoning trace",
+    )?;
 
     // Validate confidence
     if !(0.0..=1.0).contains(&request.confidence) {
@@ -631,38 +694,56 @@ pub async fn create_reasoning_trace(
         vec![]
     };
 
-    // Resolve public key
-    let public_key = epigraph_db::AgentRepository::get_by_id(
-        &state.db_pool,
-        AgentId::from_uuid(request.agent_id),
-    )
-    .await
-    .ok()
-    .flatten()
-    .map(|a| a.public_key)
-    .unwrap_or([0u8; 32]);
+    let refused = |e: &epigraph_db::DbError| {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            handler = "create_reasoning_trace",
+            error = %e,
+            "the database refused the reasoning trace"
+        );
+        crate::errors::write_refused("claim")
+    };
+    let mut tx = state.write_as(&viewer, "create_reasoning_trace").await?;
 
+    // The claim, read as the caller. Unreadable and nonexistent answer alike.
+    let readable =
+        epigraph_db::ClaimRepository::visible_claim_ids(&mut *tx, &viewer, &[request.claim_id])
+            .await?;
+    if !readable.contains(&request.claim_id) {
+        return Err(ApiError::NotFound {
+            entity: "claim".to_string(),
+            id: request.claim_id.to_string(),
+        });
+    }
+
+    // `reasoning_traces` stores neither the author nor its key
+    // (`ReasoningTraceRepository::create_with_reasoning_type`), so no key is
+    // looked up.
     let trace = ReasoningTrace::new(
-        AgentId::from_uuid(request.agent_id),
-        public_key,
+        AgentId::from_uuid(author),
+        [0u8; 32],
         methodology,
         inputs,
         request.confidence,
         request.explanation.clone(),
     );
 
-    let created = ReasoningTraceRepository::create(
-        &state.db_pool,
-        &trace,
-        ClaimId::from_uuid(request.claim_id),
-    )
-    .await?;
+    let created =
+        ReasoningTraceRepository::create(&mut *tx, &trace, ClaimId::from_uuid(request.claim_id))
+            .await
+            .map_err(|e| {
+                if crate::errors::db_is_insufficient_privilege(&e) {
+                    refused(&e)
+                } else {
+                    ApiError::from(e)
+                }
+            })?;
 
     let trace_id: Uuid = created.id.into();
 
-    // Materialize claim --HAS_TRACE--> trace edge
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        &state.db_pool,
+    // Materialize claim --HAS_TRACE--> trace edge (best-effort, as before)
+    crate::routes::belief::create_edge_under_savepoint(
+        &mut tx,
         state.edge_signing_key(),
         request.claim_id,
         "claim",
@@ -670,28 +751,28 @@ pub async fn create_reasoning_trace(
         "trace",
         "HAS_TRACE",
         None,
-        None,
-        None,
     )
-    .await;
+    .await?;
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the reasoning trace: {e}"),
+    })?;
 
     // Record provenance
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        let hash = blake3::hash(trace_id.as_bytes());
-        if let Err(e) = crate::middleware::provenance::record_provenance(
-            &state.db_pool,
-            auth,
-            "trace",
-            trace_id,
-            "create",
-            hash.as_bytes(),
-            &[],
-            None,
-        )
-        .await
-        {
-            tracing::warn!(trace_id = %trace_id, error = %e, "Failed to record trace provenance");
-        }
+    let hash = blake3::hash(trace_id.as_bytes());
+    if let Err(e) = crate::middleware::provenance::record_provenance(
+        &state.db_pool,
+        auth,
+        "trace",
+        trace_id,
+        "create",
+        hash.as_bytes(),
+        &[],
+        None,
+    )
+    .await
+    {
+        tracing::warn!(trace_id = %trace_id, error = %e, "Failed to record trace provenance");
     }
 
     Ok((
@@ -699,7 +780,7 @@ pub async fn create_reasoning_trace(
         Json(ReasoningTraceResponse {
             id: trace_id,
             claim_id: request.claim_id,
-            agent_id: request.agent_id,
+            agent_id: author,
             methodology: request.methodology,
             confidence: request.confidence,
             explanation: request.explanation,
@@ -767,10 +848,13 @@ pub async fn create_analysis(
 ) -> Result<(StatusCode, Json<CreateAnalysisResponse>), ApiError> {
     use epigraph_db::AnalysisRepository;
 
-    // Enforce scope when OAuth2-authenticated
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
-    }
+    // Enforce scope unconditionally: a request with no AuthContext is refused
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:write"])?;
 
     if request.analysis_type.trim().is_empty() {
         return Err(ApiError::ValidationError {
@@ -796,8 +880,12 @@ pub async fn create_analysis(
     let claim_ids = request.claim_ids.unwrap_or_default();
 
     // Persist analysis + edges atomically
+    // Its `concludes` / `interpreted_by` edges are attested at INSERT with the
+    // API's own key (backlog dae795f8), `None` when this API has none
+    // configured.
     let analysis_id = AnalysisRepository::persist_bundle(
         &state.db_pool,
+        state.edge_signing_key(),
         &analysis,
         &claim_ids,
         &request.input_evidence_ids,
@@ -1087,6 +1175,20 @@ pub struct PromoteStagedEdgesRequest {
     pub edge_ids: Option<Vec<Uuid>>,
 }
 
+/// Whether a staged copy's INSERT was refused by a unique or exclusion
+/// constraint of `edges` (23505 / 23P01): what the bulk copy's bare
+/// `ON CONFLICT DO NOTHING` used to skip silently.
+#[cfg(feature = "db")]
+fn staged_copy_conflicts(e: &epigraph_db::DbError) -> bool {
+    match e {
+        epigraph_db::DbError::DuplicateKey { .. } => true,
+        epigraph_db::DbError::QueryFailed {
+            source: sqlx::Error::Database(d),
+        } => matches!(d.code().as_deref(), Some("23505" | "23P01")),
+        _ => false,
+    }
+}
+
 /// Promote approved staged edges to the production edges table
 ///
 /// POST /api/v1/edges-staging/promote
@@ -1116,136 +1218,122 @@ pub async fn promote_staged_edges(
         .0;
     crate::middleware::scopes::check_scopes(&auth, &["claims:admin"])?;
 
-    // Build the query based on whether specific IDs were provided. Each arm is
-    // ONE statement ($1 = the reserved keys), so the reserved-key check and
-    // the copy read the same snapshot. `reserved` lists the selected rows whose
-    // `properties` carry `dedup` or `supersede_act`; when any does,
-    // `to_promote` is empty and nothing is written. Those keys mark a dedup
-    // act's identity edge and a supersession's act edge, which only the acts
-    // write (create and patch refuse them too); a staged row is copied
-    // verbatim, so promoting it would publish a forged act record. The whole
-    // request is refused rather than silently promoting the rest. `lineage`
-    // does the same for a staged `supersedes` row (any spelling): copied
-    // verbatim it would publish a lineage edge that retires nothing.
-    //
-    // The one column NOT copied verbatim is a case-folded relationship
-    // (`CASE_FOLDED_RELATIONSHIPS`, the last bind): it is promoted in its
-    // lower-case canonical spelling, as every edge writer stores it (backlog
-    // 3ce5e00c; `edges_staging.relationship` defaults to `CORROBORATES`).
-    let (promoted_count, reserved, lineage, provenance): (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>) =
-        if let Some(ref ids) = request.edge_ids {
-            if ids.is_empty() {
-                return Err(ApiError::ValidationError {
-                    field: "edge_ids".to_string(),
-                    reason: "edge_ids array must not be empty when provided".to_string(),
-                });
-            }
+    if request.edge_ids.as_ref().is_some_and(Vec::is_empty) {
+        return Err(ApiError::ValidationError {
+            field: "edge_ids".to_string(),
+            reason: "edge_ids array must not be empty when provided".to_string(),
+        });
+    }
+    let db_err = |e: &dyn std::fmt::Display| ApiError::DatabaseError {
+        message: format!("Failed to promote staged edges: {e}"),
+    };
 
-            // Promote specific IDs (must be 'approved')
-            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
-            &"WITH selected AS (
-                SELECT id, source_id, source_type, target_id, target_type,
-                       relationship, properties
+    // ONE transaction. The selected rows (the given ids, else every approved
+    // row; only 'approved' ones either way) are read and LOCKED with their
+    // three refusal flags in one statement, so the checks and the copy see the
+    // same rows. `reserved`: the row's `properties` carry `dedup` or
+    // `supersede_act` (a dedup act's identity edge, a supersession's act edge,
+    // which only the acts write; create and patch refuse them too), so copying
+    // it would publish a forged act record. `lineage`: a staged `supersedes`
+    // row (any spelling), which would publish a lineage edge that retires
+    // nothing. `provenance`: the document ingest's own provenance and the
+    // agent-credit edges (see the doc comment). When any row is refused the
+    // whole request is refused and NOTHING is written, rather than promoting
+    // the rest.
+    // id, source, source type, target, target type, relationship, properties,
+    // and the reserved / lineage / provenance flags.
+    type StagedRow = (
+        Uuid,
+        Uuid,
+        String,
+        Uuid,
+        String,
+        String,
+        serde_json::Value,
+        bool,
+        bool,
+        bool,
+    );
+    let mut tx = state.db_pool.begin().await.map_err(|e| db_err(&e))?;
+    let selected: Vec<StagedRow> = sqlx::query_as(
+        &"SELECT id, source_id, source_type::text, target_id, target_type::text,
+                     relationship::text, properties,
+                     COALESCE(properties ?| $1::text[], false),
+                     lower(relationship) = 'supersedes',
+                     COALESCE(__PROVENANCE__, false)
                 FROM edges_staging
-                WHERE id = ANY($2) AND review_status = 'approved'
+               WHERE review_status = 'approved'
+                 AND ($2::uuid[] IS NULL OR id = ANY($2))
+               ORDER BY id
+                 FOR UPDATE"
+            .replace(
+                "__PROVENANCE__",
+                &epigraph_db::staged_provenance_refusal_sql(),
             ),
-            reserved AS (
-                SELECT id FROM selected WHERE properties ?| $1::text[]
-            ),
-            lineage AS (
-                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
-            ),
-            provenance AS (
-                SELECT id FROM selected WHERE __PROVENANCE__
-            ),
-            to_promote AS (
-                SELECT * FROM selected
-                WHERE NOT EXISTS (SELECT 1 FROM reserved)
-                  AND NOT EXISTS (SELECT 1 FROM lineage)
-                  AND NOT EXISTS (SELECT 1 FROM provenance)
-            ),
-            inserted AS (
-                INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type,
-                       CASE WHEN lower(relationship) = ANY($3::text[])
-                            THEN lower(relationship) ELSE relationship END,
-                       properties
-                FROM to_promote
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            ),
-            updated AS (
-                UPDATE edges_staging
-                SET review_status = 'promoted', reviewed_at = NOW()
-                WHERE id IN (SELECT id FROM to_promote)
+    )
+    .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
+    .bind(request.edge_ids.as_deref())
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| db_err(&e))?;
+    let flagged = |pick: fn(&StagedRow) -> bool| -> Vec<Uuid> {
+        selected.iter().filter(|r| pick(r)).map(|r| r.0).collect()
+    };
+    let reserved = flagged(|r| r.7);
+    let lineage = flagged(|r| r.8);
+    let provenance = flagged(|r| r.9);
+    let mut promoted_count: i64 = 0;
+    if reserved.is_empty() && lineage.is_empty() && provenance.is_empty() {
+        // Each copy is attested at INSERT with the API's own key (backlog
+        // dae795f8; `None` when this API has none configured, and the copy is
+        // then unsigned). The signer is the API, never the claims:admin caller
+        // nor the row's stager. One row at a time, each in its own SAVEPOINT:
+        // a copy refused by a unique index of `edges` (migrations 091, 175) is
+        // skipped and the rest go on, as the bulk copy's bare
+        // `ON CONFLICT DO NOTHING` skipped it. The relationship is stored in
+        // its canonical spelling (`canonical_relationship`: the case-folded
+        // relationships, backlog 3ce5e00c, lower-cased; any other verbatim),
+        // as every edge writer stores it.
+        let key = state.edge_signing_key();
+        for (_, source_id, source_type, target_id, target_type, relationship, properties, ..) in
+            &selected
+        {
+            let mut sp = sqlx::Acquire::begin(&mut *tx)
+                .await
+                .map_err(|e| db_err(&e))?;
+            match epigraph_db::EdgeRepository::create_signed_conn(
+                &mut sp,
+                key,
+                *source_id,
+                source_type,
+                *target_id,
+                target_type,
+                relationship,
+                Some(properties.clone()),
+                None,
+                None,
             )
-            SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])"
-                .replace("__PROVENANCE__", &epigraph_db::staged_provenance_refusal_sql()),
+            .await
+            {
+                Ok(_) => sp.commit().await.map_err(|e| db_err(&e))?,
+                Err(e) if staged_copy_conflicts(&e) => {
+                    sp.rollback().await.map_err(|e| db_err(&e))?;
+                }
+                Err(e) => return Err(db_err(&e)),
+            }
+        }
+        let ids: Vec<Uuid> = selected.iter().map(|r| r.0).collect();
+        sqlx::query(
+            "UPDATE edges_staging SET review_status = 'promoted', reviewed_at = NOW() \
+              WHERE id = ANY($1)",
         )
-        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
-        .bind(ids)
-        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
-        .fetch_one(&state.db_pool)
+        .bind(&ids)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to promote staged edges: {e}"),
-        })?
-        } else {
-            // Promote all approved
-            sqlx::query_as::<_, (i64, Vec<Uuid>, Vec<Uuid>, Vec<Uuid>)>(
-            &"WITH selected AS (
-                SELECT id, source_id, source_type, target_id, target_type,
-                       relationship, properties
-                FROM edges_staging
-                WHERE review_status = 'approved'
-            ),
-            reserved AS (
-                SELECT id FROM selected WHERE properties ?| $1::text[]
-            ),
-            lineage AS (
-                SELECT id FROM selected WHERE lower(relationship) = 'supersedes'
-            ),
-            provenance AS (
-                SELECT id FROM selected WHERE __PROVENANCE__
-            ),
-            to_promote AS (
-                SELECT * FROM selected
-                WHERE NOT EXISTS (SELECT 1 FROM reserved)
-                  AND NOT EXISTS (SELECT 1 FROM lineage)
-                  AND NOT EXISTS (SELECT 1 FROM provenance)
-            ),
-            inserted AS (
-                INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-                SELECT source_id, source_type, target_id, target_type,
-                       CASE WHEN lower(relationship) = ANY($2::text[])
-                            THEN lower(relationship) ELSE relationship END,
-                       properties
-                FROM to_promote
-                ON CONFLICT DO NOTHING
-                RETURNING id
-            ),
-            updated AS (
-                UPDATE edges_staging
-                SET review_status = 'promoted', reviewed_at = NOW()
-                WHERE id IN (SELECT id FROM to_promote)
-            )
-            SELECT (SELECT COUNT(*) FROM to_promote),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM reserved), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM lineage), '{}'::uuid[]),
-                   COALESCE((SELECT array_agg(id ORDER BY id) FROM provenance), '{}'::uuid[])"
-                .replace("__PROVENANCE__", &epigraph_db::staged_provenance_refusal_sql()),
-        )
-        .bind(epigraph_db::RESERVED_EDGE_PROPERTIES)
-        .bind(epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS)
-        .fetch_one(&state.db_pool)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to promote staged edges: {e}"),
-        })?
-        };
+        .map_err(|e| db_err(&e))?;
+        tx.commit().await.map_err(|e| db_err(&e))?;
+        promoted_count = i64::try_from(selected.len()).unwrap_or(i64::MAX);
+    }
 
     if !provenance.is_empty() {
         let ids: Vec<String> = provenance.iter().map(Uuid::to_string).collect();
@@ -1330,9 +1418,12 @@ pub async fn get_boundary_claims(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<BoundaryClaimsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1749,9 +1840,12 @@ pub async fn get_split_candidates(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<SplitCandidatesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -1821,9 +1915,12 @@ pub async fn get_distant_claims(
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     axum::extract::Query(params): axum::extract::Query<DistantClaimsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if let Some(axum::Extension(ref auth)) = auth_ctx {
-        crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
-    }
+    let Some(axum::Extension(ref auth)) = auth_ctx else {
+        return Err(ApiError::Unauthorized {
+            reason: "authentication required".to_string(),
+        });
+    };
+    crate::middleware::scopes::check_scopes(auth, &["claims:read"])?;
 
     use epigraph_db::ClaimThemeRepository;
 
@@ -2075,14 +2172,7 @@ pub async fn create_theme_with_centroid(
     // vectors for it to average itself.
     match request.centroid.as_ref().filter(|c| !c.is_empty()) {
         Some(centroid) => {
-            let centroid_str = format!(
-                "[{}]",
-                centroid
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let centroid_str = epigraph_db::pgvector_literal(centroid);
             ClaimThemeRepository::set_centroid(&mut *tx, theme.id, &centroid_str)
                 .await
                 .map_err(map)?;

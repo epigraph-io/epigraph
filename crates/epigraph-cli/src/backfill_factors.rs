@@ -69,6 +69,9 @@ WHERE tgt.is_current AND src.is_current
     'elaborates','specializes','generalizes','informs','frame_validates'
   )
   AND NOT EXISTS (SELECT 1 FROM mass_functions mf WHERE mf.claim_id = tgt.id)
+  -- An edge marked "moves_belief": false (an abstract consolidation's
+  -- generalizes edge) carries no mass: see epigraph_db::EDGE_MOVES_BELIEF_SQL.
+  AND (e.properties->>'moves_belief') IS DISTINCT FROM 'false'
 ORDER BY e.target_id, e.created_at
 LIMIT $1 OFFSET $2
 "#;

@@ -1899,6 +1899,7 @@ async fn the_new_attribution_surface_is_pinned(pool: PgPool) {
             let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
             let res = epigraph_db::ClaimRepository::supersede_act_conn(
                 &mut tx,
+                None,
                 epigraph_core::ClaimId::from_uuid(r_claim),
                 "a revision of R's claim",
                 epigraph_core::TruthValue::new(0.6).expect("truth"),

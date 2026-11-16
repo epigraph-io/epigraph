@@ -463,6 +463,21 @@ pub const SAMPLE_CANDIDATE_WINDOW: usize = 500;
 /// for the whole boundary and turn the sample into the survey.
 pub const MAX_BOUNDARY_EDGE_SAMPLE: i64 = 1000;
 
+/// The attempt budget ([`PrivatizationRepository::enqueue_job_conn`]'s
+/// `max_attempts`, the row's `max_retries`) of a privatization apply, revert or
+/// reseal job: ONE attempt, recovered by re-delivery, never by a retry ladder.
+pub const PRIVATIZATION_JOB_ATTEMPTS: i32 = 1;
+
+/// The attempt budget of the unseal's `embedding_generation` jobs: the first
+/// attempt plus two retries for a transient provider error (a 429, a 503, a
+/// timeout), each on a later drain run (backlog 1320b4e3). The handler is
+/// idempotent. A permanent error fails the job at once:
+/// `ConfigurableEmbeddingHandler` classifies a claim that is sealed, retired or
+/// gone by the time it stores, empty text, a dimension mismatch and a payload
+/// of another variant as permanent. Missing claim TEXT stays transient, because
+/// the service also reports a failed read that way.
+pub const EMBEDDING_RESTORE_JOB_ATTEMPTS: i32 = 3;
+
 /// A persisted plan row, as migration 087's SELECT policy admits it.
 ///
 /// `expires_at` is deliberately ABSENT: FINAL-PLAN §6.5.2 gives a preview a 4 h
@@ -2812,7 +2827,7 @@ impl PrivatizationRepository {
         if moved_claim_ids.is_empty() {
             return Ok(Vec::new());
         }
-        sqlx::query_as::<_, WorkflowMove>(
+        let moves = sqlx::query_as::<_, WorkflowMove>(
             r#"
             WITH completed AS (
                 SELECT w.id,
@@ -2852,7 +2867,15 @@ impl PrivatizationRepository {
         .bind(target_group_id)
         .fetch_all(&mut *conn)
         .await
-        .map_err(|source| DbError::QueryFailed { source })
+        .map_err(|source| DbError::QueryFailed { source })?;
+        // Migration 219: a workflow endpoint contributes its row's tenancy to
+        // an edge's meet, and no trigger re-meets an edge when only its
+        // workflow row changes. So the moved rows' own edges (`variant_of`,
+        // `AUTHORED`, `executes` onto a claim the plan leaves public) are
+        // re-met here, on this transaction.
+        let moved: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
+        Self::recompute_boundary_meet_conn(conn, &moved).await?;
+        Ok(moves)
     }
 
     /// Record the `workflows` rows an apply batch moved
@@ -2927,7 +2950,7 @@ impl PrivatizationRepository {
         correlation_id: Option<&str>,
         target_group_id: Uuid,
     ) -> Result<u64, DbError> {
-        sqlx::query(
+        let restored: Vec<Uuid> = sqlx::query_scalar(
             r#"
             WITH recorded AS (
                 SELECT DISTINCT ON (a.entity_id)
@@ -2960,16 +2983,21 @@ impl PrivatizationRepository {
             SELECT $1, $3, 'item.revert', 'workflow', r.id, 'group', $2,
                    r.before_visibility, r.before_owner_group_id, $4
               FROM restored r
+            RETURNING entity_id
             "#,
         )
         .bind(plan_id)
         .bind(target_group_id)
         .bind(actor_agent_id)
         .bind(correlation_id)
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await
-        .map(|r| r.rows_affected())
-        .map_err(|source| DbError::QueryFailed { source })
+        .map_err(|source| DbError::QueryFailed { source })?;
+        // Migration 219: the claims went back first, and their re-meet still
+        // read these rows as private, so every edge on a restored row is re-met
+        // now that the row is back (widening allowed, as for the claims').
+        Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        Ok(restored.len() as u64)
     }
 
     /// Restore a batch of claims to the tenancy the freeze recorded.
@@ -3522,7 +3550,7 @@ impl PrivatizationRepository {
     /// no-op rather than a second, differently-keyed seal over a row whose
     /// plaintext is already gone.
     ///
-    /// # Nine statements, one transaction, no partial seal
+    /// # Every statement in one transaction, no partial seal
     ///
     /// The caller opens the transaction and the caller commits it. Every
     /// statement below is bounded to the ids the first one actually inserted,
@@ -3547,7 +3575,12 @@ impl PrivatizationRepository {
     ///    a plaintext-derived vector on a sealed claim, which is the exact
     ///    defect the plan's own audit clause was written to catch one column
     ///    over. `content_tsv` needs no statement — it is `GENERATED ALWAYS` and
-    ///    follows `content`.
+    ///    follows `content`. Step 2b then takes the claim out of its theme
+    ///    (`claims.theme_id`) and recomputes each theme it left
+    ///    (`claim_themes.centroid`, `claim_count`) from the remaining
+    ///    embedded members (backlog f43ef0a6): a centroid is an aggregate of
+    ///    member vectors, so nulling the claim's vector without recomputing
+    ///    it leaves the sealed vector folded into the theme.
     /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
@@ -3563,17 +3596,30 @@ impl PrivatizationRepository {
     ///
     /// # Ordering: restrict first, then seal
     ///
-    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081),
-    /// which raises `42501` on sealing a claim that is still
-    /// `visibility='public'`. That is the backstop, not the control: the route
-    /// refuses a plan that has not been applied. It is load-bearing anyway,
-    /// because it is what makes the ordering an invariant of the database
-    /// rather than of this function.
+    /// Statement 1 fires `claim_encryption_no_public_sealed` (migration 081,
+    /// coded PRV01 by 176, body last re-stated by 227), which raises `42501`
+    /// on sealing a claim that is still `visibility='public'`. That is the
+    /// backstop, not the control: the route refuses a plan that has not been
+    /// applied. It is load-bearing anyway, because it is what makes the
+    /// ordering an invariant of the database rather than of this function.
+    ///
+    /// # Row locks (migration 227)
+    ///
+    /// Since 227 that trigger reads each claim's visibility `FOR NO KEY
+    /// UPDATE`, so statement 1, not statement 2, is where this function first
+    /// takes the claim rows' locks and waits on a concurrent publicize (which
+    /// then either commits first and the seal is refused, or waits for the
+    /// seal and is refused by 074). The rows are locked in the order of
+    /// `items`. Under the route's `lock_timeout` a contended claim therefore
+    /// surfaces as a `55P03` from statement 1, and a lock-order deadlock with a
+    /// multi-claim publicize (possible before 227 at statement 2) as a `40P01`
+    /// from either statement; both abort the transaction with nothing written.
     ///
     /// # Errors
     ///
-    /// [`DbError`] for a query fault. A `42501` from statement 1 is 081's guard
-    /// refusing an unrestricted claim.
+    /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
+    /// guard refusing an unrestricted claim; a `55P03` or `40P01` is a lock
+    /// wait that timed out or deadlocked (above).
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
@@ -3640,6 +3686,66 @@ impl PrivatizationRepository {
         .execute(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
+
+        // 2b. The theme channel (backlog f43ef0a6). `claim_themes.centroid` is
+        //     an average OVER MEMBER EMBEDDINGS and `claim_count` a count of
+        //     embedded members, both denormalised and recomputed only by an
+        //     explicit maintenance call; a theme's label is itself a summary
+        //     of what its members say. Statement 2 removes the sealed vector
+        //     from the row but not from the aggregate it was folded into, so
+        //     without this a theme the sealed claim belonged to kept a
+        //     centroid that still averaged that vector, and a ONE-member
+        //     theme's centroid WAS that vector. The membership is dropped and
+        //     each affected theme recomputed here, in the seal's transaction,
+        //     with `recompute_centroid_for_theme`'s definitions. Written
+        //     unconditionally, so a theme left with no embedded member gets a
+        //     NULL centroid and a zero count rather than keeping the sealed
+        //     vector (it is unassignable until re-seeded, which the
+        //     alternative would not be, and the alternative is the leak).
+        //     `centroid_3072` is not touched: no code path averages members
+        //     into it; it is only ever seeded from outside the corpus.
+        //     An unseal does not restore `theme_id`; the unthemed-assignment
+        //     sweep re-themes the claim once it is re-embedded.
+        let themes: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r"
+            WITH prior AS (
+                SELECT c.id, c.theme_id
+                  FROM public.claims c
+                 WHERE c.id = ANY($1) AND c.theme_id IS NOT NULL
+            ),
+            cleared AS (
+                UPDATE public.claims c
+                   SET theme_id = NULL
+                  FROM prior
+                 WHERE c.id = prior.id
+                RETURNING prior.theme_id
+            )
+            SELECT DISTINCT theme_id FROM cleared
+            ",
+        )
+        .bind(&sealed)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|source| DbError::QueryFailed { source })?;
+        if !themes.is_empty() {
+            sqlx::query(
+                r"
+                UPDATE public.claim_themes t
+                   SET centroid = (SELECT avg(c.embedding)::vector(1536)
+                                     FROM public.claims c
+                                    WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       claim_count = (SELECT count(*)::int4
+                                        FROM public.claims c
+                                       WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       updated_at = now()
+                 WHERE t.id = ANY($1)
+                ",
+            )
+            .bind(&themes)
+            .execute(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        }
 
         // 3/4. Version history.
         let (version_ids, version_cts): (Vec<Uuid>, Vec<Vec<u8>>) = items
@@ -4414,31 +4520,40 @@ impl PrivatizationRepository {
     /// never flipped (which the handler refuses on condition 1, correctly, but
     /// noisily and after the fact).
     ///
-    /// # Plain enqueue, NOT `enqueue_unique_pending`
+    /// # Plain enqueue, never deduplicated by `job_type`
     ///
-    /// `PostgresJobQueue::enqueue_unique_pending` guards on `job_type` plus
-    /// `state = 'pending'` and discriminates nothing about the payload, so a
-    /// second plan's apply would be silently dropped while the first is queued.
-    /// A privatization that reports 202 and never runs is the failure this
-    /// function's shape refuses.
+    /// A dedup that guards on `job_type` plus `state = 'pending'` (the queue
+    /// once had one, `enqueue_unique_pending`, removed with no caller)
+    /// discriminates nothing about the payload, so a second plan's apply would
+    /// be silently dropped while the first is queued. A privatization that
+    /// reports 202 and never runs is the failure this function's shape refuses.
     ///
-    /// # `max_retries` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
+    /// # `max_attempts` IS AN ATTEMPT BUDGET, NOT A COUNT OF RETRIES AFTER THE
     /// FIRST
     ///
-    /// `JobRunner`'s worker loop evaluates `job.retry_count >= job.max_retries`
-    /// BEFORE it calls `handler.handle`, and marks the job `failed` when it
-    /// holds. So the row's invariant at first dequeue is
-    /// `retry_count < max_retries`, and a row inserted with `(0, 0)` is failed
-    /// without the handler ever running — a 202 that never happens, which is the
-    /// failure this function's shape exists to refuse.
+    /// It is written to `jobs.max_retries`. Both runners (the drain's
+    /// `JobRunner::process_job` and `JobRunner::start`'s loop) evaluate
+    /// `job.retry_count >= job.max_retries` BEFORE they call `handler.handle`,
+    /// and mark the job `failed` when it holds. So the row's invariant at first
+    /// dequeue is `retry_count < max_retries`, and a row inserted with `(0, 0)`
+    /// is failed without the handler ever running — a 202 that never happens,
+    /// which is the failure this function's shape exists to refuse. A value
+    /// below 1 is therefore refused here.
     ///
-    /// `1` is therefore the value that means what `JobHandler::max_retries() =
-    /// 0` means on these two handlers: exactly ONE attempt, no exponential
-    /// ladder. Recovery from a partial apply is the stale-job reaper
-    /// re-dispatching, which re-runs the full re-validation, not a retry into
-    /// the same lock timeout. (`JobHandler::max_retries` is not consulted by the
-    /// runner at all — the row's column is the only load-bearing number — which
-    /// is why this one is spelled out here rather than inferred.)
+    /// The callers pass one of two budgets:
+    ///
+    /// * [`PRIVATIZATION_JOB_ATTEMPTS`] (1) for the apply, revert and reseal
+    ///   jobs: what `JobHandler::max_retries() = 0` means on those handlers,
+    ///   exactly ONE attempt, no ladder. Recovery from a partial apply is the
+    ///   stale-job reaper re-dispatching, which re-runs the full re-validation,
+    ///   not a retry into the same lock timeout.
+    /// * [`EMBEDDING_RESTORE_JOB_ATTEMPTS`] for the unseal's
+    ///   `embedding_generation` jobs, whose failures are mostly transient
+    ///   provider errors and whose handler is idempotent (backlog 1320b4e3).
+    ///
+    /// (`JobHandler::max_retries` is not consulted by either runner — the
+    /// row's column is the only load-bearing number — which is why the budget
+    /// is spelled out here rather than inferred.)
     ///
     /// # Errors
     ///
@@ -4449,18 +4564,28 @@ impl PrivatizationRepository {
         conn: &mut PgConnection,
         job_type: &str,
         payload: &serde_json::Value,
+        max_attempts: i32,
     ) -> Result<Uuid, DbError> {
+        if max_attempts < 1 {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "a job enqueued with max_attempts = {max_attempts} would be failed before \
+                     its handler runs; the budget is at least 1"
+                ),
+            });
+        }
         sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO public.jobs
                    (id, job_type, payload, state, retry_count, max_retries,
                     created_at, updated_at)
-            VALUES (gen_random_uuid(), $1, $2, 'pending', 0, 1, now(), now())
+            VALUES (gen_random_uuid(), $1, $2, 'pending', 0, $3, now(), now())
             RETURNING id
             "#,
         )
         .bind(job_type)
         .bind(payload)
+        .bind(max_attempts)
         .fetch_one(&mut *conn)
         .await
         .map_err(|source| DbError::QueryFailed { source })

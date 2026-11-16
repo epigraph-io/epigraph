@@ -311,6 +311,17 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          `evolve_step`: the workflow claims it patches are authored by \
          `workflow-ingest-system`. An R3 blocker, recorded in scripts/e2e/README.md.",
     ),
+    (
+        "unauthenticated_reader.rs",
+        "AgentRepository::create",
+        1,
+        "`UnauthenticatedReader::find_or_create`'s first-use creation of the \
+         `--allow-unauthenticated-http` reader agent's OWN `agents` row. `agents` carries no \
+         owner group (universally readable, migration 077), so the INSERT is admitted \
+         unstamped, and no caller exists to stamp from: this IS the zero-membership identity \
+         the listener reads as. Same row class and reason as `server.rs`'s \
+         `AgentRepository::create`.",
+    ),
 ];
 
 /// Call sites the write-name heuristic matches but which do not WRITE through
@@ -331,10 +342,12 @@ const NOT_ACTUALLY_A_POOL_WRITE: &[(&str, &str, &str)] = &[
     // `raw_pool_register.rs` registers reads by their tenancy instead.
     (
     "claim_helper.rs",
-    "store_embedding_author_stamped",
+    "store_embedding_author_stamped_for",
     "The `&server.pool` here is the helper's READ pool: it resolves the author's viewer through \
      `epigraph_live_memberships` (SECURITY DEFINER) before the stamp exists. The WRITE inside that \
-     helper runs on `ScopedPool::begin_as`, which is the whole point of it.",
+     helper runs on `ScopedPool::begin_as`, which is the whole point of it. (The call moved from \
+     `store_embedding_author_stamped` to its grant-taking form with backlog 46902f71; the plain \
+     form now delegates to it and touches no pool itself.)",
 ),
     (
         "embed.rs",

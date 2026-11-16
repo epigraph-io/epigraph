@@ -281,10 +281,10 @@ pub struct ApproveClientResponse {
 /// `granted_scopes` verbatim, and a request-serving process holds no
 /// maintenance connection (operator decision D9). So this route runs its
 /// refusals (`clients:admin`, `platform:admin`, migration 128's armed
-/// admin-only scopes) and then answers 501 MOVED, approving nothing. A
-/// maintenance session approves through the definer directly
-/// (`OAuthClientRepository::approve` on a maintenance pool), which keeps its
-/// `oauth.client_approved` audit row.
+/// admin-only scopes) and then answers 501 MOVED, approving nothing, naming
+/// `epigraph-operator approve-client`, which approves a PENDING client through
+/// the definer on the maintenance DSN and keeps its `oauth.client_approved`
+/// audit row.
 #[cfg(feature = "db")]
 pub async fn approve_client(
     State(state): State<AppState>,
@@ -330,19 +330,16 @@ pub async fn approve_client(
         requested_by = %auth.client_id,
         "client approval requested on a request unit; it runs on a maintenance session"
     );
-    Err(ApiError::MaintenanceSurfaceNotServed {
-        surface: "approve_client".to_string(),
-        runs_on_kind: "none",
-        runs_on_name: CLIENT_APPROVAL_NOT_SERVED.to_string(),
-    })
+    Err(ApiError::moved_to_cli(
+        "approve_client",
+        CLIENT_APPROVAL_CLI,
+    ))
 }
 
 /// `runs_on.name` for `POST /api/v1/admin/clients/:id/approve` (migration 188):
-/// no operator verb approves a client yet, so the answer names the definer a
-/// maintenance session calls.
-pub const CLIENT_APPROVAL_NOT_SERVED: &str =
-    "client approval is maintenance-only: call epigraph_oauth_client_approve on a maintenance \
-     session";
+/// the operator verb that approves a pending client on the maintenance DSN
+/// through `epigraph_oauth_client_approve`.
+pub const CLIENT_APPROVAL_CLI: &str = "epigraph-operator approve-client";
 
 // =============================================================================
 // ENTITY-TYPE REGISTRATION
@@ -1237,6 +1234,7 @@ mod tests {
             require_packet_signatures: true,
             max_request_size: 2048,
             public_base_url: "http://localhost:8080".to_string(),
+            ..ApiConfig::default()
         });
         let router = test_router_with_state(state);
 
@@ -1279,11 +1277,11 @@ mod tests {
         {
             let mut store = state.idempotency_store.write().await;
             store.insert(
-                "test-key".to_string(),
+                (uuid::Uuid::nil(), "test-key".to_string()),
                 crate::state::CachedSubmission {
                     claim_id: uuid::Uuid::new_v4(),
                     truth_value: 0.5,
-                    trace_id: uuid::Uuid::new_v4(),
+                    trace_id: Some(uuid::Uuid::new_v4()),
                     evidence_ids: vec![],
                     created_at: std::time::Instant::now(),
                 },
@@ -1319,6 +1317,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     active: true,
                     secret: "x".repeat(32),
+                    agent_id: Some(uuid::Uuid::new_v4()),
                 },
             );
         }
@@ -1486,11 +1485,11 @@ mod tests {
         {
             let mut store = state.idempotency_store.write().await;
             store.insert(
-                "mutation-test-key".to_string(),
+                (uuid::Uuid::nil(), "mutation-test-key".to_string()),
                 crate::state::CachedSubmission {
                     claim_id: uuid::Uuid::new_v4(),
                     truth_value: 0.5,
-                    trace_id: uuid::Uuid::new_v4(),
+                    trace_id: Some(uuid::Uuid::new_v4()),
                     evidence_ids: vec![],
                     created_at: std::time::Instant::now(),
                 },

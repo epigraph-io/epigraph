@@ -6,13 +6,10 @@
 //!
 //! - **Discovery** ([`discovery_session`]): one long-lived client session per
 //!   extension, authenticated with a gateway *service* token. It drives
-//!   `list_all_tools` for the routing cache. Every reconnect tick re-lists it
-//!   (the health check: a failure demotes the extension, a changed list swaps
-//!   its routes) and re-dials it when unhealthy; see
-//!   `SharedFederation::reconnect_tick`. Persisting it avoids a fresh TCP +
-//!   `initialize` handshake on every list. Its rmcp response cache is OFF: a
-//!   cached `tools/list`, or rmcp's stale-on-error fallback, would answer the
-//!   health check from memory and hide both a change and an outage.
+//!   `list_all_tools` for the routing cache, and the gateway's health timer
+//!   ([`super::SharedFederation::reconnect_tick`]) re-lists over it on every
+//!   tick and re-dials it when that fails. Persisting it avoids a fresh TCP +
+//!   `initialize` handshake on every list.
 //! - **Invocation** ([`invoke_once`]): a fresh, ephemeral session per federated
 //!   `tools/call`, authenticated with the *caller's* raw bearer so the
 //!   downstream sees the real principal (not the gateway). The session is
@@ -21,27 +18,30 @@
 //!
 //! ## Timeouts
 //!
-//! The proxied `tools/call` is bounded by the extension's `call_timeout_secs=`
-//! ([`super::config::DEFAULT_CALL_TIMEOUT`] when unset), and surfaces
-//! [`FederationError::CallTimeout`].
-//!
 //! The `initialize` handshake ([`serve_client`]) is wrapped in a bounded
 //! [`tokio::time::timeout`]. A downstream that accepts the TCP connection but
 //! never completes `initialize` would otherwise hang the gateway's `build()`
 //! (discovery) or a caller's `tools/call` (invocation) indefinitely. On timeout
 //! we surface a [`FederationError::Timeout`] so the registry can log-and-skip a
 //! wedged extension rather than wedge the whole gateway.
+//!
+//! The two requests made on an established session are bounded too: a
+//! `tools/list` by [`LIST_TIMEOUT`] (it runs on the health timer, which a hung
+//! downstream would otherwise stop for every extension), and the proxied
+//! `tools/call` by the gateway's configured call timeout
+//! ([`DEFAULT_CALL_TIMEOUT`] unless overridden), so a downstream that accepts
+//! a call and never answers cannot hold the caller's request open forever.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, ErrorData, Tool};
+use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::serve_client;
-use rmcp::service::{RunningService, ServiceError};
+use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use rmcp::{ClientCacheConfig, Peer, RoleClient};
+use rmcp::RoleClient;
 
 /// How long to wait for the `initialize` handshake before giving up on a
 /// downstream extension. Deliberately short: a healthy loopback extension
@@ -50,11 +50,17 @@ use rmcp::{ClientCacheConfig, Peer, RoleClient};
 /// gateway startup or a caller's request.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long one `tools/list` on a discovery session may take, at boot, on a
-/// reconnect and on every re-list. The reconnect loop visits extensions one
-/// after another, so an unbounded list against a wedged extension would stall
-/// it for every other extension too.
-pub const LIST_TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `tools/list` on an established session may take. A healthy
+/// loopback extension answers in milliseconds; this only has to be long enough
+/// never to demote a busy one.
+pub const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a proxied `tools/call` may take when the gateway is given no
+/// other value (`EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS`). Deliberately
+/// generous: federated tools include LLM-backed syntheses that run for
+/// minutes. The bound exists to end a call that will never answer, not to
+/// police a slow one.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The largest single response event the gateway accepts from a downstream
 /// extension: 16 MiB, rmcp 3.9's default, set explicitly in [`connect`].
@@ -96,47 +102,37 @@ pub enum FederationError {
         cause: String,
     },
 
-    /// The downstream ANSWERED the request, with an MCP error. Carried whole
-    /// (code, message, data) so the gateway hands the caller the downstream's
-    /// own answer unchanged rather than a redacted "internal error" (backlog
-    /// 7ea4bd74): it is the extension's reply to the caller's own request,
-    /// made under the caller's own token.
-    #[error("extension answered with an MCP error: {0}")]
-    Downstream(ErrorData),
-
-    /// A request on an established session failed without an MCP answer
-    /// (the transport broke, the session closed, the reply was refused as
-    /// oversized, …). Carries the stringified rmcp error, which can name the
-    /// dialed URI, so it is for the server log only.
+    /// A request on an established session failed (`list_tools`,
+    /// `call_tool`, …) for a reason that is not the downstream's own answer:
+    /// the transport closed, the reply was not a tool result, and so on.
     #[error("request to extension failed: {0}")]
     Request(String),
 
-    /// A discovery `tools/list` gave no answer within [`LIST_TOOLS_TIMEOUT`].
-    #[error("extension gave no tools/list answer within {0:?}")]
-    ListTimeout(Duration),
+    /// The downstream ANSWERED the call with a JSON-RPC error (its own
+    /// invalid-params refusal, an unknown tool, …). Kept as the downstream's
+    /// `ErrorData`, code and message, so the gateway can hand it to the caller
+    /// as the tool error it is instead of redacting it to an internal error.
+    #[error("extension returned an error: {}", .0.message)]
+    Downstream(rmcp::ErrorData),
 
-    /// The downstream accepted the `tools/call` and gave no answer within the
-    /// extension's `call_timeout_secs=` (backlog 7ea4bd74). The gateway stopped
-    /// waiting and dropped the session; the call may still complete there.
-    #[error("extension gave no answer within {0:?}")]
-    CallTimeout(Duration),
-
-    /// No mounted extension routes this effective tool name (any more): the
-    /// route was looked up and was gone, e.g. the extension was demoted
-    /// between the caller's lookup and the call.
-    #[error("no federated route for tool `{0}`")]
-    NoRoute(String),
+    /// The downstream accepted `tool` and did not answer within `timeout`.
+    /// The call was abandoned; it may still have run downstream.
+    #[error("extension did not answer `{tool}` within {timeout:?}")]
+    CallTimeout {
+        /// The bound that elapsed.
+        timeout: Duration,
+        /// The downstream (un-prefixed) tool name.
+        tool: String,
+    },
 }
 
 impl FederationError {
-    /// Classify an rmcp request failure: an MCP error answer is
-    /// [`Downstream`](Self::Downstream), anything else
-    /// [`Request`](Self::Request).
-    fn from_service(e: ServiceError) -> Self {
-        match e {
-            ServiceError::McpError(data) => Self::Downstream(data),
-            other => Self::Request(other.to_string()),
-        }
+    /// Whether this failure means the extension could not be REACHED (as
+    /// opposed to reached and unhappy): the handshake was refused or timed
+    /// out. The registry demotes an extension on one of these.
+    #[must_use]
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, Self::Timeout(..) | Self::Connect { .. })
     }
 }
 
@@ -161,52 +157,53 @@ pub async fn discovery_session(
     addr: &str,
     discovery_token: &str,
 ) -> Result<ExtensionClient, FederationError> {
-    let session = connect(addr, Some(discovery_token)).await?;
-    session
-        .peer()
-        .set_response_cache_config(ClientCacheConfig::disabled())
-        .await;
-    Ok(session)
+    connect(addr, Some(discovery_token)).await
 }
 
 /// List every tool the extension advertises over its discovery session,
 /// following pagination to completion.
 ///
 /// # Errors
-/// [`FederationError::Downstream`] or [`FederationError::Request`] if the
-/// downstream `tools/list` fails; [`FederationError::ListTimeout`] if it gives
-/// no answer within [`LIST_TOOLS_TIMEOUT`].
+/// [`FederationError::Request`] if the downstream `tools/list` fails or does
+/// not complete within [`LIST_TIMEOUT`].
 pub async fn list_all_tools(client: &ExtensionClient) -> Result<Vec<Tool>, FederationError> {
     list_all_tools_on(client.peer()).await
 }
 
-/// [`list_all_tools`] on a discovery session's [`Peer`], which the registry
-/// clones out from under its lock so the list runs with no lock held.
+/// [`list_all_tools`] on a cloned peer handle, so the health timer can list
+/// over an extension's persistent session without holding the registry lock
+/// (the session itself stays in the registry).
 ///
 /// # Errors
 /// As [`list_all_tools`].
-pub async fn list_all_tools_on(peer: &Peer<RoleClient>) -> Result<Vec<Tool>, FederationError> {
-    match tokio::time::timeout(LIST_TOOLS_TIMEOUT, peer.list_all_tools()).await {
-        Ok(listed) => listed.map_err(FederationError::from_service),
-        Err(_elapsed) => Err(FederationError::ListTimeout(LIST_TOOLS_TIMEOUT)),
+pub async fn list_all_tools_on(
+    peer: &rmcp::service::Peer<RoleClient>,
+) -> Result<Vec<Tool>, FederationError> {
+    match tokio::time::timeout(LIST_TIMEOUT, peer.list_all_tools()).await {
+        Ok(Ok(tools)) => Ok(tools),
+        Ok(Err(e)) => Err(FederationError::Request(e.to_string())),
+        Err(_elapsed) => Err(FederationError::Request(format!(
+            "tools/list did not complete within {LIST_TIMEOUT:?}"
+        ))),
     }
 }
 
 /// Proxy a single `tools/call` to the extension at `addr` on a **fresh**
 /// ephemeral session authenticated with `caller_token` (the caller's raw
-/// bearer, forwarded verbatim so the downstream sees the real principal),
-/// waiting at most `call_timeout` for the answer.
+/// bearer, forwarded verbatim so the downstream sees the real principal).
 ///
 /// The session is dropped when this function returns; rmcp's transport worker
 /// issues `delete_session` on drop, so the downstream session is released and
 /// does not leak.
 ///
+/// The round trip is bounded by `call_timeout`: dropping the session when it
+/// elapses cancels the request and releases the downstream session.
+///
 /// # Errors
 /// [`FederationError::Timeout`] / [`FederationError::Connect`] on handshake
-/// failure; [`FederationError::Downstream`] if the downstream answers the
-/// `tools/call` with an MCP error; [`FederationError::Request`] if the call
-/// fails without one; [`FederationError::CallTimeout`] if it gives no answer
-/// within `call_timeout`.
+/// failure; [`FederationError::Downstream`] when the downstream answers with a
+/// JSON-RPC error; [`FederationError::CallTimeout`] when it does not answer in
+/// time; [`FederationError::Request`] for any other failure of the call.
 pub async fn invoke_once(
     addr: &str,
     caller_token: &str,
@@ -218,8 +215,13 @@ pub async fn invoke_once(
     let mut params = CallToolRequestParams::new(name.to_string());
     params.arguments = arguments;
     let result = match tokio::time::timeout(call_timeout, client.peer().call_tool(params)).await {
-        Ok(answer) => answer.map_err(FederationError::from_service),
-        Err(_elapsed) => Err(FederationError::CallTimeout(call_timeout)),
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(rmcp::ServiceError::McpError(e))) => Err(FederationError::Downstream(e)),
+        Ok(Err(e)) => Err(FederationError::Request(e.to_string())),
+        Err(_elapsed) => Err(FederationError::CallTimeout {
+            timeout: call_timeout,
+            tool: name.to_string(),
+        }),
     };
     // Explicit drop: releasing the session (and its downstream `delete_session`)
     // is the whole point of the ephemeral-per-call model. Dropping after we have

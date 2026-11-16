@@ -279,9 +279,13 @@ async fn write_neighborhoods(
     for (n_idx, (comm, members)) in groups.iter().enumerate() {
         let neighborhood_id = Uuid::new_v4();
         let (mean_betp, dominant_frame) = aggregate_neighborhood(atoms, |i| members.contains(&i));
-        let label = dominant_frame
-            .map(|f| f.to_string())
-            .unwrap_or_else(|| format!("neighborhood-{}", n_idx + 1));
+        // Always the positional placeholder, never the dominant frame's id
+        // (backlog 01e0b839). The frame is computed over EVERY member, private
+        // ones included, and is stored in its own `dominant_frame_id` column;
+        // a UUID is no name either. `scripts/label_themes_llm.py
+        // --neighborhoods` replaces the placeholder with a name built from
+        // public members only.
+        let label = format!("neighborhood-{}", n_idx + 1);
 
         sqlx::query(
             r#"INSERT INTO graph_neighborhoods

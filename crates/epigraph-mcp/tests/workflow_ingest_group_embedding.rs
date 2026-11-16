@@ -154,7 +154,7 @@ async fn a_group_private_ingest_claim_is_embedded_through_its_known_author(pool:
     assert!(!embedded(&pool, private_claim).await);
     assert!(!embedded(&pool, public_claim).await);
 
-    let pgvec = epigraph_mcp::embed::format_pgvector(&vec![0.01_f32; 1536]);
+    let pgvec = epigraph_db::pgvector_literal(&vec![0.01_f32; 1536]);
 
     // The embedder's own path (`author: None`) cannot store on the
     // group-private claim...

@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Internal crates
-epigraph-core = { workspace = true }
-
 # Async runtime
 tokio = { workspace = true }
 async-trait = "0.1"  # Async trait support for EmbeddingService
@@ -17,13 +14,6 @@ async-trait = "0.1"  # Async trait support for EmbeddingService
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-
-# Database (optional — only needed when storing/querying embeddings in PostgreSQL)
-sqlx = { workspace = true, optional = true }
-pgvector = { workspace = true, optional = true }  # PostgreSQL vector extension support
-
-# Identifiers
-uuid = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -39,15 +29,16 @@ tiktoken-rs = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+wiremock = "0.6"  # HTTP fixture for the OpenAI provider tests
 proptest = { workspace = true }
-sqlx = { workspace = true }
 
 [features]
-default = ["db"]
-db = ["sqlx", "pgvector"]  # Enable database storage/retrieval of embeddings
+# `openai` by default: every consumer already gets it through the workspace dep,
+# and CI's bare `cargo test -p epigraph-embeddings` must compile
+# tests/openai_provider_http.rs, which is `cfg(feature = "openai")`.
+default = ["openai"]
 openai = ["reqwest", "tiktoken-rs"]  # Enable OpenAI API support
 jina = ["reqwest"]  # Enable Jina multimodal embedding API support
-local = []  # Enable local embedding model support
 
 [[test]]
 name = "embeddings_tests"

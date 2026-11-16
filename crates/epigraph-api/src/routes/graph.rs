@@ -1,7 +1,7 @@
 //! /api/v1/graph/{overview, clusters/:id/expand, neighborhood} — read-only
 //! endpoints over the latest successful clustering run.
 //!
-//! # Tenancy: 2 of this file's 4 raw-pool sites are converted
+//! # Tenancy: 3 of this file's 4 raw-pool sites are converted
 //!
 //! Conversion shard 7. `expand` is ONE register site whose alias was spent on
 //! FOUR statements, and all four now run on a viewer-stamped connection from
@@ -37,13 +37,27 @@
 //! connection too, and is viewer-scoped by the spliced `claims` predicate in
 //! `ClaimThemeRepository::overview_page`: the per-theme count is of the
 //! current members the caller can read, and theme rows narrow to those with
-//! at least one such member. Its LABELS are not viewer-scoped: a stored label
-//! may be derived from members the caller cannot read (the label residual on
-//! `D-PR16-theme-cluster-viewer-scope`).
+//! at least one such member. Its LABELS are not viewer-scoped. The theme
+//! scripts now build them from public members only
+//! (`scripts/theme_lib.py::public_label_source`), but a label stored before
+//! that rule may still be derived from members the caller cannot read (the
+//! label residual on `D-PR16-theme-cluster-viewer-scope`).
 //!
-//! The other 2 sites — `overview`, `themes_expand` — are routed GETs that hold
-//! no `Viewer` at all. Their owner is `D-PR16-theme-cluster-viewer-scope`, an
-//! open entry that explicitly has no control.
+//! `themes_expand` (backlog 01e0b839) runs on a [`AppState::read_as`]
+//! connection as well. The theme answers 404 unless the caller can read one of
+//! its current members, neighbourhoods narrow to those with a readable current
+//! member, and every aggregate (size, mean pignistic probability, dominant
+//! frame, inter-neighbourhood edge weight) is recomputed over what the caller
+//! can read, in `GraphViewRepository::{theme_visible_summary,
+//! theme_neighborhoods, theme_neighborhood_edges}`. Neighbourhood labels are
+//! stored `neighborhood-N` placeholders until
+//! `scripts/label_themes_llm.py --neighborhoods` names them from public
+//! members only (`scripts/theme_lib.py::public_label_source`); a label stored
+//! before that rule shares the theme-label residual above.
+//!
+//! The other site, `overview`, is a routed GET that holds no `Viewer` at all.
+//! Its owner is `D-PR16-theme-cluster-viewer-scope`, an open entry that
+//! explicitly has no control.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
 
@@ -98,6 +112,7 @@ const GRAPH_VIEW_RELATIONSHIPS: &[&str] = &[
     // Equivalence / variants
     "same_as",
     "equivalent_to",
+    "EQUIVALENT_TO",
     "analogous",
     "variant_of",
     "definitional_variant_of",
@@ -643,12 +658,12 @@ async fn fetch_subgraph_edges(
 #[derive(Debug, Serialize)]
 pub struct ThemeOut {
     pub id: Uuid,
-    /// The stored theme label, cut to 200 characters. NOT viewer-scoped: for
-    /// a theme with members the caller cannot read, it may be derived from
-    /// their text (`scripts/label_themes_llm.py` samples members with no
-    /// visibility predicate, except that it never samples a claim the
-    /// bug-report intake group owns: `scripts/theme_lib.py::not_intake_owned`).
-    /// Residual recorded on `D-PR16-theme-cluster-viewer-scope`.
+    /// The stored theme label, cut to 200 characters. NOT viewer-scoped. The
+    /// theme scripts build stored labels from public, non-intake members only
+    /// (`scripts/theme_lib.py::public_label_source`), but a label stored
+    /// before that rule, until an operator relabels, may still be derived from
+    /// members the caller cannot read. Residual recorded on
+    /// `D-PR16-theme-cluster-viewer-scope`.
     pub label: String,
     /// Current claims assigned to this theme that the CALLER can read. Live,
     /// never the stored `claim_themes.claim_count` (backlog 57917c13).
@@ -681,9 +696,9 @@ pub struct ThemesOverviewParams {
 /// Which themes appear and their `claim_count` are per viewer (owner ruling
 /// A1): a theme is listed only when the caller can read at least one current
 /// member, and the count is of those members, ordered `claim_count DESC, id
-/// ASC`. These guarantees are THIS route's only; `themes_expand` and
-/// `/api/v1/themes/split-candidates` do not yet hold them. Labels are
-/// corpus-derived for mixed themes (see [`ThemeOut::label`]).
+/// ASC`. [`themes_expand`] holds the same per-viewer guarantees for one
+/// theme's neighbourhoods; `/api/v1/themes/split-candidates` does not yet.
+/// Labels are corpus-derived for mixed themes (see [`ThemeOut::label`]).
 pub async fn themes_overview(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
@@ -739,7 +754,7 @@ pub async fn themes_overview(
     }))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct NeighborhoodOut {
     pub id: Uuid,
     pub label: String,
@@ -763,61 +778,90 @@ pub struct ThemeExpandResponse {
     pub neighborhood_edges: Vec<NeighborhoodEdgeOut>,
 }
 
+/// `GET /api/v1/graph/themes/:theme_id/expand` — viewer-scoped (backlog
+/// 01e0b839).
+///
+/// One viewer-stamped connection for the whole response. A theme the caller
+/// cannot read any current member of is the same 404 as a theme that does not
+/// exist, as in [`themes_overview`]. Each neighbourhood is listed only when
+/// the caller can read at least one of its current members, and its `size`,
+/// `mean_betp`, `dominant_frame_id` and the inter-neighbourhood edge weights
+/// are recomputed over what the caller can read
+/// (`GraphViewRepository::{theme_neighborhoods, theme_neighborhood_edges}`);
+/// the stored aggregates, computed over every member, are not returned.
+///
+/// Labels are stored, not viewer-derived, and are built from public members
+/// only: a neighbourhood's is `neighborhood-N` until
+/// `scripts/label_themes_llm.py --neighborhoods` names it, and the
+/// single-node answer for a theme with no run or no readable neighbourhood
+/// carries the theme's own label (the one [`themes_overview`] returns).
 pub async fn themes_expand(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Path(theme_id): Path<Uuid>,
     Query(params): Query<ExpandParams>,
 ) -> Result<Json<ThemeExpandResponse>, (axum::http::StatusCode, String)> {
     use axum::http::StatusCode;
-    let pool: &PgPool = &state.db_pool;
+    use epigraph_db::GraphViewRepository;
 
-    let exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM claim_themes WHERE id = $1")
-        .bind(theme_id)
-        .fetch_optional(pool)
+    let mut read = state.read_as(&viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler = "themes_expand",
+            "could not acquire a viewer-stamped connection"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to acquire a scoped connection".to_string(),
+        )
+    })?;
+
+    let Some(theme) = GraphViewRepository::theme_visible_summary(&mut *read, &viewer, theme_id)
         .await
-        .map_err(internal)?;
-    if exists.is_none() {
+        .map_err(internal_db)?
+    else {
         return Err((StatusCode::NOT_FOUND, "theme not found".into()));
-    }
+    };
 
-    let latest_run = epigraph_db::ClusterRunRepository::latest(pool)
+    let latest_run = epigraph_db::ClusterRunRepository::latest(&mut *read)
         .await
         .map_err(internal_db)?;
     let Some(run_id) = latest_run.map(|r| r.run_id) else {
-        return Ok(Json(synthesize_pre_run_response(theme_id)));
+        return Ok(Json(synthesize_pre_run_response(theme_id, &theme)));
     };
 
     let budget = params.budget.max(1);
-    let neighborhoods: Vec<NeighborhoodOut> = sqlx::query_as::<_, NeighborhoodOut>(
-        "SELECT id, label, size, mean_betp, dominant_frame_id \
-         FROM graph_neighborhoods \
-         WHERE run_id = $1 AND theme_id = $2 \
-         ORDER BY size DESC LIMIT $3",
-    )
-    .bind(run_id)
-    .bind(theme_id)
-    .bind(budget)
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?;
+    let neighborhoods: Vec<NeighborhoodOut> =
+        GraphViewRepository::theme_neighborhoods(&mut *read, &viewer, run_id, theme_id, budget)
+            .await
+            .map_err(internal_db)?
+            .into_iter()
+            .map(|n| NeighborhoodOut {
+                id: n.id,
+                label: n.label,
+                size: n.size,
+                mean_betp: n.mean_betp,
+                dominant_frame_id: n.dominant_frame_id,
+            })
+            .collect();
 
     if neighborhoods.is_empty() {
-        return Ok(Json(synthesize_pre_run_response(theme_id)));
+        return Ok(Json(synthesize_pre_run_response(theme_id, &theme)));
     }
 
     let nbr_id_set: Vec<Uuid> = neighborhoods.iter().map(|n| n.id).collect();
-    let edges: Vec<NeighborhoodEdgeOut> = sqlx::query_as::<_, (Uuid, Uuid, f64)>(
-        "SELECT neighborhood_a, neighborhood_b, weight FROM neighborhood_edges \
-         WHERE run_id = $1 AND neighborhood_a = ANY($2) AND neighborhood_b = ANY($2)",
-    )
-    .bind(run_id)
-    .bind(&nbr_id_set)
-    .fetch_all(pool)
-    .await
-    .map_err(internal)?
-    .into_iter()
-    .map(|(a, b, w)| NeighborhoodEdgeOut { a, b, weight: w })
-    .collect();
+    let edges: Vec<NeighborhoodEdgeOut> =
+        GraphViewRepository::theme_neighborhood_edges(&mut *read, &viewer, run_id, &nbr_id_set)
+            .await
+            .map_err(internal_db)?
+            .into_iter()
+            .map(|e| NeighborhoodEdgeOut {
+                a: e.a,
+                b: e.b,
+                weight: e.weight,
+            })
+            .collect();
 
     Ok(Json(ThemeExpandResponse {
         theme_id,
@@ -827,14 +871,21 @@ pub async fn themes_expand(
     }))
 }
 
-fn synthesize_pre_run_response(theme_id: Uuid) -> ThemeExpandResponse {
+/// The single-node answer when there is no run, or the run gave the caller no
+/// readable neighbourhood of this theme: the theme itself, named by its
+/// stored label (never the old literal `synthetic`), sized by its readable
+/// current members.
+fn synthesize_pre_run_response(
+    theme_id: Uuid,
+    theme: &epigraph_db::repos::graph_view::ThemeVisibleSummaryRow,
+) -> ThemeExpandResponse {
     ThemeExpandResponse {
         theme_id,
         truncated: false,
         neighborhoods: vec![NeighborhoodOut {
             id: theme_id,
-            label: "synthetic".into(),
-            size: 0,
+            label: theme.label.clone(),
+            size: i32::try_from(theme.visible_members).unwrap_or(i32::MAX),
             mean_betp: None,
             dominant_frame_id: None,
         }],
@@ -916,6 +967,9 @@ mod tests {
         // Equivalence / variants
         "same_as",
         "equivalent_to",
+        // The belief-neutral equivalence link, stored upper case by HTTP
+        // `POST /api/v1/edges` and MCP `link_epistemic` (backlog f07e9624).
+        "EQUIVALENT_TO",
         "analogous",
         "variant_of",
         "definitional_variant_of",

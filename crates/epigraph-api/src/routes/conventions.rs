@@ -121,6 +121,48 @@ pub struct SkillResponse {
 }
 
 // =============================================================================
+// EMBEDDING
+// =============================================================================
+
+/// Embed a claim one of these handlers just created, best-effort (CLAUDE.md
+/// "Embedding policy"): every failure is logged and swallowed, because the
+/// claim is already stored and a failed embed must not fail the request.
+///
+/// Stored on `pool`, the handler's own `state.db_pool`: these handlers write
+/// the claim itself and everything attached to it there, so the vector lands
+/// on the authority that wrote the row. `ClaimRepository::store_embedding`
+/// carries the "not sealed" predicate every claim-vector writer needs.
+async fn embed_created_claim(
+    state: &AppState,
+    pool: &epigraph_db::PgPool,
+    claim_id: Uuid,
+    content: &str,
+    route: &'static str,
+) {
+    let Some(embedder) = state.embedding_service() else {
+        tracing::debug!(claim_id = %claim_id, route, "no embedding service; not embedded");
+        return;
+    };
+    let embedding = match embedder.generate(content).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(claim_id = %claim_id, route, error = %e, "Failed to generate embedding");
+            return;
+        }
+    };
+    let pgvector = epigraph_db::pgvector_literal(&embedding);
+    match epigraph_db::ClaimRepository::store_embedding(pool, claim_id, &pgvector).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(claim_id = %claim_id, route, "embedding matched no row; no vector stored");
+        }
+        Err(e) => {
+            tracing::warn!(claim_id = %claim_id, route, error = %e, "Failed to store embedding");
+        }
+    }
+}
+
+// =============================================================================
 // HANDLERS
 // =============================================================================
 
@@ -217,7 +259,14 @@ pub async fn learn_convention(
         Some(request.evidence),
         claim.id,
     );
-    epigraph_db::EvidenceRepository::create(pool, &evidence).await?;
+    // With its `evidence -> claim` `supports` edge, in the evidence's own
+    // transaction (backlog 2d60f619).
+    epigraph_db::EvidenceRepository::create(
+        pool,
+        &evidence,
+        epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
+    )
+    .await?;
 
     // Create reasoning trace
     let trace = epigraph_core::ReasoningTrace::new(
@@ -231,9 +280,9 @@ pub async fn learn_convention(
     epigraph_db::ReasoningTraceRepository::create(pool, &trace, claim.id).await?;
     epigraph_db::ClaimRepository::update_trace_id(pool, claim.id, trace.id).await?;
 
-    // Materialize graph edges
+    // Materialize graph edges (the evidence's own `supports` edge was written
+    // with the evidence row above).
     let claim_uuid = claim.id.as_uuid();
-    let evidence_uuid = evidence.id.as_uuid();
     let trace_uuid = trace.id.as_uuid();
     let agent_uuid = system_agent.id.as_uuid();
 
@@ -245,19 +294,6 @@ pub async fn learn_convention(
         claim_uuid,
         "claim",
         "AUTHORED",
-        None,
-        None,
-        None,
-    )
-    .await;
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        pool,
-        state.edge_signing_key(),
-        evidence_uuid,
-        "evidence",
-        claim_uuid,
-        "claim",
-        "SUPPORTS",
         None,
         None,
         None,
@@ -287,6 +323,16 @@ pub async fn learn_convention(
         None,
         None,
         None,
+    )
+    .await;
+
+    // After every write of this request, so a failed embed changes nothing.
+    embed_created_claim(
+        &state,
+        pool,
+        claim_uuid,
+        &request.content,
+        "learn_convention",
     )
     .await;
 
@@ -367,32 +413,21 @@ pub async fn forget_convention(
         Some(evidence_text.to_string()),
         claim_id_typed,
     );
-    epigraph_db::EvidenceRepository::create(pool, &evidence).await?;
-
-    // Materialize evidence --REFUTES--> claim edge, on a transaction stamped
-    // with the CALLER's viewer (migration 120, D8): the caller writes the edge,
-    // so between two public claims it owns it. Every other statement of this
-    // handler autocommits on the raw pool, so this splits no transaction.
-    // Best-effort, as before.
-    if let Ok(mut tx) = state.write_as(&viewer, "forget_convention").await {
-        if epigraph_db::EdgeRepository::create_signed_conn(
-            &mut tx,
-            state.edge_signing_key(),
-            evidence.id.as_uuid(),
-            "evidence",
-            claim_id,
-            "claim",
-            "REFUTES",
-            None,
-            None,
-            None,
-        )
-        .await
-        .is_ok()
-        {
-            let _ = tx.commit().await;
-        }
-    }
+    // The evidence and its `evidence -> claim` `refutes` edge, in ONE
+    // transaction stamped with the CALLER's viewer (backlog 2d60f619; migration
+    // 120, D8): the caller writes the edge, so between two public endpoints it
+    // owns it, as the separate best-effort edge write this replaces did. The
+    // evidence row is the caller's write too (migration 114's attach rule on a
+    // public claim it does not own). Every other statement of this handler
+    // autocommits on the raw pool, so this splits no transaction.
+    let mut tx = state.write_as(&viewer, "forget_convention").await?;
+    epigraph_db::EvidenceRepository::create(
+        &mut *tx,
+        &evidence,
+        epigraph_db::EvidenceEdge::refutes(state.edge_signing_key()),
+    )
+    .await?;
+    tx.commit().await?;
 
     // Drive truth to near-zero via Bayesian refutation
     // TODO: migrate to CDST pignistic probability (BayesianUpdater is deprecated)
@@ -471,6 +506,8 @@ pub async fn list_skills(
 ///
 /// `POST /api/v1/skills/share`
 pub async fn share_skill(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(request): Json<ShareSkillRequest>,
@@ -552,6 +589,16 @@ pub async fn share_skill(
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("Failed to commit the SHARED_BY edge: {e}"),
     })?;
+
+    // The shared copy is a new current claim, so it is embedded like one.
+    embed_created_claim(
+        &state,
+        pool,
+        shared_claim.id.as_uuid(),
+        &claim.content,
+        "share_skill",
+    )
+    .await;
 
     Ok((
         StatusCode::CREATED,

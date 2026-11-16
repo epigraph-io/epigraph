@@ -55,6 +55,10 @@ pub struct DsAutoResult {
     /// stored either way; the values above are then this call's combination,
     /// NOT what the claim's cache holds.
     pub cache_written: bool,
+    /// The BBA this call stored for its own evidence, on the binary frame
+    /// (index 0 is TRUE). Its masses drive the claim's Beta-Bernoulli track
+    /// (`epigraph_engine::ds_divergence::beta_increments`).
+    pub evidence_bba: MassFunction,
 }
 
 /// Entry for batch DS wiring (used by `do_ingest_document`).
@@ -580,6 +584,7 @@ pub async fn auto_wire_ds_for_claim(
         mass_on_missing: missing,
         frame_id,
         cache_written,
+        evidence_bba: bba,
     })
 }
 
@@ -963,6 +968,7 @@ pub async fn auto_wire_ds_update_filed_on(
         mass_on_missing: missing,
         frame_id,
         cache_written,
+        evidence_bba: bba,
     })
 }
 

@@ -153,6 +153,7 @@ pub async fn auto_wire_ds_for_edge(
         frame_id,
         &frame,
         crate::belief_profile::overrides_in(&frame_row.properties),
+        VacateGate::ClaimWide,
     )
     .await?;
     Ok(EdgeFactorOutcome::Wired)
@@ -578,12 +579,30 @@ pub async fn recompute_claim_belief_binary(
 /// `epigraph-cli/src/bin/recompute_claim_belief.rs`) that need to refresh
 /// the cached BetP after a direct mutation to `mass_functions.source_strength`
 /// landed on a non-binary frame (research_validity, textbook_veracity_*, ...).
-/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are
-/// frame-agnostic scalars — last writer wins — so for claims with BBAs
-/// across multiple frames, the caller is responsible for ordering
-/// per-frame recomputes deterministically.
+/// Also called directly, with the frame the caller is handling, by the
+/// per-write paths (MCP `submit_ds_evidence`, the HTTP belief route) and the
+/// retraction cascades.
 ///
-/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`.
+/// The `claims.{belief, plausibility, pignistic_prob, ...}` columns are ONE
+/// cache per claim, not one per frame, and `claims.belief_frame_id` records
+/// which frame's combination they hold. This function does NOT apply the
+/// cache-owner rule: it folds the frame it is given and writes that fold to
+/// the cache with `belief_frame_id = frame_id`. Which frame should own the
+/// cache is decided by [`recompute_claim_cached_belief`] (`binary_truth`,
+/// else `claim_validity`, else the recorded frame, else the first writer),
+/// which then calls this function with that frame. A caller that passes
+/// another frame re-points the cache to it whenever its session may write the
+/// claim row, so such a caller still decides the outcome by its call order.
+///
+/// The one write the database declines is that of a session that does not
+/// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
+/// reached through `MassFunctionRepository::update_claim_belief`): it may
+/// refresh the cache on the frame already recorded, or seed an empty cache on
+/// `binary_truth`; on any other frame its write is a no-op, not an error.
+///
+/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`. `Ok(true)`
+/// means the claim has BBAs there and the fold was attempted; it does not say
+/// the cache was written.
 ///
 /// # Errors
 /// String error if the frame row can't be loaded, the frame's hypothesis
@@ -615,6 +634,7 @@ pub async fn recompute_claim_belief_on_frame(
         frame_id,
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::ClaimWide,
     )
     .await?;
     Ok(true)
@@ -683,6 +703,7 @@ pub async fn preview_claim_belief_on_frame_vacating(
         frame_id,
         &frame,
         crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::ClaimWide,
     )
     .await
 }
@@ -1155,6 +1176,34 @@ pub fn is_known_evidence_type_key_in(key: &str, profile: &BeliefProfile) -> bool
         || RELATIONSHIP_VOCAB_ALLOWLIST.contains(&key.to_lowercase().as_str())
 }
 
+/// The `mass_functions.locality_tag` values a caller may send (backlog
+/// 86ee2d30), sorted.
+///
+/// The fold distinguishes only two classes, read off
+/// `global_source_strength`'s `compose_with_locality`: a tag that begins
+/// with `intra` composes the intra-locality factor, and every other tag the
+/// cross factor. So `intra_self_cite` (what `finish_edge_bba` writes) and
+/// the bare `intra` shorthand both discount, `cross` and `unknown` do not.
+/// The global test is case-sensitive, so the claim's cached belief does NOT
+/// discount `Intra_self_cite`; a perspective-scoped read
+/// ([`effective_source_strength_profiled`]) lowercases the tag first and
+/// does. Every known tag is lowercase, so a known tag folds the same way in
+/// both.
+///
+/// `intra_methodological_overlap` is left out on purpose: no write path emits
+/// it yet, and it is 28 characters against the column's `varchar(20)`
+/// (migration 045; `epigraph-mcp`'s `LOCALITY_TAG_MAX_CHARS`), so storing it
+/// fails.
+pub const KNOWN_LOCALITY_TAGS: &[&str] = &["cross", "intra", "intra_self_cite", "unknown"];
+
+/// Whether `tag` is in [`KNOWN_LOCALITY_TAGS`]. A tag outside it is stored
+/// as given and never refused: a misspelt intra tag (`self-cite`) just
+/// silently gets no discount, which is why callers report it.
+#[must_use]
+pub fn is_known_locality_tag(tag: &str) -> bool {
+    KNOWN_LOCALITY_TAGS.contains(&tag)
+}
+
 /// Phase 4 (issue #197) Q8: warn on per-frame evidence-type override
 /// keys that aren't in the known vocabulary of the profile the combine folds
 /// under.
@@ -1499,6 +1548,7 @@ async fn compute_combined_belief(
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
+    gate: VacateGate,
 ) -> Result<Option<(CombinedBeliefPreview, bool)>, String> {
     let rows = MassFunctionRepository::get_for_claim_frame(&mut *conn, viewer, claim_id, frame_id)
         .await
@@ -1518,11 +1568,7 @@ async fn compute_combined_belief(
     // `None` with input on the frame: the scope rule left none of it.
     match folded {
         Some(preview) => Ok(Some((preview, false))),
-        None if had_input
-            && crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id)
-                .await
-                .map_err(|e| format!("derivation scope read: {e}"))? =>
-        {
+        None if had_input && gate.vacates(&mut *conn, viewer, claim_id).await? => {
             let profile = fold_profile(
                 &mut *conn,
                 frame_id,
@@ -1544,6 +1590,45 @@ async fn compute_combined_belief(
     }
 }
 
+/// When a fold of the owner frame that the derivation scope rule emptied
+/// replaces the cache with full ignorance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VacateGate {
+    /// Every recompute: only when NO frame of the claim has an admissible
+    /// input ([`crate::derivation_scope::must_vacate_cache`]). An admissible
+    /// input on another frame leaves the cache as it was.
+    ClaimWide,
+    /// A widening act (publicize, share with a team): whenever the claim has a
+    /// fold cache. The act has just widened the audience the cached value is
+    /// served to, and that value was folded from the owner frame's inputs
+    /// under the OLD audience. When none of them may reach the new audience,
+    /// keeping it serves their direction and weight to readers who may not
+    /// see them, whatever another frame holds.
+    OwnerFrame,
+}
+
+impl VacateGate {
+    async fn vacates(
+        self,
+        conn: &mut sqlx::PgConnection,
+        viewer: &epigraph_db::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, String> {
+        match self {
+            Self::ClaimWide => {
+                crate::derivation_scope::must_vacate_cache(&mut *conn, viewer, claim_id).await
+            }
+            Self::OwnerFrame => {
+                epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_has_fold_cache(
+                    &mut *conn, viewer, claim_id,
+                )
+                .await
+            }
+        }
+        .map_err(|e| format!("derivation scope read: {e}"))
+    }
+}
+
 /// The classification a vacated cache carries on every frame (ruling R-80):
 /// the label the classifier gives full ignorance on the binary frame.
 const VACATED_CLASSIFICATION: &str = "not_enough_info";
@@ -1561,6 +1646,7 @@ async fn recompute_combined_belief(
     frame_id: Uuid,
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
+    gate: VacateGate,
 ) -> Result<(), String> {
     let Some((preview, vacated)) = compute_combined_belief(
         &mut *conn,
@@ -1569,6 +1655,7 @@ async fn recompute_combined_belief(
         frame_id,
         frame,
         frame_overrides,
+        gate,
     )
     .await?
     else {
@@ -1712,6 +1799,58 @@ pub async fn recompute_claim_cached_belief(
     recompute_claim_belief_on_frame(&mut *conn, viewer, claim_id, owner).await
 }
 
+/// [`recompute_claim_cached_belief`] for a claim whose audience an act has
+/// just WIDENED (`crate::visibility_act`: publicize, share with a team),
+/// called inside the act's transaction.
+///
+/// The owner frame and the fold are the same. The difference is the vacate:
+/// when the owner frame has inputs and the derivation scope rule admits none
+/// of them for the claim's new audience, the cache is set to full ignorance
+/// (as [`recompute_claim_cached_belief`] does only when no frame of the claim
+/// has an admissible input), provided the claim has a fold cache. Without
+/// this, a claim whose `binary_truth` inputs all stay behind (pinned evidence,
+/// an edge-factor BBA whose edge the new audience cannot read) while its
+/// `claim_validity` keeps an admissible input would serve the old
+/// `binary_truth` fold, and the influence of what stayed behind, to the
+/// wider audience (backlog 31285392). A claim with no cache still gets none,
+/// and a claim with no owner frame (a non-procedural compound, template-only
+/// rows) is left as it was.
+///
+/// Returns whether a write was attempted (as [`recompute_claim_cached_belief`]).
+///
+/// # Errors
+/// As [`recompute_claim_cached_belief`].
+pub async fn recompute_widened_claim_cached_belief(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_id: Uuid,
+) -> Result<bool, String> {
+    let Some(owner) =
+        MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+            .await
+            .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+    else {
+        return Ok(false);
+    };
+    let row = FrameRepository::get_by_id(&mut *conn, viewer, owner)
+        .await
+        .map_err(|e| format!("frame get_by_id: {e}"))?
+        .ok_or_else(|| format!("frame {owner} not found"))?;
+    let frame = FrameOfDiscernment::new(row.name.clone(), row.hypotheses.clone())
+        .map_err(|e| format!("build frame {}: {e}", row.name))?;
+    recompute_combined_belief(
+        &mut *conn,
+        viewer,
+        claim_id,
+        owner,
+        &frame,
+        crate::belief_profile::overrides_in(&row.properties),
+        VacateGate::OwnerFrame,
+    )
+    .await?;
+    Ok(true)
+}
+
 /// Why the single atom-cache writer is called (SPEC §4.2, "Empty fold").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CacheWriteCause {
@@ -1807,13 +1946,14 @@ pub struct AtomCacheSettings {
 }
 
 impl AtomCacheSettings {
-    /// This process's settings: the two flags as read at startup, and O24 as
+    /// This process's settings: the two flags as read at startup
+    /// ([`crate::atom_items::modes`]), and the evidence-removal vacate as
     /// ruled.
     #[must_use]
     pub fn current() -> Self {
         Self {
-            fold: crate::atom_items::AtomFoldMode::current(),
-            compound_source_edges: crate::atom_items::CompoundSourceEdges::current(),
+            fold: crate::atom_items::modes().atom_fold,
+            compound_source_edges: crate::atom_items::modes().compound_source_edges,
             vacate_on_evidence_removal: true,
         }
     }
@@ -2203,6 +2343,22 @@ pub async fn ensure_binary_frame(
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<Uuid, String> {
     ensure_binary_frame_row(conn, viewer).await.map(|r| r.id)
+}
+
+/// The canonical `binary_truth` frame's id, when it exists and `viewer` can
+/// read it. Read-only: unlike [`ensure_binary_frame`] it never creates the
+/// frame, so a read path can call it.
+///
+/// # Errors
+/// The frame lookup fails.
+pub async fn find_binary_frame(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+) -> Result<Option<Uuid>, String> {
+    FrameRepository::get_by_name(&mut *conn, viewer, BINARY_FRAME_NAME)
+        .await
+        .map(|row| row.map(|r| r.id))
+        .map_err(|e| format!("get_by_name: {e}"))
 }
 
 /// [`ensure_binary_frame`], returning the frame row (its `properties` carry

@@ -2,7 +2,8 @@
 
 //! EpiGraph Full-Framework MCP Server — exposes all workspace crates as MCP tools.
 //!
-//! Connects to the EpiGraph PostgreSQL backend and provides 58 MCP tools including
+//! Connects to the EpiGraph PostgreSQL backend and provides the kernel MCP tools
+//! (the count is derived from the router, see `server_instructions`), including
 //! full CDST support (6 combination methods), scoped beliefs, and DS-vs-Bayesian divergence.
 //!
 //! ## Usage
@@ -42,7 +43,10 @@ use zeroize::Zeroizing;
 #[derive(Parser)]
 #[command(
     name = "epigraph-mcp-full",
-    about = "EpiGraph full-framework MCP server — 58 epistemic tools"
+    // No tool count here: the number is derived from the router at runtime
+    // (`EpiGraphMcpFull::all_tools_json`, in the handshake instructions and
+    // the startup log), and a literal in this string goes stale.
+    about = "EpiGraph full-framework MCP server"
 )]
 struct Cli {
     /// PostgreSQL connection URL
@@ -895,8 +899,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env -> empty registry -> the gateway behaves exactly as pre-federation.
     // A malformed EPIGRAPH_MCP_EXTENSIONS is a hard boot error (fail fast rather
     // than silently drop an extension); a tool-name COLLISION between two
-    // extensions, or between an extension and a kernel tool, is likewise fatal
-    // (ambiguous routing; `build` reserves the kernel's names). An individual extension
+    // extensions is likewise fatal (ambiguous routing). An individual extension
     // being unreachable at startup is NOT fatal — it is logged and mounted
     // unhealthy inside `build`.
     let ext_env = std::env::var("EPIGRAPH_MCP_EXTENSIONS").ok();
@@ -915,10 +918,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              and likely fail; extensions will mount unhealthy"
         );
     }
+    // Bound on one proxied tools/call. Unset, zero or unparseable keeps the
+    // default: an operator who mistypes the value must not get an unbounded
+    // call, which is the behaviour this bound replaced.
+    let call_timeout = std::env::var("EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(
+            epigraph_mcp::federation::client::DEFAULT_CALL_TIMEOUT,
+            std::time::Duration::from_secs,
+        );
     let federation = epigraph_mcp::federation::SharedFederation::new(
         epigraph_mcp::federation::FederationRegistry::build(ext_configs, &discovery_token)
             .await
-            .map_err(|e| format!("federation gateway build failed: {e}"))?,
+            .map_err(|e| format!("federation gateway build failed: {e}"))?
+            .with_call_timeout(call_timeout),
     );
     let federated_tool_count = federation.list_federated_tools().len();
     if federation.is_empty() {
@@ -947,8 +962,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         tracing::info!(
             reconnect_interval_secs = reconnect_interval.as_secs(),
-            "Federation gateway: reconnect timer started (re-lists mounted extensions, \
-             re-dials unhealthy ones)"
+            call_timeout_secs = call_timeout.as_secs(),
+            "Federation gateway: health timer started (re-dials unhealthy extensions, \
+             re-reads healthy ones' tool lists)"
         );
         federation.spawn_reconnect_loop(reconnect_interval);
     }
@@ -1199,13 +1215,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `epigraph_mcp::stdio_transport`.
         let (stdin, stdout) = rmcp::transport::stdio();
         let transport = epigraph_mcp::stdio_transport::stdio_server_transport(stdin, stdout);
+        // Taken before `serve` consumes the server: the detached tasks its
+        // tools spawn (a queued document walk, post-commit embedding) are
+        // waited for below.
+        let background = server.background_tasks();
         let service = server.serve(transport).await.map_err(|e| {
             tracing::error!("MCP serve error: {e}");
             e
         })?;
 
         tracing::info!("EpiGraph MCP full-framework server running on stdio ({mode})");
-        service.waiting().await?;
+        let served = service.waiting().await;
+
+        // The client has disconnected. Returning now drops the runtime, which
+        // CANCELS whatever is still running on it: a walk the client was told
+        // was `queued` (nothing written), or the embedding of claims that have
+        // already committed (backlog b928ccc1). Wait for them, with a bound so
+        // a stuck provider call cannot hold the process open forever.
+        let pending = background.active();
+        if pending > 0 {
+            let drain = epigraph_mcp::background::exit_drain_timeout();
+            tracing::info!(
+                pending,
+                timeout_secs = drain.as_secs(),
+                "stdio client disconnected; waiting for background work to finish"
+            );
+            if !background.wait_idle(drain).await {
+                tracing::warn!(
+                    unfinished = background.active(),
+                    timeout_secs = drain.as_secs(),
+                    "exiting with background work unfinished: a queued ingest may have written \
+                     nothing, and committed claims may have no embedding until a backfill"
+                );
+            }
+        }
+        served?;
     }
 
     Ok(())
