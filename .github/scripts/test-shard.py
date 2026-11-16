@@ -133,6 +133,8 @@ WALKERS = {
         "crates/epigraph-auth/src/*",
     ),
     "crates/epigraph-api/tests/delegated_run_token_viewer.rs": ("crates/epigraph-mcp/src/*",),
+    # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
+    "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
     # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
     # renamed is only caught by a full run (main, staging, `ci:full`).
@@ -158,7 +160,15 @@ WALKERS = {
     "crates/epigraph-db/tests/unstamped_http_edge_writes.rs": (),
     # Every file of that name anywhere in the tree.
     "crates/epigraph-db/tests/viewer_fixture_single_source.rs": ("*viewer_fixture.rs",),
-    "crates/epigraph-engine/tests/calibration_single_loader_ratchet.rs": (
+    # One pgvector formatter and one embedding client: scans every production
+    # source under crates/*/src and services/*/src.
+    "crates/epigraph-embeddings/tests/embedding_stack_ratchet.rs": (
+        "crates/*/src/*",
+        "services/*/src/*",
+    ),
+    # The shared walker behind calibration_single_loader_ratchet.rs and
+    # belief_mode_readers.rs (both `#[path]`-include it).
+    "crates/epigraph-engine/tests/support/rust_sources.rs": (
         "crates/*/src/*",
         "crates/*/build.rs",
     ),
@@ -460,11 +470,22 @@ def scan_reads(root, pkgs, dirs, files, read=None, gone=()):
             stem = rest[: -len("/mod.rs")] if rest.endswith("/mod.rs") else rest[: -len(".rs")]
             if "/" not in stem:
                 decl = re.compile(r"\bmod\s+" + re.escape(stem) + r"\s*;")
-                users = sorted(
-                    t for src, (p, t) in roots.items() if p == name and decl.search(text_of(src))
-                )
-                if users:
-                    return TARGETS, tuple(users)
+                top_only = False
+            else:
+                # A helper in a subdirectory, pulled in by a target at the top
+                # of tests/ with `#[path = "<dir>/<file>.rs"] mod <name>;`
+                # (the path is relative to that target's directory).
+                decl = re.compile(r'#\[\s*path\s*=\s*"' + re.escape(rest) + r'"\s*\]')
+                top_only = True
+            users = sorted(
+                t
+                for src, (p, t) in roots.items()
+                if p == name
+                and (not top_only or src.rsplit("/", 1)[0] == d + "/tests")
+                and decl.search(text_of(src))
+            )
+            if users:
+                return TARGETS, tuple(users)
         return PACKAGE, ()
 
     reads, walkers = [], set()
