@@ -54,6 +54,11 @@
 //! | `methods.rs` | `MethodRepository::get_evidence_strength` | [`method_evidence_counts_only_the_claims_the_viewer_can_see`] |
 //! | `methods.rs` | `MethodRepository::get` | [`method_lookup_serves_on_the_stamped_connection`] and [`method_lookup_fails_when_the_unstamped_role_cannot_read_methods`] |
 //!
+//! Not a site: `get_method`'s `source_claim_ids` projection is public
+//! attribution by decision (`F-PR29-A2`), pinned together with its predicated
+//! dereference by
+//! [`method_source_claim_ids_are_public_attribution_and_dereference_stays_predicated`].
+//!
 //! # THE DIRECTION OF THE SEARCH ASSERTIONS, STATED SO IT IS NOT ASKED FOR
 //!
 //! For the diverse path's candidate/full-fetch/neighbour sites the only
@@ -666,5 +671,97 @@ async fn method_lookup_fails_when_the_unstamped_role_cannot_read_methods(pool: P
         out["name"].as_str(),
         Some("PR29 Revoked Method"),
         "the row must come back in full from the stamped connection; got {out}"
+    );
+}
+
+/// `get_method`'s `source_claim_ids` projection — PUBLIC ATTRIBUTION BY
+/// DECISION (`F-PR29-A2`, accepted and documented on the handler).
+///
+/// `methods` is global reference data, and the response names every source
+/// claim id it stores, whoever asks. What stays predicated is the dereference:
+/// reading any of those ids goes back through the viewer-spliced `claims` read
+/// path. This arm pins both halves, so a change to either is a change to a
+/// recorded decision rather than a silent drift.
+#[sqlx::test(migrations = "../../migrations")]
+async fn method_source_claim_ids_are_public_attribution_and_dereference_stays_predicated(
+    pool: PgPool,
+) {
+    let (agent, group) = seed_agent_with_group(&pool, "svm-method-attr-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "svm-method-attr-theirs").await;
+
+    let mine = seed_group_claim(&pool, agent, group, "method attribution: mine").await;
+    let theirs = seed_group_claim(
+        &pool,
+        stranger,
+        stranger_group,
+        "method attribution: theirs",
+    )
+    .await;
+    let method = seed_method(&pool, "F-PR29-A2 Attributed Method", &[mine, theirs]).await;
+
+    // Half 1: the projection names every stored source id, in stored order,
+    // including the one this viewer cannot read.
+    let state = split_state(&pool).await;
+    let out = get_method(
+        ViewerExtractor(viewer_for(&pool, agent).await),
+        State(state),
+        Path(method),
+    )
+    .await
+    .expect("get_method must serve on the stamped connection")
+    .0;
+    let expected = serde_json::json!([mine.to_string(), theirs.to_string()]);
+    assert_eq!(
+        out["source_claim_ids"], expected,
+        "source_claim_ids is public attribution by decision: both stored ids, in \
+         stored order, whatever the viewer can read. A missing or shorter array means \
+         the projection was narrowed without revisiting F-PR29-A2; got {out}"
+    );
+
+    // Half 2: the dereference is predicated. On one stamped connection the
+    // viewer reads its own source claim (positive control) and not the other.
+    let state = split_state(&pool).await;
+    let viewer = viewer_for(&pool, agent).await;
+    let mut read = state.read_as(&viewer).await.expect("read_as");
+    let own = epigraph_db::ClaimRepository::get_by_id(
+        &mut *read,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(mine),
+    )
+    .await
+    .expect("read own source claim");
+    assert!(
+        own.is_some(),
+        "POSITIVE CONTROL: the viewer must read its own group's source claim, or the \
+         None below is not evidence of a predicate"
+    );
+    let other = epigraph_db::ClaimRepository::get_by_id(
+        &mut *read,
+        &viewer,
+        epigraph_core::ClaimId::from_uuid(theirs),
+    )
+    .await
+    .expect("read the other source claim");
+    assert!(
+        other.is_none(),
+        "the claim read path must stay viewer-predicated: an id named in \
+         source_claim_ids must not dereference for a viewer outside its group"
+    );
+    drop(read);
+
+    // CALIBRATION: the other claim exists and its own group's viewer reads it,
+    // so the None above is the predicate and not a missing row.
+    let stranger_viewer = viewer_for(&pool, stranger).await;
+    let mut read = state.read_as(&stranger_viewer).await.expect("read_as");
+    let theirs_for_them = epigraph_db::ClaimRepository::get_by_id(
+        &mut *read,
+        &stranger_viewer,
+        epigraph_core::ClaimId::from_uuid(theirs),
+    )
+    .await
+    .expect("stranger reads its own claim");
+    assert!(
+        theirs_for_them.is_some(),
+        "CALIBRATION: the stranger's own viewer must read the claim"
     );
 }
