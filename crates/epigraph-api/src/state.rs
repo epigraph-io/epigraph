@@ -1681,14 +1681,7 @@ impl AppState {
                 return false;
             }
         };
-        let pgvec = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(f32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         match self
             .store_claim_embedding_as(viewer, claim_id, &pgvec, handler)
             .await

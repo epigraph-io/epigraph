@@ -150,14 +150,7 @@ async fn embed_created_claim(
             return;
         }
     };
-    let pgvector = format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(f32::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let pgvector = epigraph_db::pgvector_literal(&embedding);
     match epigraph_db::ClaimRepository::store_embedding(pool, claim_id, &pgvector).await {
         Ok(true) => {}
         Ok(false) => {
