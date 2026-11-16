@@ -583,6 +583,11 @@ impl ServerHandler for DynStub {
                 "`depth` must be between 1 and 5",
                 None,
             )),
+            "fails_internally" => Err(ErrorData::internal_error(
+                "sample lookup: error returned from database: relation \
+                 \"stub_private_table\" does not exist",
+                None,
+            )),
             "hangs" => {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 unreachable!("the gateway abandons the call long before this")
@@ -798,6 +803,61 @@ async fn a_downstream_tool_error_reaches_the_caller_with_its_code_and_message() 
         answer.message, "`depth` must be between 1 and 5",
         "the downstream's own message, which is what lets the caller fix the call"
     );
+}
+
+/// A downstream's INTERNAL error is the one answer not passed through: its
+/// message is where a downstream that does not redact puts its driver text,
+/// which this server keeps from callers (`errors.rs`). The caller is told
+/// which extension failed, still as an internal error, and not what the
+/// downstream's database said. Operator ruling of 2026-11-16: redact.
+///
+/// Mutation: drop the `INTERNAL_ERROR` arm in `federated_call_error` -> the
+/// stub's "stub_private_table" reaches the caller, and this fails.
+#[tokio::test]
+async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
+    let (addr, _control) = spawn_dyn_stub(&["fails_internally"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+
+    let err = federation
+        .invoke("fails_internally", "caller-tok", None)
+        .await
+        .expect_err("the stub fails this tool internally");
+    assert!(
+        matches!(
+            &err,
+            epigraph_mcp::federation::client::FederationError::Downstream(d)
+                if d.message.contains("stub_private_table")
+        ),
+        "CALIBRATION: the downstream's own answer carries the driver text: {err:?}"
+    );
+    assert!(
+        federation.route_config("fails_internally").is_some(),
+        "an internal error says nothing about the extension's health"
+    );
+
+    let answer = epigraph_mcp::errors::federated_call_error("episcience", "fails_internally", err);
+    assert_eq!(
+        answer.code,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "still an internal error"
+    );
+    assert!(
+        !answer.message.contains("stub_private_table") && !answer.message.contains("database"),
+        "a downstream's internal error text must not reach the caller: {}",
+        answer.message
+    );
+    assert!(
+        answer
+            .message
+            .contains("internal error in extension `episcience`"),
+        "the caller is told which extension failed: {}",
+        answer.message
+    );
+    assert!(answer.data.is_none(), "no downstream data is forwarded");
 }
 
 /// A downstream that accepts a call and never answers is abandoned at the

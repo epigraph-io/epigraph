@@ -206,7 +206,10 @@ either clash with a `prefix=`.
 
 - Downstream socket down at startup → its tools are **absent** from `tools/list`
   (logged); gateway serves everything else. Reconnect on a timer; tools reappear.
-- Downstream errors mid-call → surfaced as a normal MCP tool error.
+- Downstream errors mid-call → surfaced as a normal MCP tool error. The exception is an
+  internal error (`-32603`): its message is where a downstream's driver text lands, so the
+  gateway redacts it as it redacts its own, names the extension instead, and logs the
+  downstream's message (`errors::federated_call_error`; operator ruling of 2026-11-16).
 - Collision at startup (two extensions, or an extension and the kernel, exporting the same
   effective tool name) → **refuse to start**.
 - Collision at runtime (an extension that reconnects, or re-lists, with a clashing name) →

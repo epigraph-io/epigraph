@@ -64,6 +64,13 @@ pub fn internal_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
 ///   invalid-params refusal, say) and the federation spec's "surfaced as a
 ///   normal MCP tool error"; redacting it left the caller unable to correct
 ///   the call.
+/// - Except an INTERNAL error (`-32603`): a downstream's internal error is
+///   where its own driver and provider text lands when it does not redact
+///   (the reference extension's `internal_error` formats `e` into the
+///   message), and this server keeps that text from every caller
+///   ([`internal_error`]). The caller is told which extension failed; the
+///   downstream's message goes to the server log ([`internal_error_logged`]).
+///   The operator ruled redaction over pass-through on 2026-11-16.
 /// - The extension could not be reached, or did not answer in time: a designed
 ///   message naming the extension and what happened, so "the tool is down"
 ///   is told apart from "the gateway is broken".
@@ -80,6 +87,19 @@ pub fn federated_call_error(
 ) -> McpError {
     use crate::federation::client::FederationError as F;
     let message = match e {
+        F::Downstream(downstream) if downstream.code == ErrorCode::INTERNAL_ERROR => {
+            return internal_error_logged(
+                format!(
+                    "`{tool}` failed with an internal error in extension `{extension}`; the \
+                     detail is in the server log"
+                ),
+                format_args!(
+                    "federated extension `{extension}` answered `{tool}` with an internal \
+                     error: {}",
+                    downstream.message
+                ),
+            );
+        }
         F::Downstream(downstream) => {
             tracing::info!(
                 target: "mcp.federation",
