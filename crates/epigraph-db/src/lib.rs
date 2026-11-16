@@ -194,6 +194,7 @@ pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
 // Abbreviated claim-id resolution (backlog 30d8b667).
+pub use repos::AtlasMapRepository;
 pub use repos::{id_prefix_bounds, ID_PREFIX_CONTENT_CHARS, MIN_ID_PREFIX_HEX};
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{

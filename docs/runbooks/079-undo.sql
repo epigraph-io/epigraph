@@ -139,6 +139,9 @@ DECLARE t text;
           -- ---- workflow rows (183) ---------------------------------------
           -- FORCEd by 183 with its tenancy columns, same precedent and reason.
           'workflows',
+          -- ---- Atlas team maps (210) -------------------------------------
+          -- FORCEd by 210 at creation, same precedent and reason.
+          'atlas_map_epochs','atlas_map_runs','atlas_map_levels',
           -- ---- hierarchical outcome reports (221) ------------------------
           -- FORCEd by 221 at creation, same precedent and reason.
           'workflow_outcome_reports'];

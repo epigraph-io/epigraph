@@ -16,6 +16,7 @@ pub mod alternative_set;
 pub mod analysis;
 pub mod assertion_nonce;
 pub mod atlas_layout;
+pub mod atlas_map;
 pub mod atom_axiom;
 pub mod atomicity_screen;
 pub mod authored_by;
@@ -136,6 +137,9 @@ pub use atlas_layout::{
     PublicThemeCentroid, PublicThemeLinkCount, RegionDetail, ThemePageCursor, ThemePlacement,
     UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
+};
+pub use atlas_map::{
+    AtlasHierarchy, AtlasMap, AtlasMapRepository, LevelDoc, MapEpochs, MapLevel, NewMapRun,
 };
 pub use atomicity_screen::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use authored_by::{

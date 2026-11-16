@@ -431,6 +431,9 @@ const PROTECTED: &[&str] = &[
     "harvester_sources",
     "harvester_audit_reports",
     "workflows",
+    "atlas_map_epochs",
+    "atlas_map_runs",
+    "atlas_map_levels",
     "workflow_outcome_reports",
 ];
 

@@ -390,6 +390,9 @@ pub async fn run_batch(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = app_readable(conn, specs, &claim_ids, &keys).await?;
     let counters_before = xact_counters(conn).await?;
+    // Migration 210's Atlas map epochs, as they stand before the first write.
+    let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
 
     let payload: Vec<serde_json::Value> = work
         .iter()
@@ -484,6 +487,25 @@ pub async fn run_batch(
         expect_counts.entry(t.clone()).or_default().1 += n;
     }
     expect_counts.retain(|_, d| *d != (0, 0, 0));
+    // Migration 210's map epochs: the claims statement, then each row as the
+    // trigger left it and as the restore wrote it.
+    if let Some(me) = map_epochs.as_mut() {
+        let prior: BTreeMap<Uuid, &tables::ClaimRow> =
+            claims_prior.iter().map(|c| (c.id, c)).collect();
+        for c in &after {
+            if let Some(b) = prior.get(&c.id) {
+                me.claim((&b.visibility, b.owner), (&c.visibility, c.owner));
+            }
+        }
+        for (k, a) in &s0 {
+            let (Some(mid), Some(got)) = (s1.get(k), s2.get(k)) else {
+                continue;
+            };
+            me.row(&k.0, &a.tenancy, mid);
+            me.row(&k.0, mid, got);
+        }
+        me.expect_into(conn, &mut expect_counts).await?;
+    }
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
         &expect_counts,
