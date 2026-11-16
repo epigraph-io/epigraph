@@ -337,8 +337,11 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- column, or its `drain_jobs` timer is not running", which is a
          -- deployment signal rather than a missing-handler one; the warning
          -- in `drain_jobs`'s log (not the server's boot log) says which
-         -- provider was selected,
-         -- and `epigraph-cli reembed` remains the recovery path in that case.
+         -- provider was selected.
+         -- Recovery there is `embed_backfill` with the owning provider (it
+         -- writes `embedding`); `epigraph-cli reembed` does NOT restore this
+         -- column, it writes `embedding_3072`. Such jobs keep `drain_jobs` at
+         -- exit 4 until `drain_jobs --cancel-pending embedding_generation`.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column
          -- this clause reads. `embedding_3072` is nulled by the same seal and
