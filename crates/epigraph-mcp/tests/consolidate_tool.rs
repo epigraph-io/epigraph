@@ -56,6 +56,7 @@ fn params(ids: &[Uuid], content: &str, confidence: Option<f64>) -> ConsolidateCl
         mode: "merge".to_string(),
         reason: "test consolidation".to_string(),
         confidence,
+        survivor_claim_id: None,
     }
 }
 

@@ -254,15 +254,6 @@ async fn theme_leg(
     Ok(members.into_iter().map(|(id, _, sim)| (id, sim)).collect())
 }
 
-/// Format a `Vec<f32>` as a pgvector string literal `[a,b,c,...]`.
-///
-/// Mirrors the same helper in `epigraph-mcp/src/embed.rs` — kept private here
-/// to avoid a cross-crate dependency on the MCP crate.
-fn format_pgvector(vec: &[f32]) -> String {
-    let inner: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", inner.join(","))
-}
-
 /// Semantic recall: embed the query, find similar claims, filter by truth.
 ///
 /// Runs [`RecallRoute::Similarity`], the ANN leg alone; use [`recall_routed`]
@@ -340,7 +331,7 @@ pub async fn recall_routed(
     let mut pgvec_for_audit: Option<String> = None;
     let mut theme_leg_ran = false;
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
-        let pgvec = format_pgvector(&embedding);
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         pgvec_for_audit = Some(pgvec.clone());
         // ANN over `claims.embedding` (is_current, all levels) — NOT
         // `evidence.embedding`, which is a permanently-empty column: searching
@@ -826,17 +817,6 @@ mod tests {
         let config = EmbeddingConfig::local(64);
         let provider = MockProvider::new(config);
         assert_embedding_service(&provider);
-    }
-
-    /// Confirm that `format_pgvector` produces a pgvector-compatible string.
-    #[test]
-    fn format_pgvector_roundtrip() {
-        let vec = vec![0.1f32, 0.2, 0.3];
-        let s = format_pgvector(&vec);
-        assert!(s.starts_with('['), "should start with [");
-        assert!(s.ends_with(']'), "should end with ]");
-        // Three floats → two commas
-        assert_eq!(s.matches(',').count(), 2);
     }
 
     /// Confirm `recall` is callable with a `&dyn EmbeddingService` by checking

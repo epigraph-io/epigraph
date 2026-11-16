@@ -150,9 +150,9 @@ async fn a_counted_reap_bounds_a_job_killed_on_every_attempt(pool: PgPool) {
 
 /// The reap is decided by the row's own attempt budget, not its type (review
 /// W12a-D7). A one-attempt row (`max_retries = 1`, as
-/// `PrivatizationRepository::enqueue_job_conn` enqueues every job it writes:
-/// the privatization types AND the unseal's `embedding_generation`) is reset
-/// WITHOUT counting, whatever its type, so it is re-delivered to its handler
+/// `PrivatizationRepository::enqueue_job_conn` enqueues the privatization
+/// apply, revert and reseal jobs) is reset WITHOUT counting, whatever its type
+/// (`embedding_generation` included), so it is re-delivered to its handler
 /// instead of failed before it runs. The control: a privatization row with a
 /// multi-attempt budget, on its last attempt, IS failed by the reap, so it is
 /// the budget, not a type exemption, that keeps the one-attempt rows alive.
@@ -191,4 +191,79 @@ async fn a_one_attempt_row_is_reset_without_counting_whatever_its_type(pool: PgP
     let (state, retries, err, done) = row(&pool, spent).await;
     assert_eq!((state.as_str(), retries, done), ("failed", 3, true));
     assert_eq!(err.as_deref(), Some(epigraph_jobs::REAPED_SPENT_MESSAGE));
+}
+
+async fn redeliveries(pool: &PgPool, id: Uuid) -> i32 {
+    sqlx::query_scalar("SELECT redelivery_count FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("the job's redelivery_count")
+}
+
+/// A ONE-attempt job killed on every run (backlog 1320b4e3) is re-delivered at
+/// most `MAX_CRASH_REDELIVERIES` times: each uncounted reset leaves
+/// `retry_count` alone (so the handler still gets its attempt) and bumps
+/// `redelivery_count`; the next reap fails the row itself, with a message that
+/// tells a crash loop apart from a spent attempt budget. Before the bound such
+/// a job was reset on every run for ever.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_one_attempt_job_killed_on_every_run_is_failed_after_bounded_redeliveries(pool: PgPool) {
+    let q = PostgresJobQueue::new(pool.clone());
+    let looping = insert_running(&pool, "privatization_apply", 0, 1).await;
+    let bound = epigraph_jobs::MAX_CRASH_REDELIVERIES;
+    assert!(bound >= 1, "CALIBRATION: a bound of 0 re-delivers nothing");
+
+    for redelivery in 1..=bound {
+        let reaped = q
+            .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+            .await
+            .unwrap();
+        assert_eq!(reaped.len(), 1, "redelivery {redelivery}: {reaped:?}");
+        assert!(
+            !reaped[0].failed,
+            "redelivery {redelivery} of {bound}: {reaped:?}"
+        );
+        let (state, retries, err, done) = row(&pool, looping).await;
+        assert_eq!(
+            (state.as_str(), retries, err, done),
+            ("pending", 0, None, false),
+            "redelivery {redelivery}: a one-attempt row must be re-delivered with its attempt \
+             uncounted"
+        );
+        assert_eq!(redeliveries(&pool, looping).await, redelivery);
+        make_stale_again(&pool, looping).await;
+    }
+
+    let reaped = q
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .await
+        .unwrap();
+    assert_eq!(reaped.len(), 1, "{reaped:?}");
+    assert!(
+        reaped[0].failed && reaped[0].one_attempt,
+        "the reap past the re-delivery bound must fail the row: {reaped:?}"
+    );
+    let (state, retries, err, done) = row(&pool, looping).await;
+    assert_eq!((state.as_str(), retries, done), ("failed", 0, true));
+    assert_eq!(
+        err.as_deref(),
+        Some(epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE)
+    );
+    assert_ne!(
+        epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE,
+        epigraph_jobs::REAPED_SPENT_MESSAGE,
+        "a crash loop must be told apart from a spent attempt budget"
+    );
+
+    // A counted (multi-attempt) reap leaves the re-delivery counter alone.
+    let counted = insert_running(&pool, "cluster_graph", 0, 3).await;
+    let reaped = q
+        .reap_stale_jobs_counting_attempts(Duration::from_secs(90 * 60))
+        .await
+        .unwrap();
+    let r = reaped.iter().find(|r| r.id == counted).expect("reaped");
+    assert!(!r.failed && !r.one_attempt, "{reaped:?}");
+    assert_eq!(redeliveries(&pool, counted).await, 0);
+    assert_eq!(row(&pool, counted).await.1, 1);
 }

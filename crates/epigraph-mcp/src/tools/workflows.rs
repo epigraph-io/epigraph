@@ -14,7 +14,7 @@ use epigraph_db::{
     WorkflowRepository,
 };
 
-use crate::embed::format_pgvector;
+use epigraph_db::pgvector_literal;
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -25,6 +25,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// Read-only window into a workflow's recent behavioral executions, newest
 /// first: per-run `success`, `quality`, `tool_pattern`, `deviation_count`, and
 /// `step_beliefs` (per-step `deviation_reason`), plus a `window_success_rate`.
+/// With `include_deviation_summary`, also the per-step `deviation_reason`s
+/// rolled up by step lineage over `window_days`
+/// (`BehavioralExecutionRepository::deviation_summary`), the input an
+/// `evolve_step` proposal starts from.
 /// This is the telemetry the workflow-evolution proposer reads before
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
@@ -42,11 +46,30 @@ pub async fn get_workflow_executions(
     let workflow_id = parse_uuid(params.workflow_id.trim())?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
+    let window_days = params.window_days.unwrap_or(30).clamp(1, 365);
+
     let mut read = server.read_as(viewer, "get_workflow_executions").await?;
     let rows =
         BehavioralExecutionRepository::recent_executions(&mut *read, viewer, workflow_id, limit)
             .await
             .map_err(internal_error)?;
+    // Backlog 0a2ed32d: the per-step deviation telemetry rolled up by step
+    // lineage, read on the same stamped read as the rows.
+    let deviation_summary = if params.include_deviation_summary.unwrap_or(false) {
+        Some(
+            BehavioralExecutionRepository::deviation_summary(
+                &mut *read,
+                viewer,
+                workflow_id,
+                window_days,
+                20,
+            )
+            .await
+            .map_err(internal_error)?,
+        )
+    } else {
+        None
+    };
     read.commit().await.map_err(internal_error)?;
 
     let returned = rows.len();
@@ -74,12 +97,19 @@ pub async fn get_workflow_executions(
         })
         .collect();
 
-    success_json(&serde_json::json!({
+    let mut response = serde_json::json!({
         "workflow_id": workflow_id,
         "returned": returned,
         "window_success_rate": window_success_rate,
         "executions": executions,
-    }))
+    });
+    if let Some(summary) = deviation_summary {
+        response["deviation_summary"] = serde_json::json!({
+            "window_days": window_days,
+            "reasons": summary,
+        });
+    }
+    success_json(&response)
 }
 
 /// Evaluate whether a workflow variant is statistically ready to be promoted
@@ -346,6 +376,55 @@ pub async fn store_workflow(
     use epigraph_ingest::workflow::WorkflowExtraction;
 
     let canonical_name = slugify_workflow_goal(&params.goal);
+
+    // Embed the goal ONCE, best-effort: it decides whether this goal is a
+    // rewording of a workflow already in the tenancy this store would use
+    // (backlog 5e54282f; see `matching_workflow`), and
+    // the same vector is stored as the new row's goal embedding below. An
+    // embedder failure keeps today's behaviour (no matching, no goal vector).
+    let goal_vec = match server.embedder.generate(&params.goal).await {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = ?e, "store_workflow goal embedding failed; not matching");
+            None
+        }
+    };
+    if !params.force_new.unwrap_or(false) {
+        if let Some(qvec) = goal_vec.as_deref() {
+            let declared = params.tenancy.map(|t| t.decl());
+            if let Some(hit) =
+                matching_workflow(server, viewer, auth, declared, &canonical_name, qvec).await?
+            {
+                return success_json(&StoreWorkflowResponse {
+                    workflow_id: hit.id.to_string(),
+                    hint: Some(format!(
+                        "A workflow in the tenancy this store would use (visibility '{}', \
+                         owner group {}) already has a near-identical goal ({:.3} similar): \
+                         '{}' (canonical_name '{}', generation {}, the lineage head). Nothing \
+                         was stored. To change its steps, call improve_workflow_hierarchy \
+                         with parent_canonical_name='{}'; to mint a separate lineage anyway, \
+                         call store_workflow again with force_new=true.",
+                        hit.visibility,
+                        hit.owner_group_id,
+                        hit.similarity,
+                        hit.goal,
+                        hit.canonical_name,
+                        hit.generation,
+                        hit.canonical_name
+                    )),
+                    canonical_name: hit.canonical_name,
+                    goal: hit.goal,
+                    generation: hit.generation,
+                    step_count: 0,
+                    claims_ingested: 0,
+                    already_ingested: false,
+                    matched_existing: true,
+                    similarity: Some(hit.similarity),
+                });
+            }
+        }
+    }
+
     let prereqs = params.prerequisites.unwrap_or_default();
     let tags = params.tags.unwrap_or_default();
     let confidence = resolve_workflow_confidence(params.confidence);
@@ -413,20 +492,15 @@ pub async fn store_workflow(
     crate::tools::workflow_ingest::embed_created_workflow_claims(server, caller, &inserted).await;
 
     // Also embed the workflow goal into workflows.goal_embedding for
-    // embedding-first find_workflow_hierarchical. Omitted from the original
-    // store_workflow; do_ingest_workflow embeds it correctly.
-    if let Some(wf_id) = crate::tools::workflow_ingest::goal_embedding_target(&response) {
-        match server.embedder.generate(&params.goal).await {
-            Ok(qvec) => {
-                crate::tools::workflow_ingest::store_workflow_goal_embedding(
-                    server, caller, wf_id, &qvec,
-                )
-                .await;
-            }
-            Err(e) => {
-                tracing::warn!(workflow_id=%wf_id, error=?e, "goal embedding generation failed");
-            }
-        }
+    // embedding-first find_workflow_hierarchical (and the matching above).
+    // The vector computed before the ingest is reused; an embedder failure
+    // there was already logged.
+    if let (Some(wf_id), Some(qvec)) = (
+        crate::tools::workflow_ingest::goal_embedding_target(&response),
+        goal_vec.as_deref(),
+    ) {
+        crate::tools::workflow_ingest::store_workflow_goal_embedding(server, caller, wf_id, qvec)
+            .await;
     }
 
     success_json(&StoreWorkflowResponse {
@@ -437,7 +511,190 @@ pub async fn store_workflow(
         step_count: params.steps.len(),
         claims_ingested: response.claims_ingested,
         already_ingested: response.already_ingested,
+        matched_existing: false,
+        similarity: None,
+        hint: None,
     })
+}
+
+/// Cosine similarity at or above which `store_workflow` treats a new goal as a
+/// rewording of an existing hierarchical workflow's goal (backlog 5e54282f).
+/// Well above `find_workflow_hierarchical`'s 0.5 search floor: that one finds
+/// candidates, this one refuses to mint a lineage.
+pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
+
+/// A lineage head [`matching_workflow`] found for a reworded goal.
+struct WorkflowMatch {
+    id: uuid::Uuid,
+    canonical_name: String,
+    generation: i32,
+    goal: String,
+    similarity: f64,
+    visibility: String,
+    owner_group_id: uuid::Uuid,
+}
+
+/// The live (`truth_value >= 0.3`) hierarchical workflow LINEAGE HEAD whose
+/// goal (or the goal of an earlier generation of its lineage) is the most
+/// similar to `qvec`, when that clears [`STORE_WORKFLOW_MATCH_THRESHOLD`]
+/// under a canonical_name other than `canonical_name`, AND the head has
+/// exactly the tenancy this store would give a new lineage.
+///
+/// # The tenancy rule
+///
+/// A match redirects every later outcome report (goal text, per-step
+/// deviation reasons, `outcome_details`) onto the matched plan. Matching
+/// anything the caller merely READS would let a store meant to stay private
+/// (the undeclared default, or a declared group) land on another team's
+/// public plan, or on a plan of another group the caller is also in. So the
+/// target tenancy is decided first, exactly as the ingest would: the declared
+/// one, else `epigraph_ingest_executor::owner::resolve_caller_owner` for a new
+/// lineage (the caller's one team, else its own default), on a transaction
+/// stamped from the CALLER (the write identity, which on stdio is this
+/// server's own agent whatever viewer a driver passed). Only a head with the
+/// same `(visibility, owner_group_id)` is a match. When the target cannot be
+/// resolved (an unbound author), nothing is matched and the ingest reports
+/// its own refusal.
+///
+/// # Heads, not generations
+///
+/// The search covers every generation, and each hit is resolved to the head
+/// of its `canonical_name`, so a match never names a superseded generation.
+/// A lineage with rows the caller cannot read is skipped: its readable
+/// "head" may not be the real one.
+///
+/// # An identical goal is not a match
+///
+/// `None` whenever a row named `canonical_name` itself exists, readable or
+/// not, embedded or not, live or deprecated: an identical goal stays the
+/// ingest's own business (its idempotent `already_ingested` no-op, or its
+/// refusal of a name with rows the caller cannot read), never a match to
+/// another lineage. That check does not go through the goal embedding, which
+/// rows stored before goals were embedded (and `embed: false` ingests) do not
+/// have.
+async fn matching_workflow(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    declared: Option<epigraph_core::TenancyDecl>,
+    canonical_name: &str,
+    qvec: &[f32],
+) -> Result<Option<WorkflowMatch>, McpError> {
+    let caller = server.write_identity(auth, viewer).await?;
+    let resolved = crate::tools::workflow_ingest::caller_viewer(
+        server,
+        viewer,
+        caller.agent_id(),
+        "store_workflow",
+    )
+    .await?;
+    let caller_viewer = resolved.as_ref().unwrap_or(viewer);
+    let mut tx =
+        crate::claim_helper::begin_caller_workflow_tx(server, caller, "store_workflow").await?;
+    let target = match declared {
+        Some(d) => d,
+        None => {
+            match epigraph_ingest_executor::owner::resolve_caller_owner(
+                &mut tx,
+                caller.agent_id(),
+                None,
+            )
+            .await
+            {
+                Ok(owner) => owner.decl,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "store_workflow: no target tenancy for matching; not matching"
+                    );
+                    tx.rollback().await.map_err(internal_error)?;
+                    return Ok(None);
+                }
+            }
+        }
+    };
+    let (Some(target_visibility), Some(target_owner)) =
+        (target.visibility_bind(), target.owner_group_bind())
+    else {
+        tx.rollback().await.map_err(internal_error)?;
+        return Ok(None);
+    };
+
+    let name_taken = WorkflowRepository::head_by_canonical(&mut *tx, canonical_name)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+        || WorkflowRepository::name_has_hidden_rows_conn(&mut tx, canonical_name)
+            .await
+            .map_err(internal_error)?;
+    if name_taken {
+        tx.rollback().await.map_err(internal_error)?;
+        return Ok(None);
+    }
+    let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
+        &mut *tx,
+        caller_viewer,
+        &epigraph_db::pgvector_literal(qvec),
+        0.3,
+        10,
+    )
+    .await
+    .map_err(internal_error)?;
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut found = None;
+    for hit in hits
+        .into_iter()
+        .filter(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD)
+    {
+        if seen.contains(&hit.canonical_name) {
+            continue;
+        }
+        seen.push(hit.canonical_name.clone());
+        if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, &hit.canonical_name)
+            .await
+            .map_err(internal_error)?
+        {
+            continue;
+        }
+        let Some(head_id) = WorkflowRepository::head_by_canonical(&mut *tx, &hit.canonical_name)
+            .await
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        let Some(head) = WorkflowRepository::row_as_viewer(&mut tx, caller_viewer, head_id)
+            .await
+            .map_err(internal_error)?
+        else {
+            continue;
+        };
+        if head.truth_value < 0.3 {
+            continue;
+        }
+        let Some((visibility, owner_group_id)) =
+            WorkflowRepository::tenancy_as_viewer(&mut tx, caller_viewer, head_id)
+                .await
+                .map_err(internal_error)?
+        else {
+            continue;
+        };
+        if visibility != target_visibility || owner_group_id != target_owner {
+            continue;
+        }
+        found = Some(WorkflowMatch {
+            id: head.id,
+            canonical_name: head.canonical_name,
+            generation: head.generation,
+            goal: head.goal,
+            similarity: hit.similarity,
+            visibility,
+            owner_group_id,
+        });
+        break;
+    }
+    tx.rollback().await.map_err(internal_error)?;
+    Ok(found)
 }
 
 pub async fn find_workflow(
@@ -451,7 +708,7 @@ pub async fn find_workflow(
     // pipeline (extracted to mirror recall.rs's recall_with_context split) lets
     // integration tests skip the OpenAI embedder via `__test_only`.
     let pgvec_opt = match server.embedder.generate(&params.goal).await {
-        Ok(v) => Some(format_pgvector(&v)),
+        Ok(v) => Some(pgvector_literal(&v)),
         Err(e) => {
             tracing::warn!("embedder failed in find_workflow; relying on text fallback: {e}");
             None
@@ -1075,8 +1332,22 @@ pub async fn report_workflow_outcome(
             params.quality,
             params.goal_text.as_deref(),
             None,
+            crate::tools::workflow_hierarchical::OutcomeReportMeta {
+                outcome_details: &params.outcome_details,
+                idempotency_key: params.idempotency_key.as_deref(),
+            },
         )
         .await;
+    }
+
+    // A legacy flat workflow claim has no report row to key a retry on. Refuse
+    // a key rather than accept it and still count the retry (backlog 9928b61f).
+    // Worded for an unknown id too: this runs before the claim lookup.
+    if params.idempotency_key.is_some() {
+        return Err(invalid_params(format!(
+            "workflow {workflow_id} is not a workflows-table id you can read; \
+             `idempotency_key` is supported for workflows-table ids only"
+        )));
     }
 
     // Author = the request's principal (batch H-b, D1); signer = this server.
@@ -1212,9 +1483,16 @@ pub async fn report_workflow_outcome(
             .await
             .map_err(internal_error)?;
 
-    EvidenceRepository::create(&mut *tx, &evidence)
-        .await
-        .map_err(internal_error)?;
+    // The evidence's edge to the workflow claim, in this transaction, in the
+    // direction its BBA is filed below (`success` supports, a failure refutes;
+    // backlog 2d60f619).
+    EvidenceRepository::create(
+        &mut *tx,
+        &evidence,
+        epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.success),
+    )
+    .await
+    .map_err(internal_error)?;
 
     let before = claim.truth_value.value();
 
@@ -1314,7 +1592,7 @@ pub async fn report_workflow_outcome(
 
     // Embed the goal text for affinity matching
     let goal_embedding_pgvec = match server.embedder.generate(&behavioral_goal).await {
-        Ok(vec) => Some(format_pgvector(&vec)),
+        Ok(vec) => Some(pgvector_literal(&vec)),
         Err(e) => {
             tracing::warn!("behavioral goal embedding failed: {e}");
             None

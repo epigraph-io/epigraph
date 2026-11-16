@@ -142,6 +142,7 @@ async fn store(server: &EpiGraphMcpFull, step: &str) -> Result<String, String> {
         server,
         &viewer,
         StoreWorkflowParams {
+            force_new: None,
             tenancy: None,
             goal: goal.clone(),
             steps: vec![step.to_string()],
@@ -683,7 +684,7 @@ async fn ingest_workflow_authors(pool: &PgPool, authors: &[&str]) {
     let extraction = workflow_extraction(&format!("author-guard-{}", Uuid::new_v4()), authors);
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut conn = pool.acquire().await.expect("acquire");
-    epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, &plan, &extraction)
+    epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, None, &plan, &extraction)
         .await
         .expect("the workflow ingest succeeds with a reserved author present");
 }
@@ -702,7 +703,7 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
 fn document(
     authors: &[&str],
     source_text: Option<&str>,
-) -> epigraph_ingest::schema::DocumentExtraction {
+) -> epigraph_ingest::document::schema::DocumentExtraction {
     let tag = Uuid::new_v4();
     serde_json::from_value(serde_json::json!({
         "source": {
@@ -1021,7 +1022,8 @@ async fn registry_absent_fails_closed(pool: PgPool, armed: bool) {
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut conn = pool.acquire().await.expect("acquire");
     let r =
-        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, &plan, &extraction).await;
+        epigraph_ingest_executor::execute_workflow_ingest_plan(&mut conn, None, &plan, &extraction)
+            .await;
     drop(conn);
     assert!(
         r.is_err(),

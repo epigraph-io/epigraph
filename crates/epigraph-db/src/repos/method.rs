@@ -185,15 +185,10 @@ pub struct MethodRepository;
 impl MethodRepository {
     /// Insert a new method, optionally with embedding.
     pub async fn insert(pool: &PgPool, method: &MethodRecord) -> Result<Uuid, sqlx::Error> {
-        let embedding_str = method.embedding.as_ref().map(|emb| {
-            format!(
-                "[{}]",
-                emb.iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        });
+        let embedding_str = method
+            .embedding
+            .as_ref()
+            .map(|emb| crate::pgvector_literal(emb));
 
         let id: Uuid = if let Some(ref emb_str) = embedding_str {
             sqlx::query_scalar(
@@ -273,14 +268,7 @@ impl MethodRepository {
         technique_type: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MethodSearchResult>, sqlx::Error> {
-        let vec_str = format!(
-            "[{}]",
-            query_embedding
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let vec_str = crate::pgvector_literal(query_embedding);
 
         let rows: Vec<MethodSearchRow> = if let Some(tt) = technique_type {
             sqlx::query_as(

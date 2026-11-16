@@ -115,6 +115,7 @@ fn submit_params(
         novelty_threshold,
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

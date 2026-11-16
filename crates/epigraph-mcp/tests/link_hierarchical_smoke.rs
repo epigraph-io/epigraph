@@ -109,6 +109,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
             target_claim_id: target.to_string(),
             relationship: "decomposes_to".to_string(),
             properties: Some(serde_json::json!({"chapter": 1})),
+            ..Default::default()
         },
         None,
     )
@@ -140,6 +141,7 @@ async fn happy_path_creates_edge_and_is_idempotent(pool: PgPool) {
             target_claim_id: target.to_string(),
             relationship: "decomposes_to".to_string(),
             properties: Some(serde_json::json!({"chapter": 1})),
+            ..Default::default()
         },
         None,
     )
@@ -182,6 +184,7 @@ async fn invalid_relationship_is_rejected(pool: PgPool) {
             target_claim_id: target.to_string(),
             relationship: "supports".to_string(), // valid for generic POST, rejected here
             properties: None,
+            ..Default::default()
         },
         None,
     )
@@ -223,6 +226,7 @@ async fn missing_source_claim_returns_404_equivalent(pool: PgPool) {
             target_claim_id: target.to_string(),
             relationship: "section_follows".to_string(),
             properties: None,
+            ..Default::default()
         },
         None,
     )
@@ -250,6 +254,7 @@ async fn missing_target_claim_returns_404_equivalent(pool: PgPool) {
             target_claim_id: bogus.to_string(),
             relationship: "continues_argument".to_string(),
             properties: None,
+            ..Default::default()
         },
         None,
     )
@@ -276,6 +281,7 @@ async fn self_loop_is_rejected(pool: PgPool) {
             target_claim_id: claim.to_string(),
             relationship: "decomposes_to".to_string(),
             properties: None,
+            ..Default::default()
         },
         None,
     )

@@ -127,9 +127,10 @@ each run used to collapse into the prior run's claim and the time series was
 lost (backlog `a3e63a12`, `0a97ba24`).
 
 A claim carrying any label in `novelty_gate::STATUS_CLAIM_LABELS` (`telemetry`,
-the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels, and
-the older bare `gen-status`, `generator-summary`, `review-status`,
-`revise-status`, `research-scan`) is exempt: `novelty_gate::decide` pins its
+the scheduled writers' `norcal-rfp-*-status` / `grant-*-status` labels,
+`journal-status` for the daily journal's dated summary, and the older bare
+`gen-status`, `generator-summary`, `review-status`, `revise-status`,
+`research-scan`) is exempt: `novelty_gate::decide` pins its
 effective threshold to 0.0. Suppression only; the fixed 0.15 `near-duplicate`
 soft-flag still applies.
 
@@ -137,7 +138,7 @@ soft-flag still applies.
   status label, and add a new label to `STATUS_CLAIM_LABELS` (exact match).
   Do not rely on passing `novelty_threshold=0` on every call.
 - Keep the list to *shape* labels. Topic labels (`graph-integrity`,
-  `maintenance`, `rfp`) stay out: exempting a topic disables dedup for genuine
+  `maintenance`, `rfp`, `daily-journal`) stay out: exempting a topic disables dedup for genuine
   content on that topic.
 - Adding a gated write path? `decide` takes `labels` as a required argument.
   Pass the caller's real labels, never `&[]` as a placeholder.
@@ -257,10 +258,10 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **HTTP `POST /api/v1/submit/packet`** — `crates/epigraph-api/src/routes/submit.rs::submit_packet` (the `if !was_duplicate` block; stored through `AppState::store_claim_embedding_as`)
 - **HTTP `POST /api/v1/workflows/ingest`** (both callsites) — `crates/epigraph-api/src/routes/workflows.rs`
 - **MCP `unmark_duplicate`** and **HTTP `POST /api/v1/claims/:id/undedup`** — not an insert, but they make a marked duplicate CURRENT again, so they re-embed it post-commit the same way (`tools/supersede.rs::unmark_duplicate`, `routes/versioning.rs::unmark_duplicate`; stored through `store_embedding_if_unsealed`)
-- **MCP `supersede_claim`** and **HTTP `POST /api/v1/claims/:id/supersede`** — the act inserts a current replacement with new text and copies no vector, so the replacement is embedded post-commit: MCP through its inherited author (`tools/supersede.rs::supersede_claim`, `embed_claim_author_stamped`), HTTP on the caller's stamp (`routes/versioning.rs::supersede_claim`, `AppState::embed_claim_as`)
+- **MCP `supersede_claim`** and **HTTP `POST /api/v1/claims/:id/supersede`** — the act inserts a current replacement with new text and copies no vector, so the replacement is embedded post-commit: MCP on the stamp of the principal whose transaction inserted it (`actor`), not the inherited author, who may not write the claim's group (`tools/supersede.rs::supersede_claim`, `embed_claim_author_stamped`), HTTP on the caller's stamp (`routes/versioning.rs::supersede_claim`, `AppState::embed_claim_as`)
 - **MCP `evolve_step`** and **HTTP `POST /api/v1/workflows/steps/:id/evolve`** — the new step, `supersedes` or `revises`, embedded post-commit through the caller that authored it (`tools/evolve_step.rs`, `embed_created_workflow_claims`; `routes/workflows.rs::evolve_step`, `embed_inserted_workflow_claims`)
 - **CLI `unmark_duplicate`** — the operator's un-mark on the maintenance DSN (request servers refuse one under D9); re-embeds each restored claim post-commit through `store_embedding_if_unsealed`, best-effort (`crates/epigraph-cli/src/bin/unmark_duplicate.rs::embed_restored`)
-- **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format `[v,v,...]`, bind as `$N::vector`)
+- **CLI `hypothesis`** — `crates/epigraph-cli/src/bin/hypothesis.rs` (embedding included directly in INSERT; canonical CLI pattern — acquire embedder via `epigraph_cli::embedding_service()`, format the vector with `epigraph_db::pgvector_literal` (the one helper; `embedding_stack_ratchet` refuses a hand-written `[v,v,...]`), bind as `$N::vector`)
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
 
 `epigraph-ingest-executor` is pure-DB and does **not** embed itself; it returns
@@ -285,7 +286,7 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
 - **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
 - **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
-- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL`
+- **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL` (mode `merge` only: `abstract` retires nothing, and `identity` goes through `mark_duplicate_act` below)
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 
 `scripts/fuzzy_dedup_claims.py` marks through `POST /api/v1/claims/:id/dedup`
@@ -336,8 +337,11 @@ SELECT COUNT(*) FILTER (WHERE is_current AND embedding IS NULL
          -- column, or its `drain_jobs` timer is not running", which is a
          -- deployment signal rather than a missing-handler one; the warning
          -- in `drain_jobs`'s log (not the server's boot log) says which
-         -- provider was selected,
-         -- and `epigraph-cli reembed` remains the recovery path in that case.
+         -- provider was selected.
+         -- Recovery there is `embed_backfill` with the owning provider (it
+         -- writes `embedding`); `epigraph-cli reembed` does NOT restore this
+         -- column, it writes `embedding_3072`. Such jobs keep `drain_jobs` at
+         -- exit 4 until `drain_jobs --cancel-pending embedding_generation`.
          --
          -- Restoration is HALF: the job writes `embedding`, which is the column
          -- this clause reads. `embedding_3072` is nulled by the same seal and

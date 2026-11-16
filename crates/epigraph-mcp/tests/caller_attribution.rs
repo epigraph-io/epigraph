@@ -168,3 +168,54 @@ async fn a_foreign_event_actor_is_refused_over_http(pool: PgPool) {
         .expect("stdio keeps the parameter");
     assert_eq!(events_of(&pool, "review.stdio").await, vec![Some(foreign)]);
 }
+
+/// `claim.assessed` is the assess route's own writer record (backlog
+/// 4a7f90f8), written inside its slot transaction. A caller who could file one
+/// could make it a slot's "previous record" and re-attribute the next real
+/// overwrite, so it is refused on BOTH transports, even acted by the caller
+/// itself, in any padding or case, with nothing written. An ordinary type
+/// still publishes afterwards, so the refusal is about the type.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reserved_event_type_is_refused_on_every_transport(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (caller, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let public = fixture::public_viewer(&pool).await;
+
+    for spelling in ["claim.assessed", " claim.assessed\n", "CLAIM.assessed"] {
+        let err = tools::events::publish_event(
+            &server,
+            &viewer,
+            event(spelling, Some(caller)),
+            Some(&token),
+        )
+        .await
+        .expect_err("an OAuth caller must not file the assess route's record");
+        assert!(err.message.contains("is reserved"), "{}", err.message);
+
+        let err = tools::events::publish_event(&server, &public, event(spelling, None), None)
+            .await
+            .expect_err("stdio must not file the assess route's record either");
+        assert!(err.message.contains("is reserved"), "{}", err.message);
+    }
+    let filed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events \
+          WHERE lower(btrim(event_type, E' \\t\\n\\r')) = 'claim.assessed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count assessment records");
+    assert_eq!(filed, 0, "nothing a caller published was written");
+
+    tools::events::publish_event(
+        &server,
+        &viewer,
+        event("review.ordinary", None),
+        Some(&token),
+    )
+    .await
+    .expect("an ordinary event type still publishes");
+    assert_eq!(
+        events_of(&pool, "review.ordinary").await,
+        vec![Some(caller)]
+    );
+}

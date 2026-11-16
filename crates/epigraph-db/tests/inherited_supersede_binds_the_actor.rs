@@ -145,6 +145,7 @@ async fn supersede_as(
             let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
             let r = epigraph_db::ClaimRepository::supersede_act_conn(
                 &mut tx,
+                None,
                 epigraph_core::ClaimId::from_uuid(old),
                 &format!("a restatement of {old} by {actor}"),
                 epigraph_core::TruthValue::new(0.6).expect("truth"),
@@ -410,6 +411,7 @@ async fn a_reopen_of_an_inherited_successor_is_still_attributed_to_its_writer(po
         let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
         let (s, _) = epigraph_db::ClaimRepository::supersede_act_conn(
             &mut tx,
+            None,
             epigraph_core::ClaimId::from_uuid(p),
             "a custodial restatement",
             epigraph_core::TruthValue::new(0.6).expect("truth"),

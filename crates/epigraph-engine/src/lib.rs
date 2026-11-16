@@ -18,6 +18,7 @@
 
 pub mod admin_cascade;
 pub mod agent_assessment;
+pub mod atlas_flow;
 pub mod atom_items;
 pub mod bayesian;
 pub mod bba;
@@ -41,6 +42,7 @@ pub mod derivation_scope;
 pub mod diverse_retrieval;
 pub mod diverse_select;
 pub mod domain_decay;
+pub mod ds_divergence;
 pub mod edge_factor;
 pub mod epistemic_interval;
 pub mod error_mass;

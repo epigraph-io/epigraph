@@ -218,6 +218,7 @@ async fn supersede_on(
             .unwrap_or_else(uuid::Uuid::nil);
     let r = epigraph_db::ClaimRepository::supersede_act_conn(
         &mut tx,
+        None,
         epigraph_core::ClaimId::from_uuid(old),
         &format!("a revision of {old}"),
         epigraph_core::TruthValue::new(0.6).expect("truth"),
@@ -674,6 +675,7 @@ async fn the_sanctioned_lineage_writes_are_unchanged(pool: PgPool) {
     let merged = as_app(&pool, a, &ga, |mut conn| async move {
         let r = epigraph_db::ClaimRepository::consolidate_act_conn(
             &mut conn,
+            None,
             &[s1, s2],
             "A's merged claim",
             0.7,

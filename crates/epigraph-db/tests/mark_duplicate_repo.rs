@@ -456,6 +456,7 @@ async fn mark_duplicate_rejects_retired_canonical(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
         let err = ClaimRepository::mark_duplicate_act_attributed_conn(
             &mut conn,
+            None,
             ClaimId::from_uuid(d),
             ClaimId::from_uuid(retired),
             &epigraph_db::DuplicateProvenance::new(

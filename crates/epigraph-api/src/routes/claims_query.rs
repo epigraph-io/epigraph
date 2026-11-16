@@ -46,16 +46,9 @@ const VALID_METHODOLOGIES: &[&str] = &[
     "observational",
 ];
 
-/// Valid evidence type values (mirrors DB CHECK constraint on evidence + later migrations)
-const VALID_EVIDENCE_TYPES: &[&str] = &[
-    "document",
-    "observation",
-    "testimony",
-    "computation",
-    "reference",
-    "figure",
-    "conversational",
-];
+/// Valid evidence type values: the `evidence_type_valid` CHECK's vocabulary,
+/// from its one Rust copy.
+const VALID_EVIDENCE_TYPES: &[&str] = epigraph_core::STORED_EVIDENCE_TYPES;
 
 // ============================================================================
 // Request / Response DTOs
@@ -111,7 +104,8 @@ pub struct ClaimQueryParams {
     pub methodology: Option<String>,
 
     /// Filter by evidence type (requires claim to have evidence of this type).
-    /// Values: document, observation, testimony, computation, reference, figure, conversational
+    /// Values: document, observation, testimony, computation, reference, figure,
+    /// conversational, dataset (`epigraph_core::STORED_EVIDENCE_TYPES`)
     pub evidence_type: Option<String>,
 
     /// Restrict to the claims assigned to this theme (`claims.theme_id`). A
@@ -1646,6 +1640,7 @@ mod tests {
             "reference",
             "figure",
             "conversational",
+            "dataset",
         ] {
             let state = AppState::new(ApiConfig::default());
             let router = test_router(state);
