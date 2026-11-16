@@ -202,6 +202,8 @@ pub use repos::AtlasLeafRepository;
 pub use repos::AtlasMeaningRepository;
 // The rows behind the Atlas leaf flow weights (Atlas W7).
 pub use repos::AtlasFlowRepository;
+// The Atlas naming step's run reads (Atlas W8).
+pub use repos::AtlasNamingRepository;
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
