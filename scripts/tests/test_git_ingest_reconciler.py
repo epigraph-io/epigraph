@@ -126,7 +126,6 @@ class ArgvTests(unittest.TestCase):
                              merged_at="2026-06-02T15:10:01Z")
         argv = gir.build_ingest_argv(pr, mirror="/m", endpoint="http://127.0.0.1:8080",
                                      rev_range="2a31f8d^1..2a31f8d^2", slug="epigraph-io/epigraph",
-                                     default_orchestrator_id="7b3a0c1e-0000-4000-8000-000000000001",
                                      ingest_git_bin="ingest_git", dry_run=True)
         self.assertEqual(argv[0], "ingest_git")
         self.assertIn("--pr-ingest", argv)
@@ -137,7 +136,8 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(val("--merge-sha"), "2a31f8d")
         self.assertEqual(val("--rev-range"), "2a31f8d^1..2a31f8d^2")
         self.assertEqual(val("--merged-at"), "2026-06-02T15:10:01Z")
-        self.assertEqual(val("--orchestrator-id"), "7b3a0c1e-0000-4000-8000-000000000001")
+        self.assertNotIn("--orchestrator-id", argv)  # a fallback goes in the env
+        self.assertNotIn("--token", argv)
         self.assertEqual(val("--repo"), "/m")
         self.assertEqual(val("--endpoint"), "http://127.0.0.1:8080")
         self.assertIn("--dry-run", argv)
@@ -145,7 +145,7 @@ class ArgvTests(unittest.TestCase):
 class MainLoopTests(unittest.TestCase):
     def test_runs_all_prs_and_isolates_failures(self):
         cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
-                         default_orchestrator_id=None)
+                         default_orchestrator_id=None, author_key_file="/k")
         prs = [gir.PullRequest(1,"a","",f"s1","b","u","2026-06-03T11:59:00Z"),
                gir.PullRequest(2,"b","",f"s2","b","u","2026-06-03T11:59:00Z")]
         calls = []
@@ -155,6 +155,103 @@ class MainLoopTests(unittest.TestCase):
             n_ok, n_fail = gir.run_once(cfg, dry_run=False)
         self.assertEqual(calls, [1,2])          # both attempted (failure isolated)
         self.assertEqual((n_ok,n_fail),(1,1))
+
+ORCH = "7b3a0c1e-0000-4000-8000-000000000001"
+SECRET = "tok-very-secret-value"
+KEYF = "/s/author.key"
+
+class ChildEnvTests(unittest.TestCase):
+    """Backlog 7d9e60c6 (1) and (2): what run_once hands each ingest_git child."""
+    def _run(self, cfg, environ, dry_run=False):
+        pr = gir.PullRequest(7, "fix(x): y", "body", "s7", "b", "u", "2026-06-03T11:59:00Z")
+        seen = []
+        def fake_run(argv, **kw):
+            seen.append((argv, kw.get("env")))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.dict(os.environ, environ, clear=True), \
+             mock.patch.object(gir, "ensure_mirror", return_value="/m"), \
+             mock.patch.object(gir, "discover_merged_prs", return_value=[pr]), \
+             mock.patch.object(gir, "compute_rev_range", return_value="s7^1..s7^2"), \
+             mock.patch.object(gir.subprocess, "run", side_effect=fake_run), \
+             self.assertLogs(gir.LOG, level="DEBUG") as logs:
+            result = gir.run_once(cfg, dry_run=dry_run)
+        return result, seen, "\n".join(logs.output)
+
+    def test_token_file_reaches_child_env_not_argv_or_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            tf = Path(d, "token"); tf.write_text(SECRET + "\n")
+            cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir=d, token_file=str(tf),
+                             author_key_file=KEYF)
+            (ok, fail), seen, log = self._run(cfg, {"PATH": "/usr/bin", "GH_TOKEN": "ghp_x",
+                                                    "EPIGRAPH_GIT_INGEST_GITHUB_PAT": "ghp_y"})
+        self.assertEqual((ok, fail), (1, 0))
+        (argv, env), = seen
+        self.assertEqual(env["EPIGRAPH_TOKEN"], SECRET)
+        self.assertNotIn(SECRET, " ".join(argv))
+        self.assertNotIn("--token", argv)
+        self.assertNotIn(SECRET, log)
+        self.assertIn("ingest PR #7", log)  # the argv is still logged
+        self.assertNotIn("GH_TOKEN", env)  # GitHub creds stay with gh
+        self.assertNotIn("EPIGRAPH_GIT_INGEST_GITHUB_PAT", env)
+
+    def test_inherited_epigraph_token_is_passed_when_no_token_file(self):
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         author_key_file=KEYF)
+        _, seen, log = self._run(cfg, {"PATH": "/usr/bin", "EPIGRAPH_TOKEN": SECRET})
+        self.assertEqual(seen[0][1]["EPIGRAPH_TOKEN"], SECRET)
+        self.assertNotIn(SECRET, log)
+
+    def test_unreadable_token_file_fails_the_run_without_ingesting(self):
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         token_file="/nonexistent/token", author_key_file=KEYF)
+        (ok, fail), seen, _ = self._run(cfg, {"PATH": "/usr/bin"})
+        self.assertEqual((ok, fail, seen), (0, 1, []))
+
+    def test_dry_run_does_not_read_the_token_file(self):
+        # A dry run makes no API call; an unreadable token_file must not fail it.
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         token_file="/nonexistent/token")
+        (ok, fail), seen, _ = self._run(cfg, {"PATH": "/usr/bin"}, dry_run=True)
+        self.assertEqual((ok, fail), (1, 0))
+        (argv, env), = seen
+        self.assertIn("--dry-run", argv)
+        self.assertNotIn("EPIGRAPH_TOKEN", env)
+
+    def test_live_run_without_an_author_key_file_fails_before_ingesting(self):
+        # Without the host secret ingest_git refuses every live PR; the run says
+        # so once, up front, instead of failing PR by PR.
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st")
+        (ok, fail), seen, log = self._run(cfg, {"PATH": "/usr/bin", "EPIGRAPH_TOKEN": SECRET})
+        self.assertEqual((ok, fail, seen), (0, 1, []))
+        self.assertIn("author key file", log)
+
+    def test_author_key_file_reaches_the_argv_from_config_or_env(self):
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         author_key_file=KEYF)
+        _, seen, _ = self._run(cfg, {"PATH": "/usr/bin"})
+        argv = seen[0][0]
+        self.assertEqual(argv[argv.index("--author-key-file") + 1], KEYF)
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st")
+        _, seen, _ = self._run(cfg, {"PATH": "/usr/bin", "EPIGRAPH_GIT_AUTHOR_KEY_FILE": "/env/k"})
+        argv = seen[0][0]
+        self.assertEqual(argv[argv.index("--author-key-file") + 1], "/env/k")
+
+    def test_default_orchestrator_is_an_env_fallback_not_a_flag(self):
+        # `--orchestrator-id` beats a PR's Epigraph-Orchestrator-Id trailer in
+        # ingest_git; the env fallback does not.
+        cfg = gir.Config(repos=["o/r"], endpoint="http://x", state_dir="/tmp/st",
+                         default_orchestrator_id=ORCH, author_key_file=KEYF)
+        _, seen, _ = self._run(cfg, {"PATH": "/usr/bin"})
+        (argv, env), = seen
+        self.assertNotIn("--orchestrator-id", argv)
+        self.assertNotIn(ORCH, argv)
+        self.assertEqual(env["EPIGRAPH_DEFAULT_ORCHESTRATOR_ID"], ORCH)
+
+    def test_config_reads_token_file_key(self):
+        cfg = gir.load_config_str('token_file = "/s/tok"\ndefault_orchestrator_id = "%s"\n'
+                                  'author_key_file = "/s/key"\n' % ORCH)
+        self.assertEqual((cfg.token_file, cfg.default_orchestrator_id, cfg.author_key_file),
+                         ("/s/tok", ORCH, "/s/key"))
 
 def _resolve_ingest_git():
     """Locate the built `ingest_git` binary across the tree's possible target

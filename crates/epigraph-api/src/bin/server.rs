@@ -154,6 +154,68 @@ async fn main() {
         }
     }
 
+    // Rate limiting (backlog 966164c8), read once. Until this block the
+    // limiter the router layers (`middleware::rate_limit`) was never built in
+    // this binary, so every request, including the anonymous `/oauth/token`,
+    // `/oauth/register` and `/elevate/*`, was unlimited. ON by default; a
+    // malformed limit or proxy list refuses to start, because the silent
+    // alternative (a different limit, or every client behind the proxy in one
+    // bucket) is worse than a refusal. Built here, before any connection, so
+    // the boot log says whether it is on even when the database is down.
+    let rate_limit = match epigraph_api::RateLimitSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: rate limiting is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    if rate_limit.unrecognised_switch {
+        tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT is set to a value that is neither `on` nor `off`: rate \
+             limiting stays ON (only `off` disables it)"
+        );
+    }
+    let rate_limiter = rate_limit.build();
+
+    // Serving settings (backlog ebd7952c), read once and here for the same
+    // reason as the rate limit: a malformed bind address or limit refuses to
+    // start before any connection, and the log says what is in force.
+    let serve = match epigraph_api::serving::ServeSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: serving is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        bind_ip = %serve.bind_ip,
+        request_timeout_secs = ?serve.request_timeout.map(|t| t.as_secs()),
+        shutdown_grace_secs = serve.shutdown_grace.as_secs(),
+        max_request_bytes = serve.max_request_bytes,
+        "serving settings"
+    );
+    if serve.request_timeout.is_none() {
+        tracing::warn!(
+            "EPIGRAPH_REQUEST_TIMEOUT_SECS=0: the request timeout is OFF; a stuck handler \
+             holds its connection indefinitely"
+        );
+    }
+    if rate_limiter.is_some() {
+        tracing::info!(
+            per_key_rpm = rate_limit.per_key_rpm,
+            global_rpm = ?rate_limit.global_rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "rate limiter ON: authenticated requests are charged to their principal, \
+             anonymous ones to their client address (X-Forwarded-For believed only from \
+             trusted_proxies)"
+        );
+    } else {
+        tracing::warn!(
+            "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited, \
+             including the anonymous OAuth and elevation endpoints"
+        );
+    }
+
     // The passkey relying party (elevation plan EL-3), read once. Unset is
     // "off" (the enrollment endpoints answer 503); a partial or malformed
     // configuration refuses to start rather than silently serving 503s.
@@ -262,7 +324,9 @@ async fn main() {
         std::env::var("EPIGRAPH_ALLOW_ALL_IDENTITIES").as_deref() == Ok("true");
     let config = ApiConfig {
         require_packet_signatures,
-        max_request_size: 10 * 1024 * 1024, // 10MB — figure evidence carries base64 images
+        // EPIGRAPH_MAX_REQUEST_BYTES; 10 MiB by default (figure evidence
+        // carries base64 images).
+        max_request_size: serve.max_request_bytes,
         public_base_url,
         allow_all_identities,
     };
@@ -397,16 +461,53 @@ async fn main() {
         if epigraph_api::should_migrate_on_boot(
             std::env::var("EPIGRAPH_MIGRATE_ON_BOOT").ok().as_deref(),
         ) {
+            // On the MIGRATION DSN, not on the request pool (backlog
+            // e1b96df7): migrating needs DDL privilege, which the application
+            // role must not have, so on a deployment that has split the
+            // credentials the request pool cannot migrate at all. Same rule as
+            // `epigraph-migrate`: MIGRATION_DATABASE_URL, falling back to
+            // DATABASE_URL with a WARN.
+            let dsn = match epigraph_api::migrate::migration_dsn_from_env() {
+                Ok(dsn) => dsn,
+                Err(reason) => {
+                    eprintln!("ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set: {reason}");
+                    std::process::exit(1);
+                }
+            };
+            if dsn.fell_back() {
+                tracing::warn!("{}", epigraph_api::migrate::MIGRATION_DSN_FALLBACK_WARNING);
+            }
+            tracing::info!(
+                dsn_var = dsn.var,
+                "migrating on boot over the migration DSN"
+            );
+            // A short-lived pool on the MIGRATION DSN (DDL privilege, a
+            // stronger role than the maintenance one), built only under
+            // EPIGRAPH_MIGRATE_ON_BOOT by the shared constructor and closed
+            // below, before this process serves anything.
+            let migration_pool = match epigraph_api::migrate::connect_migration_pool(&dsn).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!(
+                        "ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database \
+                         ({}) cannot be reached: {e}",
+                        dsn.var
+                    );
+                    std::process::exit(1);
+                }
+            };
             // Same schema-head checks as `epigraph-migrate` (issue #492): a
             // database carrying migrations this binary does not embed is
             // refused unless EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD opts in to the
             // rollback case.
-            let report = epigraph_api::run_migrations(
-                &pool,
+            let migrated = epigraph_api::run_migrations(
+                &migration_pool,
                 epigraph_api::migrate::MigrateOptions::from_env(),
             )
-            .await
-            .unwrap_or_else(|e| panic!("Failed to apply pending migrations: {e}"));
+            .await;
+            migration_pool.close().await;
+            let report =
+                migrated.unwrap_or_else(|e| panic!("Failed to apply pending migrations: {e}"));
             tracing::info!(
                 db_head = report.db_head,
                 binary_head = report.binary_head,
@@ -419,6 +520,20 @@ async fn main() {
             tracing::info!(
                 "EPIGRAPH_MIGRATE_ON_BOOT unset — skipping migrations; run `epigraph-migrate`"
             );
+        }
+
+        // The pgvector floor (backlog e30316ae): below 0.8.0 every semantic
+        // search fails (SQLSTATE 42602 on `hnsw.iterative_scan`), so refuse to
+        // serve rather than serve a corpus that cannot be searched. The same
+        // check `epigraph-migrate` runs after migrating
+        // (`migrate::check_pgvector_version`); here it also covers a server
+        // started without that deploy step, or after `EPIGRAPH_MIGRATE_ON_BOOT`.
+        match epigraph_api::migrate::check_pgvector_version(&pool).await {
+            Ok(version) => tracing::info!(pgvector = %version, "pgvector version ok"),
+            Err(e) => {
+                eprintln!("ERROR: refusing to serve: {e}");
+                std::process::exit(1);
+            }
         }
 
         // Operator decision D9: no maintenance pool, no job pool, no job runner
@@ -485,14 +600,6 @@ async fn main() {
             .with_bp_apply(bp_apply_from_env())
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
-        // The router wraps every route in `rate_limit_middleware`, which is a
-        // no-op unless a limiter is installed, and nothing installed one
-        // (backlog 966164c8). Opt-in, from the environment; the log line
-        // below says which state this process is in.
-        let state = match rate_limiter_from_env() {
-            Some(limiter) => state.with_rate_limiter(limiter),
-            None => state,
-        };
 
         // Prime the entity_types registry cache. `with_db` is sync and can't
         // SELECT, so the cache loads here — after migrations (054 seeds the
@@ -568,6 +675,12 @@ async fn main() {
         )
         .expect("failed to build providers registry");
         state.with_providers(providers)
+    };
+
+    // Install the limiter built at the top of `main` (or none when it is off).
+    let state = match rate_limiter {
+        Some(limiter) => state.with_rate_limiter(limiter),
+        None => state,
     };
 
     // Hydrate the in-process webhook store from `webhook_subscriptions`
@@ -704,7 +817,12 @@ async fn main() {
         );
     }
 
-    let app = create_router(state).layer(axum::Extension(metrics.clone()));
+    // The request-id, trace and timeout layers wrap the whole router
+    // (`epigraph_api::serving::apply_layers`).
+    let app = epigraph_api::serving::apply_layers(
+        create_router(state).layer(axum::Extension(metrics.clone())),
+        &serve,
+    );
 
     // ---------------------------------------------------------------------
     // Internal metrics listener (PR-03, §10.3 Q1 option (a)).
@@ -752,12 +870,13 @@ async fn main() {
         }
     }
 
-    // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs.
+    // Bind to address. EPIGRAPH_PORT env var allows side-by-side test runs;
+    // EPIGRAPH_BIND_ADDR picks the interface (default 0.0.0.0, as before).
     let port: u16 = std::env::var("EPIGRAPH_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8080);
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = std::net::SocketAddr::new(serve.bind_ip, port);
 
     // Check for TLS configuration via environment variables.
     // EPIGRAPH_TLS_CERT and EPIGRAPH_TLS_KEY must both be set to enable TLS.
@@ -784,10 +903,26 @@ async fn main() {
             .await
             .expect("Failed to load TLS certificate/key");
 
+        // SIGTERM or SIGINT stops accepting and drains in-flight requests
+        // for at most the shutdown grace, as on the plain listener below.
+        let handle = axum_server::Handle::new();
+        {
+            let handle = handle.clone();
+            let grace = serve.shutdown_grace;
+            tokio::spawn(async move {
+                epigraph_api::serving::shutdown_signal().await;
+                handle.graceful_shutdown(Some(grace));
+            });
+        }
+
+        // With connect info: the rate limiter keys an anonymous request on
+        // its TCP peer, and without it every such request shares one bucket.
         axum_server::bind_rustls(addr, rustls_config)
-            .serve(app.into_make_service())
+            .handle(handle)
+            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("TLS server error");
+        tracing::info!("server stopped");
         return;
     }
 
@@ -805,9 +940,18 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    tracing::info!("Server listening on {}", addr);
+    // The bound address, not the requested one: with EPIGRAPH_PORT=0 the
+    // kernel picks the port, and this line is how a caller learns it.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!("Server listening on {}", bound);
 
-    axum::serve(listener, app).await.expect("Server error");
+    // Serves with connect info (the rate limiter keys an anonymous request on
+    // its TCP peer) until SIGTERM or SIGINT, then drains in-flight requests
+    // for at most EPIGRAPH_SHUTDOWN_GRACE_SECS and returns, so `main` exits 0
+    // instead of dying mid-response on the signal.
+    epigraph_api::serving::serve_until_signal(listener, app, serve.shutdown_grace)
+        .await
+        .expect("Server error");
 }
 
 /// `EPIGRAPH_BP_APPLY`, as the belief modes read it at boot: whether
@@ -827,41 +971,6 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
         );
     }
     switch
-}
-
-/// `EPIGRAPH_RATE_LIMIT_RPM` (and the optional
-/// `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM`), read once at boot: the limiter the
-/// router's `rate_limit_middleware` enforces, or `None` when the operator set
-/// none. Logged either way, so a journal shows whether this process limits
-/// requests at all; an unusable value refuses to start (exit 1) rather than
-/// serve unlimited while a limit is believed to be installed.
-#[cfg(feature = "db")]
-fn rate_limiter_from_env() -> Option<epigraph_api::AgentRateLimiter> {
-    use epigraph_api::security::rate_limit::{RATE_LIMIT_GLOBAL_RPM_ENV, RATE_LIMIT_RPM_ENV};
-    let per_client = std::env::var(RATE_LIMIT_RPM_ENV).ok();
-    let global = std::env::var(RATE_LIMIT_GLOBAL_RPM_ENV).ok();
-    match epigraph_api::RateLimitConfig::from_env_values(per_client.as_deref(), global.as_deref()) {
-        Ok(Some(config)) => {
-            tracing::info!(
-                per_client_rpm = config.default_rpm,
-                global_rpm = config.enable_global_limit.then_some(config.global_rpm),
-                "Rate limiting: ON (keyed by client IP; health probes exempt)"
-            );
-            Some(epigraph_api::AgentRateLimiter::new(config))
-        }
-        Ok(None) => {
-            tracing::warn!(
-                "Rate limiting: OFF. {RATE_LIMIT_RPM_ENV} is not set, so no request is rate \
-                 limited by this process, the anonymous /oauth and /elevate endpoints included. \
-                 Set it, or limit at the reverse proxy."
-            );
-            None
-        }
-        Err(reason) => {
-            tracing::error!("Rate limiting is misconfigured: {reason}. Refusing to start.");
-            std::process::exit(1);
-        }
-    }
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

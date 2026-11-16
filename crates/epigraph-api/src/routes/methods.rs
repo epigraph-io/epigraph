@@ -46,6 +46,17 @@ use crate::state::AppState;
 /// Running both on one stamped handle is what makes the response internally
 /// consistent: `evidence` describes the corpus this reader can see, not a
 /// different one sampled a connection later.
+///
+/// # `source_claim_ids` is public attribution, by decision
+///
+/// The response returns every id in `methods.source_claim_ids`, whatever the
+/// viewer can read. That is intentional (`F-PR29-A2`, decided 2026-09-22:
+/// accept and document). `methods` is global reference data, and a method
+/// names the claims it was drawn from. The field carries ids only, with no
+/// claim content, and dereferencing an id still goes through the
+/// viewer-predicated `claims` read path, so it returns only what the viewer may
+/// read. Narrowing this projection reverses that decision. Pinned by
+/// `tests/search_voids_methods_scoped_read.rs::method_source_claim_ids_are_public_attribution_and_dereference_stays_predicated`.
 #[cfg(feature = "db")]
 pub async fn get_method(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
