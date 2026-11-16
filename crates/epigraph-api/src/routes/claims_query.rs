@@ -17,6 +17,8 @@ use crate::errors::ApiError;
 use crate::state::AppState;
 
 #[cfg(feature = "db")]
+use epigraph_db::repos::claim::LabelCursor;
+#[cfg(feature = "db")]
 use epigraph_db::ClaimRepository;
 
 use crate::middleware::bearer::ViewerExtractor;
@@ -117,6 +119,14 @@ pub struct ClaimQueryParams {
     /// refutes, contradicts, cites, ...) whose two endpoints are both on the
     /// returned page, so a timeline can draw the page with its connections.
     pub include_links: Option<bool>,
+
+    /// Opaque keyset cursor: the previous page's `next_cursor`, passed back
+    /// unchanged. Returns the claims strictly after that page's last row in
+    /// the `(created_at, id)` order `sort_order` names, so a page boundary
+    /// does not drift under concurrent writes. Only with `sort_by=created_at`
+    /// (the default), and not with a non-zero `offset`.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// One claim-to-claim link among the claims of a page.
@@ -184,6 +194,12 @@ pub struct ClaimListResponse {
 
     /// The offset that was applied
     pub offset: u32,
+
+    /// Keyset cursor of the next page (pass back as `after`): present on a
+    /// full `created_at`-ordered page, `null` on a short one (the end) and on
+    /// a `truth_value`-ordered page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 
     /// With `include_links=true`: the in-force epistemic edges among the
     /// claims of this page that the caller may read, oldest first, at most
@@ -350,9 +366,36 @@ pub async fn list_claims_query(
         }
     }
 
+    // ---- Validate the keyset cursor ----
+    let after = match params.after.as_deref() {
+        None | Some("") => None,
+        Some(token) => {
+            if offset > 0 {
+                return Err(ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "`after` cannot be combined with a non-zero `offset`".to_string(),
+                });
+            }
+            if sort_by != "created_at" {
+                return Err(ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "`after` pages only `sort_by=created_at`".to_string(),
+                });
+            }
+            Some(LabelCursor::decode(token).ok_or_else(|| {
+                ApiError::ValidationError {
+                    field: "after".to_string(),
+                    reason: "malformed `after` cursor; pass back a page's `next_cursor` \
+                             unchanged"
+                        .to_string(),
+                }
+            })?)
+        }
+    };
+
     // ---- The one viewer-stamped connection every read below runs on ----
     //
-    // Acquired HERE and not at the top of the function: the seven validation
+    // Acquired HERE and not at the top of the function: the eight validation
     // early-returns above answer without touching the database, and hoisting the
     // acquire over them would hold a pooled connection across every 400.
     //
@@ -459,6 +502,7 @@ pub async fn list_claims_query(
         } else {
             epigraph_db::ClaimSortOrder::Desc
         },
+        after,
     };
 
     // `count_filtered` and `list_filtered` are two statements, and `total` is
@@ -476,6 +520,13 @@ pub async fn list_claims_query(
         ClaimRepository::list_filtered(&mut *read, &viewer, &filter, limit as i64, offset as i64)
             .await
             .map_err(|e| scoped_read_failure(&e, "Database query failed"))?;
+
+    // The next page's cursor: the last row of a FULL created_at page (a short
+    // page is the end of the set).
+    let next_cursor = (sort_by == "created_at" && rows.len() >= limit as usize)
+        .then(|| rows.last())
+        .flatten()
+        .map(|c| LabelCursor::of(c).encode());
 
     // The links among the page's claims, on the same stamped handle. One more
     // than the cap is asked for, so the response can say whether it is whole.
@@ -535,6 +586,7 @@ pub async fn list_claims_query(
         total,
         limit,
         offset,
+        next_cursor,
         links,
         links_truncated,
     }))
@@ -735,6 +787,7 @@ pub async fn list_claims_query(
             total: 0,
             limit,
             offset,
+            next_cursor: None,
             links: None,
             links_truncated: None,
         }));
@@ -844,6 +897,7 @@ pub async fn list_claims_query(
         total,
         limit,
         offset,
+        next_cursor: None,
         links: None,
         links_truncated: None,
     }))

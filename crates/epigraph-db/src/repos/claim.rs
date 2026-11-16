@@ -187,6 +187,13 @@ pub struct ClaimListFilter<'a> {
     pub sort_by: ClaimSortField,
     /// `ORDER BY` direction (ignored by `count_filtered`).
     pub sort_order: ClaimSortOrder,
+    /// Keyset position (ignored by `count_filtered`, so `total` stays the
+    /// whole matching set on every page): only rows strictly after this one
+    /// in the `(created_at, id)` order `sort_order` names. Valid only with
+    /// [`ClaimSortField::CreatedAt`]; [`ClaimRepository::list_filtered`]
+    /// refuses it beside `TruthValue`, whose order the position does not
+    /// describe.
+    pub after: Option<LabelCursor>,
 }
 
 /// Filter arguments for [`ClaimRepository::list_by_labels`].
@@ -5455,9 +5462,9 @@ impl ClaimRepository {
     /// that defect in its widest form — `total` reporting the whole corpus
     /// while the page shows one tenant's slice.
     ///
-    /// The bind indices differ (`$10` for the count, `$12` after
-    /// `LIMIT`/`OFFSET`), so the viewer half of these two statements could
-    /// never have been literally shared anyway.
+    /// The bind indices differ (`$10` for the count, `$14` after
+    /// `LIMIT`/`OFFSET` and the cursor), so the viewer half of these two
+    /// statements could never have been literally shared anyway.
     const FILTER_WHERE: &'static str = r#"
             WHERE ($1::text IS NULL OR content ILIKE $1)
               AND ($2::float8 IS NULL OR truth_value >= $2)
@@ -5539,8 +5546,9 @@ impl ClaimRepository {
         viewer: &crate::visibility::Viewer,
         filter: &ClaimListFilter<'_>,
     ) -> Result<i64, DbError> {
-        // `bind_filter` consumes `$1..$9` and this statement has no `LIMIT`, so
-        // the group bind is `$10` here and `$12` in `list_filtered`. The
+        // `bind_filter` consumes `$1..$9` and this statement has no `LIMIT`
+        // (and no cursor: `after` narrows the page, never the count), so the
+        // group bind is `$10` here and `$14` in `list_filtered`. The
         // marker is written here rather than carried by `FILTER_WHERE` — see
         // that constant's doc for why, and for what holds the two in step.
         let sql = viewer.splice(
@@ -5616,28 +5624,37 @@ impl ClaimRepository {
             ClaimSortField::CreatedAt => "created_at",
             ClaimSortField::TruthValue => "truth_value",
         };
-        let direction = match filter.sort_order {
-            ClaimSortOrder::Desc => "DESC",
-            ClaimSortOrder::Asc => "ASC",
+        let (direction, past) = match filter.sort_order {
+            ClaimSortOrder::Desc => ("DESC", "<"),
+            ClaimSortOrder::Asc => ("ASC", ">"),
         };
+        if filter.after.is_some() && filter.sort_by != ClaimSortField::CreatedAt {
+            return Err(DbError::InvalidData {
+                reason: "a (created_at, id) cursor pages only the created_at order".to_string(),
+            });
+        }
 
         // `bind_filter` consumes `$1..$9`, `LIMIT`/`OFFSET` take `$10`/`$11`,
-        // so the group bind is `$12`. The marker is the same literal
-        // `count_filtered` writes, and `the_viewer_filters_both_halves_of_the_pair`
-        // is what asserts the two statements agree about it.
+        // the cursor `$12`/`$13`, so the group bind is `$14`. The marker is
+        // the same literal `count_filtered` writes, and
+        // `the_viewer_filters_both_halves_of_the_pair` is what asserts the two
+        // statements agree about it. The cursor is a row-value comparison in
+        // the page's own direction, so it continues exactly where the
+        // `ORDER BY {sort_column} {direction}, id {direction}` page ended.
         let sql = viewer.splice(
             &format!(
                 r#"
             SELECT id, content, truth_value, agent_id, trace_id, created_at, updated_at,
                    COALESCE(is_current, true) AS is_current, supersedes
             FROM claims{where_clause}
+              AND ($12::timestamptz IS NULL OR (created_at, id) {past} ($12, $13::uuid))
               /* {{VISIBILITY:claims}} */
             ORDER BY {sort_column} {direction}, id {direction}
             LIMIT $10 OFFSET $11
             "#,
                 where_clause = Self::FILTER_WHERE,
             ),
-            12,
+            14,
         );
 
         let mut q = Self::bind_filter(
@@ -5646,7 +5663,9 @@ impl ClaimRepository {
             filter,
         )
         .bind(limit)
-        .bind(offset);
+        .bind(offset)
+        .bind(filter.after.map(|a| a.created_at))
+        .bind(filter.after.map(|a| a.id));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
