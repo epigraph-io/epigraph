@@ -267,35 +267,84 @@ pub async fn rate_limit_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, RateLimitResponse> {
-    let path = request.uri().path().to_string();
-    let method = request.method().clone();
-
     // Check if route should bypass rate limiting
-    if should_bypass_rate_limit(&path, &method) {
+    if should_bypass_rate_limit(request.uri().path(), request.method()) {
         return Ok(next.run(request).await);
     }
 
     // Get rate limiter from state
-    let rate_limiter = match &state.rate_limiter {
-        Some(limiter) => limiter,
-        None => {
-            // Rate limiting not configured, allow all requests
-            return Ok(next.run(request).await);
-        }
+    let Some(rate_limiter) = state.rate_limiter.clone() else {
+        // Rate limiting not configured, allow all requests
+        return Ok(next.run(request).await);
     };
 
     // Which bucket: principal > signed agent > client address
-    // ([`rate_limit_key`]). The nil fallback is reachable only for a router
-    // served WITHOUT connect info, which `bin/server.rs` never does; it is one
-    // shared bucket, so it is logged.
-    let agent_id = rate_limit_key(&request, rate_limiter.trusted_proxies()).unwrap_or_else(|| {
-        tracing::warn!(
-            path = %path,
-            "Rate limiting request without identifiable client - using fallback ID \
-             (is the router served with into_make_service_with_connect_info?)"
-        );
-        AgentId::from_uuid(uuid::Uuid::nil())
-    });
+    // ([`rate_limit_key`]).
+    let agent_id = rate_limit_key(&request, rate_limiter.trusted_proxies())
+        .unwrap_or_else(|| fallback_key(request.uri().path()));
+    charge(&state, &rate_limiter, agent_id, request, next).await
+}
+
+/// The guest reads' default limiter (the operator's ruling of 2026-11-16).
+///
+/// Layered on each `/api/v1/guest/*` route alone (`routes::create_router`),
+/// inside the `public` router's own layers. It charges a request only when
+/// the state carries a [`AppState::guest_rate_limiter`] and NO
+/// [`AppState::rate_limiter`]: a configured limiter already charged the
+/// request in [`rate_limit_middleware`], one layer out, and charging it twice
+/// would halve the configured limit. `bin/server.rs` installs the guest
+/// limiter only while `EPIGRAPH_GUEST_READS` is on and no limiter is
+/// configured (`RateLimitSettings::guest_default`).
+///
+/// It keys on the client address ([`client_ip`], so `X-Forwarded-For` is
+/// believed only from a trusted proxy) and never on a principal: a bearer the
+/// request carries does not widen what a guest route reads, so it does not
+/// buy a separate bucket either.
+#[cfg(feature = "db")]
+pub async fn guest_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, RateLimitResponse> {
+    if state.rate_limiter.is_some()
+        || should_bypass_rate_limit(request.uri().path(), request.method())
+    {
+        return Ok(next.run(request).await);
+    }
+    let Some(rate_limiter) = state.guest_rate_limiter.clone() else {
+        return Ok(next.run(request).await);
+    };
+    let agent_id = client_ip(&request, rate_limiter.trusted_proxies())
+        .map(ip_to_agent_id)
+        .unwrap_or_else(|| fallback_key(request.uri().path()));
+    charge(&state, &rate_limiter, agent_id, request, next).await
+}
+
+/// The bucket of a request no key could be read for. Reachable only for a
+/// router served WITHOUT connect info, which `bin/server.rs` never does; it is
+/// one shared bucket, so it is logged.
+fn fallback_key(path: &str) -> AgentId {
+    tracing::warn!(
+        path = %path,
+        "Rate limiting request without identifiable client - using fallback ID \
+         (is the router served with into_make_service_with_connect_info?)"
+    );
+    AgentId::from_uuid(uuid::Uuid::nil())
+}
+
+/// Charge `agent_id`'s bucket in `rate_limiter`: refuse 429 (recording the
+/// refusal once per bucket per window) or run the request and add the
+/// rate-limit headers. Shared by [`rate_limit_middleware`] and
+/// [`guest_rate_limit_middleware`], which differ only in which limiter and
+/// which key.
+async fn charge(
+    state: &AppState,
+    rate_limiter: &crate::security::AgentRateLimiter,
+    agent_id: AgentId,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, RateLimitResponse> {
+    let path = request.uri().path().to_string();
 
     // Check rate limit
     if let Err(err) = rate_limiter.check(&agent_id) {

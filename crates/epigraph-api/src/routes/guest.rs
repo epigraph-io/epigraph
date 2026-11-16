@@ -9,9 +9,11 @@
 //! predicate apply, as for a signed-in principal that has joined nothing,
 //! less that principal's personal group. A valid bearer the request happens to carry does not widen what
 //! these routes read (a signed-in caller reads its own graph through the
-//! authenticated routes); it only moves the rate-limit charge from the client
-//! address to the principal. A present but invalid bearer is refused 401 by the
-//! `public` router's optional bearer layer, as on every route of that router.
+//! authenticated routes); under a configured limiter it only moves the
+//! rate-limit charge from the client address to the principal (the guest
+//! default limiter keys on the address alone, below). A present but invalid
+//! bearer is refused 401 by the `public` router's optional bearer layer, as on
+//! every route of that router.
 //!
 //! # The routes
 //!
@@ -66,10 +68,17 @@
 //!
 //! The routes sit on the `public` router (`routes/mod.rs`), so they carry its
 //! layers: the anonymous body limit and, when the operator configured one
-//! (it is off unless `EPIGRAPH_RATE_LIMIT*` is set), the rate limiter, which
-//! charges a request without a token to its client address. Every answer is
-//! `Cache-Control: no-store`, so a claim made private stops being served at
-//! once rather than when a cache expires.
+//! (`EPIGRAPH_RATE_LIMIT*`), the rate limiter, which charges a request
+//! without a token to its client address. With guest reads on and NO limiter
+//! configured, they are rate limited all the same (the operator's ruling of
+//! 2026-11-16): `bin/server.rs` installs #841's default limit (600 requests a
+//! minute) as `AppState::guest_rate_limiter`, which these four routes alone
+//! carry (`middleware::rate_limit::guest_rate_limit_middleware`), keyed on the
+//! client address whether or not a bearer is presented, with
+//! `X-Forwarded-For` believed only from `EPIGRAPH_TRUSTED_PROXIES`. An
+//! explicit `EPIGRAPH_RATE_LIMIT=off` leaves them unlimited, with a boot
+//! warning. Every answer is `Cache-Control: no-store`, so a claim made private
+//! stops being served at once rather than when a cache expires.
 
 use axum::{
     extract::{Path, Query, State},

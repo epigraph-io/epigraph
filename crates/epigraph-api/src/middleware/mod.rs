@@ -18,6 +18,8 @@ pub use auth::{
 };
 
 // Re-export rate limiting middleware
+#[cfg(feature = "db")]
+pub use rate_limit::guest_rate_limit_middleware;
 pub use rate_limit::{rate_limit_middleware, RateLimitResponse};
 
 // Re-export OAuth2 middleware

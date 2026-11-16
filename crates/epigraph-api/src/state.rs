@@ -340,6 +340,13 @@ pub struct AppState {
     /// from [`GUEST_READS_ENV`] at boot.
     #[cfg(feature = "db")]
     pub guest_reads: GuestReads,
+    /// The guest reads' own limiter, used only while [`Self::rate_limiter`] is
+    /// `None` (`middleware::rate_limit::guest_rate_limit_middleware`). `None`
+    /// in every constructor; `bin/server.rs` sets it when
+    /// `EPIGRAPH_GUEST_READS` is on and no limiter is configured (the
+    /// operator's ruling of 2026-11-16, `RateLimitSettings::guest_default`).
+    #[cfg(feature = "db")]
+    pub guest_rate_limiter: Option<AgentRateLimiter>,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -1310,6 +1317,7 @@ impl AppState {
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1421,6 +1429,14 @@ impl AppState {
     #[must_use]
     pub fn with_guest_reads(mut self, guest_reads: GuestReads) -> Self {
         self.guest_reads = guest_reads;
+        self
+    }
+
+    /// Set the guest reads' own limiter; see [`Self::guest_rate_limiter`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_guest_rate_limiter(mut self, limiter: AgentRateLimiter) -> Self {
+        self.guest_rate_limiter = Some(limiter);
         self
     }
 
@@ -1878,6 +1894,7 @@ impl AppState {
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1955,6 +1972,7 @@ impl AppState {
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

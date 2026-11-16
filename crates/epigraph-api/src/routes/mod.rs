@@ -418,6 +418,11 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries none but carries `AppState::guest_rate_limiter` (guest
+/// reads on, no limiter configured: the operator's ruling of 2026-11-16), the
+/// four `/api/v1/guest/*` routes alone are limited, by client address, and
+/// every other route is not.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1307,9 +1312,21 @@ pub fn create_router_with_extensions(
     // `Viewer::public_only()` (no group), so they serve `visibility = 'public'`
     // rows only, answer a non-public id exactly as an absent one, and withhold
     // the stored theme and region labels (see `routes/guest.rs`). They sit here
-    // to carry this router's anonymous body limit and per-address rate limit.
-    // They are routed always but answer only when `AppState::guest_reads` is
-    // on (`EPIGRAPH_GUEST_READS=on`); off, each is a bare 404.
+    // to carry this router's anonymous body limit and, when the operator
+    // configured one, its rate limiter. They are routed always but answer only
+    // when `AppState::guest_reads` is on (`EPIGRAPH_GUEST_READS=on`); off, each
+    // is a bare 404.
+    //
+    // Each guest route also carries `guest_limit`, the guest reads' DEFAULT
+    // limiter (the operator's ruling of 2026-11-16): with guest reads on and
+    // no limiter configured, `bin/server.rs` sets `AppState::guest_rate_limiter`
+    // (#841's default limit, keyed on the client address), and these four
+    // routes, and no other, are limited by it. With a limiter configured that
+    // layer is a no-op, so a guest request is charged once, by the router's.
+    let guest_limit = middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::guest_rate_limit_middleware,
+    );
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
@@ -1334,15 +1351,21 @@ pub fn create_router_with_extensions(
         .route("/elevate/act/:id/challenge", post(elevate::act_challenge))
         .route("/elevate/act/:id/assert", post(elevate::act_assert))
         .route("/elevate/assets/elevate.js", get(elevate::elevate_js))
-        .route("/api/v1/guest/claims/:id", get(guest::claim_card))
-        .route("/api/v1/guest/claims/:id/ego", get(guest::claim_ego))
+        .route(
+            "/api/v1/guest/claims/:id",
+            get(guest::claim_card).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/claims/:id/ego",
+            get(guest::claim_ego).layer(guest_limit.clone()),
+        )
         .route(
             "/api/v1/guest/graph/themes/overview",
-            get(guest::themes_overview),
+            get(guest::themes_overview).layer(guest_limit.clone()),
         )
         .route(
             "/api/v1/guest/graph/themes/layout",
-            get(guest::themes_layout),
+            get(guest::themes_layout).layer(guest_limit),
         );
 
     // Layered on the allowlist: a request with no Authorization

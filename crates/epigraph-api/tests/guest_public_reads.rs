@@ -692,6 +692,235 @@ async fn guest_routes_are_rate_limited_per_address() {
     );
 }
 
+/// A limiter refusing after `limit` requests per key, refilled far slower
+/// than a test runs, with no global limit.
+fn limiter_of(limit: u32) -> AgentRateLimiter {
+    AgentRateLimiter::new(RateLimitConfig {
+        default_rpm: limit,
+        global_rpm: 1_000_000,
+        replenish_interval_secs: 60,
+        enable_global_limit: false,
+    })
+}
+
+/// One GET from `peer`, with `token` as its bearer if given, as
+/// `into_make_service_with_connect_info` would deliver it.
+async fn status_from(
+    router: &Router,
+    method: Method,
+    path: &str,
+    peer: &str,
+    token: Option<&str>,
+) -> StatusCode {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    let peer: SocketAddr = peer.parse().unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    router.clone().oneshot(req).await.unwrap().status()
+}
+
+/// The operator's ruling of 2026-11-16: with guest reads on and no limiter
+/// configured, `bin/server.rs` installs the guest default limiter
+/// (`AppState::guest_rate_limiter`) and nothing else. The four guest routes
+/// are limited per client address; every other route, anonymous ones
+/// included, is not. No database: the limiter refuses before any read, and
+/// the other routes driven here never read.
+///
+/// Fails if the guest layer is dropped (no 429 on a guest route), or if the
+/// default limiter is installed router-wide (a 429 on the discovery and
+/// OpenAPI routes).
+#[tokio::test]
+async fn the_guest_default_limiter_limits_the_guest_routes_only() {
+    const LIMIT: u32 = 3;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default())
+            .with_guest_reads(GuestReads::On)
+            .with_guest_rate_limiter(limiter_of(LIMIT)),
+    );
+    let a = "192.0.2.20:4000";
+    for (i, path) in [
+        format!("/api/v1/guest/claims/{}", Uuid::new_v4()),
+        format!("/api/v1/guest/claims/{}/ego", Uuid::new_v4()),
+        "/api/v1/guest/graph/themes/overview".to_string(),
+        "/api/v1/guest/graph/themes/layout".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Each route from its own address, so each starts with a full bucket.
+        let peer = format!("192.0.2.{}:4000", 30 + i);
+        for _ in 0..LIMIT {
+            let status = status_from(&router, Method::GET, &path, &peer, None).await;
+            assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "{path}: under quota");
+            assert_ne!(status, StatusCode::NOT_FOUND, "{path}: the route is routed");
+        }
+        assert_eq!(
+            status_from(&router, Method::GET, &path, &peer, None).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{path}: a guest route past the default quota"
+        );
+    }
+
+    let overview = "/api/v1/guest/graph/themes/overview";
+    for _ in 0..LIMIT {
+        status_from(&router, Method::GET, overview, a, None).await;
+    }
+    assert_eq!(
+        status_from(&router, Method::GET, overview, a, None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "CALIBRATION: {a} has spent its guest bucket"
+    );
+    assert_ne!(
+        status_from(&router, Method::GET, overview, "192.0.2.21:4000", None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "another address keeps its own guest bucket"
+    );
+    for path in [
+        "/.well-known/oauth-authorization-server",
+        "/api/v1/openapi.json",
+    ] {
+        for i in 0..LIMIT * 3 {
+            assert_eq!(
+                status_from(&router, Method::GET, path, a, None).await,
+                StatusCode::OK,
+                "{path}: request {i} from {a} is not limited by the guest default"
+            );
+        }
+    }
+}
+
+/// The guest default keys on the client address, never on a principal: a
+/// caller rotating bearers does not buy a fresh guest bucket. And an
+/// authenticated route stays unlimited for the same principal from the same
+/// address. Needs the database: both bearer layers read the revocation table.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_guest_default_keys_on_the_address_and_leaves_authenticated_routes_unlimited(
+    pool: PgPool,
+) {
+    const LIMIT: u32 = 3;
+    let state = AppState::with_db(pool, ApiConfig::default())
+        .with_guest_reads(GuestReads::On)
+        .with_guest_rate_limiter(limiter_of(LIMIT));
+    let router = create_router(state.clone());
+    let token = || {
+        let agent = Uuid::new_v4();
+        state
+            .jwt_config
+            .issue_access_token(
+                Uuid::new_v4(),
+                vec!["claims:read".into()],
+                "agent",
+                None,
+                Some(agent),
+                chrono::Duration::minutes(10),
+                epigraph_auth::AccessTokenBinding::NONE,
+            )
+            .expect("token")
+            .0
+    };
+    let peer = "203.0.113.40:6000";
+    let overview = "/api/v1/guest/graph/themes/overview";
+    for i in 0..LIMIT {
+        let status = status_from(&router, Method::GET, overview, peer, Some(&token())).await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i}: under quota"
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "CALIBRATION: the token must authenticate"
+        );
+    }
+    assert_eq!(
+        status_from(&router, Method::GET, overview, peer, Some(&token())).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a fresh principal from a spent address is still refused on a guest route"
+    );
+
+    let one = token();
+    for i in 0..LIMIT * 3 {
+        let status = status_from(&router, Method::POST, "/api/v1/claims", peer, Some(&one)).await;
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "POST /api/v1/claims request {i}: authenticated routes are not limited by the \
+             guest default"
+        );
+        assert_ne!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "CALIBRATION: the token must authenticate"
+        );
+    }
+}
+
+/// With a limiter configured, the guest routes use it, as before the ruling,
+/// and the guest default layer charges nothing: a guest default limit of 1
+/// would refuse the second request, the configured limit of 3 refuses the
+/// fourth.
+#[tokio::test]
+async fn a_configured_limiter_replaces_the_guest_default() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default())
+            .with_guest_reads(GuestReads::On)
+            .with_rate_limiter(limiter_of(3))
+            .with_guest_rate_limiter(limiter_of(1)),
+    );
+    let path = format!("/api/v1/guest/claims/{}", Uuid::new_v4());
+    let peer = "192.0.2.50:4000";
+    for i in 0..3 {
+        assert_ne!(
+            status_from(&router, Method::GET, &path, peer, None).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i}: within the configured limit, so the guest default is unused"
+        );
+    }
+    assert_eq!(
+        status_from(&router, Method::GET, &path, peer, None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the configured limit applies to the guest routes"
+    );
+}
+
+/// `EPIGRAPH_RATE_LIMIT=off` with guest reads on: `bin/server.rs` installs
+/// neither limiter (`RateLimitSettings::guest_default` is `None` for an
+/// explicit off, pinned in `security::rate_limit`'s unit tests), so the guest
+/// routes are not limited. The boot warning is pinned in
+/// `boot_rate_limit_test.rs`, the served behaviour in
+/// `boot_rate_limit_served.rs`.
+#[tokio::test]
+async fn explicit_off_leaves_the_guest_routes_unlimited() {
+    let settings =
+        epigraph_api::RateLimitSettings::parse(Some("off"), None, None, None).expect("parse");
+    assert!(settings.build().is_none() && settings.guest_default().is_none());
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default()).with_guest_reads(GuestReads::On),
+    );
+    let path = format!("/api/v1/guest/claims/{}", Uuid::new_v4());
+    for i in 0..20 {
+        assert_ne!(
+            status_from(&router, Method::GET, &path, "192.0.2.60:4000", None).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "request {i}: no limiter is installed"
+        );
+    }
+}
+
 // ── The constructor's call sites ──
 
 /// `Viewer::public_only` is built ONLY in the guest route module. Anywhere
