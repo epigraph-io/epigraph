@@ -316,27 +316,23 @@ pub enum UnauthenticatedWrites {
 /// and `claims:admin` tool. Before batch HTTP-id this context carried every
 /// scope, `claims:admin` included, with no human behind any of it.
 ///
-/// # Tenancy (PR-09)
+/// # Tenancy (PR-09, narrowed by backlog fe514fc3)
 ///
-/// `agent_id` now carries `server_agent_id` — the server's own `agents.id` —
-/// instead of `None`. Plan §4.12 assigns this change to PR-09, and it is
-/// required for the flag to keep working now that
+/// `agent_id` carries the listener's principal rather than `None`:
 /// `tools::viewer::request_viewer` refuses an `AuthContext` with no agent
-/// principal: with `None` here, every content tool on this listener would
-/// return the "token carries no agent principal" error and the flag would be
-/// misleading in a *new* way.
+/// principal, so with `None` every content tool on this listener would refuse.
 ///
-/// **Call it a widening, because it is one.** Before, `request_viewer` mapped
-/// this context's nil `client_id` to `Viewer::resolve(pool, nil)` — an empty
-/// group set, public rows only, fail-closed by accident. Now every holder of
-/// this listener's credential (in production, one shared bearer token in front
-/// of a unix socket) reads with the server agent's group set. On today's corpus
-/// the two are identical, because migration 062 defaults `visibility` to
-/// `'public'` and backfills nothing; the difference appears the moment PR-12's
-/// backfill writes the first `'group'` row. Operators who do not want that
-/// should not be running `--allow-unauthenticated-http`.
+/// Which principal is the caller's choice ([`crate::unauthenticated_reader::listener_principal`]):
+/// on the READ-ONLY listener (the default) it is the dedicated zero-membership
+/// reader agent, so reads are PUBLIC-ONLY; on the
+/// [`UnauthenticatedWrites::AsListenerSigner`] opt-in it is the listener's own
+/// signer, whose group set those callers then read with. PR-09 used the
+/// server agent for both, which handed every holder of the listener's shared
+/// credential the server agent's groups. `request_viewer` refuses a read-only
+/// principal-less context whose viewer carries any group, so that cannot come
+/// back through wiring.
 pub fn unauthenticated_context(
-    server_agent_id: Option<uuid::Uuid>,
+    principal: Option<uuid::Uuid>,
     writes: UnauthenticatedWrites,
 ) -> AuthContext {
     let mut scopes: Vec<String> = crate::scope_map::SCOPE_MAP
@@ -350,7 +346,7 @@ pub fn unauthenticated_context(
     scopes.dedup();
     AuthContext {
         client_id: uuid::Uuid::nil(),
-        agent_id: server_agent_id,
+        agent_id: principal,
         owner_id: None,
         client_type: epigraph_auth::ClientType::Service,
         scopes,
@@ -378,12 +374,17 @@ pub fn is_principal_less(auth: &AuthContext) -> bool {
     auth.client_id.is_nil() && auth.jti.is_nil()
 }
 
-/// Something that can resolve the server's own `agents.id`, retrying on failure.
+/// Something that can resolve the unauthenticated listener's principal (an
+/// `agents.id`), retrying on failure.
 ///
-/// Implemented by `server::EpiGraphMcpFull`, whose `agent_id()` caches only on
-/// success (`agent_db_id: Arc<Mutex<Option<Uuid>>>` is written in the `Ok` arm
-/// and left untouched on `Err`), so a real implementation is already
-/// resolve-once-then-cheap without any further caching here.
+/// Implemented by `server::EpiGraphMcpFull` (the server's own agent, the
+/// principal of a `--allow-unauthenticated-writes` listener), whose
+/// `agent_id()` caches only on success (`agent_db_id: Arc<Mutex<Option<Uuid>>>`
+/// is written in the `Ok` arm and left untouched on `Err`), and by
+/// `unauthenticated_reader::UnauthenticatedReader` (the zero-membership reader
+/// of a read-only listener), which caches the same way. Both are therefore
+/// resolve-once-then-cheap without any further caching here. The method keeps
+/// its historical name.
 ///
 /// A trait rather than the concrete type so this module does not depend on the
 /// server, and so the retry behaviour can be driven deterministically in a test
@@ -598,9 +599,9 @@ impl UnauthenticatedPrincipal {
                 tracing::error!(
                     error = %e,
                     cooldown_secs = self.cooldown.as_secs(),
-                    "could not resolve the server agent id for \
-                     --allow-unauthenticated-http; content tools on that listener \
-                     will refuse (no agent principal) until it resolves"
+                    "could not resolve the --allow-unauthenticated-http listener's \
+                     principal; content tools on that listener will refuse until it \
+                     resolves"
                 );
                 None
             }
@@ -625,9 +626,9 @@ pub async fn inject_unauthenticated_context(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let server_agent_id = principal.agent_id().await;
+    let agent_id = principal.agent_id().await;
     req.extensions_mut()
-        .insert(unauthenticated_context(server_agent_id, principal.writes));
+        .insert(unauthenticated_context(agent_id, principal.writes));
     next.run(req).await
 }
 
