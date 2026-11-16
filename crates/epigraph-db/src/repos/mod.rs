@@ -26,6 +26,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_id_prefix;
 pub mod claim_ingest;
 pub mod claim_role;
 pub mod claim_theme;
@@ -146,19 +147,23 @@ pub use claim::{
     AdminToken, BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute,
     ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
     ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
-    DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
-    EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
-    HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
-    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
-    SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
-    SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
-    DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
-    EXPANSION_RELATIONSHIPS, RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED,
-    SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
+    CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy,
+    EmbeddingSeedScope, EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit,
+    GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead,
+    MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration,
+    SupersedeTool, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, RESERVED_EDGE_PROPERTIES,
+    SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_id_prefix::{
+    id_prefix_bounds, ClaimIdPrefixMatch, ClaimIdPrefixRepository, ID_PREFIX_CONTENT_CHARS,
+    MIN_ID_PREFIX_HEX,
 };
 pub use claim_ingest::{
     credited_agent_end, ingest_only_edge_refusal, is_agent_attribution,

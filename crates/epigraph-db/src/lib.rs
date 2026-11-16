@@ -115,8 +115,8 @@ pub use repos::{
     ClaimSortOrder, ClaimSummary, ClaimThemeRepository, ClaimThemeRow, ClaimVersionRepository,
     ClaimVersionRow, CommunityRepository, ConsolidateEdgeMigration, ConsolidateMode,
     ConsolidateResult, ContextRepository, CorpusCounts, CorpusStatsRepository,
-    CounterfactualRepository, CounterfactualRow, DecideOutcome, DedupRepair, DedupReversal,
-    DedupRevert, DerivationEvidence, DeviationReasonSummary, DivergenceRepository,
+    CounterfactualRepository, CounterfactualRow, CreatedWindow, DecideOutcome, DedupRepair,
+    DedupReversal, DedupRevert, DerivationEvidence, DeviationReasonSummary, DivergenceRepository,
     DuplicateProvenance, EdgeEncryptionRepository, EdgeEncryptionRow, EdgeRepository, EdgeTenancy,
     EmbeddingSeedScope, EntityRepository, EntityRow, EntityTypeEntry, EntityTypeRepository,
     EpistemicEdgePairRow, EventCursor, EventRepository, EventRow, EvidenceAtTimeRow,
@@ -192,6 +192,8 @@ pub use repos::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BIND
 pub use repos::{INGEST_AUTHORS_PROPERTY, MAX_RECORDED_AUTHORS};
 // The Atlas layout reads and the operator build (migration 197).
 pub use repos::AtlasLayoutRepository;
+// Abbreviated claim-id resolution (backlog 30d8b667).
+pub use repos::{id_prefix_bounds, ID_PREFIX_CONTENT_CHARS, MIN_ID_PREFIX_HEX};
 // The sources overview (`GET /api/v1/sources/overview`).
 pub use repos::{
     SourceAuthor, SourceCursor, SourceDetail, SourceEntry, SourceKind, SourceOverviewRepository,
@@ -199,9 +201,10 @@ pub use repos::{
 };
 // The ego/placement reads the Explorer's claim page and graph canvas call.
 pub use repos::{
-    ClaimContextRepository, ClaimPlacement, ClusterRunRepository, ClusterRunRow, ContextClaimRow,
-    ContextEdgeRow, ContextEdgeTally, ContextPage, ContextPaperRow, EgoEdgeRow, EgoEdges,
-    EgoEntity, EgoRepository, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+    ClaimContextRepository, ClaimIdPrefixMatch, ClaimIdPrefixRepository, ClaimPlacement,
+    ClusterRunRepository, ClusterRunRow, ContextClaimRow, ContextEdgeRow, ContextEdgeTally,
+    ContextPage, ContextPaperRow, EgoEdgeRow, EgoEdges, EgoEntity, EgoRepository,
+    CONTEXT_EPISTEMIC_RELATIONSHIPS,
 };
 pub use vector_literal::pgvector_literal;
 pub use visibility::{Elevation, MaintenanceLease, SystemReason, Viewer};
