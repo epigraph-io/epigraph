@@ -141,7 +141,11 @@ pub struct CascadeReport {
     /// Downstream claims whose derived records the cascade actually touched
     /// (or tried and failed to touch). A candidate that turned out to have no
     /// derived record at all is **absent**: the union of `recomputed`,
-    /// `unbacked` and the claims named in `errors`.
+    /// `unbacked` and the claims named in `errors`. So is a candidate that
+    /// still has BBAs but whose refold wrote nothing: no BBAs on the repaired
+    /// frame, a fold that admitted none of them with nothing to vacate, or a
+    /// write the database declined because the session does not own the
+    /// claim's cache (migration 114). Its cache is left as it was.
     pub targets: Vec<Uuid>,
     /// Stale edge-factor BBAs deleted (invalidation, not recombination).
     pub invalidated_bbas: u64,
@@ -909,6 +913,15 @@ async fn repair_one(
 /// so an ordinary `mark_duplicate` of two BBA-free claims arrives here with
 /// nothing to repair, and listing it under `targets` would assert a repair
 /// that did not happen.
+///
+/// Nor is a candidate that keeps BBAs but whose refold wrote nothing
+/// (`recompute_claim_belief_on_frame` answers `Ok(false)`, and
+/// [`mark_unbacked_if_evidence_free`] finds BBAs left): no BBAs on
+/// `frame_id`, a fold that admitted none with nothing to vacate, or a write
+/// migration 114 declined for a session that does not own the claim's cache.
+/// Its cache is left as it was. Before the recompute reported whether it
+/// wrote (backlog 8d720490 (2)), the last two were listed under `recomputed`,
+/// which claimed a write that did not happen.
 async fn repair_targets(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,

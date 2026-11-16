@@ -59,7 +59,9 @@ pub enum EdgeFactorOutcome {
     NonEpistemic,
     /// Restriction produced a vacuous interval (no information transfer).
     Vacuous,
-    /// BBA materialized and target belief recomputed.
+    /// BBA materialized. The target's cache is refolded on `binary_truth`
+    /// when that frame owns it (`cache_owner_frame_for_claim`); a compound,
+    /// or a claim whose cache another frame owns, keeps its cache.
     Wired,
 }
 
@@ -146,16 +148,40 @@ pub async fn auto_wire_ds_for_edge(
     .await
     .map_err(|e| format!("store BBA: {e}"))?;
 
-    recompute_combined_belief(
-        &mut *conn,
-        viewer,
-        target_id,
-        frame_id,
-        &frame,
-        crate::belief_profile::overrides_in(&frame_row.properties),
-        VacateGate::ClaimWide,
-    )
-    .await?;
+    // Refold the target's cache ONLY WHEN `binary_truth` OWNS IT (backlog
+    // d33a5c9f). The cache is ONE frame's fold, the one
+    // `MassFunctionRepository::cache_owner_frame_for_claim` names for every
+    // other recomputer. Folding `binary_truth` unconditionally here wrote a
+    // COMPOUND's cache (which has no owner: its belief is a query over its
+    // leaves) from its own `binary_truth` inputs, and nothing undid it: a
+    // retraction of the edge's BBA, or of the edge, neither refolds nor
+    // vacates a claim with no owner. It also let an edge whose BBA the
+    // derivation scope rule keeps out of the cache vacate a cache another
+    // frame owns. The owner is resolved after the BBA is stored, so a claim
+    // whose only input is this BBA gets `binary_truth`. The BBA is stored
+    // either way, so the outcome is still `Wired`.
+    let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, target_id)
+        .await
+        .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
+    if owner == Some(frame_id) {
+        recompute_combined_belief(
+            &mut *conn,
+            viewer,
+            target_id,
+            frame_id,
+            &frame,
+            crate::belief_profile::overrides_in(&frame_row.properties),
+            VacateGate::ClaimWide,
+        )
+        .await?;
+    } else {
+        tracing::debug!(
+            edge = %edge_id,
+            target = %target_id,
+            owner = ?owner,
+            "edge BBA stored; the target's cache is not binary_truth's to refold"
+        );
+    }
     Ok(EdgeFactorOutcome::Wired)
 }
 
@@ -562,8 +588,10 @@ pub async fn auto_wire_edge_if_epistemic(
 
 /// Re-fetch all BBAs on (claim, binary frame), discount by source_strength,
 /// combine, and write the resulting Bel/Pl/BetP/conflict/missing to the
-/// claim's row. Public so other belief-recompute paths (e.g. HTTP
-/// `propagate_to_dependents`) can share the cascade.
+/// claim's row, re-pointing the cache to `binary_truth`. It does NOT apply
+/// the cache-owner rule; a caller refreshing a claim's cache wants
+/// [`recompute_claim_cached_belief`] instead (HTTP `propagate_to_dependents`
+/// switched to it, backlog d33a5c9f).
 pub async fn recompute_claim_belief_binary(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -588,11 +616,11 @@ pub async fn recompute_claim_belief_binary(
 /// which frame's combination they hold. This function does NOT apply the
 /// cache-owner rule: it folds the frame it is given and writes that fold to
 /// the cache with `belief_frame_id = frame_id`. Which frame should own the
-/// cache is decided by [`recompute_claim_cached_belief`] (`binary_truth`,
-/// else `claim_validity`, else the recorded frame, else the first writer),
-/// which then calls this function with that frame. A caller that passes
-/// another frame re-points the cache to it whenever its session may write the
-/// claim row, so such a caller still decides the outcome by its call order.
+/// cache is decided by [`recompute_claim_cached_belief`] (see
+/// `MassFunctionRepository::cache_owner_frame_for_claim`), which then calls
+/// this function with that frame. A caller that passes another frame
+/// re-points the cache to it whenever its session may write the claim row, so
+/// such a caller still decides the outcome by its call order.
 ///
 /// The one write the database declines is that of a session that does not
 /// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
@@ -600,9 +628,13 @@ pub async fn recompute_claim_belief_binary(
 /// refresh the cache on the frame already recorded, or seed an empty cache on
 /// `binary_truth`; on any other frame its write is a no-op, not an error.
 ///
-/// Returns `Ok(false)` if the claim has no BBAs on `frame_id`. `Ok(true)`
-/// means the claim has BBAs there and the fold was attempted; it does not say
-/// the cache was written.
+/// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
+/// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation
+/// scope rule admits none of them and there is nothing to vacate (the
+/// all-inadmissible vacate), and when the database declined the write (the migration-114
+/// non-owner case above). It used to answer `Ok(true)` whenever the frame had
+/// BBAs, so `recompute_beliefs` counted a fold that emptied without a write
+/// as a recompute and a frame write.
 ///
 /// # Errors
 /// String error if the frame row can't be loaded, the frame's hypothesis
@@ -636,8 +668,7 @@ pub async fn recompute_claim_belief_on_frame(
         crate::belief_profile::overrides_in(&row.properties),
         VacateGate::ClaimWide,
     )
-    .await?;
-    Ok(true)
+    .await
 }
 
 /// Write-free variant of [`recompute_claim_belief_on_frame`]: loads the frame
@@ -1639,6 +1670,10 @@ const VACATED_CLASSIFICATION: &str = "not_enough_info";
 /// frame when the cache is vacated under ruling R-80). No-ops (does not
 /// write) when the claim has no BBAs on `frame_id`, or none the scope rule
 /// admits and nothing to vacate.
+///
+/// Returns whether the cache was written: `false` for those no-ops and for a
+/// write the database declined (`MassFunctionRepository::update_claim_belief`'s
+/// migration-114 non-owner refusal).
 async fn recompute_combined_belief(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -1647,7 +1682,7 @@ async fn recompute_combined_belief(
     frame: &FrameOfDiscernment,
     frame_overrides: Option<&serde_json::Value>,
     gate: VacateGate,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Some((preview, vacated)) = compute_combined_belief(
         &mut *conn,
         viewer,
@@ -1659,7 +1694,7 @@ async fn recompute_combined_belief(
     )
     .await?
     else {
-        return Ok(());
+        return Ok(false);
     };
 
     let written = MassFunctionRepository::update_claim_belief(
@@ -1696,7 +1731,7 @@ async fn recompute_combined_belief(
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
 
-    Ok(())
+    Ok(written)
 }
 
 /// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.
@@ -1741,7 +1776,9 @@ async fn recompute_combined_belief(
 ///
 /// [`MassFunctionRepository::cache_owner_frame_for_claim`] decides, among the
 /// frames holding the claim's combine inputs (cached combination rows are
-/// excluded, as the combine itself excludes them):
+/// excluded, as the combine itself excludes them), preferring a frame with an
+/// input the derivation scope rule admits to the cache over one without
+/// (backlog 8d720490 (1)), and then:
 ///
 /// 1. `binary_truth`, when the claim has an input on it. It is what the
 ///    edge-wiring path writes and what unframed `get_belief` serves.
@@ -1803,20 +1840,31 @@ pub async fn recompute_claim_cached_belief(
 /// just WIDENED (`crate::visibility_act`: publicize, share with a team),
 /// called inside the act's transaction.
 ///
-/// The owner frame and the fold are the same. The difference is the vacate:
-/// when the owner frame has inputs and the derivation scope rule admits none
-/// of them for the claim's new audience, the cache is set to full ignorance
-/// (as [`recompute_claim_cached_belief`] does only when no frame of the claim
-/// has an admissible input), provided the claim has a fold cache. Without
-/// this, a claim whose `binary_truth` inputs all stay behind (pinned evidence,
-/// an edge-factor BBA whose edge the new audience cannot read) while its
-/// `claim_validity` keeps an admissible input would serve the old
-/// `binary_truth` fold, and the influence of what stayed behind, to the
+/// Two things differ from it.
+///
+/// **The owner is kept, not re-elected.** The owner frame is the one the
+/// cache records (`claims.belief_frame_id`) while that frame still holds an
+/// input ([`MassFunctionRepository::cache_owner_frame_keeping_recorded`]); the
+/// admissible-first owner rule of [`recompute_claim_cached_belief`] (backlog
+/// 8d720490 (1)) decides only a claim that records no such owner. The cached
+/// value is that frame's fold under the OLD audience, so it is that frame's
+/// inputs the act must judge. Re-electing inside the act would hand the cache
+/// to whichever frame's input moved with the claim. The claim's next ordinary
+/// recompute applies the admissible-first rule as usual.
+///
+/// **The vacate:** when the owner frame has inputs and the derivation scope
+/// rule admits none of them for the claim's new audience, the cache is set to
+/// full ignorance (as [`recompute_claim_cached_belief`] does only when no
+/// frame of the claim has an admissible input), provided the claim has a fold
+/// cache. Without this, a claim whose `binary_truth` inputs all stay behind
+/// (pinned evidence, an edge-factor BBA whose edge the new audience cannot
+/// read) while its `claim_validity` keeps an admissible input would serve the
+/// old `binary_truth` fold, and the influence of what stayed behind, to the
 /// wider audience (backlog 31285392). A claim with no cache still gets none,
 /// and a claim with no owner frame (a non-procedural compound, template-only
 /// rows) is left as it was.
 ///
-/// Returns whether a write was attempted (as [`recompute_claim_cached_belief`]).
+/// Returns whether the cache was written (as [`recompute_claim_cached_belief`]).
 ///
 /// # Errors
 /// As [`recompute_claim_cached_belief`].
@@ -1826,9 +1874,9 @@ pub async fn recompute_widened_claim_cached_belief(
     claim_id: Uuid,
 ) -> Result<bool, String> {
     let Some(owner) =
-        MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, claim_id)
+        MassFunctionRepository::cache_owner_frame_keeping_recorded(&mut *conn, viewer, claim_id)
             .await
-            .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?
+            .map_err(|e| format!("cache_owner_frame_keeping_recorded: {e}"))?
     else {
         return Ok(false);
     };
@@ -1847,8 +1895,7 @@ pub async fn recompute_widened_claim_cached_belief(
         crate::belief_profile::overrides_in(&row.properties),
         VacateGate::OwnerFrame,
     )
-    .await?;
-    Ok(true)
+    .await
 }
 
 /// Why the single atom-cache writer is called (SPEC §4.2, "Empty fold").

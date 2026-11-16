@@ -726,6 +726,21 @@ impl EpiGraphMcpFull {
         Self::tool_router().list_all()
     }
 
+    /// The name of every kernel tool: the names no federated extension may
+    /// export (backlog 351d3def). `FederationRegistry::build` reserves them, so a
+    /// clash fails the gateway's boot instead of listing the name twice and
+    /// routing it only to the kernel.
+    ///
+    /// Taken from [`static_tools`](Self::static_tools), the full router, rather
+    /// than any one server's: a read-only server's router has the same names.
+    #[must_use]
+    pub fn kernel_tool_names() -> HashSet<String> {
+        Self::static_tools()
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect()
+    }
+
     /// Look up the required scope for `tool_name` and verify the
     /// caller has it. Returns `Err` with a JSON-RPC-style error if:
     /// - no `AuthContext` is attached (token validation never ran or
@@ -1073,7 +1088,8 @@ impl EpiGraphMcpFull {
 
     /// The tools listed to one caller (elevation plan EL-11): every kernel
     /// tool [`crate::tools::elevation::listed`] admits, then every federated
-    /// tool. `auth` is `None` on stdio; over HTTP it must already carry the
+    /// tool when [`Self::lists_federated_tools`] says this caller can call one.
+    /// `auth` is `None` on stdio; over HTTP it must already carry the
     /// switch and the elevation ([`Self::listing_auth`], or `call_tool`'s
     /// dispatch for `list_mcp_tools`). The ONE manifest rule `list_tools` and
     /// `list_mcp_tools` share, so neither can bypass the other.
@@ -1098,8 +1114,25 @@ impl EpiGraphMcpFull {
             .into_iter()
             .filter(|t| crate::tools::elevation::listed(t.name.as_ref(), &caller))
             .collect();
-        tools.extend(self.federation.list_federated_tools());
+        if Self::lists_federated_tools(http, auth) {
+            tools.extend(self.federation.list_federated_tools());
+        }
         tools
+    }
+
+    /// Whether a caller is listed the federated tools: only one that
+    /// presented a bearer token, over HTTP (backlog b6559e75).
+    ///
+    /// `call_tool` proxies a federated call under the CALLER's own bearer,
+    /// and refuses one it has no bearer to forward. A caller without one
+    /// (stdio, which carries no `AuthContext`; an HTTP listener with no auth
+    /// layer; the unauthenticated listener, whose injected context is
+    /// principal-less and comes with no token) would be shown tools it can
+    /// never call, and the manifest would mislead every client that plans from
+    /// it.
+    #[must_use]
+    pub fn lists_federated_tools(http: bool, auth: Option<&epigraph_auth::AuthContext>) -> bool {
+        http && auth.is_some_and(|a| !crate::auth::is_principal_less(a))
     }
 
     /// Replace the admin-scope switch's cache with one whose reads stand for
@@ -2134,7 +2167,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: positive: supports, corroborates, elaborates, generalizes, specializes (they transmit the source's belief toward the target); negative: contradicts, refutes (they transmit it against the target); cites is also accepted as a structural edge that moves no belief, and so is qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief) — use it instead of contradicts for a caveat that limits where the target holds without saying it is false — and so is EQUIVALENT_TO (the two claims say the same thing and both stay current; moves no belief), in that exact upper-case spelling: use it, not corroborates, for two restatements that should both stay current without one raising the other's belief. For a positive edge polarity is not a guarantee of direction: the edge carries the source's whole belief interval, scaled by the relationship's factor, so the source's doubt travels with its belief, both its disbelief (1 - plausibility) and its open-world (frame-incompleteness) mass. So a positive edge can LOWER the target's belief and pignistic_prob when the source is weakly believed or frame-incomplete (open-world mass hits hardest when the target carries open-world mass of its own); read target_belief rather than assuming a rise. A negative edge means mutual exclusion (source and target cannot both be true): only the source's belief arrives, scaled by the relationship's factor, as disbelief in the target, together with the source's open-world mass; the source's disbelief transfers nothing. So a negative edge puts no mass on the target being true, a weakly believed or disbelieved source barely moves its target, and a negative edge cannot RAISE the target's belief or pignistic_prob (beyond the renormalisation of open-world mass the target already carries, which combining any new mass function causes). Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the source's restricted mass is vacuous (e.g. a contradictor with ~no belief), the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). belief_wired_reason names which, and is omitted when belief_wired is true: source_has_no_belief, vacuous_source_mass, already_wired, structural_relationship, or refused_or_failed (a refused or failed wiring). Two further values are defensive and appear only when the edge or its source changes underneath the call (a concurrent retraction or removal): edge_retracted and source_author_unresolved. target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Create a BELIEF-AFFECTING epistemic edge between two existing claims and wire it into Dempster-Shafer belief propagation. Direction is source -> target ('source RELATIONSHIP target'). Valid relationships: positive: supports, corroborates, elaborates, generalizes, specializes (they transmit the source's belief toward the target); negative: contradicts, refutes (they transmit it against the target); cites is also accepted as a structural edge that moves no belief, and so is qualifies (a scope caveat: the source bounds the conditions under which the target applies; moves no belief) — use it instead of contradicts for a caveat that limits where the target holds without saying it is false — and so is EQUIVALENT_TO (the two claims say the same thing and both stay current; moves no belief), in that exact upper-case spelling: use it, not corroborates, for two restatements that should both stay current without one raising the other's belief. For a positive edge polarity is not a guarantee of direction: the edge carries the source's whole belief interval, scaled by the relationship's factor, so the source's doubt travels with its belief, both its disbelief (1 - plausibility) and its open-world (frame-incompleteness) mass. So a positive edge can LOWER the target's belief and pignistic_prob when the source is weakly believed or frame-incomplete (open-world mass hits hardest when the target carries open-world mass of its own); read target_belief rather than assuming a rise. A negative edge means mutual exclusion (source and target cannot both be true): only the source's belief arrives, scaled by the relationship's factor, as disbelief in the target, together with the source's open-world mass; the source's disbelief transfers nothing. So a negative edge puts no mass on the target being true, a weakly believed or disbelieved source barely moves its target, and a negative edge cannot RAISE the target's belief or pignistic_prob (beyond the renormalisation of open-world mass the target already carries, which combining any new mass function causes). Builds a mass function from the source claim's belief interval and recomputes the target claim's combined belief; a newly created edge also emits an edge.added event. Idempotent on (source, target, relationship), and on the unordered pair for contradicts / corroborates: a re-hit returns the existing edge with was_created=false. The edge is written even when no belief moves. belief_wired=true means THIS call materialized the edge's mass function and recomputed the target — including on a re-hit when the edge had none yet and its source has since gained belief. belief_wired=false means no belief moved: the source has no belief interval, the source's restricted mass is vacuous (e.g. a contradictor with ~no belief), the edge was already wired, the relationship is structural, or the wiring was refused (e.g. the target is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write). belief_wired_reason names which, and is omitted when belief_wired is true: source_has_no_belief, vacuous_source_mass, already_wired, structural_relationship, or refused_or_failed (a refused or failed wiring). Two further values are defensive and appear only when the edge or its source changes underneath the call (a concurrent retraction or removal): edge_retracted and source_author_unresolved. target_belief is the {belief, plausibility, pignistic_prob} of belief_target_claim_id, which is your SOURCE on a reverse-direction re-hit of a symmetric edge. The target's cached belief is refolded only when binary_truth owns it (the claim's cache-owner frame): a compound (a claim with an in-force decomposes_to edge, whose belief derives from its parts) keeps its cache, and so does a claim whose cache another frame owns; belief_wired is still true once the mass function is stored, and target_belief reports the cache as stored. For supersedes use supersede_claim instead. The edge, its belief wiring and its edge.added event commit together on one transaction with the calling agent's write authority. An endpoint in a group-private claim owned by a group the calling agent cannot write is refused with nothing written. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the edge's mass function is owned by the calling agent's own group (its operator's group for an operated agent) and stays public, and belief_wired=true once that mass function is stored and the target's combination recomputed; the target's CACHED belief is updated from that combination through an audited path only when the cache already carries binary_truth or the target has no cache at all, and target_belief always reports the cache as stored (so it may be unchanged); the target claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn link_epistemic(
         &self,
@@ -2217,7 +2250,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Find claims by label using PostgreSQL array containment (GIN-indexed). Returns claims containing ALL specified labels. Useful for querying backlog items (e.g. [\"backlog\", \"pending\"]), workflows, or any labeled claim set."
+        description = "Find claims by label using PostgreSQL array containment (GIN-indexed). Returns claims containing ALL specified labels. Useful for querying backlog items (e.g. [\"backlog\", \"pending\"]), workflows, or any labeled claim set. To page, pass `after` (\"\" for the first page): the response becomes {claims, next_cursor}; pass each `next_cursor` back as `after` until it is null. Without `after` the response is a bare array paged by `offset`, which drifts under concurrent writes."
     )]
     async fn query_claims_by_label(
         &self,
@@ -2230,7 +2263,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state. Each claim's cache is written from ONE owner frame, chosen among the frames holding the claim's input BBAs (stored combination results are not inputs): binary_truth if the claim has an input there, else claim_validity, else the frame the cache already records (belief_frame_id) while it still holds an input, else the frame holding the claim's earliest input (ties by frame id). No other frame name plays a part, and no frame is created. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: recompute_claim_belief."
+        description = "Recompute cached claim beliefs (Bel/Pl/BetP/conflict) from current mass_functions state. Each claim's cache is written from ONE owner frame, chosen among the frames holding the claim's input BBAs (stored combination results are not inputs), a frame with an input the cache may fold (every source at least as widely readable as the claim) before one without, and then: binary_truth if the claim has an input there, else claim_validity, else the frame the cache already records (belief_frame_id) while it still holds an input, else the frame holding the claim's earliest input (ties by frame id). No other frame name plays a part, and no frame is created. The in-server sibling of the epigraph-recompute-belief CLI. Target by `claim_ids` (explicit), `labels` (e.g. a paper's claim set), or neither (bulk over all claims with BBAs, bounded by `limit`). Use after ingest or after editing calibration.toml / per-frame overrides so the cached scalars catch up to the combine path. Each claim's cache is recomputed in its own transaction; claims_recomputed and frame_writes count only claims whose cached belief columns (belief, plausibility, pignistic_prob, mass_on_empty, mass_on_missing, belief_frame_id) were actually written and committed, and a per-claim failure is rolled back and listed in errors. Requires scope claims:admin over HTTP (it reads and writes across every tenant). MOVED (operator decision D9): a request-serving MCP server holds no maintenance connection, so the call is refused with nothing written (JSON-RPC -32600, data.status=moved, not retryable) and names the operator CLI that runs it on the maintenance DSN: recompute_claim_belief."
     )]
     async fn recompute_beliefs(
         &self,
@@ -2653,7 +2686,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it; the response's write_outcome says which happened (inserted, unchanged for an identical resubmission that was not combined again, or replaced), deduplicated is true exactly when it is unchanged, and an unchanged or replaced write adds an entry to warnings. The belief is recomputed by the same combine recompute_beliefs uses (a Dempster fold over the claim's BBAs that reports the fold's aggregate conflict as mass_on_conflict): combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the BBA is owned by the calling agent's own group (its operator's group for an operated agent) and stays public; the claim's frame assignment stays owned by the claim's group (created if missing, never changed: an existing hypothesis_index is kept; a missing binary_truth assignment can be created only at hypothesis_index 0, i.e. TRUE, and any other index is refused with nothing written) and its cached belief is recombined over every writer's BBAs through an audited path only on the frame the cache already carries, or on binary_truth when the claim has no cache at all (a warning says when it was not); the claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
+        description = "Submit Dempster-Shafer evidence (mass function / BBA) for a claim within a frame, optionally under a perspective_id, and recompute the claim's cached belief when this frame is the claim's cache-owner frame. CACHE OWNER: a claim's cached belief is the fold of ONE frame, the one recompute_beliefs and retract_bba also refold: a frame holding an input at least as widely readable as the claim ranks first, then binary_truth, then claim_validity, then the frame the cache already records, then the frame of the claim's earliest input; a compound (a claim that decomposes into others) has no owner. Evidence filed on any other frame is stored and counted in bba_count, the response's belief is that frame's own combination, the cache is left as it was, and warnings says so. The frame assignment, the BBA and the recomputed belief commit together; a refusal (e.g. the claim is a group-private claim owned by a group the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio) cannot write, or the caller cannot read the claim, which is reported as not found) writes nothing, and every refusal is decided before the commit, never after the evidence is stored. Resubmitting for the same claim, frame and perspective_id REPLACES this agent's earlier BBA there rather than adding to it; the response's write_outcome says which happened (inserted, unchanged for an identical resubmission that was not combined again, or replaced), deduplicated is true exactly when it is unchanged, and an unchanged or replaced write adds an entry to warnings. The belief is recomputed by the same combine recompute_beliefs uses (a Dempster fold over the claim's BBAs that reports the fold's aggregate conflict as mass_on_conflict): combination_method is stored and echoed as method_used, but neither it nor gamma changes the returned belief: both are DEPRECATED, and sending a combination_method other than Dempster, or any gamma, adds an entry to the response's warnings array (omitted when empty). An evidence_type the recompute cannot resolve to a calibrated weight (not a calibration.toml [evidence_type_weights] key or [evidence_type_aliases] alias, nor in the frame's own evidence_type_weights override) is accepted and combined at the 0.5 unknown-type reliability, and is returned in unknown_keys with an explanatory entry in warnings: a warning, never a refusal. OWNERSHIP OF WHAT YOU ATTACH (migration 114): attaching to a PUBLIC claim does not require owning it. When the claim is owned by a group the calling agent cannot write (most public claims are owned by the shared world group), the BBA is owned by the calling agent's own group (its operator's group for an operated agent) and stays public; the claim's frame assignment stays owned by the claim's group (created if missing, never changed: an existing hypothesis_index is kept; a missing binary_truth assignment can be created only at hypothesis_index 0, i.e. TRUE, and any other index is refused with nothing written) and its cached belief is recombined over every writer's BBAs through an audited path only when this frame owns the cache and the cache already carries it, or on binary_truth when the claim has no cache at all (a warning says when it was not); the claim's truth_value and labels are not written. If the claim's owner later makes it non-public, rows you attached become the claim owner's (owner and visibility follow the claim). LIMITATION: the claim's cached belief combines every stored BBA as an independent source, so many submissions from ONE writer weigh as many sources; the cache is attributed per write and recomputable, and truth_value is never moved by a non-owner."
     )]
     async fn submit_ds_evidence(
         &self,
@@ -3222,7 +3255,12 @@ impl ServerHandler for EpiGraphMcpFull {
                     return Err(err);
                 }
                 // (b) require the caller's raw bearer to forward downstream.
+                // A refusal like (0) and (a), so audited like them (backlog
+                // b6559e75): reachable over HTTP by a caller the gates above
+                // admit with no token, the unauthenticated listener's.
                 let Some(token) = raw_token else {
+                    self.emit_tool_invoked(&format!("denied:{}:{}", ext_name, request.name))
+                        .await;
                     return Err(McpError {
                         code: rmcp::model::ErrorCode::INVALID_REQUEST,
                         message: std::borrow::Cow::Borrowed(
@@ -3336,8 +3374,23 @@ impl ServerHandler for EpiGraphMcpFull {
         // writes NO edge. Best-effort + memoized inside the helper (per process
         // on the HTTP listener; see `seen_auth_lineage`); borrow `auth_owned`
         // here (it is MOVED just below into `context`).
-        self.record_auth_lineage(auth_owned.as_ref().and_then(|a| a.agent_id))
-            .await;
+        //
+        // A principal-less context (`auth::is_principal_less`, the
+        // `--allow-unauthenticated-http` listener) writes NO edge either: no
+        // token was presented, so nobody authenticated and "acted on behalf
+        // of" would be false. Its injected principal is the listener's own
+        // reader agent (read-only) or the server agent itself (write opt-in;
+        // that edge is a self-loop `edges_no_self_loop` refuses anyway). An
+        // edge to the reader would also give the server agent a second
+        // OPERATED_BY target, which the operator-link functions read as the
+        // fingerprint of a shared HTTP signer and refuse to link.
+        self.record_auth_lineage(
+            auth_owned
+                .as_ref()
+                .filter(|a| !crate::auth::is_principal_less(a))
+                .and_then(|a| a.agent_id),
+        )
+        .await;
 
         // Propagate the HTTP-side `AuthContext` (set by
         // `auth::bearer_auth_middleware` and forwarded by
@@ -3399,9 +3452,9 @@ impl ServerHandler for EpiGraphMcpFull {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
         // Kernel tools first, then every federated tool the gateway currently
-        // advertises. Static-first mirrors `call_tool`'s resolution order: a
-        // kernel tool always wins a name clash (the operator resolves clashes
-        // between an extension and the kernel with a `prefix=`).
+        // advertises. The two never share a name: the registry refuses an
+        // extension tool named like a kernel tool (at boot, and leaves it
+        // unrouted on a reconnect; backlog 351d3def).
         //
         // The kernel list is THIS caller's (elevation plan EL-11, D2):
         // `sudo`/`unsudo` only to a holder of a live elevating role, and an
@@ -3425,8 +3478,8 @@ impl ServerHandler for EpiGraphMcpFull {
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        // Static router first (kernel tools win name clashes, as in call_tool),
-        // then fall back to a federated tool from the routing map.
+        // Static router first, as in call_tool, then a federated tool from the
+        // routing map. The registry never routes a kernel tool's name.
         self.tool_router.get(name).cloned().or_else(|| {
             self.federation
                 .list_federated_tools()

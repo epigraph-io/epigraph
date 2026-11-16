@@ -21,6 +21,9 @@
 //!   boot race that left episcience unroutable in production for hours — and is
 //!   a no-op against one that is still down or already healthy.
 
+#[path = "support/federation_stub.rs"]
+mod stub;
+
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
@@ -580,6 +583,11 @@ impl ServerHandler for DynStub {
                 "`depth` must be between 1 and 5",
                 None,
             )),
+            "fails_internally" => Err(ErrorData::internal_error(
+                "sample lookup: error returned from database: relation \
+                 \"stub_private_table\" does not exist",
+                None,
+            )),
             "hangs" => {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 unreachable!("the gateway abandons the call long before this")
@@ -797,6 +805,61 @@ async fn a_downstream_tool_error_reaches_the_caller_with_its_code_and_message() 
     );
 }
 
+/// A downstream's INTERNAL error is the one answer not passed through: its
+/// message is where a downstream that does not redact puts its driver text,
+/// which this server keeps from callers (`errors.rs`). The caller is told
+/// which extension failed, still as an internal error, and not what the
+/// downstream's database said. Operator ruling of 2026-11-16: redact.
+///
+/// Mutation: drop the `INTERNAL_ERROR` arm in `federated_call_error` -> the
+/// stub's "stub_private_table" reaches the caller, and this fails.
+#[tokio::test]
+async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
+    let (addr, _control) = spawn_dyn_stub(&["fails_internally"]).await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+            .await
+            .unwrap(),
+    );
+
+    let err = federation
+        .invoke("fails_internally", "caller-tok", None)
+        .await
+        .expect_err("the stub fails this tool internally");
+    assert!(
+        matches!(
+            &err,
+            epigraph_mcp::federation::client::FederationError::Downstream(d)
+                if d.message.contains("stub_private_table")
+        ),
+        "CALIBRATION: the downstream's own answer carries the driver text: {err:?}"
+    );
+    assert!(
+        federation.route_config("fails_internally").is_some(),
+        "an internal error says nothing about the extension's health"
+    );
+
+    let answer = epigraph_mcp::errors::federated_call_error("episcience", "fails_internally", err);
+    assert_eq!(
+        answer.code,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "still an internal error"
+    );
+    assert!(
+        !answer.message.contains("stub_private_table") && !answer.message.contains("database"),
+        "a downstream's internal error text must not reach the caller: {}",
+        answer.message
+    );
+    assert!(
+        answer
+            .message
+            .contains("internal error in extension `episcience`"),
+        "the caller is told which extension failed: {}",
+        answer.message
+    );
+    assert!(answer.data.is_none(), "no downstream data is forwarded");
+}
+
 /// A downstream that accepts a call and never answers is abandoned at the
 /// configured bound instead of holding the caller's request open.
 #[tokio::test]
@@ -993,4 +1056,82 @@ async fn a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied(
         .expect("stub returns text content")
         .text;
     assert_eq!(text.len(), 15 * 1024 * 1024);
+}
+
+// ── Backlog 351d3def: an extension tool named like a kernel tool ────────────
+//
+// `call_tool` tries the kernel router first, so an extension tool sharing a
+// kernel tool's name could never be called, and the manifest listed the name
+// twice. `build` reserves every kernel tool name and refuses the clash, as it
+// refuses two extensions exporting the same name. `submit_claim` is a real
+// kernel tool, so these tests pin the reserved set `build` actually uses.
+
+/// Mutation: drop the `reserved.contains` check from `build_reserving` (or
+/// have `build` reserve an empty set) -> the build succeeds and this fails.
+#[tokio::test]
+async fn an_extension_exporting_a_kernel_tool_name_fails_build() {
+    assert!(
+        epigraph_mcp::EpiGraphMcpFull::kernel_tool_names().contains("submit_claim"),
+        "CALIBRATION: `submit_claim` is a kernel tool"
+    );
+    let (addr, _slot) = spawn_stub("submit_claim").await;
+    let result =
+        FederationRegistry::build(vec![cfg("clashing", &addr, None)], "discovery-tok").await;
+    let err = match result {
+        Ok(_) => panic!("an extension exporting a kernel tool name must fail the build"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("submit_claim"), "must name the tool: {msg}");
+    assert!(msg.contains("clashing"), "must name the extension: {msg}");
+    assert!(
+        msg.contains("kernel"),
+        "must say what it clashes with: {msg}"
+    );
+    assert!(msg.contains("prefix="), "must name the remedy: {msg}");
+}
+
+/// The remedy the refusal names works: under a prefix the name is distinct.
+#[tokio::test]
+async fn a_prefix_resolves_a_kernel_tool_name_clash() {
+    let (addr, _slot) = spawn_stub("submit_claim").await;
+    let registry =
+        FederationRegistry::build(vec![cfg("clashing", &addr, Some("ext__"))], "discovery-tok")
+            .await
+            .expect("a prefixed name does not clash with the kernel");
+    assert!(registry.route("ext__submit_claim").is_some());
+    assert!(registry.route("submit_claim").is_none());
+}
+
+/// An extension down at boot is checked against nothing then, so the clash
+/// first appears at reconnect. The running gateway is not taken down: the
+/// kernel-named tool is left unrouted and unlisted, and the rest are routed.
+///
+/// Mutation: make `without_reserved` keep every tool -> `submit_claim`
+/// is routed to the extension and listed twice, and this fails.
+#[tokio::test]
+async fn a_reconnect_does_not_route_a_kernel_tool_name() {
+    let addr = stub::dead_addr().await;
+    let federation = SharedFederation::new(
+        FederationRegistry::build(vec![cfg("late", &addr, None)], "discovery-tok")
+            .await
+            .expect("an unreachable extension must not fail the build"),
+    );
+    let _control = stub::spawn_controlled_stub_on(&addr, &["submit_claim", "late_probe"]).await;
+    federation.reconnect_tick().await;
+
+    let listed: Vec<String> = federation
+        .list_federated_tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["late_probe".to_string()],
+        "only the non-clashing tool is routed after the reconnect"
+    );
+    assert!(
+        federation.route_config("submit_claim").is_none(),
+        "a kernel tool name must never route to an extension"
+    );
 }
