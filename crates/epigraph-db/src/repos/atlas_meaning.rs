@@ -158,6 +158,122 @@ impl AtlasMeaningRepository {
         Ok(out)
     }
 
+    /// How many current, themed claims `map` may draw have no embedding, in
+    /// EVERY theme (also one with no embedded member, which has no tree): the
+    /// claims no leaf of the map holds. Atlas W9's per-map
+    /// `unembedded_members`.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn unembedded_members_on_map(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::int8 \
+               FROM claims c \
+              WHERE c.theme_id IS NOT NULL \
+                AND c.embedding IS NULL \
+                AND COALESCE(c.is_current, true) \
+                AND (c.visibility = 'public' \
+                     OR ($1::uuid IS NOT NULL AND c.visibility = 'group' \
+                         AND c.owner_group_id = $1)) \
+                /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
+    /// How many claims with an embedding have no theme, as `viewer` may read
+    /// them: exactly what the nightly's theme assignment
+    /// (`ClaimThemeRepository::assign_unthemed_batch`) would place, which
+    /// assigns superseded claims too (no `is_current` filter, as there). A dry run
+    /// reports this instead of assigning. Corpus-wide, not per map: theme
+    /// membership is one column for every map.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn unthemed_embedded_count(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+    ) -> Result<i64, DbError> {
+        let sql = viewer.splice(
+            "SELECT COUNT(*)::int8 FROM claims c \
+              WHERE c.theme_id IS NULL AND c.embedding IS NOT NULL \
+                /* {VISIBILITY:c} */",
+            1,
+        );
+        let mut q = sqlx::query_scalar::<_, i64>(&sql);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
+    /// Every theme holding more than `cap` current claims, as `viewer` may
+    /// read them, with its count, largest first: the themes Atlas W1's
+    /// operator-run split should break up (W1 counts current members, as
+    /// here). The nightly reports them and splits nothing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn themes_over_member_cap(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        cap: i64,
+    ) -> Result<Vec<(Uuid, i64)>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.theme_id, COUNT(*)::int8 AS n FROM claims c \
+              WHERE c.theme_id IS NOT NULL AND COALESCE(c.is_current, true) \
+                /* {VISIBILITY:c} */ \
+              GROUP BY c.theme_id HAVING COUNT(*) > $1 \
+              ORDER BY n DESC, c.theme_id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, i64)>(&sql).bind(cap);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?)
+    }
+
+    /// The stored `truth_value` of each claim of `claim_ids` that `map` may
+    /// draw: a leaf claim node's colour value, as the region and theme levels
+    /// serve it, and nothing more (it never enters a flow weight). Ids the
+    /// map may not draw are absent, so their node carries no value.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn claim_truth_values(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        claim_ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, f64>, DbError> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.truth_value \
+               FROM claims c \
+              WHERE c.id = ANY($1) \
+                AND (c.visibility = 'public' \
+                     OR ($2::uuid IS NOT NULL AND c.visibility = 'group' \
+                         AND c.owner_group_id = $2)) \
+                /* {VISIBILITY:c} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, f64)>(&sql)
+            .bind(claim_ids)
+            .bind(map_team(map));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn).await?.into_iter().collect())
+    }
+
     /// The text of each claim of `claim_ids` that `map` may draw, for a leaf
     /// node's label. Ids the map may not draw are absent.
     ///

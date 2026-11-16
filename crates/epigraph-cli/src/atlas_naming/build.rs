@@ -187,7 +187,9 @@ pub async fn name_map(
 /// The naming and the write half of [`name_map`]. The write refuses when
 /// the map's latest finished run is no longer the one that was read: a
 /// build that finished while the model ran is newer, and a copy of the older
-/// run, finished after it, would be served in its place.
+/// run, finished after it, would be served in its place. The check and the
+/// write run under the map's publish lock
+/// (`AtlasMapRepository::lock_map_for_publish`), which the nightly takes too.
 ///
 /// # Errors
 /// A newer run of the map, documents the contract refuses, or a database
@@ -244,6 +246,10 @@ pub async fn name_and_write(
     params["naming"] = serde_json::to_value(&record)?;
     params["named_from_run"] = json!(source.id);
     let mut tx = conn.begin().await.context("begin the naming write")?;
+    // The nightly (W9) publishes the same map; both take the map's publish
+    // lock before their newer-run check, so a check and a publish cannot
+    // interleave with the other's.
+    AtlasMapRepository::lock_map_for_publish(&mut tx, map).await?;
     let latest = AtlasNamingRepository::latest_finished_run(&mut tx, viewer, map, false)
         .await?
         .map(|r| r.id);

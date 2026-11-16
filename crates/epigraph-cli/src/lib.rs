@@ -4,6 +4,7 @@ pub mod atlas_links;
 #[cfg(feature = "db")]
 pub mod atlas_meaning;
 pub mod atlas_naming;
+pub mod atlas_nightly;
 #[cfg(feature = "db")]
 pub mod atomicity_sweep;
 #[cfg(feature = "db")]
