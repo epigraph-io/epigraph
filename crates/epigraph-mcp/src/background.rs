@@ -90,6 +90,22 @@ impl BackgroundTasks {
     }
 }
 
+/// How long a process waits, before it exits, for the tracked tasks still
+/// running: `EPIGRAPH_MCP_STDIO_DRAIN_SECS`, default 120. An unparseable value
+/// keeps the default; `0` waits not at all (the behaviour before the wait
+/// existed). Read by the stdio entry point after its client disconnects and
+/// by the operator `ingest-document` CLI after its walk returns with the
+/// embedding loop still running.
+#[must_use]
+pub fn exit_drain_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("EPIGRAPH_MCP_STDIO_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::BackgroundTasks;

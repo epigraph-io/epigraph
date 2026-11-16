@@ -169,6 +169,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
     // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
     // it took the viewer only while it read lineage, and no longer reads any.
+    // write: `insert_on` records the `claim.assessed` writer event inside the
+    // slot transaction (ids and booleans only; the event list hides it from a
+    // reader who cannot read the claim).
     (
         "assess.rs",
         "assess_claim",
@@ -178,6 +181,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed",
+            "EventRepository::insert_on",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
@@ -190,8 +194,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
-            "sqlx::query(UPDATE).execute",
         ],
+    ),
+    // stamped (backlog 8a168dd6): the read runs on `AppState::read_as` with the
+    // caller's viewer; `security_events` has no in-query viewer predicate, so
+    // row security (`security_events_read`) is the filter, by design.
+    (
+        "audit.rs",
+        "query_security_events",
+        &["SecurityEventRepository::query"],
     ),
     // stamped: the write transaction is stamped from the caller's viewer, and
     // the retract / un-retract definer (migration 184) selects the BBA only
@@ -206,13 +217,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bba_retract.rs",
         "unretract_bba",
         &["MassFunctionRepository::unretract_conn"],
-    ),
-    // open finding: F-aggregate-existence-oracles (the frame's conflict
-    // aggregate over mass_functions).
-    (
-        "belief.rs",
-        "frame_conflict",
-        &["sqlx::query_as(SELECT).fetch_one"],
     ),
     // gated (parent frame) then write.
     (
@@ -242,7 +246,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "CommunityRepository::communities_for_perspective",
             "CommunityRepository::member_perspective_ids",
             "ConflictDensityRepository::for_frames",
-            "DivergenceRepository::store",
             "MassFunctionRepository::store_with_perspective",
             "ScopedBeliefRepository::upsert",
             "ScopedBeliefRepository::upsert",
@@ -254,10 +257,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
             "sqlx::query(INSERT).execute",
-            "sqlx::query(UPDATE).execute",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_as(SELECT).fetch_optional",
             "sqlx::query_scalar(SELECT).fetch_optional",
@@ -397,11 +398,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bp_seed_rows",
         &["derivation_scope::retain_for_cache"],
     ),
+    // stamped: the frame-density aggregate behind `silence_alarms` takes no
+    // viewer (counts only, no row content) and runs on the caller's `read_as`
+    // connection, so row security scopes its counts; the content read beside
+    // it receives the viewer (`high_conflict_claims`).
+    (
+        "conflicts.rs",
+        "scan_conflicts",
+        &["ConflictDensityRepository::scan"],
+    ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
-    // The signed REFUTES edge write runs on a transaction stamped with the
-    // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,
-    // passed as `&mut tx`): the edge trigger and WITH CHECK decide the write,
-    // as for create_edge.
+    // The refuting evidence and its signed `refutes` edge (backlog 2d60f619)
+    // are ONE write on a transaction stamped with the caller's viewer
+    // (`state.write_as(&viewer, ..)`, passed as `&mut *tx`): the evidence and
+    // edge triggers and WITH CHECK decide the write, as for create_edge.
     (
         "conventions.rs",
         "forget_convention",
@@ -409,7 +419,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::create",
             "AgentRepository::get_by_public_key",
             "ClaimRepository::update_truth_value",
-            "EdgeRepository::create_signed_conn",
             "EvidenceRepository::create",
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
@@ -458,6 +467,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "assign_claim_to_frame",
         &[
             "FrameRepository::assign_claim",
+            "provenance::record_provenance",
+        ],
+    ),
+    // stamped / write (backlog f64cf9c6): the author is the caller; the
+    // claim's viewer-spliced pre-read, the trace and its best-effort edge run
+    // on ONE `AppState::write_as` transaction, so the database decides the
+    // trace's owner (`reasoning_traces_attach_writer`) and refuses what the
+    // caller may not write. Provenance is the audit-trail append.
+    (
+        "crud.rs",
+        "create_reasoning_trace",
+        &[
+            "ReasoningTraceRepository::create",
+            "belief::create_edge_under_savepoint",
             "provenance::record_provenance",
         ],
     ),
@@ -714,6 +737,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
+    // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
+    // with `/claims/:id/placement` and `graph_neighborhood.rs::expand`); the
+    // theme, its neighbourhoods and their edges are read through the viewer
+    // (backlog 01e0b839).
+    (
+        "graph.rs",
+        "themes_expand",
+        &["ClusterRunRepository::latest"],
+    ),
     // untenanted: the Atlas layout run and its epoch flag (migration 197); the
     // run's contents are read through the viewer (`overview`, `region_detail`,
     // `unplaced_themes`).
@@ -731,16 +763,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AtlasLayoutRepository::resolve_sides",
             "AtlasLayoutRepository::run",
-        ],
-    ),
-    // open finding: F-aggregate-existence-oracles (the two decomposes_to
-    // counts deciding center_kind).
-    (
-        "graph_neighborhood.rs",
-        "claim_compound_neighborhood",
-        &[
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
     // untenanted: the latest cluster run (`ClusterRunRepository::latest`, shared
@@ -1095,9 +1117,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
     // no SQL (embeddings, including `generate_walk_query_embedding`, the
     // pageable request's variant that answers 503 instead of the mock when the
-    // service fails), untenanted (claim_themes, the centroid-dimension probe),
-    // and the content read registered in viewer_route_table_lint.rs's
-    // UNCOMPENSATED_INLINE_READS (ids from a viewer-spliced theme read).
+    // service fails) and untenanted (claim_themes, the centroid-dimension
+    // probe). The diverse arm's content read left this list when it became
+    // `ClaimRepository::semantic_selected_claims(.., &viewer, ..)` (backlog
+    // 67c905a3).
     (
         "search.rs",
         "semantic_search",
@@ -1107,7 +1130,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "generate_query_embedding",
             "generate_query_embedding_with_dim",
             "generate_walk_query_embedding",
-            "sqlx::query(SELECT).fetch_all",
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
@@ -1193,22 +1215,19 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "ingest_workflow",
         &["record_api_authorship"],
     ),
-    // stamped: the `workflows` row is locked (SELECT .. FOR UPDATE) and its
-    // counters updated on the caller's stamped write transaction, where row
-    // security (migration 183, ruling R-74) hides a row the caller does not
-    // read, so it takes the missing-id 404; `viewer_reads_plan_structure`
-    // (viewed) then requires a readable step before any write. untenanted:
-    // behavioral_executions. write.
+    // The `workflows` row lock, the plan check and the counter UPDATE are
+    // one viewed call, `WorkflowRepository::record_hierarchical_outcome`
+    // (backlog c34a0643; it used to be two inline statements here).
+    // untenanted: behavioral_executions. write.
     (
         "workflows.rs",
         "report_hierarchical_outcome",
-        &[
-            "BehavioralExecutionRepository::create",
-            "sqlx::query(UPDATE).execute",
-            "sqlx::query_as(SELECT).fetch_optional",
-        ],
+        &["BehavioralExecutionRepository::create"],
     ),
     // gated (`get_by_id_with_labels`) then write on the stamped transaction.
+    // The counter read on that transaction left this list when it became
+    // `WorkflowRepository::flat_workflow_claim(.., &viewer, ..)` (backlog
+    // 67c905a3).
     (
         "workflows.rs",
         "report_outcome",
@@ -1216,7 +1235,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::create",
             "ClaimRepository::set_properties_conn",
             "ClaimRepository::update_truth_value_conn",
-            "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
     // untenanted: behavioral_executions.
@@ -1318,24 +1336,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
-    // stamped: the neighborhood's edge projections, on the caller's stamped
-    // connection, are constrained in Rust to endpoints that survived the
-    // viewer-filtered node projection (PR-07); the edges' own predicate is
-    // F-edges-unfiltered.
-    (
-        "graph_neighborhood.rs",
-        "atomic_response",
-        &["sqlx::query_as(SELECT).fetch_all"],
-    ),
-    (
-        "graph_neighborhood.rs",
-        "compound_response",
-        &[
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-            "sqlx::query_as(WITH).fetch_all",
-        ],
-    ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
     // load_subgraph_conn splices the viewer except `agents` (untenanted).
@@ -1384,7 +1384,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
             "EdgeRepository::create_signed_conn",
-            "EdgeRepository::create_signed_conn",
+            // The evidence's `supports` edge (backlog 2d60f619), on the same
+            // stamped claim-write transaction.
+            "EvidenceRepository::link_to_claims_signed_conn",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",
             "sqlx::query(?).execute",
@@ -1459,7 +1461,17 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "workflows.rs",
         "require_api_lineage_authority",
-        &["WorkflowRepository::workflows_executing_step_lineage"],
+        // Both are AUTHORITY reads of the workflows executing a step's
+        // lineage (the set the caller must hold authority over), so a viewer
+        // predicate could only drop workflows and make the gate fail open.
+        // `step_lineage_executors` (migration 219's definer) is the same set
+        // read unfiltered; its ids stay in the server, and every refusal over
+        // one the caller's own read did not return is the missing-parent
+        // answer.
+        &[
+            "WorkflowRepository::step_lineage_executors",
+            "WorkflowRepository::workflows_executing_step_lineage",
+        ],
     ),
     (
         "workflows.rs",

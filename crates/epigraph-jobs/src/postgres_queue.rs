@@ -44,6 +44,20 @@ use uuid::Uuid;
 pub const REAPED_SPENT_MESSAGE: &str = "reaped: still running past the stale bound on its last \
      attempt (the drain run was killed or died mid-job); no further attempt";
 
+/// The `error_message` of a ONE-attempt row the reaper failed: it was still
+/// `running` past the stale bound after [`MAX_CRASH_REDELIVERIES`] uncounted
+/// re-deliveries, so its handler crashes or is killed on every run.
+pub const REAPED_REDELIVERIES_SPENT_MESSAGE: &str = "reaped: a one-attempt job still running past \
+     the stale bound after its last crash re-delivery (the drain run was killed or died mid-job \
+     on every run); no further delivery";
+
+/// How many times the reaper re-delivers a ONE-attempt row (`max_retries <=
+/// 1`) that was still `running` past the stale bound, before it fails the row
+/// with [`REAPED_REDELIVERIES_SPENT_MESSAGE`] (migration 220's
+/// `jobs.redelivery_count`, backlog 1320b4e3). Three re-deliveries: four runs
+/// that each died mid-job is a crash loop, not bad luck.
+pub const MAX_CRASH_REDELIVERIES: i32 = 3;
+
 /// One row [`PostgresJobQueue::reap_stale_jobs_counting_attempts`] touched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReapedJob {
@@ -51,9 +65,15 @@ pub struct ReapedJob {
     pub id: Uuid,
     /// Its type.
     pub job_type: String,
-    /// `true`: the reap used its last attempt and the row is now `failed`.
-    /// `false`: it is back to `pending`.
+    /// `true`: the row is now `failed`, because the reap used its last
+    /// attempt or (a one-attempt row) its last crash re-delivery. `false`: it
+    /// is back to `pending`.
     pub failed: bool,
+    /// `true`: a one-attempt row (`max_retries <= 1`), whose reap is bounded
+    /// by `redelivery_count` instead of `retry_count`; a failed one carries
+    /// [`REAPED_REDELIVERIES_SPENT_MESSAGE`], any other failed row
+    /// [`REAPED_SPENT_MESSAGE`].
+    pub one_attempt: bool,
 }
 
 // ============================================================================
@@ -276,62 +296,6 @@ impl JobQueue for PostgresJobQueue {
 
         tracing::debug!(job_id = %job.id, "Job enqueued successfully");
         Ok(job.id)
-    }
-
-    /// Enqueue only if no job of the same `job_type` is currently `pending`.
-    ///
-    /// Implemented as a single `INSERT ... SELECT ... WHERE NOT EXISTS` so the
-    /// check-and-insert is one statement. Returns `Ok(None)` when a pending
-    /// job of that type already exists (nothing inserted).
-    ///
-    /// Note: a vanishingly small race remains if two processes insert in the
-    /// same instant (each cron fires at most once per boot). That is harmless
-    /// here — execution is additionally serialized by an advisory lock
-    /// (`run_serialized`), so any duplicate that slips through runs as a no-op.
-    #[instrument(skip(self, job), fields(job_id = %job.id, job_type = %job.job_type))]
-    async fn enqueue_unique_pending(&self, job: Job) -> Result<Option<JobId>, JobError> {
-        let id: Uuid = job.id.into();
-        let state_str = job_state_to_str(job.state);
-
-        let result = sqlx::query(
-            r"
-            INSERT INTO jobs (
-                id, job_type, payload, state, retry_count, max_retries,
-                created_at, updated_at, started_at, completed_at, error_message
-            )
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
-            WHERE NOT EXISTS (
-                SELECT 1 FROM jobs WHERE job_type = $2 AND state = 'pending'
-            )
-            ",
-        )
-        .bind(id)
-        .bind(&job.job_type)
-        .bind(&job.payload)
-        .bind(state_str)
-        .bind(job.retry_count as i32)
-        .bind(job.max_retries as i32)
-        .bind(job.created_at)
-        .bind(job.updated_at)
-        .bind(job.started_at)
-        .bind(job.completed_at)
-        .bind(&job.error_message)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| JobError::ProcessingFailed {
-            message: format!("Failed to enqueue (unique pending): {e}"),
-        })?;
-
-        if result.rows_affected() == 0 {
-            tracing::debug!(
-                job_type = %job.job_type,
-                "enqueue_unique_pending: a pending job of this type already exists; skipped"
-            );
-            Ok(None)
-        } else {
-            tracing::debug!(job_id = %job.id, "enqueue_unique_pending: enqueued");
-            Ok(Some(job.id))
-        }
     }
 
     /// Dequeue the next pending job for processing.
@@ -711,6 +675,69 @@ impl PostgresJobQueue {
         })
     }
 
+    /// How many `pending` jobs there are of each type NOT in `job_types`: the
+    /// work a drain registered for `job_types` will never claim (one
+    /// `GROUP BY`). Types with no pending job are absent.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self))]
+    pub async fn count_pending_by_type_outside(
+        &self,
+        job_types: &[String],
+    ) -> Result<std::collections::BTreeMap<String, i64>, JobError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT job_type, count(*) FROM jobs \
+              WHERE state = 'pending' AND NOT (job_type = ANY($1)) \
+              GROUP BY job_type",
+        )
+        .bind(job_types)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to count pending jobs of unregistered types: {e}"),
+        })?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Set every `pending` job whose type is in `job_types` to `cancelled`,
+    /// with `error_message = message`, and return how many of each type it
+    /// cancelled (one `UPDATE`). Rows in any other state are untouched, so a
+    /// job a run is executing, or one already finished, is never rewritten.
+    ///
+    /// The caller decides which types may be cancelled: `drain_jobs
+    /// --cancel-pending` passes only types its run has NO handler for
+    /// (`jobs_drain::drain_cancelling` refuses any other), so this never
+    /// discards work the queue could still do.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self, message))]
+    pub async fn cancel_pending_of_types(
+        &self,
+        job_types: &[String],
+        message: &str,
+    ) -> Result<std::collections::BTreeMap<String, i64>, JobError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "WITH cancelled AS ( \
+                UPDATE jobs \
+                   SET state = 'cancelled', error_message = $2, \
+                       updated_at = now(), completed_at = now() \
+                 WHERE state = 'pending' AND job_type = ANY($1) \
+                RETURNING job_type \
+             ) \
+             SELECT job_type, count(*) FROM cancelled GROUP BY job_type",
+        )
+        .bind(job_types)
+        .bind(message)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to cancel pending jobs: {e}"),
+        })?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// The drain timer's reaper (`drain_jobs`, operator decision D9): reset
     /// every `running` row whose `started_at` is older than `stale_threshold`,
     /// COUNTING the reap as a used attempt, and fail the row outright once its
@@ -733,20 +760,27 @@ impl PostgresJobQueue {
     ///
     /// The row's own attempt budget decides, not a list of job types. A row
     /// enqueued with one attempt (`PrivatizationRepository::enqueue_job_conn`
-    /// writes `max_retries = 1` for every type it enqueues: the privatization
-    /// apply, revert and reseal jobs AND the unseal's `embedding_generation`
-    /// jobs) is built around ONE attempt plus re-delivery: a worker that died
-    /// mid-job is re-delivered, and the handler's own state check makes a
-    /// re-delivery after its terminal write a no-op refusal. A counted reap
-    /// would compute `0 + 1 >= 1` and fail such a job before its handler ever
-    /// runs (a privatization plan left mid-flight; a restored claim left with no
-    /// embedding). So those rows keep [`Self::recover_stale_jobs`]' behaviour.
+    /// writes `max_retries = 1` for the privatization apply, revert and reseal
+    /// jobs; the unseal's `embedding_generation` jobs get a retry budget since
+    /// backlog 1320b4e3) is built around ONE attempt plus re-delivery: a worker
+    /// that died mid-job is re-delivered, and the handler's own state check
+    /// makes a re-delivery after its terminal write a no-op refusal. A counted
+    /// reap would compute `0 + 1 >= 1` and fail such a job before its handler
+    /// ever runs (a privatization plan left mid-flight). So those rows keep
+    /// [`Self::recover_stale_jobs`]' behaviour.
     ///
     /// Deciding by the row means a new one-attempt enqueuer is covered without
-    /// editing a list here. The cost: a one-attempt job that is killed on EVERY
-    /// run is re-delivered on every run, as it was before this reaper existed.
-    /// What bounds it in practice is the drain unit's start timeout, whose
-    /// failure mails the operator (`OnFailure=`).
+    /// editing a list here.
+    ///
+    /// # A one-attempt row's re-deliveries are bounded by their own counter
+    ///
+    /// An uncounted reset bumps `jobs.redelivery_count` (migration 220) instead
+    /// of `retry_count`, and the reap that would take it past
+    /// [`MAX_CRASH_REDELIVERIES`] fails the row with
+    /// [`REAPED_REDELIVERIES_SPENT_MESSAGE`]. Before that bound a one-attempt
+    /// job killed on EVERY run was re-delivered on every run, for ever
+    /// (backlog 1320b4e3). A privatization job failed this way leaves its plan
+    /// in `applying` / `reverting`; the operator's recovery is the plan's abort.
     ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error or an invalid duration.
@@ -761,31 +795,38 @@ impl PostgresJobQueue {
                     message: format!("Invalid duration: {e}"),
                 }
             })?;
-        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+        let rows: Vec<(Uuid, String, String, bool)> = sqlx::query_as(
             r"
             WITH stale AS (
                 SELECT id,
                        max_retries > 1 AS counted,
-                       max_retries > 1 AND retry_count + 1 >= max_retries AS spent
+                       CASE WHEN max_retries > 1 THEN retry_count + 1 >= max_retries
+                            ELSE redelivery_count + 1 > $3 END AS spent
                   FROM jobs
                  WHERE state = 'running' AND started_at < $1
                  FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs j
-               SET retry_count   = CASE WHEN s.counted THEN j.retry_count + 1
-                                        ELSE j.retry_count END,
-                   state         = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
-                   started_at    = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
-                   completed_at  = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
-                   error_message = CASE WHEN s.spent THEN $2 ELSE j.error_message END,
-                   updated_at    = NOW()
+               SET retry_count      = CASE WHEN s.counted THEN j.retry_count + 1
+                                           ELSE j.retry_count END,
+                   redelivery_count = CASE WHEN s.counted OR s.spent THEN j.redelivery_count
+                                           ELSE j.redelivery_count + 1 END,
+                   state            = CASE WHEN s.spent THEN 'failed' ELSE 'pending' END,
+                   started_at       = CASE WHEN s.spent THEN j.started_at ELSE NULL END,
+                   completed_at     = CASE WHEN s.spent THEN NOW() ELSE j.completed_at END,
+                   error_message    = CASE WHEN NOT s.spent THEN j.error_message
+                                           WHEN s.counted THEN $2
+                                           ELSE $4 END,
+                   updated_at       = NOW()
               FROM stale s
              WHERE j.id = s.id
-            RETURNING j.id, j.job_type, j.state
+            RETURNING j.id, j.job_type, j.state, NOT s.counted
             ",
         )
         .bind(cutoff)
         .bind(REAPED_SPENT_MESSAGE)
+        .bind(MAX_CRASH_REDELIVERIES)
+        .bind(REAPED_REDELIVERIES_SPENT_MESSAGE)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| JobError::ProcessingFailed {
@@ -793,10 +834,11 @@ impl PostgresJobQueue {
         })?;
         let reaped: Vec<ReapedJob> = rows
             .into_iter()
-            .map(|(id, job_type, state)| ReapedJob {
+            .map(|(id, job_type, state, one_attempt)| ReapedJob {
                 id,
                 job_type,
                 failed: state == "failed",
+                one_attempt,
             })
             .collect();
         if !reaped.is_empty() {

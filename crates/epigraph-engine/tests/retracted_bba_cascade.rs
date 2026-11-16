@@ -144,6 +144,7 @@ async fn the_supersede_cascade_keeps_retracted_edge_bbas_and_counts_them(pool: P
         let mut tx = pool.begin().await.expect("begin");
         let ids = ClaimRepository::supersede_act_conn(
             &mut tx,
+            None,
             ClaimId::from_uuid(a),
             "k4a s8 replacement",
             epigraph_core::TruthValue::clamped(0.5),

@@ -221,7 +221,7 @@ fn one_author_extraction(
     doi: &str,
     author: &str,
     tag: &str,
-) -> epigraph_ingest::schema::DocumentExtraction {
+) -> epigraph_ingest::document::schema::DocumentExtraction {
     serde_json::from_value(serde_json::json!({
         "source": {
             "title": format!("Card Count Study {tag}"),
@@ -250,7 +250,7 @@ fn authors_extraction(
     doi: &str,
     authors: &[&str],
     tag: &str,
-) -> epigraph_ingest::schema::DocumentExtraction {
+) -> epigraph_ingest::document::schema::DocumentExtraction {
     let mut x = one_author_extraction(doi, authors[0], tag);
     x.source.authors = authors
         .iter()

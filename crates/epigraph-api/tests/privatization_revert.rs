@@ -504,7 +504,7 @@ async fn revert_is_refused_while_a_seal_plan_item_is_still_sealed(pool: PgPool) 
     .expect("count queued revert jobs");
     assert_eq!(
         queued, 1,
-        "the dispatch must enqueue exactly one job. `enqueue_unique_pending` would have made a \
+        "the dispatch must enqueue exactly one job. A dedup on `job_type` would have made a \
          second plan's job silently vanish, which is why the repo uses a plain enqueue"
     );
 

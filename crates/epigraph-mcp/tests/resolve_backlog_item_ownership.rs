@@ -115,6 +115,7 @@ async fn resolve_backlog_item_permits_own_signer_claim(pool: PgPool) {
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
@@ -343,6 +344,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

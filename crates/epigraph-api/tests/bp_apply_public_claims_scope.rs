@@ -95,9 +95,14 @@ async fn bp_apply_never_writes_a_public_claim_from_a_private_neighbour(pool: PgP
         "max_iterations": 10,
     }))
     .expect("request");
-    let Json(body) = propagate_beliefs(ViewerExtractor(viewer), State(state), Json(request))
-        .await
-        .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
+    let Json(body) = propagate_beliefs(
+        ViewerExtractor(viewer),
+        bearer(member, &["claims:write"]),
+        State(state),
+        Json(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
 
     let computed: Vec<Uuid> = body["updated_beliefs"]
         .as_array()
@@ -209,9 +214,14 @@ async fn bp_apply_never_writes_a_group_claim_from_another_groups_neighbour(pool:
         "max_iterations": 10,
     }))
     .expect("request");
-    let Json(body) = propagate_beliefs(ViewerExtractor(viewer), State(state), Json(request))
-        .await
-        .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
+    let Json(body) = propagate_beliefs(
+        ViewerExtractor(viewer),
+        bearer(member, &["claims:write"]),
+        State(state),
+        Json(request),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("propagate_beliefs failed: {e:?}"));
 
     assert_eq!(
         betp(&pool, in_a).await,
@@ -232,4 +242,25 @@ async fn bp_apply_never_writes_a_group_claim_from_another_groups_neighbour(pool:
         body["applied_count"].as_u64().unwrap_or_default() >= 1,
         "the one-group component must still be applied: {body}"
     );
+}
+
+/// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
+/// f00d75ab: `apply_updates: true` needs `claims:write`).
+fn bearer(
+    agent: Uuid,
+    scopes: &[&str],
+) -> axum::Extension<epigraph_api::middleware::bearer::AuthContext> {
+    axum::Extension(epigraph_api::middleware::bearer::AuthContext {
+        client_id: agent,
+        agent_id: Some(agent),
+        owner_id: Some(agent),
+        client_type: epigraph_api::middleware::ClientType::Service,
+        scopes: scopes.iter().map(|s| s.to_string()).collect(),
+        jti: Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+        delegated_by: None,
+    })
 }

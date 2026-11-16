@@ -187,6 +187,35 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The most dataset rows `get_claim` lists for one claim (the oldest first);
+/// a row is up to about 21 KB at the validator's bounds, so this keeps the
+/// response under about 700 KB however many rows are attached. More is
+/// reported as `datasets_truncated`.
+const GET_CLAIM_MAX_DATASETS: usize = 32;
+
+/// The evidence type a submission's evidence row is stored as.
+///
+/// `evidence_type` is parsed (and so validated) whether or not a `dataset` is
+/// given: it still names the calibration weight and the DS wiring's evidence
+/// category. A `dataset` only decides the STORED variant, which becomes
+/// [`EvidenceType::Dataset`], normalised and validated by
+/// [`EvidenceType::dataset`] (backlog c8beb101). Runs before anything is
+/// written, so a bad dataset refuses the call (or, in a batch, its entry) and
+/// writes nothing.
+fn submission_evidence_type(
+    evidence_type: &str,
+    source_url: Option<&str>,
+    dataset: Option<&crate::types::DatasetEvidenceParams>,
+) -> Result<EvidenceType, McpError> {
+    let parsed = parse_evidence_type(evidence_type, source_url).map_err(invalid_params)?;
+    match dataset {
+        Some(d) => {
+            EvidenceType::dataset(d.clone().into()).map_err(|e| invalid_params(e.to_string()))
+        }
+        None => Ok(parsed),
+    }
+}
+
 /// The largest claim content, in bytes, the claim-writing tools accept. The
 /// same cap as the HTTP twins (`epigraph-api` `routes/submit.rs` and
 /// `routes/batch.rs`, `MAX_CLAIM_CONTENT_LENGTH`), so the two transports agree
@@ -297,6 +326,9 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
             if !params.labels.is_empty() {
                 discarded.push("labels");
             }
+            if params.dataset.is_some() {
+                discarded.push("dataset");
+            }
         }
         DedupBy::ContentHash => {
             applied.extend([
@@ -313,6 +345,9 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
             }
             if !params.labels.is_empty() {
                 applied.push("labels");
+            }
+            if params.dataset.is_some() {
+                applied.push("dataset");
             }
             if params.novelty_threshold.is_some() {
                 discarded.push("novelty_threshold");
@@ -391,8 +426,11 @@ async fn prepare_submission(
     // through here.
     check_claim_content_length(&params.content)?;
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
-    let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
-        .map_err(invalid_params)?;
+    let evidence_type = submission_evidence_type(
+        &params.evidence_type,
+        params.source_url.as_deref(),
+        params.dataset.as_ref(),
+    )?;
 
     // Label validation runs HERE — before any write — not at the
     // `ClaimRepository::update_labels` call further down. The repo layer
@@ -522,6 +560,8 @@ async fn prepare_submission(
                         visibility: None,
                         owner_group_id: None,
                         visibility_note: None,
+                        // About the SUBMITTED text, on every path.
+                        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
                     },
                 )));
             }
@@ -672,6 +712,14 @@ async fn write_submission(
                 .signer
                 .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
         );
+        // The row signature above covers `content_hash` (BLAKE3 of
+        // evidence_data) only. A dataset's structured fields (root, manifest
+        // digest, counts) get a signature of their own, bound to this row's
+        // evidence and claim ids, under the separate `Dataset` signing domain,
+        // so the bytes every existing evidence signature covers are unchanged
+        // (backlog c8beb101). A no-op for any other evidence type.
+        e.evidence_type
+            .attest_dataset(e.id, e.claim_id, &server.signer);
         e
     };
 
@@ -726,6 +774,10 @@ async fn write_submission(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence_with_sig.evidence_type)),
+        // The evidence's own edge to the claim, in this transaction (backlog
+        // 2d60f619). A submission's evidence supports its claim: its BBA is
+        // built with `supports: true`.
+        epigraph_db::EvidenceEdge::supports(Some(edge_key)),
     )
     .await
     .map_err(internal_error)?;
@@ -953,6 +1005,8 @@ async fn finish_submission(
         visibility: Some(tenancy.visibility.to_string()),
         owner_group_id: Some(tenancy.owner_group_id.to_string()),
         visibility_note: tenancy.note,
+        // Warn-only (backlog 72850d43): the claim above is already committed.
+        atomicity: crate::types::AtomicityWarning::for_content(&params.content),
     })
 }
 
@@ -987,6 +1041,25 @@ pub async fn query_claims(
     // pre-LIMIT pass: on the `max_truth=0.4` queue the spine paragraphs were
     // most of the page (backlog 31e7b727). Off unless the caller asks.
     let exclude_spine = params.exclude_spine.unwrap_or(false);
+
+    // The created_at window and offset (backlog 24caecaa): bound in SQL before
+    // LIMIT, inside the same viewer-filtered statement, so paging by offset
+    // lists every readable claim created in the window. Both refusals run
+    // before any statement, so they cannot depend on what the caller may see.
+    let window = epigraph_db::CreatedWindow {
+        after: params.created_after,
+        before: params.created_before,
+    };
+    if window.is_inverted() {
+        return Err(invalid_params(
+            "created_after is later than created_before; no claim can be created in that window",
+        ));
+    }
+    let offset = params.offset.unwrap_or(0);
+    if offset < 0 {
+        return Err(invalid_params("offset must not be negative"));
+    }
+
     let mut read = server.read_as(viewer, "query_claims").await?;
     let claims = ClaimRepository::list_by_belief_range(
         &mut *read,
@@ -995,8 +1068,9 @@ pub async fn query_claims(
         max,
         is_current,
         limit,
-        0,
+        offset,
         exclude_spine,
+        window,
     )
     .await
     .map_err(internal_error)?;
@@ -1092,6 +1166,24 @@ pub async fn get_claim(
         .map_err(internal_error)?
         .remove(&id)
         .unwrap_or_default();
+    // The claim's dataset evidence, always (possibly empty): the structured
+    // fields a reader resolves and verifies the data by, without parsing
+    // evidence_data (backlog c8beb101). Filtered per evidence row, as the URLs.
+    // Capped (the oldest GET_CLAIM_MAX_DATASETS), since anyone who can attach
+    // evidence to the claim can attach dataset rows; one more is read so
+    // `datasets_truncated` can say there were more.
+    let mut datasets = EvidenceRepository::datasets_by_claim_ids(
+        &mut *read,
+        viewer,
+        &[id],
+        i64::try_from(GET_CLAIM_MAX_DATASETS + 1).unwrap_or(i64::MAX),
+    )
+    .await
+    .map_err(internal_error)?
+    .remove(&id)
+    .unwrap_or_default();
+    let datasets_truncated = datasets.len() > GET_CLAIM_MAX_DATASETS;
+    datasets.truncate(GET_CLAIM_MAX_DATASETS);
 
     // Additive lensed belief: compute the claim's belief under the chosen lens.
     // Frame/perspective existence is already validated, so a compute failure
@@ -1164,6 +1256,11 @@ pub async fn get_claim(
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
         source_urls: Vec<String>,
+        datasets: Vec<epigraph_db::DatasetEvidence>,
+        /// Present (true) only when the claim has more dataset rows than
+        /// `datasets` lists.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        datasets_truncated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         authored_by: Option<epigraph_db::AuthoredBy>,
     }
@@ -1184,6 +1281,8 @@ pub async fn get_claim(
         classification,
         lensed_belief,
         source_urls,
+        datasets,
+        datasets_truncated,
         authored_by,
     })
 }
@@ -1575,6 +1674,9 @@ pub async fn update_with_evidence(
             .source_url
             .as_deref()
             .or_else(|| EvidenceRepository::source_url_of(&evidence.evidence_type)),
+        // The evidence's edge to the claim, in this transaction, in the
+        // direction its BBA is filed (`supports` / `refutes`, backlog 2d60f619).
+        epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.supports),
     )
     .await
     .map_err(internal_error)?;
@@ -1708,6 +1810,48 @@ pub async fn update_with_evidence(
     // MIGRATION 114: on a public claim the caller does not own, neither update
     // runs (labels were refused above) and `truth_after` reports the unchanged
     // value. The recombined DS belief is still returned below.
+    // The claim's Beta-Bernoulli track and its DS-vs-Bayesian divergence row
+    // (backlog f50344c0), kept as `POST /frames/:id/evidence` keeps them, by
+    // the same functions: the evidence BBA's mass on TRUE (index 0 of the
+    // binary frame) goes to alpha, the rest of its non-conflict mass to beta,
+    // and the row records this call's BetP against that posterior on the
+    // cache's frame, for `get_divergence`. Every call here stores a new BBA
+    // (an identical `evidence_data` is refused above), so it is always
+    // counted. Both are best-effort, each under its own savepoint: the row is
+    // claim-derived, and a non-owner of a public claim is refused it (and the
+    // Beta write) without losing the evidence.
+    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+        &mut tx,
+        viewer,
+        claim_id,
+        Some(epigraph_engine::ds_divergence::beta_increments(
+            &ds.evidence_bba,
+            Some(0),
+        )),
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+    let frame_version = epigraph_engine::ds_divergence::frame_version(
+        &mut tx,
+        viewer,
+        ds.frame_id,
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+    epigraph_engine::ds_divergence::record_divergence(
+        &mut tx,
+        claim_id,
+        ds.frame_id,
+        ds.pignistic_prob,
+        bayesian_posterior,
+        frame_version,
+        "update_with_evidence",
+    )
+    .await
+    .map_err(internal_error)?;
+
     let after_truth = if foreign_claim {
         claim.truth_value
     } else {
@@ -2298,6 +2442,7 @@ pub async fn resolve_backlog_item(
         novelty_threshold: Some(0.0),
         visibility: resolution_visibility,
         group_id: resolution_group,
+        dataset: None,
     };
     let sub = match prepare_submission(server, viewer, submit_params, auth).await? {
         PreparedSubmission::Fresh(sub) => *sub,
@@ -3058,6 +3203,15 @@ mod tests {
                 novelty_threshold: Some(0.1),
                 visibility: None,
                 group_id: None,
+                dataset: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "root_uri": "s3://b/run",
+                        "manifest_hash": format!("blake3:{}", "0".repeat(64)),
+                        "file_count": 1,
+                        "total_bytes": 1
+                    }))
+                    .unwrap(),
+                ),
             }
         }
 
@@ -3074,6 +3228,7 @@ mod tests {
                 "source_url",
                 "reasoning",
                 "labels",
+                "dataset",
             ] {
                 assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
             }
@@ -3090,9 +3245,16 @@ mod tests {
             p.reasoning = None;
             p.labels.clear();
             p.novelty_threshold = None;
+            p.dataset = None;
             for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
                 let d = dedup_block(by, uuid::Uuid::nil(), &p);
-                for absent in ["source_url", "reasoning", "labels", "novelty_threshold"] {
+                for absent in [
+                    "source_url",
+                    "reasoning",
+                    "labels",
+                    "novelty_threshold",
+                    "dataset",
+                ] {
                     assert!(
                         !d.inputs_applied.contains(&absent)
                             && !d.inputs_discarded.contains(&absent),

@@ -54,10 +54,11 @@
 //! These cover the reads PR-07 converted. They do NOT cover the graph
 //! cluster/run metadata (`graph_clusters`, `graph_neighborhoods`,
 //! `cluster_edges`, `neighborhood_edges`), which carry no tenancy columns, or
-//! the `edges` traversals inside the graph projections, which do and are the
-//! module's recorded residual — see `epigraph_db::repos::graph_view`'s module
-//! docs and the `F-edges-unfiltered` entry in `docs/tenancy/progress.json`
-//! (assigned to PR-13).
+//! the `edges` traversals inside the graph projections, which are filtered
+//! since backlog batch B08 and pinned in
+//! `crates/epigraph-db/tests/graph_view_edge_scope.rs` — see
+//! `epigraph_db::repos::graph_view`'s module docs and the `F-edges-unfiltered`
+//! entry in `docs/tenancy/progress.json`.
 
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{

@@ -2172,13 +2172,15 @@ async fn a_privileged_unit_never_serves_an_elevated_request(pool: PgPool) {
     );
 
     let privileged = spawn_privileged(&pool).await;
-    let elevated = privileged.scoped_token(&p, Some(session), &["claims:read"]);
+    // `claims:write` on both tokens: assess requires it (backlog f00d75ab), so
+    // the elevated refusal below is the elevation's, not the scope gate's.
+    let elevated = privileged.scoped_token(&p, Some(session), &["claims:read", "claims:write"]);
     // CALIBRATION that the route CAN write here: P's unelevated assess of its
     // OWN claim on the same privileged unit is served.
     let (status, seen) = privileged
         .post(
             &format!("/api/v1/claims/{mine}/assess"),
-            Some(&privileged.scoped_token(&p, None, &["claims:read"])),
+            Some(&privileged.scoped_token(&p, None, &["claims:read", "claims:write"])),
             &body,
         )
         .await;
@@ -2790,8 +2792,10 @@ async fn an_elevated_token_writes_through_no_non_get_route(pool: PgPool) {
         .await;
     let ticket: Uuid = t["ticket_id"].as_str().unwrap().parse().unwrap();
     let session = confirm_directly(&pool, ticket, credential_of(&pool, p.person).await).await;
-    let elevated = s.scoped_token(&p, Some(session), &["claims:read"]);
-    let plain = s.scoped_token(&p, None, &["claims:read"]);
+    // `claims:write` on both tokens: assess requires it (backlog f00d75ab), so
+    // the elevated refusal below is the elevation's, not the scope gate's.
+    let elevated = s.scoped_token(&p, Some(session), &["claims:read", "claims:write"]);
+    let plain = s.scoped_token(&p, None, &["claims:read", "claims:write"]);
     let mass_functions = |claim: Uuid| {
         let pool = pool.clone();
         async move {
