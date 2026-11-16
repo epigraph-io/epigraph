@@ -42,7 +42,8 @@ epigraph-io stack is built on it.
 
 All of them use one PostgreSQL 16 database with the `pgvector` extension,
 version 0.8.0 or newer: the semantic search and recall queries set
-`hnsw.iterative_scan`, which pgvector 0.8.0 introduced.
+`hnsw.iterative_scan`, which pgvector 0.8.0 introduced. `epigraph-migrate`
+and the server refuse an older one.
 
 ## Quickstart (local trial)
 

@@ -18,6 +18,7 @@ pub mod query_parser;
 pub mod routes;
 pub mod security;
 pub mod services;
+pub mod serving;
 pub mod state;
 pub mod tenancy_disclosure;
 #[cfg(feature = "db")]

@@ -142,6 +142,20 @@ only raise a NOTICE ("Cannot CREATE ROLE ...: provision it out of band"),
 and 161 then skips the attestor grant (section 9 has the recipe). That path
 is not exercised by CI.
 
+On an older pgvector every semantic search fails with SQLSTATE 42602, and
+distribution packages often ship 0.6. `epigraph-migrate` applies the
+migrations, then refuses (exit 1, no `migrations: ok` marker); the server
+refuses to start. To see what you have:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'vector';             -- installed in this database
+SELECT default_version FROM pg_available_extensions WHERE name = 'vector'; -- what the server can install
+```
+
+If the installed version is older, install pgvector 0.8.0 or newer on the
+server, then run `ALTER EXTENSION vector UPDATE;` in the database as its owner
+or a superuser, and restart the API.
+
 **Check:** `psql "<migration DSN>" -c 'SELECT 1'` connects.
 
 ### Step 3 — Migrate
@@ -447,7 +461,11 @@ For the others, anything else is off.
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `EPIGRAPH_REDIRECT_URI` | — | Read only because `providers.toml.example`'s Google provider names them (`client_id_env`, `client_secret_env`, `audience_env`, `redirect_uri_env`). Missing while the provider is configured → startup refusal (`env var ... not set`). |
 | `EPIGRAPH_PUBLIC_BASE_URL` | `http://localhost:8080` | The public origin, with no trailing slash. |
 | `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
-| `EPIGRAPH_PORT` | `8080` | The application port. The bind address is `0.0.0.0`. |
+| `EPIGRAPH_PORT` | `8080` | The application port. |
+| `EPIGRAPH_BIND_ADDR` | `0.0.0.0` | The IP address the application listener binds (for example `127.0.0.1` behind a reverse proxy on the same host, or `::`). An IP address only; the port is `EPIGRAPH_PORT`. Not an IP address → exit 1. |
+| `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
+| `EPIGRAPH_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM or SIGINT the server stops accepting connections and lets in-flight requests finish for at most this long, then exits 0. Keep it below the unit's `TimeoutStopSec` (systemd's default is 90 s). Not a whole number → exit 1. |
+| `EPIGRAPH_MAX_REQUEST_BYTES` | `10485760` (10 MiB) | The request-body limit on authenticated routes; over it the request is answered 413. The anonymous routes (`/oauth/*`, `/.well-known/*`, `/health`, `/api/v1/openapi.json`, `/elevate/*`) are held to 64 KiB whatever this says. Not a positive whole number → exit 1. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
@@ -455,7 +473,7 @@ For the others, anything else is off.
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
-| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
+| `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot, on a short-lived pool on `MIGRATION_DATABASE_URL` (falling back to `DATABASE_URL` with a WARN, as `epigraph-migrate` does), closed before it serves. A migration DSN it cannot reach → exit 1, naming the variable; a failed migration panics. The DDL credential is then in the server's environment for as long as it runs, so the supported path is `epigraph-migrate`. |
 | `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD` | off | The deliberate-rollback opt-in, for any entry point that migrates (section 4). |
 | `EPIGRAPH_REQUIRE_SIGNATURES` | off | Enforces Ed25519 payload signatures on `POST /api/v1/submit/packet` only (section 7). |
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
@@ -515,7 +533,7 @@ not to the API.
 
 | Flag / variable | Meaning |
 |---|---|
-| `MIGRATION_DATABASE_URL` | The migration DSN. Unset → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
+| `MIGRATION_DATABASE_URL` | The migration DSN, for `epigraph-migrate` and the server's `EPIGRAPH_MIGRATE_ON_BOOT`. Unset or blank → `DATABASE_URL`, with a WARN, shown only when `RUST_LOG` enables `warn` (for example `RUST_LOG=info`); the default filter shows errors only. |
 | `--allow-db-ahead` / `EPIGRAPH_MIGRATE_ALLOW_DB_AHEAD=1` | The deliberate-rollback opt-in (section 4). |
 
 ### `drain_jobs` and `replay_deferred_cascades`
@@ -584,7 +602,9 @@ the empty string, skips. Booting without migrating logs
 Several migrations (074, 075 and 084 among them) `RAISE` when their
 preconditions do not hold, and the boot-time call site panics on failure, so
 an unattended boot-time apply turns a precondition failure into a crash loop.
-Keep migration an explicit step.
+Keep migration an explicit step. When it is set, the server migrates on the
+migration DSN by the same rule as `epigraph-migrate` below (not on its request
+pool, whose role has no DDL privilege), on a pool it closes before serving.
 
 `epigraph-migrate` reads `MIGRATION_DATABASE_URL`, falling back to
 `DATABASE_URL` with a `WARN`. That WARN is shown only when `RUST_LOG` enables
@@ -4575,6 +4595,10 @@ Do not improvise it against a live database without that entry's context.
 | A passkey configuration error at boot (`ERROR: ...`), or `passkeys not configured (EPIGRAPH_WEBAUTHN_RP_ID / _ORIGIN unset): the enrollment ceremony answers 503` | Set both `EPIGRAPH_WEBAUTHN_RP_ID` and `EPIGRAPH_WEBAUTHN_ORIGIN`, or neither. |
 | `FATAL: session GUCs do not survive between statements on one pooled connection. ...` | A transaction-mode pooler. Use a session-mode endpoint, or `EPIGRAPH_SESSION_GUC_MODE=transaction` (section 6). |
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
+| `ERROR: refusing to serve: pgvector <v> is installed but 0.8.0 or newer is required ...` | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2), and restart. |
+| ``ERROR: refusing to serve: the pgvector extension (`vector`) is not installed in this database ...`` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
+| `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
+| `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
 | `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
 | `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at the `epigraph_app` login. |
