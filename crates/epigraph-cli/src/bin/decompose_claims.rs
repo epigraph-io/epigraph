@@ -1026,12 +1026,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for (p, why) in &drifted {
                 eprintln!("REFUSED {}: {why:?}", p.claim_id);
             }
-            let embedder = epigraph_cli::embedding_service();
             let submit = move |t: String, g: i64, p: AtomParent| {
                 submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p)
             };
-            let totals =
-                persist_planned(db, viewer, &ok, embedder, ledger.as_mut(), &submit).await?;
+            let totals = persist_planned(db, viewer, &ok, ledger.as_mut(), &submit).await?;
             for (id, why) in &totals.failed {
                 eprintln!("FAILED {id}: {why}");
             }
@@ -1175,14 +1173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return Ok(());
             }
-            let embedder = epigraph_cli::embedding_service();
             let totals = run_decomposition_batches(
                 db,
                 viewer,
                 &claims,
                 llm.as_ref(),
                 cli.batch_size,
-                embedder,
                 ledger.as_mut(),
                 move |t, g, p| submit_atom(http.clone(), api_base.clone(), token.clone(), t, g, p),
             )

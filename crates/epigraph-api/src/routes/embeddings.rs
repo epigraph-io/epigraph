@@ -67,14 +67,7 @@ pub async fn neighborhood_density(
             message: format!("Failed to embed query: {e}"),
         })?;
     let embedding_dim = embedding.len() as u32;
-    let embedding_str = format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|f| f.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let embedding_str = epigraph_db::pgvector_literal(&embedding);
 
     // Both reads run as the caller, on one viewer-stamped connection: every
     // number in the response is an aggregate over claims the caller may read.

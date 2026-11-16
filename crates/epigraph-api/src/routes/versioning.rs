@@ -1252,10 +1252,7 @@ pub async fn unmark_duplicate(
     if let Some(embedder) = state.storing_embedding_service() {
         match embedder.generate(&content).await {
             Ok(v) => {
-                let pgvec = format!(
-                    "[{}]",
-                    v.iter().map(f32::to_string).collect::<Vec<_>>().join(",")
-                );
+                let pgvec = epigraph_db::pgvector_literal(&v);
                 let (conn, admin_viewer) = session.split();
                 match ClaimRepository::store_embedding_if_unsealed(
                     conn,

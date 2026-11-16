@@ -148,7 +148,7 @@ pub async fn create_hypothesis(
         "research_question": request.research_question,
         "search_radius": search_radius,
     }))
-    .bind(format_embedding(&embedding))
+    .bind(epigraph_db::pgvector_literal(&embedding))
     .bind(decl.visibility_bind())
     .bind(decl.owner_group_bind())
     .fetch_one(&mut *tx)
@@ -231,7 +231,7 @@ pub async fn create_hypothesis(
     let neighbors = epigraph_db::ClaimRepository::grounded_neighborhood(
         &state.db_pool,
         &viewer,
-        &format_embedding(&embedding),
+        &epigraph_db::pgvector_literal(&embedding),
         claim_id.0,
         search_radius,
         50,
@@ -669,18 +669,6 @@ pub async fn promote_hypothesis(
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-fn format_embedding(embedding: &[f32]) -> String {
-    format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
 
 // `ClaimRow` was deleted with the inline claim-content read in
 // `hypothesis_status`. Its replacement is

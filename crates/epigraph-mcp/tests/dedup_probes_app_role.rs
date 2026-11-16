@@ -194,12 +194,7 @@ async fn the_novelty_gate_sees_the_members_own_private_neighbour(pool: PgPool) {
         .await
         .expect("mock embedding");
     let neighbour = fixture::seed_group_claim(&pool, member, group, "the private neighbour").await;
-    fixture::set_claim_embedding(
-        &pool,
-        neighbour,
-        &epigraph_mcp::embed::format_pgvector(&vector),
-    )
-    .await;
+    fixture::set_claim_embedding(&pool, neighbour, &epigraph_db::pgvector_literal(&vector)).await;
     let server = app_server(&pool).await;
 
     let member_viewer = viewer_of(&pool, member).await;
