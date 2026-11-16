@@ -4,7 +4,8 @@
 //! `epigraph-recompute-belief` operator binary: it refreshes the cached
 //! `claims.{belief, plausibility, pignistic_prob, conflict_k, missing_mass}`
 //! scalars from current `mass_functions` state, writing each claim's cache from
-//! its ONE owner frame (`binary_truth`, else `claim_validity`, else the frame the
+//! its ONE owner frame (a frame with a cache-admissible input first; then
+//! `binary_truth`, else `claim_validity`, else the frame the
 //! cache already records, else the frame holding the claim's earliest input;
 //! see `MassFunctionRepository::cache_owner_frame_for_claim`).
 //!
@@ -67,8 +68,9 @@ struct RecomputeBeliefsResult {
 ///
 /// Target precedence: `claim_ids` (explicit) > `labels` (current claims with
 /// all labels) > bulk enumeration of every claim that has a BBA. Each target
-/// claim's cache is written from ONE owner frame (`binary_truth`, else
-/// `claim_validity`, else the recorded owner, else the first-writer frame), see
+/// claim's cache is written from ONE owner frame (a frame with a
+/// cache-admissible input first; then `binary_truth`, else `claim_validity`,
+/// else the recorded owner, else the first-writer frame), see
 /// `MassFunctionRepository::cache_owner_frame_for_claim`.
 ///
 /// # Every statement runs on the maintenance session's connection
@@ -208,8 +210,11 @@ pub async fn recompute_beliefs(
                     error: format!("recomputed but could not commit: {e}"),
                 }),
             },
-            // No input on the owner frame: nothing was written. Dropping `tx`
-            // rolls back the (empty) transaction.
+            // Nothing was written: no input on the owner frame, or the
+            // derivation scope rule admitted none of it and there was nothing
+            // to vacate (backlog 8d720490 (2): such a claim used to be
+            // counted as recomputed and as a frame write). Dropping `tx` rolls
+            // back the (write-free) transaction.
             Ok(false) => {}
             Err(e) => errors.push(RecomputeError {
                 claim_id: claim_id.to_string(),

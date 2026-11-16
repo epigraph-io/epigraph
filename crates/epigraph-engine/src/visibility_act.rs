@@ -23,11 +23,13 @@
 //! `routes::claim_visibility`): the definer, then, for every moved claim,
 //! [`edge_factor::recompute_widened_claim_cached_belief`], whose fold of the
 //! cache-owner frame admits only what the moved claim's new audience may
-//! read. When the owner frame has inputs and none of them is admissible, the
-//! cache is vacated (the full-ignorance value) even if ANOTHER frame of the
-//! claim still has an admissible input: the cached value is the owner frame's
-//! old fold, and the act has just widened who is served it. (An ordinary
-//! recompute vacates only when no frame has an admissible input.) The caller
+//! read. The owner is the frame the cache records, kept through the act and
+//! not re-elected. When the owner frame has inputs and none of them is
+//! admissible, the cache is vacated (the full-ignorance value) even if ANOTHER
+//! frame of the claim still has an admissible input: the cached value is the
+//! owner frame's old fold, and the act has just widened who is served it. (An
+//! ordinary recompute vacates only when no frame has an admissible input, and
+//! its owner rule puts a frame with an admissible input first.) The caller
 //! commits after both, so the act and the refold commit together or not at
 //! all.
 //!
@@ -51,8 +53,10 @@
 //!   it: unchanged.
 //! * A claim whose owner frame has only inadmissible rows while ANOTHER frame
 //!   still has an admissible one is vacated, not refolded from that other
-//!   frame: the cache owner rule still picks the owner frame, and the act
-//!   does not change it.
+//!   frame: the act keeps the recorded owner
+//!   (`MassFunctionRepository::cache_owner_frame_keeping_recorded`). The
+//!   claim's next ordinary recompute hands the cache to that other frame
+//!   (the admissible-first owner rule, backlog 8d720490 (1)).
 //! * `claims.truth_value`, which some writers set from a fold, is not
 //!   recomputed.
 //! * Claims moved by 206 before this ran keep the value folded then.
