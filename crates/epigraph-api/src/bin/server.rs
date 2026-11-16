@@ -157,7 +157,10 @@ async fn main() {
     // Rate limiting (backlog 966164c8), read once. Until this block the
     // limiter the router layers (`middleware::rate_limit`) was never built in
     // this binary, so every request, including the anonymous `/oauth/token`,
-    // `/oauth/register` and `/elevate/*`, was unlimited. ON by default; a
+    // `/oauth/register` and `/elevate/*`, was unlimited. OFF unless configured
+    // (the operator's ruling: a deployment that sets none of the variables
+    // must not start rate limiting); once configured it is keyed on the
+    // principal or the TCP peer. A
     // malformed limit or proxy list refuses to start, because the silent
     // alternative (a different limit, or every client behind the proxy in one
     // bucket) is worse than a refusal. Built here, before any connection, so
@@ -172,7 +175,7 @@ async fn main() {
     if rate_limit.unrecognised_switch {
         tracing::warn!(
             "EPIGRAPH_RATE_LIMIT is set to a value that is neither `on` nor `off`: rate \
-             limiting stays ON (only `off` disables it)"
+             limiting is ON (only `off` disables it)"
         );
     }
     let rate_limiter = rate_limit.build();
@@ -185,10 +188,16 @@ async fn main() {
              anonymous ones to their client address (X-Forwarded-For believed only from \
              trusted_proxies)"
         );
+    } else if rate_limit.switched_off {
+        tracing::warn!(
+            "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited by this \
+             process, the anonymous OAuth and elevation endpoints included"
+        );
     } else {
         tracing::warn!(
-            "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited, \
-             including the anonymous OAuth and elevation endpoints"
+            "rate limiter OFF: EPIGRAPH_RATE_LIMIT_RPM is not set, so no request is rate \
+             limited by this process, the anonymous OAuth and elevation endpoints included. \
+             Set it, or limit at the reverse proxy."
         );
     }
 

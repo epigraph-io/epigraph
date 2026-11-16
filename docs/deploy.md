@@ -268,8 +268,13 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   that terminates TLS. `EPIGRAPH_PUBLIC_BASE_URL` must be the public origin
   either way. It is used in OAuth discovery documents and consent links, and
   it defaults to `http://localhost:8080`.
-- **Rate limiting** is on by default: `EPIGRAPH_RATE_LIMIT_RPM` (default
-  600) requests a minute per bucket, after a burst of the same size. An
+- **Rate limiting** is off unless configured: with none of
+  `EPIGRAPH_RATE_LIMIT`, `EPIGRAPH_RATE_LIMIT_RPM` and
+  `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` set, the API applies **no** rate limit
+  (logged at boot as `rate limiter OFF`); set one, or limit at the reverse
+  proxy. Once on, the limit is `EPIGRAPH_RATE_LIMIT_RPM` (600 when only
+  `EPIGRAPH_RATE_LIMIT=on` or a global limit is given) requests a minute per
+  bucket, after a burst of the same size. An
   authenticated request is charged to its principal (the token's agent, else
   its client); an anonymous one (`/oauth/*`, `/.well-known/*`, `/elevate/*`,
   the allowlist without a token) to its client address. The address is the
@@ -299,7 +304,8 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   it exists.
 
 **Check.** The log contains `rate limiter ON` (with the effective
-`per_key_rpm`, `global_rpm` and `trusted_proxies`), `Session-GUC probe passed`,
+`per_key_rpm`, `global_rpm` and `trusted_proxies`) when you configured a limit,
+`rate limiter OFF` otherwise, `Session-GUC probe passed`,
 `entity_types registry cache loaded`, `Internal metrics listener started`
 and `Server listening on 0.0.0.0:<port>`. An operator-binding line is also
 logged: `operator binding is NOT ARMED on this database: ...` until you arm it
@@ -428,10 +434,10 @@ For the others, anything else is off.
 | `EPIGRAPH_RESOURCE_METADATA_URL` | `${EPIGRAPH_PUBLIC_BASE_URL}/.well-known/oauth-protected-resource` | Advertised in every 401's `WWW-Authenticate`. A value that cannot go in an HTTP header → exit 1. |
 | `EPIGRAPH_PORT` | `8080` | The application port. The bind address is `0.0.0.0`. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
-| `EPIGRAPH_RATE_LIMIT` | `on` | `off` installs no rate limiter (logged as a warning at boot). Any other value stays on and is warned about. |
-| `EPIGRAPH_RATE_LIMIT_RPM` | `600` | Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
-| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets. A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
-| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. An entry that does not parse → exit 1. |
+| `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
+| `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
 | `EPIGRAPH_MIGRATE_ON_BOOT` | off | `1`/`true`/`yes` → the server applies migrations at boot and panics on failure. The supported path is `epigraph-migrate`. |
