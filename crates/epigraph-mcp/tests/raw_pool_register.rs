@@ -242,31 +242,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-engine/src/recall.rs",
-        "annotate_disputes",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "effective_beliefs",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "log_recall_event",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
         "recall",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
-    (
-        "epigraph-engine/src/recall.rs",
-        "text_search_fallback",
         1,
         ENGINE_POOL_PARAM,
     ),
@@ -624,8 +600,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// identity the `--allow-unauthenticated-http` listener reads as, so there is
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
-/// against a higher ceiling.
-const HIGH_WATER: usize = 86;
+/// against a higher ceiling. #875 then converted the recall helpers onto the
+/// caller's stamped connection, removing four rows: 86 -> 82.
+const HIGH_WATER: usize = 82;
 
 // ===========================================================================
 // The scanner.

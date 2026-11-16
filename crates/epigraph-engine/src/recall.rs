@@ -15,10 +15,53 @@
 //! `ClaimRepository::list_filtered`. Both legs serve current rows only: the
 //! semantic leg reads `search_by_embedding_current`, and the fallback filters
 //! `is_current` in SQL before `LIMIT` (supersede SPEC K11).
+//!
+//! # Routes (backlog a47df8ed)
+//!
+//! [`recall_routed`] takes a [`RecallRoute`]; [`recall`] is
+//! [`RecallRoute::Similarity`], so its existing callers (episcience synthesis
+//! seeding) keep the page they had before the theme leg existed. Auto and
+//! Hierarchical are opt-in through [`recall_routed`]; `RecallRoute` has no
+//! `Default`, so a caller that offers a route must choose its default itself.
+//!
+//! - **Similarity** is the System-1 leg alone: ANN over `claims.embedding`.
+//! - **Hierarchical** is the System-2 leg alone: the query's nearest themes
+//!   by centroid ([`ClaimThemeRepository::find_similar_themes_at_dim`]), then
+//!   those themes' current members ranked by similarity
+//!   ([`ClaimThemeRepository::claims_in_themes_at_dim_since`], viewer-scoped).
+//! - **Auto** runs the ANN leg and adds the theme leg only when the ANN page
+//!   is sparse ([`ann_page_is_sparse`]): fewer than
+//!   [`SPARSE_MIN_HITS`] hits (capped at `limit`), or a best similarity
+//!   below [`SPARSE_MAX_SIMILARITY`]. The two ranked lists are then fused by
+//!   reciprocal rank ([`rrf_merge`], `k = `[`RRF_K`]) and cut to `limit`.
+//!
+//! A theme leg hit is a claim the ANN page did not rank this high: its theme
+//! sits near the query even though the claim itself does not. Both legs read
+//! on the same connection under the caller's `viewer`, so the merge cannot
+//! widen what the viewer may see; theme rows carry no tenancy, and only their
+//! ids are used.
+//! A failed theme leg degrades to the ANN page on Auto, and to the text
+//! fallback on Hierarchical, the same way a failed ANN leg does. A query
+//! vector at a dimension other than 1536 fails the 1536-d ANN read first, so
+//! Auto and Similarity drop to the text fallback before the theme leg runs;
+//! on Hierarchical the theme read refuses any dimension but 1536 or 3072 and
+//! drops to the text fallback the same way.
+//!
+//! # Which connection the reads run on
+//!
+//! [`recall`] reads on the `pool` its caller passes, as it always has (the
+//! episcience worker passes its application pool). [`recall_routed`] takes no
+//! pool: it opens the caller's own stamped read, `ScopedPool::read_as(viewer)`,
+//! and runs every leg on it (ANN, theme traversal, beliefs, disputes and the
+//! text fallback), so row security agrees with the in-query viewer predicate
+//! and the theme leg reads exactly what the viewer may read. A `Bypass` viewer
+//! has no stamp; `read_as` refuses it, so the theme routes are not served to
+//! one (a maintenance caller uses [`recall`] on its maintenance pool).
 
 use epigraph_core::ClaimId;
-use epigraph_db::{ClaimListFilter, ClaimRepository, PgPool, ScopedPool};
+use epigraph_db::{ClaimListFilter, ClaimRepository, ClaimThemeRepository, PgPool, ScopedPool};
 use epigraph_embeddings::EmbeddingService;
+use sqlx::PgConnection;
 use thiserror::Error;
 
 /// Errors from the library-level `recall` function.
@@ -68,16 +111,204 @@ pub struct RecallResult {
     /// page and its `get_by_id` read; it is carried so that a consumer can
     /// check currency without a second read rather than assume it.
     pub is_current: bool,
+    /// `true` iff the theme-traversal leg ranked this claim (backlog
+    /// a47df8ed), alone or together with the ANN leg. Always `false` on the
+    /// similarity route and on the text fallback.
+    pub via_theme_traversal: bool,
+}
+
+/// Which retrieval legs a recall runs (backlog a47df8ed). See the module docs.
+///
+/// Deliberately no `Default`: [`recall`] pins `Similarity`, and which route a
+/// caller-facing `route=` parameter defaults to is that surface's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecallRoute {
+    /// ANN, plus the theme leg RRF-merged in when the ANN page is sparse.
+    Auto,
+    /// ANN only: the behaviour before the theme leg existed, and [`recall`]'s.
+    Similarity,
+    /// Theme traversal only.
+    Hierarchical,
+}
+
+impl RecallRoute {
+    /// The audit-row spelling, also the `route=` parameter spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Similarity => "similarity",
+            Self::Hierarchical => "hierarchical",
+        }
+    }
+}
+
+impl std::str::FromStr for RecallRoute {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "similarity" => Ok(Self::Similarity),
+            "hierarchical" => Ok(Self::Hierarchical),
+            other => Err(format!(
+                "unknown recall route {other:?}: expected auto, similarity or hierarchical"
+            )),
+        }
+    }
+}
+
+/// Auto traverses themes when the ANN page has fewer hits than this (or than
+/// `limit`, whichever is smaller).
+pub const SPARSE_MIN_HITS: usize = 5;
+/// Auto traverses themes when the ANN page's best cosine similarity is below
+/// this.
+pub const SPARSE_MAX_SIMILARITY: f64 = 0.4;
+/// How many nearest themes the theme leg draws members from.
+pub const THEME_LEG_THEMES: i32 = 3;
+/// The reciprocal-rank-fusion constant, the same `k = 60` the MCP hybrid
+/// recall fuses with.
+pub const RRF_K: f64 = 60.0;
+
+/// Whether an ANN page is sparse enough for Auto to add the theme leg.
+///
+/// The hit floor is capped at `limit`: a caller asking for 2 results who got
+/// 2 has a full page, and only the similarity test can call it weak.
+pub fn ann_page_is_sparse(hits: &[(uuid::Uuid, f64)], limit: usize) -> bool {
+    if hits.len() < SPARSE_MIN_HITS.min(limit.max(1)) {
+        return true;
+    }
+    let best = hits.iter().map(|h| h.1).fold(f64::NEG_INFINITY, f64::max);
+    best < SPARSE_MAX_SIMILARITY
+}
+
+/// One fused candidate from [`rrf_merge`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedCandidate {
+    pub claim_id: uuid::Uuid,
+    /// The fused score: the sum of `1 / (RRF_K + rank)` over the legs that
+    /// ranked this claim (rank 1 = best).
+    pub rrf_score: f64,
+    /// The claim's cosine similarity to the query. Both legs rank on the same
+    /// column, so where both carry it the value is the same; the larger is kept.
+    pub similarity: f64,
+    pub via_ann: bool,
+    pub via_theme: bool,
+}
+
+/// Reciprocal-rank fusion of the ANN and theme legs, best first, cut to
+/// `limit`.
+///
+/// Each list must be ordered best first. A claim on both lists sums its two
+/// terms, so theme membership lifts an ANN hit and a theme-only claim enters
+/// at the rank its theme list gave it. Ties are broken by similarity, then by
+/// claim id, so the page is deterministic.
+pub fn rrf_merge(
+    ann: &[(uuid::Uuid, f64)],
+    theme: &[(uuid::Uuid, f64)],
+    limit: usize,
+) -> Vec<MergedCandidate> {
+    let mut by_id: std::collections::HashMap<uuid::Uuid, MergedCandidate> =
+        std::collections::HashMap::new();
+    for (leg, hits) in [(false, ann), (true, theme)] {
+        for (idx, (id, sim)) in hits.iter().enumerate() {
+            let term = 1.0 / (RRF_K + idx as f64 + 1.0);
+            let e = by_id.entry(*id).or_insert(MergedCandidate {
+                claim_id: *id,
+                rrf_score: 0.0,
+                similarity: *sim,
+                via_ann: false,
+                via_theme: false,
+            });
+            // A list repeating an id counts it once, at its best rank.
+            let seen = if leg { e.via_theme } else { e.via_ann };
+            if !seen {
+                e.rrf_score += term;
+            }
+            e.similarity = e.similarity.max(*sim);
+            if leg {
+                e.via_theme = true;
+            } else {
+                e.via_ann = true;
+            }
+        }
+    }
+    let mut merged: Vec<MergedCandidate> = by_id.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.rrf_score
+            .total_cmp(&a.rrf_score)
+            .then(b.similarity.total_cmp(&a.similarity))
+            .then(a.claim_id.cmp(&b.claim_id))
+    });
+    merged.truncate(limit);
+    merged
+}
+
+/// The theme-traversal leg: the query's nearest themes, then their current
+/// members visible to `viewer`, best first, on the recall's own connection.
+///
+/// Runs in a nested transaction (a savepoint when `conn` is already in one,
+/// as a `SessionGucMode::Transaction` read is), the way
+/// `diverse_retrieval::run_diverse_pipeline_conn` brackets its probe: a
+/// failed theme read is rolled back rather than aborting the caller's
+/// transaction, whose next statement is the ANN page's materialisation or the
+/// text fallback.
+async fn theme_leg(
+    conn: &mut PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    pgvec: &str,
+    dim: usize,
+    limit: usize,
+) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
+    let mut bracket = sqlx::Connection::begin(&mut *conn).await?;
+    let got = theme_leg_reads(&mut bracket, viewer, pgvec, dim, limit).await;
+    match got {
+        Ok(members) => {
+            bracket.commit().await?;
+            Ok(members)
+        }
+        Err(e) => {
+            // The theme read's error is the one worth reporting; a failed
+            // rollback here would only repeat it.
+            let _ = bracket.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn theme_leg_reads(
+    conn: &mut PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    pgvec: &str,
+    dim: usize,
+    limit: usize,
+) -> Result<Vec<(uuid::Uuid, f64)>, epigraph_db::DbError> {
+    let dim = u32::try_from(dim).unwrap_or(0);
+    let themes =
+        ClaimThemeRepository::find_similar_themes_at_dim(&mut *conn, pgvec, THEME_LEG_THEMES, dim)
+            .await?;
+    if themes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let theme_ids: Vec<uuid::Uuid> = themes.iter().map(|t| t.0).collect();
+    let page = i32::try_from(limit).unwrap_or(i32::MAX);
+    let members = ClaimThemeRepository::claims_in_themes_at_dim_since(
+        conn, viewer, &theme_ids, pgvec, page, dim, false, None,
+    )
+    .await?;
+    Ok(members.into_iter().map(|(id, _, sim)| (id, sim)).collect())
 }
 
 /// Semantic recall: embed the query, find similar claims, filter by truth.
+///
+/// Runs [`RecallRoute::Similarity`], the ANN leg alone; use [`recall_routed`]
+/// for the theme-traversal routes.
 ///
 /// Falls back to an ILIKE text search over current claims
 /// ([`text_search_fallback`]) when `embedder` returns an error (e.g.
 /// embeddings disabled, no API key).
 ///
 /// # Parameters
-/// - `pool`      — live database connection pool the recall READS on
+/// - `pool`      — live database connection pool the recall READS on (one
+///   connection, held for the whole recall)
 /// - `scoped`    — the caller's tenancy-aware pool, which the audit row is
 ///   WRITTEN through (backlog 41841f7b). Required, not optional: as the
 ///   application role `recall_events_tenancy` admits an audit row only on a
@@ -99,8 +330,9 @@ pub struct RecallResult {
 ///   (backlog `14b98adc`).
 ///
 /// # Errors
-/// Returns `RecallError::Db` if the fallback text search fails.
-/// Embedding errors cause silent fallback, not a returned error.
+/// Returns `RecallError::Db` if no connection can be taken from `pool` or the
+/// fallback text search fails. Embedding errors cause silent fallback, not a
+/// returned error.
 pub async fn recall(
     pool: &PgPool,
     scoped: &ScopedPool,
@@ -110,10 +342,70 @@ pub async fn recall(
     limit: usize,
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
+    let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
+    recall_on(
+        &mut conn,
+        scoped,
+        viewer,
+        embedder,
+        query,
+        limit,
+        min_truth,
+        RecallRoute::Similarity,
+    )
+    .await
+}
+
+/// [`recall`] with an explicit [`RecallRoute`] (backlog a47df8ed), read on
+/// the caller's own stamped connection.
+///
+/// Takes no raw pool: every leg runs on `scoped.read_as(viewer)`, so the theme
+/// traversal, like the ANN leg, the belief and dispute batches and the text
+/// fallback, reads exactly what `viewer` may read under row security as well as
+/// under the in-query predicate. The audit row is written as in [`recall`].
+/// Otherwise the same parameters, fallback and page as [`recall`] at
+/// [`RecallRoute::Similarity`].
+///
+/// # Errors
+/// `RecallError::Db` when the stamped read cannot be opened, which includes a
+/// `Bypass` viewer (`ScopedPool::read_as` refuses one: a maintenance caller
+/// uses [`recall`] on its maintenance pool), or when the fallback text search
+/// fails.
+#[allow(clippy::too_many_arguments)]
+pub async fn recall_routed(
+    scoped: &ScopedPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    embedder: &dyn EmbeddingService,
+    query: &str,
+    limit: usize,
+    min_truth: f64,
+    route: RecallRoute,
+) -> Result<Vec<RecallResult>, RecallError> {
+    let mut read = scoped.read_as(viewer).await?;
+    recall_on(
+        &mut read, scoped, viewer, embedder, query, limit, min_truth, route,
+    )
+    .await
+}
+
+/// The recall body, every read on `conn`: [`recall`]'s connection from its
+/// pool, or [`recall_routed`]'s stamped read.
+#[allow(clippy::too_many_arguments)]
+async fn recall_on(
+    conn: &mut PgConnection,
+    scoped: &ScopedPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    embedder: &dyn EmbeddingService,
+    query: &str,
+    limit: usize,
+    min_truth: f64,
+    route: RecallRoute,
+) -> Result<Vec<RecallResult>, RecallError> {
     let limit_i64 = limit as i64;
 
     // Try semantic search first.
     let mut pgvec_for_audit: Option<String> = None;
+    let mut theme_leg_ran = false;
     let results = if let Ok(embedding) = embedder.generate_query(query).await {
         let pgvec = epigraph_db::pgvector_literal(&embedding);
         pgvec_for_audit = Some(pgvec.clone());
@@ -121,62 +413,70 @@ pub async fn recall(
         // `evidence.embedding`, which is a permanently-empty column: searching
         // it made this semantic leg always return nothing and silently starved
         // downstream callers (episcience synthesis stage-1 seeding).
-        match ClaimRepository::search_by_embedding_current(pool, viewer, &pgvec, limit_i64).await {
-            Ok(hits) => {
-                // ONE round-trip for the whole page's DS state, resolved BEFORE
-                // the loop (backlog 14b98adc). Per-hit would re-introduce an
-                // N+1 on top of the get_by_id this loop already does.
-                let scores = effective_beliefs(
-                    pool,
-                    viewer,
-                    &hits.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
+        // `search_by_embedding_scoped` with no scope filters is
+        // `search_by_embedding_current` on a caller's connection.
+        let ann = match route {
+            RecallRoute::Hierarchical => Ok(Vec::new()),
+            RecallRoute::Auto | RecallRoute::Similarity => {
+                ClaimRepository::search_by_embedding_scoped(
+                    &mut *conn, viewer, &pgvec, limit_i64, None, None,
                 )
-                .await;
-                let mut results = Vec::new();
-                for hit in hits {
-                    if let Ok(Some(claim)) =
-                        ClaimRepository::get_by_id(pool, viewer, ClaimId::from_uuid(hit.claim_id))
-                            .await
-                    {
-                        let tv = claim.truth_value.value();
-                        // Absent key == not visible to this viewer / deleted
-                        // mid-page. Fall back to the `truth_value` already in
-                        // hand so a claim with no DS state behaves exactly as
-                        // it did before this change.
-                        let score = scores.get(&hit.claim_id).copied().unwrap_or(tv);
-                        if score >= min_truth {
-                            results.push(RecallResult {
-                                claim_id: hit.claim_id.to_string(),
-                                content: claim.content,
-                                truth_value: tv,
-                                belief_score: score,
-                                similarity: hit.similarity,
-                                // Annotated by the batched dispute post-pass
-                                // below, keyed by claim_id.
-                                dispute_count: 0,
-                                is_contested: false,
-                                contesting_claim_ids: Vec::new(),
-                                // `get_by_id` post-fixes the row's real state.
-                                is_current: claim.is_current,
-                            });
+                .await
+                .map(|hits| {
+                    hits.into_iter()
+                        .map(|h| (h.claim_id, h.similarity))
+                        .collect::<Vec<_>>()
+                })
+            }
+        };
+        let candidates = match ann {
+            Err(e) => {
+                tracing::warn!("embedding search failed, falling back to text search: {e}");
+                None
+            }
+            Ok(ann) => {
+                let traverse = match route {
+                    RecallRoute::Similarity => false,
+                    RecallRoute::Hierarchical => true,
+                    RecallRoute::Auto => ann_page_is_sparse(&ann, limit),
+                };
+                if !traverse {
+                    Some(rrf_merge(&ann, &[], limit))
+                } else {
+                    theme_leg_ran = true;
+                    match theme_leg(&mut *conn, viewer, &pgvec, embedding.len(), limit).await {
+                        Ok(theme) => Some(rrf_merge(&ann, &theme, limit)),
+                        // Auto still holds a valid ANN page: serve it.
+                        Err(e) if route == RecallRoute::Auto => {
+                            tracing::warn!(
+                                error = %e,
+                                "recall theme leg failed; serving the ANN page alone"
+                            );
+                            Some(rrf_merge(&ann, &[], limit))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "recall theme leg failed, falling back to text search: {e}"
+                            );
+                            None
                         }
                     }
                 }
-                results
             }
-            Err(e) => {
-                tracing::warn!("embedding search failed, falling back to text search: {e}");
-                text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
-            }
+        };
+        match candidates {
+            Some(candidates) => materialize(&mut *conn, viewer, candidates, min_truth).await,
+            None => text_search_fallback(&mut *conn, viewer, query, limit_i64, min_truth).await?,
         }
     } else {
         // Embedding generation failed (no API key, mock mode, etc.) — fall back
-        // to the current-only text search.
-        text_search_fallback(pool, viewer, query, limit_i64, min_truth).await?
+        // to the current-only text search. The theme leg needs the query
+        // vector too, so no route has anything else to run.
+        text_search_fallback(&mut *conn, viewer, query, limit_i64, min_truth).await?
     };
 
     let mut results = results;
-    annotate_disputes(pool, viewer, &mut results).await;
+    annotate_disputes(&mut *conn, viewer, &mut results).await;
 
     // Recall audit log (backlog 8cbffa0e). This is the LIBRARY path —
     // episcience synthesis calls it directly, with no MCP request — but not a
@@ -184,18 +484,74 @@ pub async fn recall(
     // that principal owns the row (backlog 41841f7b). `tool` distinguishes it
     // from the MCP surfaces.
     log_recall_event(
-        pool,
+        conn,
         scoped,
         viewer,
         query,
         pgvec_for_audit.as_deref(),
-        limit,
-        min_truth,
+        serde_json::json!({
+            "limit": limit,
+            "min_truth": min_truth,
+            // Recorded because the route, and whether Auto traversed, change
+            // which claims a query returns: without them the row cannot be
+            // replayed.
+            "route": route.as_str(),
+            "theme_leg": theme_leg_ran,
+        }),
         &results,
     )
     .await;
 
     Ok(results)
+}
+
+/// Resolve a fused page into results: one batched DS-belief read, then the
+/// `min_truth` gate per claim, in fused order.
+async fn materialize(
+    conn: &mut PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    candidates: Vec<MergedCandidate>,
+    min_truth: f64,
+) -> Vec<RecallResult> {
+    // ONE round-trip for the whole page's DS state, resolved BEFORE the loop
+    // (backlog 14b98adc). Per-hit would re-introduce an N+1 on top of the
+    // get_by_id this loop already does.
+    let scores = effective_beliefs(
+        &mut *conn,
+        viewer,
+        &candidates.iter().map(|h| h.claim_id).collect::<Vec<_>>(),
+    )
+    .await;
+    let mut results = Vec::new();
+    for hit in candidates {
+        if let Ok(Some(claim)) =
+            ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(hit.claim_id)).await
+        {
+            let tv = claim.truth_value.value();
+            // Absent key == not visible to this viewer / deleted mid-page.
+            // Fall back to the `truth_value` already in hand so a claim with
+            // no DS state behaves exactly as it did before this change.
+            let score = scores.get(&hit.claim_id).copied().unwrap_or(tv);
+            if score >= min_truth {
+                results.push(RecallResult {
+                    claim_id: hit.claim_id.to_string(),
+                    content: claim.content,
+                    truth_value: tv,
+                    belief_score: score,
+                    similarity: hit.similarity,
+                    // Annotated by the batched dispute post-pass in
+                    // `recall_on`, keyed by claim_id.
+                    dispute_count: 0,
+                    is_contested: false,
+                    contesting_claim_ids: Vec::new(),
+                    // `get_by_id` post-fixes the row's real state.
+                    is_current: claim.is_current,
+                    via_theme_traversal: hit.via_theme,
+                });
+            }
+        }
+    }
+    results
 }
 
 /// Why an engine recall audit row was not written. Either way the recall is
@@ -235,7 +591,9 @@ enum AuditNotWritten {
 /// group it lost.
 ///
 /// A `Bypass` viewer has no principal: its row stays agent-less and
-/// instance-wide, written on `pool`. That is the only agent-less row this path
+/// instance-wide, written on `conn`, the connection [`recall`] took from its
+/// `pool` (only [`recall`] reaches this with one: [`recall_routed`]'s stamped
+/// read refuses a `Bypass` viewer). That is the only agent-less row this path
 /// writes, and it is admitted only through the bypass arm, so it lands only
 /// when the caller honours [`recall`]'s contract and passes the maintenance
 /// pool with a `Bypass` viewer. It is not routed through `scoped` instead:
@@ -243,13 +601,12 @@ enum AuditNotWritten {
 /// lease inside this library would grant a bypass the caller never asked for.
 #[allow(clippy::too_many_arguments)]
 async fn log_recall_event(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     scoped: &ScopedPool,
     viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     pgvec: Option<&str>,
-    limit: usize,
-    min_truth: f64,
+    params: serde_json::Value,
     results: &[RecallResult],
 ) {
     let returned_claim_ids: Vec<uuid::Uuid> = results
@@ -263,7 +620,7 @@ async fn log_recall_event(
             tool: "engine::recall".to_string(),
             query_text: query.to_string(),
             query_pgvector: pgvec.map(ToString::to_string),
-            params: serde_json::json!({ "limit": limit, "min_truth": min_truth }),
+            params: params.clone(),
             returned_claim_ids,
             owner_group_id,
         }
@@ -275,7 +632,7 @@ async fn log_recall_event(
             })
             .await
         }
-        None => epigraph_db::RecallEventRepository::log(pool, event(None, None))
+        None => epigraph_db::RecallEventRepository::log(conn, event(None, None))
             .await
             .map(|_| ())
             .map_err(AuditNotWritten::Write),
@@ -325,7 +682,7 @@ async fn write_as_principal(
 /// unannotated rather than failing a recall that already has its results. The
 /// signal informs the caller; it never re-ranks and never gates retrieval.
 async fn annotate_disputes(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     results: &mut [RecallResult],
 ) {
@@ -333,7 +690,7 @@ async fn annotate_disputes(
         .iter()
         .filter_map(|r| uuid::Uuid::parse_str(&r.claim_id).ok())
         .collect();
-    match ClaimRepository::dispute_batch(pool, viewer, &claim_ids).await {
+    match ClaimRepository::dispute_batch(conn, viewer, &claim_ids).await {
         Ok(mut by_claim) => {
             for r in results.iter_mut() {
                 let Ok(cid) = uuid::Uuid::parse_str(&r.claim_id) else {
@@ -364,11 +721,11 @@ async fn annotate_disputes(
 /// before this change. Failing the recall instead would trade a stale filter
 /// for no results at all.
 async fn effective_beliefs(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     claim_ids: &[uuid::Uuid],
 ) -> std::collections::HashMap<uuid::Uuid, f64> {
-    match ClaimRepository::effective_belief_batch(pool, viewer, claim_ids).await {
+    match ClaimRepository::effective_belief_batch(conn, viewer, claim_ids).await {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
@@ -392,7 +749,7 @@ async fn effective_beliefs(
 /// `ClaimRepository::list`, which this used to call, has no currency
 /// predicate at all.
 async fn text_search_fallback(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     query: &str,
     limit: i64,
@@ -403,11 +760,11 @@ async fn text_search_fallback(
         is_current: Some(true),
         ..ClaimListFilter::default()
     };
-    let claims = ClaimRepository::list_filtered(pool, viewer, &filter, limit, 0).await?;
+    let claims = ClaimRepository::list_filtered(&mut *conn, viewer, &filter, limit, 0).await?;
     // Same one-round-trip DS resolution the semantic leg does, so the two legs
     // cannot gate on different columns (backlog 14b98adc).
     let scores = effective_beliefs(
-        pool,
+        conn,
         viewer,
         &claims.iter().map(|c| c.id.as_uuid()).collect::<Vec<_>>(),
     )
@@ -431,6 +788,7 @@ async fn text_search_fallback(
             is_contested: false,
             contesting_claim_ids: Vec::new(),
             is_current: c.is_current,
+            via_theme_traversal: false,
         })
         .collect())
 }
@@ -457,6 +815,79 @@ mod tests {
     // Until then, the tests below cover the trait-bound and wiring layer
     // only. They will not catch a regression where, e.g., the `min_truth`
     // filter is applied at the wrong place — that gap closes in Phase 1.
+
+    fn id(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// A theme-only claim enters at the rank its theme list gave it, and a
+    /// claim on both lists sums its two terms (backlog a47df8ed).
+    #[test]
+    fn rrf_merge_sums_shared_ids_and_admits_theme_only_hits() {
+        let ann = [(id(1), 0.35), (id(2), 0.33), (id(3), 0.30)];
+        let theme = [(id(3), 0.30), (id(9), 0.20)];
+        let got = rrf_merge(&ann, &theme, 3);
+        let order: Vec<_> = got.iter().map(|m| m.claim_id).collect();
+        // id3 sums 1/63 + 1/61 and beats id1's lone 1/61. id9 (theme rank 2,
+        // 1/62) ties id2 (ANN rank 2, 1/62) and loses the tie on similarity
+        // (0.20 < 0.33), so id2 keeps the third slot.
+        assert_eq!(order, vec![id(3), id(1), id(2)]);
+        let shared = &got[0];
+        assert!(shared.via_ann && shared.via_theme);
+        assert!((shared.rrf_score - (1.0 / 63.0 + 1.0 / 61.0)).abs() < 1e-12);
+        let page4 = rrf_merge(&ann, &theme, 4);
+        let tail = page4.last().unwrap();
+        assert_eq!(tail.claim_id, id(9));
+        assert!(tail.via_theme && !tail.via_ann);
+        assert!((tail.similarity - 0.20).abs() < 1e-12);
+    }
+
+    /// With no theme leg the fused order IS the ANN order, so the similarity
+    /// route serves exactly the page it served before the merge existed.
+    #[test]
+    fn rrf_merge_of_ann_alone_preserves_ann_order() {
+        let ann = [(id(5), 0.9), (id(2), 0.8), (id(7), 0.7)];
+        let got = rrf_merge(&ann, &[], 10);
+        let order: Vec<_> = got.iter().map(|m| m.claim_id).collect();
+        assert_eq!(order, vec![id(5), id(2), id(7)]);
+        assert!(got.iter().all(|m| m.via_ann && !m.via_theme));
+    }
+
+    /// A list repeating an id counts it once, at its best rank: a duplicated
+    /// row must not double its own score past a genuinely shared one.
+    #[test]
+    fn rrf_merge_counts_a_repeated_id_once_per_leg() {
+        let ann = [(id(1), 0.5), (id(1), 0.5), (id(2), 0.4)];
+        let got = rrf_merge(&ann, &[], 10);
+        assert_eq!(got.len(), 2);
+        assert!((got[0].rrf_score - 1.0 / 61.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sparse_when_short_or_weak_but_not_when_full_and_strong() {
+        let strong: Vec<_> = (0..5).map(|n| (id(n), 0.8)).collect();
+        assert!(!ann_page_is_sparse(&strong, 10), "5 strong hits is dense");
+        assert!(ann_page_is_sparse(&strong[..4], 10), "4 < 5 hits is sparse");
+        assert!(
+            !ann_page_is_sparse(&strong[..2], 2),
+            "a full page of 2 for limit 2 is not short"
+        );
+        let weak: Vec<_> = (0..5).map(|n| (id(n), 0.39)).collect();
+        assert!(ann_page_is_sparse(&weak, 10), "best 0.39 < 0.4 is weak");
+        assert!(ann_page_is_sparse(&[], 10));
+    }
+
+    #[test]
+    fn route_parses_its_own_spelling_and_refuses_others() {
+        for r in [
+            RecallRoute::Auto,
+            RecallRoute::Similarity,
+            RecallRoute::Hierarchical,
+        ] {
+            assert_eq!(r.as_str().parse::<RecallRoute>(), Ok(r));
+        }
+        assert!("ann".parse::<RecallRoute>().is_err());
+    }
 
     /// Confirm `MockProvider` satisfies the `EmbeddingService` bound required by
     /// `recall`. This is a compile-time wiring test; it panics with a DB error
