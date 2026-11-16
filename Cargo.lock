@@ -1680,6 +1680,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "epigraph-atlas-contract",
  "epigraph-core",
  "epigraph-crypto",
  "epigraph-db",
