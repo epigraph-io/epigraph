@@ -1490,6 +1490,8 @@ async fn finish_entity(pool: &PgPool, entity: &str, rows_done: i64) -> anyhow::R
 /// only to name the migration in the NOTE an operator reads.
 const DEFINER_FUNCTIONS: &[&str] = &[
     "epigraph_claims_require_tenancy",
+    // Last redefined by migration 219 (the `workflow` arm; CREATE OR REPLACE
+    // keeps the owner, and 219 re-sets it regardless).
     "epigraph_node_tenancy",
     // Last redefined by migration 120 (writer-owned edges: CREATE OR REPLACE,
     // re-owned in its section 9). Kept HERE, unconditional, rather than moved
@@ -1498,9 +1500,9 @@ const DEFINER_FUNCTIONS: &[&str] = &[
     // missing 070 body is a finding" into "skipped".
     "epigraph_edges_tenancy",
     "epigraph_inherit_tenancy_stmt",
-    // Last redefined by migration 122 (120's body with the edges meet made
-    // set-based: two equi-joins and inlined endpoint reads, OB6); see the note
-    // above.
+    // Last redefined by migration 219 (168's body, itself 122's set-based
+    // edges meet plus one IF, with a `workflows` join per endpoint); see the
+    // note above.
     "epigraph_propagate_tenancy",
     // `epigraph_ownership_transcribe` (071) was the sixth entry until PR-22.
     // Migration 084 drops the function with the table it wrote through, so an
@@ -1749,6 +1751,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the UPDATE moves; a foreign row would move 0 rows, which the body
     // refuses (VIS06) rather than auditing a change that did not happen.
     ("epigraph_set_agent_default_group", 209),
+    // 212 (backlog f78526ad), the sealed-row vector guards on `claims` and
+    // `evidence`. Both fail OPEN and QUIETLY under a non-member owner: their
+    // only read is of the FORCEd `claim_encryption` / `evidence_encryption`,
+    // which 077's policy then filters exactly as the writing session's own
+    // read would, so a sealed row whose group the owner cannot see reads as
+    // unsealed and its vector is admitted with no error. The owner is the
+    // control here.
+    ("epigraph_refuse_sealed_claim_vector", 212),
+    ("epigraph_refuse_sealed_evidence_vector", 212),
     // 207, the bug-report intake. The write fails LOUD under a non-member
     // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
     // `evidence` are refused by their WITH CHECK (the owner no longer passes
@@ -1782,6 +1793,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // update policy (42501): nothing is ever confirmed or declined that the
     // owner could not see.
     ("epigraph_countersign_authorship", 208),
+    // 210 (Atlas W2, backlog 77f4bf09), the per-team Atlas map staleness
+    // epochs. The bump is the only writer of the FORCEd `atlas_map_epochs`
+    // (the application role holds SELECT only), and the two triggers call it
+    // on every claims, edges and evidence UPDATE that changes a row's
+    // signature. Under an owner without the epochs grant (the application
+    // role) every such UPDATE (a share, a publicize, a narrowing, a
+    // re-tenant) fails LOUD with 42501, an outage of those writes; so does a
+    // trigger whose owner cannot EXECUTE the bump (210 revokes it from
+    // PUBLIC). Under a non-member owner that holds the grant the definer
+    // bypass is false: the bump's `groups` join is filtered to the session's
+    // read set, so a departure from a group the session cannot read bumps
+    // nothing and that map keeps being served as current with a row its
+    // viewers lost (fails OPEN, silently); a readable group the session
+    // cannot write is refused by the epochs WITH CHECK (loud).
+    ("epigraph_atlas_map_bump", 210),
+    ("epigraph_atlas_map_stale", 210),
+    ("epigraph_atlas_map_stale_row", 210),
     // 217, the two factor triggers (backlog a2c5f714): the application role
     // holds no INSERT / DELETE on `factors`, so they write it as their owner.
     // Under a non-member owner without the `factors` grant the edge mint
@@ -1792,6 +1820,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the owner cannot see is minted over, silently.
     ("auto_create_factor_from_edge", 217),
     ("deactivate_superseded_factors", 217),
+    // 219, the `evolve_step` gate's unfiltered read of every workflow that
+    // executes a step's lineage. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a group plan's `executes` edge a
+    // non-member cannot see is not returned, its authority is never checked,
+    // and the gate admits an evolve of a step a hidden plan runs. That is the
+    // stake this entry reports.
+    ("epigraph_step_lineage_executors", 219),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3166,6 +3202,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_countersign_authorship",
             "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
+            true,
+        ),
+        // 219: the `evolve_step` gate calls it on the request DSN (REST and
+        // MCP); without the grant every evolve of an executed step is 42501.
+        (
+            "epigraph_step_lineage_executors",
+            "public.epigraph_step_lineage_executors(uuid)",
             true,
         ),
     ];

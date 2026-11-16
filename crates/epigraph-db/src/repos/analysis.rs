@@ -3,6 +3,9 @@
 //! Analyses represent interpretive reasoning over evidence,
 //! linked to claims via `concludes` edges and to evidence via `interpreted_by` edges.
 
+use crate::errors::DbError;
+use crate::repos::edge::EdgeRepository;
+use crate::repos::edge_signature::EdgeSigningKey;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -169,53 +172,24 @@ impl AnalysisRepository {
             .collect())
     }
 
-    /// Create an `interpreted_by` edge from evidence to analysis.
-    pub async fn link_evidence(
-        pool: &PgPool,
-        evidence_id: Uuid,
-        analysis_id: Uuid,
-    ) -> Result<Uuid, sqlx::Error> {
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'evidence', $3, 'analysis', 'interpreted_by', '{}'::jsonb) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(edge_id)
-        .bind(evidence_id)
-        .bind(analysis_id)
-        .execute(pool)
-        .await?;
-        Ok(edge_id)
-    }
-
-    /// Create a `concludes` edge from analysis to claim.
-    pub async fn link_claim(
-        pool: &PgPool,
-        analysis_id: Uuid,
-        claim_id: Uuid,
-    ) -> Result<Uuid, sqlx::Error> {
-        let edge_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-             VALUES ($1, $2, 'analysis', $3, 'claim', 'concludes', '{}'::jsonb) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(edge_id)
-        .bind(analysis_id)
-        .bind(claim_id)
-        .execute(pool)
-        .await?;
-        Ok(edge_id)
-    }
-
     /// Atomic: insert analysis + create all `concludes` and `interpreted_by` edges.
+    ///
+    /// Every edge is attested at INSERT by `key` (backlog `dae795f8`): the
+    /// request transport's own key (the API's), never the
+    /// analysis' agent; unsigned with `key = None`. No unique index of `edges`
+    /// covers these two relationships (migrations 091, 175), so the old
+    /// `ON CONFLICT DO NOTHING` could not fire and is not carried over.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a statement fails (nothing is written);
+    /// `DbError::InvalidData` if a stored edge cannot be attested.
     pub async fn persist_bundle(
         pool: &PgPool,
+        key: Option<EdgeSigningKey<'_>>,
         analysis: &AnalysisRecord,
         claim_ids: &[Uuid],
         evidence_ids: &[Uuid],
-    ) -> Result<Uuid, sqlx::Error> {
+    ) -> Result<Uuid, DbError> {
         let mut tx = pool.begin().await?;
 
         sqlx::query(
@@ -237,30 +211,34 @@ impl AnalysisRepository {
         .await?;
 
         for &claim_id in claim_ids {
-            let edge_id = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-                 VALUES ($1, $2, 'analysis', $3, 'claim', 'concludes', '{}'::jsonb) \
-                 ON CONFLICT DO NOTHING",
+            EdgeRepository::create_signed_conn(
+                &mut tx,
+                key,
+                analysis.id,
+                "analysis",
+                claim_id,
+                "claim",
+                "concludes",
+                None,
+                None,
+                None,
             )
-            .bind(edge_id)
-            .bind(analysis.id)
-            .bind(claim_id)
-            .execute(&mut *tx)
             .await?;
         }
 
         for &evidence_id in evidence_ids {
-            let edge_id = Uuid::new_v4();
-            sqlx::query(
-                "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship, properties) \
-                 VALUES ($1, $2, 'evidence', $3, 'analysis', 'interpreted_by', '{}'::jsonb) \
-                 ON CONFLICT DO NOTHING",
+            EdgeRepository::create_signed_conn(
+                &mut tx,
+                key,
+                evidence_id,
+                "evidence",
+                analysis.id,
+                "analysis",
+                "interpreted_by",
+                None,
+                None,
+                None,
             )
-            .bind(edge_id)
-            .bind(evidence_id)
-            .bind(analysis.id)
-            .execute(&mut *tx)
             .await?;
         }
 

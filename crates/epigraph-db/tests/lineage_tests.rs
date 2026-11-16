@@ -277,19 +277,31 @@ async fn test_lineage_includes_all_evidence_at_each_level(pool: PgPool) {
 
     // Add evidence to each claim
     let ev_root_1 = make_evidence(agent.id, root_claim.id, "Root evidence 1");
-    let ev_root_1 = EvidenceRepository::create(&pool, &ev_root_1).await.unwrap();
+    let ev_root_1 =
+        EvidenceRepository::create(&pool, &ev_root_1, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_root_1: Uuid = ev_root_1.id.as_uuid();
 
     let ev_root_2 = make_evidence(agent.id, root_claim.id, "Root evidence 2");
-    let ev_root_2 = EvidenceRepository::create(&pool, &ev_root_2).await.unwrap();
+    let ev_root_2 =
+        EvidenceRepository::create(&pool, &ev_root_2, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_root_2: Uuid = ev_root_2.id.as_uuid();
 
     let ev_middle = make_evidence(agent.id, middle_claim.id, "Middle evidence");
-    let ev_middle = EvidenceRepository::create(&pool, &ev_middle).await.unwrap();
+    let ev_middle =
+        EvidenceRepository::create(&pool, &ev_middle, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_middle: Uuid = ev_middle.id.as_uuid();
 
     let ev_leaf = make_evidence(agent.id, leaf_claim.id, "Leaf evidence");
-    let ev_leaf = EvidenceRepository::create(&pool, &ev_leaf).await.unwrap();
+    let ev_leaf =
+        EvidenceRepository::create(&pool, &ev_leaf, epigraph_db::EvidenceEdge::supports(None))
+            .await
+            .unwrap();
     let evidence_leaf: Uuid = ev_leaf.id.as_uuid();
 
     // Execute: Query lineage from leaf
@@ -657,6 +669,12 @@ async fn test_lineage_detects_and_reports_cycles(pool: PgPool) {
     assert!(
         lineage.claims.len() <= 3,
         "Lineage should not have duplicates despite cycle"
+    );
+    // ...and report the cycle it walked (backlog c07884a9).
+    assert_eq!(lineage.claims.len(), 3);
+    assert!(
+        lineage.cycle_detected,
+        "A -> B -> C -> A is among the claims"
     );
 }
 
@@ -1585,5 +1603,629 @@ async fn lineage_max_nodes_cut_inside_a_depth_layer_is_pinned(pool: PgPool) {
         sorted(three.claims[&root].parent_ids.clone()),
         vec![parents[1], parents[2]],
         "the dropped lowest-id parent must not be named as a parent"
+    );
+}
+
+// ============================================================================
+// Dense DAGs: the walks are bounded by nodes x depth, not by paths
+// ============================================================================
+
+/// A dense layered DAG ("lattice"): `top -> L_d (w claims) -> ... -> L_1 (w
+/// claims) -> bottom`, every claim of a layer `supports` every claim of the
+/// next one. Layer `L_j` is `j` hops above `bottom`, so `bottom` sees
+/// `w^(j-1)` distinct paths to each claim of `L_j` and `w^d` to `top`, while
+/// the lattice holds only `w * d + 2` claims.
+///
+/// Returns `(top, layers, bottom)` with `layers[j - 1]` = `L_j`.
+async fn create_lattice(
+    pool: &PgPool,
+    tag: &str,
+    width: usize,
+    layers: usize,
+) -> (Uuid, Vec<Vec<Uuid>>, Uuid) {
+    // Content is unique per claim (the tag and both indices) so no claim of
+    // one lattice can be shared with another.
+    let bottom = create_test_claim(pool, &format!("{tag} bottom"), 0.5).await;
+    let mut built: Vec<Vec<Uuid>> = Vec::with_capacity(layers);
+    let mut below = vec![bottom];
+    for j in 1..=layers {
+        let mut layer = Vec::with_capacity(width);
+        for i in 0..width {
+            let c = create_test_claim(pool, &format!("{tag} L{j}-{i}"), 0.5).await;
+            for &child in &below {
+                create_claim_edge(pool, c, child, "supports").await;
+            }
+            layer.push(c);
+        }
+        below = layer.clone();
+        built.push(layer);
+    }
+    let top = create_test_claim(pool, &format!("{tag} top"), 0.5).await;
+    for &child in &below {
+        create_claim_edge(pool, top, child, "supports").await;
+    }
+    (top, built, bottom)
+}
+
+/// A connection whose statements are cancelled after a few seconds. A walk
+/// that enumerates paths cannot finish a lattice with millions of paths in
+/// that time on any host; a walk bounded by nodes x depth finishes in
+/// milliseconds. The bound is short on purpose: a path-enumerating walk spills
+/// its rows (content plus a path array each) to temp files while it runs.
+async fn time_boxed_conn(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET statement_timeout = '5s'")
+        .execute(&mut *conn)
+        .await
+        .expect("set statement_timeout");
+    conn
+}
+
+/// Width and depth of the lattice the dense-DAG tests walk: 4^12 (about 16.7
+/// million) paths from `bottom` to `top`, over 50 claims.
+const LATTICE_WIDTH: usize = 4;
+const LATTICE_LAYERS: usize = 12;
+
+/// Backlog f889c86f: every lineage walk that reports each claim's shortest
+/// depth finishes on a dense DAG, and reports exactly the claims and depths
+/// the DAG has, in both directions, with `truncated` exact at the boundary.
+///
+/// On the path-enumerating walks (`UNION ALL` plus a path array, deduplicated
+/// only by the outer `DISTINCT ON`) every call here exceeds the 5 s statement
+/// timeout.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_walks_finish_on_a_dense_dag(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (top, layers, bottom) = create_lattice(&pool, "dense", LATTICE_WIDTH, LATTICE_LAYERS).await;
+    let d = LATTICE_LAYERS as i32;
+    let total = LATTICE_WIDTH * LATTICE_LAYERS + 2;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    // ---- ancestors of `bottom` ----
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, None, None)
+        .await
+        .expect("get_lineage over the lattice must finish inside the statement timeout");
+    assert_eq!(up.claims.len(), total);
+    assert_eq!(up.claims[&bottom].depth, 0);
+    for (j, layer) in layers.iter().enumerate() {
+        for c in layer {
+            assert_eq!(up.claims[c].depth, j as i32 + 1, "L{} depth", j + 1);
+        }
+    }
+    assert_eq!(up.claims[&top].depth, d + 1);
+    assert_eq!(up.max_depth_reached, d + 1);
+    assert!(!up.truncated);
+    assert_eq!(up.topological_order.first(), Some(&top));
+    assert_eq!(up.topological_order.last(), Some(&bottom));
+    assert_eq!(
+        up.claims[&bottom].parent_ids.len(),
+        LATTICE_WIDTH,
+        "bottom's parents are all of L1"
+    );
+
+    // Ending exactly at max_depth is complete; one layer short is truncated
+    // and omits exactly the claim past the cut.
+    let exact = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, Some(d + 1), None)
+        .await
+        .expect("lineage at the exact depth");
+    assert_eq!(exact.claims.len(), total);
+    assert!(!exact.truncated);
+    let short = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, Some(d), None)
+        .await
+        .expect("lineage one layer short");
+    assert!(short.truncated, "top lies past max_depth");
+    assert_eq!(short.claims.len(), total - 1);
+    assert!(!short.claims.contains_key(&top));
+    assert_eq!(short.max_depth_reached, d);
+
+    let ids = LineageRepository::get_ancestor_ids(&mut *conn, &viewer, bottom, None)
+        .await
+        .expect("get_ancestor_ids over the lattice");
+    assert_eq!(ids.len(), total);
+    assert_eq!(ids.first(), Some(&top), "ancestors first");
+    assert_eq!(ids.last(), Some(&bottom));
+
+    // ---- descendants of `top` ----
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None)
+        .await
+        .expect("get_descendants over the lattice must finish inside the statement timeout");
+    assert_eq!(down.claims.len(), total);
+    assert_eq!(down.claims[&top].depth, 0);
+    for (j, layer) in layers.iter().enumerate() {
+        for c in layer {
+            assert_eq!(
+                down.claims[c].depth,
+                d - j as i32,
+                "L{} depth from top",
+                j + 1
+            );
+        }
+    }
+    assert_eq!(down.claims[&bottom].depth, d + 1);
+    assert!(!down.truncated);
+    let down_short = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d))
+        .await
+        .expect("descendants one layer short");
+    assert!(down_short.truncated, "bottom lies past max_depth");
+    assert_eq!(down_short.claims.len(), total - 1);
+    assert!(!down_short.claims.contains_key(&bottom));
+
+    let dids = LineageRepository::get_descendant_ids(&mut *conn, &viewer, top, None)
+        .await
+        .expect("get_descendant_ids over the lattice");
+    assert_eq!(dids.len(), total);
+    assert_eq!(dids.first(), Some(&top), "root first");
+    assert_eq!(dids.last(), Some(&bottom));
+
+    // ---- lowest common ancestor of two L1 claims ----
+    // Both are one hop below every L2 claim; nothing is closer to both.
+    let lca = LineageRepository::get_lca(&mut *conn, &viewer, layers[0][0], layers[0][1], None)
+        .await
+        .expect("get_lca over the lattice")
+        .expect("the L1 claims share ancestors");
+    assert!(layers[1].contains(&lca.ancestor_id), "an L2 claim");
+    assert_eq!(
+        (lca.depth_from_a, lca.depth_from_b, lca.total_depth),
+        (1, 1, 2)
+    );
+}
+
+/// Backlog f889c86f: a claim that is reached both by a shortcut AND, past
+/// `max_depth`, by a long path is reported at its SHORTEST depth and does not
+/// make the result truncated. The deduplicated walk must keep the minimum
+/// depth per claim, as the path-enumerating walk's `DISTINCT ON (id) ...
+/// ORDER BY id, depth` did.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_shortcut_keeps_the_shortest_depth_on_a_dense_dag(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (top, layers, bottom) =
+        create_lattice(&pool, "shortcut", LATTICE_WIDTH, LATTICE_LAYERS).await;
+    // top -> bottom directly: top is one hop from bottom, and d + 1 hops
+    // along every lattice path.
+    create_claim_edge(&pool, top, bottom, "supports").await;
+    let d = LATTICE_LAYERS as i32;
+    let total = LATTICE_WIDTH * LATTICE_LAYERS + 2;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    // max_depth = d: every claim is within d of bottom once the shortcut
+    // exists (top at 1, L_j at j), so nothing lies past the cut.
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, Some(d), None)
+        .await
+        .expect("lineage with a shortcut");
+    assert_eq!(up.claims.len(), total);
+    assert_eq!(
+        up.claims[&top].depth, 1,
+        "top's shortest depth is the shortcut"
+    );
+    assert_eq!(up.claims[&layers[d as usize - 1][0]].depth, d);
+    assert!(
+        !up.truncated,
+        "a claim reachable within max_depth is not a truncation witness, even when a \
+         longer path to it runs past the cut"
+    );
+    assert_eq!(up.topological_order.last(), Some(&bottom));
+
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d))
+        .await
+        .expect("descendants with a shortcut");
+    assert_eq!(down.claims.len(), total);
+    assert_eq!(down.claims[&bottom].depth, 1);
+    assert!(!down.truncated);
+
+    let lca = LineageRepository::get_lca(&mut *conn, &viewer, bottom, layers[0][0], Some(d))
+        .await
+        .expect("lca with a shortcut")
+        .expect("L1 is an ancestor of bottom");
+    assert_eq!(
+        lca.ancestor_id, layers[0][0],
+        "L1-0 is its own ancestor at depth 0"
+    );
+    assert_eq!((lca.depth_from_a, lca.depth_from_b), (1, 0));
+
+    // Unbounded (default depth), so the long paths to top ARE walked: the
+    // shortest depth must still win over them.
+    let lca_top = LineageRepository::get_lca(&mut *conn, &viewer, bottom, top, None)
+        .await
+        .expect("lca of bottom and top")
+        .expect("top is an ancestor of bottom");
+    assert_eq!(lca_top.ancestor_id, top);
+    assert_eq!(
+        (lca_top.depth_from_a, lca_top.depth_from_b),
+        (1, 0),
+        "top is one hop from bottom through the shortcut"
+    );
+
+    // The same pair swapped, so the shortcut lies on the SECOND walk
+    // (`ancestors_b`): each side must keep its own shortest depth.
+    let lca_swapped = LineageRepository::get_lca(&mut *conn, &viewer, top, bottom, None)
+        .await
+        .expect("lca of top and bottom")
+        .expect("top is an ancestor of bottom");
+    assert_eq!(lca_swapped.ancestor_id, top);
+    assert_eq!(
+        (lca_swapped.depth_from_a, lca_swapped.depth_from_b),
+        (0, 1),
+        "top is one hop from bottom through the shortcut, from the second walk too"
+    );
+
+    // Ancestors first by shortest depth: top sorts with L1 (depth 1), just
+    // before bottom, not first (where its lattice depth d + 1 would put it).
+    let ids = LineageRepository::get_ancestor_ids(&mut *conn, &viewer, bottom, None)
+        .await
+        .expect("ancestor ids with a shortcut");
+    assert_eq!(ids.len(), total);
+    let depth_one = &ids[total - 1 - (LATTICE_WIDTH + 1)..total - 1];
+    assert!(depth_one.contains(&top), "top is at depth 1: {ids:?}");
+    assert_eq!(ids.last(), Some(&bottom));
+
+    // Root first by shortest depth: bottom sorts with L_d (depth 1).
+    let dids = LineageRepository::get_descendant_ids(&mut *conn, &viewer, top, None)
+        .await
+        .expect("descendant ids with a shortcut");
+    assert_eq!(dids.len(), total);
+    assert_eq!(dids.first(), Some(&top));
+    assert!(
+        dids[1..=LATTICE_WIDTH + 1].contains(&bottom),
+        "bottom is at depth 1: {dids:?}"
+    );
+}
+
+// ============================================================================
+// Cycles: the walks end when no new claim is reached, not at the depth bound
+// ============================================================================
+
+/// A hub cycle with a tail: `root -> kid_i` and `kid_i -> root` for every
+/// kid (all `supports`), plus `kid_0 -> tail -> end`. Every kid lies on a
+/// 2-cycle through `root`.
+///
+/// Returns `(root, kids, tail, end)`.
+async fn create_hub_cycle(pool: &PgPool, tag: &str, kids: usize) -> (Uuid, Vec<Uuid>, Uuid, Uuid) {
+    let root = create_test_claim(pool, &format!("{tag} root"), 0.5).await;
+    let mut ks = Vec::with_capacity(kids);
+    for i in 0..kids {
+        let k = create_test_claim(pool, &format!("{tag} kid {i}"), 0.5).await;
+        create_claim_edge(pool, root, k, "supports").await;
+        create_claim_edge(pool, k, root, "supports").await;
+        ks.push(k);
+    }
+    let tail = create_test_claim(pool, &format!("{tag} tail"), 0.5).await;
+    create_claim_edge(pool, ks[0], tail, "supports").await;
+    let end = create_test_claim(pool, &format!("{tag} end"), 0.5).await;
+    create_claim_edge(pool, tail, end, "supports").await;
+    (root, ks, tail, end)
+}
+
+/// Kids on the hub cycle. Large enough that a walk which re-emits the cycle
+/// at every depth does millions of rows of work at [`UNBOUNDED`].
+const HUB_KIDS: usize = 200;
+
+/// A depth bound no lineage reaches. The repository accepts any bound (the
+/// provenance export CLI passes its `--max-depth` through uncapped), so a
+/// walk's cost must not grow with it once the reachable claims are exhausted.
+const UNBOUNDED: i32 = 1_000_000;
+
+fn assert_unique(ids: &[Uuid], what: &str) {
+    let set: std::collections::HashSet<&Uuid> = ids.iter().collect();
+    assert_eq!(set.len(), ids.len(), "{what}: a claim is listed twice");
+}
+
+/// Review of backlog f889c86f: on a graph with cycles every lineage walk
+/// stops as soon as a layer reaches no new claim, reports each claim once at
+/// its exact shortest depth, and keeps `truncated` exact.
+///
+/// A walk without a visited set (the per-`(id, depth)` `UNION` form) is ended
+/// on a cycle only by the depth bound: it re-emits every claim of the cycle at
+/// every depth, about `HUB_KIDS` x `UNBOUNDED` rows here, and every call below
+/// exceeds the 5 s statement timeout.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_walks_end_on_a_cycle_at_exact_depths(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (root, kids, tail, end) = create_hub_cycle(&pool, "cycle", HUB_KIDS).await;
+    let total = HUB_KIDS + 3;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    // ---- ancestors of `end`: tail 1, kid_0 2, root 3, the other kids 4 ----
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(UNBOUNDED), None)
+        .await
+        .expect("get_lineage on a cycle must end inside the statement timeout");
+    assert_eq!(up.claims.len(), total);
+    assert_eq!(up.claims[&end].depth, 0);
+    assert_eq!(up.claims[&tail].depth, 1);
+    assert_eq!(up.claims[&kids[0]].depth, 2);
+    assert_eq!(up.claims[&root].depth, 3);
+    for k in &kids[1..] {
+        assert_eq!(up.claims[k].depth, 4, "a kid behind the root");
+    }
+    assert_eq!(up.max_depth_reached, 4);
+    assert!(!up.truncated, "the cycle is exhausted, not cut");
+    assert_unique(&up.topological_order, "ancestor topological order");
+    assert_eq!(up.topological_order.len(), total);
+    assert_eq!(up.topological_order.last(), Some(&end));
+
+    // One layer short: the kids behind the root are past the cut.
+    let short = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(3), None)
+        .await
+        .expect("lineage one layer short");
+    assert!(
+        short.truncated,
+        "the kids behind the root lie past max_depth"
+    );
+    assert_eq!(short.claims.len(), 4);
+    assert_eq!(short.max_depth_reached, 3);
+
+    // The default bound, from a claim ON the cycle: root's parents are the
+    // kids (each `kid -> root`), and root itself is not re-entered.
+    let at_root = LineageRepository::get_lineage_conn(&mut conn, &viewer, root, None, None)
+        .await
+        .expect("lineage from a claim on the cycle");
+    assert_eq!(at_root.claims.len(), HUB_KIDS + 1);
+    assert_eq!(at_root.claims[&root].depth, 0);
+    assert!(kids.iter().all(|k| at_root.claims[k].depth == 1));
+    assert!(!at_root.truncated);
+
+    let ids = LineageRepository::get_ancestor_ids(&mut *conn, &viewer, end, Some(UNBOUNDED))
+        .await
+        .expect("get_ancestor_ids on a cycle");
+    assert_eq!(ids.len(), total);
+    assert_unique(&ids, "ancestor ids");
+    assert!(kids[1..].contains(&ids[0]), "the deepest ancestors first");
+    assert_eq!(ids[total - 4..], [root, kids[0], tail, end]);
+
+    // ---- descendants of `root`: kids 1, tail 2, end 3 ----
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED))
+        .await
+        .expect("get_descendants on a cycle must end inside the statement timeout");
+    assert_eq!(down.claims.len(), total);
+    assert_eq!(down.claims[&root].depth, 0);
+    assert!(kids.iter().all(|k| down.claims[k].depth == 1));
+    assert_eq!(down.claims[&tail].depth, 2);
+    assert_eq!(down.claims[&end].depth, 3);
+    assert_eq!(down.max_depth_reached, 3);
+    assert!(!down.truncated);
+    assert_unique(&down.topological_order, "descendant topological order");
+
+    let down_short = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(2))
+        .await
+        .expect("descendants one layer short");
+    assert!(down_short.truncated, "end lies past max_depth");
+    assert_eq!(down_short.claims.len(), total - 1);
+    assert!(!down_short.claims.contains_key(&end));
+
+    let dids = LineageRepository::get_descendant_ids(&mut *conn, &viewer, root, Some(UNBOUNDED))
+        .await
+        .expect("get_descendant_ids on a cycle");
+    assert_eq!(dids.len(), total);
+    assert_unique(&dids, "descendant ids");
+    assert_eq!(dids.first(), Some(&root));
+    assert_eq!(dids[total - 2..], [tail, end]);
+
+    // ---- lowest common ancestor across the cycle ----
+    // Both walks run through the whole cycle; `tail` is the only common
+    // ancestor at total depth 1 (end -> tail, tail itself).
+    let lca = LineageRepository::get_lca(&mut *conn, &viewer, end, tail, Some(UNBOUNDED))
+        .await
+        .expect("get_lca on a cycle must end inside the statement timeout")
+        .expect("tail is an ancestor of end");
+    assert_eq!(lca.ancestor_id, tail);
+    assert_eq!((lca.depth_from_a, lca.depth_from_b), (1, 0));
+    // And with the pair swapped, so the long walk is the second one.
+    let lca = LineageRepository::get_lca(&mut *conn, &viewer, kids[1], end, Some(UNBOUNDED))
+        .await
+        .expect("get_lca on a cycle, swapped")
+        .expect("root is an ancestor of both");
+    assert_eq!(
+        lca.total_depth, 4,
+        "kid_1 <- root (1) and end <- tail <- kid_0 <- root (3)"
+    );
+}
+
+// ============================================================================
+// `get_depth` and `detect_cycles`: bounded by the claims and edges reached
+// ============================================================================
+
+/// Backlog c07884a9: `get_depth` and `detect_cycles` finish on the dense
+/// lattice, and answer exactly: every path from `bottom` to `top` has
+/// `LATTICE_LAYERS + 1` hops, and the lattice has no cycle.
+///
+/// The path-enumerating forms (`UNION ALL` plus a path array, guarded only by
+/// `NOT c.id = ANY(path)`) walk all 4^12 paths, and each call here exceeds the
+/// 5 s statement timeout (SQLSTATE 57014).
+#[sqlx::test(migrations = "../../migrations")]
+async fn depth_and_cycle_check_finish_on_a_dense_dag(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (top, layers, bottom) = create_lattice(&pool, "dense", LATTICE_WIDTH, LATTICE_LAYERS).await;
+    let d = LATTICE_LAYERS as i32;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, bottom)
+        .await
+        .expect("get_depth over the lattice must finish inside the statement timeout");
+    assert_eq!(depth, d + 1, "bottom -> L1 -> ... -> L12 -> top");
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, layers[0][0])
+        .await
+        .expect("get_depth from an L1 claim");
+    assert_eq!(depth, d, "L1 -> ... -> L12 -> top");
+    let depth = LineageRepository::get_depth(&mut *conn, &viewer, top)
+        .await
+        .expect("get_depth from the top");
+    assert_eq!(depth, 0, "top has no parents");
+
+    // Every claim of the lattice is reached many times over, so a check that
+    // calls "reached an already-visited claim" a cycle answers `true` here.
+    let has_cycle = LineageRepository::detect_cycles(&mut *conn, &viewer, bottom)
+        .await
+        .expect("detect_cycles over the lattice must finish inside the statement timeout");
+    assert!(!has_cycle, "a dense DAG has no cycle");
+
+    // The full walk over the same DAG carries the same answer.
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, bottom, None, None)
+        .await
+        .expect("get_lineage over the lattice");
+    assert!(!up.cycle_detected, "a dense DAG has no cycle");
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None)
+        .await
+        .expect("get_descendants over the lattice");
+    assert!(!down.cycle_detected, "a dense DAG has no cycle");
+}
+
+/// Backlog c07884a9: `get_depth` is the LONGEST chain of parents, not the
+/// shortest. `root`'s ancestors are the chain `root <- a <- b <- c` plus the
+/// shortcut `root <- c`: `c` is one hop away by the shortcut and three by the
+/// chain, so the depth is 3 (a walk that reports its deepest SHORTEST depth
+/// answers 1).
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_depth_is_the_longest_chain_past_a_shortcut(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = create_test_claim(&pool, "depth root", 0.5).await;
+    let a = create_test_claim(&pool, "depth a", 0.5).await;
+    let b = create_test_claim(&pool, "depth b", 0.5).await;
+    let c = create_test_claim(&pool, "depth c", 0.5).await;
+    create_claim_edge(&pool, a, root, "supports").await;
+    create_claim_edge(&pool, b, a, "supports").await;
+    create_claim_edge(&pool, c, b, "supports").await;
+    create_claim_edge(&pool, c, root, "supports").await;
+    // A second edge on the same pair must not count twice.
+    create_claim_edge(&pool, c, root, "elaborates").await;
+
+    let depth = LineageRepository::get_depth(&pool, &viewer, root)
+        .await
+        .expect("get_depth");
+    assert_eq!(depth, 3, "root <- a <- b <- c, past the shortcut root <- c");
+    assert!(!LineageRepository::detect_cycles(&pool, &viewer, root)
+        .await
+        .expect("detect_cycles"));
+
+    // A claim that does not exist has no lineage.
+    let depth = LineageRepository::get_depth(&pool, &viewer, Uuid::new_v4())
+        .await
+        .expect("get_depth of a missing claim");
+    assert_eq!(depth, 0);
+}
+
+/// Backlog c07884a9: on a cycle that does NOT pass through the start,
+/// `detect_cycles` answers `true` and `get_depth` counts the cycle as one
+/// step. `root <- a <- {b <-> c} <- d`: the chain of parents is root, a, the
+/// cycle {b, c}, d, so the depth is 3.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cycle_behind_the_start_is_detected_and_counted_once(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let root = create_test_claim(&pool, "cyc root", 0.5).await;
+    let a = create_test_claim(&pool, "cyc a", 0.5).await;
+    let b = create_test_claim(&pool, "cyc b", 0.5).await;
+    let c = create_test_claim(&pool, "cyc c", 0.5).await;
+    let d = create_test_claim(&pool, "cyc d", 0.5).await;
+    create_claim_edge(&pool, a, root, "supports").await;
+    create_claim_edge(&pool, b, a, "supports").await;
+    create_claim_edge(&pool, c, b, "supports").await;
+    create_claim_edge(&pool, b, c, "supports").await;
+    create_claim_edge(&pool, d, c, "supports").await;
+
+    assert!(LineageRepository::detect_cycles(&pool, &viewer, root)
+        .await
+        .expect("detect_cycles"));
+    assert_eq!(
+        LineageRepository::get_depth(&pool, &viewer, root)
+            .await
+            .expect("get_depth"),
+        3,
+        "root, a, the cycle {{b, c}} as one step, d"
+    );
+    // From `d`, which nothing derives from, there is neither.
+    assert!(!LineageRepository::detect_cycles(&pool, &viewer, d)
+        .await
+        .expect("detect_cycles from d"));
+
+    let up = LineageRepository::get_lineage(&pool, &viewer, root, None, None)
+        .await
+        .expect("get_lineage");
+    assert_eq!(up.claims.len(), 5);
+    assert!(up.cycle_detected, "b <-> c lies among the returned claims");
+    // Capped to the target and its nearest ancestor, the cycle is gone.
+    let capped = LineageRepository::get_lineage(&pool, &viewer, root, None, Some(2))
+        .await
+        .expect("get_lineage, capped");
+    assert!(capped.truncated);
+    assert!(
+        !capped.cycle_detected,
+        "the flag describes the returned claims, and {{root, a}} has no cycle"
+    );
+}
+
+/// Backlog c07884a9: `cycle_detected` and `detect_cycles` are real on the hub
+/// cycle (every kid on a 2-cycle through the root, reached from `end`, which
+/// is on no cycle), and both finish inside the statement timeout.
+///
+/// Before this fix `cycle_detected` was `false` by construction on every
+/// walk.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cycle_detected_is_set_on_the_hub_cycle(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let (root, _kids, tail, end) = create_hub_cycle(&pool, "hub", HUB_KIDS).await;
+    let mut conn = time_boxed_conn(&pool).await;
+
+    assert!(LineageRepository::detect_cycles(&mut *conn, &viewer, end)
+        .await
+        .expect("detect_cycles on the hub cycle"));
+    // end <- tail <- {root and every kid, kid_0 included}: the cycle is one
+    // step, so the depth is 2.
+    assert_eq!(
+        LineageRepository::get_depth(&mut *conn, &viewer, end)
+            .await
+            .expect("get_depth on the hub cycle"),
+        2
+    );
+
+    let up = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(UNBOUNDED), None)
+        .await
+        .expect("get_lineage on the hub cycle");
+    assert!(up.cycle_detected, "every kid is on a 2-cycle through root");
+    // Stopped before the root, the walk returns end, tail and kid_0 only.
+    let short = LineageRepository::get_lineage_conn(&mut conn, &viewer, end, Some(2), None)
+        .await
+        .expect("get_lineage before the root");
+    assert_eq!(short.claims.len(), 3);
+    assert!(!short.cycle_detected, "no cycle among end, tail and kid_0");
+
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED))
+        .await
+        .expect("get_descendants on the hub cycle");
+    assert!(
+        down.cycle_detected,
+        "every kid is on a 2-cycle through root"
+    );
+    let below = LineageRepository::get_descendants_conn(&mut conn, &viewer, tail, Some(UNBOUNDED))
+        .await
+        .expect("get_descendants below the cycle");
+    assert!(!below.cycle_detected, "tail -> end is a chain");
+}
+
+/// Backlog c07884a9: an edge the viewer cannot read cannot close a cycle.
+/// `a -> b` is public; the back edge `b -> a` belongs to a group, so only a
+/// member sees the cycle, and for anyone else the answer reveals nothing
+/// about the private edge.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cycle_closed_by_an_unreadable_edge_is_not_reported(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "cycle-edge-owner").await;
+    let public = fixture::public_viewer(&pool).await;
+    let member = epigraph_db::visibility::Viewer::resolve(&pool, owner)
+        .await
+        .expect("resolve member");
+    let a = fixture::seed_public_claim(&pool, owner, "vis a").await;
+    let b = fixture::seed_public_claim(&pool, owner, "vis b").await;
+    create_claim_edge(&pool, a, b, "supports").await;
+    fixture::seed_edge_owned_by(&pool, b, a, "group", group).await;
+
+    assert!(LineageRepository::detect_cycles(&pool, &member, b)
+        .await
+        .expect("detect_cycles, member"));
+    assert!(!LineageRepository::detect_cycles(&pool, &public, b)
+        .await
+        .expect("detect_cycles, public"));
+    assert_eq!(
+        LineageRepository::get_depth(&pool, &public, b)
+            .await
+            .expect("get_depth, public"),
+        1,
+        "b <- a over the public edge only"
     );
 }

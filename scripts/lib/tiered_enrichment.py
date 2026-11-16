@@ -1,6 +1,8 @@
 """Tiered enrichment utility for EpiGraph claim evidence.
 
 Provides enrich_tier1/2/3() and auto_tier() router. Uses claude CLI for LLM calls.
+auto_tier() routes on the split-conformal prediction set of the Tier-1 result
+(scripts/lib/scifact_conformal.py, quantiles from calibration.toml).
 Constrains methodology output to canonical Rust vocabulary (cdst.rs methodology_profile keys).
 
 Can be imported as a library or invoked as a CLI:
@@ -9,6 +11,7 @@ Can be imported as a library or invoked as a CLI:
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -18,6 +21,7 @@ from dataclasses import dataclass, asdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.claude_cli import claude_cli_call
+from lib.scifact_conformal import conformal_prediction_set, load_conformal_quantiles
 
 log = logging.getLogger(__name__)
 
@@ -241,6 +245,38 @@ async def enrich_tier3(
     return _parse_enrichment(raw, tier=3)
 
 
+# ── Conformal routing ──
+
+_REPO_CALIBRATION_TOML = os.path.join(os.path.dirname(__file__), "..", "..", "calibration.toml")
+
+
+@functools.lru_cache(maxsize=1)
+def routing_quantiles() -> dict[str, float]:
+    """The `[conformal.quantiles]` auto_tier routes on, read once.
+
+    `CALIBRATION_PATH` when set, else the repository's calibration.toml.
+    The variable is the one the Rust engine reads, but the fallback is not:
+    `CalibrationConfig::resolve` serves its compiled-in copy when the
+    override does not load, while this fails closed. A missing file raises
+    FileNotFoundError and a file without the section raises ValueError (see
+    scifact_conformal.load_conformal_quantiles), so a `CALIBRATION_PATH` the
+    Rust server tolerates can still stop the worker.
+    """
+    path = os.environ.get("CALIBRATION_PATH") or os.path.normpath(_REPO_CALIBRATION_TOML)
+    return load_conformal_quantiles(path)
+
+
+def tier1_prediction_set(result: EnrichmentResult) -> list[str]:
+    """The split-conformal prediction set of a Tier-1 result."""
+    return conformal_prediction_set(
+        evidence_type=result.evidence_type,
+        methodology=result.methodology,
+        confidence=result.confidence,
+        supports=result.supports_claim,
+        quantiles=routing_quantiles(),
+    )
+
+
 async def auto_tier(
     claim_text: str,
     evidence_text: str,
@@ -248,7 +284,20 @@ async def auto_tier(
     has_conflict: bool = False,
     **context,
 ) -> EnrichmentResult:
-    """Router: picks appropriate tier based on confidence/conflict.
+    """Router: runs Tier 1, then escalates on the conformal set or a conflict.
+
+    Routing (backlog 3a6666e9): the Tier-1 result's split-conformal prediction
+    set over {supported, contradicted, not_enough_info}, at the quantiles the
+    offline calibrator fit (calibration.toml `[conformal.quantiles]`), replaces
+    the raw `confidence < 0.3` cutoff.
+
+      1. The set is not a singleton (empty = abstention, 2+ = ambiguity) -> Tier 2.
+      2. Else has_conflict -> Tier 3 when its context is present, else Tier 2.
+      3. Else the Tier-1 result.
+
+    `tier1_confidence` is accepted for compatibility and no longer routes: a
+    bare confidence carries no methodology, evidence type or direction, so it
+    has no prediction set. Tier 1 always runs once.
 
     Context kwargs for higher tiers:
       - abstract: str (Tier 2/3)
@@ -256,20 +305,14 @@ async def auto_tier(
       - cross_source_history: list[dict] (Tier 3)
       - ds_belief_state: dict (Tier 3)
     """
-    # Step 1: Run Tier 1 if no confidence provided
-    tier1_result = None
-    if tier1_confidence is None:
-        tier1_result = await enrich_tier1(claim_text, evidence_text)
-        tier1_confidence = tier1_result.confidence
+    if tier1_confidence is not None:
+        log.debug("auto_tier: tier1_confidence=%s ignored; routing uses the conformal set",
+                  tier1_confidence)
+    tier1_result = await enrich_tier1(claim_text, evidence_text)
+    pred_set = tier1_prediction_set(tier1_result)
 
-    # Step 2: High confidence + no conflict → return Tier 1 result
-    if tier1_confidence >= 0.3 and not has_conflict:
-        if tier1_result is not None:
-            return tier1_result
-        return await enrich_tier1(claim_text, evidence_text)
-
-    # Step 3: Low confidence → Tier 2
-    if tier1_confidence < 0.3:
+    # Step 1: no single conforming label -> Tier 2 (paper context)
+    if len(pred_set) != 1:
         if "abstract" not in context:
             raise ValueError("Tier 2 enrichment requires 'abstract' in context kwargs")
         return await enrich_tier2(
@@ -278,7 +321,7 @@ async def auto_tier(
             context.get("surrounding_sentences", []),
         )
 
-    # Step 4: has_conflict AND Tier 3 context available → Tier 3
+    # Step 2: has_conflict AND Tier 3 context available -> Tier 3
     if has_conflict:
         if "cross_source_history" in context and "ds_belief_state" in context:
             return await enrich_tier3(
@@ -287,7 +330,7 @@ async def auto_tier(
                 context["cross_source_history"],
                 context["ds_belief_state"],
             )
-        # Step 5: has_conflict but no Tier 3 context → fallback to Tier 2
+        # has_conflict but no Tier 3 context -> fallback to Tier 2
         if "abstract" not in context:
             raise ValueError("Tier 2 enrichment requires 'abstract' in context kwargs")
         return await enrich_tier2(
@@ -296,10 +339,8 @@ async def auto_tier(
             context.get("surrounding_sentences", []),
         )
 
-    # Fallback: return Tier 1
-    if tier1_result is not None:
-        return tier1_result
-    return await enrich_tier1(claim_text, evidence_text)
+    # Step 3: a confident single label and no conflict -> Tier 1
+    return tier1_result
 
 
 # ── CLI interface ──

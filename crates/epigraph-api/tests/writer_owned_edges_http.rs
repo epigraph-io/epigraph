@@ -462,6 +462,7 @@ async fn a_viewer_holding_handlers_edge_is_the_callers(pool: PgPool) {
 
     // share_skill: the SHARED_BY edge is W's.
     let (status, Json(shared)) = share_skill(
+        write_scope(),
         ViewerExtractor(viewer(&pool, w).await),
         State(state.clone()),
         Json(ShareSkillRequest {
@@ -749,4 +750,26 @@ async fn an_http_edge_patch_cannot_set_the_supersede_act_marker(pool: PgPool) {
         0,
         "nothing merged: {props}"
     );
+}
+
+/// The `claims:write` scope the write handlers now take as their first
+/// extractor (backlog f00d75ab). A direct handler call stands in for the
+/// bearer middleware, so it supplies the scope the route checks.
+fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
+    let principal = uuid::Uuid::new_v4();
+    epigraph_api::middleware::bearer::RequireScopeWrite(
+        epigraph_api::middleware::bearer::AuthContext {
+            client_id: principal,
+            agent_id: Some(principal),
+            owner_id: Some(principal),
+            client_type: epigraph_api::middleware::ClientType::Service,
+            scopes: vec!["claims:write".to_string()],
+            jti: uuid::Uuid::new_v4(),
+            family_id: None,
+            elevation_claim: None,
+            elevation: None,
+            admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
+            delegated_by: None,
+        },
+    )
 }

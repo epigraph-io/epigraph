@@ -287,14 +287,7 @@ async fn embed_new_challenge(
             return;
         }
     };
-    let pgvector = format!(
-        "[{}]",
-        embedding
-            .iter()
-            .map(f32::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
+    let pgvector = epigraph_db::pgvector_literal(&embedding);
     match state
         .store_claim_embedding_as(viewer, id, &pgvector, "create_challenge.embed")
         .await

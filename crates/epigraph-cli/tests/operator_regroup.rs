@@ -15,8 +15,9 @@
 //!   evidence), to a public claim P, and from a group-private workflow in SRC
 //!   (`executes`). B moves; the edges to S become co-owned `(DST, group,
 //!   co-owner SRC)`, readable only by a member of both, and so does the edge
-//!   from the workflow, which the tool meets with the workflow's own tuple
-//!   (`(SRC, group, co-owner DST)`) where the trigger would count it public.
+//!   from the workflow, met with the workflow's own tuple
+//!   (`(SRC, group, co-owner DST)`) by the tool and, since migration 219, by
+//!   the cascade too.
 //! * The holds: N is `('group', H)` (not the source's); Q is sealed; R carries
 //!   an evidence row owned by H; V carries a PUBLIC evidence row; W carries
 //!   PINNED evidence; E carries an edge to P DECLARED co-owned by H (the move's
@@ -300,11 +301,11 @@ async fn seed(pool: &PgPool) -> Fx {
     let e_bs = fixture::seed_edge(pool, b, s).await;
     let e_bp = fixture::seed_edge(pool, b, p).await;
     let e_ev_bs = evidence_edge(pool, ev_b, ev_s, src).await;
-    // A group-private workflow in SRC that executes B. The edges arm (and
-    // `epigraph_node_tenancy`) count a workflow endpoint as public, so the
-    // trigger stamps B's tuple, (SRC, group). Once B moves, the tool writes
-    // the exact meet, (SRC, group, co-owner DST); the workflow row itself is a
-    // node and is not touched.
+    // A group-private workflow in SRC that executes B. Both are SRC's, so the
+    // trigger stamps (SRC, group). Once B moves, the exact meet is (SRC,
+    // group, co-owner DST): the cascade writes it itself since migration 219
+    // (a workflow endpoint is met with its own row), and the tool writes the
+    // same; the workflow row itself is a node and is not touched.
     let wf = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO workflows (id, canonical_name, generation, goal, owner_group_id, visibility) \
@@ -2194,14 +2195,16 @@ async fn an_edge_to_a_public_node_goes_to_the_target(pool: PgPool) {
 /// requiring it) and reported. Its recorded prior, the claim's tuple alone,
 /// was already wider than the node: the reversal will not write it back and
 /// holds the claim instead, which the dry run and the apply both report
-/// (IRREVERSIBLE-EDGE and its count).
+/// (IRREVERSIBLE-EDGE and its count). The node is a CONTEXT, which the trigger
+/// still meets as public; since migration 219 a workflow endpoint is met with
+/// its own row, so an edge from a workflow is stamped exactly at insert and
+/// never has this stale prior.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
-    let c =
-        fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, run by H's workflow").await;
-    let wf = seed_node(&pool, "workflow", fx.h_group, "group").await;
-    let e = typed_edge(&pool, wf, "workflow", c, "claim").await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in H's context").await;
+    let node = seed_node(&pool, "context", fx.h_group, "group").await;
+    let e = typed_edge(&pool, node, "context", c, "claim").await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -2267,20 +2270,20 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
     );
 }
 
-/// An edge from a workflow that is already in the TARGET goes to the target
-/// alone (the node requires nothing beyond the target) and is not a
+/// An edge from a node (a context) that is already in the TARGET goes to the
+/// target alone (the node requires nothing beyond the target) and is not a
 /// SOURCE-NODE-EDGE. Its recorded prior, the claim's tuple alone, was wider
 /// than the node (a SOURCE-only reader read an edge naming a TARGET-private
-/// workflow), so the reversal will not write it back and holds the claim
+/// node), so the reversal will not write it back and holds the claim
 /// instead. The dry run and the apply both say so up front (IRREVERSIBLE-EDGE
-/// and its count).
+/// and its count). A context, not a workflow: see
+/// [`an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds`].
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
-    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, run by DST's workflow")
-        .await;
-    let wf = seed_node(&pool, "workflow", fx.dst, "group").await;
-    let e = typed_edge(&pool, wf, "workflow", c, "claim").await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
+    let node = seed_node(&pool, "context", fx.dst, "group").await;
+    let e = typed_edge(&pool, node, "context", c, "claim").await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);

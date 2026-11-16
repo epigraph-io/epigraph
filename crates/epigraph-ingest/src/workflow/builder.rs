@@ -122,6 +122,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             // axes are a document-ingest declaration (issue #222).
             axis: None,
             supporting_text: None,
+            supporting_locator: None,
             enrichment: serde_json::json!({}),
         });
         Some(id)
@@ -184,6 +185,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
             // axes are a document-ingest declaration (issue #222).
             axis: None,
             supporting_text: None,
+            supporting_locator: None,
             enrichment: serde_json::json!({}),
         });
 
@@ -231,6 +233,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                 // axes are a document-ingest declaration (issue #222).
                 axis: None,
                 supporting_text: Some(step.rationale.clone()),
+                supporting_locator: None,
                 enrichment: serde_json::json!({}),
             });
 
@@ -268,6 +271,7 @@ pub fn build_ingest_plan(extraction: &WorkflowExtraction) -> IngestPlan {
                     // axes are a document-ingest declaration (issue #222).
                     axis: None,
                     supporting_text: Some(step.rationale.clone()),
+                    supporting_locator: None,
                     enrichment: serde_json::json!({}),
                 });
 

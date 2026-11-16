@@ -42,8 +42,11 @@ pub struct CachedSubmission {
     pub created_at: Instant,
 }
 
-/// Idempotency store type alias
-pub type IdempotencyStore = Arc<RwLock<HashMap<String, CachedSubmission>>>;
+/// Idempotency store type alias.
+///
+/// Keyed by `(authenticated principal, client idempotency key)`: a client key
+/// is only unique within the caller that chose it (backlog 449bc6c1).
+pub type IdempotencyStore = Arc<RwLock<HashMap<(Uuid, String), CachedSubmission>>>;
 
 /// Thread-safe propagation orchestrator type alias
 pub type SharedOrchestrator = Arc<RwLock<PropagationOrchestrator>>;
@@ -488,11 +491,10 @@ pub struct AppState {
     pub edge_signer: Option<Arc<crate::edge_signer::ApiEdgeSigner>>,
 }
 
-/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
-pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
-
 /// Whether `POST /api/v1/bp/propagate` may write its results to `claims`
-/// (`apply_updates: true`).
+/// (`apply_updates: true`): `EPIGRAPH_BP_APPLY`, the
+/// [`epigraph_engine::belief_modes`] flag, parsed there once per process
+/// (backlog 820c15f1), so `/health`'s `bp_apply` and the gate are one value.
 ///
 /// BP apply is RETIRED under atom-level belief (SPEC §6.2, hazard H4): a
 /// whole-graph loopy-BP run rewrote claim caches, compounds included, with
@@ -502,63 +504,15 @@ pub const BP_APPLY_ENV: &str = "EPIGRAPH_BP_APPLY";
 /// then it writes atoms only (a compound is a query over its atoms and has no
 /// cache of its own to write). Read-only BP runs stay available as a
 /// diagnostic whatever this says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum BpApply {
-    /// `apply_updates: true` is refused (409). The default everywhere.
-    #[default]
-    Off,
-    /// `apply_updates: true` writes BP's values to the non-compound claims
-    /// the caller can see.
-    On,
-}
+///
+/// `Off` (the default everywhere): `apply_updates: true` is refused (409).
+/// `On`: it writes BP's values to the non-compound claims the caller can see.
+/// ONLY the value `on` (trimmed, any case) switches it on; `true`, `1` or a
+/// typo leave it off and are reported at boot.
+pub use epigraph_engine::belief_modes::BpApply;
 
-impl BpApply {
-    /// The switch's parse, apart from the environment: ONLY the exact value
-    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
-    /// `1` or a typo leave it OFF, so a mistyped value fails closed.
-    #[must_use]
-    pub fn parse(raw: Option<&str>) -> Self {
-        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
-            Self::On
-        } else {
-            Self::Off
-        }
-    }
-
-    /// Whether `raw` is SET to a value that is neither `on` nor `off`
-    /// (trimmed, case-insensitive): a value [`Self::parse`] silently reads as
-    /// OFF, which the server warns about at boot. Unset or blank is the plain
-    /// default and is not flagged.
-    #[must_use]
-    pub fn is_unrecognised(raw: Option<&str>) -> bool {
-        raw.map(str::trim).is_some_and(|v| {
-            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
-        })
-    }
-}
-
-#[cfg(test)]
-mod bp_apply_switch_tests {
-    use super::BpApply;
-
-    #[test]
-    fn only_on_switches_bp_apply_on() {
-        for on in ["on", "ON", " On "] {
-            assert_eq!(BpApply::parse(Some(on)), BpApply::On, "{on:?}");
-            assert!(!BpApply::is_unrecognised(Some(on)), "{on:?}");
-        }
-        // Values an operator might mean as "yes" stay OFF, and are flagged.
-        for typo in ["true", "1", "yes", "enabled", "onn"] {
-            assert_eq!(BpApply::parse(Some(typo)), BpApply::Off, "{typo:?}");
-            assert!(BpApply::is_unrecognised(Some(typo)), "{typo:?}");
-        }
-        for off in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
-            assert_eq!(BpApply::parse(off), BpApply::Off, "{off:?}");
-            assert!(!BpApply::is_unrecognised(off), "{off:?}");
-        }
-        assert_eq!(BpApply::default(), BpApply::Off);
-    }
-}
+/// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
+pub const BP_APPLY_ENV: &str = BpApply::ENV;
 
 /// API configuration options
 #[derive(Clone)]
@@ -734,6 +688,15 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // Workflow rows (183, ruling R-74): given tenancy columns and FORCEd by
     // that migration, on the same precedent.
     "workflows",
+    // Atlas team maps (210, backlog 77f4bf09): created with tenancy columns
+    // and FORCEd by that migration, on the same precedent.
+    "atlas_map_epochs",
+    "atlas_map_runs",
+    "atlas_map_levels",
+    // Hierarchical outcome reports (221, backlog 9928b61f), FORCEd by the
+    // migration that creates them, on the same precedent; their policies
+    // inherit the workflow row's tenancy.
+    "workflow_outcome_reports",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.
@@ -1180,6 +1143,36 @@ const TENANCY_TRIGGERS_173: &[(&str, &str)] = &[
 const MIGRATION_173_MARKERS: &[&str] = &[
     "epigraph_audit_report_inherit_tenancy",
     "epigraph_fragment_audit_reports_follow",
+];
+
+/// The triggers **migration 210** (per-team Atlas maps) adds, as
+/// `(relation, trigger)`: the require-tenancy root trigger of each of its three
+/// tables, and the three staleness triggers on `claims`, `edges` and
+/// `evidence`. A dropped or disabled staleness trigger is the silent case: a
+/// claim, edge or evidence row leaves a team's or the public map's readable
+/// set, no epoch moves, and a stored map that still holds it keeps reporting
+/// itself current and departure-free.
+///
+/// Required **only when one of [`MIGRATION_210_MARKERS`] exists**, for the
+/// reasons [`TENANCY_TRIGGERS_089`] gives.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_210: &[(&str, &str)] = &[
+    ("atlas_map_epochs", "atlas_map_epochs_require_tenancy"),
+    ("atlas_map_runs", "atlas_map_runs_require_tenancy"),
+    ("atlas_map_levels", "atlas_map_levels_require_tenancy"),
+    ("claims", "claims_atlas_map_stale"),
+    ("edges", "edges_atlas_map_stale"),
+    ("evidence", "evidence_atlas_map_stale"),
+];
+
+/// The markers that migration 210 has run: the three functions its staleness
+/// triggers use. Any one present means 210 ran; its documented undo
+/// (`docs/runbooks/210-undo.sql`) drops all three.
+#[cfg(feature = "db")]
+const MIGRATION_210_MARKERS: &[&str] = &[
+    "epigraph_atlas_map_bump",
+    "epigraph_atlas_map_stale",
+    "epigraph_atlas_map_stale_row",
 ];
 
 impl AppState {
@@ -1727,14 +1720,7 @@ impl AppState {
                 return false;
             }
         };
-        let pgvec = format!(
-            "[{}]",
-            embedding
-                .iter()
-                .map(f32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
+        let pgvec = epigraph_db::pgvector_literal(&embedding);
         match self
             .store_claim_embedding_as(viewer, claim_id, &pgvec, handler)
             .await
@@ -2038,6 +2024,8 @@ impl AppState {
     ///   * [`TENANCY_TRIGGERS_173`] is required only once either of
     ///     [`MIGRATION_173_MARKERS`] — 173's own functions — is present, on the
     ///     same reasoning.
+    ///   * [`TENANCY_TRIGGERS_210`] is required only once any of
+    ///     [`MIGRATION_210_MARKERS`] — 210's staleness functions — is present.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -2056,7 +2044,8 @@ impl AppState {
                 AND (t.tgname LIKE '%\\_require\\_tenancy' \
                      OR t.tgname LIKE '%\\_inherit\\_tenancy' \
                      OR t.tgname IN ('edges_tenancy','claims_propagate_tenancy', \
-                                     'claims_block_widening')) \
+                                     'claims_block_widening', 'claims_atlas_map_stale', \
+                                     'edges_atlas_map_stale', 'evidence_atlas_map_stale')) \
               ORDER BY c.relname, t.tgname",
         )
         .fetch_all(&self.db_pool)
@@ -2087,6 +2076,7 @@ impl AppState {
                 .chain(TENANCY_TRIGGERS_074.iter())
                 .chain(TENANCY_TRIGGERS_089.iter())
                 .chain(TENANCY_TRIGGERS_173.iter())
+                .chain(TENANCY_TRIGGERS_210.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -2101,7 +2091,7 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        // One read for every marker-gated tier (089's and 173's), so the boot
+        // One read for every marker-gated tier (089's, 173's and 210's), so the boot
         // check keeps a single catalog probe.
         let markers: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.proname::text FROM pg_proc p \
@@ -2111,6 +2101,7 @@ impl AppState {
         .bind(
             std::iter::once(MIGRATION_089_MARKER)
                 .chain(MIGRATION_173_MARKERS.iter().copied())
+                .chain(MIGRATION_210_MARKERS.iter().copied())
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
@@ -2120,6 +2111,9 @@ impl AppState {
         let migration_173_applied = markers
             .iter()
             .any(|m| MIGRATION_173_MARKERS.contains(&m.as_str()));
+        let migration_210_applied = markers
+            .iter()
+            .any(|m| MIGRATION_210_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -2135,6 +2129,9 @@ impl AppState {
         }
         if migration_173_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_173);
+        }
+        if migration_210_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_210);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -2191,6 +2188,7 @@ impl AppState {
             migration_074_applied,
             migration_089_applied,
             migration_173_applied,
+            migration_210_applied,
             "tenancy triggers armed"
         );
         Ok(())

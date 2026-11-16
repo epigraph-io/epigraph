@@ -124,6 +124,8 @@ fn context_to_response(row: epigraph_db::ContextRow) -> ContextResponse {
 /// `POST /api/v1/contexts`
 #[cfg(feature = "db")]
 pub async fn create_context(
+    // `claims:write`, checked before the body is parsed (backlog f00d75ab).
+    _scope: crate::middleware::bearer::RequireScopeWrite,
     State(state): State<AppState>,
     Json(request): Json<CreateContextRequest>,
 ) -> Result<(StatusCode, Json<ContextResponse>), ApiError> {

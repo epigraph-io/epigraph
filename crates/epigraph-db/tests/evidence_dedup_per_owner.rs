@@ -143,10 +143,25 @@ async fn on_the_app_role_another_owners_body_lands_and_an_identical_retry_is_a_d
     let (owners_write, writers_write, writers_retry) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, owner).await;
-            let o = EvidenceRepository::create(&mut *conn, &document(owner, claim, &b)).await;
+            let o = EvidenceRepository::create(
+                &mut *conn,
+                &document(owner, claim, &b),
+                epigraph_db::EvidenceEdge::supports(None),
+            )
+            .await;
             stamp(&mut conn, &p, writer).await;
-            let w = EvidenceRepository::create(&mut *conn, &document(writer, claim, &b)).await;
-            let r = EvidenceRepository::create(&mut *conn, &document(writer, claim, &b)).await;
+            let w = EvidenceRepository::create(
+                &mut *conn,
+                &document(writer, claim, &b),
+                epigraph_db::EvidenceEdge::supports(None),
+            )
+            .await;
+            let r = EvidenceRepository::create(
+                &mut *conn,
+                &document(writer, claim, &b),
+                epigraph_db::EvidenceEdge::supports(None),
+            )
+            .await;
             (conn, (o, w, r))
         })
         .await;
@@ -200,7 +215,12 @@ async fn same_owner_duplicates_already_stored_stay_valid(pool: PgPool) {
         pair.push(id);
     }
 
-    let third = EvidenceRepository::create(&pool, &document(owner, claim, &body)).await;
+    let third = EvidenceRepository::create(
+        &pool,
+        &document(owner, claim, &body),
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await;
     assert!(
         is_duplicate(&third),
         "a third copy is answered as a duplicate: {third:?}"
@@ -238,16 +258,24 @@ async fn concurrent_identical_first_writes_serialize_to_one_row(pool: PgPool) {
     let body = format!("two first writes at once {}", Uuid::new_v4());
 
     let mut first = pool.begin().await.expect("begin the first writer");
-    EvidenceRepository::create(&mut *first, &document(owner, claim, &body))
-        .await
-        .expect("the first write lands in its open transaction");
+    EvidenceRepository::create(
+        &mut *first,
+        &document(owner, claim, &body),
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("the first write lands in its open transaction");
 
     let p = pool.clone();
     let b = body.clone();
-    let mut second =
-        tokio::spawn(
-            async move { EvidenceRepository::create(&p, &document(owner, claim, &b)).await },
-        );
+    let mut second = tokio::spawn(async move {
+        EvidenceRepository::create(
+            &p,
+            &document(owner, claim, &b),
+            epigraph_db::EvidenceEdge::supports(None),
+        )
+        .await
+    });
     assert!(
         tokio::time::timeout(Duration::from_millis(750), &mut second)
             .await
@@ -281,7 +309,7 @@ async fn derivation_evidence_is_recorded_once(pool: PgPool) {
 
     let mut conn = pool.acquire().await.expect("acquire");
     let first =
-        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, atom, parent, "test")
+        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, None, atom, parent, "test")
             .await
             .expect("the first derivation write succeeds");
     assert!(
@@ -289,7 +317,7 @@ async fn derivation_evidence_is_recorded_once(pool: PgPool) {
         "first: {first:?}"
     );
     let again =
-        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, atom, parent, "test")
+        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, None, atom, parent, "test")
             .await
             .expect("a re-applied derivation succeeds");
     assert!(
@@ -328,18 +356,20 @@ async fn derivation_is_already_present_on_a_database_that_still_has_the_key(pool
     let viewer = fixture::public_viewer(&pool).await;
 
     let mut tx = pool.begin().await.expect("the caller's transaction");
-    let first = EvidenceRepository::record_derivation_conn(&mut tx, &viewer, atom, parent, "test")
-        .await
-        .expect("the first derivation write succeeds");
+    let first =
+        EvidenceRepository::record_derivation_conn(&mut tx, &viewer, None, atom, parent, "test")
+            .await
+            .expect("the first derivation write succeeds");
     assert!(
         matches!(first, DerivationEvidence::Recorded(_)),
         "first: {first:?}"
     );
-    let again = EvidenceRepository::record_derivation_conn(&mut tx, &viewer, atom, parent, "test")
-        .await
-        .unwrap_or_else(|e| {
-            panic!("a re-applied derivation on a keyed database must not be an error: {e:?}")
-        });
+    let again =
+        EvidenceRepository::record_derivation_conn(&mut tx, &viewer, None, atom, parent, "test")
+            .await
+            .unwrap_or_else(|e| {
+                panic!("a re-applied derivation on a keyed database must not be an error: {e:?}")
+            });
     assert!(
         matches!(again, DerivationEvidence::AlreadyPresent),
         "again: {again:?}"
@@ -364,9 +394,19 @@ async fn a_claim_two_owners_hold_one_body_on_can_still_be_privatized(pool: PgPoo
     let b = body.clone();
     let (o, w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, owner).await;
-        let o = EvidenceRepository::create(&mut *conn, &document(owner, claim, &b)).await;
+        let o = EvidenceRepository::create(
+            &mut *conn,
+            &document(owner, claim, &b),
+            epigraph_db::EvidenceEdge::supports(None),
+        )
+        .await;
         stamp(&mut conn, &p, writer).await;
-        let w = EvidenceRepository::create(&mut *conn, &document(writer, claim, &b)).await;
+        let w = EvidenceRepository::create(
+            &mut *conn,
+            &document(writer, claim, &b),
+            epigraph_db::EvidenceEdge::supports(None),
+        )
+        .await;
         (conn, (o, w))
     })
     .await;
@@ -441,9 +481,13 @@ async fn batch_create_refuses_a_same_tenancy_duplicate_whole_and_lands_another_o
     let fresh = format!("a body nobody holds {}", Uuid::new_v4());
     let held = format!("a body another group holds {}", Uuid::new_v4());
 
-    EvidenceRepository::batch_create(&pool, &[document(owner, claim, &stored)])
-        .await
-        .expect("control: the first batch lands");
+    EvidenceRepository::batch_create(
+        &pool,
+        &[document(owner, claim, &stored)],
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .expect("control: the first batch lands");
 
     let refused = EvidenceRepository::batch_create(
         &pool,
@@ -451,6 +495,7 @@ async fn batch_create_refuses_a_same_tenancy_duplicate_whole_and_lands_another_o
             document(owner, claim, &fresh),
             document(owner, claim, &stored),
         ],
+        epigraph_db::EvidenceEdge::supports(None),
     )
     .await;
     assert!(
@@ -469,6 +514,7 @@ async fn batch_create_refuses_a_same_tenancy_duplicate_whole_and_lands_another_o
             document(owner, claim, &fresh),
             document(owner, claim, &fresh),
         ],
+        epigraph_db::EvidenceEdge::supports(None),
     )
     .await;
     assert!(
@@ -478,11 +524,15 @@ async fn batch_create_refuses_a_same_tenancy_duplicate_whole_and_lands_another_o
     assert!(rows_with_body(&pool, claim, &fresh).await.is_empty());
 
     let held_row = seed_held_body(&pool, claim, other_group, &held).await;
-    let landed = EvidenceRepository::batch_create(&pool, &[document(owner, claim, &held)])
-        .await
-        .unwrap_or_else(|e| {
-            panic!("a body another group holds on the claim must land like a fresh one: {e:?}")
-        });
+    let landed = EvidenceRepository::batch_create(
+        &pool,
+        &[document(owner, claim, &held)],
+        epigraph_db::EvidenceEdge::supports(None),
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("a body another group holds on the claim must land like a fresh one: {e:?}")
+    });
     assert_eq!(landed.len(), 1);
     let rows = rows_with_body(&pool, claim, &held).await;
     assert_eq!(rows.len(), 2, "both rows stand: {rows:?}");
@@ -516,7 +566,7 @@ async fn another_groups_row_with_the_parents_text_does_not_suppress_a_derivation
 
     let mut conn = pool.acquire().await.expect("acquire");
     let recorded =
-        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, atom, parent, "test")
+        EvidenceRepository::record_derivation_conn(&mut conn, &viewer, None, atom, parent, "test")
             .await
             .expect("the derivation write succeeds");
     let DerivationEvidence::Recorded(id) = recorded else {

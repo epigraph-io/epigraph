@@ -163,6 +163,7 @@
 //! conditioned on row security being active): it is unconditional.
 
 pub mod admin_scopes;
+pub mod approve_client;
 pub mod arm;
 pub mod backfill_markers;
 pub mod bind;
@@ -175,6 +176,7 @@ pub mod dcr_sweep;
 pub mod default_group;
 pub mod delete_frames;
 pub mod elevation;
+pub mod evidence_edges;
 pub mod group_role;
 pub mod hide;
 pub mod human;
@@ -192,6 +194,7 @@ pub mod reverse;
 pub mod system_agent;
 pub mod tables;
 pub mod team_group;
+pub mod workflow_submitter;
 
 use anyhow::{anyhow, bail, Context};
 use sqlx::PgConnection;

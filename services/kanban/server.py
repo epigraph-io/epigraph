@@ -40,6 +40,21 @@ DEVELOP_TEMPLATE = os.path.join(HERE, "prompts", "develop.md")
 
 COLUMNS = ["backlog", "develop", "review", "accepted", "shipped"]
 STATUSES = ["idle", "queued", "running", "awaiting_review", "merging", "merged", "failed", "stopped"]
+# The claim's own backlog:* status labels (not the board's agent-run STATUSES above), most advanced first.
+BACKLOG_STATUS_PRECEDENCE = ("completed", "working", "pending")
+# A card's corroboration count: distinct other current claims joined to it by an in-force `corroborates`
+# edge in EITHER direction. `corroborates` is symmetric (epigraph_core SYMMETRIC_CLAIM_RELATIONSHIPS) and is
+# stored in whichever orientation its writer chose, so a target-only read misses every edge written from the
+# backlog item's side. Read from GET /api/v1/claims/:id/context?list=edges, whose SQL
+# (ClaimContextRepository::epistemic_edges) applies both directions, `valid_to`, viewer visibility and the far
+# claim's is_current.
+CORROBORATION_RELATIONSHIP = "corroborates"
+# Page size of that read (the route's maximum) and the most pages one card may take; a claim with more
+# epistemic edges than that gets an unknown count, not a truncated one.
+CORROBORATION_PAGE_LIMIT = 200
+CORROBORATION_MAX_PAGES = 5
+# Stop asking for counts after this many failures in a row (the context route is down, not one claim).
+CORROBORATION_MAX_CONSECUTIVE_FAILURES = 3
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$")
 # A GitHub pull-request URL and nothing else. Used with fullmatch: `search` accepted any string that
@@ -537,6 +552,7 @@ def new_card(claim: Dict[str, Any]) -> Dict[str, Any]:
         "labels": claim.get("labels") or [],
         "truth_value": claim.get("truth_value"),
         "created_at": claim.get("created_at"),
+        "corroboration_count": claim.get("corroboration_count"),
         "column": "backlog",
         "status": "idle",
         "stale": False,
@@ -602,8 +618,27 @@ def normalize_claim(raw: Any) -> Optional[Dict[str, Any]]:
         tv = float(tv) if tv is not None else None
     except (TypeError, ValueError):
         tv = None
+    cc = raw.get("corroboration_count")
+    if not isinstance(cc, int) or isinstance(cc, bool) or cc < 0:
+        cc = None  # unknown (the claude source, or a failed count), never a made-up 0
     return {"id": cid.lower(), "content": str(raw.get("content") or ""), "labels": [str(x) for x in labels],
-            "truth_value": tv, "created_at": raw.get("created_at")}
+            "truth_value": tv, "created_at": raw.get("created_at"), "corroboration_count": cc}
+
+
+def backlog_status(labels: Any) -> Optional[str]:
+    """The claim's backlog:pending / backlog:working / backlog:completed status, most advanced first.
+
+    None when it carries none of them: a bare `backlog` label, or another backlog:<suffix>, is not a status.
+    """
+    present = set()
+    for label in labels or []:
+        label = str(label)
+        if label.startswith("backlog:"):
+            present.add(label[len("backlog:"):])
+    for status in BACKLOG_STATUS_PRECEDENCE:
+        if status in present:
+            return status
+    return None
 
 
 class ApiError(Exception):
@@ -682,6 +717,64 @@ def fetch_backlog_http(cfg: Config) -> List[Dict[str, Any]]:
         if len(page) < limit:
             break
         offset += limit
+    return out
+
+
+def fetch_corroboration_count(cfg: Config, claim_id: str) -> Optional[int]:
+    """Distinct other current claims joined to `claim_id` by an in-force `corroborates` edge, either direction.
+
+    Pages GET /api/v1/claims/<id>/context?list=edges. Returns None when the claim has more epistemic edges
+    than CORROBORATION_MAX_PAGES pages hold (a count cut short would understate); raises on a failed read.
+    """
+    headers = {"Accept": "application/json", "Authorization": "Bearer " + cfg.token}
+    base = "%s/api/v1/claims/%s/context?" % (cfg.api_base, urllib.parse.quote(claim_id, safe=""))
+    neighbours = set()
+    after: Optional[str] = None
+    for _ in range(CORROBORATION_MAX_PAGES):
+        params = {"list": "edges", "limit": CORROBORATION_PAGE_LIMIT}
+        if after:
+            params["after"] = after
+        req = urllib.request.Request(base + urllib.parse.urlencode(params), headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        page = body.get("edges") if isinstance(body, dict) else None
+        items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(items, list):
+            raise ValueError("context route did not return an edges page")
+        for edge in items:
+            if not isinstance(edge, dict) or str(edge.get("relationship") or "").lower() != CORROBORATION_RELATIONSHIP:
+                continue
+            neighbour = edge.get("neighbor")
+            nid = str(neighbour.get("id") or "").lower() if isinstance(neighbour, dict) else ""
+            if nid and nid != claim_id.lower():
+                neighbours.add(nid)
+        after = page.get("next_cursor")
+        if not after:
+            return len(neighbours)
+    return None
+
+
+def fetch_corroboration_counts(cfg: Config, claim_ids: List[str]) -> Dict[str, Optional[int]]:
+    """One count per claim; None where it could not be read. Never raises: counts are decoration.
+
+    Only a failed read counts toward the consecutive-failure stop; a claim too large to count is a
+    successful read with an unknown answer, so a run of edge-heavy claims does not switch counting off.
+    """
+    out: Dict[str, Optional[int]] = {}
+    failures = 0
+    for cid in claim_ids:
+        if failures >= CORROBORATION_MAX_CONSECUTIVE_FAILURES:
+            out[cid] = None
+            continue
+        try:
+            out[cid] = fetch_corroboration_count(cfg, cid)
+            failures = 0
+        except Exception as e:  # noqa: BLE001 -- a missing count must not fail the backlog refresh
+            out[cid] = None
+            failures += 1
+            if failures == CORROBORATION_MAX_CONSECUTIVE_FAILURES:
+                log("corroboration counts: %d failures in a row (last: %s); skipping the rest"
+                    % (failures, str(e)[:200]))
     return out
 
 
@@ -1369,7 +1462,7 @@ class App:
                     added += 1
                     continue
                 changed = False
-                for key in ("content", "labels", "truth_value", "created_at"):
+                for key in ("content", "labels", "truth_value", "created_at", "corroboration_count"):
                     if claim.get(key) is not None and card.get(key) != claim[key]:
                         card[key] = claim[key]
                         changed = True
@@ -1425,6 +1518,15 @@ class App:
             if claims is None:
                 claims = fetch_backlog_claude(self.cfg)
                 source = "claude"
+            elif source == "http":
+                # Only the http source can count corroborations (same token, the context route); the claude source
+                # leaves them unknown. A count that fails stays None and the card keeps its last known value.
+                ids = [c["id"] for c in (normalize_claim(x) for x in claims) if c]
+                counts = fetch_corroboration_counts(self.cfg, ids)
+                for raw in claims:
+                    norm = normalize_claim(raw)
+                    if norm and isinstance(raw, dict):
+                        raw["corroboration_count"] = counts.get(norm["id"])
             added, updated = self.merge_backlog(claims, source or mode)
             log("backlog refresh via %s: %d claims, %d added, %d updated" % (source, len(claims), added, updated))
             if error and claims:
@@ -2378,7 +2480,10 @@ class App:
     # ---- read models -----------------------------------------------------
 
     def public_card(self, card: Dict[str, Any]) -> Dict[str, Any]:
-        return {k: v for k, v in card.items() if not k.startswith("_")}
+        out = {k: v for k, v in card.items() if not k.startswith("_")}
+        out["backlog_status"] = backlog_status(card.get("labels"))
+        out.setdefault("corroboration_count", None)  # cards imported before the count existed
+        return out
 
     def state_view(self) -> Dict[str, Any]:
         with self.store.lock:

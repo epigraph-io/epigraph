@@ -135,3 +135,74 @@ async fn run_clustering_populates_neighborhoods_when_themes_exist() {
         "runner should populate at least one neighborhood for the seeded theme"
     );
 }
+
+/// Backlog 01e0b839: a Louvain neighbourhood's stored label is the positional
+/// placeholder `neighborhood-N`, never its dominant frame's id. The frame is
+/// still recorded, in `dominant_frame_id`. Before the fix every atom below,
+/// carrying one frame, gave each multi-member community the frame's UUID
+/// string as its `label`, which is no name and is computed over every member
+/// (private ones included).
+#[tokio::test(flavor = "multi_thread")]
+async fn louvain_neighborhood_labels_are_placeholders_not_the_dominant_frame_id() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    common::reset_neighborhood_tables(&pool).await;
+    let (run_id, theme_id, atoms, _standalone) = common::seed_two_clique_theme(&pool).await;
+
+    let frame_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0', 'h1']) RETURNING id",
+    )
+    .bind(format!("nbr-label-frame-{}", Uuid::new_v4().simple()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for atom in &atoms {
+        sqlx::query("INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2)")
+            .bind(atom)
+            .bind(frame_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    epigraph_jobs::cluster_graph::neighborhood::run_theme_neighborhoods(
+        &pool,
+        run_id,
+        &epigraph_jobs::cluster_graph::neighborhood::Config {
+            resolution: 1.0,
+            skip_threshold_nodes: 0,
+            skip_threshold_edges: 0,
+        },
+        Some(&[theme_id]),
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT label, dominant_frame_id FROM graph_neighborhoods
+         WHERE run_id = $1 AND theme_id = $2",
+    )
+    .bind(run_id)
+    .bind(theme_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3, "two cliques + singleton: {rows:?}");
+    let framed = rows.iter().filter(|(_, f)| *f == Some(frame_id)).count();
+    assert_eq!(
+        framed, 2,
+        "CALIBRATION: both cliques record the frame as dominant: {rows:?}"
+    );
+    for (label, _) in &rows {
+        assert_ne!(label, &frame_id.to_string(), "{rows:?}");
+        let n = label
+            .strip_prefix("neighborhood-")
+            .unwrap_or_else(|| panic!("label {label:?} is not a placeholder"));
+        assert!(n.parse::<u32>().is_ok(), "{label:?}");
+    }
+}
