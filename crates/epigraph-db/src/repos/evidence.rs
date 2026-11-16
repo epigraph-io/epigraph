@@ -111,6 +111,19 @@ pub struct EvidenceSourceIdentity {
     pub source_url: Option<String>,
 }
 
+/// One `dataset` evidence row, as [`EvidenceRepository::datasets_by_claim_ids`]
+/// returns it (backlog c8beb101).
+///
+/// Serialises flat: `evidence_id` beside the variant's own fields and its
+/// `type: "dataset"` tag, which is the shape `get_claim` returns.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DatasetEvidence {
+    pub evidence_id: Uuid,
+    /// Always an [`EvidenceType::Dataset`].
+    #[serde(flatten)]
+    pub dataset: EvidenceType,
+}
+
 /// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
 ///
 /// `evidence_type` and `created_at` are projected even though today's only
@@ -188,9 +201,10 @@ pub struct EvidenceListFilter<'a> {
     ///
     /// That column — not the `properties` JSONB blob — is what
     /// [`EvidenceRepository::evidence_type_to_db_string`] writes, and its
-    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint in
-    /// migration 001: `document`, `observation`, `testimony`, `computation`,
-    /// `reference`, `figure`, `conversational`. Note that the Rust
+    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint
+    /// (`epigraph_core::STORED_EVIDENCE_TYPES`): migration 001's `document`,
+    /// `observation`, `testimony`, `computation`, `reference`, `figure`,
+    /// `conversational`, and migration 229's `dataset`. Note that the Rust
     /// `EvidenceType` variant names do **not** all match: `Literature` is
     /// stored as `reference` and `Consensus` as `computation`. Callers filter
     /// with the stored spelling.
@@ -317,15 +331,19 @@ impl EvidenceRepository {
     }
 
     /// The URL an evidence type carries that belongs in `evidence.source_url`:
-    /// a `Document`'s `source_url`, and nothing else.
+    /// a `Document`'s `source_url` or a `Dataset`'s `root_uri`, and nothing
+    /// else.
     ///
     /// A `Testimony`'s `source` is free text (a person's name, or the MCP
     /// default `"unknown"`), and `Literature`/`Figure` carry a DOI rather than
-    /// a URL, so none of those is a column value.
+    /// a URL, so none of those is a column value. A dataset's root is where
+    /// its data lives, so it is also the source identity the combine step
+    /// keys a re-observation on.
     #[must_use]
     pub fn source_url_of(evidence_type: &EvidenceType) -> Option<&str> {
         match evidence_type {
             EvidenceType::Document { source_url, .. } => source_url.as_deref(),
+            EvidenceType::Dataset { root_uri, .. } => Some(root_uri.as_str()),
             _ => None,
         }
     }
@@ -1072,6 +1090,78 @@ impl EvidenceRepository {
         Ok(out)
     }
 
+    /// The `dataset` evidence of each of `claim_ids` that `viewer` can see,
+    /// keyed by claim id, oldest first (backlog c8beb101).
+    ///
+    /// Backs `get_claim`'s `datasets`: the structured fields a reader needs to
+    /// resolve and verify a dataset (root, manifest location, manifest digest
+    /// with its algorithm, counts) without parsing `raw_content`.
+    ///
+    /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), as
+    /// [`Self::source_urls_by_claim_ids`] is, and for its reason. A row whose
+    /// `properties` do not parse as a `Dataset` (a hand-written row, or a
+    /// sealed one, whose `properties` are blanked) is skipped rather than
+    /// failing the read.
+    ///
+    /// At most `limit_per_claim` rows per claim, the oldest first: a caller
+    /// that always includes the result (`get_claim`) cannot otherwise bound
+    /// its response, since anyone who can attach evidence to a claim can
+    /// attach dataset rows to it. Ask for one more than you will show to tell
+    /// whether there were more. The cap applies before the parse filter, so a
+    /// skipped row still counts against it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn datasets_by_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit_per_claim: i64,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<DatasetEvidence>>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, Vec<DatasetEvidence>> =
+            std::collections::HashMap::new();
+        if claim_ids.is_empty() || limit_per_claim <= 0 {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            "SELECT claim_id, id, properties FROM ( \
+               SELECT e.claim_id, e.id, e.properties, e.created_at, \
+                      row_number() OVER ( \
+                        PARTITION BY e.claim_id ORDER BY e.created_at, e.id \
+                      ) AS rn \
+               FROM evidence e \
+               WHERE e.claim_id = ANY($1) \
+                 AND e.evidence_type = 'dataset' \
+                 /* {VISIBILITY:e} */ \
+             ) ranked \
+             WHERE rn <= $2 \
+             ORDER BY claim_id, created_at, id",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(&sql)
+            .bind(claim_ids)
+            .bind(limit_per_claim);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (claim_id, evidence_id, properties) in q.fetch_all(executor).await? {
+            match serde_json::from_value::<EvidenceType>(properties) {
+                Ok(dataset @ EvidenceType::Dataset { .. }) => {
+                    out.entry(claim_id).or_default().push(DatasetEvidence {
+                        evidence_id,
+                        dataset,
+                    });
+                }
+                _ => tracing::warn!(
+                    %evidence_id,
+                    "dataset evidence row whose properties are not a Dataset; skipped"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// The source identity of each of `ids` that `viewer` can see
     /// ([`EvidenceSourceIdentity`]), keyed by evidence id. An id the
     /// viewer cannot see, or that names no evidence row, is absent.
@@ -1476,14 +1566,7 @@ impl EvidenceRepository {
 
     /// Convert EvidenceType enum to database string
     fn evidence_type_to_db_string(evidence_type: &EvidenceType) -> &'static str {
-        match evidence_type {
-            EvidenceType::Document { .. } => "document",
-            EvidenceType::Observation { .. } => "observation",
-            EvidenceType::Testimony { .. } => "testimony",
-            EvidenceType::Literature { .. } => "reference",
-            EvidenceType::Consensus { .. } => "computation",
-            EvidenceType::Figure { .. } => "figure",
-        }
+        evidence_type.stored_type()
     }
 
     /// Store an embedding vector on an evidence row `viewer` may write, and

@@ -187,6 +187,35 @@ fn parse_evidence_type(s: &str, source_url: Option<&str>) -> Result<EvidenceType
     }
 }
 
+/// The most dataset rows `get_claim` lists for one claim (the oldest first);
+/// a row is up to about 21 KB at the validator's bounds, so this keeps the
+/// response under about 700 KB however many rows are attached. More is
+/// reported as `datasets_truncated`.
+const GET_CLAIM_MAX_DATASETS: usize = 32;
+
+/// The evidence type a submission's evidence row is stored as.
+///
+/// `evidence_type` is parsed (and so validated) whether or not a `dataset` is
+/// given: it still names the calibration weight and the DS wiring's evidence
+/// category. A `dataset` only decides the STORED variant, which becomes
+/// [`EvidenceType::Dataset`], normalised and validated by
+/// [`EvidenceType::dataset`] (backlog c8beb101). Runs before anything is
+/// written, so a bad dataset refuses the call (or, in a batch, its entry) and
+/// writes nothing.
+fn submission_evidence_type(
+    evidence_type: &str,
+    source_url: Option<&str>,
+    dataset: Option<&crate::types::DatasetEvidenceParams>,
+) -> Result<EvidenceType, McpError> {
+    let parsed = parse_evidence_type(evidence_type, source_url).map_err(invalid_params)?;
+    match dataset {
+        Some(d) => {
+            EvidenceType::dataset(d.clone().into()).map_err(|e| invalid_params(e.to_string()))
+        }
+        None => Ok(parsed),
+    }
+}
+
 /// The largest claim content, in bytes, the claim-writing tools accept. The
 /// same cap as the HTTP twins (`epigraph-api` `routes/submit.rs` and
 /// `routes/batch.rs`, `MAX_CLAIM_CONTENT_LENGTH`), so the two transports agree
@@ -297,6 +326,9 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
             if !params.labels.is_empty() {
                 discarded.push("labels");
             }
+            if params.dataset.is_some() {
+                discarded.push("dataset");
+            }
         }
         DedupBy::ContentHash => {
             applied.extend([
@@ -313,6 +345,9 @@ fn dedup_block(by: DedupBy, existing_claim_id: Uuid, params: &SubmitClaimParams)
             }
             if !params.labels.is_empty() {
                 applied.push("labels");
+            }
+            if params.dataset.is_some() {
+                applied.push("dataset");
             }
             if params.novelty_threshold.is_some() {
                 discarded.push("novelty_threshold");
@@ -391,8 +426,11 @@ async fn prepare_submission(
     // through here.
     check_claim_content_length(&params.content)?;
     let methodology = parse_methodology(&params.methodology).map_err(invalid_params)?;
-    let evidence_type = parse_evidence_type(&params.evidence_type, params.source_url.as_deref())
-        .map_err(invalid_params)?;
+    let evidence_type = submission_evidence_type(
+        &params.evidence_type,
+        params.source_url.as_deref(),
+        params.dataset.as_ref(),
+    )?;
 
     // Label validation runs HERE — before any write — not at the
     // `ClaimRepository::update_labels` call further down. The repo layer
@@ -674,6 +712,14 @@ async fn write_submission(
                 .signer
                 .sign_entity(epigraph_crypto::SignedEntity::Evidence, &evidence_hash),
         );
+        // The row signature above covers `content_hash` (BLAKE3 of
+        // evidence_data) only. A dataset's structured fields (root, manifest
+        // digest, counts) get a signature of their own, bound to this row's
+        // evidence and claim ids, under the separate `Dataset` signing domain,
+        // so the bytes every existing evidence signature covers are unchanged
+        // (backlog c8beb101). A no-op for any other evidence type.
+        e.evidence_type
+            .attest_dataset(e.id, e.claim_id, &server.signer);
         e
     };
 
@@ -1120,6 +1166,24 @@ pub async fn get_claim(
         .map_err(internal_error)?
         .remove(&id)
         .unwrap_or_default();
+    // The claim's dataset evidence, always (possibly empty): the structured
+    // fields a reader resolves and verifies the data by, without parsing
+    // evidence_data (backlog c8beb101). Filtered per evidence row, as the URLs.
+    // Capped (the oldest GET_CLAIM_MAX_DATASETS), since anyone who can attach
+    // evidence to the claim can attach dataset rows; one more is read so
+    // `datasets_truncated` can say there were more.
+    let mut datasets = EvidenceRepository::datasets_by_claim_ids(
+        &mut *read,
+        viewer,
+        &[id],
+        i64::try_from(GET_CLAIM_MAX_DATASETS + 1).unwrap_or(i64::MAX),
+    )
+    .await
+    .map_err(internal_error)?
+    .remove(&id)
+    .unwrap_or_default();
+    let datasets_truncated = datasets.len() > GET_CLAIM_MAX_DATASETS;
+    datasets.truncate(GET_CLAIM_MAX_DATASETS);
 
     // Additive lensed belief: compute the claim's belief under the chosen lens.
     // Frame/perspective existence is already validated, so a compute failure
@@ -1192,6 +1256,11 @@ pub async fn get_claim(
         #[serde(skip_serializing_if = "Option::is_none")]
         lensed_belief: Option<LensedBelief>,
         source_urls: Vec<String>,
+        datasets: Vec<epigraph_db::DatasetEvidence>,
+        /// Present (true) only when the claim has more dataset rows than
+        /// `datasets` lists.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        datasets_truncated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         authored_by: Option<epigraph_db::AuthoredBy>,
     }
@@ -1212,6 +1281,8 @@ pub async fn get_claim(
         classification,
         lensed_belief,
         source_urls,
+        datasets,
+        datasets_truncated,
         authored_by,
     })
 }
@@ -2371,6 +2442,7 @@ pub async fn resolve_backlog_item(
         novelty_threshold: Some(0.0),
         visibility: resolution_visibility,
         group_id: resolution_group,
+        dataset: None,
     };
     let sub = match prepare_submission(server, viewer, submit_params, auth).await? {
         PreparedSubmission::Fresh(sub) => *sub,
@@ -3131,6 +3203,15 @@ mod tests {
                 novelty_threshold: Some(0.1),
                 visibility: None,
                 group_id: None,
+                dataset: Some(
+                    serde_json::from_value(serde_json::json!({
+                        "root_uri": "s3://b/run",
+                        "manifest_hash": format!("blake3:{}", "0".repeat(64)),
+                        "file_count": 1,
+                        "total_bytes": 1
+                    }))
+                    .unwrap(),
+                ),
             }
         }
 
@@ -3147,6 +3228,7 @@ mod tests {
                 "source_url",
                 "reasoning",
                 "labels",
+                "dataset",
             ] {
                 assert!(d.inputs_discarded.contains(&want), "{want}: {d:?}");
             }
@@ -3163,9 +3245,16 @@ mod tests {
             p.reasoning = None;
             p.labels.clear();
             p.novelty_threshold = None;
+            p.dataset = None;
             for by in [DedupBy::NoveltyGate, DedupBy::ContentHash] {
                 let d = dedup_block(by, uuid::Uuid::nil(), &p);
-                for absent in ["source_url", "reasoning", "labels", "novelty_threshold"] {
+                for absent in [
+                    "source_url",
+                    "reasoning",
+                    "labels",
+                    "novelty_threshold",
+                    "dataset",
+                ] {
                     assert!(
                         !d.inputs_applied.contains(&absent)
                             && !d.inputs_discarded.contains(&absent),

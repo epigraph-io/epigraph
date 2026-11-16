@@ -587,6 +587,7 @@ async fn a_document_repeating_a_directly_filed_claim_leaves_the_filer_its_author
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )

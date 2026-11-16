@@ -109,16 +109,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-/// `evidence_type_valid`'s seven values (migration 001's CHECK).
-pub const EVIDENCE_TYPES: &[&str] = &[
-    "document",
-    "observation",
-    "testimony",
-    "computation",
-    "reference",
-    "figure",
-    "conversational",
-];
+/// `evidence_type_valid`'s values (migration 001's seven, plus migration
+/// 229's `dataset`), from their one Rust copy.
+pub const EVIDENCE_TYPES: &[&str] = epigraph_core::STORED_EVIDENCE_TYPES;
 
 /// The `operation` a hide manifest's header carries, which `reown-reverse`
 /// dispatches on.

@@ -145,6 +145,7 @@ fn submit(content: &str, visibility: Option<&str>, group: Option<Uuid>) -> Submi
         novelty_threshold: Some(0.0),
         visibility: visibility.map(str::to_string),
         group_id: group.map(|g| g.to_string()),
+        dataset: None,
     }
 }
 

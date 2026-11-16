@@ -54,9 +54,9 @@ pub struct ListEvidenceQuery {
     pub claim_id: Option<Uuid>,
     /// Exact match on the stored `evidence_type` column. Vocabulary:
     /// `document`, `observation`, `testimony`, `computation`, `reference`,
-    /// `figure`, `conversational` (the `evidence_type_valid` CHECK
-    /// constraint). Note `Literature` is stored as `reference` and
-    /// `Consensus` as `computation`.
+    /// `figure`, `conversational`, `dataset` (the `evidence_type_valid` CHECK
+    /// constraint, `epigraph_core::STORED_EVIDENCE_TYPES`). Note `Literature`
+    /// is stored as `reference` and `Consensus` as `computation`.
     pub evidence_type: Option<String>,
     /// Case-insensitive substring match on `raw_content`. Rows with a NULL
     /// `raw_content` never match this predicate.
@@ -307,6 +307,33 @@ pub async fn create_evidence(
             field: "evidence_type".to_string(),
             reason: format!("Invalid evidence_type JSON: {e}"),
         })?;
+    // A dataset's own invariants (digest form and length, bounded text). The
+    // shape check above admits any strings; without this a malformed manifest
+    // digest would be stored and no reader could verify against it.
+    evidence_type
+        .validate()
+        .map_err(|e| ApiError::ValidationError {
+            field: format!("evidence_type.{}", e.field),
+            reason: e.reason,
+        })?;
+    // A dataset's attestation is a server's signature over its fields, written
+    // by the MCP writer that signs the row. This route signs nothing, so a
+    // body's attestation would be a caller-planted claim of a signature: a
+    // reader verifying it against the row's signer would be misled, or, if
+    // the caller copied a real one from another row, at best refused.
+    if matches!(
+        &evidence_type,
+        EvidenceType::Dataset {
+            attestation: Some(_),
+            ..
+        }
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "evidence_type.attestation".to_string(),
+            reason: "is written by the server that signs a dataset; a request may not supply one"
+                .to_string(),
+        });
+    }
 
     // Compute content hash from raw_content (or use provided hash).
     //
@@ -411,6 +438,7 @@ pub async fn create_evidence(
         EvidenceType::Literature { .. } => "literature",
         EvidenceType::Consensus { .. } => "consensus",
         EvidenceType::Figure { .. } => "figure",
+        EvidenceType::Dataset { .. } => "dataset",
     };
 
     Ok((

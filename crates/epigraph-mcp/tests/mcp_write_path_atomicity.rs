@@ -104,6 +104,7 @@ fn submit_params_with_evidence(content: &str, evidence: &str) -> SubmitClaimPara
         novelty_threshold: Some(0.0),
         visibility: Some("public".to_string()),
         group_id: None,
+        dataset: None,
     }
 }
 

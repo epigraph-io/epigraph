@@ -286,6 +286,7 @@ async fn bootstrap_server_agent(server: &epigraph_mcp::EpiGraphMcpFull, pool: &P
             novelty_threshold: None,
             visibility: Some("public".to_string()),
             group_id: None,
+            dataset: None,
         },
         None,
     )
