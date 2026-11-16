@@ -79,6 +79,13 @@
 //! caller sees on [`EgoEdges::untenanted_types`] — so the predicate that
 //! counted an edge and the rule that decides whether its far node may be
 //! rendered cannot drift apart.
+//!
+//! A caller may also HIDE untenanted types (`hidden_far_types`): they are
+//! taken out of that one set before it is bound, so an edge to a hidden type
+//! is neither counted, nor listed, nor rendered as a bare node. The guest ego
+//! (`epigraph-api` `routes/guest.rs`) hides `agent`, so a signed-out reader is
+//! not told who filed or asserted a claim. Hiding only narrows: a tenanted
+//! type is not in the set to begin with, so naming one changes nothing.
 
 use std::collections::HashSet;
 
@@ -178,6 +185,12 @@ impl EgoRepository {
     ///
     /// `relationships`, when supplied non-empty, filters case-insensitively.
     ///
+    /// `hidden_far_types` are removed from the untenanted set before any of
+    /// the three statements binds it, so an edge whose far endpoint has one of
+    /// these types is absent from the count, the fetch and
+    /// [`EgoEdges::untenanted_types`] alike (module docs). Pass `&[]` to hide
+    /// nothing.
+    ///
     /// Takes a `&mut PgConnection` rather than a generic executor because it
     /// runs three statements and they must describe the same corpus on the
     /// caller's one viewer-stamped connection (the `ClaimRepository::
@@ -191,6 +204,7 @@ impl EgoRepository {
         center: Uuid,
         max_degree: usize,
         relationships: Option<&[String]>,
+        hidden_far_types: &[&str],
     ) -> Result<EgoEdges, DbError> {
         // `None` binds as SQL NULL, which the `$2 IS NULL` guard reads as
         // "no filter"; an empty slice would filter everything out instead.
@@ -204,6 +218,7 @@ impl EgoRepository {
         let untenanted: Vec<String> = Self::untenanted_entity_types(&mut *conn)
             .await?
             .into_iter()
+            .filter(|t| !hidden_far_types.contains(&t.as_str()))
             .collect();
 
         // The far endpoint has to be computed before it can be constrained,

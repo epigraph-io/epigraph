@@ -56,6 +56,8 @@ Pre-existing rows are backfilled to explicit `public`; the owner is the author's
 **D3 — `public` means ANY AUTHENTICATED AGENT. Anonymous callers get NOTHING.**
 A request with `AuthContext.agent_id == None` receives zero claim content. There is no anonymous read path, so there is no `Viewer::Anonymous`, no anonymous ANN fast path, and no partial `WHERE visibility='public'` index justified by one.
 
+> **Amended (backlog `1deb9dbf`).** The Atlas design (`docs/superpowers/specs/2026-11-04-epigraph-explorer-atlas-design.md`, §5) gives signed-out callers the public graph. Four `GET /api/v1/guest/*` routes read as `Viewer::public_only()`, a `Scoped` viewer with no group (not an `Anonymous` shape), and answer a non-public id exactly as an absent one. They are off unless `EPIGRAPH_GUEST_READS=on`. While off, D3 holds as written above; when on, `public` means anyone for those four reads.
+
 **D4 — There must be an ADMIN SURFACE to take a subgraph private / enable subgraph encryption on it.**
 The corpus starts public (D2) and admins selectively privatize regions of it. First-class feature: its own schema (`privatization_plans`, `privatization_plan_items`, `privatization_audit`, `instance_admins`), job handler, CLI, and PRs (PR-18, PR-21).
 

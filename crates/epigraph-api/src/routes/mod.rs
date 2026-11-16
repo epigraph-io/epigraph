@@ -97,6 +97,9 @@ pub mod graph_query;
 pub mod graph_query_utils;
 #[cfg(feature = "db")]
 pub mod groups;
+/// The guest read surface: anonymous, public-only reads (backlog `1deb9dbf`).
+#[cfg(feature = "db")]
+pub mod guest;
 pub mod harvest;
 pub mod health;
 #[cfg(feature = "db")]
@@ -368,10 +371,13 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// token, with 401 and an RFC 6750 `WWW-Authenticate: Bearer …,
 /// error="invalid_token"` challenge.
 ///
-/// ## `public` — the anonymous ALLOWLIST, fourteen routes
+/// ## `public` — the anonymous ALLOWLIST, eighteen routes
 ///
 /// - `GET /health` — static, stateless
 /// - `GET /api/v1/openapi.json` — static schema document
+/// - four `GET /api/v1/guest/*` public-only reads (backlog `1deb9dbf`): a
+///   public claim's card, its ego, and the theme overview and layout without
+///   stored labels, each read as `Viewer::public_only()` (`routes/guest.rs`)
 /// - twelve `/elevate/*` ceremony routes, anonymous by design (the ceremony's
 ///   id and the passkey are its credentials): passkey enrollment
 ///   (`/elevate/enroll/:id` with its `challenge` and `finish`), the elevation
@@ -413,6 +419,11 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries none but carries `AppState::guest_rate_limiter` (guest
+/// reads on, no limiter configured: the operator's ruling of 2026-11-16), the
+/// four `/api/v1/guest/*` routes alone are limited, by client address, and
+/// every other route is not.
 #[cfg(feature = "db")]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -887,7 +898,8 @@ pub fn create_router_with_extensions(
     //
     // The rule is not "audit N handlers" — it is invert the split. `public` is
     // now an ALLOWLIST (built below: two routes when PR-03 landed, fourteen
-    // with the `/elevate/*` ceremonies); every other registration is
+    // with the `/elevate/*` ceremonies, eighteen with the public-only
+    // `/api/v1/guest/*` reads); every other registration is
     // appended to `protected` and inherits `bearer_auth_middleware`.
     //
     // Axum permits repeated `.route()` calls on the same path with different
@@ -1301,6 +1313,28 @@ pub fn create_router_with_extensions(
     // that one act through migration 130's ceremony definers, the challenge
     // commits to the act's stored args digest, and nothing here executes an
     // act (the maintenance CLI's `--act` does).
+    //
+    // The GUEST read surface (backlog `1deb9dbf`) is anonymous BY DESIGN: a
+    // signed-out visitor, or a link-card fetcher with no user token, reads the
+    // PUBLIC graph. Four GETs under `/api/v1/guest/`, each reading as
+    // `Viewer::public_only()` (no group), so they serve `visibility = 'public'`
+    // rows only, answer a non-public id exactly as an absent one, and withhold
+    // the stored theme and region labels (see `routes/guest.rs`). They sit here
+    // to carry this router's anonymous body limit and, when the operator
+    // configured one, its rate limiter. They are routed always but answer only
+    // when `AppState::guest_reads` is on (`EPIGRAPH_GUEST_READS=on`); off, each
+    // is a bare 404.
+    //
+    // Each guest route also carries `guest_limit`, the guest reads' DEFAULT
+    // limiter (the operator's ruling of 2026-11-16): with guest reads on and
+    // no limiter configured, `bin/server.rs` sets `AppState::guest_rate_limiter`
+    // (#841's default limit, keyed on the client address), and these four
+    // routes, and no other, are limited by it. With a limiter configured that
+    // layer is a no-op, so a guest request is charged once, by the router's.
+    let guest_limit = middleware::from_fn_with_state(
+        state.clone(),
+        crate::middleware::guest_rate_limit_middleware,
+    );
     let public = Router::new()
         .route("/health", get(health::health_check))
         .route(
@@ -1324,7 +1358,23 @@ pub fn create_router_with_extensions(
         .route("/elevate/act/:id", get(elevate::act_page))
         .route("/elevate/act/:id/challenge", post(elevate::act_challenge))
         .route("/elevate/act/:id/assert", post(elevate::act_assert))
-        .route("/elevate/assets/elevate.js", get(elevate::elevate_js));
+        .route("/elevate/assets/elevate.js", get(elevate::elevate_js))
+        .route(
+            "/api/v1/guest/claims/:id",
+            get(guest::claim_card).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/claims/:id/ego",
+            get(guest::claim_ego).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/graph/themes/overview",
+            get(guest::themes_overview).layer(guest_limit.clone()),
+        )
+        .route(
+            "/api/v1/guest/graph/themes/layout",
+            get(guest::themes_layout).layer(guest_limit),
+        );
 
     // Layered on the allowlist: a request with no Authorization
     // header passes through, a request with a present-but-invalid token still

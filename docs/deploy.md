@@ -286,7 +286,13 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `EPIGRAPH_RATE_LIMIT`, `EPIGRAPH_RATE_LIMIT_RPM` and
   `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` set, the API applies **no** rate limit
   (logged at boot as `rate limiter OFF`); set one, or limit at the reverse
-  proxy. Once on, the limit is `EPIGRAPH_RATE_LIMIT_RPM` (600 when only
+  proxy. The one exception is the guest reads: with `EPIGRAPH_GUEST_READS=on`
+  and none of those three variables set, the four `/api/v1/guest/*` routes,
+  and no other, are limited at 600 requests a minute per client address
+  (keyed as below), logged at boot as `guest routes are rate limited by
+  default`. Setting a limit replaces that default with the configured limiter
+  on every route; `EPIGRAPH_RATE_LIMIT=off` removes it too, and then the boot
+  log warns that the guest reads are UNLIMITED. Once on, the limit is `EPIGRAPH_RATE_LIMIT_RPM` (600 when only
   `EPIGRAPH_RATE_LIMIT=on` or a global limit is given) requests a minute per
   bucket, after a burst of the same size. An
   authenticated request is charged to its principal (the token's agent, else
@@ -319,7 +325,8 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
 
 **Check.** The log contains `rate limiter ON` (with the effective
 `per_key_rpm`, `global_rpm` and `trusted_proxies`) when you configured a limit,
-`rate limiter OFF` otherwise, `Session-GUC probe passed`,
+`rate limiter OFF` otherwise (with guest reads on, `rate limiter OFF except on
+the guest reads` and `guest routes are rate limited by default`), `Session-GUC probe passed`,
 `entity_types registry cache loaded`, `Internal metrics listener started`
 and `Server listening on 0.0.0.0:<port>`. An operator-binding line is also
 logged: `operator binding is NOT ARMED on this database: ...` until you arm it
@@ -488,6 +495,7 @@ For the others, anything else is off.
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
+| `EPIGRAPH_GUEST_READS` | `off` | `on` serves every `visibility = 'public'` claim, edge and theme count to signed-out callers under `GET /api/v1/guest/*` (`docs/tenancy.md`); off, each answers 404. Any other value stays off and is warned about. With no rate limit configured, the guest routes are limited at 600 a minute per client address (Step 8, "Rate limiting"). |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
 | `OPENAI_API_KEY`, `JINA_API_KEY`, `EMBEDDING_DIMENSION` | unset, unset, `1536` | The embedding provider. OpenAI first; then Jina, which works only in a build with the `jina` feature; otherwise a mock provider for development (`Embedding service: Mock (development only)`). |
 | `CALIBRATION_PATH` | the `calibration.toml` compiled into the binary | An override file. One that does not load is logged as an error, and the compiled-in calibration is served instead. Changes need a restart. |

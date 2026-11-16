@@ -334,6 +334,19 @@ pub struct AppState {
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
     #[cfg(feature = "db")]
     pub bp_apply: BpApply,
+    /// Whether the anonymous guest reads under `/api/v1/guest/` answer
+    /// (`routes/guest.rs`). OFF in every constructor, where each guest route
+    /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
+    /// from [`GUEST_READS_ENV`] at boot.
+    #[cfg(feature = "db")]
+    pub guest_reads: GuestReads,
+    /// The guest reads' own limiter, used only while [`Self::rate_limiter`] is
+    /// `None` (`middleware::rate_limit::guest_rate_limit_middleware`). `None`
+    /// in every constructor; `bin/server.rs` sets it when
+    /// `EPIGRAPH_GUEST_READS` is on and no limiter is configured (the
+    /// operator's ruling of 2026-11-16, `RateLimitSettings::guest_default`).
+    #[cfg(feature = "db")]
+    pub guest_rate_limiter: Option<AgentRateLimiter>,
     /// API configuration
     pub config: ApiConfig,
     /// Idempotency store for duplicate request detection
@@ -513,6 +526,75 @@ pub use epigraph_engine::belief_modes::BpApply;
 
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
 pub const BP_APPLY_ENV: &str = BpApply::ENV;
+
+/// The environment variable that switches the guest reads on:
+/// `EPIGRAPH_GUEST_READS`.
+pub const GUEST_READS_ENV: &str = "EPIGRAPH_GUEST_READS";
+
+/// Whether the anonymous guest reads (`routes/guest.rs`, backlog `1deb9dbf`)
+/// answer.
+///
+/// A guest read serves every `visibility = 'public'` row to a caller with no
+/// credential at all. Before these routes, `public` meant "any authenticated
+/// agent" (`docs/tenancy.md`, D3), and rows were stored as `public` under that
+/// meaning. Switching the routes on widens every such row to the open
+/// internet, so it is an explicit operator act, taken once the public corpus
+/// has been checked for rows meant only for signed-in readers, and never a
+/// side effect of deploying the code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GuestReads {
+    /// Every guest route answers a bare 404, as an unrouted path does. The
+    /// default everywhere.
+    #[default]
+    Off,
+    /// The guest routes serve the public graph to signed-out callers.
+    On,
+}
+
+impl GuestReads {
+    /// The switch's parse, apart from the environment: ONLY the exact value
+    /// `on` (trimmed, case-insensitive) switches it on. Unset, empty, `true`,
+    /// `1` or a typo leave it OFF, so a mistyped value fails closed.
+    #[must_use]
+    pub fn parse(raw: Option<&str>) -> Self {
+        if raw.is_some_and(|v| v.trim().eq_ignore_ascii_case("on")) {
+            Self::On
+        } else {
+            Self::Off
+        }
+    }
+
+    /// Whether `raw` is SET to a value that is neither `on` nor `off`
+    /// (trimmed, case-insensitive), which the server warns about at boot.
+    #[must_use]
+    pub fn is_unrecognised(raw: Option<&str>) -> bool {
+        raw.map(str::trim).is_some_and(|v| {
+            !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
+        })
+    }
+}
+
+#[cfg(test)]
+mod guest_reads_switch_tests {
+    use super::GuestReads;
+
+    #[test]
+    fn only_on_switches_guest_reads_on() {
+        for on in ["on", "ON", " On "] {
+            assert_eq!(GuestReads::parse(Some(on)), GuestReads::On, "{on:?}");
+            assert!(!GuestReads::is_unrecognised(Some(on)), "{on:?}");
+        }
+        for typo in ["true", "1", "yes", "enabled", "onn"] {
+            assert_eq!(GuestReads::parse(Some(typo)), GuestReads::Off, "{typo:?}");
+            assert!(GuestReads::is_unrecognised(Some(typo)), "{typo:?}");
+        }
+        for off in [None, Some(""), Some("  "), Some("off"), Some("OFF")] {
+            assert_eq!(GuestReads::parse(off), GuestReads::Off, "{off:?}");
+            assert!(!GuestReads::is_unrecognised(off), "{off:?}");
+        }
+        assert_eq!(GuestReads::default(), GuestReads::Off);
+    }
+}
 
 /// API configuration options
 #[derive(Clone)]
@@ -1234,6 +1316,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
+            guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1337,6 +1421,22 @@ impl AppState {
     #[must_use]
     pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
         self.bp_apply = bp_apply;
+        self
+    }
+
+    /// Set the guest-reads switch; see [`Self::guest_reads`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_guest_reads(mut self, guest_reads: GuestReads) -> Self {
+        self.guest_reads = guest_reads;
+        self
+    }
+
+    /// Set the guest reads' own limiter; see [`Self::guest_rate_limiter`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_guest_rate_limiter(mut self, limiter: AgentRateLimiter) -> Self {
+        self.guest_rate_limiter = Some(limiter);
         self
     }
 
@@ -1793,6 +1893,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
+            guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,
@@ -1869,6 +1971,8 @@ impl AppState {
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
             bp_apply: BpApply::Off,
+            guest_reads: GuestReads::Off,
+            guest_rate_limiter: None,
             config,
             idempotency_store: Arc::new(RwLock::new(HashMap::new())),
             signature_state,

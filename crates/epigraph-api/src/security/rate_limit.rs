@@ -409,6 +409,31 @@ impl RateLimitSettings {
             .with_trusted_proxies(self.trusted_proxies.clone()),
         )
     }
+
+    /// The settings of the limiter the anonymous guest reads
+    /// (`routes/guest.rs`) get when the operator configured none: the
+    /// operator's ruling of 2026-11-16, which `bin/server.rs` applies only
+    /// while `EPIGRAPH_GUEST_READS` is on. Guest reads are opt-in, so no
+    /// deployment that has not switched them on changes.
+    ///
+    /// `Some` only when no limiter is configured AND [`RATE_LIMIT_ENV`] was
+    /// not explicitly `off`: a configured limiter already covers the guest
+    /// routes, and an explicit `off` is the operator's choice, which is
+    /// respected (and warned about at boot). The default is
+    /// [`DEFAULT_RATE_LIMIT_RPM`] per client address with no global limit,
+    /// keyed through the same [`TrustedProxies`] a configured limiter would
+    /// use. Build it with [`Self::build`], the one installer.
+    #[must_use]
+    pub fn guest_default(&self) -> Option<Self> {
+        (!self.enabled && !self.switched_off).then(|| Self {
+            enabled: true,
+            switched_off: false,
+            unrecognised_switch: false,
+            per_key_rpm: DEFAULT_RATE_LIMIT_RPM,
+            global_rpm: None,
+            trusted_proxies: self.trusted_proxies.clone(),
+        })
+    }
 }
 
 /// Seconds between two recorded refusals of one bucket
@@ -1103,6 +1128,56 @@ mod tests {
         let none = RateLimitSettings::parse(None, None, Some("off"), Some("none")).unwrap();
         assert_eq!(none.global_rpm, None);
         assert!(none.trusted_proxies.is_empty());
+    }
+
+    /// The operator's ruling of 2026-11-16: the guest reads get a default
+    /// limiter only when none is configured and rate limiting was not
+    /// switched off explicitly; it is #841's default limit, keyed through the
+    /// configured trusted proxies, with no global limit.
+    #[test]
+    fn the_guest_default_applies_only_when_nothing_is_configured() {
+        let unset = RateLimitSettings::parse(None, None, None, None).unwrap();
+        let guest = unset.guest_default().expect("unconfigured: guest default");
+        assert!(guest.enabled && !guest.switched_off && !guest.unrecognised_switch);
+        assert_eq!(guest.trusted_proxies, TrustedProxies::loopback());
+        let limiter = guest.build().expect("the guest default builds a limiter");
+        assert_eq!(limiter.config().default_rpm, DEFAULT_RATE_LIMIT_RPM);
+        assert!(!limiter.config().enable_global_limit);
+
+        // A proxy list alone does not configure a limiter, so the guest
+        // default applies, keyed through that list.
+        let proxied = RateLimitSettings::parse(None, None, None, Some("192.0.2.0/24")).unwrap();
+        assert!(!proxied.enabled);
+        let limiter = proxied.guest_default().and_then(|g| g.build()).unwrap();
+        assert!(limiter
+            .trusted_proxies()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(!limiter
+            .trusted_proxies()
+            .contains("127.0.0.1".parse().unwrap()));
+
+        // A configured limiter (`on`, a per-key limit, a numeric global
+        // limit, an unrecognised switch) already covers the guest routes.
+        for (switch, rpm, global) in [
+            (Some("on"), None, None),
+            (None, Some("42"), None),
+            (None, None, Some("5000")),
+            (Some("disabled"), None, None),
+        ] {
+            let s = RateLimitSettings::parse(switch, rpm, global, None).unwrap();
+            assert!(
+                s.enabled,
+                "{switch:?} {rpm:?} {global:?} configures a limiter"
+            );
+            assert!(
+                s.guest_default().is_none(),
+                "{switch:?} {rpm:?} {global:?}: no separate guest default"
+            );
+        }
+
+        // An explicit `off` is the operator's choice: no guest default.
+        let off = RateLimitSettings::parse(Some("off"), None, None, None).unwrap();
+        assert!(off.guest_default().is_none());
     }
 
     #[test]

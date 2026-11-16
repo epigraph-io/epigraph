@@ -16,6 +16,13 @@
 //!   `X-Forwarded-For` (no proxy is trusted here);
 //! - a request from 127.0.0.2 is NOT 429: a second peer has its own bucket.
 //!
+//! And, for the operator's ruling of 2026-11-16, with `EPIGRAPH_GUEST_READS=on`:
+//!
+//! - with no limiter configured, a guest route is refused 429 past #841's
+//!   default limit from one peer, a second peer is served, and an anonymous
+//!   non-guest route is never refused;
+//! - with `EPIGRAPH_RATE_LIMIT=off`, the guest routes are never refused.
+//!
 //! Verified to fail: without the `with_rate_limiter` install in `main` the
 //! fourth request is answered normally; serving with plain
 //! `axum::serve(listener, app)` (no connect info) puts both peers in one
@@ -62,9 +69,9 @@ fn providers_file() -> std::path::PathBuf {
     path
 }
 
-/// Start the server against `db_url` and wait until it serves; return it and
-/// the port it bound.
-fn start_server(db_url: &str) -> (Server, u16) {
+/// Start the server against `db_url`, with `env` on top of the fixed
+/// environment, and wait until it serves; return it and the port it bound.
+fn start_server(db_url: &str, env: &[(&str, &str)]) -> (Server, u16) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_server"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -73,7 +80,6 @@ fn start_server(db_url: &str) -> (Server, u16) {
         .env("EPIGRAPH_PORT", "0")
         .env("EPIGRAPH_METRICS_ADDR", "127.0.0.1:0")
         .env("EPIGRAPH_PROVIDERS_CONFIG", providers_file())
-        .env("EPIGRAPH_RATE_LIMIT_RPM", RPM.to_string())
         .env("EPIGRAPH_TRUSTED_PROXIES", "none")
         .env("RUST_LOG", "info")
         .env("NO_COLOR", "1")
@@ -82,6 +88,9 @@ fn start_server(db_url: &str) -> (Server, u16) {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     let mut child = cmd.spawn().expect("spawn the server binary");
     let (tx, rx) = mpsc::channel::<String>();
     for pipe in [
@@ -140,8 +149,15 @@ fn serving_port(line: &str) -> Option<u16> {
     digits.parse().ok().filter(|p| *p != 0)
 }
 
-/// One anonymous GET from the local address `from`; the response status.
+/// One anonymous GET of [`PATH`] from the local address `from`; the response
+/// status.
 async fn get_from(from: Ipv4Addr, port: u16, extra_header: Option<&str>) -> u16 {
+    get_path_from(from, port, PATH, extra_header).await
+}
+
+/// One anonymous GET of `path` from the local address `from`; the response
+/// status.
+async fn get_path_from(from: Ipv4Addr, port: u16, path: &str, extra_header: Option<&str>) -> u16 {
     let socket = tokio::net::TcpSocket::new_v4().expect("socket");
     socket
         .bind(SocketAddr::new(IpAddr::V4(from), 0))
@@ -152,7 +168,7 @@ async fn get_from(from: Ipv4Addr, port: u16, extra_header: Option<&str>) -> u16 
         .expect("connect to the server");
     let extra = extra_header.map(|h| format!("{h}\r\n")).unwrap_or_default();
     let request =
-        format!("GET {PATH} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
@@ -187,9 +203,11 @@ fn serving_port_reads_the_bound_port() {
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_served_binary_limits_each_anonymous_peer_separately(pool: PgPool) {
     let db_url = fixture::database_url_for(&pool).await;
-    let (_server, port) = tokio::task::spawn_blocking(move || start_server(&db_url))
-        .await
-        .expect("join");
+    let (_server, port) = tokio::task::spawn_blocking(move || {
+        start_server(&db_url, &[("EPIGRAPH_RATE_LIMIT_RPM", &RPM.to_string())])
+    })
+    .await
+    .expect("join");
 
     let a = Ipv4Addr::new(127, 0, 0, 1);
     let b = Ipv4Addr::new(127, 0, 0, 2);
@@ -218,5 +236,107 @@ async fn the_served_binary_limits_each_anonymous_peer_separately(pool: PgPool) {
         get_from(b, port, None).await,
         200,
         "a second peer ({b}) must have its own bucket: the served router sees the TCP peer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guest reads (the operator's ruling of 2026-11-16)
+// ---------------------------------------------------------------------------
+
+/// A guest route, served whether or not the corpus holds a theme.
+const GUEST_PATH: &str = "/api/v1/guest/graph/themes/overview";
+
+/// #841's default per-key limit, which the guest reads get by default.
+const DEFAULT_RPM: usize = 600;
+
+/// More requests than the default limit allows in a burst, with room for the
+/// refill (10 a second) while they are sent.
+const PAST_DEFAULT: usize = 3 * DEFAULT_RPM;
+
+/// Send GETs of `path` from `from` until one is refused 429 or `cap` were
+/// sent; the statuses of the answered ones, and whether a 429 came.
+async fn until_refused(from: Ipv4Addr, port: u16, path: &str, cap: usize) -> (Vec<u16>, bool) {
+    let mut answered = Vec::new();
+    for _ in 0..cap {
+        match get_path_from(from, port, path, None).await {
+            429 => return (answered, true),
+            status => answered.push(status),
+        }
+    }
+    (answered, false)
+}
+
+/// Guest reads on and no limiter configured: the served binary limits the
+/// guest routes at the default limit per TCP peer, and leaves the other
+/// routes unlimited.
+///
+/// Fails without the guest-default install in `main` (no 429 on the guest
+/// route), or with the default installed router-wide (a 429 on discovery).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_served_binary_limits_the_guest_reads_by_default(pool: PgPool) {
+    let db_url = fixture::database_url_for(&pool).await;
+    let (_server, port) = tokio::task::spawn_blocking(move || {
+        start_server(&db_url, &[("EPIGRAPH_GUEST_READS", "on")])
+    })
+    .await
+    .expect("join");
+
+    let a = Ipv4Addr::new(127, 0, 0, 1);
+    let b = Ipv4Addr::new(127, 0, 0, 2);
+
+    let (answered, refused) = until_refused(a, port, GUEST_PATH, PAST_DEFAULT).await;
+    assert!(
+        answered.iter().all(|s| *s == 200),
+        "CALIBRATION: every guest read under the limit must be served normally; got {:?}",
+        answered.iter().filter(|s| **s != 200).collect::<Vec<_>>()
+    );
+    assert!(
+        refused,
+        "{PAST_DEFAULT} guest reads from one peer must meet a 429: the default limiter is \
+         installed"
+    );
+    assert!(
+        answered.len() >= DEFAULT_RPM,
+        "the default limit is {DEFAULT_RPM} a minute after a full burst, but the peer was \
+         refused after {}",
+        answered.len()
+    );
+    assert_eq!(
+        get_path_from(b, port, GUEST_PATH, None).await,
+        200,
+        "a second peer ({b}) has its own guest bucket"
+    );
+
+    // The peer whose guest bucket is spent is not limited elsewhere.
+    let (answered, refused) = until_refused(a, port, PATH, PAST_DEFAULT).await;
+    assert!(
+        !refused && answered.iter().all(|s| *s == 200),
+        "{PATH} from {a} must not be rate limited: the guest default limits the guest \
+         routes only"
+    );
+}
+
+/// Guest reads on with `EPIGRAPH_RATE_LIMIT=off`: the operator's explicit
+/// choice is respected, so the served guest routes are unlimited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn explicit_off_serves_the_guest_reads_unlimited(pool: PgPool) {
+    let db_url = fixture::database_url_for(&pool).await;
+    let (_server, port) = tokio::task::spawn_blocking(move || {
+        start_server(
+            &db_url,
+            &[
+                ("EPIGRAPH_GUEST_READS", "on"),
+                ("EPIGRAPH_RATE_LIMIT", "off"),
+            ],
+        )
+    })
+    .await
+    .expect("join");
+
+    let (answered, refused) =
+        until_refused(Ipv4Addr::LOCALHOST, port, GUEST_PATH, PAST_DEFAULT).await;
+    assert!(
+        !refused && answered.iter().all(|s| *s == 200),
+        "{PAST_DEFAULT} guest reads under EPIGRAPH_RATE_LIMIT=off must all be served"
     );
 }

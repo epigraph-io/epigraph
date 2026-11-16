@@ -180,6 +180,20 @@ async fn main() {
     }
     let rate_limiter = rate_limit.build();
 
+    // Guest reads (backlog `1deb9dbf`), read here, next to the rate limit,
+    // because they decide whether the guest routes get a limiter of their own
+    // (the operator's ruling of 2026-11-16): with guest reads on and no
+    // limiter configured, the four `/api/v1/guest/*` routes, and no other,
+    // are limited at #841's default, keyed on the client address. Built by
+    // the same installer as the configured limiter
+    // (`RateLimitSettings::guest_default`, then `build`).
+    let guest_reads = guest_reads_from_env();
+    let guest_rate_limit = match guest_reads {
+        epigraph_api::state::GuestReads::On => rate_limit.guest_default(),
+        epigraph_api::state::GuestReads::Off => None,
+    };
+    let guest_rate_limiter = guest_rate_limit.as_ref().and_then(|s| s.build());
+
     // Serving settings (backlog ebd7952c), read once and here for the same
     // reason as the rate limit: a malformed bind address or limit refuses to
     // start before any connection, and the log says what is in force.
@@ -216,6 +230,29 @@ async fn main() {
         tracing::warn!(
             "rate limiter OFF (EPIGRAPH_RATE_LIMIT=off): no request is rate limited by this \
              process, the anonymous OAuth and elevation endpoints included"
+        );
+        if guest_reads == epigraph_api::state::GuestReads::On {
+            tracing::warn!(
+                "EPIGRAPH_RATE_LIMIT=off with EPIGRAPH_GUEST_READS=on: the guest reads under \
+                 /api/v1/guest/ are UNLIMITED; any signed-out caller may read the public \
+                 graph at any rate. Unset EPIGRAPH_RATE_LIMIT to limit them by default, or \
+                 limit at the reverse proxy."
+            );
+        }
+    } else if let Some(guest) = &guest_rate_limit {
+        tracing::warn!(
+            "rate limiter OFF except on the guest reads: EPIGRAPH_RATE_LIMIT_RPM is not set, \
+             so no other request is rate limited by this process, the anonymous OAuth and \
+             elevation endpoints included. Set it, or limit at the reverse proxy."
+        );
+        tracing::info!(
+            per_key_rpm = guest.per_key_rpm,
+            trusted_proxies = %guest.trusted_proxies,
+            "guest routes are rate limited by default (EPIGRAPH_GUEST_READS=on): each \
+             client address may make per_key_rpm requests a minute to /api/v1/guest/ \
+             (X-Forwarded-For believed only from trusted_proxies). Set \
+             EPIGRAPH_RATE_LIMIT_RPM to limit every route instead, or EPIGRAPH_RATE_LIMIT=off \
+             to remove the limit."
         );
     } else {
         tracing::warn!(
@@ -607,6 +644,7 @@ async fn main() {
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_bp_apply(bp_apply_from_env())
+            .with_guest_reads(guest_reads)
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
 
@@ -689,6 +727,11 @@ async fn main() {
     // Install the limiter built at the top of `main` (or none when it is off).
     let state = match rate_limiter {
         Some(limiter) => state.with_rate_limiter(limiter),
+        None => state,
+    };
+    // And the guest reads' default limiter, when it applies (see above).
+    let state = match guest_rate_limiter {
+        Some(limiter) => state.with_guest_rate_limiter(limiter),
         None => state,
     };
 
@@ -978,6 +1021,33 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
             "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \
              claims (BP apply is retired; compounds are never written)"
         );
+    }
+    switch
+}
+
+/// `EPIGRAPH_GUEST_READS`, read once at boot: whether the anonymous guest
+/// reads under `/api/v1/guest/` answer (`epigraph_api::state::GuestReads`).
+/// OFF unless the value is exactly `on`; logged either way, so a journal
+/// shows whether the public graph is open to signed-out callers.
+#[cfg(feature = "db")]
+fn guest_reads_from_env() -> epigraph_api::state::GuestReads {
+    use epigraph_api::state::{GuestReads, GUEST_READS_ENV};
+    let raw = std::env::var(GUEST_READS_ENV).ok();
+    if GuestReads::is_unrecognised(raw.as_deref()) {
+        tracing::warn!(
+            value = raw.as_deref().unwrap_or_default(),
+            "EPIGRAPH_GUEST_READS is set to a value that is neither `on` nor `off`: guest \
+             reads stay OFF on this process (only `on` enables them)"
+        );
+    }
+    let switch = GuestReads::parse(raw.as_deref());
+    if switch == GuestReads::On {
+        tracing::warn!(
+            "EPIGRAPH_GUEST_READS=on: every `visibility = 'public'` claim, edge and theme \
+             count is readable WITHOUT a credential under /api/v1/guest/"
+        );
+    } else {
+        tracing::info!("guest reads OFF: /api/v1/guest/ answers 404");
     }
     switch
 }

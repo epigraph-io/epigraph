@@ -872,7 +872,9 @@ fn d3_the_only_unrestricted_shape_costs_a_lease() {
 /// plus, in the `db` variant only, the passkey enrollment ceremony (elevation
 /// plan EL-3), the elevation ceremony (EL-5) and the admin-act confirmation
 /// (EL-12b), which are anonymous by design (the enrollment, ticket or act id
-/// and the authenticator are their credentials; they need the database).
+/// and the authenticator are their credentials; they need the database), and
+/// the four public-only guest reads (backlog `1deb9dbf`), which read as
+/// `Viewer::public_only()` and so serve `visibility = 'public'` rows only.
 ///
 /// The `#[cfg(not(feature = "db"))]` variant is not built in any buildable
 /// configuration, so a source lint is the only mechanism that covers it at all.
@@ -896,6 +898,10 @@ fn d3_anonymous_route_surface_is_the_allowlist() {
             "/elevate/act/:id/challenge",
             "/elevate/act/:id/assert",
             "/elevate/assets/elevate.js",
+            "/api/v1/guest/claims/:id",
+            "/api/v1/guest/claims/:id/ego",
+            "/api/v1/guest/graph/themes/overview",
+            "/api/v1/guest/graph/themes/layout",
         ])
         .collect();
 

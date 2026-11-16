@@ -751,7 +751,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // `unplaced_themes`).
     (
         "graph_layout.rs",
-        "themes_layout",
+        "themes_layout_as",
         &["AtlasLayoutRepository::run"],
     ),
     // untenanted: the run, and both drill-down ids resolved to theme ids in
