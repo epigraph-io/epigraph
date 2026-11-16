@@ -149,12 +149,12 @@ pub use claim::{
     DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
     EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
     HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
-    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
-    SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
-    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
-    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
-    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
-    SUPERSEDE_ACT_TOOLS,
+    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput,
+    SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration, SupersedeTool,
+    SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES,
+    DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP,
+    EXPANSION_RELATIONSHIPS, RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED,
+    SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
@@ -181,7 +181,7 @@ pub use claim_visibility::{
 };
 pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::{CommunityRepository, MembershipOutcome};
-pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
+pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity, HighConflictClaim};
 pub use context::ContextRepository;
 pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
@@ -261,10 +261,11 @@ pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
     hierarchical_outcome_variance, validate_outcome_idempotency_key, ExecutedClaim,
-    FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow, HierarchicalOutcomeCounters,
-    HierarchicalOutcomeRecord, HierarchicalOutcomeResult, HierarchicalWorkflowRow,
-    NewHierarchicalOutcomeReport, ResolvedStep, ScoredHierarchicalWorkflowRow,
-    WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult, WorkflowRepository,
+    FlatWorkflowClaim, FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow,
+    HierarchicalOutcomeCounters, HierarchicalOutcomeRecord, HierarchicalOutcomeResult,
+    HierarchicalWorkflowRow, NewHierarchicalOutcomeReport, ResolvedStep,
+    ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository,
 };
 
 // Privacy / encryption repositories

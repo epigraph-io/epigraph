@@ -398,6 +398,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "bp_seed_rows",
         &["derivation_scope::retain_for_cache"],
     ),
+    // stamped: the frame-density aggregate behind `silence_alarms` takes no
+    // viewer (counts only, no row content) and runs on the caller's `read_as`
+    // connection, so row security scopes its counts; the content read beside
+    // it receives the viewer (`high_conflict_claims`).
+    (
+        "conflicts.rs",
+        "scan_conflicts",
+        &["ConflictDensityRepository::scan"],
+    ),
     // gated (`ClaimRepository::get_by_id`) then write; agents are untenanted.
     // The signed REFUTES edge write runs on a transaction stamped with the
     // caller's viewer (`if let Ok(mut tx) = state.write_as(&viewer, ..)`,
@@ -1100,9 +1109,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ("rag.rs", "search_evidence", &["generate_query_embedding"]),
     // no SQL (embeddings, including `generate_walk_query_embedding`, the
     // pageable request's variant that answers 503 instead of the mock when the
-    // service fails), untenanted (claim_themes, the centroid-dimension probe),
-    // and the content read registered in viewer_route_table_lint.rs's
-    // UNCOMPENSATED_INLINE_READS (ids from a viewer-spliced theme read).
+    // service fails) and untenanted (claim_themes, the centroid-dimension
+    // probe). The diverse arm's content read left this list when it became
+    // `ClaimRepository::semantic_selected_claims(.., &viewer, ..)` (backlog
+    // 67c905a3).
     (
         "search.rs",
         "semantic_search",
@@ -1112,7 +1122,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "generate_query_embedding",
             "generate_query_embedding_with_dim",
             "generate_walk_query_embedding",
-            "sqlx::query(SELECT).fetch_all",
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
@@ -1208,6 +1217,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["BehavioralExecutionRepository::create"],
     ),
     // gated (`get_by_id_with_labels`) then write on the stamped transaction.
+    // The counter read on that transaction left this list when it became
+    // `WorkflowRepository::flat_workflow_claim(.., &viewer, ..)` (backlog
+    // 67c905a3).
     (
         "workflows.rs",
         "report_outcome",
@@ -1215,7 +1227,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "BehavioralExecutionRepository::create",
             "ClaimRepository::set_properties_conn",
             "ClaimRepository::update_truth_value_conn",
-            "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
     // untenanted: behavioral_executions.

@@ -454,6 +454,25 @@ pub struct SemanticNeighborHit {
     pub direction: String,
 }
 
+/// Result row for [`ClaimRepository::semantic_selected_claims`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticSelectedClaim {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub belief: Option<f64>,
+    pub plausibility: Option<f64>,
+    pub agent_id: Uuid,
+    pub trace_id: Option<Uuid>,
+    /// `labels[1]`.
+    pub claim_type: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub theme_id: Option<Uuid>,
+    /// The claim's cluster in the most recently completed cluster run.
+    pub cluster_id: Option<Uuid>,
+    pub similarity: f64,
+}
+
 /// Result row for [`ClaimRepository::list_by_belief_bounds`].
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BeliefBoundedClaimHit {
@@ -3416,6 +3435,68 @@ impl ClaimRepository {
             3,
         );
         let mut q = sqlx::query_as::<_, SemanticNeighborHit>(&sql)
+            .bind(embedding)
+            .bind(claim_ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The full result rows of a diverse semantic search: one row per id in
+    /// `claim_ids` that `viewer` may read, with its similarity to `embedding`
+    /// over `embedding_col`, its latest cluster from
+    /// `claim_cluster_membership`, nearest first.
+    ///
+    /// Moved here from an inline `format!`-built statement in `epigraph-api`'s
+    /// `routes/search.rs::semantic_search`, which carried no predicate and was
+    /// safe only by a caller-side derivation: every id came out of one of two
+    /// viewer-spliced theme reads. The predicate here makes the read safe
+    /// whatever its caller hands it, so a third source of ids added later does
+    /// not reopen it. For today's two sources it filters nothing they had not
+    /// already filtered, so the result set is unchanged.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails, or
+    /// `DbError::InvalidData` for an unrecognised `embedding_col`.
+    #[instrument(skip(executor, viewer, embedding))]
+    pub async fn semantic_selected_claims<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        embedding_col: &str,
+        embedding: &str,
+        claim_ids: &[Uuid],
+    ) -> Result<Vec<SemanticSelectedClaim>, DbError> {
+        if embedding_col != "embedding" && embedding_col != "embedding_3072" {
+            return Err(DbError::InvalidData {
+                reason: format!("unsupported embedding column {embedding_col:?}"),
+            });
+        }
+        let sql = viewer.splice(
+            &format!(
+                r#"
+                SELECT c.id, c.content, c.truth_value, c.belief, c.plausibility,
+                       c.agent_id, c.trace_id,
+                       c.labels[1] as claim_type, c.created_at,
+                       c.theme_id,
+                       (
+                           SELECT m.cluster_id
+                           FROM claim_cluster_membership m
+                           JOIN graph_cluster_runs r ON r.run_id = m.run_id
+                           WHERE m.claim_id = c.id
+                           ORDER BY r.completed_at DESC
+                           LIMIT 1
+                       ) AS cluster_id,
+                       1 - (c.{embedding_col} <=> $1::vector) as similarity
+                FROM claims c
+                WHERE c.id = ANY($2)
+                  /* {{VISIBILITY:c}} */
+                ORDER BY c.{embedding_col} <=> $1::vector
+                "#
+            ),
+            3,
+        );
+        let mut q = sqlx::query_as::<_, SemanticSelectedClaim>(&sql)
             .bind(embedding)
             .bind(claim_ids);
         if let Some(g) = viewer.group_bind() {

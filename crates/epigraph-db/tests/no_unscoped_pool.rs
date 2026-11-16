@@ -795,7 +795,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `promote_staged_edges`'s two one-statement arms became one transaction on
 /// the same raw pool, `routes/crud.rs` one site fewer. A merge of two sites,
 /// not a conversion.
-const HIGH_WATER: usize = 197;
+/// 197 -> 192 on staging batch 4 (backlog batch B37, #895): `routes/conflicts.rs`
+/// 10 -> 8, `routes/political.rs` 5 -> 4, and `routes/embeddings.rs` 2 -> 0
+/// (key DELETED), each read now on the caller's stamped connection.
+const HIGH_WATER: usize = 192;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -867,7 +870,8 @@ const HIGH_WATER: usize = 197;
 /// 37 -> 36 when `routes/audit.rs` reached zero (backlog 8a168dd6).
 /// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
 /// staging after the line above).
-const HIGH_WATER_FILES: usize = 35;
+/// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
+const HIGH_WATER_FILES: usize = 34;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -953,7 +957,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/computation.rs", 5),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
-    ("routes/conflicts.rs", 10),
+    ("routes/conflicts.rs", 8),
     // 5 before conversion shard 5, which moved `list_contexts`, `get_context`,
     // `list_active_contexts` and `frame_contexts` onto `AppState::read_as`. The
     // one that remains is `create_context`, which WRITES through its alias:
@@ -1026,7 +1030,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // DELETED the factor INSERT (it fed only BP; SPEC §4.1 W10): removed, not
     // converted.
     ("routes/edges.rs", 4),
-    ("routes/embeddings.rs", 2),
     // `routes/entities.rs` was 8 and is GONE, not zeroed. Conversion shard 7
     // took 5 (`entity_neighborhood` 2, category A; `query_triples` 3, filed C by
     // PR #460 on the handler's verb but measured as a read). Backlog 850dcc61
@@ -1135,7 +1138,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `("political.rs", 1)`, so it must not be relocated to lower that
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
-    ("routes/political.rs", 5),
+    ("routes/political.rs", 4),
     // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
     // its two writers, `generate_claim_embedding` and
     // `generate_evidence_embedding` (the `PUT …/embedding` routes).
