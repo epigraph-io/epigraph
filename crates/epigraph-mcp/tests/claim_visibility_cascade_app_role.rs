@@ -139,6 +139,7 @@ fn submit(content: &str, visibility: &str, group: Option<Uuid>) -> SubmitClaimPa
         novelty_threshold: Some(0.0),
         visibility: Some(visibility.to_string()),
         group_id: group.map(|g| g.to_string()),
+        dataset: None,
     }
 }
 
