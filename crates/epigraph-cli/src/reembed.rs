@@ -17,9 +17,9 @@
 //!
 //! RETIRED CLAIMS ARE NEVER SELECTED. A retirement (`is_current = false`)
 //! nulls both vector columns, which is exactly the `embedding_3072 IS NULL`
-//! shape this tool selects on; re-populating it would make the claim
-//! retrievable again through recall at `centroid_dim = 3072`
-//! (`ClaimRepository::search_by_embedding_since` has no `is_current` filter),
+//! shape this tool selects on; re-populating it would put a vector back on a
+//! retired row (recall at `centroid_dim = 3072` has filtered `is_current`
+//! itself only since backlog 7720cb7a; before that, this was the guard),
 //! and `chk_deprecated_no_embedding` (migration 144) refuses the write, so one
 //! retired row would abort the whole run. The UPDATE re-checks the same
 //! predicate, so a claim retired between the fetch and the write is skipped
@@ -169,7 +169,7 @@ pub async fn run(pool: &PgPool, config: ReembedConfig) -> Result<ReembedSummary,
         }
 
         for ((row_id, _), embedding) in rows.iter().zip(embeddings.iter()) {
-            let pgvec = format_pgvector(embedding);
+            let pgvec = epigraph_db::pgvector_literal(embedding);
             if update_embedding_3072(pool, config.target, *row_id, &pgvec).await? {
                 rows_written += 1;
             }
@@ -258,12 +258,6 @@ async fn update_embedding_3072(
     );
     let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
     Ok(done.rows_affected() > 0)
-}
-
-/// Format a `&[f32]` as pgvector literal `[a,b,c,...]`.
-fn format_pgvector(vec: &[f32]) -> String {
-    let inner: Vec<String> = vec.iter().map(|v| format!("{v}")).collect();
-    format!("[{}]", inner.join(","))
 }
 
 fn read_checkpoint(path: Option<&PathBuf>) -> Result<Option<Uuid>, ReembedError> {

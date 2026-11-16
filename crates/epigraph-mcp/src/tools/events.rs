@@ -87,6 +87,16 @@ pub async fn publish_event(
     if params.event_type.trim().is_empty() {
         return Err(invalid_params("event_type cannot be empty"));
     }
+    // Before any identity work, on every transport: a reserved type is the
+    // server's own record of a write (the assess route's `claim.assessed`),
+    // and a caller-filed one would be trusted as that record.
+    if EventRepository::is_reserved_type(&params.event_type) {
+        return Err(invalid_params(format!(
+            "event_type {:?} is reserved for the server's own records and cannot be \
+             published. Nothing was written.",
+            params.event_type
+        )));
+    }
 
     let requested = params
         .actor_id

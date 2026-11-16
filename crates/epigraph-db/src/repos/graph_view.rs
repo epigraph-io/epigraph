@@ -159,6 +159,49 @@ pub struct SubgraphEvidenceRow {
     pub properties: serde_json::Value,
 }
 
+/// A theme as `GET /api/v1/graph/themes/:id/expand` sees it: its stored label
+/// and the number of its CURRENT members the viewer can read.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThemeVisibleSummaryRow {
+    /// `claim_themes.label`, cut to 200 characters. Stored, not
+    /// viewer-derived: the theme scripts build it from public members only.
+    pub label: String,
+    /// Current members of the theme the viewer can read; always >= 1.
+    pub visible_members: i64,
+}
+
+/// One neighbourhood of a theme expansion, aggregated over the members the
+/// viewer can read (backlog 01e0b839).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThemeNeighborhoodRow {
+    pub id: Uuid,
+    /// `graph_neighborhoods.label` once `scripts/label_themes_llm.py
+    /// --neighborhoods` has named it from public members only. A stored
+    /// positional placeholder (`neighborhood-N`) or a bare UUID (the dominant
+    /// frame id an older clustering job stored, computed over private members
+    /// too) is never returned: it is re-emitted as `neighborhood-K`, K being
+    /// the row's position in THIS viewer's list, so neither the frame nor a
+    /// gap left by a hidden neighbourhood reaches the caller.
+    pub label: String,
+    /// Current members the viewer can read, never the stored `size`.
+    pub size: i32,
+    /// Mean `pignistic_prob` of those members, never the stored mean.
+    pub mean_betp: Option<f64>,
+    /// The frame most of those members carry (each member counted under its
+    /// lowest frame id, as the clustering job does), never the stored one.
+    pub dominant_frame_id: Option<Uuid>,
+}
+
+/// An inter-neighbourhood edge of a theme expansion: `a < b`, and `weight` is
+/// the summed `forward_strength` of the edges the viewer can read between
+/// members of `a` and `b` the viewer can read.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ThemeNeighborhoodEdgeRow {
+    pub a: Uuid,
+    pub b: Uuid,
+    pub weight: f64,
+}
+
 /// An edge in a `load_subgraph` response.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SubgraphEdgeRow {
@@ -366,6 +409,159 @@ impl GraphViewRepository {
             .bind(run_id)
             .bind(degree_relationships)
             .bind(budget);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// The theme's stored label and its count of current members the viewer
+    /// can read, or `None` when the theme does not exist OR the viewer can
+    /// read none of its current members. The two are deliberately one answer
+    /// (the caller's 404): a theme's existence and label are only shown to a
+    /// viewer who can read one of its members, as in
+    /// `ClaimThemeRepository::overview_page`.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn theme_visible_summary<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        theme_id: Uuid,
+    ) -> Result<Option<ThemeVisibleSummaryRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT left(t.label, 200) AS label, COUNT(c.id)::int8 AS visible_members
+             FROM claim_themes t
+             JOIN claims c ON c.theme_id = t.id AND c.is_current /* {VISIBILITY:c} */
+             WHERE t.id = $1
+             GROUP BY t.id, t.label",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, ThemeVisibleSummaryRow>(&sql).bind(theme_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(executor).await?)
+    }
+
+    /// The neighbourhoods of `theme_id` in run `run_id` that hold at least one
+    /// current member the viewer can read, largest (by readable members)
+    /// first, at most `budget`.
+    ///
+    /// Every aggregate is recomputed over the readable members only. The
+    /// stored `size`, `mean_betp` and `dominant_frame_id` are computed by the
+    /// clustering job over ALL members, so returning them would tell a viewer
+    /// how many private members a neighbourhood has and leak their mean
+    /// pignistic probability. The membership row, the claim and the
+    /// `claim_frames` row all carry a marker (all three are tier-A).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn theme_neighborhoods<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        run_id: Uuid,
+        theme_id: Uuid,
+        budget: i64,
+    ) -> Result<Vec<ThemeNeighborhoodRow>, DbError> {
+        let sql = viewer.splice(
+            "WITH members AS (
+                SELECT m.neighborhood_id,
+                       c.pignistic_prob,
+                       (SELECT cf.frame_id FROM claim_frames cf
+                        WHERE cf.claim_id = c.id /* {VISIBILITY:cf} */
+                        ORDER BY cf.frame_id LIMIT 1) AS frame_id
+                FROM graph_neighborhoods n
+                JOIN claim_neighborhood_membership m
+                  ON m.neighborhood_id = n.id AND m.run_id = n.run_id
+                JOIN claims c ON c.id = m.claim_id
+                WHERE n.run_id = $1 AND n.theme_id = $2 AND c.is_current
+                  /* {VISIBILITY:m} */ /* {VISIBILITY:c} */
+            ),
+            agg AS (
+                SELECT neighborhood_id,
+                       COUNT(*)::int4 AS size,
+                       AVG(pignistic_prob)::float8 AS mean_betp
+                FROM members
+                GROUP BY neighborhood_id
+            )
+            SELECT n.id,
+                   CASE WHEN n.label ~ '^neighborhood-[0-9]+$'
+                          OR n.label ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                        THEN 'neighborhood-' || row_number() OVER (ORDER BY a.size DESC, n.id)
+                        ELSE n.label
+                   END AS label,
+                   a.size, a.mean_betp,
+                   (SELECT mb.frame_id FROM members mb
+                    WHERE mb.neighborhood_id = a.neighborhood_id AND mb.frame_id IS NOT NULL
+                    GROUP BY mb.frame_id
+                    ORDER BY COUNT(*) DESC, mb.frame_id
+                    LIMIT 1) AS dominant_frame_id
+            FROM agg a
+            JOIN graph_neighborhoods n ON n.id = a.neighborhood_id
+            ORDER BY a.size DESC, n.id
+            LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, ThemeNeighborhoodRow>(&sql)
+            .bind(run_id)
+            .bind(theme_id)
+            .bind(budget);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(executor).await?)
+    }
+
+    /// Inter-neighbourhood edges among `neighborhood_ids` in run `run_id`,
+    /// summed live over what the viewer can read: both endpoint claims and
+    /// their membership rows carry a claim marker and the edge an edge
+    /// marker, so a private member or a private edge contributes no weight
+    /// and a pair joined only through them has no edge. Same canonical pair
+    /// and `forward_strength > 0` rule as the clustering job's stored
+    /// `neighborhood_edges`, which is NOT read (its weights count every
+    /// edge).
+    ///
+    /// Precondition: pass the ids [`Self::theme_neighborhoods`] returned.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, neighborhood_ids))]
+    pub async fn theme_neighborhood_edges<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &Viewer,
+        run_id: Uuid,
+        neighborhood_ids: &[Uuid],
+    ) -> Result<Vec<ThemeNeighborhoodEdgeRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT LEAST(ma.neighborhood_id, mb.neighborhood_id) AS a,
+                    GREATEST(ma.neighborhood_id, mb.neighborhood_id) AS b,
+                    SUM(COALESCE(ft.forward_strength, 0))::float8 AS weight
+             FROM claim_neighborhood_membership ma
+             JOIN claims ca ON ca.id = ma.claim_id
+             JOIN edges e ON e.source_id = ma.claim_id
+             JOIN claim_neighborhood_membership mb
+               ON mb.claim_id = e.target_id AND mb.run_id = ma.run_id
+             JOIN claims cb ON cb.id = mb.claim_id
+             LEFT JOIN LATERAL edge_to_factor_type(e.relationship) ft ON true
+             WHERE ma.run_id = $1
+               AND ma.neighborhood_id = ANY($2)
+               AND mb.neighborhood_id = ANY($2)
+               AND ma.neighborhood_id <> mb.neighborhood_id
+               AND ca.is_current AND cb.is_current
+               /* {VISIBILITY:ma} */ /* {VISIBILITY:ca} */
+               /* {VISIBILITY:mb} */ /* {VISIBILITY:cb} */
+               /* {EDGE_VISIBILITY:e} */
+             GROUP BY 1, 2
+             HAVING SUM(COALESCE(ft.forward_strength, 0)) > 0
+             ORDER BY 1, 2",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, ThemeNeighborhoodEdgeRow>(&sql)
+            .bind(run_id)
+            .bind(neighborhood_ids);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

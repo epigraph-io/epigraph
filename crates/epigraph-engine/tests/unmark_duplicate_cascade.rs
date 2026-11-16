@@ -1108,6 +1108,7 @@ async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool, how: Retire)
                         .expect("the superseded claim's author");
                 let (replacement, _) = ClaimRepository::supersede_act_conn(
                     &mut conn,
+                    None,
                     ClaimId::from_uuid(canonical),
                     &format!("canonical, revised {}", Uuid::new_v4()),
                     epigraph_core::TruthValue::clamped(0.5),
@@ -1128,6 +1129,7 @@ async fn an_unmark_follows_the_canonicals_replacement(pool: PgPool, how: Retire)
                 let partner = new_claim(&pool, author, "consolidation partner").await;
                 let merged = ClaimRepository::consolidate_act_conn(
                     &mut conn,
+                    None,
                     &[canonical, partner],
                     &format!("canonical and partner, merged {}", Uuid::new_v4()),
                     0.5,
@@ -1238,6 +1240,7 @@ async fn supersede(conn: &mut sqlx::PgConnection, old: Uuid) -> Uuid {
             .expect("the superseded claim's author");
     let (replacement, _) = ClaimRepository::supersede_act_conn(
         conn,
+        None,
         ClaimId::from_uuid(old),
         &format!("revised {old} {}", Uuid::new_v4()),
         epigraph_core::TruthValue::clamped(0.5),
@@ -1409,6 +1412,7 @@ async fn an_unmark_follows_a_chain_of_replacements_to_the_current_canonical(pool
     let partner = new_claim(&pool, author, "consolidation partner").await;
     let n1 = ClaimRepository::consolidate_act_conn(
         &mut conn,
+        None,
         &[canonical, partner],
         &format!("canonical and partner, merged {}", Uuid::new_v4()),
         0.5,

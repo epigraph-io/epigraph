@@ -64,7 +64,7 @@ async fn run(
     x: &WorkflowExtraction,
 ) -> Result<WorkflowIngestExecutionResult, IngestExecutorError> {
     let plan = build_ingest_plan(x);
-    execute_workflow_ingest_plan(&mut pool.acquire().await.expect("acquire"), &plan, x).await
+    execute_workflow_ingest_plan(&mut pool.acquire().await.expect("acquire"), None, &plan, x).await
 }
 
 async fn rows(pool: &PgPool, canonical: &str) -> i64 {

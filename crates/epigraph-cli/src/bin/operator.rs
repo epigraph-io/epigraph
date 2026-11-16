@@ -38,7 +38,8 @@
 //!         [--attest-shared-signer <uuid,...>] [--apply]
 //!     epigraph-operator reown-claims --claims-file claims.txt --operator <uuid> \
 //!         --derived follow-claim --manifest-out reown-1.jsonl [--apply]
-//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl [--apply]
+//!     epigraph-operator reown-reverse --manifest reown-2.jsonl --manifest reown-1.jsonl \
+//!         [--allow-truncated-tail] [--apply]
 //!     epigraph-operator hide-evidence --claims-file claims.txt --operator <uuid> \
 //!         --hide-evidence-type testimony [--hide-evidence-label L] [--hide-evidence-ids f] \
 //!         [--apply --confirm-hide N --manifest-out hide-1.jsonl [--reason TEXT]]
@@ -58,11 +59,19 @@
 //!         --manifest-out reown-wf-1.jsonl [--apply --confirm-count N --ruling TEXT \
 //!         --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest reown-wf-1.jsonl [--apply]
+//!     epigraph-operator set-workflow-submitter (--ids-file F | --canonical-names-file F | \
+//!         --without-submitter) --submitter <agent> --operator <uuid> [--force-reassign] \
+//!         [--apply --confirm-count N --manifest-out wf-sub-1.jsonl --ruling TEXT --reason TEXT]
+//!     epigraph-operator set-workflow-submitter --reverse wf-sub-1.jsonl --operator <uuid> \
+//!         [--apply --reason TEXT]
 //!     epigraph-operator backfill-ingest-markers [--attestation-signer <uuid>]... \
 //!         [--ingest-signer <uuid>]... [--written-before RFC3339] [--no-creation-records] \
 //!         [--batch-size N] [--max-batches N] [--apply --written-before RFC3339 --confirm-count N \
 //!          --manifest-out backfill-1.jsonl --ruling TEXT --reason TEXT]
 //!     epigraph-operator reverse-ingest-markers --manifest backfill-1.jsonl [--apply]
+//!     epigraph-operator backfill-evidence-edges [--batch-size N] [--max-batches N] \
+//!         [--apply --confirm-count N --manifest-out ev-edges-1.jsonl --reason TEXT]
+//!     epigraph-operator reverse-evidence-edges --manifest ev-edges-1.jsonl [--apply]
 //!     epigraph-operator register-system-agent --role legacy-ingest --create-agent \
 //!         --reason TEXT [--apply]
 //!     epigraph-operator register-human-operator --agent <uuid> --client <uuid> --reason TEXT [--apply]
@@ -117,6 +126,8 @@
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
 //!     epigraph-operator sweep-dcr-clients [--older-than-hours 24] [--reason TEXT] [--apply]
 //!     epigraph-operator list-dcr-clients [--older-than-hours 24]
+//!     epigraph-operator approve-client (--client <uuid> | --client-id <string>) \
+//!         --scope S [--scope S ...] [--approved-by <uuid>] --reason TEXT [--apply]
 //!     epigraph-operator suspend-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
@@ -124,10 +135,10 @@
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
-    self, admin_scopes, arm, backfill_markers, bind, binding_client, client_scope, client_status,
-    confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation, group_role, hide,
-    human, legacy, link, passkey, regroup, reown, reown_linked, reown_workflows, restrict,
-    retire_link, reverse, system_agent, team_group,
+    self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
+    client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
+    evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
+    reown_workflows, restrict, retire_link, reverse, system_agent, team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -147,8 +158,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Grant a platform role (migration 123) to a REGISTERED HUMAN for an
-    /// explicit window. Agents never hold a role (CUS01); once a custodian
-    /// exists every grant names a live custodian as --granted-by (CUS03).
+    /// explicit window. Agents never hold a role (CUS01).
+    ///
+    /// Which variant applies is decided by the database's state, so measure
+    /// first (`list-role-assignments --role role:platform-custodian`, and
+    /// `list-passkeys --person <grantor>`):
+    ///
+    /// * no live custodian: the BOOTSTRAP grant, with no --granted-by
+    ///   (giving one fails CUS03, the grantor holds no live custodian
+    ///   assignment);
+    /// * a live custodian exists: --granted-by <a live custodian> is required
+    ///   (CUS03 without it);
+    /// * the grantor holds a live passkey (migration 130): also --act <a
+    ///   CONFIRMED role.grant act with exactly these flags> (ELV10 without
+    ///   it).
     GrantRole {
         /// A catalog role: `role:platform-custodian`, `role:auditor`, or one
         /// `define-group-role` added (migration 165).
@@ -579,6 +602,36 @@ enum Command {
         #[arg(long)]
         revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Approve ONE PENDING OAuth client (migration 188 made approval a
+    /// maintenance act): `epigraph_oauth_client_approve` sets it `active` with
+    /// exactly the `--scope`s given, and this verb writes its own audit row
+    /// beside the definer's, in one transaction. Refused for a client that is
+    /// not `pending`, for `platform:admin`, and for an admin-only scope while
+    /// migration 128 is armed.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["client", "client_id"])))]
+    ApproveClient {
+        /// The client's `oauth_clients.id` row uuid.
+        #[arg(long)]
+        client: Option<Uuid>,
+        /// The client's `client_id` string (what `/oauth/register` returns),
+        /// mapped to its row.
+        #[arg(long)]
+        client_id: Option<String>,
+        /// A scope to grant (repeatable; at least one). Exactly these become
+        /// the client's `granted_scopes`.
+        #[arg(long = "scope", required = true)]
+        scopes: Vec<String>,
+        /// The approving client's `oauth_clients.id`, recorded by the definer
+        /// as the client's `created_by` (the prior value is in the audit row).
+        #[arg(long)]
+        approved_by: Option<Uuid>,
+        /// Recorded in the audit row. Required, not blank.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, the approval and its audit rows roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -1099,6 +1152,56 @@ enum Command {
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
     },
+    /// Write the stored `evidence -> claim` edge every evidence row lacks
+    /// (backlog 2d60f619), through the same writer every evidence insert
+    /// calls: `supports`, or `refutes` where the row's BBAs argue against its
+    /// claim. Rows with any edge to their claim (any relationship, any state)
+    /// and SEALED rows are left alone and counted. Dry run (default) is
+    /// read-only. Reversed by `reverse-evidence-edges --manifest`.
+    BackfillEvidenceEdges {
+        /// Perform the writes. Without it, the census only (read-only).
+        #[arg(long)]
+        apply: bool,
+        /// Under `--apply`, the dry run's `to_write`, repeated back.
+        #[arg(long)]
+        confirm_count: Option<u64>,
+        /// Where to write the undo manifest (must not exist). Required under
+        /// `--apply`; fsynced before each batch's commit.
+        #[arg(long)]
+        manifest_out: Option<PathBuf>,
+        /// Why (manifest and audit row). Required under `--apply`.
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Evidence rows per transaction.
+        #[arg(long, default_value_t = 1000)]
+        batch_size: usize,
+        /// Stop after this many batches; a re-run (new manifest) continues.
+        #[arg(long)]
+        max_batches: Option<usize>,
+        /// `lock_timeout` for each batch (a PostgreSQL interval).
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+        /// `statement_timeout` for the read-only census.
+        #[arg(long, default_value = "10min")]
+        statement_timeout: String,
+    },
+    /// Reverse a `backfill-evidence-edges` run from its manifest: delete
+    /// exactly the edges it wrote, each only while it still runs from the
+    /// recorded evidence to the recorded claim with the recorded
+    /// relationship and nobody has built on it since (an edge retracted, or
+    /// keying an edge-keyed BBA, is kept and counted). An applied reversal
+    /// holds the backfill's advisory lock. Dry run rolls back.
+    ReverseEvidenceEdges {
+        /// The run's manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// Commit. Without it, every batch is rolled back.
+        #[arg(long)]
+        apply: bool,
+        /// `lock_timeout` for each batch.
+        #[arg(long, default_value = "5s")]
+        lock_timeout: String,
+    },
     /// Remove an explicit list of `frames` rows (test or probe frames), with
     /// the rows that cascade from them, refusing any frame a real claim or
     /// another row still depends on. Audited. Exit 3: at least one listed
@@ -1162,6 +1265,55 @@ enum Command {
     /// arrays, with a `security_events` row. A live access token keeps the
     /// scope until it expires; the next refresh drops it.
     RevokeClientScope(ScopeArgs),
+    /// Set or correct the recorded SUBMITTER (`metadata.epigraph_submitted_by`)
+    /// of selected `workflows` rows, audited; or reverse such a run
+    /// (`--reverse <manifest>`). Select with exactly one of --ids-file,
+    /// --canonical-names-file, --without-submitter. A row recording another
+    /// submitter is HELD unless --force-reassign. A dry run unless --apply,
+    /// which needs --confirm-count (the dry run's ELIGIBLE-WORKFLOW-ROWS),
+    /// --ruling, --reason and --manifest-out; one transaction and one
+    /// security_events row per run. Exits 3 when an --apply (or an applied
+    /// reversal) left a selected row unwritten.
+    #[command(group(
+        clap::ArgGroup::new("selector")
+            .required(true)
+            .args(["ids_file", "canonical_names_file", "without_submitter", "reverse"])
+    ))]
+    SetWorkflowSubmitter {
+        /// Workflow ids, one per line.
+        #[arg(long)]
+        ids_file: Option<PathBuf>,
+        /// Canonical names, one per line: every generation of each lineage.
+        #[arg(long)]
+        canonical_names_file: Option<PathBuf>,
+        /// Every workflow that records no submitter.
+        #[arg(long)]
+        without_submitter: bool,
+        /// Reverse a manifest an applied run wrote (compare-and-swap per row).
+        #[arg(long)]
+        reverse: Option<PathBuf>,
+        /// The agent to record as submitter.
+        #[arg(long, required_unless_present = "reverse", conflicts_with = "reverse")]
+        submitter: Option<Uuid>,
+        /// The registered human operator this act (or this reversal) is
+        /// made under, checked live and named in the audit row.
+        #[arg(long)]
+        operator: Uuid,
+        /// Replace a submitter another agent is recorded as.
+        #[arg(long, conflicts_with = "reverse")]
+        force_reassign: bool,
+        /// Where the undo record is written (create_new) under --apply.
+        #[arg(long, conflicts_with = "reverse")]
+        manifest_out: Option<PathBuf>,
+        #[arg(long, conflicts_with = "reverse")]
+        confirm_count: Option<usize>,
+        #[arg(long, default_value = "", conflicts_with = "reverse")]
+        ruling: String,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Restore every row a manifest's run moved to the owner it recorded.
     ReownReverse {
         /// A manifest to reverse. Repeatable: several are applied newest-first
@@ -1174,6 +1326,15 @@ enum Command {
         batch_size: usize,
         #[arg(long, default_value = "5s")]
         lock_timeout: String,
+        /// Tolerate ONE torn final line per manifest (no trailing newline,
+        /// not JSON): what a run that crashed mid-append leaves. It is
+        /// dropped and printed as a WARN line; every other malformed line is
+        /// still refused. Prove first, from the database, that the batch the
+        /// torn record belongs to rolled back, and dry-run on a copy. Pass
+        /// the crashed manifest together with every manifest a resumed run
+        /// wrote, so they are reversed newest first.
+        #[arg(long)]
+        allow_truncated_tail: bool,
     },
 }
 
@@ -1287,6 +1448,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     // Refuse a non-admin-only scope before any connection is made.
     if let Command::GrantClientScope(a) | Command::RevokeClientScope(a) = &cli.command {
         client_scope::validate_scope(&a.scope)?;
+    }
+    // approve-client: platform:admin, a blank or repeated scope, or a blank
+    // reason, before any connection is made.
+    if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
+        approve_client::validate(scopes, reason)?;
     }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
@@ -1443,6 +1609,33 @@ async fn main_inner() -> anyhow::Result<i32> {
             creation_records: !*no_creation_records,
         };
         backfill_markers::validate(&o)?;
+        Some(o)
+    } else {
+        None
+    };
+    // backfill-evidence-edges' options, likewise refused before any connection.
+    let evidence_edges_opts = if let Command::BackfillEvidenceEdges {
+        apply,
+        confirm_count,
+        manifest_out,
+        reason,
+        batch_size,
+        max_batches,
+        lock_timeout,
+        statement_timeout,
+    } = &cli.command
+    {
+        let o = evidence_edges::Options {
+            apply: *apply,
+            confirm_count: *confirm_count,
+            manifest_out: manifest_out.clone(),
+            reason: reason.clone(),
+            batch_size: *batch_size,
+            max_batches: *max_batches,
+            lock_timeout: lock_timeout.clone(),
+            statement_timeout: statement_timeout.clone(),
+        };
+        evidence_edges::validate(&o)?;
         Some(o)
     } else {
         None
@@ -2250,6 +2443,35 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(outcome.exit_code())
         }
+        Command::ApproveClient {
+            client,
+            client_id,
+            scopes,
+            approved_by,
+            reason,
+            apply,
+        } => {
+            let which = match (client, client_id) {
+                (Some(id), None) => approve_client::ClientRef::Row(id),
+                (None, Some(s)) => approve_client::ClientRef::ClientId(s),
+                _ => unreachable!("clap requires exactly one of --client / --client-id"),
+            };
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            let outcome = approve_client::run(
+                &mut conn,
+                &which,
+                &scopes,
+                approved_by,
+                &reason,
+                apply,
+                &who,
+            )
+            .await?;
+            for line in approve_client::describe(&outcome) {
+                println!("{line}");
+            }
+            Ok(0)
+        }
         cmd @ (Command::SuspendClient(_) | Command::RevokeClient(_)) => {
             let (act, a) = match cmd {
                 Command::SuspendClient(a) => (client_status::StatusAct::Suspend, a),
@@ -2526,6 +2748,28 @@ async fn main_inner() -> anyhow::Result<i32> {
                 .await?;
             Ok(0)
         }
+        Command::BackfillEvidenceEdges { .. } => {
+            let opts = evidence_edges_opts.expect("built above");
+            let report =
+                evidence_edges::run(&mut conn, &opts, &db.session_user, &mut stdout).await?;
+            Ok(if report.batch_failure.is_none() { 0 } else { 2 })
+        }
+        Command::ReverseEvidenceEdges {
+            manifest,
+            apply,
+            lock_timeout,
+        } => {
+            evidence_edges::reverse(
+                &mut conn,
+                &manifest,
+                apply,
+                &lock_timeout,
+                &db.session_user,
+                &mut stdout,
+            )
+            .await?;
+            Ok(0)
+        }
         Command::RestrictClaims { claims_file, .. } => {
             let opts = restrict_opts.expect("built above");
             let ids = operator::read_ids_file(&claims_file)?;
@@ -2660,17 +2904,69 @@ async fn main_inner() -> anyhow::Result<i32> {
             println!("{}", client_scope::describe(&outcome));
             Ok(0)
         }
+        Command::SetWorkflowSubmitter {
+            ids_file,
+            canonical_names_file,
+            without_submitter,
+            reverse: reverse_manifest,
+            submitter,
+            operator: op,
+            force_reassign,
+            manifest_out,
+            confirm_count,
+            ruling,
+            reason,
+            apply,
+        } => {
+            let who = client_scope::Operator::of_this_process(db.session_user.clone());
+            if let Some(path) = reverse_manifest {
+                let r = workflow_submitter::reverse(
+                    &mut conn,
+                    &path,
+                    op,
+                    apply,
+                    &reason,
+                    &who,
+                    &mut stdout,
+                )
+                .await?;
+                return Ok(if apply && r.held > 0 { 3 } else { 0 });
+            }
+            let selection = if let Some(f) = ids_file {
+                workflow_submitter::Selection::Ids(workflow_submitter::read_ids_file(&f)?)
+            } else if let Some(f) = canonical_names_file {
+                workflow_submitter::Selection::CanonicalNames(reown_workflows::read_names_file(&f)?)
+            } else {
+                debug_assert!(without_submitter);
+                workflow_submitter::Selection::WithoutSubmitter
+            };
+            let opts = workflow_submitter::Options {
+                selection,
+                submitter: submitter.expect("clap requires --submitter"),
+                operator: op,
+                force_reassign,
+                apply,
+                confirm_count,
+                ruling,
+                reason,
+                manifest_out,
+            };
+            let report = workflow_submitter::run(&mut conn, &opts, &who, &mut stdout).await?;
+            Ok(workflow_submitter::exit_code(&report, &opts))
+        }
         Command::ReownReverse {
             manifest,
             apply,
             batch_size,
             lock_timeout,
+            allow_truncated_tail,
         } => {
             let opts = reverse::Options {
                 manifests: manifest,
                 apply,
                 batch_size,
                 lock_timeout,
+                allow_truncated_tail,
             };
             let report = reverse::run(&mut conn, &opts, &mut stdout).await?;
             Ok(if !report.batch_failures.is_empty() {

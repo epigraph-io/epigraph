@@ -80,6 +80,9 @@ async fn query_claims_hides_only_the_private_claim_per_id(pool: PgPool) {
             // so the test states which population it asserts over.
             is_current: Some(true),
             exclude_spine: None,
+            created_after: None,
+            created_before: None,
+            offset: None,
         },
     )
     .await

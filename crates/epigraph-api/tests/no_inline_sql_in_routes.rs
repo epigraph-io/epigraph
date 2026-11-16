@@ -95,28 +95,24 @@ use std::path::{Path, PathBuf};
 /// `(path relative to crates/epigraph-api/src/routes, count)`, sorted by path.
 const REGISTER: &[(&str, usize)] = &[
     ("assess.rs", 2),
-    ("belief.rs", 9),
+    ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
     ("computation.rs", 9),
-    ("conflicts.rs", 1),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
     ("edges.rs", 6),
-    ("embeddings.rs", 2),
     ("experiment_loop.rs", 2),
-    ("graph.rs", 11),
+    ("graph.rs", 8),
     ("graph_neighborhood.rs", 1),
     ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
     ("papers.rs", 8),
     ("policies.rs", 4),
-    ("political.rs", 1),
     ("revoke_signature.rs", 6),
-    ("search.rs", 4),
+    ("search.rs", 3),
     ("submit.rs", 5),
-    ("workflows.rs", 4),
 ];
 
 /// Total of [`REGISTER`]. Never raise this.
@@ -132,7 +128,16 @@ const REGISTER: &[(&str, usize)] = &[
 /// into `MassFunctionRepository::frame_conflict_summary` (`belief.rs` 10 -> 9)
 /// and the compound neighbourhood's graph reads into `GraphViewRepository`
 /// (`graph_neighborhood.rs` 7 -> 1).
-const HIGH_WATER: usize = 105;
+/// Lowered to 103 on staging batch 3a (#922), where the B08 / B22 stack met
+/// the rest of that batch: `belief.rs` measures 7 on the combined tree.
+/// Lowered to 101 on staging batch 4 when the hierarchical outcome report's
+/// counter write (its `SELECT metadata .. FOR UPDATE` and
+/// `UPDATE workflows SET metadata`) moved into `WorkflowRepository`, shared
+/// with the MCP tool (`workflows.rs` 4 -> 2, backlog batch B31).
+/// Lowered to 94 on staging batch 4 by backlog batch B37 (#895): its route
+/// reads moved into the repo layer (`search.rs` 4 -> 3; `conflicts.rs`,
+/// `embeddings.rs`, `political.rs` and `workflows.rs` reached zero).
+const HIGH_WATER: usize = 91;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

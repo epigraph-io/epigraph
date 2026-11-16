@@ -781,10 +781,26 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 205 -> 204: `routes/perspective.rs::set_source_reliability` writes on
 /// `AppState::write_as` (backlog 0f2f9ddb); the file keeps one site, so the
 /// file count does not move.
-/// 204 -> 202 (backlog 9bef22f3): `PUT /api/v1/claims/:id/embedding` and
-/// `PUT /api/v1/evidence/:id/embedding` were deleted with their handlers;
-/// `routes/rag.rs` 2 -> 0, key DELETED (`HIGH_WATER_FILES` 37 -> 36).
-const HIGH_WATER: usize = 202;
+/// 204 -> 200 on merging backlog f64cf9c6 and 8a168dd6: `create_reasoning_trace`
+/// moved its three pool sites onto the caller's `AppState::write_as`
+/// transaction (`routes/crud.rs`, keeping sites), and `query_security_events`
+/// reads on the caller's `AppState::read_as` (`routes/audit.rs` reached zero
+/// and its key was DELETED; `HIGH_WATER_FILES` falls by one with it).
+/// 200 -> 198 (backlog 9bef22f3, merged on staging after the line above):
+/// `PUT /api/v1/claims/:id/embedding` and `PUT /api/v1/evidence/:id/embedding`
+/// were deleted with their handlers; `routes/rag.rs` 2 -> 0, key DELETED.
+/// Each side lowered from 204 on its own branch; the merge keeps both drops.
+/// 198 -> 197 (backlog dae795f8, merged on staging after the lines above):
+/// `promote_staged_edges`'s two one-statement arms became one transaction on
+/// the same raw pool, `routes/crud.rs` one site fewer. A merge of two sites,
+/// not a conversion.
+/// 197 -> 192 on staging batch 4 (backlog batch B37, #895): `routes/conflicts.rs`
+/// 10 -> 8, `routes/political.rs` 5 -> 4, and `routes/embeddings.rs` 2 -> 0
+/// (key DELETED), each read now on the caller's stamped connection.
+/// 192 -> 191 (backlog 01e0b839, #885, merged on staging batch 4):
+/// `themes_expand` holds a `Viewer` and runs every read on the caller's
+/// stamped read (`routes/graph.rs` 2 -> 1). No file reached zero.
+const HIGH_WATER: usize = 191;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -853,8 +869,11 @@ const HIGH_WATER: usize = 202;
 /// 39 -> 38 when `routes/provenance.rs` reached zero (`set_provenance` on the
 /// caller's stamped transaction; merged with the line above on staging).
 /// 38 -> 37 when `routes/isomorphism.rs` was deleted (see [`HIGH_WATER`]).
-/// 37 -> 36 when `routes/rag.rs` reached zero (backlog 9bef22f3).
-const HIGH_WATER_FILES: usize = 36;
+/// 37 -> 36 when `routes/audit.rs` reached zero (backlog 8a168dd6).
+/// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
+/// staging after the line above).
+/// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
+const HIGH_WATER_FILES: usize = 34;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -866,7 +885,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/agent_keys.rs", 6),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
-    ("routes/audit.rs", 1),
+    // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
+    // `query_security_events` reads on `AppState::read_as` with the caller's
+    // viewer.
     // 17 before this PR. Shard 4 converted the FOURTEEN read-only handlers onto
     // `AppState::read_as`. The row SURVIVES at 3 rather than being deleted, and
     // the remainder is a class rather than a leftover: `create_frame`,
@@ -938,7 +959,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/computation.rs", 5),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
-    ("routes/conflicts.rs", 10),
+    ("routes/conflicts.rs", 8),
     // 5 before conversion shard 5, which moved `list_contexts`, `get_context`,
     // `list_active_contexts` and `frame_contexts` onto `AppState::read_as`. The
     // one that remains is `create_context`, which WRITES through its alias:
@@ -992,7 +1013,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 31 -> 30: `build_themes_from_corpus` (the k-means bootstrap, a corpus-wide
     // write on `state.db_pool`) was deleted with the prototype, backlog
     // a0ed0180. A removal, not a conversion.
-    ("routes/crud.rs", 30),
+    // 30 -> 27 (backlog f64cf9c6): `create_reasoning_trace` writes its author
+    // key read, the trace and its `HAS_TRACE` edge on one `AppState::write_as`
+    // transaction. Its provenance append stays on the pool, as every
+    // `record_provenance` call does.
+    // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
+    // `&state.db_pool` each) became one transaction begun on it. Still the raw
+    // pool, so not a conversion.
+    ("routes/crud.rs", 26),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,
@@ -1004,7 +1032,6 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // DELETED the factor INSERT (it fed only BP; SPEC §4.1 W10): removed, not
     // converted.
     ("routes/edges.rs", 4),
-    ("routes/embeddings.rs", 2),
     // `routes/entities.rs` was 8 and is GONE, not zeroed. Conversion shard 7
     // took 5 (`entity_neighborhood` 2, category A; `query_triples` 3, filed C by
     // PR #460 on the handler's verb but measured as a read). Backlog 850dcc61
@@ -1037,10 +1064,14 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // spot enumerated in the Known limits above. 3 -> 2 (backlog 57917c13):
     // `themes_overview` now holds a `Viewer` and reads through
     // `AppState::read_as` and the viewer-spliced
-    // `ClaimThemeRepository::overview_page`. The two that remain (`overview`,
-    // `themes_expand`) are routed GETs that hold NO `Viewer`; their owner is
+    // `ClaimThemeRepository::overview_page`. 2 -> 1 (backlog 01e0b839):
+    // `themes_expand` now holds a `Viewer` and reads through
+    // `AppState::read_as` and the viewer-spliced
+    // `GraphViewRepository::{theme_visible_summary, theme_neighborhoods,
+    // theme_neighborhood_edges}`. The one that remains (`overview`) is a
+    // routed GET that holds NO `Viewer`; its owner is
     // `D-PR16-theme-cluster-viewer-scope`.
-    ("routes/graph.rs", 2),
+    ("routes/graph.rs", 1),
     // `routes/graph_neighborhood.rs` was 2 and is GONE, not zeroed: conversion
     // shard 5 moved `expand` and `claim_compound_neighborhood` onto
     // `AppState::read_as`. It is one of TWO rows that shard deleted; see
@@ -1113,7 +1144,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // `("political.rs", 1)`, so it must not be relocated to lower that
     // register), `list_techniques`, `list_coalitions`, and the two `create_*`
     // handlers, which write. This file's module doc carries the reasoning.
-    ("routes/political.rs", 5),
+    ("routes/political.rs", 4),
     // `routes/rag.rs` was 2 and is GONE, not zeroed: backlog 9bef22f3 deleted
     // its two writers, `generate_claim_embedding` and
     // `generate_evidence_embedding` (the `PUT …/embedding` routes).

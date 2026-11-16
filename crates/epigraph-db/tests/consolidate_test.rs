@@ -605,3 +605,269 @@ async fn invalid_source_sets_are_rejected(pool: PgPool) {
         "nonexistent source"
     );
 }
+
+/// An abstraction generalises its sources; it retires none of them (backlog
+/// 22602dd8). The new claim links to each source by a `generalizes` edge, and
+/// every source stays current, with no forwarding pointer, and keeps its own
+/// edges: nothing is migrated onto the abstraction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_mode_retires_nothing_and_writes_generalizes_edges(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let actor = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "abstract source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "abstract source two", &[]).await;
+    let supporter = seed_claim(&pool, author, "supports source one", &[]).await;
+    seed_edge(&pool, supporter, s1, "supports").await;
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "the general pattern behind both sources",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        actor,
+    )
+    .await
+    .expect("abstract consolidation");
+    assert!(!res.already_existed);
+    assert!(
+        res.superseded.is_empty(),
+        "an abstraction retires nothing: {:?}",
+        res.superseded
+    );
+
+    for s in [s1, s2] {
+        let (is_current, supersedes): (bool, Option<Uuid>) =
+            sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+                .bind(s)
+                .fetch_one(&pool)
+                .await
+                .expect("read source");
+        assert!(is_current, "source {s} stays current under an abstraction");
+        assert_eq!(supersedes, None, "source {s} gets no forwarding pointer");
+        assert_eq!(
+            count_edges(&pool, res.merged_id, s, "generalizes").await,
+            1,
+            "abstraction -generalizes-> {s}"
+        );
+        assert_eq!(
+            count_edges(&pool, res.merged_id, s, "supersedes").await,
+            0,
+            "an abstraction is not a lineage successor of {s}"
+        );
+    }
+    let a_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(res.merged_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read abstraction");
+    assert!(a_current, "the abstraction is current");
+    assert_eq!(
+        count_edges(&pool, supporter, s1, "supports").await,
+        1,
+        "the source keeps its own edge"
+    );
+    assert_eq!(
+        count_edges(&pool, supporter, res.merged_id, "supports").await,
+        0,
+        "nothing is migrated onto the abstraction"
+    );
+}
+
+/// An abstraction takes its default confidence from its sources, so its
+/// `generalizes` edges must not feed that belief back into them. The act marks
+/// each edge `"moves_belief": false`, and both sheaf reads skip a marked edge
+/// while still reading an ordinary edge between the same claims (backlog
+/// 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_edges_are_marked_and_skipped_by_the_sheaf_reads(pool: PgPool) {
+    use epigraph_db::repos::sheaf::SheafRepository;
+    use epigraph_db::visibility::Viewer;
+
+    let author = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "sheaf abstract source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "sheaf abstract source two", &[]).await;
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "the pattern both sheaf sources share",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        author,
+    )
+    .await
+    .expect("abstract consolidation");
+    let a = res.merged_id;
+
+    let marks: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT properties->>'moves_belief' FROM edges
+          WHERE source_id = $1 AND relationship = 'generalizes' ORDER BY target_id",
+    )
+    .bind(a)
+    .fetch_all(&pool)
+    .await
+    .expect("read abstraction edges");
+    assert_eq!(
+        marks,
+        vec![Some("false".to_string()), Some("false".to_string())],
+        "every abstraction edge is marked as moving no belief"
+    );
+
+    // Control: an ordinary, unmarked generalizes edge from the abstraction to
+    // s1, which the sheaf reads must still see.
+    seed_edge(&pool, a, s1, "GENERALIZES").await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.6, plausibility = 0.9, pignistic_prob = 0.75
+          WHERE id = ANY($1)",
+    )
+    .bind(vec![a, s1, s2])
+    .execute(&pool)
+    .await
+    .expect("give the claims a belief interval");
+
+    let viewer = Viewer::resolve(&pool, Uuid::nil()).await.expect("viewer");
+    let pairs = SheafRepository::get_epistemic_edge_pairs(&pool, &viewer, None)
+        .await
+        .expect("edge pairs");
+    let mut from_a: Vec<(Uuid, String)> = pairs
+        .iter()
+        .filter(|p| p.source_id == a)
+        .map(|p| (p.target_id, p.relationship.clone()))
+        .collect();
+    from_a.sort();
+    assert_eq!(
+        from_a,
+        vec![(s1, "GENERALIZES".to_string())],
+        "the edge-pair read sees only the unmarked control edge"
+    );
+
+    let neighbours = SheafRepository::get_claim_neighbor_betp_pairs(&pool, &viewer, None)
+        .await
+        .expect("neighbour pairs");
+    let mut of_a: Vec<Uuid> = neighbours
+        .iter()
+        .filter(|r| r.claim_id == a)
+        .map(|r| r.neighbor_id)
+        .collect();
+    of_a.sort();
+    assert_eq!(
+        of_a,
+        vec![s1],
+        "the neighbour read sees the abstraction only through the control edge"
+    );
+}
+
+/// An abstraction may generalise a revision successor: it re-points no
+/// `supersedes`, so a source that already carries one is no obstacle. A merge
+/// over the same sources is still refused (backlog 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn abstract_mode_may_generalise_a_revision_successor(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let older = seed_claim(&pool, author, "revision older text", &[]).await;
+    let newer = seed_claim(&pool, author, "revision newer text", &[]).await;
+    let other = seed_claim(&pool, author, "an unrelated second source", &[]).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(older)
+        .execute(&pool)
+        .await
+        .expect("retire the older revision");
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(older)
+        .bind(newer)
+        .execute(&pool)
+        .await
+        .expect("make newer its successor");
+
+    let merge = ClaimRepository::consolidate(
+        &pool,
+        &[newer, other],
+        "merge over a revision successor",
+        0.6,
+        ConsolidateMode::Merge,
+        "merge",
+        author,
+    )
+    .await;
+    let merge_err = format!(
+        "{:?}",
+        merge.expect_err("a merge over a successor is refused")
+    );
+    assert!(
+        merge_err.contains("already superseded"),
+        "control: a merge still refuses a source that already has a supersedes pointer: {merge_err}"
+    );
+
+    let res = ClaimRepository::consolidate(
+        &pool,
+        &[newer, other],
+        "a generalisation over a revision successor",
+        0.6,
+        ConsolidateMode::Abstract,
+        "generalisation",
+        author,
+    )
+    .await
+    .expect("an abstraction may generalise a revision successor");
+    let (is_current, supersedes): (bool, Option<Uuid>) =
+        sqlx::query_as("SELECT is_current, supersedes FROM claims WHERE id = $1")
+            .bind(newer)
+            .fetch_one(&pool)
+            .await
+            .expect("read successor");
+    assert!(is_current, "the successor stays current");
+    assert_eq!(supersedes, Some(older), "its own pointer is untouched");
+    assert_eq!(
+        count_edges(&pool, res.merged_id, newer, "generalizes").await,
+        1
+    );
+}
+
+/// `identity` writes no new claim: it is the dedup act, run per source by the
+/// tool layer. The merge act refuses it as an input error, before it writes
+/// anything (backlog 22602dd8).
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_is_refused_by_the_merge_act_and_writes_nothing(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let s1 = seed_claim(&pool, author, "identity source one", &[]).await;
+    let s2 = seed_claim(&pool, author, "identity source two", &[]).await;
+
+    let err = ClaimRepository::consolidate(
+        &pool,
+        &[s1, s2],
+        "identity would-be merged text",
+        0.6,
+        ConsolidateMode::Identity,
+        "restatements",
+        author,
+    )
+    .await
+    .expect_err("identity is not the merge act's mode");
+    assert!(
+        matches!(
+            err,
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Input,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(format!("{err:?}").contains("mark_duplicate"), "{err:?}");
+
+    let written: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE content = 'identity would-be merged text'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(written, 0, "no new claim");
+    let current: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1) AND is_current")
+            .bind(&[s1, s2][..])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(current, 2, "no source retired");
+}

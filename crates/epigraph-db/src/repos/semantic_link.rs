@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use epigraph_core::{
     AgentId, ClaimId, LinkStrength, SemanticLink, SemanticLinkId, SemanticLinkType,
 };
-use sqlx::{FromRow, PgPool, Row};
+use sqlx::{FromRow, Row};
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -113,54 +113,6 @@ fn semantic_link_from_row(row: EdgeRow) -> Result<SemanticLink, DbError> {
 }
 
 impl SemanticLinkRepository {
-    /// Create a new semantic link in the database
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool, link))]
-    pub async fn create(pool: &PgPool, link: &SemanticLink) -> Result<SemanticLink, DbError> {
-        let source_id: Uuid = link.source_claim_id.into();
-        let target_id: Uuid = link.target_claim_id.into();
-        let relationship = link_type_to_str(link.link_type);
-        let created_by: Uuid = link.created_by.into();
-
-        // Store strength, created_by, and created_at in properties JSONB
-        let properties = serde_json::json!({
-            "strength": link.strength.value(),
-            "created_by": created_by.to_string(),
-            "created_at": link.created_at.to_rfc3339()
-        });
-
-        // Use the existing cached INSERT query pattern
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-            "#,
-            source_id,
-            "claim",
-            target_id,
-            "claim",
-            relationship,
-            properties
-        )
-        .fetch_one(pool)
-        .await?;
-
-        // Return the link with the DB-generated ID
-        SemanticLink::with_id(
-            SemanticLinkId::from_uuid(row.id),
-            link.source_claim_id,
-            link.target_claim_id,
-            link.link_type,
-            link.strength,
-            link.created_at,
-            link.created_by,
-        )
-        .map_err(|e| DbError::CoreError { source: e })
-    }
-
     /// Get a semantic link by ID
     ///
     /// # Errors

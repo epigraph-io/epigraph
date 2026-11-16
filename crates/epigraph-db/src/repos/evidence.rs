@@ -1,6 +1,9 @@
 //! Evidence repository for database operations
 
 use crate::errors::DbError;
+use crate::repos::edge_signature::EdgeSigningKey;
+use crate::repos::EdgeRepository;
+use epigraph_core::edge::relationships;
 use epigraph_core::{AgentId, ClaimId, Evidence, EvidenceId, EvidenceType};
 use sqlx::PgPool;
 use tracing::instrument;
@@ -8,6 +11,95 @@ use uuid::Uuid;
 
 /// Repository for Evidence operations
 pub struct EvidenceRepository;
+
+/// Which way an evidence row bears on the claim it applies to: the
+/// relationship of its stored `evidence -> claim` edge (backlog 2d60f619).
+///
+/// The `evidence` row records no direction of its own (`EvidenceType` has no
+/// polarity), so the writer passes the one it holds: a tool's `supports` or
+/// `success` input, a deprecation (always against). A writer that holds none
+/// passes [`Self::Supports`]. The backfill derives it from the evidence's BBA.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceDirection {
+    /// The evidence argues for the claim: `supports`.
+    Supports,
+    /// The evidence argues against the claim: `refutes`.
+    Refutes,
+}
+
+impl EvidenceDirection {
+    /// `Supports` when `supports` is true, else `Refutes`.
+    #[must_use]
+    pub const fn from_supports(supports: bool) -> Self {
+        if supports {
+            Self::Supports
+        } else {
+            Self::Refutes
+        }
+    }
+
+    /// The stored relationship, in its canonical (lower-case) spelling
+    /// (`relationships::canonical_relationship`).
+    #[must_use]
+    pub const fn relationship(self) -> &'static str {
+        match self {
+            Self::Supports => relationships::SUPPORTS,
+            Self::Refutes => relationships::REFUTES,
+        }
+    }
+}
+
+/// What every evidence write needs to write the evidence's edge to its claim:
+/// the writer's edge signing key (`None` writes it unsigned, as every edge
+/// writer without a key does) and the direction.
+#[derive(Debug, Clone, Copy)]
+pub struct EvidenceEdge<'k> {
+    /// The writer's key; the edge is attested at INSERT when it is `Some`.
+    pub key: Option<EdgeSigningKey<'k>>,
+    /// The relationship the edge is stored with.
+    pub direction: EvidenceDirection,
+}
+
+impl<'k> EvidenceEdge<'k> {
+    /// A `supports` edge, signed by `key`.
+    #[must_use]
+    pub const fn supports(key: Option<EdgeSigningKey<'k>>) -> Self {
+        Self {
+            key,
+            direction: EvidenceDirection::Supports,
+        }
+    }
+
+    /// A `refutes` edge, signed by `key`.
+    #[must_use]
+    pub const fn refutes(key: Option<EdgeSigningKey<'k>>) -> Self {
+        Self {
+            key,
+            direction: EvidenceDirection::Refutes,
+        }
+    }
+
+    /// `supports` when `supports` is true, else `refutes`.
+    #[must_use]
+    pub const fn new(key: Option<EdgeSigningKey<'k>>, supports: bool) -> Self {
+        Self {
+            key,
+            direction: EvidenceDirection::from_supports(supports),
+        }
+    }
+}
+
+/// What [`EvidenceRepository::link_to_claims_signed_conn`] did for one claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceClaimLink {
+    /// The claim.
+    pub claim_id: Uuid,
+    /// The edge between the evidence and the claim: the new one, or the one
+    /// already there.
+    pub edge_id: Uuid,
+    /// `true` when this call inserted the edge.
+    pub created: bool,
+}
 
 /// What names an evidence row's source, for the canonical item key
 /// ([`EvidenceRepository::source_identity_by_id`]).
@@ -17,6 +109,19 @@ pub struct EvidenceSourceIdentity {
     pub doi: Option<String>,
     /// `source_url`.
     pub source_url: Option<String>,
+}
+
+/// One `dataset` evidence row, as [`EvidenceRepository::datasets_by_claim_ids`]
+/// returns it (backlog c8beb101).
+///
+/// Serialises flat: `evidence_id` beside the variant's own fields and its
+/// `type: "dataset"` tag, which is the shape `get_claim` returns.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DatasetEvidence {
+    pub evidence_id: Uuid,
+    /// Always an [`EvidenceType::Dataset`].
+    #[serde(flatten)]
+    pub dataset: EvidenceType,
 }
 
 /// Result row for [`EvidenceRepository::provided_for_claim_as_of`].
@@ -96,9 +201,10 @@ pub struct EvidenceListFilter<'a> {
     ///
     /// That column — not the `properties` JSONB blob — is what
     /// [`EvidenceRepository::evidence_type_to_db_string`] writes, and its
-    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint in
-    /// migration 001: `document`, `observation`, `testimony`, `computation`,
-    /// `reference`, `figure`, `conversational`. Note that the Rust
+    /// vocabulary is pinned by the `evidence_type_valid` CHECK constraint
+    /// (`epigraph_core::STORED_EVIDENCE_TYPES`): migration 001's `document`,
+    /// `observation`, `testimony`, `computation`, `reference`, `figure`,
+    /// `conversational`, and migration 229's `dataset`. Note that the Rust
     /// `EvidenceType` variant names do **not** all match: `Literature` is
     /// stored as `reference` and `Consensus` as `computation`. Callers filter
     /// with the stored spelling.
@@ -198,28 +304,46 @@ impl EvidenceRepository {
     /// is an accident of a deployment, not a property of the schema, and it is
     /// what made the 42501 look like a `reasoning_traces`-only defect.
     ///
+    /// # The evidence's edge to its claim, in the same transaction
+    ///
+    /// Every evidence row is stored with its `evidence -> claim` edge
+    /// ([`Self::link_to_claims_signed_conn`], backlog 2d60f619), written after the
+    /// de-duplication passes and before the row commits, signed by
+    /// `edge.key` and with `edge.direction`'s relationship. A refused duplicate
+    /// writes neither.
+    ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` for a same-owner duplicate (nothing is
     /// written), `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(conn, evidence))]
+    #[instrument(skip(conn, evidence, edge))]
     pub async fn create<'c, A: sqlx::Acquire<'c, Database = sqlx::Postgres>>(
         conn: A,
         evidence: &Evidence,
+        edge: EvidenceEdge<'_>,
     ) -> Result<Evidence, DbError> {
-        Self::create_with_source_url(conn, evidence, Self::source_url_of(&evidence.evidence_type))
-            .await
+        Self::create_with_source_url(
+            conn,
+            evidence,
+            Self::source_url_of(&evidence.evidence_type),
+            edge,
+        )
+        .await
     }
 
     /// The URL an evidence type carries that belongs in `evidence.source_url`:
-    /// a `Document`'s `source_url`, and nothing else.
+    /// a `Document`'s `source_url` or a `Dataset`'s `root_uri`, and nothing
+    /// else.
     ///
     /// A `Testimony`'s `source` is free text (a person's name, or the MCP
     /// default `"unknown"`), and `Literature`/`Figure` carry a DOI rather than
-    /// a URL, so none of those is a column value.
+    /// a URL, so none of those is a column value. A dataset's root is where
+    /// its data lives, so it is also the source identity the combine step
+    /// keys a re-observation on.
     #[must_use]
     pub fn source_url_of(evidence_type: &EvidenceType) -> Option<&str> {
         match evidence_type {
             EvidenceType::Document { source_url, .. } => source_url.as_deref(),
+            EvidenceType::Dataset { root_uri, .. } => Some(root_uri.as_str()),
             _ => None,
         }
     }
@@ -236,11 +360,12 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// As [`Self::create`].
-    #[instrument(skip(conn, evidence))]
+    #[instrument(skip(conn, evidence, edge))]
     pub async fn create_with_source_url<'c, A: sqlx::Acquire<'c, Database = sqlx::Postgres>>(
         conn: A,
         evidence: &Evidence,
         source_url: Option<&str>,
+        edge: EvidenceEdge<'_>,
     ) -> Result<Evidence, DbError> {
         let id: Uuid = evidence.id.into();
         let agent_id: Uuid = evidence.agent_id.into();
@@ -286,6 +411,14 @@ impl EvidenceRepository {
             tx.rollback().await?;
             return Err(Self::duplicate());
         }
+        Self::link_to_claims_signed_conn(
+            &mut tx,
+            edge.key,
+            row.id,
+            &[row.claim_id],
+            edge.direction,
+        )
+        .await?;
         tx.commit().await?;
 
         // Parse content_hash
@@ -365,10 +498,19 @@ impl EvidenceRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if a statement fails.
-    #[instrument(skip(conn, viewer))]
+    ///
+    /// # Its edge
+    ///
+    /// A recorded row gets its `evidence -> claim` edge in the same savepoint
+    /// ([`Self::link_to_claims_signed_conn`]), `supports` and signed by `key`: the
+    /// row records no direction, and "the parent states it" is not an
+    /// argument against the claim. The edge moves no belief (no BBA, and
+    /// belief factors are claim/claim only).
+    #[instrument(skip(conn, viewer, key))]
     pub async fn record_derivation_conn(
         conn: &mut sqlx::PgConnection,
         viewer: &crate::visibility::Viewer,
+        key: Option<EdgeSigningKey<'_>>,
         claim_id: Uuid,
         parent_id: Uuid,
         method: &str,
@@ -443,8 +585,88 @@ impl EvidenceRepository {
             tx.rollback().await?;
             return Ok(DerivationEvidence::AlreadyPresent);
         }
+        Self::link_to_claims_signed_conn(
+            &mut tx,
+            key,
+            id,
+            &[claim_id],
+            EvidenceDirection::Supports,
+        )
+        .await?;
         tx.commit().await?;
         Ok(DerivationEvidence::Recorded(id))
+    }
+
+    /// Write the stored `evidence -> claim` edge from `evidence_id` to each of
+    /// `claim_ids`: THE one place an evidence row's edge to its claim is
+    /// written (backlog 2d60f619, operator ruling on the Atlas leaf view:
+    /// leaves draw stored evidence edges only, never a derived one).
+    ///
+    /// Every evidence insert calls this in its own transaction
+    /// (`evidence_insert_writes_claim_edge.rs` refuses a writer that does
+    /// not), and the operator backfill writes the missing edges of older rows
+    /// through it too.
+    ///
+    /// * **At least one claim.** An empty `claim_ids` is refused with
+    ///   `DbError::InvalidData` and writes nothing: evidence that applies to
+    ///   no claim is not filed.
+    /// * **Relationship.** `direction`'s canonical spelling (`supports` /
+    ///   `refutes`).
+    /// * **Idempotent in either spelling.** An existing edge of the same
+    ///   relationship between the two, upper or lower case, IN FORCE OR
+    ///   RETRACTED, is returned instead
+    ///   (`EdgeRepository::create_if_absent_including_retracted_signed_conn`):
+    ///   a re-run never duplicates an edge and never resurrects one its owner
+    ///   retracted.
+    /// * **Signed** at INSERT by `key` when it is `Some` (ruling R-50).
+    /// * **Tenancy** is the meet of the two endpoints, stamped by the
+    ///   `edges_tenancy` trigger as for every edge; the edge is never wider
+    ///   than the evidence row.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for an empty `claim_ids`; `DbError::QueryFailed`
+    /// if a statement fails.
+    pub async fn link_to_claims_signed_conn(
+        conn: &mut sqlx::PgConnection,
+        key: Option<EdgeSigningKey<'_>>,
+        evidence_id: Uuid,
+        claim_ids: &[Uuid],
+        direction: EvidenceDirection,
+    ) -> Result<Vec<EvidenceClaimLink>, DbError> {
+        if claim_ids.is_empty() {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "evidence {evidence_id} names no claim it applies to: every evidence row \
+                     must apply to at least one claim; nothing was written"
+                ),
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::with_capacity(claim_ids.len());
+        for &claim_id in claim_ids {
+            if !seen.insert(claim_id) {
+                continue;
+            }
+            let (row, created) = EdgeRepository::create_if_absent_including_retracted_signed_conn(
+                conn,
+                key,
+                evidence_id,
+                "evidence",
+                claim_id,
+                "claim",
+                direction.relationship(),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            out.push(EvidenceClaimLink {
+                claim_id,
+                edge_id: row.id,
+                created,
+            });
+        }
+        Ok(out)
     }
 
     /// Whether the evidence row `id`, just written in `conn`'s transaction,
@@ -868,6 +1090,78 @@ impl EvidenceRepository {
         Ok(out)
     }
 
+    /// The `dataset` evidence of each of `claim_ids` that `viewer` can see,
+    /// keyed by claim id, oldest first (backlog c8beb101).
+    ///
+    /// Backs `get_claim`'s `datasets`: the structured fields a reader needs to
+    /// resolve and verify a dataset (root, manifest location, manifest digest
+    /// with its algorithm, counts) without parsing `raw_content`.
+    ///
+    /// Filtered PER EVIDENCE ROW (`{VISIBILITY:e}`), as
+    /// [`Self::source_urls_by_claim_ids`] is, and for its reason. A row whose
+    /// `properties` do not parse as a `Dataset` (a hand-written row, or a
+    /// sealed one, whose `properties` are blanked) is skipped rather than
+    /// failing the read.
+    ///
+    /// At most `limit_per_claim` rows per claim, the oldest first: a caller
+    /// that always includes the result (`get_claim`) cannot otherwise bound
+    /// its response, since anyone who can attach evidence to a claim can
+    /// attach dataset rows to it. Ask for one more than you will show to tell
+    /// whether there were more. The cap applies before the parse filter, so a
+    /// skipped row still counts against it.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, claim_ids))]
+    pub async fn datasets_by_claim_ids<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_ids: &[Uuid],
+        limit_per_claim: i64,
+    ) -> Result<std::collections::HashMap<Uuid, Vec<DatasetEvidence>>, DbError> {
+        let mut out: std::collections::HashMap<Uuid, Vec<DatasetEvidence>> =
+            std::collections::HashMap::new();
+        if claim_ids.is_empty() || limit_per_claim <= 0 {
+            return Ok(out);
+        }
+        let sql = viewer.splice(
+            "SELECT claim_id, id, properties FROM ( \
+               SELECT e.claim_id, e.id, e.properties, e.created_at, \
+                      row_number() OVER ( \
+                        PARTITION BY e.claim_id ORDER BY e.created_at, e.id \
+                      ) AS rn \
+               FROM evidence e \
+               WHERE e.claim_id = ANY($1) \
+                 AND e.evidence_type = 'dataset' \
+                 /* {VISIBILITY:e} */ \
+             ) ranked \
+             WHERE rn <= $2 \
+             ORDER BY claim_id, created_at, id",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Uuid, serde_json::Value)>(&sql)
+            .bind(claim_ids)
+            .bind(limit_per_claim);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        for (claim_id, evidence_id, properties) in q.fetch_all(executor).await? {
+            match serde_json::from_value::<EvidenceType>(properties) {
+                Ok(dataset @ EvidenceType::Dataset { .. }) => {
+                    out.entry(claim_id).or_default().push(DatasetEvidence {
+                        evidence_id,
+                        dataset,
+                    });
+                }
+                _ => tracing::warn!(
+                    %evidence_id,
+                    "dataset evidence row whose properties are not a Dataset; skipped"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
     /// The source identity of each of `ids` that `viewer` can see
     /// ([`EvidenceSourceIdentity`]), keyed by evidence id. An id the
     /// viewer cannot see, or that names no evidence row, is absent.
@@ -1272,14 +1566,7 @@ impl EvidenceRepository {
 
     /// Convert EvidenceType enum to database string
     fn evidence_type_to_db_string(evidence_type: &EvidenceType) -> &'static str {
-        match evidence_type {
-            EvidenceType::Document { .. } => "document",
-            EvidenceType::Observation { .. } => "observation",
-            EvidenceType::Testimony { .. } => "testimony",
-            EvidenceType::Literature { .. } => "reference",
-            EvidenceType::Consensus { .. } => "computation",
-            EvidenceType::Figure { .. } => "figure",
-        }
+        evidence_type.stored_type()
     }
 
     /// Store an embedding vector on an evidence row `viewer` may write, and
@@ -1430,10 +1717,11 @@ impl EvidenceRepository {
     /// # Performance
     /// - Batch size is limited internally to prevent memory issues
     /// - For very large batches (>1000), consider chunking externally
-    #[instrument(skip(pool, evidence), fields(batch_size = evidence.len()))]
+    #[instrument(skip(pool, evidence, edge), fields(batch_size = evidence.len()))]
     pub async fn batch_create(
         pool: &PgPool,
         evidence: &[Evidence],
+        edge: EvidenceEdge<'_>,
     ) -> Result<Vec<Evidence>, DbError> {
         if evidence.is_empty() {
             return Ok(Vec::new());
@@ -1526,6 +1814,17 @@ impl EvidenceRepository {
             {
                 return Err(Self::duplicate());
             }
+        }
+        // Each row's edge to its claim, in the batch's transaction.
+        for row in &rows {
+            Self::link_to_claims_signed_conn(
+                &mut tx,
+                edge.key,
+                row.id,
+                &[row.claim_id],
+                edge.direction,
+            )
+            .await?;
         }
         tx.commit().await?;
 

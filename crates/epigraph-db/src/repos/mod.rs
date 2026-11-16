@@ -15,8 +15,15 @@ pub mod agent_lookup;
 pub mod alternative_set;
 pub mod analysis;
 pub mod assertion_nonce;
+pub mod atlas_flow;
 pub mod atlas_layout;
+pub mod atlas_leaf;
+pub mod atlas_map;
+pub mod atlas_meaning;
+pub mod atlas_naming;
+pub mod atlas_serve;
 pub mod atom_axiom;
+pub mod atomicity_screen;
 pub mod authored_by;
 pub mod authorization_code;
 pub mod authorize_session;
@@ -26,6 +33,7 @@ pub mod challenge;
 pub mod claim;
 pub mod claim_context;
 pub mod claim_encryption;
+pub mod claim_id_prefix;
 pub mod claim_ingest;
 pub mod claim_role;
 pub mod claim_theme;
@@ -127,6 +135,7 @@ pub use agent_lookup::{
 };
 pub use alternative_set::{AlternativePairRow, AlternativeSetRepository};
 pub use analysis::{AnalysisRecord, AnalysisRepository, ClaimSummary};
+pub use atlas_flow::{AtlasFlowRepository, EvidenceMassRow, FlowInputs};
 pub use atlas_layout::{
     AtlasLayoutRepository, DetailPart, LayoutBuild, LayoutLinkCursor, LayoutLinkOut, LayoutLinkRow,
     LayoutOverview, LayoutRegionOut, LayoutRunRow, LayoutThemeOut, LinkPage, LinkPairCursor,
@@ -135,6 +144,19 @@ pub use atlas_layout::{
     UnplacedCursor, UnplacedPage, VisibleRegionRow, VisibleThemeRow, ATLAS_DEFAULT_RELATIONSHIPS,
     ATLAS_LAYOUT_ALGO, ATLAS_LAYOUT_EXTENT, ATLAS_PAGE_MAX, ATLAS_STRUCTURE_RELATIONSHIPS,
 };
+pub use atlas_leaf::{
+    assemble_leaf, claim_attachments, fallback_split, resolve_with_fallback, AtlasLeafRepository,
+    CappedClaim, LeafCounts, LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet,
+    LeafOutcome, LeafRows, NeedsSplit, SplitReason, StoredLeafEdge, ATLAS_LEAF_NODE_CAP,
+    DERIVED_FILER_RELATIONSHIP,
+};
+pub use atlas_map::{
+    AtlasHierarchy, AtlasMap, AtlasMapRepository, LevelDoc, MapEpochs, MapLevel, NewMapRun,
+};
+pub use atlas_meaning::{AtlasMeaningRepository, ThemeMembers};
+pub use atlas_naming::{AtlasNamingRepository, FinishedRun, RunLevel, StoredName};
+pub use atlas_serve::{AtlasServeRepository, ServedRun, ThemeRoot};
+pub use atomicity_screen::{AtomicityScreenRepository, ScreenPopulation, ScreenRow};
 pub use authored_by::{
     AgentAuthorship, AuthorRef, AuthoredBy, AuthoredByRepository, Corroboration, Filer, Ingester,
     LiteratureAuthorship, PaperAuthor, PaperAuthorship, PaperIngest, PaperRef, PromptSnapshotAt,
@@ -146,19 +168,23 @@ pub use claim::{
     AdminToken, BeliefBoundedClaimHit, BeliefSort, ClaimBeliefColumns, ClaimDispute,
     ClaimEmbeddingHit, ClaimListFilter, ClaimNeighbor, ClaimPairDistance, ClaimRepository,
     ClaimSortField, ClaimSortOrder, ConsolidateEdgeMigration, ConsolidateMode, ConsolidateResult,
-    DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy, EmbeddingSeedScope,
-    EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit, GroundedNeighbor,
-    HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead, MarkedDuplicateRow,
-    MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff, PatchClaimInput, SortDirection,
-    SupersedeActor, SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
-    CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
-    DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,
-    RESERVED_EDGE_PROPERTIES, SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY,
-    SUPERSEDE_ACT_TOOLS,
+    CreatedWindow, DedupRepair, DedupReversal, DedupRevert, DuplicateProvenance, EdgeTenancy,
+    EmbeddingSeedScope, EvolveStepResult, FlatRanking, FrameClaimBeliefHit, GraphExpansionHit,
+    GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType, LineageHead,
+    MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
+    PatchClaimInput, SemanticSelectedClaim, SortDirection, SupersedeActor, SupersedeEdgeMigration,
+    SupersedeTool, SweepCandidate, UnmarkedDuplicate, CONSOLIDATE_MAX_SOURCES,
+    CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED, DUPLICATE_IDENTITY_PROPERTY,
+    DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS, RESERVED_EDGE_PROPERTIES,
+    SUPERSEDE_ACT_KEY_RESERVED, SUPERSEDE_ACT_PROPERTY, SUPERSEDE_ACT_TOOLS,
 };
 pub use claim_context::{
     ClaimContextRepository, ContextClaimRow, ContextEdgeRow, ContextEdgeTally, ContextPage,
     ContextPaperRow, CONTEXT_EPISTEMIC_RELATIONSHIPS,
+};
+pub use claim_id_prefix::{
+    id_prefix_bounds, ClaimIdPrefixMatch, ClaimIdPrefixRepository, ID_PREFIX_CONTENT_CHARS,
+    MIN_ID_PREFIX_HEX,
 };
 pub use claim_ingest::{
     credited_agent_end, ingest_only_edge_refusal, is_agent_attribution,
@@ -181,7 +207,7 @@ pub use claim_visibility::{
 };
 pub use cluster_run::{ClaimPlacement, ClusterRunRepository, ClusterRunRow};
 pub use community::{CommunityRepository, MembershipOutcome};
-pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity};
+pub use conflict_density::{ConflictDensityRepository, FrameConflictDensity, HighConflictClaim};
 pub use context::ContextRepository;
 pub use corpus_stats::{CorpusCounts, CorpusStatsRepository};
 pub use counterfactual::{CounterfactualRepository, CounterfactualRow};
@@ -198,8 +224,9 @@ pub use entity::{EntityRepository, EntityRow};
 pub use entity_type::{EntityTypeEntry, EntityTypeRepository, TenancyPrecondition};
 pub use event::{EventCursor, EventRepository, EventRow};
 pub use evidence::{
-    DerivationEvidence, EvidenceAtTimeRow, EvidenceDetailRow, EvidenceEdgeRow, EvidenceListFilter,
-    EvidenceListRow, EvidenceRepository, EvidenceSearchResult,
+    DatasetEvidence, DerivationEvidence, EvidenceAtTimeRow, EvidenceClaimLink, EvidenceDetailRow,
+    EvidenceDirection, EvidenceEdge, EvidenceEdgeRow, EvidenceListFilter, EvidenceListRow,
+    EvidenceRepository, EvidenceSearchResult,
 };
 pub use experiment::{
     ExperimentRepository, ExperimentResultRepository, ExperimentResultRow, ExperimentRow,
@@ -260,14 +287,19 @@ pub use trace::{ReasoningTraceRepository, TraceProvenanceStep};
 pub use triple::{IndexCounts, MentionRow, TripleRepository, TripleRow};
 pub use webhook::{WebhookSubscriptionRepository, WebhookSubscriptionRow};
 pub use workflow::{
-    ExecutedClaim, FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow, HierarchicalWorkflowRow,
-    ResolvedStep, ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow,
-    WorkflowRecallResult, WorkflowRepository,
+    hierarchical_outcome_variance, validate_outcome_idempotency_key, ExecutedClaim,
+    FlatWorkflowClaim, FrozenPlanEdgeRow, FrozenPlanRead, FrozenPlanRow,
+    HierarchicalOutcomeCounters, HierarchicalOutcomeRecord, HierarchicalOutcomeResult,
+    HierarchicalWorkflowRow, NewHierarchicalOutcomeReport, ResolvedStep,
+    ScoredHierarchicalWorkflowRow, WorkflowGoalEmbeddingHit, WorkflowListRow, WorkflowRecallResult,
+    WorkflowRepository,
 };
 
 // Privacy / encryption repositories
 pub use assertion_nonce::{AssertionNonceRepository, NonceConsumption};
-pub use behavioral_execution::{BehavioralExecutionRepository, BehavioralExecutionRow};
+pub use behavioral_execution::{
+    BehavioralExecutionRepository, BehavioralExecutionRow, DeviationReasonSummary,
+};
 pub use claim_encryption::{ClaimEncryptionRepository, ClaimEncryptionRow};
 pub use edge_encryption::{EdgeEncryptionRepository, EdgeEncryptionRow};
 pub use edge_signature::{

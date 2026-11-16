@@ -33,6 +33,7 @@ async fn batch_submit_claims_attaches_per_entry_labels(pool: PgPool) {
                 labels: vec!["capability-registry".into()],
                 visibility: Some("public".to_string()),
                 group_id: None,
+                dataset: None,
             }],
         },
         None,

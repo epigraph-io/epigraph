@@ -320,12 +320,20 @@ fn build_bundle(root: Uuid, lineage: &LineageResult, limits: Limits) -> String {
         let evidence_entities: Vec<serde_json::Value> = evidence
             .iter()
             .map(|le| {
-                serde_json::json!({
+                let mut entity = serde_json::json!({
                     "@type": "prov:Entity",
                     "@id": format!("evidence:{}", le.id),
                     "claim_id": format!("claim:{}", le.claim_id),
                     "evidence_type": le.evidence_type,
-                })
+                });
+                // A dataset row carries its structured fields (root, manifest
+                // location and digest, counts), so the bundle alone is enough
+                // to resolve and verify the data (backlog c8beb101). Counted
+                // against the output budget like the rest of the entity.
+                if let Some(dataset) = &le.dataset {
+                    entity["dataset"] = dataset.clone();
+                }
+                entity
             })
             .collect();
         let trace_entities: Vec<(Uuid, Vec<Uuid>, serde_json::Value)> = traces
@@ -487,6 +495,7 @@ mod tests {
                         claim_id: id,
                         evidence_type: "testimony".into(),
                         content_hash: vec![],
+                        dataset: None,
                     },
                 );
             }

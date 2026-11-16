@@ -320,6 +320,23 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    // ---- Migration 221: hierarchical outcome reports. ----------------------
+    (
+        "workflow_outcome_reports",
+        "UPDATE",
+        "An outcome report (221) is the record of what one report said and the result a \
+         retry with its key is answered with; nothing edits it. Under FORCE the absent \
+         UPDATE policy default-denies every non-superuser role, and 221 grants the \
+         application SELECT and INSERT only.",
+    ),
+    (
+        "workflow_outcome_reports",
+        "DELETE",
+        "An outcome report (221) is never deleted by the application; it goes with its \
+         workflow row (ON DELETE CASCADE). Under FORCE the absent DELETE policy \
+         default-denies every non-superuser role, and 221 grants the application SELECT \
+         and INSERT only.",
+    ),
     (
         "workflows",
         "DELETE",
@@ -414,6 +431,10 @@ const PROTECTED: &[&str] = &[
     "harvester_sources",
     "harvester_audit_reports",
     "workflows",
+    "atlas_map_epochs",
+    "atlas_map_runs",
+    "atlas_map_levels",
+    "workflow_outcome_reports",
 ];
 
 // ===========================================================================
@@ -1588,6 +1609,22 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_countersign_authorship` definer.",
         ),
         (
+            "workflow_outcome_reports_read",
+            "workflow_outcome_reports.workflow_id",
+            "221's read policy: its arm `EXISTS (SELECT 1 FROM workflows w WHERE w.id = \
+             workflow_outcome_reports.workflow_id)` names no session helper itself, but the \
+             subquery reads `workflows` with the reader's own rights, so it is \
+             `workflows_read` (183's session arms) that answers it: session-derived through \
+             the subquery, as `challenges_claim_readable` is through `claims`.",
+        ),
+        (
+            "workflow_outcome_reports_insert",
+            "workflow_outcome_reports.workflow_id",
+            "221's insert policy: the same `EXISTS` over `workflows` as its read policy, \
+             answered by `workflows_read` with the writer's own rights, so a report is \
+             written only on a workflow the session reads.",
+        ),
+        (
             "challenges_claim_readable",
             "challenges.claim_id",
             "168's RESTRICTIVE read policy (ruling R-CH1b): its arm `EXISTS (SELECT 1 FROM \
@@ -2079,7 +2116,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 ///
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
-/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | `epigraph_bypass()` is true, guard intact |
+/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | **REMOVED** (backlog cbf57f24): it had no caller; the pool assertion below still pins the queue to the maintenance DSN |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
@@ -2171,8 +2208,8 @@ fn guard_subquery_sites_are_enumerated() {
             "epigraph_db::ScopedPool::connect_with_options(\n        &maintenance_url"
         ),
         "the drain's pool must be built from maintenance_url. If it moves to the app DSN, \
-         `enqueue_unique_pending`'s `WHERE NOT EXISTS` guard becomes an unconditional insert \
-         under RLS — no error, duplicate jobs."
+         every read of `jobs` is filtered to nothing under RLS and a read-guarded write on \
+         the queue becomes an unconditional one, with no error."
     );
     assert!(
         drain.contains("source != epigraph_db::MaintenanceDsnSource::Configured"),

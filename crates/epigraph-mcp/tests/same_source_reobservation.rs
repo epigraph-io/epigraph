@@ -326,6 +326,7 @@ async fn submit_then_same_source_updates_do_not_raise_betp(pool: PgPool) {
                 novelty_threshold: None,
                 visibility: Some("public".to_string()),
                 group_id: None,
+                dataset: None,
             },
             None,
         )

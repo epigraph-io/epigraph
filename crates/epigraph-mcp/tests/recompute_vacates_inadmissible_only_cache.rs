@@ -32,6 +32,9 @@
 //!   group claims); that frame owns the cache instead and refolds it from the
 //!   admissible input (backlog 8d720490 (1): the owner rule ranks a frame
 //!   with an admissible input first);
+//! * a widening act (publicize, share) keeps the recorded owner instead
+//!   (`cache_owner_frame_keeping_recorded`), and falls back to that rule only
+//!   when the claim records none;
 //! * a compound is never vacated (its cache is not a fold of its own BBAs);
 //! * a claim with no cache stays without one (writing a vacuous value there
 //!   would announce that an unseen BBA exists).
@@ -544,6 +547,86 @@ async fn owner_as(scoped: &ScopedPool, viewer: &Viewer, claim: Uuid) -> Option<U
         .expect("owner on the application role");
     tx.rollback().await.expect("rollback");
     owner
+}
+
+/// The owner a WIDENING act (publicize, share) folds, as `viewer` resolves
+/// it on the application role.
+async fn kept_owner_as(scoped: &ScopedPool, viewer: &Viewer, claim: Uuid) -> Option<Uuid> {
+    let mut tx = scoped.begin_as(viewer).await.expect("stamped app session");
+    let owner = MassFunctionRepository::cache_owner_frame_keeping_recorded(&mut *tx, viewer, claim)
+        .await
+        .expect("kept owner on the application role");
+    tx.rollback().await.expect("rollback");
+    owner
+}
+
+/// The admissible-first owner rule is for the ORDINARY owner choice. A
+/// widening act keeps the owner the cache records, so that when none of that
+/// frame's inputs may reach the new audience the cache is vacated under it
+/// (backlog 31285392, pinned end to end in `claim_visibility_cascade_app_role`)
+/// instead of being re-elected to the frame whose input moved with the claim.
+/// Same shape as `an_admissible_input_on_another_frame_takes_the_cache`: the
+/// ordinary rule moves the owner to `claim_validity`, the widening rule keeps
+/// `binary_truth`. A twin claim that records NO owner gets the ordinary
+/// rule's answer from both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_widening_keeps_the_recorded_owner_the_admissible_first_rule_would_move(pool: PgPool) {
+    let w = world(&pool, "r80-kept-owner").await;
+    let validity =
+        resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
+            .await
+            .expect("claim_validity");
+    let mut claims = Vec::new();
+    for label in ["r80 kept owner, recorded", "r80 kept owner, none recorded"] {
+        let claim = fixture::seed_public_claim(&pool, w.author, label).await;
+        let open_ev = fixture::seed_evidence(&pool, claim, "observation").await;
+        store(&pool, claim, validity, w.author, open_ev, 0.7).await;
+        let hidden_ev = fixture::seed_evidence(&pool, claim, "document").await;
+        store(&pool, claim, w.binary, w.member, hidden_ev, 0.9).await;
+        claims.push((claim, hidden_ev));
+    }
+    let (recorded, unrecorded) = (claims[0].0, claims[1].0);
+    recompute_claim_cached_belief(
+        &mut pool.acquire().await.expect("acquire"),
+        &w.public,
+        recorded,
+    )
+    .await
+    .expect("recompute while every source is public");
+    assert_eq!(
+        cache(&pool, recorded).await.5,
+        Some(w.binary),
+        "PREMISE: binary_truth is the recorded owner"
+    );
+    assert_eq!(
+        cache(&pool, unrecorded).await.5,
+        None,
+        "PREMISE: the twin records no owner"
+    );
+    for (_, hidden_ev) in &claims {
+        hide(&pool, *hidden_ev, w.group, w.member).await;
+    }
+
+    let scoped = app_role(&pool).await;
+    for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
+        assert_eq!(
+            owner_as(&scoped, viewer, recorded).await,
+            Some(validity),
+            "the {who}'s ordinary owner rule must rank claim_validity's admissible input first"
+        );
+        assert_eq!(
+            kept_owner_as(&scoped, viewer, recorded).await,
+            Some(w.binary),
+            "a widening must keep binary_truth, the owner the {who} finds recorded, not \
+             re-elect claim_validity"
+        );
+        assert_eq!(
+            kept_owner_as(&scoped, viewer, unrecorded).await,
+            Some(validity),
+            "with no recorded owner, the widening rule must fall back to the ordinary rule \
+             for the {who}"
+        );
+    }
 }
 
 /// The claim's cache is owned by `frame` (holding the claim's only
