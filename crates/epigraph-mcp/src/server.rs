@@ -1123,7 +1123,8 @@ impl EpiGraphMcpFull {
     /// Whether a caller is listed the federated tools: only one that
     /// presented a bearer token, over HTTP (backlog b6559e75).
     ///
-    /// `call_tool` proxies a federated call under the CALLER's own bearer,
+    /// `call_tool` proxies a federated call under a token exchanged for the
+    /// CALLER's own bearer,
     /// and refuses one it has no bearer to forward. A caller without one
     /// (stdio, which carries no `AuthContext`; an HTTP listener with no auth
     /// layer; the unauthenticated listener, whose injected context is
@@ -3254,7 +3255,8 @@ impl ServerHandler for EpiGraphMcpFull {
                         .await;
                     return Err(err);
                 }
-                // (b) require the caller's raw bearer to forward downstream.
+                // (b) require the caller's raw bearer: the gateway exchanges it at the
+                // kernel's token endpoint (it never reaches the downstream).
                 // A refusal like (0) and (a), so audited like them (backlog
                 // b6559e75): reachable over HTTP by a caller the gates above
                 // admit with no token, the unauthenticated listener's.
@@ -3273,7 +3275,8 @@ impl ServerHandler for EpiGraphMcpFull {
                 // (c) durable audit event, namespaced by the owning extension.
                 self.emit_tool_invoked(&format!("{}:{}", ext_name, request.name))
                     .await;
-                // (d) proxy to the downstream on a fresh caller-token session.
+                // (d) proxy to the downstream on a fresh session authenticated with a
+                // token exchanged for the caller's (aud = the extension; c9b82fae).
                 // A failure is answered as what it is (backlog 7ea4bd74): the
                 // downstream's own JSON-RPC error unchanged, and a designed
                 // message for an extension that is down or did not answer.
