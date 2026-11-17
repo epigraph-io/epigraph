@@ -77,7 +77,7 @@ WHOLE label mutation needs that ownership, whatever the labels (as
 label stays ungated. A stdio agent that shares no operator with the claim's
 author, and is not its delegate, is now refused, including through `release/epiclaw/CLAUDE.md`'s
 `update_labels(original_id, add=["resolved"])` procedure, and so is a stdio
-server with no declared signer (`--agent-key` / `--agent-model`) on any claim it
+server with no declared signer (`--agent-key` or the separate signing key) on any claim it
 did not author. The deploy preconditions this sets for the fleet are in
 `scripts/e2e/README.md` ("Deploy preconditions").
 

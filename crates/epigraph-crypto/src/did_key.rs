@@ -33,7 +33,9 @@
 //! them to NAME an agent (its public key, its `did:key`); never sign with
 //! them, and never treat a signature under one as proof of anything (backlog
 //! bfc2eff8). An agent row created for such a key is stored with
-//! `key_kind = 'seed-derived'`, which no verifier accepts. A signer needs a
+//! `key_kind = 'seed-derived'`, which `AgentRepository::public_key_if_signer`
+//! (epigraph-db) refuses; `verify_claim`, the edge verifier and the OAuth
+//! assertion check do not read `key_kind` yet. A signer needs a
 //! random key, or `keypair_from_llm_agent_keyed`, whose seed is keyed with a
 //! secret the host keeps.
 

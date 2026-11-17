@@ -136,7 +136,11 @@ everywhere. Three seed strategies are in use today:
 Every seed above is an IDENTIFIER, never a credential: anyone can compute
 its private half, so an agent named by one must not sign. An agent row
 created for such a key is stored with `key_kind = 'seed-derived'`
-(migration 230), which no signature path accepts.
+(migration 230). `AgentRepository::public_key_if_signer`, the key source of
+the packet-signature check, refuses such a key. Three other verifiers do
+not read `key_kind` yet: `verify_claim`, the edge-signature check and the
+OAuth `client_credentials` assertion check still accept a signature under
+the agent's bare public key.
 
 A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
 
@@ -505,7 +509,7 @@ Related but not the same:
   or a live delegated run token, and a `claims:admin` token also
   passes. A stdio agent that shares no operator with the author is
   refused, and so is a stdio server with no declared signer
-  (`--agent-key` / `--agent-model`) on any claim it did not author.
+  (`--agent-key` or the separate signing key) on any claim it did not author.
   There is no free-text workaround: a bare "Resolves <UUID>:" claim is
   exactly the drift the "Do **not**" list above forbids. If you are
   refused, have an owner retire the item.

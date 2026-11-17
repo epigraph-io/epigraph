@@ -312,7 +312,9 @@ pub enum AgentKind {
     /// `"orcid:{id}"`), so ANYONE who knows the name or ORCID can compute it:
     /// the key identifies the node and must never verify a signature (since
     /// migration 230 such a node is stored with `key_kind = 'seed-derived'`,
-    /// which no signature path accepts; backlog bfc2eff8).
+    /// which `AgentRepository::public_key_if_signer` refuses; `verify_claim`,
+    /// the edge verifier and the OAuth assertion check do not read
+    /// `key_kind` yet; backlog bfc2eff8).
     IngestAuthor,
     /// No visible evidence (the legacy rows; `agent_type` is not evidence).
     Unknown,

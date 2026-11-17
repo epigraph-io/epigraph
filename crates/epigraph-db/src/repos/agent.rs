@@ -271,7 +271,9 @@ pub struct AgentPublicProfile {
 /// Ed25519 SECRET, so anyone who knows the seed holds the private key. Such a
 /// key names the agent and is NOT a signature verifier:
 /// [`AgentRepository::public_key_if_signer`] returns `None` for it, as for
-/// the OAuth placeholder `derived`. Insert these rows with
+/// the OAuth placeholder `derived`. NOT YET enforced by the verifiers that
+/// read `agents.public_key` directly: `verify_claim`'s bare-key fallback, the
+/// edge-signature check and the OAuth assertion check. Insert these rows with
 /// [`AgentRepository::create_seed_derived_conn`].
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
@@ -360,8 +362,8 @@ impl AgentRepository {
 
     /// [`Self::create_conn`] for an agent whose `public_key` is derived from a
     /// PUBLIC seed: the row is stored with `key_kind =`
-    /// [`KEY_KIND_SEED_DERIVED`], so no signature path accepts its key (see
-    /// the constant). Every other column, the duplicate-key mapping and the
+    /// [`KEY_KIND_SEED_DERIVED`], so [`Self::public_key_if_signer`] refuses
+    /// its key (see the constant). Every other column, the duplicate-key mapping and the
     /// `agent.registered` event are exactly [`Self::create_conn`]'s.
     ///
     /// A runtime query (not `query!`), so the `.sqlx` offline cache of
