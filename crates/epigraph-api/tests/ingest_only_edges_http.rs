@@ -661,6 +661,85 @@ async fn provenance_is_attached_only_by_the_filer_for_authors_it_speaks_for(pool
     );
 }
 
+/// Backlog bfc2eff8: the organization node the provenance route creates for an
+/// author's affiliation is stored `key_kind = 'seed-derived'`. Its key is
+/// `keypair_from_name("org:{name}")`, the Ed25519 key of BLAKE3 of the org
+/// name, which anyone can compute, so the packet-signature verifier's key
+/// source (`public_key_if_signer`) must return nothing for it. Before 230 the
+/// row took the default `ed25519`. Created on the APPLICATION role, so 077's
+/// `agents_provision` policy is exercised as in production. CALIBRATION: the
+/// route succeeds and writes the affiliation edge, so the node under test is
+/// the one it created.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provenance_organization_node_is_seed_derived(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (human, _) = viewer_fixture::seed_human_operator(&pool, "org-human").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, human, "the human's org claim").await;
+    let name = "Brannoch Elsworth";
+    let node: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(
+        epigraph_crypto::did_key::did_key_for_author(None, name)
+            .1
+            .as_slice(),
+    )
+    .bind(name)
+    .fetch_one(&pool)
+    .await
+    .expect("author node");
+    link(&pool, node, human).await;
+
+    let org = "Quarrendon Institute of Applied Optics";
+    let (status, got) = post_provenance(
+        &state,
+        human,
+        &["claims:write", "edges:write"],
+        claim,
+        json!({"authors": [{"name": name, "position": 0, "affiliations": [org]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["organization_agents"][0]["created"], true, "{got}");
+
+    let org_key = epigraph_crypto::did_key::keypair_from_name(&format!(
+        "org:{}",
+        epigraph_crypto::did_key::normalize_author_name(org)
+    ))
+    .public_key();
+    let (org_id, kind): (Uuid, String) =
+        sqlx::query_as("SELECT id, key_kind::text FROM agents WHERE public_key = $1")
+            .bind(org_key.as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("the route created the org node under its derived key");
+    assert_eq!(
+        got["organization_agents"][0]["agent_id"],
+        org_id.to_string()
+    );
+    assert_eq!(kind, "seed-derived");
+    let mut conn = pool.acquire().await.expect("acquire");
+    assert_eq!(
+        AgentRepository::public_key_if_signer(&mut conn, org_id)
+            .await
+            .expect("public_key_if_signer"),
+        None
+    );
+    let affiliated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'AFFILIATED_WITH'",
+    )
+    .bind(node)
+    .bind(org_id)
+    .fetch_one(&pool)
+    .await
+    .expect("affiliation edge");
+    assert_eq!(
+        affiliated, 1,
+        "calibration: the affiliation edge was written"
+    );
+}
+
 /// The evidence detail's `agent_id` is the evidence row's own record (its
 /// signer, set by the writer that stored it), never the source of an
 /// `agent -> evidence` edge. A stranger may post `supports`,
