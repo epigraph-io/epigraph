@@ -1,4 +1,4 @@
--- 230: the application role `epigraph_app` is NOLOGIN, whatever the cluster
+-- 231: the application role `epigraph_app` is NOLOGIN, whatever the cluster
 -- held before (backlog bb200b7b).
 --
 -- ===================================================================
@@ -84,7 +84,7 @@ BEGIN
     SELECT rolcanlogin INTO can_login FROM pg_roles WHERE rolname = 'epigraph_app';
 
     IF NOT FOUND THEN
-        RAISE NOTICE '230: role epigraph_app does not exist; nothing to do. Provision it NOLOGIN out of band (docs/deploy.md, section 2, step 2).';
+        RAISE NOTICE '231: role epigraph_app does not exist; nothing to do. Provision it NOLOGIN out of band (docs/deploy.md, section 2, step 2).';
         RETURN;
     END IF;
 
@@ -105,10 +105,10 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
             MESSAGE = format(
-                '230 refuses: %s session(s) are logged in as epigraph_app (application_name: %s), '
+                '231 refuses: %s session(s) are logged in as epigraph_app (application_name: %s), '
                 'and NOLOGIN would refuse their next connection; nothing was changed. Move that '
                 'service to its own login, a member of epigraph_app with SET role = epigraph_app '
-                '(docs/deploy.md, section 2, step 4, and the migration 230 row of section 11), '
+                '(docs/deploy.md, section 2, step 4, and the migration 231 row of section 11), '
                 'restart it, then re-run epigraph-migrate.',
                 live, apps);
     END IF;
@@ -119,9 +119,9 @@ BEGIN
         RAISE EXCEPTION USING
             ERRCODE = '42501',
             MESSAGE = format(
-                '230 refuses: %s may not ALTER ROLE epigraph_app, which can still log in. Run '
+                '231 refuses: %s may not ALTER ROLE epigraph_app, which can still log in. Run '
                 'ALTER ROLE epigraph_app NOLOGIN once as a superuser, after moving every service '
-                'off that role (docs/deploy.md, the migration 230 row of section 11), then re-run '
+                'off that role (docs/deploy.md, the migration 231 row of section 11), then re-run '
                 'epigraph-migrate.',
                 current_user);
     END;
@@ -129,6 +129,6 @@ BEGIN
     IF (SELECT rolcanlogin FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         RAISE EXCEPTION USING
             ERRCODE = '55000',
-            MESSAGE = '230: epigraph_app can still log in after ALTER ROLE ... NOLOGIN.';
+            MESSAGE = '231: epigraph_app can still log in after ALTER ROLE ... NOLOGIN.';
     END IF;
 END $$;

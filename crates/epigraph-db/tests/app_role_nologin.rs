@@ -1,4 +1,4 @@
-//! Migration 230 (backlog bb200b7b): `epigraph_app` is NOLOGIN after
+//! Migration 231 (backlog bb200b7b): `epigraph_app` is NOLOGIN after
 //! migrating, whatever the cluster held before.
 //!
 //! # The scenario CI never sees
@@ -15,12 +15,12 @@
 //! Roles are CLUSTER-global, and a real second login needs a COMMITTED
 //! `LOGIN` (a new connection cannot see an uncommitted `ALTER ROLE`). Every
 //! test in this file flips `epigraph_app`'s LOGIN and some open a session
-//! logged in as it, which migration 230 refuses cluster-wide, so the tests
+//! logged in as it, which migration 231 refuses cluster-wide, so the tests
 //! here are serialized on [`SERIAL`] and each runs its own migrations
 //! (`migrations = false`) under that lock. This file is its own test binary,
 //! and `cargo test` runs binaries one after another, so no other binary's
 //! migrations overlap these sessions. Each test leaves `epigraph_app` NOLOGIN
-//! with no password, which is the state migration 230 establishes anyway.
+//! with no password, which is the state migration 231 establishes anyway.
 
 use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::PgConnectOptions;
@@ -29,8 +29,10 @@ use uuid::Uuid;
 
 static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
-/// The last migration before the one under test.
-const HEAD_BEFORE_230: i64 = 229;
+/// Every migration below the one under test. 230 is another change's slot
+/// (it may or may not be on this tree); `up_to` takes whatever exists at or
+/// below it.
+const HEAD_BEFORE_231: i64 = 230;
 
 /// Serializes every test in this binary; see the module docs. An async
 /// mutex: each `#[sqlx::test]` runs on its own runtime, and the guard is held
@@ -55,7 +57,7 @@ fn up_to(max: i64) -> Migrator {
 }
 
 /// Which migration set this binary embeds, printed so a run shows whether it
-/// ran with or without 230 (`sqlx::migrate!` embeds at compile time).
+/// ran with or without 231 (`sqlx::migrate!` embeds at compile time).
 fn report_embedded_head() {
     let head = MIGRATOR.migrations.iter().map(|m| m.version).max();
     println!("embedded migration head: {head:?}");
@@ -103,7 +105,7 @@ async fn arm_app_login(pool: &PgPool, password: Option<&str>) {
     );
 }
 
-/// Leave the cluster in 230's end state, password removed.
+/// Leave the cluster in 231's end state, password removed.
 async fn disarm_app_login(pool: &PgPool) {
     pool.execute("ALTER ROLE epigraph_app NOLOGIN PASSWORD NULL")
         .await
@@ -158,7 +160,7 @@ async fn identity(conn: &mut PgConnection) -> (String, String) {
 }
 
 /// The bug itself: a cluster whose `epigraph_app` already had LOGIN before
-/// 060 ran. 060 skips the existing role, and before 230 nothing ever took the
+/// 060 ran. 060 skips the existing role, and before 231 nothing ever took the
 /// login away.
 #[sqlx::test(migrations = false)]
 async fn a_pre_existing_login_app_role_is_nologin_after_migrating(pool: PgPool) {
@@ -173,7 +175,7 @@ async fn a_pre_existing_login_app_role_is_nologin_after_migrating(pool: PgPool) 
     assert!(
         !app_can_login(&pool).await,
         "epigraph_app had LOGIN before migrating and still has it after: 060 keeps an existing \
-         role as it is, so the end state must be asserted by a later migration (230)"
+         role as it is, so the end state must be asserted by a later migration (231)"
     );
     // Only LOGIN changes: the role keeps the posture the contract asserts.
     let (superuser, bypassrls, createrole, createdb): (bool, bool, bool, bool) = sqlx::query_as(
@@ -191,7 +193,7 @@ async fn a_pre_existing_login_app_role_is_nologin_after_migrating(pool: PgPool) 
     disarm_app_login(&pool).await;
 }
 
-/// A service logged in as `epigraph_app` while the deploy migrates: 230
+/// A service logged in as `epigraph_app` while the deploy migrates: 231
 /// refuses, changes nothing, and the operator sees a message that names the
 /// fix. Once the session is gone, the same run succeeds.
 #[sqlx::test(migrations = false)]
@@ -199,9 +201,9 @@ async fn the_migration_refuses_while_a_session_is_logged_in_as_the_app_role(pool
     let _serial = SERIAL.lock().await;
     report_embedded_head();
 
-    migrate(&pool, &up_to(HEAD_BEFORE_230))
+    migrate(&pool, &up_to(HEAD_BEFORE_231))
         .await
-        .expect("migrate to 229");
+        .expect("migrate to just below 231");
     let password = format!("pw-{}", Uuid::new_v4().simple());
     arm_app_login(&pool, Some(&password)).await;
 
@@ -216,29 +218,29 @@ async fn the_migration_refuses_while_a_session_is_logged_in_as_the_app_role(pool
 
     let err = migrate(&pool, &MIGRATOR)
         .await
-        .expect_err("230 must refuse while a session is logged in as epigraph_app");
+        .expect_err("231 must refuse while a session is logged in as epigraph_app");
     // What `epigraph-migrate` prints after `migrations: FAILED: sqlx::migrate failed: `.
     let shown = err.to_string();
     println!("operator sees: {shown}");
     assert!(
-        shown.starts_with("while executing migration 230: ")
-            && shown.contains("230 refuses: 1 session(s) are logged in as epigraph_app")
+        shown.starts_with("while executing migration 231: ")
+            && shown.contains("231 refuses: 1 session(s) are logged in as epigraph_app")
             && shown.contains("app_role_nologin_test")
             && shown.contains("docs/deploy.md")
             && shown.contains("re-run epigraph-migrate"),
         "{shown}"
     );
     match &err {
-        MigrateError::ExecuteMigration(e, 230) => assert_eq!(
+        MigrateError::ExecuteMigration(e, 231) => assert_eq!(
             e.as_database_error().and_then(|d| d.code()).as_deref(),
             Some("55000"),
             "{e}"
         ),
-        other => panic!("expected ExecuteMigration(_, 230), got {other:?}"),
+        other => panic!("expected ExecuteMigration(_, 231), got {other:?}"),
     }
     assert!(app_can_login(&pool).await, "a refusal must change nothing");
     assert!(
-        !applied_successfully(&pool, 230).await,
+        !applied_successfully(&pool, 231).await,
         "a refusal must record nothing"
     );
 
@@ -249,8 +251,8 @@ async fn the_migration_refuses_while_a_session_is_logged_in_as_the_app_role(pool
 
     migrate(&pool, &MIGRATOR)
         .await
-        .expect("with the session gone, the same run applies 230");
-    assert!(applied_successfully(&pool, 230).await);
+        .expect("with the session gone, the same run applies 231");
+    assert!(applied_successfully(&pool, 231).await);
     assert!(!app_can_login(&pool).await);
     let refused = PgConnection::connect_with(&login_options(&pool, "epigraph_app", &password))
         .await
@@ -265,7 +267,7 @@ async fn the_migration_refuses_while_a_session_is_logged_in_as_the_app_role(pool
 
 /// The runbook's central claim. With the service moved to its own login (a
 /// member of `epigraph_app` whose default is `SET role = 'epigraph_app'`),
-/// 230 applies while that login's session is open, the session keeps
+/// 231 applies while that login's session is open, the session keeps
 /// working, new connections as that login still succeed with `current_user =
 /// epigraph_app` (what the API's posture check keys on), and only direct
 /// `epigraph_app` logins are refused. A superuser session that has merely
@@ -276,9 +278,9 @@ async fn a_member_login_with_the_app_role_default_keeps_working_and_does_not_blo
     let _serial = SERIAL.lock().await;
     report_embedded_head();
 
-    migrate(&pool, &up_to(HEAD_BEFORE_230))
+    migrate(&pool, &up_to(HEAD_BEFORE_231))
         .await
-        .expect("migrate to 229");
+        .expect("migrate to just below 231");
     let app_password = format!("pw-{}", Uuid::new_v4().simple());
     arm_app_login(&pool, Some(&app_password)).await;
 
@@ -334,7 +336,7 @@ async fn a_member_login_with_the_app_role_default_keeps_working_and_does_not_blo
 
     migrate(&pool, &MIGRATOR)
         .await
-        .expect("230 applies while only member logins and downgraded sessions are open");
+        .expect("231 applies while only member logins and downgraded sessions are open");
     assert!(!app_can_login(&pool).await);
 
     assert_eq!(
@@ -344,14 +346,14 @@ async fn a_member_login_with_the_app_role_default_keeps_working_and_does_not_blo
     );
     let mut next = PgConnection::connect_with(&login_options(&pool, &login, &password))
         .await
-        .expect("a NEW connection as the member login still succeeds after 230");
+        .expect("a NEW connection as the member login still succeeds after 231");
     assert_eq!(
         identity(&mut next).await,
         ("epigraph_app".to_string(), login.clone())
     );
     let refused = PgConnection::connect_with(&login_options(&pool, "epigraph_app", &app_password))
         .await
-        .expect_err("a direct epigraph_app login is refused after 230");
+        .expect_err("a direct epigraph_app login is refused after 231");
     assert!(
         refused.to_string().contains("not permitted to log in"),
         "{refused}"

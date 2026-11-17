@@ -3209,7 +3209,7 @@ restart.
   `application/octet-stream` Document. Undo only after rolling every 229
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
-- **230**: public `epigraph_app_nologin` (backlog bb200b7b). Asserts the end
+- **231**: public `epigraph_app_nologin` (backlog bb200b7b). Asserts the end
   state `epigraph_app` NOLOGIN. 060 creates the role NOLOGIN only `IF NOT
   EXISTS` and never alters an existing one, so on a cluster where the role
   could already log in (armed by the old docs/deploy.md step 4, or created
@@ -3229,11 +3229,13 @@ restart.
   is NOLOGIN after migrating; the refusal while a real `epigraph_app` login is
   open, with the operator-visible message, nothing recorded, and a clean
   re-run once it closes; a member login with the role default keeps working,
-  does not block, and still connects after 230 while a direct `epigraph_app`
-  login is refused). All three fail on the series without 230. Undo:
-  `ALTER ROLE epigraph_app LOGIN;` as a superuser. Checked before claiming: no
-  migration on main, on an open PR or on an origin `security/*` branch carries a
-  `230`. **Deploy order (binding):** move every service that logs in as
+  does not block, and still connects after 231 while a direct `epigraph_app`
+  login is refused). All three fail on the series without 231. Undo:
+  `ALTER ROLE epigraph_app LOGIN;` as a superuser. Slot 231 was assigned by the
+  2026-11-17 security wave (230 belongs to another change in the same wave,
+  `agents_key_kind_seed_derived`); checked before claiming: no migration on main,
+  on an open PR or on an origin `security/*` branch carries a `231`. 231 does not
+  depend on 230, and either may be applied first. **Deploy order (binding):** move every service that logs in as
   `epigraph_app` to a login of its own first (docs/deploy.md, section 2, step
   4); the check sees open sessions only, so a stopped unit or an occasional
   timer still on that login passes it and is refused at its next connect.
