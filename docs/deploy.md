@@ -48,8 +48,8 @@ may use others.
 
 | Process | Binary (package) | Database variable | Login it should be | Notes |
 |---|---|---|---|---|
-| HTTP API | `server` (`epigraph-api`) | `DATABASE_URL` | `epigraph_app`, the application login | Serves requests. **Refuses to start when `MAINTENANCE_DATABASE_URL` is set.** Builds no job pool, no maintenance pool and no job runner. |
-| MCP server | `epigraph-mcp-full` (`epigraph-mcp`) | `--database-url` / `DATABASE_URL` | `epigraph_app` | stdio by default. HTTP with `--listen`, which needs `--jwt-secret`. Same refusal on `MAINTENANCE_DATABASE_URL`, on every transport. |
+| HTTP API | `server` (`epigraph-api`) | `DATABASE_URL` | the API login (`epigraph_api_login`): a member of `epigraph_app` that acts as it (step 4) | Serves requests. **Refuses to start when `MAINTENANCE_DATABASE_URL` is set.** Builds no job pool, no maintenance pool and no job runner. |
+| MCP server | `epigraph-mcp-full` (`epigraph-mcp`) | `--database-url` / `DATABASE_URL` | its own login, a member of `epigraph_app`, made like the API login (step 4) | stdio by default. HTTP with `--listen`, which needs `--jwt-secret`. Same refusal on `MAINTENANCE_DATABASE_URL`, on every transport. |
 | Migrator | `epigraph-migrate` (`epigraph-api`) | `MIGRATION_DATABASE_URL` (falls back to `DATABASE_URL` with a WARN, shown only when `RUST_LOG` enables `warn`; the default filter shows errors only) | the migration login: the schema owner or a superuser | Applies every embedded migration up to the build's head, then exits. |
 | Cascade replay | `replay_deferred_cascades` (`epigraph-cli`) | `MAINTENANCE_DATABASE_URL` (**required**; no fallback) and `DATABASE_URL` (naming the same database) | the maintenance login | Applies the cascades every request process defers. Suggested unit: `epigraph-cascade-replay.timer`. |
 | Job drain | `drain_jobs` (`epigraph-api`) | `MAINTENANCE_DATABASE_URL` (**required**) and `DATABASE_URL` (the same database) | the maintenance login | Drains the job queue once per run. Suggested unit: `epigraph-jobs-drain.timer`. |
@@ -61,7 +61,8 @@ The four logins:
 | Login | Who creates it | Privileges |
 |---|---|---|
 | **migration login** | you, before the first migrate | Owns the schema or is a superuser. DDL on every table; creates roles and extensions. Used by `epigraph-migrate` and the undo runbooks. |
-| **`epigraph_app`** | migration 060 creates the role `NOLOGIN`; **you** give it `LOGIN` and a password | The request path's DML, which row security is written against. Never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB. |
+| **`epigraph_app`** | migration 060 creates the role `NOLOGIN`, and migration 230 takes `LOGIN` away from one that has it. It is a role you grant, never a login | The request path's DML, which row security is written against. Never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB. |
+| **API login** (`epigraph_api_login`) | you: a `LOGIN` role that is a member of `epigraph_app`, with `SET role = 'epigraph_app'` as its default (step 4) | Nothing of its own: it inherits `epigraph_app`'s grants, and every session starts as `epigraph_app`, so row security and the API's posture checks see the application role. Give every other request process (each MCP unit) a login of its own made the same way, so each credential can be rotated and traced alone. |
 | **maintenance login** | you: a login role that is a member of `epigraph_maintenance` | `epigraph_bypass()` is true on it, so it can do cross-tenant maintenance. It must be a NON-superuser with no CREATE on schema `public`. |
 | **`epigraph_identity_attestor`** (optional) | migration 161 creates the role `NOLOGIN`; **you** give it `LOGIN` | USAGE on schema `public`, EXECUTE on agent-identity registration (161) and on the role-attachment question `epigraph_role_agent_may_run` (166), nothing else. Needed only if a host registers agent identities (section 9). |
 
@@ -87,10 +88,17 @@ non-superuser.
 No migration grants a role LOGIN or carries a password.
 `crates/epigraph-db/tests/schema_contract.rs::no_migration_grants_a_role_login`
 fails on any migration that does. The repository is public, and credentials
-never land in it. `schema_contract.rs::tenancy_roles_are_nologin` allows the
-out-of-band `epigraph_app` login, and asserts that it is never SUPERUSER,
-BYPASSRLS, CREATEROLE or CREATEDB, while `epigraph_maintenance` and
-`epigraph_seed` must stay NOLOGIN.
+never land in it. Migration 230 asserts that `epigraph_app` is NOLOGIN: on a
+cluster where it could log in (an install that followed this runbook before
+230, or a role that existed before 060 ran) it takes the login away, and it
+refuses, changing nothing, while any session is logged in as `epigraph_app`
+(section 11). `crates/epigraph-db/tests/app_role_nologin.rs` covers that
+cluster, which CI's empty Postgres never produces.
+`schema_contract.rs::tenancy_roles_are_nologin` asserts that `epigraph_app`
+is never SUPERUSER, BYPASSRLS, CREATEROLE or CREATEDB, and that
+`epigraph_maintenance` and `epigraph_seed` stay NOLOGIN. It still tolerates
+LOGIN on `epigraph_app`, so a login armed by hand after 230 is not caught by
+it.
 
 ## 2. A production install, from an empty cluster
 
@@ -172,21 +180,34 @@ migration is `194_retracted_bba_delete_guard.sql`, the expected line is
 from the 158 files in `migrations/`, not measured. Section 4 describes the
 marker and every refusal.
 
-### Step 4 — Give the application role a login
+### Step 4 — Create the API's login
 
-Migration 060 created `epigraph_app`. Give it a login out of band:
+Migration 060 created `epigraph_app` NOLOGIN, and it stays NOLOGIN (migration
+230 asserts it). The API logs in as a role of its own that is a member of
+`epigraph_app`. As a superuser, out of band:
 
 ```sql
-ALTER ROLE epigraph_app LOGIN PASSWORD '<secret>';
+CREATE ROLE epigraph_api_login LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB
+  NOCREATEROLE NOREPLICATION INHERIT PASSWORD '<secret>' IN ROLE epigraph_app;
+ALTER ROLE epigraph_api_login SET role = 'epigraph_app';
 ```
 
-This `ALTER ROLE` is what arms the row-security posture assertion in the
-request units. The assertion is keyed on `current_user = 'epigraph_app'`, so
-it is inert on any other login and fully armed on this one. A request unit
-that connects as any other role logs a WARN, not a refusal
-(`epigraph_api::state::rls_verdict` carries the reasoning).
+Send a SCRAM verifier computed on the client rather than the plain password
+where you can, and keep the statement out of the server log (`SET
+log_statement = 'none'` in that session).
 
-**Check:** `psql "postgres://epigraph_app:<secret>@<host>/epigraph" -c 'SELECT current_user'` prints `epigraph_app`.
+The `SET role` default is what arms the row-security posture assertion in the
+request units. The assertion is keyed on `current_user = 'epigraph_app'`, and
+with that default every session of the login starts as `epigraph_app` (a
+pool's `RESET ALL` or `DISCARD ALL` returns to it), while `session_user`
+stays `epigraph_api_login`, so `pg_stat_activity` and every `session_user`
+audit column name the service. Without the default the login still inherits
+`epigraph_app`'s grants, but `current_user` is the login, the assertion is
+inert, and the API logs a WARN instead of refusing a bad posture
+(`epigraph_api::state::rls_verdict` carries the reasoning). Each MCP unit
+gets a login of its own, made the same way.
+
+**Check:** `psql "postgres://epigraph_api_login:<secret>@<host>/epigraph" -c 'SELECT current_user, session_user'` prints `epigraph_app | epigraph_api_login`.
 
 ### Step 5 — Create the maintenance login
 
@@ -267,7 +288,7 @@ stops that client renewing. Every scope in `default_scopes` must exist in
 The minimum production environment for `server`:
 
 ```ini
-DATABASE_URL=postgres://epigraph_app:<secret>@<host>:5432/epigraph
+DATABASE_URL=postgres://epigraph_api_login:<secret>@<host>:5432/epigraph
 EPIGRAPH_JWT_SECRET=<at least 32 random bytes>
 EPIGRAPH_PUBLIC_BASE_URL=https://<your-host>
 EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
@@ -2196,8 +2217,8 @@ role").
    `epigraph-operator grant-role --role role:platform-custodian --holder <the
    human's own agent> (--valid-to <RFC3339> | --open-ended) --reason <text>
    --apply`. Omit `--granted-by` only while no live custodian exists.
-   - Confirm that each request unit connects as `epigraph_app` with
-     `epigraph_bypass() = false`. On an armed database, its boot log must
+   - Confirm that each request unit acts as `epigraph_app` (its own login,
+     with `current_user = 'epigraph_app'`) with `epigraph_bypass() = false`. On an armed database, its boot log must
      carry the line that starts `operator binding ENFORCED:` (with the
      colon).
    - On an armed database, a request unit (`epigraph-api`, and
@@ -4316,6 +4337,7 @@ here. Each migration's header is authoritative and holds its full undo.
 | 193 | Apply BEFORE a binary whose `cache_owner_frame_for_claim` calls `epigraph_claim_is_compound` serves; without it every owner lookup errors (`42883`). An older binary ignores it. Undo only after rolling the binary back. |
 | 194 | **Binding order.** Migrate 194 only after every binary that can delete `mass_functions` rows on a privileged connection runs the release that keeps retracted rows on those paths. A binary still on an older build deletes a retracted row, the guard refuses it, and the whole administrative cascade aborts and is replayed for ever. Install a `delete-frames` built for 194 after the migrate. A precondition refuses (`55000`) unless `epigraph_cascade_delete_edge_bbas(uuid[], text)` has 117's body (md5 `39f3eacd53e7717a323759ec91b5c2c0`) and its `proconfig` is `search_path=pg_catalog, public` or `search_path=pg_catalog, public, pg_temp`. Check first with `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[], text)')`. Undo: `docs/runbooks/194-undo.sql`. |
 | 220 | `jobs.redelivery_count`, which bounds the crash re-delivery of a one-attempt job. **Migrate BEFORE** rolling out a `drain_jobs` built with the bounded reaper: its reaper names the column, and on a database below 220 every run fails at its first statement (`42703`) and drains nothing. An older `drain_jobs` ignores the column. Undo: `docs/runbooks/220-undo.sql`, only after rolling every such `drain_jobs` back. |
+| 230 | `epigraph_app` becomes NOLOGIN. **Binding order: move every service off an `epigraph_app` DSN first.** Create a login of its own for each one (section 2, step 4), point its DSN at it, restart it, and check `SELECT usename, count(*) FROM pg_stat_activity WHERE usename = 'epigraph_app' GROUP BY 1` returns no row. 230 refuses (`55000`, nothing changed, nothing recorded) while any session is logged in as `epigraph_app`, so migrating with the API still on the old DSN stops the deploy instead of the API; re-run `epigraph-migrate` once it has moved. It sees only OPEN sessions: a unit that is stopped during the migration, or a timer that connects now and then, passes it and is refused at its next connect (`role "epigraph_app" is not permitted to log in`), so find every DSN naming `epigraph_app` before migrating. A migration login that is neither a superuser nor holds CREATEROLE with ADMIN on the role fails it (`42501`) while the role can log in; run `ALTER ROLE epigraph_app NOLOGIN;` as a superuser and re-run. A cluster where the role is already NOLOGIN (every fresh install) is unchanged. Undo: `ALTER ROLE epigraph_app LOGIN;` as a superuser (the password is kept). |
 
 The md5 values above are copied from the migrations' own preconditions. They
 are properties of the public function bodies, not of any deployment.
@@ -4609,13 +4631,15 @@ Do not improvise it against a live database without that entry's context.
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |
-| `refusing to serve: RLS posture assertion failed` | The API connects as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
-| `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at the `epigraph_app` login. |
+| `refusing to serve: RLS posture assertion failed` | The API acts as `epigraph_app` and a protected table is not FORCEd. Typically this is a partial FORCE after an older `079-undo.sql`, or a table migrated in without FORCE (see 173). |
+| `operator binding NOT ENFORCED for the writer on this privileged DSN: ...`, then `ERROR: refusing to start: ...` | A request unit on a privileged DSN against an armed database. Point it at its own login in `epigraph_app` (step 4). |
 | `ERROR: stopping: ...` from a running unit | The same, found by the periodic re-check (`EPIGRAPH_REQUEST_UNIT_RECHECK_SECS`) after the database was armed. |
 | `operator binding is NOT ARMED on this database: ...` (WARN) | Expected until you arm (section 9). |
 | `migration 122 (operator binding) is not applied to this database; claim writes through default declarations fail closed until it is` | Run `epigraph-migrate`. |
 | `migrations: FAILED: REFUSING: the database has N applied migration version(s) this binary does not embed: ...` | A stale binary (section 4). Deploy the newer build, or `--allow-db-ahead` for a deliberate rollback. |
 | `migrations: FAILED: migrations were applied, but pgvector <v> is installed but 0.8.0 or newer is required ...` | The migrations ran; the installed pgvector is too old for semantic search (`hnsw.iterative_scan`). Install a newer pgvector on the server and run `ALTER EXTENSION vector UPDATE` in the database, then re-run `epigraph-migrate`. |
+| `migrations: FAILED: sqlx::migrate failed: while executing migration 230: error returned from database: 230 refuses: N session(s) are logged in as epigraph_app ...` | A service still logs in as `epigraph_app`. Nothing was changed. Move it to its own login (step 4), restart it, and re-run `epigraph-migrate` (section 11, 230). |
+| `FATAL: role "epigraph_app" is not permitted to log in` | A service still uses an `epigraph_app` DSN after migration 230. Move it to its own login (step 4); to restore service first, `ALTER ROLE epigraph_app LOGIN;` as a superuser. |
 | `migrations: FAILED: sqlx::migrate failed: ...` | Often an edited applied migration (a checksum mismatch), or a precondition `RAISE` (`55000` from the md5 preconditions, 074/075/084's pre-flights). Read the message, and the migration's header. |
 | `epigraph-migrate` exits 0 and applies nothing, but your migration is missing | A stale binary from a shared target directory (section 4). |
 | `Failed to bind the internal metrics listener; metrics will not be scrapeable. The API continues to serve.` | Another process holds `EPIGRAPH_METRICS_ADDR`. Give each instance its own. |

@@ -55,8 +55,17 @@ and fails closed at 060.
 
 ```bash
 export E2E_SU_DSN='postgres://<su>:<pw>@127.0.0.1:5433/epigraph_e2e_test'
-export E2E_APP_DSN='postgres://epigraph_app:<pw>@127.0.0.1:5433/epigraph_e2e_test'
+export E2E_APP_DSN='postgres://<app_login>:<pw>@127.0.0.1:5433/epigraph_e2e_test'
 ```
+
+`<app_login>` is a login in `epigraph_app` made the way docs/deploy.md
+(section 2, step 4) makes the API's: `LOGIN ... INHERIT IN ROLE
+epigraph_app`, then `ALTER ROLE <app_login> SET role = 'epigraph_app'`. Not
+`epigraph_app` itself: migration 230 makes that role NOLOGIN, and roles are
+cluster-wide, so once ANY database on the test cluster is migrated to 230 an
+`epigraph_app` DSN is refused (`role "epigraph_app" is not permitted to log
+in`), and a migration run while a harness session is logged in as it refuses
+instead.
 
 ## The two schema configurations
 
