@@ -384,9 +384,10 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
   the `--listen` authority. Behind a reverse proxy that preserves the
   client's `Host`, add the public name with `--allowed-host`
   (`EPIGRAPH_MCP_ALLOWED_HOSTS`, comma-separated). Ports are ignored.
-- Give every stdio server a declared identity: `--agent-key`, or
-  `--agent-model` with `--agent-system-prompt` or `--agent-system-prompt-hash`,
-  or the separate-signing-key mode (section 9). Without one, every launch
+- Give every stdio server a declared identity: `--agent-key` (a random key),
+  or the separate-signing-key mode (section 9). `--agent-model` and its prompt
+  inputs are refused at startup (backlog bfc2eff8): they derived the signing
+  key from public inputs. Without one, every launch
   prints `Generated new agent keypair` and a secret key to stderr, authors as
   a new random agent, and logs that the ownership-gated tools
   (`supersede_claim`, `mark_duplicate`, `resolve_backlog_item`) do not
@@ -510,8 +511,8 @@ For the others, anything else is off.
 | `--database-url` / `DATABASE_URL` | — (required) | The application DSN. The variable keeps it out of `argv`. |
 | `MAINTENANCE_DATABASE_URL` | must be unset | Set → exit 1, on every transport. |
 | `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` | unset | The signer's Ed25519 secret key, 64 hex characters. |
-| `--agent-model` / `EPIGRAPH_AGENT_MODEL`, with `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT` or `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | unset | Derives the identity deterministically from (model, prompt). It takes precedence over `--agent-key`. The raw prompt is hashed (BLAKE3) and never logged. |
-| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes the two options above. |
+| `--agent-model` / `EPIGRAPH_AGENT_MODEL`, `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT`, `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | must be unset | Set → exit 1 (backlog bfc2eff8). They derived the signing key as BLAKE3 of public inputs (model and prompt hash), which anyone can recompute. Use the separate-signing-key mode, whose identity the host derives with a secret, or `--agent-key`. |
+| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. |
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | Required for a TCP `--listen`. At least 32 bytes. The same secret as the API. |
@@ -4622,7 +4623,7 @@ Do not improvise it against a live database without that entry's context.
 | `ERROR: drain_jobs: ...` | `drain_jobs` could not start: the maintenance DSN is unset, names another database, or does not satisfy `epigraph_bypass()`. |
 | `42501 permission denied for function epigraph_live_memberships` | A login outside `epigraph_app` / `epigraph_maintenance` resolved a viewer. Use the maintenance login. |
 | Elevated tokens read nothing extra | Expected before migration 132, on a unit without the recorder declaration, on a privileged DSN, behind a transaction-mode pooler, or with a DSN role switch (section 10). |
-| The MCP server prints `Generated new agent keypair` | No declared identity. Set `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` or `--agent-model` with a prompt or prompt hash. |
+| The MCP server prints `Generated new agent keypair` | No declared identity. Set `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY`, or the separate-signing-key pair. |
 | MCP `embeddings disabled (no API key)` / `could not embed the query` | No `OPENAI_API_KEY` for the MCP server. Flat `recall` still works lexically. |
 | A burst of 400s from `POST /api/v1/webhooks` | Look for `Refusing webhook registration: target host failed egress vetting`, and check the API host's resolver first (section 7). |
 
