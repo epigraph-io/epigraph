@@ -3209,6 +3209,38 @@ restart.
   `application/octet-stream` Document. Undo only after rolling every 229
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **230**: public `agents_key_kind_seed_derived` (backlog bfc2eff8). Re-creates
+  061's `agents_key_kind_check` with `ed25519`, `derived` and a third value,
+  `seed-derived`: an agent whose `public_key` is the Ed25519 key of
+  `BLAKE3(<public seed>)` (a `did_key_for_author` name or ORCID, an `org:`
+  affiliation name, the legacy `workflow-ingest-system` constant, an unkeyed
+  LLM identity), whose private half anyone can compute. Such a key names the
+  agent and is not a signature verifier: `AgentRepository::public_key_if_signer`
+  filters `key_kind = 'ed25519'`, so it already excludes the new value. Not
+  `derived`: 077's `agents_provision` refuses that to the application role,
+  which creates author nodes, and 161 / 180 / 195 read `derived` as an LLM or
+  OAuth identity. One `ALTER TABLE` (drop and add), under `lock_timeout = 3s`;
+  the re-validation scans `agents` under the ALTER's lock. The column comment
+  names all three. Rows are marked AT INSERT
+  (`AgentRepository::create_seed_derived_conn`); existing rows are NOT
+  backfilled (PostgreSQL has no BLAKE3, and 118 bars the application role from
+  updating `key_kind`), so marking them is an operator task on the maintenance
+  role. No table, column, function, trigger, policy, index or grant. Pinned
+  by `epigraph-db/tests/agents_key_kind_seed_derived.rs` (the CHECK admits the
+  kind and still refuses a fourth, the verifier refuses it, the repository
+  insert on the application role, the undo),
+  `epigraph-db/tests/schema_contract.rs`, and the write paths' own tests
+  (`epigraph-mcp/tests/seed_derived_author_key_kind.rs`,
+  `epigraph-ingest-executor/tests/seed_derived_agents.rs`). Undo:
+  `docs/runbooks/230-undo.sql` (tested: run twice, it returns the constraint
+  and the column comment to 061's; it refuses, changing nothing, while any
+  `seed-derived` row exists). Checked before claiming: no migration on main or
+  any origin branch carries a `230`. **Deploy order:** migrate before rolling
+  out a 230 binary (its author, org, system-agent and `epigraph-operator link
+  --agent-model` inserts are refused 23514 on an unmigrated database); a
+  pre-230 binary reads a `seed-derived` row like any other. Undo only after
+  rolling every 230 binary back. **Applied to throwaway databases only, NOT
+  to any deployed database.**
 
 ## `-- no-transaction` migrations
 
