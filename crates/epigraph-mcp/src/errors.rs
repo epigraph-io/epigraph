@@ -126,6 +126,13 @@ pub fn federated_call_error(
                  re-dials it on a timer and its tools return when it answers."
             )
         }
+        F::Exchange(ref detail) => {
+            tracing::warn!(target: "mcp.federation", extension, tool, detail = %detail, "federated call refused: no extension token");
+            format!(
+                "the gateway could not obtain a token for extension `{extension}` ({detail}); \
+                 `{tool}` was not run"
+            )
+        }
         F::Request(ref detail) => {
             tracing::error!(target: "mcp.federation", extension, tool, detail = %detail, "federated call failed");
             format!(
