@@ -23,6 +23,19 @@
 //!
 //! The same ORCID always produces the same `did:key`. For authors without an
 //! ORCID, the normalized name hash serves as fallback.
+//!
+//! # These keys are identifiers, never signers
+//!
+//! Every unkeyed derivation here (`keypair_from_orcid`, `keypair_from_name`,
+//! `keypair_from_llm_agent[_prehashed]`) uses `BLAKE3(seed)` as the Ed25519
+//! SECRET key, and every seed is public (a name, an ORCID, a model id and the
+//! hash of prompt files). Anyone who knows the seed holds the private key. Use
+//! them to NAME an agent (its public key, its `did:key`); never sign with
+//! them, and never treat a signature under one as proof of anything (backlog
+//! bfc2eff8). An agent row created for such a key is stored with
+//! `key_kind = 'seed-derived'`, which no verifier accepts. A signer needs a
+//! random key, or `keypair_from_llm_agent_keyed`, whose seed is keyed with a
+//! secret the host keeps.
 
 use crate::errors::CryptoError;
 use crate::signer::AgentSigner;
