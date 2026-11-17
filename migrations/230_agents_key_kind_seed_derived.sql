@@ -39,11 +39,21 @@
 -- are seed-derived, and 118 bars the application role from updating
 -- `key_kind`. Marking them is an operator task on the maintenance role.
 --
--- No table, column, function, trigger, policy, index or grant. Every reader
--- that filters `key_kind = 'ed25519'` (`AgentRepository::public_key_if_signer`,
--- `ensure_for_client`'s real-signer adoption) already excludes the new value;
--- 077's `agents_provision` admits it to the application role (it refuses only
--- `derived`).
+-- Every reader that filters `key_kind = 'ed25519'`
+-- (`AgentRepository::public_key_if_signer`, `ensure_for_client`'s real-signer
+-- adoption) already excludes the new value; 077's `agents_provision` admits
+-- it to the application role (it refuses only `derived`).
+--
+-- One function changes: 161's re-runnable `epigraph_backfill_legacy_agent_keys()`
+-- gives every agent without one an ACTIVE `identity-legacy` row in
+-- `agent_keys`, an ATTESTED key that `verify_claim` binds signatures to. Run
+-- after 230 (the cut-over, `tenancy_backfill`), it would attest every
+-- seed-derived key, the opposite of this migration. It now skips
+-- `key_kind = 'seed-derived'`; everything else is 161's definition verbatim
+-- (same signature, SECURITY DEFINER, search_path, owner and grants, which
+-- CREATE OR REPLACE keeps). Rows it already wrote are not touched: retiring
+-- them is the operator's rotation step. No table, column, trigger, policy,
+-- index or grant changes.
 --
 -- ===================================================================
 -- 2. UNDO
@@ -51,7 +61,7 @@
 --
 -- `docs/runbooks/230-undo.sql`. It refuses while any `seed-derived` row
 -- exists (re-narrowing the CHECK would fail on them anyway); roll every
--- binary that writes the kind back first.
+-- binary that writes the kind back first. It restores 161's backfill body.
 
 SET LOCAL lock_timeout = '3s';
 
@@ -59,6 +69,35 @@ ALTER TABLE public.agents
     DROP CONSTRAINT IF EXISTS agents_key_kind_check,
     ADD CONSTRAINT agents_key_kind_check
         CHECK (key_kind IN ('ed25519', 'derived', 'seed-derived'));
+
+-- 161's backfill, plus the one predicate marked below.
+CREATE OR REPLACE FUNCTION public.epigraph_backfill_legacy_agent_keys()
+RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    n integer;
+BEGIN
+    INSERT INTO public.agent_keys (agent_id, public_key, key_type, status, valid_from)
+    SELECT a.id, a.public_key, 'identity-legacy', 'active', a.created_at
+      FROM public.agents a
+     WHERE NOT EXISTS (SELECT 1 FROM public.agent_keys k
+                        WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')
+       -- A host-registered identity's key never signs (D1): its signatures
+       -- bind through its `signing` key, so it gets no legacy row.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                        WHERE s.agent_id = a.id)
+       -- A key already retired in agent_keys (rotated or revoked) never comes
+       -- back as an ACTIVE legacy key: rotation leaves agents.public_key as it
+       -- was, so this column alone would re-legitimise it for key binding.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_keys r
+                        WHERE r.public_key = a.public_key AND r.status <> 'active')
+       -- 230: a key derived from a public seed is computable by anyone; it is
+       -- never attested as a signing key.
+       AND a.key_kind <> 'seed-derived';
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END $$;
 
 COMMENT ON COLUMN public.agents.key_kind IS
   '''ed25519'': public_key is a real Ed25519 verifier (the default). '

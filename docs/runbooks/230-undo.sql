@@ -18,7 +18,9 @@
 --      WHERE key_kind = 'seed-derived';
 --
 -- WHAT IT DOES: re-creates `agents_key_kind_check` with migration 061's two
--- values, in 061's spelling, and restores 061's column comment. Tested by
+-- values, in 061's spelling, restores 061's column comment, and restores
+-- 161's `epigraph_backfill_legacy_agent_keys()` body (without 230's
+-- seed-derived skip; owner and grants are kept by CREATE OR REPLACE). Tested by
 -- `epigraph-db/tests/agents_key_kind_seed_derived.rs` (run twice, it returns
 -- the constraint to its definition below 230; it refuses while a
 -- seed-derived row exists).
@@ -45,6 +47,32 @@ $$;
 ALTER TABLE public.agents
     DROP CONSTRAINT IF EXISTS agents_key_kind_check,
     ADD CONSTRAINT agents_key_kind_check CHECK (key_kind IN ('ed25519','derived'));
+
+-- Migration 161's backfill, verbatim.
+CREATE OR REPLACE FUNCTION public.epigraph_backfill_legacy_agent_keys()
+RETURNS integer
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    n integer;
+BEGIN
+    INSERT INTO public.agent_keys (agent_id, public_key, key_type, status, valid_from)
+    SELECT a.id, a.public_key, 'identity-legacy', 'active', a.created_at
+      FROM public.agents a
+     WHERE NOT EXISTS (SELECT 1 FROM public.agent_keys k
+                        WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')
+       -- A host-registered identity's key never signs (D1): its signatures
+       -- bind through its `signing` key, so it gets no legacy row.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s
+                        WHERE s.agent_id = a.id)
+       -- A key already retired in agent_keys (rotated or revoked) never comes
+       -- back as an ACTIVE legacy key: rotation leaves agents.public_key as it
+       -- was, so this column alone would re-legitimise it for key binding.
+       AND NOT EXISTS (SELECT 1 FROM public.agent_keys r
+                        WHERE r.public_key = a.public_key AND r.status <> 'active');
+    GET DIAGNOSTICS n = ROW_COUNT;
+    RETURN n;
+END $$;
 
 COMMENT ON COLUMN public.agents.key_kind IS
   '''derived'' means public_key is blake3::derive_key("epigraph-oauth-client", '

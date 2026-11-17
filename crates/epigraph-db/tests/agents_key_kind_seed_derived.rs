@@ -113,6 +113,65 @@ async fn the_repository_insert_stores_the_kind_on_the_app_role(pool: PgPool) {
     assert!(matches!(err, DbError::DuplicateKey { .. }), "{err:?}");
 }
 
+/// 161's re-runnable `epigraph_backfill_legacy_agent_keys()` gives every agent
+/// without one an ACTIVE `identity-legacy` row, an ATTESTED key that
+/// `verify_claim` binds signatures to. Since 230 it skips a seed-derived agent
+/// (its key is computable by anyone), and still keys an `ed25519` agent
+/// created beside it (calibration: the backfill ran and was not a no-op).
+/// Run as the maintenance role, which is who runs it at a cut-over.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_legacy_key_backfill_never_attests_a_seed_derived_key(pool: PgPool) {
+    let seeded = epigraph_crypto::did_key::did_key_for_author(None, "Corvina Aldermoot").1;
+    let seed_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, key_kind) VALUES ($1, 'seed-derived') RETURNING id",
+    )
+    .bind(seeded.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("seed-derived agent");
+    let real = epigraph_crypto::AgentSigner::generate().public_key();
+    let real_id: Uuid =
+        sqlx::query_scalar("INSERT INTO agents (public_key) VALUES ($1) RETURNING id")
+            .bind(real.as_slice())
+            .fetch_one(&pool)
+            .await
+            .expect("ed25519 agent");
+
+    let added: i32 =
+        viewer_fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let n: i32 = sqlx::query_scalar("SELECT public.epigraph_backfill_legacy_agent_keys()")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("maintenance runs the backfill");
+            (conn, n)
+        })
+        .await;
+    assert!(added >= 1, "calibration: the backfill added rows");
+
+    let legacy = |id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM agent_keys WHERE agent_id = $1 AND key_type = 'identity-legacy'",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("legacy rows")
+        }
+    };
+    assert_eq!(
+        legacy(real_id).await,
+        1,
+        "calibration: the ed25519 agent is keyed"
+    );
+    assert_eq!(
+        legacy(seed_id).await,
+        0,
+        "a seed-derived key must never become an attested identity-legacy key"
+    );
+}
+
 fn up_to(max: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
@@ -146,6 +205,15 @@ async fn constraint_def(pool: &PgPool) -> String {
     .fetch_one(pool)
     .await
     .expect("agents_key_kind_check exists")
+}
+
+async fn backfill_def(pool: &PgPool) -> String {
+    sqlx::query_scalar(
+        "SELECT pg_get_functiondef('public.epigraph_backfill_legacy_agent_keys()'::regprocedure)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("the backfill exists")
 }
 
 async fn column_comment(pool: &PgPool) -> String {
@@ -184,12 +252,14 @@ async fn run_undo(pool: &PgPool) -> Result<(), sqlx::Error> {
 async fn the_230_undo_restores_the_catalog_below_230(pool: PgPool) {
     migrate(&pool, &up_to(229)).await;
     let (below, below_comment) = (constraint_def(&pool).await, column_comment(&pool).await);
+    let below_backfill = backfill_def(&pool).await;
     assert!(!below.contains("seed-derived"), "{below}");
 
     migrate(&pool, &MIGRATOR).await;
     let at_230 = constraint_def(&pool).await;
     assert!(at_230.contains("'seed-derived'"), "{at_230}");
     assert_ne!(column_comment(&pool).await, below_comment);
+    assert!(backfill_def(&pool).await.contains("seed-derived"));
 
     let key = epigraph_crypto::did_key::did_key_for_author(None, "Undo Probe").1;
     let row: Uuid = sqlx::query_scalar(
@@ -211,6 +281,7 @@ async fn the_230_undo_restores_the_catalog_below_230(pool: PgPool) {
     run_undo(&pool).await.expect("undo");
     assert_eq!(constraint_def(&pool).await, below);
     assert_eq!(column_comment(&pool).await, below_comment);
+    assert_eq!(backfill_def(&pool).await, below_backfill);
     run_undo(&pool).await.expect("undo, second run");
     assert_eq!(constraint_def(&pool).await, below);
 }

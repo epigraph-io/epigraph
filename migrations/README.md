@@ -3225,16 +3225,22 @@ restart.
   (`AgentRepository::create_seed_derived_conn`); existing rows are NOT
   backfilled (PostgreSQL has no BLAKE3, and 118 bars the application role from
   updating `key_kind`), so marking them is an operator task on the maintenance
-  role. No table, column, function, trigger, policy, index or grant. Pinned
-  by `epigraph-db/tests/agents_key_kind_seed_derived.rs` (the CHECK admits the
-  kind and still refuses a fourth, the verifier refuses it, the repository
-  insert on the application role, the undo),
+  role. One function changes: 161's re-runnable
+  `epigraph_backfill_legacy_agent_keys()` (SECURITY DEFINER, maintenance-owned)
+  now skips `key_kind = 'seed-derived'`, so a cut-over or `tenancy_backfill`
+  run after 230 never gives a publicly computable key an attested
+  `identity-legacy` row; otherwise 161's body verbatim, and CREATE OR REPLACE
+  keeps its owner, grants and search_path. No table, column, trigger, policy,
+  index or grant. Pinned by `epigraph-db/tests/agents_key_kind_seed_derived.rs`
+  (the CHECK admits the kind and still refuses a fourth, the verifier refuses
+  it, the repository insert on the application role, the backfill skips it
+  while still keying an ed25519 agent, the undo),
   `epigraph-db/tests/schema_contract.rs`, and the write paths' own tests
   (`epigraph-mcp/tests/seed_derived_author_key_kind.rs`,
   `epigraph-ingest-executor/tests/seed_derived_agents.rs`). Undo:
   `docs/runbooks/230-undo.sql` (tested: run twice, it returns the constraint
-  and the column comment to 061's; it refuses, changing nothing, while any
-  `seed-derived` row exists). Checked before claiming: no migration on main or
+  and the column comment to 061's and the backfill to 161's definition; it
+  refuses, changing nothing, while any `seed-derived` row exists). Checked before claiming: no migration on main or
   any origin branch carries a `230`. **Deploy order:** migrate before rolling
   out a 230 binary (its author, org, system-agent and `epigraph-operator link
   --agent-model` inserts are refused 23514 on an unmigrated database); a
