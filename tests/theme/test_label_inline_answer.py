@@ -147,6 +147,50 @@ def test_an_unusable_inline_answer_is_refused(stub_claude, tmp_path, stdout):
     assert _call(stub_claude, stdout, tmp_path) is None
 
 
+# The schema the prompt shows, spelled out here (not read from the module) so
+# the refusal is checked against the literal text a model would echo.
+TEMPLATE = {
+    "label": "short topic name (3-8 words)",
+    "description": "One sentence describing the cluster's subject matter, "
+                   "methodology focus, or domain.",
+}
+ANSWER = {"label": INLINE_LABEL, "description": INLINE_DESCRIPTION}
+
+
+@pytest.mark.parametrize("result", [
+    "Per claim [1] and [2], the answer is: " + json.dumps(ANSWER),
+    "The schema was " + json.dumps(TEMPLATE) + ", so:\n" + fenced(ANSWER),
+], ids=["citation-first", "schema-echo-first"])
+def test_the_answer_after_a_refused_value_is_found(stub_claude, tmp_path, result):
+    """A `[1]` citation or an echo of the prompt's schema before the answer is
+    skipped, not taken for the answer (which would refuse a good answer, or
+    store the placeholder label)."""
+    assert _call(stub_claude, envelope(result), tmp_path) == ANSWER
+
+
+def test_an_echo_of_the_schema_alone_is_refused_inline(stub_claude, tmp_path):
+    assert _call(stub_claude, envelope(fenced(TEMPLATE)), tmp_path) is None
+
+
+def test_an_echo_of_the_schema_alone_is_refused_in_the_file(stub_claude, tmp_path):
+    set_stdout, _prompts, result_dir = stub_claude
+    set_stdout(envelope("I wrote the file."))
+    result_path = result_dir / "theme_0badf11e.json"
+    result_path.write_text(json.dumps(TEMPLATE))
+    assert L.call_claude_cli("label this", str(result_path), cwd=str(tmp_path)) is None
+
+
+def test_the_prompt_shows_the_schema_the_refusal_names():
+    """The refused placeholder is the one the prompt actually shows."""
+    assert (L.TEMPLATE_LABEL, L.TEMPLATE_DESCRIPTION) == (
+        TEMPLATE["label"], TEMPLATE["description"])
+    prompt, _path = L.build_prompt(
+        {"id": "deadbeef-0000", "claim_count": 1,
+         "samples": [{"agent": "a", "content": "c"}]})
+    assert f'"label": "{L.TEMPLATE_LABEL}"' in prompt
+    assert f'"description": "{L.TEMPLATE_DESCRIPTION}"' in prompt
+
+
 def test_the_envelope_itself_is_never_taken_for_the_answer(stub_claude, tmp_path):
     """The envelope is the first {...} on stdout and carries no label; a raw scan
     of stdout would decode it first. Its `result` is what is parsed."""

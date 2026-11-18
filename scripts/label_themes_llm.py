@@ -128,6 +128,14 @@ def load_themes_with_samples(conn, limit=None):
     return themes
 
 
+# The placeholder values the prompt's schema shows. A model that echoes the
+# schema back has not answered, so valid_label_answer refuses this label.
+TEMPLATE_LABEL = "short topic name (3-8 words)"
+TEMPLATE_DESCRIPTION = (
+    "One sentence describing the cluster's subject matter, methodology focus, or domain."
+)
+
+
 def build_prompt(theme, kind="theme"):
     """Build the LLM prompt for theme (or, with kind="neighborhood", graph
     neighbourhood) labeling. The kind also prefixes the result file, so a
@@ -152,8 +160,8 @@ Write your response as a JSON file to: {result_path}
 
 The JSON must have exactly these fields:
 {{
-  "label": "short topic name (3-8 words)",
-  "description": "One sentence describing the cluster's subject matter, methodology focus, or domain."
+  "label": "{TEMPLATE_LABEL}",
+  "description": "{TEMPLATE_DESCRIPTION}"
 }}
 
 Write ONLY the JSON file. No other output."""
@@ -162,11 +170,13 @@ Write ONLY the JSON file. No other output."""
 
 def valid_label_answer(answer):
     """`answer` when it is a usable label answer, else None: a dict whose
-    `label` is a non-empty string and whose `description` is a string."""
+    `label` is a non-empty string other than the prompt's placeholder
+    (TEMPLATE_LABEL) and whose `description` is a string."""
     if (
         isinstance(answer, dict)
         and isinstance(answer.get("label"), str)
         and answer["label"].strip()
+        and answer["label"].strip() != TEMPLATE_LABEL
         and isinstance(answer.get("description"), str)
     ):
         return answer
@@ -179,11 +189,12 @@ def inline_label_answer(stdout):
 
     stdout is the CLI's envelope; only its `result` string is the model's
     answer (the envelope is itself the first object on stdout, so stdout is
-    never scanned raw). An error envelope is refused. In `result` the FIRST
-    JSON value that starts at a `{` or `[` is the answer, which skips prose and
-    a code fence around it; it is accepted only if valid_label_answer accepts
-    it, so a list (even one wrapping a well-formed answer) is refused rather
-    than searched.
+    never scanned raw). An error envelope is refused. In `result` the answer is
+    the first top-level JSON value (one that starts at a `{` or `[`, which
+    skips prose and a code fence around it) that valid_label_answer accepts.
+    A value it refuses (a `[1]` citation, an echo of the prompt's schema) is
+    skipped WHOLE, never searched inside, so a list wrapping a well-formed
+    answer is still refused.
     """
     try:
         envelope = json.loads(stdout)
@@ -195,14 +206,19 @@ def inline_label_answer(stdout):
     if not isinstance(text, str):
         return None
     decoder = json.JSONDecoder()
-    for i, ch in enumerate(text):
-        if ch not in "{[":
+    i = 0
+    while i < len(text):
+        if text[i] not in "{[":
+            i += 1
             continue
         try:
-            answer, _end = decoder.raw_decode(text, i)
+            answer, end = decoder.raw_decode(text, i)
         except ValueError:
+            i += 1
             continue
-        return valid_label_answer(answer)
+        if valid_label_answer(answer) is not None:
+            return answer
+        i = end
     return None
 
 
