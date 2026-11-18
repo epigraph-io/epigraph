@@ -32,6 +32,7 @@
 // `protected` chain of the buildable variant.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
+    use crate::middleware::bearer::test_auth_with_scopes;
     use crate::routes::batch::batch_create_claims;
     use crate::routes::challenge::submit_challenge;
     use crate::routes::rag::rag_context;
@@ -41,7 +42,7 @@ mod malformed_input_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::routing::{get, post};
-    use axum::Router;
+    use axum::{Extension, Router};
     use epigraph_crypto::ContentHasher;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -52,6 +53,7 @@ mod malformed_input_tests {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(Extension(test_auth_with_scopes(&["claims:write"])))
             .with_state(state)
     }
 
@@ -76,6 +78,7 @@ mod malformed_input_tests {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/query/rag", get(rag_context))
+            .layer(Extension(test_auth_with_scopes(&["claims:read"])))
             .with_state(state)
     }
 
@@ -84,6 +87,7 @@ mod malformed_input_tests {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/webhooks", post(register_webhook))
+            .layer(Extension(test_auth_with_scopes(&["webhooks:write"])))
             .with_state(state)
     }
 
@@ -1027,6 +1031,9 @@ mod concurrency_tests {
                 tokio::spawn(async move {
                     let router = Router::new()
                         .route("/api/v1/submit/packet", post(submit_packet))
+                        .layer(axum::Extension(
+                            crate::middleware::bearer::test_auth_with_scopes(&["claims:write"]),
+                        ))
                         .with_state(state);
 
                     let body = valid_packet_json();

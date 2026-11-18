@@ -704,6 +704,7 @@ mod tests {
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
+        use crate::middleware::bearer::test_auth_with_scopes;
         use crate::state::ApiConfig;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -722,6 +723,10 @@ mod tests {
             Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&[
+                    "claims:read",
+                    "claims:write",
+                ])))
                 .with_state(state)
         }
 
@@ -895,6 +900,7 @@ mod tests {
             // Build router with the same state
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -1112,6 +1118,7 @@ mod tests {
             // Build router with same state for the GET endpoint
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -1177,6 +1184,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             // List for claim A → expect 2

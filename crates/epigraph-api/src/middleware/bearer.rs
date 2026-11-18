@@ -889,6 +889,37 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
     }
 }
 
+/// The `AuthContext` that [`bearer_auth_middleware`] installs for a service
+/// principal holding exactly `scopes`, for unit-test routers.
+///
+/// A test router built from a bare `Router::new()` has no bearer middleware,
+/// so a handler that takes [`ViewerExtractor`] (or refuses an absent
+/// `AuthContext`) answers 401 before its own logic runs. Layer this with
+/// `.layer(axum::Extension(test_auth_with_scopes(&[..])))` to reach the
+/// handler. Build it ONCE per router: `client_id`, `agent_id` and `owner_id`
+/// are one fresh uuid, and handlers that check ownership (webhooks) compare
+/// it across requests.
+///
+/// Pass the scopes the route really checks, not a superset, so a test still
+/// fails if a handler's scope requirement changes.
+#[cfg(test)]
+pub(crate) fn test_auth_with_scopes(scopes: &[&str]) -> AuthContext {
+    let principal = uuid::Uuid::new_v4();
+    AuthContext {
+        client_id: principal,
+        agent_id: Some(principal),
+        owner_id: Some(principal),
+        client_type: ClientType::Service,
+        scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+        jti: uuid::Uuid::new_v4(),
+        family_id: None,
+        elevation_claim: None,
+        elevation: None,
+        admin_scopes: AdminScopePosture::Unarmed,
+        delegated_by: None,
+    }
+}
+
 #[cfg(test)]
 mod require_scope_tests {
     use super::*;

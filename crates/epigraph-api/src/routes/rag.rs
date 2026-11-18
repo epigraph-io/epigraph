@@ -774,6 +774,9 @@ mod tests {
             let state = AppState::new(ApiConfig::default());
             Router::new()
                 .route("/api/v1/query/rag", get(rag_context))
+                .layer(axum::Extension(
+                    crate::middleware::bearer::test_auth_with_scopes(&["claims:read"]),
+                ))
                 .with_state(state)
         }
 

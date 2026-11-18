@@ -2503,6 +2503,9 @@ mod tests {
                 .route("/api/v1/webhooks", get(list_webhooks))
                 .route("/api/v1/webhooks/:id", get(get_webhook))
                 .route("/api/v1/webhooks/:id", delete(delete_webhook))
+                .layer(axum::Extension(
+                    crate::middleware::bearer::test_auth_with_scopes(&["webhooks:write"]),
+                ))
                 .with_state(state)
         }
 
@@ -2513,6 +2516,9 @@ mod tests {
                 .route("/api/v1/webhooks", get(list_webhooks))
                 .route("/api/v1/webhooks/:id", get(get_webhook))
                 .route("/api/v1/webhooks/:id", delete(delete_webhook))
+                .layer(axum::Extension(
+                    crate::middleware::bearer::test_auth_with_scopes(&["webhooks:write"]),
+                ))
                 .with_state(state)
         }
 
