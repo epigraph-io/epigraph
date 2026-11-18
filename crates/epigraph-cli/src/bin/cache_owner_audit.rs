@@ -76,7 +76,9 @@ struct Cli {
     statement_timeout_ms: Option<u64>,
 
     /// An agent whose edge signatures mark an edge as created over HTTP, besides
-    /// the API's own signer agent (found by its display name). Repeatable.
+    /// the API's own signer agent (found by its display name). Repeatable. When
+    /// several agents carry that display name, the run is refused unless this
+    /// is given, and then only these agents count.
     #[arg(long, value_name = "AGENT_ID")]
     api_signer: Vec<uuid::Uuid>,
 }

@@ -218,6 +218,7 @@ struct World {
     signed_edge: Uuid,
     mcp_edge: Uuid,
     retargeted_edge: Uuid,
+    api_signer: Uuid,
 }
 
 async fn seed_world(pool: &PgPool) -> World {
@@ -300,7 +301,8 @@ async fn seed_world(pool: &PgPool) -> World {
     let http_edge = edge(pool, strong_source, target, "supports").await;
     http_create_provenance(pool, http_edge).await;
     let signed_edge = edge(pool, strong_source, target, "supports").await;
-    sign(pool, signed_edge, api_signer_agent(pool).await).await;
+    let api_signer = api_signer_agent(pool).await;
+    sign(pool, signed_edge, api_signer).await;
     let mcp_edge = edge(pool, factorless_source, target, "supports").await;
     sign(pool, mcp_edge, agent).await;
 
@@ -355,7 +357,14 @@ async fn seed_world(pool: &PgPool) -> World {
         signed_edge,
         mcp_edge,
         retargeted_edge,
+        api_signer,
     }
+}
+
+async fn try_audit(pool: &PgPool, opts: &Options) -> Result<Report, String> {
+    let (_scoped, viewer) = viewer_fixture::bypass(pool).await;
+    let mut conn = pool.acquire().await.expect("a connection");
+    run_read_only(&mut conn, &viewer, opts, &mut Vec::new()).await
 }
 
 async fn audit(pool: &PgPool, opts: &Options) -> (Report, Vec<serde_json::Value>) {
@@ -550,6 +559,48 @@ fn the_api_signer_name_is_the_apis() {
         epigraph_cli::cache_owner_audit::API_SIGNER_DISPLAY_NAME,
         epigraph_api::edge_signer::SIGNER_DISPLAY_NAME
     );
+}
+
+/// `agents.display_name` is not unique: a second agent registered under the
+/// API signer's name would turn its own edges into "HTTP" ones. The audit
+/// refuses an ambiguous name until the signer is named, and then counts only
+/// the named agent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_ambiguous_signer_name_refuses_until_the_signer_is_named(pool: PgPool) {
+    let w = seed_world(&pool).await;
+    let (one, _) = audit(&pool, &Options::default()).await;
+    assert_eq!(one.api_signer_agents, vec![w.api_signer]);
+    assert_eq!(one.edges_without_bba_http_signed, 1);
+
+    let impostor = api_signer_agent(&pool).await;
+    let refused = try_audit(&pool, &Options::default()).await;
+    let err = refused.expect_err("two agents carry the API signer's name");
+    assert!(err.contains("--api-signer"), "{err}");
+
+    let (named, _) = audit(
+        &pool,
+        &Options {
+            api_signers: vec![w.api_signer],
+            ..Options::default()
+        },
+    )
+    .await;
+    assert_eq!(named.api_signer_agents, vec![w.api_signer]);
+    assert_eq!(named.api_signer_name_matches.len(), 2);
+    assert_eq!(named.edges_without_bba_http_signed, 1);
+
+    // The named list REPLACES the ambiguous name match: naming the impostor
+    // alone leaves the API-signed edge unmarked.
+    let (other, _) = audit(
+        &pool,
+        &Options {
+            api_signers: vec![impostor],
+            ..Options::default()
+        },
+    )
+    .await;
+    assert_eq!(other.api_signer_agents, vec![impostor]);
+    assert_eq!(other.edges_without_bba_http_signed, 0);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

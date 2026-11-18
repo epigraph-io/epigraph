@@ -46,6 +46,10 @@
 //!      (`epigraph-api` attests its edges with a separate key held by a
 //!      separate agent, named [`API_SIGNER_DISPLAY_NAME`], so an API signature
 //!      is never an MCP one), or an agent passed in [`Options::api_signers`].
+//!      The display name is not unique (`agents.display_name` has no unique
+//!      index), so when more than one agent carries it the name identifies
+//!      nothing: the audit then refuses unless the signer is named with
+//!      [`Options::api_signers`], and the named agents replace the name match.
 //!      Absent for an edge written before the API had its key, or by an API
 //!      with no key configured (it writes unsigned), or one signing as a
 //!      borrowed agent (its boot warns).
@@ -124,9 +128,11 @@ pub struct Options {
     pub sample: usize,
     /// `SET LOCAL statement_timeout` inside the transaction, in milliseconds.
     pub statement_timeout_ms: Option<u64>,
-    /// Agents whose edge signatures mark an edge as created over HTTP, besides
-    /// every agent named [`API_SIGNER_DISPLAY_NAME`] (e.g. an agent the API
-    /// signed as with a borrowed key).
+    /// Agents whose edge signatures mark an edge as created over HTTP. Added
+    /// to the ONE agent named [`API_SIGNER_DISPLAY_NAME`] (e.g. an agent the
+    /// API signed as with a borrowed key). When several agents carry that
+    /// name, the name is ambiguous: these agents are then the only signers,
+    /// and the audit refuses to run while this list is empty.
     pub api_signers: Vec<Uuid>,
 }
 
@@ -254,6 +260,9 @@ pub struct Report {
     pub epistemic_relationships: Vec<String>,
     /// The agents whose edge signatures count as HTTP origin.
     pub api_signer_agents: Vec<Uuid>,
+    /// Every agent registered under [`API_SIGNER_DISPLAY_NAME`]; more than one
+    /// means the name is ambiguous and only the named signers were used.
+    pub api_signer_name_matches: Vec<Uuid>,
     pub edges_scanned: u64,
     pub edges_complete: bool,
     /// Category (3), every origin.
@@ -524,6 +533,27 @@ type EdgeTuple = (
     Option<f64>,
 );
 
+/// The agents whose signature marks an edge as HTTP-created: the ONE agent
+/// named [`API_SIGNER_DISPLAY_NAME`] plus `explicit`; when several agents
+/// carry the name it identifies nothing, so only `explicit` counts, and an
+/// empty `explicit` is refused (any agent can register under the name, and
+/// would turn its own edges into "HTTP" ones, breaking the lower bound).
+fn resolve_signers(named: &[Uuid], explicit: &[Uuid]) -> Result<Vec<Uuid>, String> {
+    if named.len() > 1 {
+        if explicit.is_empty() {
+            let ids: Vec<String> = named.iter().map(Uuid::to_string).collect();
+            return Err(format!(
+                "{} agents are named {API_SIGNER_DISPLAY_NAME} ({}), so the name does not \
+                 identify the API's edge signer; name it with --api-signer",
+                named.len(),
+                ids.join(", ")
+            ));
+        }
+        return Ok(explicit.to_vec());
+    }
+    Ok(named.iter().chain(explicit).copied().collect())
+}
+
 /// Every claim-to-claim edge id that keys at least one mass function, on any
 /// claim, retracted rows included: the wire's "ever wired" test
 /// (`MassFunctionRepository::exists_for_perspective`, which has no claim
@@ -589,15 +619,16 @@ async fn audit_edges(
 ) -> Result<(), String> {
     let relationships = epistemic_relationships(conn).await?;
     report.epistemic_relationships.clone_from(&relationships);
-    let mut signers: Vec<Uuid> =
+    let named: Vec<Uuid> =
         sqlx::query_scalar("SELECT a.id FROM agents a WHERE a.display_name = $1 ORDER BY a.id")
             .bind(API_SIGNER_DISPLAY_NAME)
             .fetch_all(&mut *conn)
             .await
             .map_err(|e| format!("the API signer agents: {e}"))?;
-    signers.extend(opts.api_signers.iter().copied());
+    let mut signers = resolve_signers(&named, &opts.api_signers)?;
     signers.sort_unstable();
     signers.dedup();
+    report.api_signer_name_matches = named;
     report.api_signer_agents.clone_from(&signers);
     if relationships.is_empty() {
         report.edges_complete = true;
@@ -723,6 +754,15 @@ mod tests {
         assert_eq!(room(Some(250), 200, 100), 50);
         assert_eq!(room(Some(250), 250, 100), 0);
         assert_eq!(room(Some(10), 0, 100), 10);
+    }
+
+    #[test]
+    fn an_ambiguous_signer_name_needs_named_signers() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(resolve_signers(&[a], &[c]).unwrap(), vec![a, c]);
+        assert_eq!(resolve_signers(&[], &[c]).unwrap(), vec![c]);
+        assert!(resolve_signers(&[a, b], &[]).is_err());
+        assert_eq!(resolve_signers(&[a, b], &[c]).unwrap(), vec![c]);
     }
 
     #[test]
