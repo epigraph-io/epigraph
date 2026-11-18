@@ -27,13 +27,24 @@
 //!    not `Neutral`, decided by the engine function per stored relationship)
 //!    with NO mass function keyed on the edge id (any row, retracted
 //!    included: the wire's own "ever wired" test,
-//!    `MassFunctionRepository::exists_for_perspective`). Each carries
-//!    `http_created`: the edge has a `provenance_log` row
-//!    (`record_type = 'edge'`, `action = 'create'`), which only `POST /edges`
-//!    and `POST /claims/:id/relate` write. MCP writes none, so the HTTP count
-//!    is the subset with that row. It is a LOWER BOUND on edges created over
-//!    HTTP: the provenance write is best-effort (after the commit, failure only
-//!    logged). And `source_state` replays the wire's own gate
+//!    `MassFunctionRepository::exists_for_perspective`). Each carries two
+//!    HTTP-origin markers, neither complete alone, so `http_created` is
+//!    either one:
+//!    * `http_signed`: `edges.signer_id` is the API's OWN edge signer
+//!      (`epigraph-api` attests its edges with a separate key held by a
+//!      separate agent, named [`API_SIGNER_DISPLAY_NAME`], so an API signature
+//!      is never an MCP one), or an agent passed in [`Options::api_signers`].
+//!      Absent for an edge written before the API had its key, or by an API
+//!      with no key configured (it writes unsigned), or one signing as a
+//!      borrowed agent (its boot warns).
+//!    * `http_provenance`: a `provenance_log` row (`record_type = 'edge'`,
+//!      `action = 'create'`), which only `POST /edges` and
+//!      `POST /claims/:id/relate` write, and MCP never does. Best-effort:
+//!      written after the commit, a failure only logged.
+//!
+//!    So the HTTP count is a LOWER BOUND on edges created over HTTP; the
+//!    all-origins count is the upper one. And `source_state` replays the
+//!    wire's own gate
 //!    (`restrict_edge_source` on the source's CURRENT cache): `factorless`
 //!    (no belief interval, the wire skips) and `vacuous` (the wire stores
 //!    nothing) are not wiring failures; only `would_wire` is.
@@ -76,6 +87,11 @@ pub const DEFAULT_PAGE: i64 = 1000;
 /// Largest accepted page.
 pub const MAX_PAGE: i64 = 10_000;
 
+/// The display name `epigraph-api` registers its own edge-signer agent
+/// under (`epigraph_api::edge_signer::SIGNER_DISPLAY_NAME`; this crate does
+/// not link the API, and a test pins the two equal).
+pub const API_SIGNER_DISPLAY_NAME: &str = "epigraph-api-signer";
+
 /// How the audit runs.
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -88,6 +104,10 @@ pub struct Options {
     pub sample: usize,
     /// `SET LOCAL statement_timeout` inside the transaction, in milliseconds.
     pub statement_timeout_ms: Option<u64>,
+    /// Agents whose edge signatures mark an edge as created over HTTP, besides
+    /// every agent named [`API_SIGNER_DISPLAY_NAME`] (e.g. an agent the API
+    /// signed as with a borrowed key).
+    pub api_signers: Vec<Uuid>,
 }
 
 impl Default for Options {
@@ -97,6 +117,7 @@ impl Default for Options {
             limit: None,
             sample: 10,
             statement_timeout_ms: None,
+            api_signers: Vec::new(),
         }
     }
 }
@@ -144,7 +165,10 @@ pub enum Finding {
         source_id: Uuid,
         target_id: Uuid,
         relationship: String,
+        /// `http_signed || http_provenance`.
         http_created: bool,
+        http_signed: bool,
+        http_provenance: bool,
         source_state: SourceState,
     },
 }
@@ -186,13 +210,19 @@ pub struct Report {
     pub ownerless_cached_not_compound: u64,
     /// The stored relationships the wire treats as epistemic.
     pub epistemic_relationships: Vec<String>,
+    /// The agents whose edge signatures count as HTTP origin.
+    pub api_signer_agents: Vec<Uuid>,
     pub edges_scanned: u64,
     pub edges_complete: bool,
     /// Category (3), every origin.
     pub edges_without_bba: Category,
-    /// Of category (3), the edges with an HTTP create provenance row (a lower
+    /// Of category (3), the edges with either HTTP-origin marker (a lower
     /// bound on HTTP-created edges, see the module docs).
     pub edges_without_bba_http: Category,
+    /// Of category (3), the edges signed by an API signer agent.
+    pub edges_without_bba_http_signed: u64,
+    /// Of category (3), the edges with an HTTP create provenance row.
+    pub edges_without_bba_http_provenance: u64,
     /// Category (3) by [`SourceState`].
     pub edges_without_bba_by_source_state: BTreeMap<String, u64>,
     /// Of the HTTP subset, the edges the wire would wire today.
@@ -400,9 +430,18 @@ async fn epistemic_relationships(conn: &mut sqlx::PgConnection) -> Result<Vec<St
         .collect())
 }
 
-/// `(id, source, target, relationship, has an edge-keyed BBA, has an HTTP
-/// create provenance row, the source's open_world_mass)`.
-type EdgeTuple = (Uuid, Uuid, Uuid, String, bool, bool, Option<f64>);
+/// `(id, source, target, relationship, signer, has an edge-keyed BBA, has an
+/// HTTP create provenance row, the source's open_world_mass)`.
+type EdgeTuple = (
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    Option<Uuid>,
+    bool,
+    bool,
+    Option<f64>,
+);
 
 /// The next page of in-force epistemic claim-to-claim edges after `after`.
 ///
@@ -418,7 +457,7 @@ async fn edge_page(
     page: i64,
 ) -> Result<Vec<EdgeTuple>, String> {
     sqlx::query_as(&format!(
-        "SELECT e.id, e.source_id, e.target_id, e.relationship::text, \
+        "SELECT e.id, e.source_id, e.target_id, e.relationship::text, e.signer_id, \
                 EXISTS (SELECT 1 FROM mass_functions mf \
                          WHERE mf.claim_id IN (e.source_id, e.target_id) \
                            AND mf.perspective_id = e.id), \
@@ -449,6 +488,16 @@ async fn audit_edges(
 ) -> Result<(), String> {
     let relationships = epistemic_relationships(conn).await?;
     report.epistemic_relationships.clone_from(&relationships);
+    let mut signers: Vec<Uuid> =
+        sqlx::query_scalar("SELECT a.id FROM agents a WHERE a.display_name = $1 ORDER BY a.id")
+            .bind(API_SIGNER_DISPLAY_NAME)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(|e| format!("the API signer agents: {e}"))?;
+    signers.extend(opts.api_signers.iter().copied());
+    signers.sort_unstable();
+    signers.dedup();
+    report.api_signer_agents.clone_from(&signers);
     if relationships.is_empty() {
         report.edges_complete = true;
         return Ok(());
@@ -468,7 +517,7 @@ async fn audit_edges(
         }
         let sources: Vec<Uuid> = rows
             .iter()
-            .filter(|r| !r.4)
+            .filter(|r| !r.5)
             .map(|r| r.1)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -476,7 +525,17 @@ async fn audit_edges(
         let caches = crate::belief_cache::read_cache_columns(&mut *conn, &sources)
             .await
             .map_err(|e| format!("read the source caches: {e}"))?;
-        for (edge_id, source_id, target_id, relationship, has_bba, http, open_world) in &rows {
+        for (
+            edge_id,
+            source_id,
+            target_id,
+            relationship,
+            signer,
+            has_bba,
+            provenance,
+            open_world,
+        ) in &rows
+        {
             report.edges_scanned += 1;
             if *has_bba {
                 continue;
@@ -504,7 +563,15 @@ async fn audit_edges(
                 .edges_without_bba_by_source_state
                 .entry(source_state.label().to_string())
                 .or_default() += 1;
-            if *http {
+            let signed = signer.is_some_and(|s| signers.binary_search(&s).is_ok());
+            if signed {
+                report.edges_without_bba_http_signed += 1;
+            }
+            if *provenance {
+                report.edges_without_bba_http_provenance += 1;
+            }
+            let http = signed || *provenance;
+            if http {
                 report.edges_without_bba_http.add(*edge_id, opts.sample);
                 if source_state == SourceState::WouldWire {
                     report.edges_without_bba_http_would_wire += 1;
@@ -517,7 +584,9 @@ async fn audit_edges(
                     source_id: *source_id,
                     target_id: *target_id,
                     relationship: relationship.clone(),
-                    http_created: *http,
+                    http_created: http,
+                    http_signed: signed,
+                    http_provenance: *provenance,
                     source_state,
                 },
             )?;
@@ -554,6 +623,8 @@ mod tests {
             target_id: id,
             relationship: "supports".into(),
             http_created: true,
+            http_signed: true,
+            http_provenance: false,
             source_state: SourceState::WouldWire,
         })
         .unwrap();

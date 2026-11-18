@@ -9,10 +9,13 @@
 //! * (2) `compound_cached`: a compound holding a cache over a live BBA, and
 //!   the d33a5c9f (2) shape, a compound whose only BBA is retracted while its
 //!   value stays cached; control: a compound with no cache.
-//! * (3) `edge_without_bba`: an epistemic edge created over HTTP (its create
-//!   provenance row, written by the real `ProvenanceRepository::append`) whose
-//!   source would wire today, and an MCP-shaped one (no provenance row) whose
-//!   source is factorless; controls: an edge with a live edge-keyed BBA, one
+//! * (3) `edge_without_bba`: two epistemic edges created over HTTP, one known
+//!   by its create provenance row (written by the real
+//!   `ProvenanceRepository::append`) and one by its signer (the API's own
+//!   signer agent, named by `epigraph_api::edge_signer::SIGNER_DISPLAY_NAME`),
+//!   both with a source that would wire today, and an MCP-shaped one (signed
+//!   by another agent, no provenance row) whose source is factorless;
+//!   controls: an edge with a live edge-keyed BBA, one
 //!   whose edge-keyed BBA is retracted (the wire's "ever wired" test counts
 //!   it), an out-of-force edge, and the structural `decomposes_to` edges.
 //!
@@ -106,6 +109,34 @@ async fn cache(pool: &PgPool, claim: Uuid, belief: f64, plausibility: f64, frame
     .expect("set the cache");
 }
 
+/// Record `signer` as the edge's signer (the signature bytes are not checked
+/// by the audit, only who signed).
+async fn sign(pool: &PgPool, edge_id: Uuid, signer: Uuid) {
+    sqlx::query("UPDATE edges SET signer_id = $2, signature = $3 WHERE id = $1")
+        .bind(edge_id)
+        .bind(signer)
+        .bind(vec![7u8; 64])
+        .execute(pool)
+        .await
+        .expect("sign the edge");
+}
+
+/// An agent registered the way `epigraph-api` registers its own edge signer.
+async fn api_signer_agent(pool: &PgPool) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type) \
+         VALUES ($1, $2, $3, 'system')",
+    )
+    .bind(id)
+    .bind(id.as_bytes().repeat(2))
+    .bind(epigraph_api::edge_signer::SIGNER_DISPLAY_NAME)
+    .execute(pool)
+    .await
+    .expect("the API signer agent");
+    id
+}
+
 async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -165,6 +196,7 @@ async fn http_create_provenance(pool: &PgPool, edge_id: Uuid) {
 }
 
 struct World {
+    author: Uuid,
     owned: Uuid,
     repointed: Uuid,
     unrecorded: Uuid,
@@ -173,6 +205,7 @@ struct World {
     binary_truth: Uuid,
     claim_validity: Uuid,
     http_edge: Uuid,
+    signed_edge: Uuid,
     mcp_edge: Uuid,
 }
 
@@ -235,7 +268,10 @@ async fn seed_world(pool: &PgPool) -> World {
 
     let http_edge = edge(pool, strong_source, target, "supports").await;
     http_create_provenance(pool, http_edge).await;
+    let signed_edge = edge(pool, strong_source, target, "supports").await;
+    sign(pool, signed_edge, api_signer_agent(pool).await).await;
     let mcp_edge = edge(pool, factorless_source, target, "supports").await;
+    sign(pool, mcp_edge, agent).await;
 
     let wired = edge(pool, strong_source, target, "corroborates").await;
     edge_bba(pool, wired, target, binary_truth, agent).await;
@@ -255,6 +291,7 @@ async fn seed_world(pool: &PgPool) -> World {
     .expect("take the edge out of force");
 
     World {
+        author: agent,
         owned,
         repointed,
         unrecorded,
@@ -263,6 +300,7 @@ async fn seed_world(pool: &PgPool) -> World {
         binary_truth,
         claim_validity,
         http_edge,
+        signed_edge,
         mcp_edge,
     }
 }
@@ -358,26 +396,41 @@ async fn each_category_holds_exactly_its_seeded_rows(pool: PgPool) {
     assert_eq!(report.compound_cached.count, 2);
     assert_eq!(report.ownerless_cached_not_compound, 0);
 
-    // (3): the two unwired epistemic edges, the HTTP one flagged; not the
-    // wired, the retracted-wire, the out-of-force or the structural edges.
+    // (3): the three unwired epistemic edges, the two HTTP ones flagged, each
+    // by its own marker; not the wired, the retracted-wire, the out-of-force
+    // or the structural edges.
     assert_eq!(
         ids_of(&lines, "edge_without_bba", "edge_id"),
-        set(&[w.http_edge, w.mcp_edge]),
+        set(&[w.http_edge, w.signed_edge, w.mcp_edge]),
         "category (3)"
     );
-    assert_eq!(report.edges_without_bba.count, 2);
-    assert_eq!(report.edges_without_bba_http.count, 1);
-    assert_eq!(report.edges_without_bba_http.sample, vec![w.http_edge]);
-    assert_eq!(report.edges_without_bba_http_would_wire, 1);
-    let state = |edge: Uuid| {
+    assert_eq!(report.edges_without_bba.count, 3);
+    assert_eq!(report.edges_without_bba_http.count, 2);
+    assert_eq!(report.edges_without_bba_http_signed, 1);
+    assert_eq!(report.edges_without_bba_http_provenance, 1);
+    assert_eq!(report.edges_without_bba_http_would_wire, 2);
+    assert_eq!(report.api_signer_agents.len(), 1);
+    let field = |edge: Uuid, key: &str| {
         lines
             .iter()
             .find(|l| l["edge_id"] == edge.to_string())
-            .expect("the edge's line")["source_state"]
+            .expect("the edge's line")[key]
             .clone()
     };
-    assert_eq!(state(w.http_edge), "would_wire");
-    assert_eq!(state(w.mcp_edge), "factorless");
+    assert_eq!(field(w.http_edge, "http_provenance"), true);
+    assert_eq!(field(w.http_edge, "http_signed"), false);
+    assert_eq!(field(w.signed_edge, "http_signed"), true);
+    assert_eq!(field(w.signed_edge, "http_provenance"), false);
+    for e in [w.http_edge, w.signed_edge] {
+        assert_eq!(field(e, "http_created"), true);
+        assert_eq!(field(e, "source_state"), "would_wire");
+    }
+    assert_eq!(
+        field(w.mcp_edge, "http_created"),
+        false,
+        "a signature by another agent is no HTTP origin"
+    );
+    assert_eq!(field(w.mcp_edge, "source_state"), "factorless");
     assert_eq!(
         report.epistemic_relationships,
         vec![
@@ -387,12 +440,34 @@ async fn each_category_holds_exactly_its_seeded_rows(pool: PgPool) {
         ],
         "decomposes_to is structural: the wire's own gate leaves it out"
     );
-    // Four in-force epistemic edges: the two findings, the wired one and the
-    // retracted-wire one (the out-of-force edge is not scanned).
-    assert_eq!(report.edges_scanned, 4);
+    // Five in-force epistemic edges: the three findings, the wired one and
+    // the retracted-wire one (the out-of-force edge is not scanned).
+    assert_eq!(report.edges_scanned, 5);
 
     assert!(report.claims_complete && report.edges_complete);
-    assert_eq!(lines.len(), 6, "one line per finding: {lines:?}");
+    assert_eq!(lines.len(), 7, "one line per finding: {lines:?}");
+
+    // An operator-named signer (`--api-signer`) counts as HTTP origin too.
+    let (named, _) = audit(
+        &pool,
+        &Options {
+            api_signers: vec![w.author],
+            ..Options::default()
+        },
+    )
+    .await;
+    assert_eq!(named.edges_without_bba_http.count, 3);
+    assert_eq!(named.edges_without_bba_http_signed, 2);
+}
+
+/// The audit names the API's signer by the API's own constant (this crate
+/// does not link the API outside its tests).
+#[test]
+fn the_api_signer_name_is_the_apis() {
+    assert_eq!(
+        epigraph_cli::cache_owner_audit::API_SIGNER_DISPLAY_NAME,
+        epigraph_api::edge_signer::SIGNER_DISPLAY_NAME
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -429,7 +504,7 @@ async fn a_limit_truncates_each_pass_and_says_so(pool: PgPool) {
     assert_eq!(report.claims_scanned, 3);
     assert!(!report.claims_complete, "more claims are left");
     assert_eq!(report.edges_scanned, 3);
-    assert!(!report.edges_complete, "one more edge is left");
+    assert!(!report.edges_complete, "two more edges are left");
     assert!(report.repointed_cache.sample.len() <= 1);
 
     // Paging alone (no limit) reaches the same totals as one page.
@@ -523,7 +598,7 @@ async fn the_binary_writes_the_findings_and_refuses_what_it_must(pool: PgPool) {
     assert_eq!(report["transaction_read_only"], true);
     assert_eq!(report["repointed_cache"]["count"], 2);
     assert_eq!(report["compound_cached"]["count"], 2);
-    assert_eq!(report["edges_without_bba"]["count"], 2);
+    assert_eq!(report["edges_without_bba"]["count"], 3);
     let lines: Vec<serde_json::Value> = std::fs::read_to_string(&out)
         .expect("the findings file")
         .lines()

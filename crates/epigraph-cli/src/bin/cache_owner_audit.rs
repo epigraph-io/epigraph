@@ -25,7 +25,7 @@
 //!
 //! Usage:
 //!     cache_owner_audit --out <findings.jsonl> [--limit N] [--sample N]
-//!         [--page-size N] [--statement-timeout-ms N]
+//!         [--page-size N] [--statement-timeout-ms N] [--api-signer <agent id>]...
 //!
 //! # Authority
 //!
@@ -73,6 +73,11 @@ struct Cli {
     /// `SET LOCAL statement_timeout` in the audit's transaction, in milliseconds.
     #[arg(long)]
     statement_timeout_ms: Option<u64>,
+
+    /// An agent whose edge signatures mark an edge as created over HTTP, besides
+    /// the API's own signer agent (found by its display name). Repeatable.
+    #[arg(long, value_name = "AGENT_ID")]
+    api_signer: Vec<uuid::Uuid>,
 }
 
 /// The refusal when MAINTENANCE_DATABASE_URL is unset.
@@ -147,6 +152,7 @@ async fn audit(
         limit: cli.limit,
         sample: cli.sample,
         statement_timeout_ms: cli.statement_timeout_ms,
+        api_signers: cli.api_signer.clone(),
     };
     let mut sink = std::io::BufWriter::new(file);
     let report = run_read_only(conn, viewer, &opts, &mut sink)
