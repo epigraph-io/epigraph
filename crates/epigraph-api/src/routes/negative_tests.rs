@@ -22,14 +22,12 @@
 //!   tokio tasks, each creating its own router via `create_router` to avoid
 //!   consuming the router with `oneshot`.
 
-// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
-// the `not(feature = "db")` configuration has 28 pre-existing compile errors
-// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
-// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
-// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
-// intended behaviour, not coverage of it. The behaviour is actually asserted
-// by `tests/public_router_allowlist.rs`, which probes every route on the
-// `protected` chain of the buildable variant.
+// not(db) arm only. CI builds AND runs these: `lint-features`, step
+// "No-db lib-test build check" (`cargo test -p epigraph-api
+// --no-default-features --lib`). A bare test router has no bearer
+// middleware, so routes that read an `AuthContext` get the one it would
+// install via `crate::middleware::bearer::test_auth_with_scopes`; the
+// tests asserting a 401 go through `create_router` with no credential.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
     use crate::middleware::bearer::test_auth_with_scopes;
