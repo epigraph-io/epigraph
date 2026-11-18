@@ -59,8 +59,10 @@
 -- (measured by the admitted controls in the test above).
 --
 -- The maintenance role and SECURITY DEFINER bodies keep 077's bypass, as on
--- every other policy of these tables: `seal_claims_conn` and the unseal and
--- re-seal paths run on a maintenance connection, which this does not touch.
+-- every other policy of these tables. The privatization seal and unseal
+-- (`seal_claims_conn`, `unseal_claims_conn`) run on a maintenance
+-- connection, which this does not touch, and no shipped code UPDATEs
+-- `claim_encryption` (grep of crates/*/src at the time of writing).
 --
 -- No function body is re-stated, so there is no md5 guard. No table,
 -- column, function, trigger, index or grant changes. 126's restrictive
