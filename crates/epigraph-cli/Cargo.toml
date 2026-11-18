@@ -16,6 +16,20 @@ name = "recompute_claim_belief"
 path = "src/bin/recompute_claim_belief.rs"
 required-features = ["db"]
 
+# Backlog d33a5c9f: the read-only cache-owner audit (re-pointed caches,
+# cached compounds, epistemic edges with no edge-keyed BBA). One READ ONLY
+# transaction on the maintenance connection; writes its findings to --out only.
+[[bin]]
+name = "cache_owner_audit"
+path = "src/bin/cache_owner_audit.rs"
+required-features = ["db"]
+
+# Drives the `db`-gated `cache_owner_audit` bin end to end.
+[[test]]
+name = "cache_owner_audit"
+path = "tests/cache_owner_audit.rs"
+required-features = ["db"]
+
 [[bin]]
 name = "recompute_betp"
 path = "src/bin/recompute_betp.rs"
