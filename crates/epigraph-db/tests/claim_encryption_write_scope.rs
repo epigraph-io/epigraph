@@ -31,6 +31,10 @@
 //! `group_id` to another writable group, is admitted below 232 and refused at
 //! head; rewriting an own row's ciphertext is admitted at both.
 //!
+//! [`a_claim_created_and_sealed_in_one_app_transaction_is_admitted`]: the
+//! shipped `POST /claims` fully_private shape (INSERT the claim, then seal it,
+//! in one application-role transaction) is admitted below 232 and at head.
+//!
 //! [`the_232_undo_returns_the_policies_below_232`]: 232 adds exactly its two
 //! policies, and the undo runbook removes exactly them, idempotently.
 //!
@@ -403,6 +407,89 @@ async fn a_seal_row_cannot_be_moved_onto_another_groups_claim(pool: PgPool) {
                 "CALIBRATION (at {at}): an own seal row re-keys to another writable group"
             );
         }
+    }
+}
+
+/// The shipped writer's shape, end to end on the application role: one
+/// transaction INSERTs the group claim (`ClaimRepository::create_strict`'s
+/// `INSERT … RETURNING`) and then seals it under the same group
+/// (`ClaimEncryptionRepository::insert_conn`), before anything commits.
+///
+/// The control in [`a_seal_is_bound_to_the_claims_owner_group`] seals a claim
+/// a superuser seeded and COMMITTED earlier, which is not how `POST /claims`
+/// with `fully_private` runs. 232's `EXISTS` reads `claims` under the caller's
+/// row security in the caller's snapshot; if that read could not see the
+/// caller's own just-inserted, not-yet-sealed claim, every legitimate
+/// fully_private create would be refused while the committed-claim control
+/// still passed. This pins the admitted shape.
+///
+/// Verified to fail: with 232's INSERT predicate mutated to also require
+/// `c.created_at < now()` (a stand-in for any predicate that hides a claim
+/// created in the current transaction), this test is refused 42501 while the
+/// committed-claim controls in the other tests still pass.
+#[sqlx::test(migrations = false)]
+async fn a_claim_created_and_sealed_in_one_app_transaction_is_admitted(pool: PgPool) {
+    for (at, migrator) in [("below 232", up_to(BELOW)), ("head", up_to(i64::MAX))] {
+        migrate(&pool, &migrator).await;
+        let (a, group_a) = team(&pool, "seal-create-a").await;
+        let principal = a.to_string();
+        let groups = group_a.to_string();
+        let out: Result<Uuid, String> =
+            viewer_fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+                let run = async {
+                    conn.execute("BEGIN").await?;
+                    sqlx::query(
+                        "SELECT set_config('epigraph.principal_id', $1, true), \
+                                set_config('epigraph.group_ids', $2, true), \
+                                set_config('epigraph.writable_group_ids', $2, true)",
+                    )
+                    .bind(&principal)
+                    .bind(&groups)
+                    .execute(&mut *conn)
+                    .await?;
+                    let id: Uuid = sqlx::query_scalar(
+                        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, \
+                                             is_current, visibility, owner_group_id) \
+                         VALUES (gen_random_uuid(), 'created and sealed', \
+                                 decode(md5(gen_random_uuid()::text) || \
+                                        md5(gen_random_uuid()::text), 'hex'), \
+                                 0.8, $1, true, 'group', $2) \
+                         RETURNING id",
+                    )
+                    .bind(a)
+                    .bind(group_a)
+                    .fetch_one(&mut *conn)
+                    .await?;
+                    sqlx::query(SEAL)
+                        .bind(id)
+                        .bind(group_a)
+                        .execute(&mut *conn)
+                        .await?;
+                    conn.execute("COMMIT").await?;
+                    Ok::<Uuid, sqlx::Error>(id)
+                };
+                let out = run.await.map_err(|e| match &e {
+                    sqlx::Error::Database(d) => {
+                        format!("{} [{}]", d.message(), d.code().unwrap_or_default())
+                    }
+                    _ => e.to_string(),
+                });
+                if out.is_err() {
+                    let _ = conn.execute("ROLLBACK").await;
+                }
+                (conn, out)
+            })
+            .await;
+        let id = out.unwrap_or_else(|e| {
+            panic!(
+                "(at {at}) the app role creates a group claim and seals it in one transaction: {e}"
+            )
+        });
+        assert_eq!(
+            sealed_under(&pool, id).await,
+            Some(group_a),
+            "(at {at}) the fresh claim is sealed under its owner group"
+        );
     }
 }
 
