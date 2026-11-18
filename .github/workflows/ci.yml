@@ -767,6 +767,14 @@ jobs:
         # non-optional. Warnings are not denied: without `db` some
         # dependencies only db code uses are reported unused.
         run: cargo check -p epigraph-cli --no-default-features --locked
+      - name: epigraph-cli no-db lib-test build check
+        # The step above is `cargo check` over lib+bins, so it never compiles
+        # the crate's `#[cfg(test)]` modules: an ungated test module that uses
+        # a db-only item (e.g. `crate::atlas_meaning`) would break the no-db
+        # lib-test target while that check stays green, the same blind spot
+        # the api's "No-db lib-test build check" closes. This compiles the
+        # target without running it. Warnings are not denied, as above.
+        run: cargo test -p epigraph-cli --no-default-features --lib --no-run --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
