@@ -1714,7 +1714,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     );
 
     let mut offenders: Vec<String> = Vec::new();
-    let mut exemptions_hit: BTreeSet<&str> = BTreeSet::new();
+    // Keyed on (policy, needle), not the needle alone: two entries may share a
+    // needle (232's insert and update policies do), and a needle-only key
+    // would keep a dropped policy's entry "hit" through its sibling's arm.
+    let mut exemptions_hit: BTreeSet<(&str, &str)> = BTreeSet::new();
     for (table, policy, using, with_check) in &rows {
         for (clause, expr) in [("USING", using), ("WITH CHECK", with_check)] {
             let Some(expr) = expr else { continue };
@@ -1729,8 +1732,8 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
                 let exempt = ROW_ONLY_BY_DESIGN
                     .iter()
                     .find(|(p, needle, _)| p == policy && arm.contains(needle));
-                if let Some((_, needle, _)) = exempt {
-                    exemptions_hit.insert(needle);
+                if let Some((p, needle, _)) = exempt {
+                    exemptions_hit.insert((p, needle));
                     continue;
                 }
                 if !mentions_session && !allowed_constant {
@@ -1744,10 +1747,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     // matches any arm is an entry that has silently stopped exempting anything,
     // and would keep excusing a future arm that happened to contain the same
     // substring.
-    let stale: Vec<&str> = ROW_ONLY_BY_DESIGN
+    let stale: Vec<(&str, &str)> = ROW_ONLY_BY_DESIGN
         .iter()
-        .map(|(_, needle, _)| *needle)
-        .filter(|n| !exemptions_hit.contains(n))
+        .map(|(p, needle, _)| (*p, *needle))
+        .filter(|k| !exemptions_hit.contains(k))
         .collect();
     assert!(
         stale.is_empty(),
