@@ -1675,6 +1675,23 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              marker) needs one of the two session arms beside it (`epigraph_bypass()` / \
              `epigraph_definer_bypass()`), i.e. the maintenance session or 207's definer.",
         ),
+        (
+            "claim_encryption_owner_scope_insert",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE insert policy: its arm (the claim exists and its owner group IS \
+             the seal row's `group_id`) narrows and grants nothing. It is AND-ed with 077's \
+             permissive `claim_encryption_tenancy`, whose WITH CHECK still requires `group_id` \
+             in `epigraph_writable_groups()`; the `claims` read inside it is the caller's, \
+             under its own row security.",
+        ),
+        (
+            "claim_encryption_owner_scope_update",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the \
+             same reason as `claim_encryption_owner_scope_insert`: AND-ed with 077's \
+             permissive `claim_encryption_tenancy` (USING the read set, WITH CHECK the \
+             writable set), it narrows and grants nothing.",
+        ),
     ];
 
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
