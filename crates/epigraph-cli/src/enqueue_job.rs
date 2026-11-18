@@ -10,6 +10,10 @@
 //!   (the k-means `ThemeClusterRebuild`, a misspelling) is refused;
 //! * every key of the kind's body is one the kind has, so a stray or
 //!   misspelled extra key is refused rather than silently dropped;
+//! * its values are ones the drain can run safely: a `ClusterGraph` needs a
+//!   finite `resolution` above 0 and a `retain_runs` of at least 1 (the run
+//!   garbage-collects all but the newest `retain_runs` runs after inserting
+//!   its own, so 0 deletes the run it just built and its neighbourhoods);
 //! * it is not one of the privatization kinds. Their authority is the HTTP
 //!   dispatch that flips the plan's state and writes the matching
 //!   `security_events` row in one transaction (migrations 077 and 119 keep
@@ -39,6 +43,16 @@ pub enum JobRefusal {
         kind: String,
         /// The key it does not have.
         field: String,
+    },
+    /// A value the drain would run destructively or meaninglessly.
+    #[error("the {kind} job's {field} {reason}")]
+    OutOfRange {
+        /// The kind's tag.
+        kind: &'static str,
+        /// The offending field.
+        field: &'static str,
+        /// What the field must be.
+        reason: &'static str,
     },
     /// A privatization kind.
     #[error(
@@ -76,6 +90,20 @@ pub fn parse_job(text: &str) -> Result<EpiGraphJob, JobRefusal> {
     }
 
     match job {
+        EpiGraphJob::ClusterGraph { resolution, .. }
+            if !(resolution.is_finite() && resolution > 0.0) =>
+        {
+            Err(JobRefusal::OutOfRange {
+                kind: "ClusterGraph",
+                field: "resolution",
+                reason: "must be a finite number above 0",
+            })
+        }
+        EpiGraphJob::ClusterGraph { retain_runs: 0, .. } => Err(JobRefusal::OutOfRange {
+            kind: "ClusterGraph",
+            field: "retain_runs",
+            reason: "must be at least 1 (0 garbage-collects the run the job just built)",
+        }),
         EpiGraphJob::PrivatizationApply { .. }
         | EpiGraphJob::PrivatizationRevert { .. }
         | EpiGraphJob::PrivatizationReseal { .. } => Err(JobRefusal::Privatization(job.job_type())),
@@ -139,6 +167,32 @@ mod tests {
                 field: "retian_runs".into()
             })
         );
+    }
+
+    #[test]
+    fn a_cluster_graph_the_drain_would_run_destructively_is_refused() {
+        for (text, field) in [
+            (
+                r#"{"ClusterGraph":{"resolution":1.0,"retain_runs":0}}"#,
+                "retain_runs",
+            ),
+            (
+                r#"{"ClusterGraph":{"resolution":0,"retain_runs":3}}"#,
+                "resolution",
+            ),
+            (
+                r#"{"ClusterGraph":{"resolution":-1.0,"retain_runs":3}}"#,
+                "resolution",
+            ),
+        ] {
+            assert!(
+                matches!(parse_job(text), Err(JobRefusal::OutOfRange { field: f, .. }) if f == field),
+                "{text} must be refused on {field}: {:?}",
+                parse_job(text)
+            );
+        }
+        // The boundary values are accepted.
+        assert!(parse_job(r#"{"ClusterGraph":{"resolution":0.01,"retain_runs":1}}"#).is_ok());
     }
 
     #[test]

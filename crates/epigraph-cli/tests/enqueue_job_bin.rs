@@ -240,6 +240,10 @@ async fn a_refused_job_writes_nothing(pool: PgPool) {
             r#"{"ClusterGraph":{"resolution":1.0,"retain_runs":3,"keep":9}}"#,
             "has no field",
         ),
+        (
+            r#"{"ClusterGraph":{"resolution":1.0,"retain_runs":0}}"#,
+            "must be at least 1",
+        ),
         (apply.as_str(), "enqueue_job refuses them"),
         ("not json", "not JSON"),
     ] {
