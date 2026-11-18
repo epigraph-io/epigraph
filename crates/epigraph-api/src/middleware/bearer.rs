@@ -900,8 +900,11 @@ impl axum::extract::FromRequestParts<AppState> for ViewerExtractor {
 /// are one fresh uuid, and handlers that check ownership (webhooks) compare
 /// it across requests.
 ///
-/// Pass the scopes the route really checks, not a superset, so a test still
-/// fails if a handler's scope requirement changes.
+/// The scopes only matter where the handler under test checks one. In the
+/// `not(db)` build that is webhook registration and deletion
+/// (`webhooks:write`); the `not(db)` rag, challenge and submit handlers check
+/// no scope, so for those routers the list documents intent and a changed
+/// scope list does not change a test's outcome.
 #[cfg(test)]
 pub(crate) fn test_auth_with_scopes(scopes: &[&str]) -> AuthContext {
     let principal = uuid::Uuid::new_v4();

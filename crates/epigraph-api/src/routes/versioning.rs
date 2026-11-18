@@ -1365,18 +1365,26 @@ pub async fn claim_history(
 // TESTS
 // =============================================================================
 // Supersession and version history are served only by the `db` arm
-// (`ClaimRepository::supersede` and the version-chain walk). Their behaviour
-// is covered by the database integration tests under `tests/` (for example
-// `supersede_refusal_codes_http.rs`, `supersede_emits_claim_superseded_http.rs`,
-// `claim_history_cycle_test.rs` and `own_claim_authority_http.rs`).
+// (`ClaimRepository::supersede` and the version-chain walk). Parts of that
+// behaviour have database integration tests under `tests/`: refusal codes
+// and 409 (`supersede_refusal_codes_http.rs`, `refusal_kinds_http.rs`),
+// `ClaimSuperseded` emission (`supersede_emits_claim_superseded_http.rs`),
+// history walks (`claim_history_cycle_test.rs`), viewer-filtered 404s
+// (`write_gate_reads_are_viewer_filtered.rs`) and ownership
+// (`own_claim_authority_http.rs`).
+//
+// NOT YET TESTED in the db arm: the request-validation 400s of the db
+// `supersede_claim` (empty or whitespace `content` or `reason`, the
+// content and reason length caps, a `truth_value` outside [0, 1] or not
+// finite) and its `ClaimSubmitted` publish. These still need db integration
+// tests.
 //
 // The `not(db)` arm keeps only the two 503 stubs above. The in-memory
-// supersession tests that used to live here (validation, 404/409, version
-// numbering, history walks, `ClaimSubmitted` publishing) asserted behaviour
-// those stubs do not have, so every one of them failed at runtime once the
-// not(db) lib-test target was compiled. They were deleted rather than
-// rewritten: their subject no longer exists in this arm, and the db suites
-// above own it. What the not(db) arm DOES promise is pinned below.
+// supersession tests that used to live here asserted behaviour those stubs
+// do not have, so every one of them failed at runtime once the not(db)
+// lib-test target was run. They were deleted rather than rewritten: their
+// subject no longer exists in this arm. What the not(db) arm DOES promise is
+// pinned below.
 
 #[cfg(all(test, not(feature = "db")))]
 mod nodb_stub_tests {
