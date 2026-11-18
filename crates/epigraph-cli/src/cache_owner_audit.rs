@@ -25,9 +25,10 @@
 //! 3. **`edge_without_bba`**: in-force claim-to-claim edges whose relationship
 //!    the edge wire treats as epistemic (`restriction_kind_with_profile` is
 //!    not `Neutral`, decided by the engine function per stored relationship)
-//!    with NO mass function keyed on the edge id (any row, retracted
-//!    included: the wire's own "ever wired" test,
-//!    `MassFunctionRepository::exists_for_perspective`). Each carries two
+//!    with NO mass function keyed on the edge id ON ANY CLAIM (any row,
+//!    retracted included: the wire's own "ever wired" test,
+//!    `MassFunctionRepository::exists_for_perspective`, which has no claim
+//!    restriction). Each carries two
 //!    HTTP-origin markers, neither complete alone, so `http_created` is
 //!    either one:
 //!    * `http_signed`: `edges.signer_id` is the API's OWN edge signer
@@ -48,6 +49,12 @@
 //!    (`restrict_edge_source` on the source's CURRENT cache): `factorless`
 //!    (no belief interval, the wire skips) and `vacuous` (the wire stores
 //!    nothing) are not wiring failures; only `would_wire` is.
+//! 4. **`edge_bba_off_endpoint`**: an in-force epistemic edge whose
+//!    edge-keyed BBA exists but sits on neither of the edge's CURRENT
+//!    endpoints. Superseding the target re-targets the edge
+//!    (`migrate_superseded_edges`) and moves no `mass_functions` row, so the
+//!    BBA stays on the retired target. The wire counts the edge as wired, so
+//!    it is NOT in (3); listed so the leftover BBAs can be found.
 //!
 //! # Read only
 //!
@@ -63,7 +70,9 @@
 //! RETRACTED rows included (a compound whose only BBA was retracted is
 //! exactly the shape whose cache the old retract path left behind), keyset
 //! paged by id. Edges: the in-force epistemic claim-to-claim edges, keyset
-//! paged by id. `limit` bounds each pass separately; the report says whether
+//! paged by id, tested against the set of edge ids that key ANY mass
+//! function, read once (`perspective_id` has no index, so a per-edge test
+//! would scan the table per edge). `limit` bounds each pass separately; the report says whether
 //! each pass finished (`claims_complete`, `edges_complete`), so a trial run is
 //! never read as totals.
 
@@ -159,6 +168,13 @@ pub enum Finding {
         claim_id: Uuid,
         stored_frame_id: Option<Uuid>,
     },
+    /// Category (4): the edge's BBA exists, on neither current endpoint.
+    EdgeBbaOffEndpoint {
+        edge_id: Uuid,
+        source_id: Uuid,
+        target_id: Uuid,
+        relationship: String,
+    },
     /// Category (3): an epistemic edge with no BBA keyed on it.
     EdgeWithoutBba {
         edge_id: Uuid,
@@ -227,6 +243,9 @@ pub struct Report {
     pub edges_without_bba_by_source_state: BTreeMap<String, u64>,
     /// Of the HTTP subset, the edges the wire would wire today.
     pub edges_without_bba_http_would_wire: u64,
+    /// Category (4): edges whose edge-keyed BBA sits on neither current
+    /// endpoint (wired, so not in (3)).
+    pub edges_bba_off_endpoint: Category,
 }
 
 /// Run the audit in one read-only transaction on `conn` (a connection whose
@@ -430,8 +449,9 @@ async fn epistemic_relationships(conn: &mut sqlx::PgConnection) -> Result<Vec<St
         .collect())
 }
 
-/// `(id, source, target, relationship, signer, has an edge-keyed BBA, has an
-/// HTTP create provenance row, the source's open_world_mass)`.
+/// `(id, source, target, relationship, signer, has an edge-keyed BBA on one
+/// of its endpoints, has an HTTP create provenance row, the source's
+/// open_world_mass)`.
 type EdgeTuple = (
     Uuid,
     Uuid,
@@ -443,13 +463,33 @@ type EdgeTuple = (
     Option<f64>,
 );
 
+/// Every claim-to-claim edge id that keys at least one mass function, on any
+/// claim, retracted rows included: the wire's "ever wired" test
+/// (`MassFunctionRepository::exists_for_perspective`, which has no claim
+/// restriction) for every edge at once. One read: `perspective_id` has no
+/// index, so testing each edge would scan the table per edge.
+async fn edge_keyed_perspectives(
+    conn: &mut sqlx::PgConnection,
+) -> Result<std::collections::HashSet<Uuid>, String> {
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT mf.perspective_id FROM mass_functions mf \
+           JOIN edges e ON e.id = mf.perspective_id \
+          WHERE e.source_type = 'claim' AND e.target_type = 'claim'",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| format!("edge-keyed mass functions: {e}"))?;
+    Ok(ids.into_iter().collect())
+}
+
 /// The next page of in-force epistemic claim-to-claim edges after `after`.
 ///
-/// The edge-keyed BBA test is the wire's "ever wired" test
-/// (`MassFunctionRepository::exists_for_perspective`: any row with
-/// `perspective_id` = the edge, retracted included), narrowed to the edge's
-/// two endpoints so it rides the `claim_id` index: the wire stores the BBA on
-/// the edge's target (`edge_factor::auto_wire_ds_for_edge`).
+/// The per-edge flag is whether the edge-keyed BBA sits on one of the edge's
+/// CURRENT endpoints (the wire stores it on the target,
+/// `edge_factor::auto_wire_ds_for_edge`), which rides the `claim_id` index.
+/// It is NOT the wire's "ever wired" test: an edge re-targeted by a supersede
+/// keeps its BBA on the retired target. [`edge_keyed_perspectives`] is that
+/// test; this flag only tells (3) from (4).
 async fn edge_page(
     conn: &mut sqlx::PgConnection,
     relationships: &[String],
@@ -502,6 +542,8 @@ async fn audit_edges(
         report.edges_complete = true;
         return Ok(());
     }
+    // Read in the same snapshot as the edge pages.
+    let keyed = edge_keyed_perspectives(conn).await?;
     let profile = BeliefProfile::served();
     let mut after = None;
     loop {
@@ -517,7 +559,7 @@ async fn audit_edges(
         }
         let sources: Vec<Uuid> = rows
             .iter()
-            .filter(|r| !r.5)
+            .filter(|r| !r.5 && !keyed.contains(&r.0))
             .map(|r| r.1)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -538,6 +580,21 @@ async fn audit_edges(
         {
             report.edges_scanned += 1;
             if *has_bba {
+                continue;
+            }
+            if keyed.contains(edge_id) {
+                // Wired (the wire's own test), but the BBA sits on neither
+                // current endpoint: (4), not (3).
+                report.edges_bba_off_endpoint.add(*edge_id, opts.sample);
+                emit(
+                    sink,
+                    &Finding::EdgeBbaOffEndpoint {
+                        edge_id: *edge_id,
+                        source_id: *source_id,
+                        target_id: *target_id,
+                        relationship: relationship.clone(),
+                    },
+                )?;
                 continue;
             }
             // The wire's gate (`auto_wire_ds_for_edge`) on the source's

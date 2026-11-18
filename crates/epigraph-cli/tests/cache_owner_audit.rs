@@ -18,6 +18,10 @@
 //!   controls: an edge with a live edge-keyed BBA, one
 //!   whose edge-keyed BBA is retracted (the wire's "ever wired" test counts
 //!   it), an out-of-force edge, and the structural `decomposes_to` edges.
+//! * (4) `edge_bba_off_endpoint`: an edge wired onto its target, then
+//!   re-targeted to the target's successor the way a supersede moves it
+//!   (`migrate_superseded_edges`: the edge moves, its BBA does not). It is
+//!   wired, so it is not in (3).
 //!
 //! The categorisation is asserted exactly, and every category is pinned by a
 //! mutation of the audit that turns its arm red (recorded in the commit).
@@ -207,6 +211,7 @@ struct World {
     http_edge: Uuid,
     signed_edge: Uuid,
     mcp_edge: Uuid,
+    retargeted_edge: Uuid,
 }
 
 async fn seed_world(pool: &PgPool) -> World {
@@ -279,6 +284,25 @@ async fn seed_world(pool: &PgPool) -> World {
     let row = edge_bba(pool, wired_then_retracted, target, binary_truth, agent).await;
     retract(pool, row, agent).await;
 
+    // (4): wired onto `retired_target`, then re-targeted to its successor as
+    // `migrate_superseded_edges` does (`UPDATE edges SET target_id`), which
+    // moves no mass function.
+    let retired_target = claim("audit: superseded edge target").await;
+    let successor = claim("audit: the superseded target's successor").await;
+    let retargeted_edge = edge(pool, strong_source, retired_target, "supports").await;
+    edge_bba(pool, retargeted_edge, retired_target, binary_truth, agent).await;
+    sqlx::query("UPDATE edges SET target_id = $2 WHERE id = $1")
+        .bind(retargeted_edge)
+        .bind(successor)
+        .execute(pool)
+        .await
+        .expect("re-target the edge");
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(retired_target)
+        .execute(pool)
+        .await
+        .expect("retire the old target");
+
     let out_of_force = edge(pool, strong_source, target, "supports").await;
     http_create_provenance(pool, out_of_force).await;
     sqlx::query(
@@ -302,6 +326,7 @@ async fn seed_world(pool: &PgPool) -> World {
         http_edge,
         signed_edge,
         mcp_edge,
+        retargeted_edge,
     }
 }
 
@@ -440,12 +465,21 @@ async fn each_category_holds_exactly_its_seeded_rows(pool: PgPool) {
         ],
         "decomposes_to is structural: the wire's own gate leaves it out"
     );
-    // Five in-force epistemic edges: the three findings, the wired one and
-    // the retracted-wire one (the out-of-force edge is not scanned).
-    assert_eq!(report.edges_scanned, 5);
+    // (4): the re-targeted edge is wired (its BBA sits on the retired
+    // target), so it is listed apart from (3), never in it.
+    assert_eq!(
+        ids_of(&lines, "edge_bba_off_endpoint", "edge_id"),
+        set(&[w.retargeted_edge]),
+        "category (4)"
+    );
+    assert_eq!(report.edges_bba_off_endpoint.count, 1);
+    // Six in-force epistemic edges: the three findings, the wired one, the
+    // retracted-wire one and the re-targeted one (the out-of-force edge is
+    // not scanned).
+    assert_eq!(report.edges_scanned, 6);
 
     assert!(report.claims_complete && report.edges_complete);
-    assert_eq!(lines.len(), 7, "one line per finding: {lines:?}");
+    assert_eq!(lines.len(), 8, "one line per finding: {lines:?}");
 
     // An operator-named signer (`--api-signer`) counts as HTTP origin too.
     let (named, _) = audit(
@@ -504,7 +538,7 @@ async fn a_limit_truncates_each_pass_and_says_so(pool: PgPool) {
     assert_eq!(report.claims_scanned, 3);
     assert!(!report.claims_complete, "more claims are left");
     assert_eq!(report.edges_scanned, 3);
-    assert!(!report.edges_complete, "two more edges are left");
+    assert!(!report.edges_complete, "three more edges are left");
     assert!(report.repointed_cache.sample.len() <= 1);
 
     // Paging alone (no limit) reaches the same totals as one page.

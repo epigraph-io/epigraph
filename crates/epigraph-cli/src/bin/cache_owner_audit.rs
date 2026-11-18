@@ -1,5 +1,5 @@
 //! `cache_owner_audit`: the read-only measurement for the cache-owner repair
-//! (backlog d33a5c9f). See `epigraph_cli::cache_owner_audit` for the three
+//! (backlog d33a5c9f). See `epigraph_cli::cache_owner_audit` for the
 //! categories and what each one means.
 //!
 //! Every read runs in ONE `REPEATABLE READ READ ONLY` transaction on the
@@ -18,7 +18,8 @@
 //!
 //! Category (2) (`compound_cached`) is report-only: `recompute_claim_belief`
 //! skips a compound, which has no cache owner. Category (3)
-//! (`edge_without_bba`) is report-only too.
+//! (`edge_without_bba`) and (4) (`edge_bba_off_endpoint`, an edge whose BBA a
+//! supersede left on the retired target) are report-only too.
 //!
 //! The file names claim and edge ids: write it to the operator's private
 //! results directory, never into a repository.
