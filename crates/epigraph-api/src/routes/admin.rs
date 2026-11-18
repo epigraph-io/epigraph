@@ -1114,9 +1114,9 @@ mod db_tests {
 // not(db) arm only. CI builds AND runs these: `lint-features`, step
 // "No-db lib-test build check" (`cargo test -p epigraph-api
 // --no-default-features --lib`). A bare test router has no bearer
-// middleware, so routes that read an `AuthContext` get the one it would
-// install via `crate::middleware::bearer::test_auth_with_scopes`; the
-// tests asserting a 401 go through `create_router` with no credential.
+// middleware, so the admin routes get the `claims:admin` context it would
+// install (`admin_auth` below); the tests asserting a 401 go through
+// `create_router` with no credential.
 #[cfg(all(test, not(feature = "db")))]
 mod tests {
     use super::*;
