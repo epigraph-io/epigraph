@@ -81,8 +81,17 @@ mod malformed_input_tests {
     }
 
     /// Create a direct router for the webhook registration endpoint (no auth middleware).
+    ///
+    /// The egress guard answers from a stub resolver: `AppState::new` builds
+    /// it on the system resolver, and a case that got past the cheap checks
+    /// would otherwise look `example.com` up on the CI runner's DNS.
     fn webhook_router() -> Router {
-        let state = AppState::new(ApiConfig::default());
+        let state = AppState::new(ApiConfig::default()).with_webhook_egress(
+            epigraph_jobs::egress::EgressGuard::with_resolver(std::sync::Arc::new(
+                epigraph_jobs::egress::StubResolver::new()
+                    .with("example.com", ["93.184.216.34".parse().unwrap()]),
+            )),
+        );
         Router::new()
             .route("/api/v1/webhooks", post(register_webhook))
             .layer(Extension(test_auth_with_scopes(&["webhooks:write"])))

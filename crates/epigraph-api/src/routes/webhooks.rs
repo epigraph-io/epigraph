@@ -2497,21 +2497,35 @@ mod tests {
                 require_packet_signatures: false,
                 ..ApiConfig::default()
             });
-
-            Router::new()
-                .route("/api/v1/webhooks", post(register_webhook))
-                .route("/api/v1/webhooks", get(list_webhooks))
-                .route("/api/v1/webhooks/:id", get(get_webhook))
-                .route("/api/v1/webhooks/:id", delete(delete_webhook))
-                .layer(axum::Extension(
-                    crate::middleware::bearer::test_auth_with_scopes(&["webhooks:write"]),
-                ))
-                .with_state(state)
+            test_router_with_state(state)
         }
 
         /// Create a test router with shared state for multi-request tests
         fn test_router_with_state(state: AppState) -> Router {
-            Router::new()
+            test_router_with_stub(state).0
+        }
+
+        /// The router plus the stub resolver its egress guard answers from.
+        ///
+        /// `register_webhook` vets the URL's host through
+        /// `AppState::webhook_egress`, and `AppState::new` builds that guard on
+        /// the operating-system resolver. These tests run in CI
+        /// (lint-features), so a real lookup of `example.com` would make them
+        /// depend on the runner's DNS: no resolver, or one that sinkholes the
+        /// name, turns every 201 below into a 400. The stub answers
+        /// `example.com` with a public documentation-range address and fails
+        /// every other name, so no test here touches the network.
+        fn test_router_with_stub(
+            state: AppState,
+        ) -> (Router, std::sync::Arc<epigraph_jobs::egress::StubResolver>) {
+            let stub = std::sync::Arc::new(
+                epigraph_jobs::egress::StubResolver::new()
+                    .with("example.com", ["93.184.216.34".parse().unwrap()]),
+            );
+            let state = state.with_webhook_egress(
+                epigraph_jobs::egress::EgressGuard::with_resolver(stub.clone()),
+            );
+            let router = Router::new()
                 .route("/api/v1/webhooks", post(register_webhook))
                 .route("/api/v1/webhooks", get(list_webhooks))
                 .route("/api/v1/webhooks/:id", get(get_webhook))
@@ -2519,7 +2533,35 @@ mod tests {
                 .layer(axum::Extension(
                     crate::middleware::bearer::test_auth_with_scopes(&["webhooks:write"]),
                 ))
-                .with_state(state)
+                .with_state(state);
+            (router, stub)
+        }
+
+        /// Registration resolves the host through the router's stub, never the
+        /// system resolver, so this module's CI run makes no DNS query.
+        #[tokio::test]
+        async fn registration_resolves_through_the_stub_resolver() {
+            let (router, stub) = test_router_with_stub(AppState::new(ApiConfig {
+                require_packet_signatures: false,
+                ..ApiConfig::default()
+            }));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/webhooks")
+                        .header("content-type", "application/json")
+                        .body(Body::from(valid_registration_json().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            assert_eq!(
+                stub.calls("example.com"),
+                1,
+                "registration must vet example.com through the stub, exactly once"
+            );
         }
 
         /// Helper to parse JSON response body
