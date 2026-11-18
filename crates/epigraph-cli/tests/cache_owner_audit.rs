@@ -8,7 +8,11 @@
 //!   and a re-pointed cache on a claim that is no longer current.
 //! * (2) `compound_cached`: a compound holding a cache over a live BBA, and
 //!   the d33a5c9f (2) shape, a compound whose only BBA is retracted while its
-//!   value stays cached; control: a compound with no cache.
+//!   value stays cached; control: a compound with no cache. Beside it,
+//!   `ownerless_cached`: two NON-compounds whose only BBA is retracted, one
+//!   still serving the retracted value (the pre-vacate shape) and one
+//!   vacated; they are the negative control of the compound test (forcing it
+//!   true moves them into (2)).
 //! * (3) `edge_without_bba`: two epistemic edges created over HTTP, one known
 //!   by its create provenance row (written by the real
 //!   `ProvenanceRepository::append`) and one by its signer (the API's own
@@ -206,6 +210,8 @@ struct World {
     unrecorded: Uuid,
     compound_live: Uuid,
     compound_retracted: Uuid,
+    stale_retracted: Uuid,
+    vacated_retracted: Uuid,
     binary_truth: Uuid,
     claim_validity: Uuid,
     http_edge: Uuid,
@@ -225,9 +231,17 @@ async fn seed_world(pool: &PgPool) -> World {
     bba(pool, owned, binary_truth, agent, None).await;
     cache(pool, owned, 0.6, 1.0, Some(binary_truth)).await;
 
+    // The re-pointed cache also holds a second writer's claim_validity BBA,
+    // since retracted: the residual retract path (a non-owner's retraction on
+    // the recorded, non-owner frame; the refold on the owner frame is refused
+    // by migration 114's non-owner rule) leaves exactly this state, and it is
+    // still category (1).
     let repointed = claim("audit: cache re-pointed to claim_validity").await;
     bba(pool, repointed, binary_truth, agent, None).await;
     bba(pool, repointed, claim_validity, agent, None).await;
+    let (second_writer, _) = viewer_fixture::seed_agent_with_group(pool, "d33a5c9f-audit-2").await;
+    let row = bba(pool, repointed, claim_validity, second_writer, None).await;
+    retract(pool, row, second_writer).await;
     cache(pool, repointed, 0.3, 0.9, Some(claim_validity)).await;
 
     let unrecorded = claim("audit: cache recording no frame").await;
@@ -263,6 +277,18 @@ async fn seed_world(pool: &PgPool) -> World {
     let compound_uncached = claim("audit: compound with no cache").await;
     edge(pool, compound_uncached, leaf, "decomposes_to").await;
     bba(pool, compound_uncached, binary_truth, agent, None).await;
+
+    // Beside (2): non-compounds with no owner left (their only BBA is
+    // retracted), one still serving the retracted fold, one vacated.
+    let stale_retracted = claim("audit: non-compound serving a retracted fold").await;
+    let row = bba(pool, stale_retracted, binary_truth, agent, None).await;
+    retract(pool, row, agent).await;
+    cache(pool, stale_retracted, 0.6, 1.0, Some(binary_truth)).await;
+
+    let vacated_retracted = claim("audit: non-compound vacated after its retraction").await;
+    let row = bba(pool, vacated_retracted, binary_truth, agent, None).await;
+    retract(pool, row, agent).await;
+    cache(pool, vacated_retracted, 0.0, 1.0, Some(binary_truth)).await;
 
     // (3) edges. A source with a confident cache (the wire would store a BBA
     // from it today) and a factorless one.
@@ -321,6 +347,8 @@ async fn seed_world(pool: &PgPool) -> World {
         unrecorded,
         compound_live,
         compound_retracted,
+        stale_retracted,
+        vacated_retracted,
         binary_truth,
         claim_validity,
         http_edge,
@@ -419,7 +447,27 @@ async fn each_category_holds_exactly_its_seeded_rows(pool: PgPool) {
         "category (2)"
     );
     assert_eq!(report.compound_cached.count, 2);
-    assert_eq!(report.ownerless_cached_not_compound, 0);
+
+    // Beside (2): the two non-compounds with no owner, each flagged; only the
+    // one still serving the retracted fold is counted as damage.
+    assert_eq!(
+        ids_of(&lines, "ownerless_cached", "claim_id"),
+        set(&[w.stale_retracted, w.vacated_retracted]),
+        "ownerless non-compounds"
+    );
+    assert_eq!(report.ownerless_cached.count, 2);
+    assert_eq!(report.ownerless_cached_retracted_not_vacuous, 1);
+    let claim_field = |claim: Uuid, key: &str| {
+        lines
+            .iter()
+            .find(|l| l["claim_id"] == claim.to_string())
+            .expect("the claim's line")[key]
+            .clone()
+    };
+    assert_eq!(claim_field(w.stale_retracted, "all_retracted"), true);
+    assert_eq!(claim_field(w.stale_retracted, "vacuous"), false);
+    assert_eq!(claim_field(w.vacated_retracted, "all_retracted"), true);
+    assert_eq!(claim_field(w.vacated_retracted, "vacuous"), true);
 
     // (3): the three unwired epistemic edges, the two HTTP ones flagged, each
     // by its own marker; not the wired, the retracted-wire, the out-of-force
@@ -479,7 +527,7 @@ async fn each_category_holds_exactly_its_seeded_rows(pool: PgPool) {
     assert_eq!(report.edges_scanned, 6);
 
     assert!(report.claims_complete && report.edges_complete);
-    assert_eq!(lines.len(), 8, "one line per finding: {lines:?}");
+    assert_eq!(lines.len(), 10, "one line per finding: {lines:?}");
 
     // An operator-named signer (`--api-signer`) counts as HTTP origin too.
     let (named, _) = audit(
@@ -632,6 +680,7 @@ async fn the_binary_writes_the_findings_and_refuses_what_it_must(pool: PgPool) {
     assert_eq!(report["transaction_read_only"], true);
     assert_eq!(report["repointed_cache"]["count"], 2);
     assert_eq!(report["compound_cached"]["count"], 2);
+    assert_eq!(report["ownerless_cached"]["count"], 2);
     assert_eq!(report["edges_without_bba"]["count"], 3);
     let lines: Vec<serde_json::Value> = std::fs::read_to_string(&out)
         .expect("the findings file")

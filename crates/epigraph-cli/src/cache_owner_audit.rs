@@ -22,6 +22,17 @@
 //!    cached belief. `recompute_claim_belief` SKIPS these (a compound has no
 //!    owner), so this list is report-only: clearing a compound's cache is the
 //!    compound-cache cleanup, an operator decision this tool does not make.
+//!    **`ownerless_cached`** sits beside it: NON-compound claims that hold a
+//!    cache but have no owner (every input retracted, or only ingest-template
+//!    or inadmissible rows left). Each line says whether every input is
+//!    retracted (`all_retracted`) and whether the cache is vacuous
+//!    (`vacuous`: Bel 0, Pl 1). Since the retract path learned to vacate
+//!    (2026-10-27), a claim whose last BBA is retracted gets a vacuous cache;
+//!    one retracted before then, with no backfill, may still serve the
+//!    retracted fold, which is the d33a5c9f (2) shape on a non-compound:
+//!    `all_retracted && !vacuous` (counted as
+//!    `ownerless_cached_retracted_not_vacuous`). Report-only too:
+//!    `recompute_claim_belief` skips a claim with no owner.
 //! 3. **`edge_without_bba`**: in-force claim-to-claim edges whose relationship
 //!    the edge wire treats as epistemic (`restriction_kind_with_profile` is
 //!    not `Neutral`, decided by the engine function per stored relationship)
@@ -168,6 +179,15 @@ pub enum Finding {
         claim_id: Uuid,
         stored_frame_id: Option<Uuid>,
     },
+    /// Beside (2): a NON-compound with a cache and no owner.
+    OwnerlessCached {
+        claim_id: Uuid,
+        stored_frame_id: Option<Uuid>,
+        /// Every mass function on the claim is retracted.
+        all_retracted: bool,
+        /// The cache is the explicit vacuous value (Bel 0, Pl 1).
+        vacuous: bool,
+    },
     /// Category (4): the edge's BBA exists, on neither current endpoint.
     EdgeBbaOffEndpoint {
         edge_id: Uuid,
@@ -220,10 +240,16 @@ pub struct Report {
     pub repointed_cache_unrecorded_frame: u64,
     /// Category (2).
     pub compound_cached: Category,
-    /// Claims with a cache and no owner that are NOT compounds (only ingest
-    /// templates or only retracted rows left). Informational: a claim whose
-    /// last BBA was retracted keeps a vacuous cache by design.
-    pub ownerless_cached_not_compound: u64,
+    /// Claims with a cache and no owner that are NOT compounds (every input
+    /// retracted, or only ingest-template or inadmissible rows left). A claim
+    /// whose last BBA was retracted gets a vacuous cache only since the
+    /// retract path learned to vacate (2026-10-27); older ones may still
+    /// serve the retracted fold. Report-only (`recompute_claim_belief` skips a
+    /// claim with no owner).
+    pub ownerless_cached: Category,
+    /// Of `ownerless_cached`, the claims whose every input is retracted and
+    /// whose cache is NOT vacuous: the d33a5c9f (2) shape on a non-compound.
+    pub ownerless_cached_retracted_not_vacuous: u64,
     /// The stored relationships the wire treats as epistemic.
     pub epistemic_relationships: Vec<String>,
     /// The agents whose edge signatures count as HTTP origin.
@@ -335,6 +361,27 @@ async fn claim_page(
     .map_err(|e| format!("claim page: {e}"))
 }
 
+/// Tolerance of the vacuous test (Bel 0, Pl 1).
+const VACUOUS_EPS: f64 = 1e-9;
+
+/// Whether a cache is the explicit vacuous value (Bel 0, Pl 1).
+fn is_vacuous(belief: Option<f64>, plausibility: Option<f64>) -> bool {
+    matches!((belief, plausibility),
+        (Some(b), Some(p)) if b.abs() <= VACUOUS_EPS && (1.0 - p).abs() <= VACUOUS_EPS)
+}
+
+/// Whether every mass function on `claim_id` is retracted (none live).
+async fn all_retracted(conn: &mut sqlx::PgConnection, claim_id: Uuid) -> Result<bool, String> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM mass_functions mf \
+                             WHERE mf.claim_id = $1 AND mf.retracted_at IS NULL)",
+    )
+    .bind(claim_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| format!("live inputs ({claim_id}): {e}"))
+}
+
 /// Remaining room under `limit` after `done` rows, capped at `page`.
 fn room(limit: Option<u64>, done: u64, page: i64) -> i64 {
     match limit {
@@ -416,7 +463,21 @@ async fn audit_claims(
                             },
                         )?;
                     } else {
-                        report.ownerless_cached_not_compound += 1;
+                        let retracted_only = all_retracted(conn, id).await?;
+                        let vacuous = is_vacuous(cache.belief, cache.plausibility);
+                        report.ownerless_cached.add(id, opts.sample);
+                        if retracted_only && !vacuous {
+                            report.ownerless_cached_retracted_not_vacuous += 1;
+                        }
+                        emit(
+                            sink,
+                            &Finding::OwnerlessCached {
+                                claim_id: id,
+                                stored_frame_id: cache.belief_frame_id,
+                                all_retracted: retracted_only,
+                                vacuous,
+                            },
+                        )?;
                     }
                 }
             }
@@ -662,6 +723,14 @@ mod tests {
         assert_eq!(room(Some(250), 200, 100), 50);
         assert_eq!(room(Some(250), 250, 100), 0);
         assert_eq!(room(Some(10), 0, 100), 10);
+    }
+
+    #[test]
+    fn vacuous_is_bel_zero_and_pl_one() {
+        assert!(is_vacuous(Some(0.0), Some(1.0)));
+        assert!(!is_vacuous(Some(0.6), Some(1.0)));
+        assert!(!is_vacuous(Some(0.0), Some(0.9)));
+        assert!(!is_vacuous(None, Some(1.0)));
     }
 
     #[test]
