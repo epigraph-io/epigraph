@@ -400,14 +400,15 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 Nothing in a request process applies cascades or runs jobs. Create these on
 the host that holds the maintenance DSN, each with a 0600 environment file
 holding `MAINTENANCE_DATABASE_URL` and `DATABASE_URL` (naming the same
-database). All four refuse to start without `DATABASE_URL`; the three
-`epigraph-cli` binaries also accept it as `--database-url`, while `drain_jobs`
-reads it from the environment only:
+database). All of them refuse to start without `DATABASE_URL` (a
+`enqueue_job --dry-run` needs none); the `epigraph-cli` binaries also accept it
+as `--database-url`, while `drain_jobs` reads it from the environment only:
 
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
 | Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 as a failure (do not add it to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
+| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 

@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = ["db"]
-db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey"]
+db = ["dep:epigraph-db", "dep:sqlx", "dep:epigraph-passkey", "dep:epigraph-jobs"]
 genai = ["db"]
 
 [[bin]]
@@ -342,6 +342,21 @@ name = "backfill_evidence_type"
 path = "src/bin/backfill_evidence_type.rs"
 required-features = ["db"]
 
+# The operator's job enqueue (backlog batch B99): validates the job as an
+# EpiGraphJob and enqueues it through PostgresJobQueue on the maintenance DSN,
+# so a timer never INSERTs into `jobs` by hand. --unique keeps one pending job
+# per type; --dry-run validates only.
+[[bin]]
+name = "enqueue_job"
+path = "src/bin/enqueue_job.rs"
+required-features = ["db"]
+
+# Spawns the `db`-gated binary above.
+[[test]]
+name = "enqueue_job_bin"
+path = "tests/enqueue_job_bin.rs"
+required-features = ["db"]
+
 # Beta-track replay backfill (follow-up to backlog f50344c0): rebuilds
 # beta_alpha/beta_beta of claims still on the Beta(1,1) prior from their stored
 # BBAs. Maintenance-only, dry run by default, --apply writes a manifest that
@@ -513,6 +528,10 @@ sqlx = { workspace = true, optional = true }
 # every stored passkey assertion offline. Links OpenSSL (webauthn-rs-core);
 # only behind `db`, which every operator verb already needs.
 epigraph-passkey = { workspace = true, optional = true }
+# `enqueue_job` (backlog batch B99): validates a job as an `EpiGraphJob` and
+# enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs. Links
+# epigraph-db, so only behind `db`.
+epigraph-jobs = { workspace = true, optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

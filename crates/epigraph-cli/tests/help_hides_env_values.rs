@@ -97,6 +97,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/embed_backfill.rs",
     ),
     (
+        "enqueue_job",
+        Some(env!("CARGO_BIN_EXE_enqueue_job")),
+        "src/bin/enqueue_job.rs",
+    ),
+    (
         "experiment",
         Some(env!("CARGO_BIN_EXE_experiment")),
         "src/bin/experiment.rs",
