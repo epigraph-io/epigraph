@@ -1022,9 +1022,6 @@ mod tests {
         assert_eq!(c("supports").as_deref(), Some("derived_support"));
     }
 
-    /// A key the calibration does not know is kept (trimmed, lowercased: every
-    /// reader lowercases), because per-frame overrides and perspective maps may
-    /// key on it deliberately. Blank input is "no type".
     #[test]
     fn stored_evidence_type_length_is_counted_in_characters() {
         assert_eq!(check_stored_evidence_type_len(None), Ok(()));
@@ -1039,6 +1036,9 @@ mod tests {
         );
     }
 
+    /// A key the calibration does not know is kept (trimmed, lowercased: every
+    /// reader lowercases), because per-frame overrides and perspective maps may
+    /// key on it deliberately. Blank input is "no type".
     #[test]
     fn canonical_evidence_type_keeps_unknown_keys_and_drops_blank() {
         let cfg = load_config();

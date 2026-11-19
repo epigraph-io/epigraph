@@ -231,7 +231,8 @@ pub async fn submit_ds_evidence(
         .filter(|s| !s.is_empty());
     // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
     // caller's own key lowercased when the calibration does not know it
-    // (bc06ec6f). The vocabulary warning below still names what the caller sent.
+    // (bc06ec6f). The vocabulary warning below names the trimmed key the caller
+    // sent, before canonicalisation.
     let stored_evidence_type =
         epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
 

@@ -180,7 +180,7 @@ async fn assert_refused(w: &World, claim: Uuid, (status, text): (u16, String), s
     assert!(
         text.contains("evidence_type")
             && text.contains(&format!("{stored_len} characters"))
-            && text.contains("50"),
+            && text.contains("at most 50"),
         "the refusal names the field, the stored length and the limit: {text}"
     );
     assert!(stored_types(w, claim).await.is_empty(), "no BBA written");
