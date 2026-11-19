@@ -1676,6 +1676,23 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_definer_bypass()`), i.e. the maintenance session or 207's definer.",
         ),
         (
+            "claim_encryption_owner_scope_insert",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE insert policy: its arm (the claim exists and its owner group IS \
+             the seal row's `group_id`) narrows and grants nothing. It is AND-ed with 077's \
+             permissive `claim_encryption_tenancy`, whose WITH CHECK still requires `group_id` \
+             in `epigraph_writable_groups()`; the `claims` read inside it is the caller's, \
+             under its own row security.",
+        ),
+        (
+            "claim_encryption_owner_scope_update",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the \
+             same reason as `claim_encryption_owner_scope_insert`: AND-ed with 077's \
+             permissive `claim_encryption_tenancy` (USING the read set, WITH CHECK the \
+             writable set), it narrows and grants nothing.",
+        ),
+        (
             "claim_version_encryption_owner_scope_insert",
             "owner_group_id = claim_version_encryption.group_id",
             "233's RESTRICTIVE insert policy: its arm (the sealed `claim_versions` row exists, \
@@ -1746,7 +1763,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     );
 
     let mut offenders: Vec<String> = Vec::new();
-    let mut exemptions_hit: BTreeSet<&str> = BTreeSet::new();
+    // Keyed on (policy, needle), not the needle alone: two entries may share a
+    // needle (232's insert and update policies do), and a needle-only key
+    // would keep a dropped policy's entry "hit" through its sibling's arm.
+    let mut exemptions_hit: BTreeSet<(&str, &str)> = BTreeSet::new();
     for (table, policy, using, with_check) in &rows {
         for (clause, expr) in [("USING", using), ("WITH CHECK", with_check)] {
             let Some(expr) = expr else { continue };
@@ -1761,8 +1781,8 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
                 let exempt = ROW_ONLY_BY_DESIGN
                     .iter()
                     .find(|(p, needle, _)| p == policy && arm.contains(needle));
-                if let Some((_, needle, _)) = exempt {
-                    exemptions_hit.insert(needle);
+                if let Some((p, needle, _)) = exempt {
+                    exemptions_hit.insert((p, needle));
                     continue;
                 }
                 if !mentions_session && !allowed_constant {
@@ -1776,10 +1796,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     // matches any arm is an entry that has silently stopped exempting anything,
     // and would keep excusing a future arm that happened to contain the same
     // substring.
-    let stale: Vec<&str> = ROW_ONLY_BY_DESIGN
+    let stale: Vec<(&str, &str)> = ROW_ONLY_BY_DESIGN
         .iter()
-        .map(|(_, needle, _)| *needle)
-        .filter(|n| !exemptions_hit.contains(n))
+        .map(|(p, needle, _)| (*p, *needle))
+        .filter(|k| !exemptions_hit.contains(k))
         .collect();
     assert!(
         stale.is_empty(),
