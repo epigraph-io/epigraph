@@ -1675,6 +1675,55 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              marker) needs one of the two session arms beside it (`epigraph_bypass()` / \
              `epigraph_definer_bypass()`), i.e. the maintenance session or 207's definer.",
         ),
+        (
+            "claim_version_encryption_owner_scope_insert",
+            "owner_group_id = claim_version_encryption.group_id",
+            "233's RESTRICTIVE insert policy: its arm (the sealed `claim_versions` row exists, \
+             belongs to the seal row's `claim_id`, and its owner group IS the seal row's \
+             `group_id`) narrows and grants nothing. It is AND-ed with 077's permissive \
+             `claim_version_encryption_tenancy`, whose WITH CHECK still requires `group_id` in \
+             `epigraph_writable_groups()`; the `claim_versions` read inside it is the caller's, \
+             under its own row security.",
+        ),
+        (
+            "claim_version_encryption_owner_scope_update",
+            "owner_group_id = claim_version_encryption.group_id",
+            "233's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the same \
+             reason as `claim_version_encryption_owner_scope_insert`: AND-ed with 077's \
+             permissive `claim_version_encryption_tenancy`, it narrows and grants nothing.",
+        ),
+        (
+            "evidence_encryption_owner_scope_insert",
+            "owner_group_id = evidence_encryption.group_id",
+            "233's RESTRICTIVE insert policy: its arm (the sealed `evidence` row exists and its \
+             owner group IS the seal row's `group_id`) narrows and grants nothing. It is AND-ed \
+             with 077's permissive `evidence_encryption_tenancy`, whose WITH CHECK still requires \
+             `group_id` in `epigraph_writable_groups()`; the `evidence` read inside it is the \
+             caller's, under its own row security.",
+        ),
+        (
+            "evidence_encryption_owner_scope_update",
+            "owner_group_id = evidence_encryption.group_id",
+            "233's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the same \
+             reason as `evidence_encryption_owner_scope_insert`: AND-ed with 077's permissive \
+             `evidence_encryption_tenancy`, it narrows and grants nothing.",
+        ),
+        (
+            "edge_encryption_owner_scope_insert",
+            "owner_group_id = edge_encryption.group_id",
+            "233's RESTRICTIVE insert policy: its arm (the sealed `edges` row exists and its \
+             owner group IS the seal row's `group_id`) narrows and grants nothing. It is AND-ed \
+             with 077's permissive `edge_encryption_tenancy`, whose WITH CHECK still requires \
+             `group_id` in `epigraph_writable_groups()`; the `edges` read inside it is the \
+             caller's, under its own row security.",
+        ),
+        (
+            "edge_encryption_owner_scope_update",
+            "owner_group_id = edge_encryption.group_id",
+            "233's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the same \
+             reason as `edge_encryption_owner_scope_insert`: AND-ed with 077's permissive \
+             `edge_encryption_tenancy`, it narrows and grants nothing.",
+        ),
     ];
 
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(

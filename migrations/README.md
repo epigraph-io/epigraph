@@ -3209,6 +3209,57 @@ restart.
   `application/octet-stream` Document. Undo only after rolling every 229
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **233**: public `sealed_row_encryption_owner_scope` (backlog candidate
+  B102-other-encryption-tables, to be filed). 077's `<table>_tenancy` WITH
+  CHECK on `claim_version_encryption`, `evidence_encryption` and
+  `edge_encryption` named only the sealing `group_id`
+  (`= ANY (epigraph_writable_groups())`) and never the sealed row, so an
+  application session writing group A could seal, under A, a claim version,
+  evidence row or edge group B owns: one it cannot read, one it reads but
+  cannot write, or, writing both, one sealed under the wrong group's key;
+  and it could UPDATE an own seal row's key column or `group_id` onto such a
+  pair. Keyed by the sealed row's id, such a row squats on it: the owner's
+  privatization seal (`seal_claims_conn`, `ON CONFLICT DO NOTHING`, then
+  blank the plaintext) writes no ciphertext under the owner's key. A
+  version's seal row could also name another group's claim in its
+  `claim_id`. 232 closes the same shape for `claim_encryption`; 233 does
+  not depend on it and applies with or without it. Adds, per table, two
+  RESTRICTIVE policies `TO PUBLIC` with 077's two bypass disjuncts:
+  `<table>_owner_scope_insert` (FOR INSERT, WITH CHECK) and
+  `<table>_owner_scope_update` (FOR UPDATE, USING and WITH CHECK), each
+  requiring the sealed row to exist with `owner_group_id = group_id`
+  (`claim_versions` by `claim_version_id`, which must also carry the seal
+  row's `claim_id`; `evidence` by `evidence_id`; `edges` by `edge_id`, owner
+  only, so a co-owned edge is sealable under its owner and not its
+  co-owner), read under the caller's own row security (no definer helper,
+  so no owner oracle). With 077's permissive check that is: the sealed row's
+  owner group is writable to the session AND the seal is under that group.
+  The privatization seal and unseal run on a maintenance connection
+  (bypassed), `EvidenceEncryptionRepository::insert` and
+  `EdgeEncryptionRepository::insert` have no caller, and no shipped code
+  UPDATEs these tables, so no shipped writer changes. No function body
+  re-stated (no md5 guard); no table, column, trigger, index or grant.
+  Pinned by `epigraph-db/tests/sealed_row_encryption_write_scope.rs` (as
+  `epigraph_app`, per table: every cross-group INSERT and UPDATE is admitted
+  below 233 and refused 42501 at 233, the own-group seal and ciphertext
+  rewrite are admitted at both, and below 233 a squatted row makes the
+  owner's seal insert nothing; the undo) and by
+  `rls_enforcement.rs::no_policy_arm_is_session_independent` (six
+  `ROW_ONLY_BY_DESIGN` entries). Undo: `docs/runbooks/233-undo.sql`
+  (tested: run twice, it returns the three tables' policies to below 233).
+  Slot 233 was assigned by the 2026-11-19 backlog wave; checked before
+  claiming: no origin branch carries a `233`. **Deploy order:** none; no
+  binary depends on it, and it may be applied before or after 232. Before
+  migrating, count existing rows in the refused state per table (they are
+  not repaired, and an UPDATE of one is refused after 233; expected 0 each):
+  `SELECT count(*) FROM claim_version_encryption cve LEFT JOIN claim_versions v
+  ON v.id = cve.claim_version_id WHERE v.claim_id IS DISTINCT FROM
+  cve.claim_id OR v.owner_group_id IS DISTINCT FROM cve.group_id`;
+  `SELECT count(*) FROM evidence_encryption ee JOIN evidence e ON e.id =
+  ee.evidence_id WHERE ee.group_id IS DISTINCT FROM e.owner_group_id`;
+  `SELECT count(*) FROM edge_encryption ge JOIN edges e ON e.id = ge.edge_id
+  WHERE ge.group_id IS DISTINCT FROM e.owner_group_id`. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
