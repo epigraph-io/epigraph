@@ -1819,8 +1819,10 @@ pub async fn update_with_evidence(
     // (an identical `evidence_data` is refused above), so it is always
     // counted. Both are best-effort, each under its own savepoint: the row is
     // claim-derived, and a non-owner of a public claim is refused it (and the
-    // Beta write) without losing the evidence.
-    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+    // Beta write) without losing the evidence. A cold start (the claim's track
+    // still at the Beta(1, 1) prior before this call) records no row: see
+    // `epigraph_engine::ds_divergence`.
+    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
         &mut tx,
         viewer,
         claim_id,
@@ -1845,7 +1847,7 @@ pub async fn update_with_evidence(
         claim_id,
         ds.frame_id,
         ds.pignistic_prob,
-        bayesian_posterior,
+        beta_update,
         frame_version,
         "update_with_evidence",
     )

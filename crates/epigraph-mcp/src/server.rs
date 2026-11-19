@@ -2780,7 +2780,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Get the DS-vs-Bayesian KL divergence for a claim, measuring how much the Dempster-Shafer and Bayesian assessments disagree."
+        description = "Get the DS-vs-Bayesian KL divergence for a claim, measuring how much the Dempster-Shafer and Bayesian assessments disagree. Recorded by submit_ds_evidence, update_with_evidence and POST /frames/:id/evidence, and not on a claim's cold start: the update that first moves its Beta track off the Beta(1,1) prior records nothing, because one BBA against a mature BetP is not a disagreement. Such a claim has no divergence data until its next live evidence write. Rows older than 7 days are not served."
     )]
     async fn get_divergence(
         &self,
