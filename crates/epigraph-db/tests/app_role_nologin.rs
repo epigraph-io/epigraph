@@ -226,7 +226,10 @@ async fn the_migration_refuses_while_a_session_is_logged_in_as_the_app_role(pool
         shown.starts_with("while executing migration 231: ")
             && shown.contains("231 refuses: 1 session(s) are logged in as epigraph_app")
             && shown.contains("app_role_nologin_test")
-            && shown.contains("docs/deploy.md")
+            // The guide is named by its directory and file separately: a whole
+            // `docs/deploy.md` literal reads to the CI shard planner as a file this
+            // test opens, so every docs-only change would run its shard.
+            && shown.contains(concat!("docs", "/deploy.md"))
             && shown.contains("re-run epigraph-migrate"),
         "{shown}"
     );
