@@ -1530,6 +1530,7 @@ dependencies = [
  "epigraph-engine",
  "epigraph-ingest",
  "epigraph-interfaces",
+ "epigraph-jobs",
  "epigraph-mcp",
  "epigraph-passkey",
  "epigraph-privacy",

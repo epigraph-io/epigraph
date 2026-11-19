@@ -490,7 +490,106 @@ impl JobQueue for PostgresJobQueue {
 // Additional PostgresJobQueue Methods
 // ============================================================================
 
+/// The advisory-lock class [`PostgresJobQueue::enqueue_unique_pending`]
+/// serializes on: the lock is `pg_advisory_xact_lock(hashtext(this),
+/// hashtext(job_type))`, one per job type. The two-int form never collides
+/// with the bigint keys in `epigraph_db::repos::maintenance_lock`.
+pub const ENQUEUE_UNIQUE_LOCK_CLASS: &str = "epigraph.jobs.enqueue_unique";
+
 impl PostgresJobQueue {
+    /// Enqueue `job` unless a job of the same `job_type` is already `pending`.
+    /// Returns `Ok(Some(id))` when it enqueued, `Ok(None)` when a pending job
+    /// of that type was found and nothing was written. A `running`,
+    /// `completed`, `failed` or `cancelled` job of the type does not block it,
+    /// and the payload is not compared: one pending job per type.
+    ///
+    /// The caller is the operator CLI `enqueue_job --unique`, which a timer
+    /// runs so that a missed drain cannot stack a second job of the type.
+    ///
+    /// # Atomic among its callers
+    ///
+    /// One transaction: first `pg_advisory_xact_lock` on
+    /// ([`ENQUEUE_UNIQUE_LOCK_CLASS`], `job_type`), as its OWN statement, then
+    /// the guarded `INSERT ... SELECT ... WHERE NOT EXISTS`. Under READ
+    /// COMMITTED each statement takes a fresh snapshot, so the INSERT's
+    /// snapshot is taken after the lock wait and sees a row a concurrent
+    /// caller committed while this one waited. (Folded into the INSERT, the
+    /// lock would be taken inside a snapshot that predates the wait, and two
+    /// callers could both insert.) A plain [`JobQueue::enqueue`] of the same
+    /// type does not take the lock and is not serialized against this.
+    ///
+    /// The deleted predecessor of this method had the same guard without the
+    /// lock (backlog cbf57f24). A unique partial index with `ON CONFLICT`
+    /// would also close the race against plain enqueues; that needs a
+    /// migration, and the only enqueuer of the scheduled types is this path.
+    ///
+    /// # Pool
+    ///
+    /// Run it on the maintenance pool, as `enqueue_job` does after asserting
+    /// the connection satisfies `epigraph_bypass()`. On an application
+    /// session row security would hide the pending rows from the guard and
+    /// turn it into an unconditional insert, except that since migration 119
+    /// `jobs_app` refuses an application session's INSERT into `jobs`
+    /// outright, so there it fails closed with an error.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` if a statement fails.
+    #[instrument(skip(self, job), fields(job_id = %job.id, job_type = %job.job_type))]
+    pub async fn enqueue_unique_pending(&self, job: Job) -> Result<Option<JobId>, JobError> {
+        let fail = |what: &str, e: sqlx::Error| JobError::ProcessingFailed {
+            message: format!("Failed to enqueue (unique pending): {what}: {e}"),
+        };
+        let id: Uuid = job.id.into();
+        let state_str = job_state_to_str(job.state);
+
+        let mut tx = self.pool.begin().await.map_err(|e| fail("begin", e))?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(ENQUEUE_UNIQUE_LOCK_CLASS)
+            .bind(&job.job_type)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("lock", e))?;
+        let inserted = sqlx::query(
+            r"
+            INSERT INTO jobs (
+                id, job_type, payload, state, retry_count, max_retries,
+                created_at, updated_at, started_at, completed_at, error_message
+            )
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+            WHERE NOT EXISTS (
+                SELECT 1 FROM jobs WHERE job_type = $2 AND state = 'pending'
+            )
+            ",
+        )
+        .bind(id)
+        .bind(&job.job_type)
+        .bind(&job.payload)
+        .bind(state_str)
+        .bind(job.retry_count as i32)
+        .bind(job.max_retries as i32)
+        .bind(job.created_at)
+        .bind(job.updated_at)
+        .bind(job.started_at)
+        .bind(job.completed_at)
+        .bind(&job.error_message)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| fail("insert", e))?
+        .rows_affected();
+        tx.commit().await.map_err(|e| fail("commit", e))?;
+
+        if inserted == 0 {
+            tracing::debug!(
+                job_type = %job.job_type,
+                "enqueue_unique_pending: a pending job of this type already exists; skipped"
+            );
+            Ok(None)
+        } else {
+            tracing::debug!(job_id = %job.id, "enqueue_unique_pending: enqueued");
+            Ok(Some(job.id))
+        }
+    }
+
     /// Get jobs by state.
     ///
     /// Useful for monitoring dashboards and administrative tasks.

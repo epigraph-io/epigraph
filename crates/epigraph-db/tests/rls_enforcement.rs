@@ -2116,7 +2116,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 ///
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
-/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | **REMOVED** (backlog cbf57f24): it had no caller; the pool assertion below still pins the queue to the maintenance DSN |
+/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (its one caller is the operator CLI `enqueue_job --unique`, on the configured maintenance DSN after `assert_privileged`; 119 lets no application session enqueue, so off that pool it fails closed with an error) | Removed with no caller (backlog cbf57f24), RESTORED for `enqueue_job --unique` with a transaction-scoped advisory lock per job type taken before the guarded INSERT, so the check-then-insert is atomic among its callers; the pool assertion below still pins the drain's queue to the maintenance DSN |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |
