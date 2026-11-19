@@ -43,6 +43,14 @@
 //! admitted below 233 and refused at head; rewriting an own row's ciphertext
 //! is admitted at both.
 //!
+//! [`a_non_superuser_maintenance_member_still_seals_at_233`]: the shipped
+//! writer, the real `seal_claims_conn`, run at head by a maintenance member
+//! that is not a superuser, still writes its version and evidence ciphertext.
+//!
+//! [`a_co_owned_edge_is_sealable_under_its_owner_group_only`]: a co-owned
+//! edge's seal under its co-owner is admitted below 233 and refused at head;
+//! under its owner it is admitted.
+//!
 //! [`the_233_undo_returns_the_policies_below_233`]: 233 adds exactly its six
 //! policies across the three tables, and the undo runbook removes exactly
 //! them, idempotently.
@@ -62,6 +70,8 @@
 //! - One table at a time, its FOR UPDATE policy dropped: that table's move
 //!   onto B's row is admitted; its FOR INSERT policy dropped: that table's
 //!   unreadable-row seal is admitted.
+//! - The edge predicate widened to also accept `co_owner_group_id`: the
+//!   co-owner seal is admitted at head.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is
 //! not extended.
@@ -763,5 +773,194 @@ async fn the_233_undo_returns_the_policies_below_233(pool: PgPool) {
             before,
             "after the {run} run the policies are exactly the ones below 233"
         );
+    }
+}
+
+/// The shipped writer of two of the three tables is the privatization seal,
+/// `PrivatizationRepository::seal_claims_conn`, on a maintenance connection.
+/// 233 keeps 077's `epigraph_bypass()` disjunct for it. Every other seal row
+/// in this file is seeded by the harness SUPERUSER, which skips row security
+/// outright and so never evaluates that disjunct. Here a fresh NOLOGIN role
+/// that is only a MEMBER of `epigraph_maintenance` (not a superuser, not
+/// BYPASSRLS, no session GUCs) runs the real `seal_claims_conn` at head on a
+/// group-private claim with a version and an owner-held evidence row, and its
+/// `claim_version_encryption` and `evidence_encryption` rows land. (Measured
+/// first without the DELETE grant below: the seal got past both ciphertext
+/// INSERTs and was refused at its later `DELETE FROM triples`, a table
+/// privilege the NOLOGIN role does not hold.)
+///
+/// What admits it, measured by mutating 233's
+/// `claim_version_encryption_owner_scope_insert` alone: the shipped seal
+/// passes 233 on BOTH grounds. With `epigraph_bypass()` removed it still
+/// passes (the seal is under the version's owner group, and the member's read
+/// of `claim_versions` is admitted by that table's own bypass arm). With the
+/// owner predicate replaced by `false` it still passes, through the bypass
+/// arms, and with `epigraph_bypass()` also removed it still passes through
+/// `epigraph_definer_bypass()`, which is true for a maintenance member. With
+/// the whole WITH CHECK replaced by `false` this test fails (42501), so it
+/// does reach the policy.
+#[sqlx::test(migrations = false)]
+async fn a_non_superuser_maintenance_member_still_seals_at_233(pool: PgPool) {
+    use epigraph_db::repos::privatization::{
+        PrivatizationRepository, SealCommitEvidence, SealCommitItem, SealCommitVersion,
+    };
+
+    migrate(&pool, &up_to(i64::MAX)).await;
+    let (a, group_a) = team(&pool, "maint-seal-a").await;
+    let version = Table::ClaimVersion
+        .seed(&pool, a, group_a, "versioned")
+        .await;
+    let claim = version.claim;
+    let evidence = viewer_fixture::seed_evidence(&pool, claim, "document").await;
+
+    let role = format!("b107_maint_member_{}", Uuid::new_v4().simple());
+    for stmt in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("GRANT epigraph_maintenance TO {role}"),
+        // The seal also DELETEs the claim's derived extractions, which the
+        // NOLOGIN `epigraph_maintenance` role holds no DELETE on (070); a
+        // deployed non-superuser maintenance login needs that grant of its
+        // own (115 section 8 says the same of the unseal). A table privilege,
+        // not a row-security exemption: it changes nothing 233 evaluates.
+        format!("GRANT DELETE ON ALL TABLES IN SCHEMA public TO {role}"),
+    ] {
+        sqlx::query(&stmt)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+
+    let items = vec![SealCommitItem {
+        claim_id: claim,
+        content_ct: vec![0xAA; 48],
+        labels_ct: vec![0xAB; 48],
+        properties_ct: vec![0xAC; 48],
+        content_hash: vec![0x11; 32],
+        versions: vec![SealCommitVersion {
+            id: version.id,
+            content_ct: vec![0xAD; 48],
+        }],
+        evidence: vec![SealCommitEvidence {
+            id: evidence,
+            content_ct: vec![0xAE; 48],
+            properties_ct: vec![0xAF; 48],
+        }],
+    }];
+    let out = viewer_fixture::as_role(&pool, &role, |mut conn| async move {
+        let calib: (bool, bool, bool) = sqlx::query_as(
+            "SELECT r.rolsuper, r.rolbypassrls, public.epigraph_bypass() \
+               FROM pg_roles r WHERE r.rolname = session_user",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("calibrate the member session");
+        let run = async {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            let sealed =
+                PrivatizationRepository::seal_claims_conn(&mut tx, group_a, 0, &items).await;
+            match sealed {
+                Ok(s) => {
+                    tx.commit().await?;
+                    Ok(Ok(s))
+                }
+                Err(e) => Ok::<_, sqlx::Error>(Err(e.to_string())),
+            }
+        };
+        let out = run.await.map_err(|e| e.to_string()).and_then(|r| r);
+        (conn, (calib, out))
+    })
+    .await;
+    assert_eq!(
+        out.0,
+        (false, false, true),
+        "CALIBRATION: the session is a maintenance member, not a superuser, not BYPASSRLS"
+    );
+    assert_eq!(
+        out.1,
+        Ok(vec![claim]),
+        "a non-superuser maintenance member seals the claim through 233"
+    );
+    assert_eq!(
+        (
+            Table::ClaimVersion.sealed_under(&pool, version.id).await,
+            Table::Evidence.sealed_under(&pool, evidence).await,
+        ),
+        (Some(group_a), Some(group_a)),
+        "the version and the evidence row are sealed under the claim's owner group"
+    );
+}
+
+/// A co-owned edge (072: an edge between rows private to two different groups
+/// carries an owner and a co-owner) is sealable under its OWNER group only.
+/// Below 233 a writer of both groups could seal it under the co-owner; at
+/// head that is refused, and sealing it under the owner is admitted. This is
+/// 233's stated choice while `edge_encryption` has no writer.
+#[sqlx::test(migrations = false)]
+async fn a_co_owned_edge_is_sealable_under_its_owner_group_only(pool: PgPool) {
+    for (at, migrator, head) in [
+        ("below 233", up_to(BELOW), false),
+        ("head", up_to(i64::MAX), true),
+    ] {
+        migrate(&pool, &migrator).await;
+        let (a, group_a) = team(&pool, "co-edge-a").await;
+        let (b, group_b) = team(&pool, "co-edge-b").await;
+        join(&pool, group_b, a, "writer").await;
+        let writer_of_both = Session {
+            principal: a,
+            read: vec![group_a, group_b],
+            write: vec![group_a, group_b],
+        };
+        let src = viewer_fixture::seed_group_claim(&pool, a, group_a, "co src").await;
+        let tgt = viewer_fixture::seed_group_claim(&pool, b, group_b, "co tgt").await;
+        let edge = viewer_fixture::seed_edge(&pool, src, tgt).await;
+        let (owner, co_owner): (Uuid, Option<Uuid>) =
+            sqlx::query_as("SELECT owner_group_id, co_owner_group_id FROM edges WHERE id = $1")
+                .bind(edge)
+                .fetch_one(&pool)
+                .await
+                .expect("read the edge's tenancy");
+        let co_owner = co_owner.unwrap_or_else(|| {
+            panic!("CALIBRATION (at {at}): an edge between A's and B's private claims is co-owned")
+        });
+        assert_eq!(
+            BTreeSet::from([owner, co_owner]),
+            BTreeSet::from([group_a, group_b]),
+            "CALIBRATION (at {at}): the edge is owned by one of A and B and co-owned by the other"
+        );
+        let target = Target {
+            id: edge,
+            claim: src,
+        };
+
+        let r = app_write(
+            &pool,
+            &writer_of_both,
+            Table::Edge.seal(),
+            Table::Edge.seal_binds(target, co_owner),
+        )
+        .await;
+        if head {
+            assert_row_security_refusal(at, "sealing a co-owned edge under its co-owner", &r);
+            assert_eq!(Table::Edge.sealed_under(&pool, edge).await, None);
+            let r = app_write(
+                &pool,
+                &writer_of_both,
+                Table::Edge.seal(),
+                Table::Edge.seal_binds(target, owner),
+            )
+            .await;
+            assert_eq!(
+                r,
+                Ok(1),
+                "(at {at}) a co-owned edge is sealed under its owner"
+            );
+            assert_eq!(Table::Edge.sealed_under(&pool, edge).await, Some(owner));
+        } else {
+            assert_eq!(
+                r,
+                Ok(1),
+                "CALIBRATION (at {at}): a writer of both seals a co-owned edge under its co-owner"
+            );
+        }
     }
 }

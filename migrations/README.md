@@ -3235,7 +3235,8 @@ restart.
   so no owner oracle). With 077's permissive check that is: the sealed row's
   owner group is writable to the session AND the seal is under that group.
   The privatization seal and unseal run on a maintenance connection
-  (bypassed), `EvidenceEncryptionRepository::insert` and
+  (bypassed; measured for the seal: a non-superuser maintenance member runs
+  the real `seal_claims_conn` through 233), `EvidenceEncryptionRepository::insert` and
   `EdgeEncryptionRepository::insert` have no caller, and no shipped code
   UPDATEs these tables, so no shipped writer changes. No function body
   re-stated (no md5 guard); no table, column, trigger, index or grant.
@@ -3243,7 +3244,9 @@ restart.
   `epigraph_app`, per table: every cross-group INSERT and UPDATE is admitted
   below 233 and refused 42501 at 233, the own-group seal and ciphertext
   rewrite are admitted at both, and below 233 a squatted row makes the
-  owner's seal insert nothing; the undo) and by
+  owner's seal insert nothing; the shipped seal on a non-superuser
+  maintenance member; a co-owned edge sealable under its owner only; the
+  undo) and by
   `rls_enforcement.rs::no_policy_arm_is_session_independent` (six
   `ROW_ONLY_BY_DESIGN` entries). Undo: `docs/runbooks/233-undo.sql`
   (tested: run twice, it returns the three tables' policies to below 233).

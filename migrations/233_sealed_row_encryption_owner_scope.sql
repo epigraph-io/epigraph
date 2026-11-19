@@ -85,8 +85,12 @@
 -- above).
 --
 -- The maintenance role and SECURITY DEFINER bodies keep 077's bypass, as on
--- every other policy of these tables. This file applies whether or not 232
--- is present: it names no `claim_encryption` object.
+-- every other policy of these tables. Measured: a NOLOGIN role that is only a
+-- member of `epigraph_maintenance` (not a superuser, not BYPASSRLS) runs the
+-- real `seal_claims_conn` through 233 and its version and evidence rows land
+-- (`a_non_superuser_maintenance_member_still_seals_at_233`). This file
+-- applies whether or not 232 is present: it names no `claim_encryption`
+-- object.
 --
 -- No function body is re-stated, so there is no md5 guard. No table,
 -- column, function, trigger, index or grant changes. 115's
