@@ -358,12 +358,46 @@ async fn update_with_evidence_writes_a_divergence_row_get_divergence_reads(pool:
 /// claim's group, which this caller does not write), so its insert is refused
 /// and rolled back to its savepoint without taking the submission with it,
 /// and the claim's Beta parameters are the owner's and do not move.
+///
+/// The claim's Beta track is seeded OFF the prior (as the owner's earlier
+/// evidence would leave it): on a track still at `Beta(1, 1)` every update is
+/// a cold start, `record_divergence` returns before it attempts the insert,
+/// and this arm would no longer test the refusal. The precondition below pins
+/// that the insert is reached.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(pool: PgPool) {
+    use epigraph_engine::ds_divergence::apply_beta_update;
+
     let (server, _group, viewer) = app_role_server(&pool).await;
     let (frame, _) = binary_truth(&pool).await;
 
     let claim = foreign_claim(&pool, "a world claim someone else wrote").await;
+    sqlx::query("UPDATE claims SET beta_alpha = 1.8, beta_beta = 1.2 WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("seed the owner's Beta track off the prior");
+
+    // Precondition: for this caller the update is not a cold start, so the
+    // divergence insert below is attempted (and refused), not skipped.
+    let url = fixture::database_url_for(&pool).await;
+    let probe_pool =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut probe = probe_pool
+        .begin_as(&viewer)
+        .await
+        .expect("stamped probe tx");
+    let update = apply_beta_update(&mut probe, &viewer, claim, Some((0.8, 0.2)), "probe")
+        .await
+        .expect("probe update");
+    probe.rollback().await.expect("roll back the probe");
+    assert!(
+        !update.cold_start,
+        "the seeded track must not read as a cold start, or the insert is never \
+         attempted and this arm is vacuous: {update:?}"
+    );
     let res =
         epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
             .await;
@@ -391,7 +425,10 @@ async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(
     assert_eq!(bbas, 2, "both submissions landed their BBA");
     assert!(divergence_rows(&pool, claim).await.is_empty());
     let (a, b) = beta(&pool, claim).await;
-    assert!(close(a, 1.0) && close(b, 1.0), "got ({a}, {b})");
+    assert!(
+        close(a, 1.8) && close(b, 1.2),
+        "the owner's track must not move: got ({a}, {b})"
+    );
 }
 
 /// Two Beta updates on one claim that overlap in time both land.

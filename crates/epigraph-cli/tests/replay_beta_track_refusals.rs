@@ -73,7 +73,9 @@ fn a_replay_apply_is_refused_before_any_file_or_connection() {
 }
 
 /// The reversal of an earlier run is not retired: `--reverse <PATH> --apply`
-/// passes the refusal and stops only at the (unreachable) database.
+/// passes the refusal and stops only at the (unreachable) database. A guard
+/// against the refusal catching too much; it passes on the pre-refusal binary
+/// too, so it is not a proof of the refusal.
 #[test]
 fn a_reverse_apply_is_not_refused_as_retired() {
     let dir = scratch_dir();
@@ -108,12 +110,15 @@ fn a_batch_out_of_range_is_refused() {
     }
 }
 
-/// With MAINTENANCE_DATABASE_URL unset the binary refuses before it creates
-/// the manifest or connects on the application DSN.
+/// With MAINTENANCE_DATABASE_URL unset the binary refuses before it connects
+/// on the application DSN (the refusal's own text, not a connection error).
+/// No run here writes a manifest any more (a replay `--apply` is retired, and
+/// a reversal only reads one), so there is no manifest to check for.
 #[test]
-fn an_unset_maintenance_dsn_is_refused_before_a_manifest_is_created() {
+fn an_unset_maintenance_dsn_is_refused_before_a_connection() {
     let dir = scratch_dir();
     let manifest = dir.join("m.jsonl");
+    std::fs::write(&manifest, "").expect("write an empty manifest");
     let manifest_arg = manifest.to_str().expect("utf-8 path");
     for args in [
         vec!["--reverse", manifest_arg, "--apply"],
@@ -121,9 +126,5 @@ fn an_unset_maintenance_dsn_is_refused_before_a_manifest_is_created() {
     ] {
         let out = run(&dir, false, &args);
         refused_with(&out, "explicitly configured MAINTENANCE_DATABASE_URL");
-        assert!(
-            !manifest.exists(),
-            "a refused run must not leave a manifest behind"
-        );
     }
 }
