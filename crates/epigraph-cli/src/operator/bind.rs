@@ -218,9 +218,13 @@ async fn resolve_agent(conn: &mut PgConnection, spec: &AgentSpec) -> anyhow::Res
             if let Some(a) = AgentRepository::get_by_public_key(&mut *conn, &key).await? {
                 return Ok((a.id.as_uuid(), false));
             }
-            // Exactly what `EpiGraphMcpFull::agent_id` creates on first boot.
+            // The row `EpiGraphMcpFull::agent_id` created on first boot when
+            // `--agent-model` was a signer. Its key is derived from public
+            // inputs, so it is stored as `seed-derived`: an identifier, whose
+            // key `public_key_if_signer` refuses (backlog bfc2eff8;
+            // epigraph-mcp now refuses to sign with it).
             let agent = epigraph_core::Agent::new(key, Some("mcp-agent".to_string()));
-            let created = AgentRepository::create_conn(&mut *conn, &agent)
+            let created = AgentRepository::create_seed_derived_conn(&mut *conn, &agent)
                 .await
                 .context("creating the agent row for this LLM identity")?;
             Ok((created.id.as_uuid(), true))

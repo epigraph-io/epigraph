@@ -123,21 +123,29 @@ everywhere. Three seed strategies are in use today:
   authoritative and the agent's key can be rotated to a secret one.
 - **LLM-driven agents** — the seed is the model identifier plus the
   BLAKE3 hash of the system prompt, so the same model+prompt pair
-  resolves to the same agent identity across sessions. The MCP server
-  derives its signer this way when it is started with `--agent-model`
-  (`EPIGRAPH_AGENT_MODEL`) and `--agent-system-prompt` or
-  `--agent-system-prompt-hash` (`keypair_from_llm_agent` in
-  `epigraph-crypto`; first tracked in
+  resolves to the same agent identity across sessions
+  (`keypair_from_llm_agent` in `epigraph-crypto`; first tracked in
   [issue #166](https://github.com/epigraph-io/epigraph/issues/166)).
   Both inputs are public, so anyone who can read them can recompute
-  that private key. User OAuth passthrough sits next on that roadmap,
-  so writes attributed to "Claude with prompt X acting for Jeremy" can
-  be distinguished from "Claude with prompt X acting for Carrie".
+  that private key. The MCP server therefore no longer signs with it:
+  `--agent-model` is refused at startup (backlog bfc2eff8). A host
+  derives the same identity KEYED with a secret it keeps
+  (`keypair_from_llm_agent_keyed`), registers it with a separate random
+  signing key, and starts the server in the separate-signing-key mode.
+
+Every seed above is an IDENTIFIER, never a credential: anyone can compute
+its private half, so an agent named by one must not sign. An agent row
+created for such a key is stored with `key_kind = 'seed-derived'`
+(migration 230). `AgentRepository::public_key_if_signer`, the key source of
+the packet-signature check, refuses such a key. Three other verifiers do
+not read `key_kind` yet: `verify_claim`, the edge-signature check and the
+OAuth `client_credentials` assertion check still accept a signature under
+the agent's bare public key.
 
 A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
 
-1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with the two options below.
-2. `--agent-model`, the LLM-agent seed above. It takes precedence over `--agent-key`.
+1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with `--agent-key`.
+2. `--agent-model` (with `--agent-system-prompt` or `--agent-system-prompt-hash`) is REFUSED: it derived the signing key from the public seed above. It is checked first, so it never falls through to another rung.
 3. `--agent-key` (`EPIGRAPH_MCP_AGENT_KEY`): a fixed 32-byte secret key that you generate once and keep. This is what the [quickstart](01-quickstart.md) sets up.
 4. None of these: the server generates a fresh keypair on every launch and says so on stderr. Each launch then authors as a different agent, and the server warns that ownership cannot be decided for such a signer.
 
@@ -501,7 +509,7 @@ Related but not the same:
   or a live delegated run token, and a `claims:admin` token also
   passes. A stdio agent that shares no operator with the author is
   refused, and so is a stdio server with no declared signer
-  (`--agent-key` / `--agent-model`) on any claim it did not author.
+  (`--agent-key` or the separate signing key) on any claim it did not author.
   There is no free-text workaround: a bare "Resolves <UUID>:" claim is
   exactly the drift the "Do **not**" list above forbids. If you are
   refused, have an owner retire the item.

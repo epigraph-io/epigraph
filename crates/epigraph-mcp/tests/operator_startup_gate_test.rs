@@ -319,25 +319,25 @@ async fn an_http_listener_refuses_a_signer_that_already_has_an_operator_link(poo
     }
 }
 
-/// Spawn a STDIO process with a derived identity and `--operator-id`, and wait
-/// until it logs the link outcome (it then blocks in the MCP handshake, so it is
-/// killed). Returns the process's stderr.
-fn spawn_stdio_with_operator(
-    db_url: &str,
-    model: &str,
-    prompt_hash: &str,
-    operator: Uuid,
-) -> String {
+/// Spawn a STDIO process with a declared identity (`--agent-key`) and
+/// `--operator-id`, and wait until it logs the link outcome (it then blocks in
+/// the MCP handshake, so it is killed). Returns the process's stderr.
+///
+/// The declared identity was `--agent-model` + a prompt hash until backlog
+/// bfc2eff8 refused that derivation; the link behaviour under test does not
+/// depend on how the identity is declared, only that it is stable.
+fn spawn_stdio_with_operator(db_url: &str, agent_key_hex: &str, operator: Uuid) -> String {
     let mut child = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_MODEL")
+        .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")
+        .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH")
         .args([
             "--database-url",
             db_url,
-            "--agent-model",
-            model,
-            "--agent-system-prompt-hash",
-            prompt_hash,
+            "--agent-key",
+            agent_key_hex,
             "--operator-id",
             &operator.to_string(),
         ])
@@ -386,7 +386,7 @@ fn spawn_stdio_with_operator(
     }
 }
 
-/// The epiclaw shape end to end: a stdio process with a derived identity and
+/// The epiclaw shape end to end: a stdio process with a declared identity and
 /// `EPIGRAPH_OPERATOR_ID` records its link at startup; after the operator
 /// revokes it, the NEXT start reports the revocation and does NOT restore it.
 #[sqlx::test(migrations = "../../migrations")]
@@ -395,15 +395,14 @@ async fn a_stdio_agent_self_links_at_startup_and_a_restart_does_not_revive_a_rev
 ) {
     let db_url = fixture::database_url_for(&pool).await;
     let (operator, _) = fixture::seed_human_operator(&pool, "operator").await;
-    let model = "operator-gate-test-model";
-    let prompt_hash = "ab".repeat(32);
-    let pk = epigraph_crypto::keypair_from_llm_agent_prehashed(model, &prompt_hash).public_key();
+    let signer = epigraph_crypto::AgentSigner::generate();
+    let key_hex = hex::encode(signer.secret_key());
+    let pk = signer.public_key();
 
-    let (url, h) = (db_url.clone(), prompt_hash.clone());
-    let log =
-        tokio::task::spawn_blocking(move || spawn_stdio_with_operator(&url, model, &h, operator))
-            .await
-            .expect("join");
+    let (url, k) = (db_url.clone(), key_hex.clone());
+    let log = tokio::task::spawn_blocking(move || spawn_stdio_with_operator(&url, &k, operator))
+        .await
+        .expect("join");
     assert!(
         log.contains("operator link recorded"),
         "first start must record the link:\n{log}"
@@ -439,11 +438,10 @@ async fn a_stdio_agent_self_links_at_startup_and_a_restart_does_not_revive_a_rev
         .await
         .expect("the operator revokes the agent");
 
-    let (url, h) = (db_url.clone(), prompt_hash.clone());
-    let log =
-        tokio::task::spawn_blocking(move || spawn_stdio_with_operator(&url, model, &h, operator))
-            .await
-            .expect("join");
+    let (url, k) = (db_url.clone(), key_hex.clone());
+    let log = tokio::task::spawn_blocking(move || spawn_stdio_with_operator(&url, &k, operator))
+        .await
+        .expect("join");
     assert!(
         log.contains("operator link is REVOKED"),
         "a restart must REPORT the revocation:\n{log}"

@@ -133,6 +133,15 @@ async fn link_binds_an_llm_identity_before_its_first_start(pool: PgPool) {
             .expect("agent row");
     assert_eq!(name.as_deref(), Some("mcp-agent"));
     assert_eq!(llm_model.as_deref(), Some(model));
+    // Backlog bfc2eff8: the unkeyed LLM identity's key is BLAKE3 of public
+    // inputs (model, prompt hash), so the row is an identifier that no
+    // signature path accepts.
+    let key_kind: String = sqlx::query_scalar("SELECT key_kind::text FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("key_kind");
+    assert_eq!(key_kind, "seed-derived");
     let binding: Option<String> = sqlx::query_scalar("SELECT public.epigraph_author_binding($1)")
         .bind(agent)
         .fetch_one(&pool)

@@ -248,7 +248,8 @@ pub struct AgentPublicProfile {
     pub id: Uuid,
     pub display_name: Option<String>,
     pub public_key: Vec<u8>,
-    /// `ed25519` or `derived` (migration 061). Always returned: a caller that
+    /// `ed25519`, `derived` (migration 061) or `seed-derived` (migration
+    /// 230). Always returned: a caller that
     /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
     /// placeholder to a signature check.
     pub key_kind: String,
@@ -261,6 +262,20 @@ pub struct AgentPublicProfile {
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
 }
+
+/// `agents.key_kind` for an agent whose `public_key` is derived from a PUBLIC
+/// seed (migration 230, backlog bfc2eff8): the `did_key_for_author` name and
+/// ORCID keys of ingested authors, the `org:` keys of affiliations, the legacy
+/// system-agent constant, and the unkeyed LLM identity
+/// (`keypair_from_llm_agent_prehashed`). Each is `BLAKE3(seed)` used as the
+/// Ed25519 SECRET, so anyone who knows the seed holds the private key. Such a
+/// key names the agent and is NOT a signature verifier:
+/// [`AgentRepository::public_key_if_signer`] returns `None` for it, as for
+/// the OAuth placeholder `derived`. NOT YET enforced by the verifiers that
+/// read `agents.public_key` directly: `verify_claim`'s bare-key fallback, the
+/// edge-signature check and the OAuth assertion check. Insert these rows with
+/// [`AgentRepository::create_seed_derived_conn`].
+pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
 /// Repository for Agent operations
 pub struct AgentRepository;
@@ -332,13 +347,102 @@ impl AgentRepository {
             DbError::from(err)
         })?;
 
+        Self::registered(
+            conn,
+            row.id,
+            row.public_key,
+            row.display_name,
+            row.created_at,
+            row.labels,
+            row.orcid,
+            row.ror_id,
+        )
+        .await
+    }
+
+    /// [`Self::create_conn`] for an agent whose `public_key` is derived from a
+    /// PUBLIC seed: the row is stored with `key_kind =`
+    /// [`KEY_KIND_SEED_DERIVED`], so [`Self::public_key_if_signer`] refuses
+    /// its key (see the constant). Every other column, the duplicate-key mapping and the
+    /// `agent.registered` event are exactly [`Self::create_conn`]'s.
+    ///
+    /// A runtime query (not `query!`), so the `.sqlx` offline cache of
+    /// [`Self::create_conn`] is untouched. The application role may insert
+    /// this kind: migration 077's `agents_provision` refuses only `derived`.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_seed_derived_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: &Agent,
+    ) -> Result<Agent, DbError> {
+        type Row = (
+            Uuid,
+            Vec<u8>,
+            Option<String>,
+            DateTime<Utc>,
+            Vec<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let id: Uuid = agent.id.into();
+        let row: Row = sqlx::query_as(
+            "INSERT INTO agents (id, public_key, display_name, created_at, updated_at, labels, \
+                                 orcid, ror_id, key_kind) \
+             VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) \
+             RETURNING id, public_key, display_name, created_at, labels, orcid, ror_id",
+        )
+        .bind(id)
+        .bind(agent.public_key.as_slice())
+        .bind(agent.display_name.as_deref())
+        .bind(agent.created_at)
+        .bind(&agent.labels)
+        .bind(agent.orcid.as_deref())
+        .bind(agent.ror_id.as_deref())
+        .bind(KEY_KIND_SEED_DERIVED)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            if let sqlx::Error::Database(ref db_err) = err {
+                if db_err.is_unique_violation() {
+                    return DbError::DuplicateKey {
+                        entity: "Agent".to_string(),
+                    };
+                }
+            }
+            DbError::from(err)
+        })?;
+        let (id, public_key, display_name, created_at, labels, orcid, ror_id) = row;
+        Self::registered(
+            conn,
+            id,
+            public_key,
+            display_name,
+            created_at,
+            labels,
+            orcid,
+            ror_id,
+        )
+        .await
+    }
+
+    /// The tail both inserts share: the `agent.registered` event on the
+    /// caller's connection, and the returned [`Agent`].
+    #[allow(clippy::too_many_arguments)]
+    async fn registered(
+        conn: &mut sqlx::PgConnection,
+        id: Uuid,
+        public_key: Vec<u8>,
+        display_name: Option<String>,
+        created_at: DateTime<Utc>,
+        labels: Vec<String>,
+        orcid: Option<String>,
+        ror_id: Option<String>,
+    ) -> Result<Agent, DbError> {
         // Convert BYTEA to [u8; 32]
-        let public_key: [u8; 32] = row
-            .public_key
-            .try_into()
-            .map_err(|_| DbError::InvalidData {
-                reason: "public_key is not 32 bytes".to_string(),
-            })?;
+        let public_key: [u8; 32] = public_key.try_into().map_err(|_| DbError::InvalidData {
+            reason: "public_key is not 32 bytes".to_string(),
+        })?;
 
         // Fire-and-forget agent.registered event (closes #61). The event log
         // is a separate observability surface and must not roll back the agent
@@ -349,23 +453,23 @@ impl AgentRepository {
         let _ = crate::repos::EventRepository::publish_or_log_conn(
             &mut *conn,
             "agent.registered",
-            Some(row.id),
+            Some(id),
             &serde_json::json!({
-                "agent_id": row.id,
-                "display_name": row.display_name,
+                "agent_id": id,
+                "display_name": display_name,
                 "public_key": public_key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
             }),
         )
         .await;
 
         Ok(Agent::with_id(
-            AgentId::from_uuid(row.id),
+            AgentId::from_uuid(id),
             public_key,
-            row.display_name,
-            row.created_at,
-            row.labels,
-            row.orcid,
-            row.ror_id,
+            display_name,
+            created_at,
+            labels,
+            orcid,
+            ror_id,
         ))
     }
 
@@ -2252,7 +2356,9 @@ impl AgentRepository {
     ///
     /// Returns `None` both for an unknown agent and for one whose `public_key`
     /// is the `key_kind = 'derived'` placeholder written by
-    /// [`Self::ensure_for_client`]. A derived key is a BLAKE3 output — nobody
+    /// [`Self::ensure_for_client`], or a `key_kind =`
+    /// [`KEY_KIND_SEED_DERIVED`] key whose private half anyone can compute
+    /// from a public seed (migration 230). A derived key is a BLAKE3 output — nobody
     /// knows a private key for it, so feeding it to an Ed25519 verifier would
     /// merely fail; but it is indistinguishable from a real key to any reader
     /// that does not filter, so signature paths call THIS, never a bare

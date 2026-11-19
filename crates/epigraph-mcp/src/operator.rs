@@ -95,8 +95,8 @@ use uuid::Uuid;
 ///
 /// * With `listen`: an HTTP listener signs every caller's claims as one agent;
 ///   operating that agent would hand every caller the operator's group.
-/// * Without a declared identity (`--agent-key` / `--agent-model` absent,
-///   `select_signer` rung 4): the signer is a fresh random keypair per process,
+/// * Without a declared identity (no `--agent-key` and no separate signing
+///   key, `select_signer` rung 4): the signer is a fresh random keypair per process,
 ///   so every start would enrol a NEW throwaway agent as a writer in the
 ///   operator's group, permanently — memberships are never revived and never
 ///   cleaned up by this path.
@@ -123,7 +123,8 @@ pub fn check_operator_transport(
     if !identity_declared {
         return Err(format!(
             "--operator-id / EPIGRAPH_OPERATOR_ID ({operator}) requires a declared signer identity \
-             (--agent-model or --agent-key). Without one this process signs as a fresh random \
+             (--agent-key, or the separate signing key EPIGRAPH_AGENT_IDENTITY_PUBKEY with \
+             EPIGRAPH_AGENT_SIGNING_KEY). Without one this process signs as a fresh random \
              agent, and linking it would enrol a new throwaway writer in the operator's group on \
              every start."
         ));
