@@ -2283,27 +2283,14 @@ mod tests {
 /// unable to resolve it.
 #[cfg(test)]
 fn test_auth() -> crate::middleware::bearer::AuthContext {
-    let id = uuid::Uuid::new_v4();
-    crate::middleware::bearer::AuthContext {
-        client_id: id,
-        agent_id: Some(id),
-        owner_id: Some(id),
-        client_type: crate::middleware::bearer::ClientType::Service,
-        scopes: vec![
-            "claims:read".to_string(),
-            "claims:write".to_string(),
-            "edges:read".to_string(),
-            "edges:write".to_string(),
-            "workflows:read".to_string(),
-            "workflows:write".to_string(),
-        ],
-        jti: uuid::Uuid::new_v4(),
-        family_id: None,
-        elevation_claim: None,
-        elevation: None,
-        admin_scopes: epigraph_auth::AdminScopePosture::Unarmed,
-        delegated_by: None,
-    }
+    crate::middleware::bearer::test_auth_with_scopes(&[
+        "claims:read",
+        "claims:write",
+        "edges:read",
+        "edges:write",
+        "workflows:read",
+        "workflows:write",
+    ])
 }
 
 #[cfg(all(test, not(feature = "db")))]
@@ -2356,6 +2343,7 @@ mod event_tests {
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state.clone());
 
         let body = valid_packet_json();
@@ -2390,6 +2378,7 @@ mod event_tests {
 
         let router = Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(axum::Extension(test_auth()))
             .with_state(state.clone());
 
         // Invalid payload: empty claim content

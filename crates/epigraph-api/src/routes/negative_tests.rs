@@ -22,16 +22,15 @@
 //!   tokio tasks, each creating its own router via `create_router` to avoid
 //!   consuming the router with `oneshot`.
 
-// NOT COMPILED, NOT RUN. `epigraph-api`'s default features are `["db"]` and
-// the `not(feature = "db")` configuration has 28 pre-existing compile errors
-// (`routes/admin.rs`'s `ApiConfig` literal alone omits `allow_all_identities`),
-// so `cargo test -p epigraph-api --lib -- --list` names none of the tests
-// below. PR-03's `OK -> UNAUTHORIZED` flips in here are DOCUMENTATION of the
-// intended behaviour, not coverage of it. The behaviour is actually asserted
-// by `tests/public_router_allowlist.rs`, which probes every route on the
-// `protected` chain of the buildable variant.
+// not(db) arm only. CI builds AND runs these: `lint-features`, step
+// "No-db lib-test build check" (`cargo test -p epigraph-api
+// --no-default-features --lib`). A bare test router has no bearer
+// middleware, so routes that read an `AuthContext` get the one it would
+// install via `crate::middleware::bearer::test_auth_with_scopes`; the
+// tests asserting a 401 go through `create_router` with no credential.
 #[cfg(all(test, not(feature = "db")))]
 mod malformed_input_tests {
+    use crate::middleware::bearer::test_auth_with_scopes;
     use crate::routes::batch::batch_create_claims;
     use crate::routes::challenge::submit_challenge;
     use crate::routes::rag::rag_context;
@@ -41,7 +40,7 @@ mod malformed_input_tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::routing::{get, post};
-    use axum::Router;
+    use axum::{Extension, Router};
     use epigraph_crypto::ContentHasher;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -52,6 +51,7 @@ mod malformed_input_tests {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/submit/packet", post(submit_packet))
+            .layer(Extension(test_auth_with_scopes(&["claims:write"])))
             .with_state(state)
     }
 
@@ -76,14 +76,25 @@ mod malformed_input_tests {
         let state = AppState::new(ApiConfig::default());
         Router::new()
             .route("/api/v1/query/rag", get(rag_context))
+            .layer(Extension(test_auth_with_scopes(&["claims:read"])))
             .with_state(state)
     }
 
     /// Create a direct router for the webhook registration endpoint (no auth middleware).
+    ///
+    /// The egress guard answers from a stub resolver: `AppState::new` builds
+    /// it on the system resolver, and a case that got past the cheap checks
+    /// would otherwise look `example.com` up on the CI runner's DNS.
     fn webhook_router() -> Router {
-        let state = AppState::new(ApiConfig::default());
+        let state = AppState::new(ApiConfig::default()).with_webhook_egress(
+            epigraph_jobs::egress::EgressGuard::with_resolver(std::sync::Arc::new(
+                epigraph_jobs::egress::StubResolver::new()
+                    .with("example.com", ["93.184.216.34".parse().unwrap()]),
+            )),
+        );
         Router::new()
             .route("/api/v1/webhooks", post(register_webhook))
+            .layer(Extension(test_auth_with_scopes(&["webhooks:write"])))
             .with_state(state)
     }
 
@@ -1027,6 +1038,9 @@ mod concurrency_tests {
                 tokio::spawn(async move {
                     let router = Router::new()
                         .route("/api/v1/submit/packet", post(submit_packet))
+                        .layer(axum::Extension(
+                            crate::middleware::bearer::test_auth_with_scopes(&["claims:write"]),
+                        ))
                         .with_state(state);
 
                     let body = valid_packet_json();
