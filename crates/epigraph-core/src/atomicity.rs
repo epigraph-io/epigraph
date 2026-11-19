@@ -40,6 +40,43 @@ pub const ATOMIC_MAX_CHARS: usize = 160;
 /// Decimals (`3.5`) and dotted identifiers (`epigraph.io`) never count, because
 /// no whitespace follows the dot.
 pub fn sentence_count(text: &str) -> usize {
+    count_sentences(text, false)
+}
+
+/// Abbreviations after which the screen does not cut a sentence, lower-cased
+/// and with their dots. Kept to words that rarely end a sentence: `etc.` and
+/// single initials are left out on purpose. `al.` counts only after `et`.
+const SCREEN_ABBREVIATIONS: [&str; 25] = [
+    "sec.", "secs.", "fig.", "figs.", "eq.", "eqs.", "eqn.", "eqns.", "ref.", "refs.", "tab.",
+    "vol.", "ch.", "e.g.", "i.e.", "al.", "vs.", "approx.", "ca.", "cf.", "resp.", "viz.", "dr.",
+    "prof.", "pp.",
+];
+
+/// Whether the `.` at `chars[dot]` ends one of [`SCREEN_ABBREVIATIONS`].
+fn ends_screen_abbreviation(chars: &[char], dot: usize) -> bool {
+    let mut start = dot;
+    while start > 0 && (chars[start - 1].is_alphabetic() || chars[start - 1] == '.') {
+        start -= 1;
+    }
+    let word: String = chars[start..=dot].iter().collect::<String>().to_lowercase();
+    if !SCREEN_ABBREVIATIONS.contains(&word.as_str()) {
+        return false;
+    }
+    if word != "al." {
+        return true;
+    }
+    // `et al.`: the word before must be `et`.
+    let before: String = chars[..start].iter().collect();
+    before
+        .trim_end()
+        .rsplit(|c: char| !c.is_alphabetic())
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("et"))
+}
+
+/// [`sentence_count`], or with `skip_abbreviations` the screen's count, which
+/// does not cut after a [`SCREEN_ABBREVIATIONS`] word.
+fn count_sentences(text: &str, skip_abbreviations: bool) -> usize {
     let chars: Vec<char> = text.trim().chars().collect();
     if chars.is_empty() {
         return 0;
@@ -59,7 +96,9 @@ pub fn sentence_count(text: &str) -> usize {
             while k < chars.len() && chars[k].is_whitespace() {
                 k += 1;
             }
-            if k > j && k < chars.len() {
+            let abbreviation =
+                skip_abbreviations && c == '.' && ends_screen_abbreviation(&chars, i);
+            if k > j && k < chars.len() && !abbreviation {
                 let next = chars[k];
                 if next.is_uppercase() || next.is_ascii_digit() || opening(next) {
                     n += 1;
@@ -115,16 +154,31 @@ pub const COMPOUND_MIN_CONJUNCTS: usize = 2;
 /// rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ConjunctScreen {
-    /// [`sentence_count`] of the text.
+    /// Sentences, by [`sentence_count`]'s boundaries except one right after
+    /// a common abbreviation (`Sec.`, `Fig.`, `Eq.`, `Ref.`, `e.g.`, `i.e.`,
+    /// `et al.`, `vs.`, `approx.` and a few more): `"As shown in Sec. III, X
+    /// holds."` is one sentence here. [`sentence_count`] itself, and so
+    /// [`looks_atomic`], still cut there.
     pub sentences: usize,
     /// Joins inside a sentence that start another independent clause: a `;`,
     /// or a comma followed by `and`, `but`, `yet`, `so`, `while`, `whereas`,
     /// `although`, `though` or `which`, or `whereas` alone. A `, and` that
     /// closes a comma list (`A, B, and C`) is not a join.
     pub clause_joins: usize,
-    /// Distinct numeric quantities. A range written with a dash (`3-5 nm`) is
-    /// one; a number glued to a letter (`CO2`, `Q3`, `v1.2`, `COVID-19`) and a
-    /// bare four-digit year (1800 to 2199) are none.
+    /// Distinct numeric quantities.
+    ///
+    /// ONE quantity each: a range written with a dash (`3-5 nm`, `3−5 nm`), a
+    /// product or dimension (`2×1`, `3 x 4 mm`), scientific notation
+    /// (`1.625 × 10^4`, `2.3×10^-9`), and a value with its uncertainty
+    /// (`78 ± 14%`, `1.12 +/- 0.02`).
+    ///
+    /// NONE: a number glued to a letter (`CO2`, `Q3`, `v1.2`, `COVID-19`, the
+    /// exponent of `1.6e-4`), an exponent after `^` (`cm^-1`), a bare
+    /// four-digit year (1800 to 2199), a figure, equation, section, table or
+    /// reference number (`Fig. 3`, `Eq. (4)`), and bracketed notation: surface
+    /// and crystallographic names (`Si(100)−2×1`, `c(4×2)`, `(111)`, `[110]`)
+    /// and square-bracket citations (`[12, 14]`). A short parenthesised number
+    /// that is none of these (`(1)`, `(12)`) still counts.
     pub quantities: usize,
     /// The estimated number of independent assertions:
     /// `max(sentences + clause_joins, ceil(quantities / 2))`. Never below
@@ -149,7 +203,8 @@ const CLAUSE_CONNECTORS: [&str; 9] = [
 /// A heuristic with no parser and no database, so the MCP server and the CLI
 /// share it. Three signals, each documented on [`ConjunctScreen`]:
 ///
-/// * sentences ([`sentence_count`]);
+/// * sentences ([`sentence_count`]'s boundaries, but not right after a common
+///   abbreviation);
 /// * clause joins inside a sentence;
 /// * distinct numeric quantities, halved and rounded up: one fact often
 ///   carries two numbers (a change from one value to another, a value and its
@@ -163,7 +218,7 @@ const CLAUSE_CONNECTORS: [&str; 9] = [
 /// list and its join is missed; a non-restrictive `, which` that only
 /// describes ("the lab, which is in Oslo") is counted.
 pub fn conjunct_screen(text: &str) -> ConjunctScreen {
-    let sentences = sentence_count(text);
+    let sentences = count_sentences(text, true);
     let clause_joins = clause_join_count(text);
     let quantities = quantity_count(text);
     ConjunctScreen {
@@ -238,10 +293,145 @@ fn clause_join_count(text: &str) -> usize {
     joins
 }
 
+/// Words whose following number is a label, not a quantity (`Fig. 3`,
+/// `Eq. (4)`, `Table 2`), lower-cased and without a trailing dot.
+const REFERENCE_WORDS: [&str; 22] = [
+    "fig",
+    "figs",
+    "figure",
+    "figures",
+    "eq",
+    "eqs",
+    "eqn",
+    "eqns",
+    "equation",
+    "equations",
+    "ref",
+    "refs",
+    "reference",
+    "sec",
+    "secs",
+    "section",
+    "sections",
+    "tab",
+    "table",
+    "tables",
+    "ch",
+    "chapter",
+];
+
+/// A dash or minus as written in ranges and notation: `-`, `–`, `—`, `−`.
+fn is_dash(c: char) -> bool {
+    matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}')
+}
+
+/// Whether the digit at `chars[i]` is the label of a [`REFERENCE_WORDS`]
+/// word: the word, an optional `.`, spaces and an optional `(` before it.
+fn is_reference_label(chars: &[char], i: usize) -> bool {
+    let mut k = i;
+    if k > 0 && chars[k - 1] == '(' {
+        k -= 1;
+    }
+    while k > 0 && chars[k - 1] == ' ' {
+        k -= 1;
+    }
+    if k > 0 && chars[k - 1] == '.' {
+        k -= 1;
+    }
+    let end = k;
+    while k > 0 && chars[k - 1].is_alphabetic() {
+        k -= 1;
+    }
+    // The number must be separated from the word: `Fig3` is glued, not a
+    // label, and is handled by the glued rule.
+    if k == end || end == i {
+        return false;
+    }
+    let word: String = chars[k..end].iter().collect::<String>().to_lowercase();
+    REFERENCE_WORDS.contains(&word.as_str())
+}
+
+/// Whether the digit at `chars[i]` is an exponent: right after `^`, with an
+/// optional sign and opening brace between (`10^4`, `cm^-1`, `10^{-9}`).
+fn is_exponent(chars: &[char], i: usize) -> bool {
+    let mut k = i;
+    for _ in 0..2 {
+        if k > 0 && (is_dash(chars[k - 1]) || matches!(chars[k - 1], '+' | '{' | '(')) {
+            k -= 1;
+        }
+    }
+    k > 0 && chars[k - 1] == '^'
+}
+
+/// The end (one past the closer) of bracketed notation whose first digit is
+/// `chars[i]`, if it is notation rather than a quantity.
+///
+/// The group holds only digits, spaces, commas, dashes, `×`/`x`, `√` and
+/// combining overbars. Square, curly and angle brackets always make notation
+/// (Miller directions and families, citations); a parenthesis does when it is
+/// glued to a letter (`Si(100)`, `c(4×2)`), holds three or more digits
+/// (`(111)`, `(1-10)`) or holds a product, a root or an overbar.
+fn bracketed_notation_end(chars: &[char], i: usize) -> Option<usize> {
+    let open = *chars.get(i.checked_sub(1)?)?;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        _ => return None,
+    };
+    let mut k = i;
+    let (mut digits, mut product) = (0, false);
+    while k < chars.len() {
+        let c = chars[k];
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else if matches!(c, '\u{d7}' | 'x' | '\u{221a}' | '\u{304}' | '\u{305}') {
+            product = true;
+        } else if !(c == ' ' || c == ',' || is_dash(c)) {
+            break;
+        }
+        k += 1;
+    }
+    if chars.get(k) != Some(&close) {
+        return None;
+    }
+    let glued = i >= 2 && chars[i - 2].is_alphabetic();
+    let notation = open != '(' || glued || digits >= 3 || product;
+    notation.then_some(k + 1)
+}
+
+/// From `chars[j]`, just past a number, the first digit of the number a join
+/// continues into, if one does: `×` or `x` (a product, or the `× 10` of
+/// scientific notation), or `±`, `+/-`, `+-` (an uncertainty), each with
+/// optional spaces around it. `x` must stand alone: `3 xenon` joins nothing.
+fn joined_number_start(chars: &[char], j: usize) -> Option<usize> {
+    let skip_spaces = |mut k: usize| {
+        while k < chars.len() && chars[k] == ' ' {
+            k += 1;
+        }
+        k
+    };
+    let k = skip_spaces(j);
+    let after_op = match chars.get(k)? {
+        '\u{d7}' | '\u{b1}' => k + 1,
+        'x' if !chars.get(k + 1).is_some_and(|c| c.is_alphabetic()) => k + 1,
+        '+' if chars.get(k + 1) == Some(&'/') && chars.get(k + 2).is_some_and(|&c| is_dash(c)) => {
+            k + 3
+        }
+        '+' if chars.get(k + 1).is_some_and(|&c| is_dash(c)) => k + 2,
+        _ => return None,
+    };
+    let mut n = skip_spaces(after_op);
+    if chars.get(n) == Some(&'\u{221a}') {
+        n += 1;
+    }
+    chars.get(n)?.is_ascii_digit().then_some(n)
+}
+
 /// [`ConjunctScreen::quantities`] of `text`.
 fn quantity_count(text: &str) -> usize {
     let chars: Vec<char> = text.chars().collect();
-    let dash = |c: char| matches!(c, '-' | '\u{2013}' | '\u{2014}');
     let mut seen = std::collections::BTreeSet::new();
     let mut i = 0;
     while i < chars.len() {
@@ -249,11 +439,21 @@ fn quantity_count(text: &str) -> usize {
             i += 1;
             continue;
         }
-        // Glued to a word on the left: `CO2`, `Q3`, `v1.2`, `COVID-19`.
-        let glued = i > 0
+        if let Some(end) = bracketed_notation_end(&chars, i) {
+            i = end;
+            continue;
+        }
+        // Glued to a word on the left (`CO2`, `Q3`, `v1.2`, `COVID-19`), or by
+        // a dash to bracketed notation (the `2×1` of `Si(100)−2×1`); an
+        // exponent; or a figure/equation/reference label.
+        let glued = (i > 0
             && (chars[i - 1].is_alphabetic()
                 || chars[i - 1] == '_'
-                || (dash(chars[i - 1]) && i > 1 && chars[i - 2].is_alphabetic()));
+                || (is_dash(chars[i - 1])
+                    && i > 1
+                    && (chars[i - 2].is_alphabetic() || chars[i - 2] == ')'))))
+            || is_exponent(&chars, i)
+            || is_reference_label(&chars, i);
         let start = i;
         let mut j = i;
         loop {
@@ -266,14 +466,39 @@ fn quantity_count(text: &str) -> usize {
                 j += 1;
                 continue;
             }
-            // A dash range (`3-5`, `3–5`) is one quantity.
-            if j + 1 < chars.len() && dash(chars[j]) && chars[j + 1].is_ascii_digit() {
+            // A dash range (`3-5`, `3–5`, `3−5`) is one quantity.
+            if j + 1 < chars.len() && is_dash(chars[j]) && chars[j + 1].is_ascii_digit() {
                 j += 1;
+                continue;
+            }
+            // An exponent belongs to its number: `10^4`, `10^-9`, `10^{23}`.
+            if chars.get(j) == Some(&'^') {
+                let mut k = j + 1;
+                while k < chars.len() && (matches!(chars[k], '{' | '(' | '+') || is_dash(chars[k]))
+                {
+                    k += 1;
+                }
+                if chars.get(k).is_some_and(|c| c.is_ascii_digit()) {
+                    while k < chars.len() && chars[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if matches!(chars.get(k), Some('}' | ')')) {
+                        k += 1;
+                    }
+                    j = k;
+                    continue;
+                }
+            }
+            // A product, scientific notation or an uncertainty is one.
+            if let Some(next) = joined_number_start(&chars, j) {
+                j = next;
                 continue;
             }
             break;
         }
-        let literal: String = chars[start..j].iter().collect();
+        // Spaces inside a joined quantity (`78 ± 14`) are not part of its
+        // identity: `78±14` and `78 ± 14` are the same quantity.
+        let literal: String = chars[start..j].iter().filter(|c| **c != ' ').collect();
         i = j;
         if glued {
             continue;
@@ -889,6 +1114,139 @@ mod tests {
             three.is_compound(),
             "three numbers bound to different referents"
         );
+    }
+
+    /// Single assertions in the shapes that made up most of a 50-atom sample
+    /// of what the compound-atom sweep flagged (backlog `705e5980`): surface
+    /// and crystallographic notation, scientific notation, a value with its
+    /// uncertainty, and an abbreviation followed by a capital or a digit.
+    /// Each is ONE assertion and must not screen compound.
+    const NOTATION_ATOMS: [&str; 24] = [
+        "The Si(100)\u{2212}2\u{d7}1 surface reconstructs at 300 K.",
+        "Dimers on Si(100)-2x1 buckle below 120 K.",
+        "The Ge(001) c(4\u{d7}2) phase is stable at 80 K.",
+        "Growth on the (111) facet proceeds layer by layer at 600 C.",
+        "The [110] direction has the lowest barrier of 0.3 eV.",
+        "The Si(111)-7\u{d7}7 unit cell holds 12 adatoms.",
+        "The rate constant is 1.625 \u{d7} 10^4 M^-1 s^-1 at 298 K.",
+        "The diffusion coefficient was 2.3\u{d7}10^-9 m^2/s in water.",
+        "The tip apex radius is about 3 x 10^-9 m.",
+        "Absorption peaks at 1.5e-3 cm^-1 above 400 K.",
+        "The binding yield was 78 \u{b1} 14% across 3 runs.",
+        "The barrier is 0.82 \u{b1} 0.05 eV on the 2\u{d7}1 surface.",
+        "The measured gap is 1.12 +/- 0.02 eV at 300 K.",
+        "As shown in Sec. III, the barrier is 0.8 eV.",
+        "The tip is stable, as Fig. 2 shows for 5 scans.",
+        "Eq. 4 gives a rate of 10 per second.",
+        "The dimer, e.g. The one in the corner, is buckled.",
+        "Smith et al. Measured a barrier of 0.7 eV.",
+        "Hydrogen passivation, i.e. H termination, lowers reactivity.",
+        "Approx. 40 percent of sites were occupied.",
+        "Ref. 12 reports the same 2.1 eV barrier.",
+        "Si vs. Ge surfaces differ in dimer buckling.",
+        "Figs. 3 and 4 show the same 7\u{d7}7 pattern.",
+        "The cell, cf. Tab. 2, holds 64 atoms.",
+    ];
+
+    /// Genuinely compound controls in the same vocabulary: they must stay
+    /// compound after the notation rules.
+    const COMPOUND_CONTROLS: [&str; 7] = [
+        "The Si(100) surface reconstructs at 300 K. The Ge(001) surface does not.",
+        "The barrier is 0.8 eV, but the prefactor is unknown.",
+        "Dimers buckle below 120 K; adatoms hop above 400 K.",
+        "The sample held 12 mg iron with 3 mg zinc at 7.4 pH",
+        "As shown in Sec. III, the barrier is 0.8 eV. The rate is 10 per second.",
+        "The yield was 78 \u{b1} 14% at 300 K, 55 \u{b1} 9% at 350 K and 20 \u{b1} 4% at 400 K.",
+        "Group A improved whereas group B declined.",
+    ];
+
+    #[test]
+    fn notation_and_abbreviations_do_not_make_a_claim_compound() {
+        let flagged: Vec<(&str, ConjunctScreen)> = NOTATION_ATOMS
+            .iter()
+            .map(|t| (*t, screen(t)))
+            .filter(|(_, s)| s.is_compound())
+            .collect();
+        assert!(
+            flagged.is_empty(),
+            "{} of {} single assertions screen compound: {flagged:#?}",
+            flagged.len(),
+            NOTATION_ATOMS.len()
+        );
+    }
+
+    #[test]
+    fn compound_controls_stay_compound_under_the_notation_rules() {
+        for t in COMPOUND_CONTROLS {
+            assert!(screen(t).is_compound(), "{t:?}: {:?}", screen(t));
+        }
+    }
+
+    #[test]
+    fn notation_counts_as_one_quantity_or_none() {
+        // Surface notation is a name, not a measurement.
+        assert_eq!(screen("Si(100)\u{2212}2\u{d7}1").quantities, 0);
+        assert_eq!(screen("Si(111)-7x7").quantities, 0);
+        assert_eq!(screen("the (111) facet").quantities, 0);
+        assert_eq!(screen("the [1\u{304}10] direction").quantities, 0);
+        // A citation in square brackets is not a quantity.
+        assert_eq!(screen("as reported [12, 14]").quantities, 0);
+        // A product or dimension is one quantity.
+        assert_eq!(screen("a 2\u{d7}1 cell").quantities, 1);
+        assert_eq!(screen("a 3 x 4 mm chip").quantities, 1);
+        // Scientific notation is one quantity, however it is written.
+        assert_eq!(screen("1.625 \u{d7} 10^4").quantities, 1);
+        assert_eq!(screen("2.3\u{d7}10^-9").quantities, 1);
+        assert_eq!(screen("6 x 10^{23}").quantities, 1);
+        assert_eq!(screen("1.6e-4 and 2.5E4").quantities, 2);
+        // A unit exponent is not a quantity.
+        assert_eq!(screen("400 cm^-1").quantities, 1);
+        assert_eq!(screen("9.8 m s^2").quantities, 1);
+        // A value and its uncertainty are one quantity.
+        assert_eq!(screen("78 \u{b1} 14%").quantities, 1);
+        assert_eq!(screen("1.12 +/- 0.02 eV").quantities, 1);
+        assert_eq!(screen("0.82\u{b1}0.05").quantities, 1);
+        // A unicode minus range is one, like a dash range.
+        assert_eq!(screen("3\u{2212}5 nm").quantities, 1);
+        // A figure, equation, section or reference number is a label.
+        assert_eq!(screen("Fig. 3 shows 5 nm").quantities, 1);
+        assert_eq!(screen("Eq. (4) and Table 2 give 7.5 eV").quantities, 1);
+        // A short parenthesised number is still a quantity (an enumeration or
+        // a bare count), as before.
+        assert_eq!(screen("(1) A, (2) B and (3) C").quantities, 3);
+    }
+
+    #[test]
+    fn the_screen_does_not_split_sentences_at_abbreviations() {
+        for t in [
+            "As shown in Sec. III, the barrier is 0.8 eV.",
+            "Fig. 2 shows the tip.",
+            "Eqs. 3 and 4 agree.",
+            "Smith et al. Measured it.",
+            "A dimer, e.g. The corner one, buckles.",
+            "Hydrogen, i.e. H termination, passivates.",
+            "Si vs. Ge differ.",
+            "Approx. 40 percent remain.",
+        ] {
+            assert_eq!(screen(t).sentences, 1, "{t:?}");
+        }
+        // A real boundary after an abbreviated sentence still counts, and so
+        // does one after an ordinary word.
+        assert_eq!(screen("See Fig. 2. The tip is sharp.").sentences, 2);
+        assert_eq!(screen("The tip is sharp. Fig. 2 shows it.").sentences, 2);
+        // `etc.` and initials are not on the list: they end sentences too
+        // often.
+        assert_eq!(screen("A, B, etc. The rest failed.").sentences, 2);
+    }
+
+    #[test]
+    fn looks_atomic_keeps_counting_abbreviation_boundaries() {
+        // The abbreviation rule is the screen's only. `sentence_count` and
+        // `looks_atomic` decide what `decompose_claims` skips, and they keep
+        // erring toward a boundary (see `sentence_count`).
+        assert_eq!(sentence_count("As shown in Sec. III, it holds."), 2);
+        assert!(!looks_atomic("As shown in Sec. III, it holds."));
+        assert_eq!(sentence_count("Fig. 2 shows the tip."), 2);
     }
 
     #[test]
