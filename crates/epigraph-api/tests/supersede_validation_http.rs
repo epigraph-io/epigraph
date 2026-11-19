@@ -339,8 +339,10 @@ async fn truth_value_below_zero_is_refused(pool: PgPool) {
     assert_refused(&pool, "v-truth-low", req, "truth_value", TRUTH_RANGE).await;
 }
 
-/// JSON cannot carry these, but the handler is also called in-process; a NaN
-/// fails every range comparison, so it is the case a bounds check written as
+/// JSON cannot carry these, and production reaches the handler only through
+/// the router's JSON extractor, so this check guards a non-JSON caller of the
+/// handler function, which today means tests only. A NaN fails every
+/// range comparison, so it is the case a bounds check written as
 /// `v < 0.0 || v > 1.0` lets through.
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_finite_truth_values_are_refused(pool: PgPool) {
