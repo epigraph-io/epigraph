@@ -22,6 +22,26 @@ closed set by design.
   `docs/superpowers/specs/2026-07-23-mcp-federation-gateway-design.md`.
   `episcience` is the reference implementation. Do **not** add federated tools
   to `SCOPE_MAP` — they are gated by the `scope=` in the env var instead.
+- **A mounted extension is trusted with every caller's bearer.** Today the
+  gateway forwards the caller's own kernel access token, verbatim, on every
+  federated `tools/call` (`federation/client.rs::invoke_once`). The extension
+  therefore receives a token whose audience is the kernel, and anything it
+  does with that token (log it, replay it against `epigraph-api` or
+  `epigraph-mcp`, hand it to another service) acts as the caller with the
+  caller's full scopes until the token expires. That is the confused-deputy
+  shape the MCP authorization spec forbids ("token passthrough").
+  It is accepted for now because the only extension that validates these
+  tokens does so with `epigraph_auth::JwtConfig`, which means it already
+  holds `EPIGRAPH_JWT_SECRET` and could mint any kernel token itself:
+  forwarding the bearer gives it no authority it does not already have. The
+  rule that follows: **mount only an extension you operate and would trust
+  with the kernel's signing secret**, and never mount a third-party one.
+  The fix (backlog `c9b82fae`; design
+  `docs/superpowers/specs/2026-09-26-episcience-operator-authority-design.md`
+  section 2 and section 6 item 6) is an RFC 8693 token-exchange grant at
+  `/oauth/token`: the gateway exchanges the caller's token for a short-lived
+  token whose `aud` names the extension, forwards only that, and the kernel
+  refuses an extension-audience token on its own routes.
 
 ## Adding HTTP routes from a downstream product
 
