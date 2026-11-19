@@ -43,6 +43,11 @@
 //! admitted below 233 and refused at head; rewriting an own row's ciphertext
 //! is admitted at both.
 //!
+//! [`a_pre_existing_foreign_seal_row_is_filtered_from_update_at_233`]: the
+//! USING half of each update policy on its own. A seal row that was already
+//! invalid (B's row under A, seeded as a pre-233 squat) is rewritten in place
+//! by a writer of A below 233 and filtered out (0 rows, unchanged) at head.
+//!
 //! [`a_non_superuser_maintenance_member_still_seals_at_233`]: the shipped
 //! writer, the real `seal_claims_conn`, run at head by a maintenance member
 //! that is not a superuser, still writes its version and evidence ciphertext.
@@ -70,6 +75,10 @@
 //! - One table at a time, its FOR UPDATE policy dropped: that table's move
 //!   onto B's row is admitted; its FOR INSERT policy dropped: that table's
 //!   unreadable-row seal is admitted.
+//! - One table at a time (each of the three), its FOR UPDATE policy's USING
+//!   replaced by `true` with WITH CHECK kept: the in-place rewrite of a
+//!   pre-existing invalid row returns 42501 in place of `Ok(0)`. The other
+//!   tests stay green under this mutation, which is why that test exists.
 //! - The edge predicate widened to also accept `co_owner_group_id`: the
 //!   co-owner seal is admitted at head.
 //!
@@ -703,6 +712,84 @@ async fn a_seal_row_cannot_be_moved_onto_another_groups_row(pool: PgPool) {
                     );
                 }
             }
+        }
+    }
+}
+
+/// The USING half of each `<table>_owner_scope_update`, on its own. Every
+/// UPDATE in [`a_seal_row_cannot_be_moved_onto_another_groups_row`] starts
+/// from a VALID seal row, so there the WITH CHECK half alone refuses each
+/// case and the USING half is never what decides. Here the row is already
+/// invalid: B's row sealed under A, the squat a session could write below
+/// 233, seeded by the superuser as a row that predates the migration. A
+/// writer of A sees it (077's USING is the sealing group's read set) and
+/// rewrites its ciphertext in place, an UPDATE whose new row is exactly as
+/// invalid as the old one.
+///
+/// - Below 233: admitted, 1 row.
+/// - At head: the USING half filters the row out, so 0 rows and no error,
+///   and the ciphertext is unchanged.
+/// - With the USING half removed (`USING (true)` on the three update
+///   policies, WITH CHECK kept): the row is no longer filtered and the WITH
+///   CHECK refuses the new row with 42501 instead, so the `Ok(0)` assertion
+///   fails on each table.
+#[sqlx::test(migrations = false)]
+async fn a_pre_existing_foreign_seal_row_is_filtered_from_update_at_233(pool: PgPool) {
+    for (at, migrator, head) in [
+        ("below 233", up_to(BELOW), false),
+        ("head", up_to(i64::MAX), true),
+    ] {
+        migrate(&pool, &migrator).await;
+        for table in TABLES {
+            let tn = table.name();
+            let (a, group_a) = team(&pool, "seal-using-a").await;
+            let (b, group_b) = team(&pool, "seal-using-b").await;
+            let writer_of_a = Session {
+                principal: a,
+                read: vec![group_a],
+                write: vec![group_a],
+            };
+
+            // The squat, seeded on the superuser connection (row security
+            // skipped), as a row written before 233.
+            let theirs = table.seed(&pool, b, group_b, "squatted").await;
+            let mut q = sqlx::query(table.seal());
+            for bind in table.seal_binds(theirs, group_a) {
+                q = q.bind(bind);
+            }
+            q.execute(&pool).await.expect("seed the pre-existing squat");
+            assert_eq!(
+                table.sealed_under(&pool, theirs.id).await,
+                Some(group_a),
+                "CALIBRATION (at {at}) {tn}: B's row is sealed under A"
+            );
+
+            let r = app_write(&pool, &writer_of_a, table.rewrite(), vec![theirs.id]).await;
+            assert_eq!(
+                r,
+                Ok(if head { 0 } else { 1 }),
+                "(at {at}) {tn}: a writer of A rewrites a pre-existing seal of B's row \
+                 (below 233 admitted; at head the USING half filters it out)"
+            );
+            let ct: Vec<u8> = sqlx::query_scalar(match table {
+                Table::ClaimVersion => {
+                    "SELECT encrypted_content FROM claim_version_encryption \
+                      WHERE claim_version_id = $1"
+                }
+                Table::Evidence => {
+                    "SELECT encrypted_content FROM evidence_encryption WHERE evidence_id = $1"
+                }
+                Table::Edge => "SELECT encrypted_labels FROM edge_encryption WHERE edge_id = $1",
+            })
+            .bind(theirs.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the ciphertext");
+            assert_eq!(
+                ct,
+                if head { vec![0x00] } else { vec![0x01] },
+                "(at {at}) {tn}: the ciphertext is rewritten only below 233"
+            );
         }
     }
 }
