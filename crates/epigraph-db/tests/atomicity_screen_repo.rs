@@ -356,3 +356,102 @@ async fn walking_every_page_returns_the_population_in_keyset_order(pool: PgPool)
         }
     }
 }
+
+/// Claims seeded by [`walking_a_tie_group_wider_than_a_window_loses_nothing`]
+/// at one `created_at`: more than `PAGE_WINDOW_MAX` (2,000), so no window of
+/// any page size holds the whole group.
+const TIE_GROUP: i32 = 2_600;
+
+/// A bulk insert in one transaction gives every row one `created_at`. The
+/// window read narrows `idx_claims_created_at` to `created_at >= t` and orders
+/// the tie group by `id`, so a group wider than a window must be walked across
+/// several windows by its `id` alone. This holds the walk to the reference
+/// order when it has to: a keyset that compared `created_at` only would skip
+/// the rest of the group after its first window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn walking_a_tie_group_wider_than_a_window_loses_nothing(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "b110-ties").await;
+    let world = fixture::world_group(&pool).await;
+    // Ten claims before the group, the group, and ten after it; every third
+    // claim of all of them is an atom of the first.
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, created_at) \
+         SELECT gen_random_uuid(), 'Tied claim ' || g || ' holds at ' || g || ' K.', \
+                sha256(convert_to('b110-tie-' || g, 'UTF8')), 0.8, $1, true, 'public', $2, \
+                CASE WHEN g <= 10 THEN timestamptz '2026-03-01 00:00:00+00' + g * interval '1 s' \
+                     WHEN g > $3 + 10 THEN timestamptz '2026-03-01 01:00:00+00' + g * interval '1 s' \
+                     ELSE timestamptz '2026-03-01 00:30:00+00' END \
+           FROM generate_series(1, $3 + 20) AS g",
+    )
+    .bind(agent)
+    .bind(world)
+    .bind(TIE_GROUP)
+    .execute(&pool)
+    .await
+    .expect("seed the tie group");
+    sqlx::query(
+        "WITH n AS (SELECT id, row_number() OVER (ORDER BY created_at, id) AS g FROM claims \
+                     WHERE content LIKE 'Tied claim %') \
+         INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         SELECT gen_random_uuid(), p.id, 'claim', a.id, 'claim', 'decomposes_to' \
+           FROM n a JOIN n p ON p.g = 1 \
+          WHERE a.g % 3 = 0",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the decompositions");
+    let (member, _) = fixture::seed_agent_with_group(&pool, "b110-tie-walker").await;
+    let viewer = Viewer::resolve(&pool, member).await.expect("resolve");
+
+    for (population, atoms) in [
+        (ScreenPopulation::Atoms, true),
+        (ScreenPopulation::All, false),
+    ] {
+        let want: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT c.id FROM claims c \
+              WHERE c.is_current AND length(c.content) > 10 \
+                AND NOT ('telemetry' = ANY(c.labels)) \
+                AND (c.properties ->> 'event') IS NULL \
+                AND (NOT $1 OR EXISTS (SELECT 1 FROM edges a \
+                      WHERE a.target_id = c.id AND a.relationship = 'decomposes_to')) \
+              ORDER BY c.created_at, c.id",
+        )
+        .bind(atoms)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert!(
+            want.len() > 800,
+            "{population:?}: the group is in the population"
+        );
+        for limit in [500_i64, 1000] {
+            let mut got = Vec::new();
+            let mut after = None;
+            loop {
+                let page = AtomicityScreenRepository::page(
+                    &mut pool.acquire().await.unwrap(),
+                    &viewer,
+                    population,
+                    after,
+                    limit,
+                )
+                .await
+                .unwrap();
+                if let Some(last) = page.last() {
+                    after = Some((last.created_at, last.id));
+                }
+                let n = page.len() as i64;
+                got.extend(page.into_iter().map(|r| r.id));
+                if n < limit {
+                    break;
+                }
+            }
+            assert_eq!(got.len(), want.len(), "{population:?} limit {limit}");
+            assert!(
+                got == want,
+                "{population:?} limit {limit}: order or members differ"
+            );
+        }
+    }
+}
