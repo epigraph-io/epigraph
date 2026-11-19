@@ -536,6 +536,37 @@ pub fn canonical_evidence_type(raw: Option<&str>) -> Option<String> {
     CalibrationConfig::cached().canonical_evidence_type(raw?)
 }
 
+/// The longest `mass_functions.evidence_type` the column stores, in
+/// characters: it is `varchar(50)` (migration 001). A column width, not a
+/// belief parameter, so it is not in `calibration.toml`; it lives beside
+/// [`canonical_evidence_type`] because the STORED key is that function's
+/// output, which is the caller's own key (trimmed and lowercased) whenever
+/// the calibration does not know it.
+pub const EVIDENCE_TYPE_MAX_CHARS: usize = 50;
+
+/// Whether a STORED `evidence_type` (the output of
+/// [`canonical_evidence_type`]) fits the column. `Err` carries its length in
+/// characters, counted as `varchar` counts them, for the writer to name in
+/// its own refusal. No stored key always fits.
+///
+/// Count the canonicalised key, not the caller's raw input: trimming can
+/// shorten it, and lowercasing can lengthen it (`'\u{130}'` lowercases to two
+/// characters).
+///
+/// # Errors
+/// The stored key's length in characters, when it exceeds
+/// [`EVIDENCE_TYPE_MAX_CHARS`].
+pub fn check_stored_evidence_type_len(stored: Option<&str>) -> Result<(), usize> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let len = stored.chars().count();
+    if len > EVIDENCE_TYPE_MAX_CHARS {
+        return Err(len);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1025,20 @@ mod tests {
     /// A key the calibration does not know is kept (trimmed, lowercased: every
     /// reader lowercases), because per-frame overrides and perspective maps may
     /// key on it deliberately. Blank input is "no type".
+    #[test]
+    fn stored_evidence_type_length_is_counted_in_characters() {
+        assert_eq!(check_stored_evidence_type_len(None), Ok(()));
+        // 50 two-byte characters (100 bytes) fit a varchar(50).
+        assert_eq!(
+            check_stored_evidence_type_len(Some(&"é".repeat(50))),
+            Ok(())
+        );
+        assert_eq!(
+            check_stored_evidence_type_len(Some(&"x".repeat(51))),
+            Err(51)
+        );
+    }
+
     #[test]
     fn canonical_evidence_type_keeps_unknown_keys_and_drops_blank() {
         let cfg = load_config();
