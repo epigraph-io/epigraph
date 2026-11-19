@@ -3244,7 +3244,8 @@ restart.
   `epigraph_app`, per table: every cross-group INSERT and UPDATE is admitted
   below 233 and refused 42501 at 233, the own-group seal and ciphertext
   rewrite are admitted at both, and below 233 a squatted row makes the
-  owner's seal insert nothing; the shipped seal on a non-superuser
+  owner's seal insert nothing; a pre-existing invalid seal row filtered
+  from an in-place UPDATE at 233; the shipped seal on a non-superuser
   maintenance member; a co-owned edge sealable under its owner only; the
   undo) and by
   `rls_enforcement.rs::no_policy_arm_is_session_independent` (six
@@ -3254,7 +3255,8 @@ restart.
   claiming: no origin branch carries a `233`. **Deploy order:** none; no
   binary depends on it, and it may be applied before or after 232. Before
   migrating, count existing rows in the refused state per table (they are
-  not repaired, and an UPDATE of one is refused after 233; expected 0 each):
+  not repaired, and after 233 an application-role UPDATE of one matches no
+  row: the USING half filters it out, 0 rows and no error; expected 0 each):
   `SELECT count(*) FROM claim_version_encryption cve LEFT JOIN claim_versions v
   ON v.id = cve.claim_version_id WHERE v.claim_id IS DISTINCT FROM
   cve.claim_id OR v.owner_group_id IS DISTINCT FROM cve.group_id`;
