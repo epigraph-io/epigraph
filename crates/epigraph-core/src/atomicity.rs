@@ -45,12 +45,42 @@ pub fn sentence_count(text: &str) -> usize {
 
 /// Abbreviations after which the screen does not cut a sentence, lower-cased
 /// and with their dots. Kept to words that rarely end a sentence: `etc.` and
-/// single initials are left out on purpose. `al.` counts only after `et`.
+/// single initials are left out on purpose. `al.` counts only after `et`, and
+/// `cf.` only lower-case (`Cf.` is californium). The
+/// [`LABEL_ABBREVIATIONS`] are here too, under their own rule.
 const SCREEN_ABBREVIATIONS: [&str; 25] = [
     "sec.", "secs.", "fig.", "figs.", "eq.", "eqs.", "eqn.", "eqns.", "ref.", "refs.", "tab.",
     "vol.", "ch.", "e.g.", "i.e.", "al.", "vs.", "approx.", "ca.", "cf.", "resp.", "viz.", "dr.",
     "prof.", "pp.",
 ];
+
+/// The [`SCREEN_ABBREVIATIONS`] that are also words or symbols that end real
+/// sentences: `30 sec.`, `by vol.`, `2 eq.` (equivalents), `Ca.` (calcium).
+/// The screen keeps the sentence whole after one of these only when a label
+/// follows it: a number (`Sec. 4`, `Eq. (2)`, `ca. 30 nm`) or a roman
+/// numeral (`Sec. III`).
+const LABEL_ABBREVIATIONS: [&str; 7] = ["sec.", "secs.", "vol.", "ch.", "ca.", "eq.", "eqs."];
+
+/// Whether what follows the `.` at `chars[dot]` (after spaces) is a label: a
+/// digit, `(` and a digit, or a roman numeral standing alone.
+fn label_follows(chars: &[char], dot: usize) -> bool {
+    let mut k = dot + 1;
+    while k < chars.len() && chars[k].is_whitespace() {
+        k += 1;
+    }
+    match chars.get(k) {
+        Some(c) if c.is_ascii_digit() => true,
+        Some('(') => chars.get(k + 1).is_some_and(char::is_ascii_digit),
+        Some(_) => {
+            let mut e = k;
+            while e < chars.len() && matches!(chars[e], 'I' | 'V' | 'X' | 'L' | 'C') {
+                e += 1;
+            }
+            e > k && !chars.get(e).is_some_and(|c| c.is_alphanumeric())
+        }
+        None => false,
+    }
+}
 
 /// Whether the `.` at `chars[dot]` ends one of [`SCREEN_ABBREVIATIONS`].
 fn ends_screen_abbreviation(chars: &[char], dot: usize) -> bool {
@@ -58,9 +88,16 @@ fn ends_screen_abbreviation(chars: &[char], dot: usize) -> bool {
     while start > 0 && (chars[start - 1].is_alphabetic() || chars[start - 1] == '.') {
         start -= 1;
     }
-    let word: String = chars[start..=dot].iter().collect::<String>().to_lowercase();
+    let written: String = chars[start..=dot].iter().collect();
+    let word = written.to_lowercase();
     if !SCREEN_ABBREVIATIONS.contains(&word.as_str()) {
         return false;
+    }
+    if LABEL_ABBREVIATIONS.contains(&word.as_str()) {
+        return label_follows(chars, dot);
+    }
+    if word == "cf." {
+        return written == "cf.";
     }
     if word != "al." {
         return true;
@@ -320,6 +357,10 @@ const REFERENCE_WORDS: [&str; 22] = [
     "chapter",
 ];
 
+/// The [`REFERENCE_WORDS`] that are also units or words (`10 sec`, `ch`,
+/// `tab`): a label only when capitalised or dotted, and not after a number.
+const SHORT_REFERENCE_WORDS: [&str; 4] = ["sec", "secs", "tab", "ch"];
+
 /// A dash or minus as written in ranges and notation: `-`, `–`, `—`, `−`.
 fn is_dash(c: char) -> bool {
     matches!(c, '-' | '\u{2013}' | '\u{2014}' | '\u{2212}')
@@ -335,7 +376,8 @@ fn is_reference_label(chars: &[char], i: usize) -> bool {
     while k > 0 && chars[k - 1] == ' ' {
         k -= 1;
     }
-    if k > 0 && chars[k - 1] == '.' {
+    let dotted = k > 0 && chars[k - 1] == '.';
+    if dotted {
         k -= 1;
     }
     let end = k;
@@ -348,7 +390,20 @@ fn is_reference_label(chars: &[char], i: usize) -> bool {
         return false;
     }
     let word: String = chars[k..end].iter().collect::<String>().to_lowercase();
-    REFERENCE_WORDS.contains(&word.as_str())
+    if !REFERENCE_WORDS.contains(&word.as_str()) {
+        return false;
+    }
+    if !SHORT_REFERENCE_WORDS.contains(&word.as_str()) {
+        return true;
+    }
+    // A short form is a label only when written as one (`Sec. 4`, `sec. 4`,
+    // `Tab 2`), and never as the unit of a number before it (`10 sec 5`).
+    let mut b = k;
+    while b > 0 && chars[b - 1] == ' ' {
+        b -= 1;
+    }
+    let after_number = b < k && b > 0 && chars[b - 1].is_ascii_digit();
+    (dotted || chars[k].is_uppercase()) && !after_number
 }
 
 /// Whether the digit at `chars[i]` is an exponent: right after `^`, with an
@@ -369,8 +424,10 @@ fn is_exponent(chars: &[char], i: usize) -> bool {
 /// The group holds only digits, spaces, commas, dashes, `×`/`x`, `√` and
 /// combining overbars. Square, curly and angle brackets always make notation
 /// (Miller directions and families, citations); a parenthesis does when it is
-/// glued to a letter (`Si(100)`, `c(4×2)`), holds three or more digits
-/// (`(111)`, `(1-10)`) or holds a product, a root or an overbar.
+/// glued to a letter (`Si(100)`, `Si(1-10)`, `c(4×2)`), is one run of three or
+/// more digits (`(111)`, `(0001)`) or holds a product, a root or an overbar.
+/// A free-standing parenthesis with a space, comma or dash inside is a range
+/// or a list (`(10-20)`, `(3, 4)`), so its numbers stay quantities.
 fn bracketed_notation_end(chars: &[char], i: usize) -> Option<usize> {
     let open = *chars.get(i.checked_sub(1)?)?;
     let close = match open {
@@ -381,14 +438,16 @@ fn bracketed_notation_end(chars: &[char], i: usize) -> Option<usize> {
         _ => return None,
     };
     let mut k = i;
-    let (mut digits, mut product) = (0, false);
+    let (mut digits, mut product, mut separated) = (0, false, false);
     while k < chars.len() {
         let c = chars[k];
         if c.is_ascii_digit() {
             digits += 1;
         } else if matches!(c, '\u{d7}' | 'x' | '\u{221a}' | '\u{304}' | '\u{305}') {
             product = true;
-        } else if !(c == ' ' || c == ',' || is_dash(c)) {
+        } else if c == ' ' || c == ',' || is_dash(c) {
+            separated = true;
+        } else {
             break;
         }
         k += 1;
@@ -397,7 +456,8 @@ fn bracketed_notation_end(chars: &[char], i: usize) -> Option<usize> {
         return None;
     }
     let glued = i >= 2 && chars[i - 2].is_alphabetic();
-    let notation = open != '(' || glued || digits >= 3 || product;
+    let index = digits >= 3 && !separated;
+    let notation = open != '(' || glued || index || product;
     notation.then_some(k + 1)
 }
 
@@ -1149,8 +1209,11 @@ mod tests {
     ];
 
     /// Genuinely compound controls in the same vocabulary: they must stay
-    /// compound after the notation rules.
-    const COMPOUND_CONTROLS: [&str; 7] = [
+    /// compound after the notation rules. The last eight sit on the edges of
+    /// those rules: an abbreviation that is also a unit, a symbol or a word
+    /// ending a real sentence; a parenthesised range or list; and a short
+    /// reference word used as a unit.
+    const COMPOUND_CONTROLS: [&str; 15] = [
         "The Si(100) surface reconstructs at 300 K. The Ge(001) surface does not.",
         "The barrier is 0.8 eV, but the prefactor is unknown.",
         "Dimers buckle below 120 K; adatoms hop above 400 K.",
@@ -1158,6 +1221,14 @@ mod tests {
         "As shown in Sec. III, the barrier is 0.8 eV. The rate is 10 per second.",
         "The yield was 78 \u{b1} 14% at 300 K, 55 \u{b1} 9% at 350 K and 20 \u{b1} 4% at 400 K.",
         "Group A improved whereas group B declined.",
+        "The sample contained Ca. The Mg content was low.",
+        "The pulse lasted 30 sec. The tip retracted by 2 nm.",
+        "The mixture was 20% by vol. The remainder was water.",
+        "We added 2 eq. The mixture turned red.",
+        "The target was rich in Cf. The decay heat was high.",
+        "Yields were (10-20), (30-40) and (50-60) percent.",
+        "Sites were (1, 2), (3, 4) and (5, 6) apart.",
+        "Exposure lasted 10 sec 5 times then 20 sec 3 times.",
     ];
 
     #[test]
@@ -1211,6 +1282,17 @@ mod tests {
         // A figure, equation, section or reference number is a label.
         assert_eq!(screen("Fig. 3 shows 5 nm").quantities, 1);
         assert_eq!(screen("Eq. (4) and Table 2 give 7.5 eV").quantities, 1);
+        assert_eq!(screen("see sec. 4 and Tab 2 at 7.5 eV").quantities, 1);
+        // A short reference word used as a unit labels nothing.
+        assert_eq!(screen("10 sec 5 times").quantities, 2);
+        assert_eq!(screen("10 sec. 5 times").quantities, 2);
+        assert_eq!(screen("a tab 3 cm wide").quantities, 1);
+        // A free-standing parenthesis with a range or list inside is not
+        // notation; glued to a symbol it still is.
+        assert_eq!(screen("yields of (10-20) percent").quantities, 1);
+        assert_eq!(screen("at (3, 4) and (5, 6)").quantities, 4);
+        assert_eq!(screen("the Si(1-10) face").quantities, 0);
+        assert_eq!(screen("the (0001) basal plane").quantities, 0);
         // A short parenthesised number is still a quantity (an enumeration or
         // a bare count), as before.
         assert_eq!(screen("(1) A, (2) B and (3) C").quantities, 3);
@@ -1227,8 +1309,23 @@ mod tests {
             "Hydrogen, i.e. H termination, passivates.",
             "Si vs. Ge differ.",
             "Approx. 40 percent remain.",
+            "The film is ca. 30 nm thick.",
+            "Eq. (2) and Sec. 4 agree.",
+            "As in Ch. IV, it holds.",
+            "The rate, cf. Table 2, is low.",
         ] {
             assert_eq!(screen(t).sentences, 1, "{t:?}");
+        }
+        // An abbreviation that is also a unit, symbol or word keeps a real
+        // boundary when no label follows it.
+        for t in [
+            "The sample contained Ca. The Mg content was low.",
+            "The pulse lasted 30 sec. The tip retracted.",
+            "It was 20% by vol. The rest was water.",
+            "We added 2 eq. The mixture turned red.",
+            "It was rich in Cf. The decay heat was high.",
+        ] {
+            assert_eq!(screen(t).sentences, 2, "{t:?}");
         }
         // A real boundary after an abbreviated sentence still counts, and so
         // does one after an ordinary word.
