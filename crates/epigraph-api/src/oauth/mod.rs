@@ -12,6 +12,7 @@ pub mod revoke;
 pub mod run_token;
 pub mod scopes;
 pub mod token;
+pub mod token_exchange;
 
 pub use authorize::{authorize_endpoint, AuthorizeQuery};
 #[cfg(feature = "db")]

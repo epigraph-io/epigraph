@@ -908,7 +908,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("EPIGRAPH_MCP_EXTENSIONS: {e}"))?;
     // Discovery uses a gateway SERVICE token (never a caller token): the
     // persistent discovery session is authenticated with it to drive
-    // list_all_tools. Per-call INVOCATION uses the caller's raw bearer instead.
+    // list_all_tools. Per-call INVOCATION uses a token exchanged for the
+    // caller's at the kernel's token endpoint (RFC 8693, backlog c9b82fae),
+    // never the caller's own bearer.
     let discovery_token = std::env::var("EPIGRAPH_MCP_DISCOVERY_TOKEN")
         .or_else(|_| std::env::var("EPIGRAPH_SERVICE_TOKEN"))
         .unwrap_or_default();
@@ -930,12 +932,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             epigraph_mcp::federation::client::DEFAULT_CALL_TIMEOUT,
             std::time::Duration::from_secs,
         );
-    let federation = epigraph_mcp::federation::SharedFederation::new(
+    // The kernel token endpoint federated calls exchange the caller's bearer
+    // at. Unset with extensions mounted: every federated call is refused (the
+    // gateway has no fallback to forwarding the caller's own bearer). A URL
+    // that is neither https nor loopback http is a boot error: it would carry
+    // every caller's bearer.
+    let token_exchange = match std::env::var("EPIGRAPH_MCP_TOKEN_EXCHANGE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        Some(url) => Some(
+            epigraph_mcp::federation::client::TokenExchange::new(url.trim())
+                .map_err(|e| format!("EPIGRAPH_MCP_TOKEN_EXCHANGE_URL: {e}"))?,
+        ),
+        None => None,
+    };
+    if !ext_configs.is_empty() && token_exchange.is_none() {
+        tracing::warn!(
+            "EPIGRAPH_MCP_EXTENSIONS is set but EPIGRAPH_MCP_TOKEN_EXCHANGE_URL is not: every \
+             federated tools/call will be refused (the gateway never forwards a caller's own \
+             bearer)"
+        );
+    }
+    let mut registry =
         epigraph_mcp::federation::FederationRegistry::build(ext_configs, &discovery_token)
             .await
             .map_err(|e| format!("federation gateway build failed: {e}"))?
-            .with_call_timeout(call_timeout),
-    );
+            .with_call_timeout(call_timeout);
+    if let Some(exchange) = token_exchange {
+        registry = registry.with_token_exchange(exchange);
+    }
+    let federation = epigraph_mcp::federation::SharedFederation::new(registry);
     let federated_tool_count = federation.list_federated_tools().len();
     if federation.is_empty() {
         tracing::info!(

@@ -643,6 +643,7 @@ async fn main() {
             .with_admin_cascade(false)
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
+            .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_guest_reads(guest_reads)
             .with_passkeys(passkeys)
@@ -1050,6 +1051,27 @@ fn guest_reads_from_env() -> epigraph_api::state::GuestReads {
         tracing::info!("guest reads OFF: /api/v1/guest/ answers 404");
     }
     switch
+}
+
+/// `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES`, read once at boot: the federation
+/// extensions the RFC 8693 token-exchange grant may mint for. Logged either
+/// way, so a journal shows whether a gateway's exchanges can succeed.
+#[cfg(feature = "db")]
+fn token_exchange_audiences_from_env() -> epigraph_api::oauth::token_exchange::TokenExchangeAudiences
+{
+    let audiences = epigraph_api::oauth::token_exchange::TokenExchangeAudiences::from_env();
+    if audiences.as_slice().is_empty() {
+        tracing::info!(
+            "EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES unset: the token-exchange grant refuses every \
+             audience (a federation gateway's calls to its extensions will fail)"
+        );
+    } else {
+        tracing::info!(
+            audiences = ?audiences.as_slice(),
+            "token-exchange grant may mint extension-audience tokens"
+        );
+    }
+    audiences
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a

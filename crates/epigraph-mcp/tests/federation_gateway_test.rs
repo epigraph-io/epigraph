@@ -10,9 +10,11 @@
 //! What is asserted:
 //! - `list_federated_tools()` surfaces the stub's tool (with optional prefix);
 //! - `invoke()` proxies a `tools/call` and returns the stub's result;
-//! - the **caller's bearer** reaches the stub (`Authorization: Bearer <token>`),
-//!   captured by a test-side middleware that mirrors production's
-//!   `bearer_auth_middleware`;
+//! - the stub receives a token EXCHANGED for the caller's at the kernel's
+//!   token endpoint (aud = the extension, same principal), never the caller's
+//!   own bearer (backlog c9b82fae), captured by a test-side middleware that
+//!   mirrors production's `bearer_auth_middleware`; and a registry with no
+//!   exchange, or an exchange the kernel refuses, forwards nothing;
 //! - two extensions exporting the SAME effective tool name make `build()` fail
 //!   with a collision, while a distinct `prefix=` on one is the escape hatch;
 //! - an unreachable address degrades gracefully (empty tools, healthy=false, no
@@ -23,6 +25,9 @@
 
 #[path = "support/federation_stub.rs"]
 mod stub;
+
+#[path = "support/token_exchange_endpoint.rs"]
+mod tx;
 
 use std::sync::{Arc, Mutex};
 
@@ -48,7 +53,12 @@ use rmcp::{ErrorData, RoleServer, ServerHandler};
 /// `no_group_or_identity_header_is_forwarded_to_the_downstream`), and the
 /// property that replaces it is a statement about what the gateway does NOT
 /// send. A capture that only ever looked at one header could not make it.
-type AuthSlot = Arc<Mutex<Option<axum::http::HeaderMap>>>;
+///
+/// Widened again (backlog c9b82fae) to EVERY request's headers, in order: a
+/// downstream sees the discovery session's requests and each call's
+/// (`initialize`, the call, the session delete), and "the last one" can be
+/// either, so a test that asks what a call carried must see them all.
+type AuthSlot = Arc<Mutex<Vec<axum::http::HeaderMap>>>;
 
 /// A minimal downstream MCP server exposing exactly one tool named `tool_name`.
 /// `call_tool` echoes a fixed payload so the gateway-side test can assert the
@@ -117,7 +127,7 @@ async fn capture_auth(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    *slot.lock().unwrap() = Some(req.headers().clone());
+    slot.lock().unwrap().push(req.headers().clone());
     next.run(req).await
 }
 
@@ -142,7 +152,7 @@ async fn spawn_stub_on(addr: &str, tool_name: &str) -> AuthSlot {
 /// the caller's job so a test can reserve a port, release it, and later reclaim
 /// exactly that port.
 fn serve_stub(listener: tokio::net::TcpListener, tool_name: &str) -> AuthSlot {
-    let slot: AuthSlot = Arc::new(Mutex::new(None));
+    let slot: AuthSlot = Arc::new(Mutex::new(Vec::new()));
     let tool_name = tool_name.to_string();
 
     let service = StreamableHttpService::new(
@@ -171,6 +181,42 @@ fn serve_stub(listener: tokio::net::TcpListener, tool_name: &str) -> AuthSlot {
     slot
 }
 
+/// Every extension name a test in this file mounts: the audiences the test
+/// token endpoint may mint for.
+const AUDIENCES: &[&str] = &[
+    "episcience",
+    "big",
+    "clashing",
+    "ext_a",
+    "ext_b",
+    "ghost",
+    "late",
+];
+
+/// A gateway client of a fresh test token endpoint for [`AUDIENCES`].
+async fn exchange() -> epigraph_mcp::federation::client::TokenExchange {
+    tx::spawn_token_endpoint(tx::SECRET, AUDIENCES)
+        .await
+        .exchange()
+}
+
+/// A kernel access token for a fresh caller.
+fn caller() -> String {
+    tx::kernel_token(tx::SECRET, &["claims:read"])
+}
+
+/// Every `Authorization` header the stub saw that is NOT the discovery
+/// session's: what the gateway's per-call sessions carried.
+fn call_bearers(slot: &AuthSlot) -> Vec<String> {
+    slot.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|h| h.get(axum::http::header::AUTHORIZATION))
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .filter(|b| b != "Bearer discovery-tok")
+        .collect()
+}
+
 fn cfg(name: &str, addr: &str, prefix: Option<&str>) -> ExtensionConfig {
     ExtensionConfig {
         name: name.to_string(),
@@ -181,11 +227,12 @@ fn cfg(name: &str, addr: &str, prefix: Option<&str>) -> ExtensionConfig {
 }
 
 #[tokio::test]
-async fn lists_and_invokes_stub_tool_forwarding_caller_bearer() {
-    let (addr, slot) = spawn_stub("ping").await;
+async fn lists_and_invokes_stub_tool() {
+    let (addr, _slot) = spawn_stub("ping").await;
     let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
         .await
-        .expect("build should succeed against a reachable stub");
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(exchange().await);
 
     // list_federated_tools surfaces the stub's single tool.
     let tools = registry.list_federated_tools();
@@ -198,9 +245,8 @@ async fn lists_and_invokes_stub_tool_forwarding_caller_bearer() {
     assert!(registry.route("nonexistent").is_none());
 
     // invoke() proxies the call and returns the stub's result.
-    let caller_token = "caller-bearer-xyz";
     let result = registry
-        .invoke("ping", caller_token, None)
+        .invoke("ping", &caller(), None)
         .await
         .expect("invoke should proxy to the stub");
     let text = result.content[0]
@@ -212,19 +258,125 @@ async fn lists_and_invokes_stub_tool_forwarding_caller_bearer() {
         text, "stub handled `ping`",
         "downstream should receive the un-prefixed tool name"
     );
+}
 
-    // The CALLER's bearer reached the stub as `Authorization: Bearer <token>`
-    // (rmcp's reqwest client prepends `Bearer ` via `.bearer_auth`).
-    let seen = slot
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("stub saw request headers");
-    assert_eq!(
-        seen.get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        Some(format!("Bearer {caller_token}").as_str())
+/// **Backlog c9b82fae: no token passthrough.** The downstream receives a token
+/// EXCHANGED for the caller's, never the caller's own bearer: the caller's
+/// token (the sentinel) appears nowhere in the request the stub saw, it went
+/// to the kernel's token endpoint instead, and what the stub got names the
+/// same principal with the extension's audience, which the kernel's own
+/// validator refuses (so the extension cannot replay it at the kernel).
+///
+/// Fails on the pre-fix gateway: `invoke_once` forwarded `caller_token`
+/// verbatim, so the stub saw `Bearer <sentinel>`.
+#[tokio::test]
+async fn the_downstream_receives_an_exchanged_token_never_the_callers_bearer() {
+    let (addr, slot) = spawn_stub("ping").await;
+    let endpoint = tx::spawn_token_endpoint(tx::SECRET, AUDIENCES).await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(endpoint.exchange());
+    let sentinel = tx::kernel_token(tx::SECRET, &["claims:read", "episcience:tools"]);
+
+    registry
+        .invoke("ping", &sentinel, None)
+        .await
+        .expect("invoke should proxy to the stub");
+
+    let requests = slot.lock().unwrap().clone();
+    for headers in &requests {
+        for (name, value) in headers {
+            assert!(
+                !value
+                    .as_bytes()
+                    .windows(sentinel.len())
+                    .any(|w| w == sentinel.as_bytes()),
+                "the caller's own bearer reached the downstream in `{name}`: token passthrough"
+            );
+        }
+    }
+    let bearers = call_bearers(&slot);
+    assert!(!bearers.is_empty(), "the call's session carried a bearer");
+    assert!(
+        bearers.iter().all(|b| *b == bearers[0]),
+        "one exchanged token per call: {bearers:?}"
     );
+    let forwarded = bearers[0]
+        .strip_prefix("Bearer ")
+        .expect("a bearer")
+        .to_string();
+    assert_eq!(
+        *endpoint.subjects.lock().unwrap(),
+        vec![sentinel.clone()],
+        "the caller's bearer went to the kernel's token endpoint, once"
+    );
+
+    let jwt = epigraph_auth::JwtConfig::from_secret(tx::SECRET);
+    let caller = jwt.validate_token(&sentinel).unwrap();
+    let got = jwt
+        .validate_token_for_audience(&forwarded, "episcience")
+        .expect("the forwarded token is for the extension");
+    assert_eq!(
+        (got.sub, got.agent_id, got.owner_id),
+        (caller.sub, caller.agent_id, caller.owner_id),
+        "the forwarded token names the caller"
+    );
+    assert!(got.exp <= caller.exp && got.exp - got.iat <= epigraph_auth::EXCHANGED_TOKEN_MAX_SECS);
+    assert!(
+        jwt.validate_token(&forwarded).is_err(),
+        "the forwarded token must not be admitted on a kernel route"
+    );
+}
+
+/// A registry with no token exchange REFUSES a federated call: it never falls
+/// back to forwarding the caller's own bearer, and never dials the downstream
+/// with it (the stub's last request is still the discovery session's).
+#[tokio::test]
+async fn a_registry_without_a_token_exchange_forwards_nothing() {
+    let (addr, slot) = spawn_stub("ping").await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub");
+    let sentinel = caller();
+
+    let err = registry
+        .invoke("ping", &sentinel, None)
+        .await
+        .expect_err("no exchange configured: the call must be refused");
+    assert!(
+        matches!(
+            err,
+            epigraph_mcp::federation::client::FederationError::Exchange(_)
+        ),
+        "{err:?}"
+    );
+    assert!(
+        call_bearers(&slot).is_empty(),
+        "the downstream saw nothing but discovery: {:?}",
+        call_bearers(&slot)
+    );
+}
+
+/// An exchange the kernel REFUSES (here: the extension is not one of its
+/// configured audiences) is a refused call: the downstream is not dialled
+/// and the caller's bearer goes nowhere but the token endpoint.
+#[tokio::test]
+async fn a_refused_exchange_forwards_nothing() {
+    let (addr, slot) = spawn_stub("ping").await;
+    let endpoint = tx::spawn_token_endpoint(tx::SECRET, &["some-other-extension"]).await;
+    let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
+        .await
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(endpoint.exchange());
+
+    let err = registry
+        .invoke("ping", &caller(), None)
+        .await
+        .expect_err("an unknown audience must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("invalid_target"), "{msg}");
+    assert!(call_bearers(&slot).is_empty(), "{:?}", call_bearers(&slot));
 }
 
 /// **PR-10's federation clause, rejected with evidence.**
@@ -236,7 +388,8 @@ async fn lists_and_invokes_stub_tool_forwarding_caller_bearer() {
 ///
 /// 1. **It is redundant.** `client::invoke_once` already forwards the CALLER'S
 ///    OWN bearer verbatim (`connect(addr, Some(caller_token))` →
-///    `.bearer_auth(token)`), and `server.rs::call_tool` refuses a federated
+///    `.bearer_auth(token)`; since backlog c9b82fae a token EXCHANGED for it,
+///    naming the same principal), and `server.rs::call_tool` refuses a federated
 ///    call outright when there is no raw caller token to forward ("federated
 ///    tools are unavailable over stdio"). The downstream therefore validates
 ///    the real principal and derives its own `Viewer` from its own
@@ -262,45 +415,51 @@ async fn no_group_or_identity_header_is_forwarded_to_the_downstream() {
     let (addr, slot) = spawn_stub("ping").await;
     let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
         .await
-        .expect("build should succeed against a reachable stub");
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(exchange().await);
 
+    let sentinel = caller();
     registry
-        .invoke("ping", "caller-bearer-xyz", None)
+        .invoke("ping", &sentinel, None)
         .await
         .expect("invoke should proxy to the stub");
 
-    let seen = slot
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("stub saw request headers");
+    let requests = slot.lock().unwrap().clone();
+    assert!(!requests.is_empty(), "stub saw request headers");
 
     // Nothing that names a principal, a group, or a tenancy decision.
-    for banned in [
-        "x-epigraph-groups",
-        "x-epigraph-group-ids",
-        "x-epigraph-viewer",
-        "x-epigraph-agent-id",
-        "x-epigraph-principal",
-        "x-epigraph-owner-group-id",
-        "x-epigraph-visibility",
-        "x-forwarded-user",
-    ] {
-        assert!(
-            seen.get(banned).is_none(),
-            "the gateway forwarded `{banned}`. A downstream that trusts a \
+    for seen in &requests {
+        for banned in [
+            "x-epigraph-groups",
+            "x-epigraph-group-ids",
+            "x-epigraph-viewer",
+            "x-epigraph-agent-id",
+            "x-epigraph-principal",
+            "x-epigraph-owner-group-id",
+            "x-epigraph-visibility",
+            "x-forwarded-user",
+        ] {
+            assert!(
+                seen.get(banned).is_none(),
+                "the gateway forwarded `{banned}`. A downstream that trusts a \
              gateway-asserted identity or group set derives read authority from \
-             an untrusted header; forward the caller's own bearer instead, which \
+             an untrusted header; forward a token for the caller instead, which \
              the downstream can validate."
-        );
+            );
+        }
     }
 
-    // …and the positive control: the caller's credential DID arrive, so the
-    // absence above is "we send only the token", not "we sent nothing".
-    assert_eq!(
-        seen.get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        Some("Bearer caller-bearer-xyz")
+    // …and the positive control: a credential for the caller DID arrive (its
+    // exchanged token, never its own bearer), so the absence above is "we
+    // send only the token", not "we sent nothing".
+    let bearers = call_bearers(&slot);
+    assert!(
+        !bearers.is_empty(),
+        "a bearer for the call reached the downstream"
+    );
+    assert!(
+        bearers.iter().all(|b| *b != format!("Bearer {sentinel}")),
+        "never the caller's own"
     );
 }
 
@@ -312,7 +471,8 @@ async fn prefix_is_applied_to_effective_name_and_stripped_on_invoke() {
         "discovery-tok",
     )
     .await
-    .unwrap();
+    .unwrap()
+    .with_token_exchange(exchange().await);
 
     // Advertised (effective) name carries the prefix.
     let tools = registry.list_federated_tools();
@@ -324,7 +484,7 @@ async fn prefix_is_applied_to_effective_name_and_stripped_on_invoke() {
     // Invoking the prefixed name strips the prefix before forwarding, so the
     // stub sees the bare `ping`.
     let result = registry
-        .invoke("episcience__ping", "tok", None)
+        .invoke("episcience__ping", &caller(), None)
         .await
         .unwrap();
     let text = result.content[0].as_text().unwrap().text.clone();
@@ -376,7 +536,8 @@ async fn prefix_resolves_collision_between_extensions() {
         "discovery-tok",
     )
     .await
-    .expect("distinct prefixes must resolve the collision");
+    .expect("distinct prefixes must resolve the collision")
+    .with_token_exchange(exchange().await);
 
     assert!(registry.route("dup").is_some());
     assert!(registry.route("b__dup").is_some());
@@ -394,7 +555,8 @@ async fn unreachable_extension_degrades_gracefully() {
 
     let registry = FederationRegistry::build(vec![cfg("ghost", &dead_addr, None)], "discovery-tok")
         .await
-        .expect("an unreachable extension must NOT fail the whole build");
+        .expect("an unreachable extension must NOT fail the whole build")
+        .with_token_exchange(exchange().await);
 
     // No tools routed; the gateway stands, just without this extension.
     assert!(
@@ -421,7 +583,8 @@ async fn reconnect_tick_revives_an_extension_that_was_down_at_boot() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
-            .expect("an unreachable extension must not fail the build"),
+            .expect("an unreachable extension must not fail the build")
+            .with_token_exchange(exchange().await),
     );
 
     // Baseline: mounted, but contributing nothing.
@@ -454,27 +617,20 @@ async fn reconnect_tick_revives_an_extension_that_was_down_at_boot() {
         "the revived route must carry the extension's configured scope gate"
     );
 
-    // ...and actually callable end-to-end, with the caller's bearer forwarded.
+    // ...and actually callable end-to-end, with the caller's exchanged token.
     // Listing alone would pass even if the routing map were updated but the
     // session were not, so assert the round-trip.
     let result = federation
-        .invoke("ping", "caller-after-revival", None)
+        .invoke("ping", &caller(), None)
         .await
         .expect("a revived extension must be invocable");
     assert_eq!(
         result.content[0].as_text().unwrap().text,
         "stub handled `ping`"
     );
-    let seen = slot
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("the revived stub saw request headers");
-    assert_eq!(
-        seen.get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok()),
-        Some("Bearer caller-after-revival"),
-        "the caller's bearer must reach the revived downstream"
+    assert!(
+        !call_bearers(&slot).is_empty(),
+        "a call's exchanged token, not only discovery, must reach the revived downstream"
     );
 }
 
@@ -484,7 +640,8 @@ async fn reconnect_tick_leaves_healthy_extensions_untouched() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
     assert_eq!(federation.list_federated_tools().len(), 1);
 
@@ -505,7 +662,8 @@ async fn reconnect_tick_leaves_healthy_extensions_untouched() {
 async fn absent_extensions_yield_empty_registry() {
     let registry = FederationRegistry::build(vec![], "discovery-tok")
         .await
-        .unwrap();
+        .unwrap()
+        .with_token_exchange(exchange().await);
     assert!(registry.is_empty());
     assert!(registry.list_federated_tools().is_empty());
 }
@@ -661,7 +819,8 @@ async fn a_tick_picks_up_a_mounted_extensions_changed_tool_list() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, Some("es_"))], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
     assert_eq!(tool_names(&federation), ["es_old_tool", "es_ping"]);
 
@@ -683,7 +842,7 @@ async fn a_tick_picks_up_a_mounted_extensions_changed_tool_list() {
         "a tool the extension no longer exports must not keep a route"
     );
     let result = federation
-        .invoke("es_new_tool", "caller-tok", None)
+        .invoke("es_new_tool", &caller(), None)
         .await
         .expect("the newly routed tool is callable");
     assert_eq!(
@@ -700,7 +859,8 @@ async fn a_tick_demotes_an_extension_that_died_and_a_later_one_revives_it() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, Some("es_"))], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
     assert_eq!(tool_names(&federation), ["es_ping"]);
 
@@ -725,7 +885,7 @@ async fn a_tick_demotes_an_extension_that_died_and_a_later_one_revives_it() {
         "the extension is back, so the next tick must route it again"
     );
     federation
-        .invoke("es_ping", "caller-tok", None)
+        .invoke("es_ping", &caller(), None)
         .await
         .expect("a revived extension is callable");
 }
@@ -738,12 +898,13 @@ async fn an_invoke_that_cannot_reach_the_extension_demotes_it() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
     control.set_down(true);
 
     let err = federation
-        .invoke("ping", "caller-tok", None)
+        .invoke("ping", &caller(), None)
         .await
         .expect_err("the extension is down");
     assert!(
@@ -777,11 +938,12 @@ async fn a_downstream_tool_error_reaches_the_caller_with_its_code_and_message() 
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
 
     let err = federation
-        .invoke("refuses", "caller-tok", None)
+        .invoke("refuses", &caller(), None)
         .await
         .expect_err("the stub refuses this tool");
     assert!(
@@ -819,11 +981,12 @@ async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
-            .unwrap(),
+            .unwrap()
+            .with_token_exchange(exchange().await),
     );
 
     let err = federation
-        .invoke("fails_internally", "caller-tok", None)
+        .invoke("fails_internally", &caller(), None)
         .await
         .expect_err("the stub fails this tool internally");
     assert!(
@@ -869,13 +1032,14 @@ async fn a_call_the_downstream_never_answers_times_out() {
         FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
             .await
             .unwrap()
+            .with_token_exchange(exchange().await)
             .with_call_timeout(std::time::Duration::from_millis(300)),
     );
 
     let started = std::time::Instant::now();
     let err = tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        federation.invoke("hangs", "caller-tok", None),
+        federation.invoke("hangs", &caller(), None),
     )
     .await
     .expect("the gateway's own bound must end the call; this outer one is the test's backstop")
@@ -933,7 +1097,8 @@ async fn an_unhealthy_extension_owning_the_prefix_is_named_as_the_candidate() {
         "discovery-tok",
     )
     .await
-    .expect("an unreachable extension must not fail the build");
+    .expect("an unreachable extension must not fail the build")
+    .with_token_exchange(exchange().await);
     let shared = SharedFederation::new(registry);
 
     assert_eq!(
@@ -951,7 +1116,8 @@ async fn a_healthy_registry_names_no_unhealthy_candidate() {
     let (addr, _slot) = spawn_stub("ping").await;
     let registry = FederationRegistry::build(vec![cfg("episcience", &addr, None)], "discovery-tok")
         .await
-        .expect("build");
+        .expect("build")
+        .with_token_exchange(exchange().await);
     let shared = SharedFederation::new(registry);
 
     assert!(
@@ -1030,10 +1196,14 @@ async fn a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied(
     let (addr, _slot) = spawn_stub("oversized_reply").await;
     let registry = FederationRegistry::build(vec![cfg("big", &addr, None)], "discovery-tok")
         .await
-        .expect("build should succeed against a reachable stub");
-    let outcome = tokio::time::timeout(deadline, registry.invoke("oversized_reply", "tok", None))
-        .await
-        .expect("an oversized reply must fail the call, not hang it");
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(exchange().await);
+    let outcome = tokio::time::timeout(
+        deadline,
+        registry.invoke("oversized_reply", &caller(), None),
+    )
+    .await
+    .expect("an oversized reply must fail the call, not hang it");
     // Matched rather than `expect_err`, which would print all 17 MiB.
     match outcome {
         Err(err) => eprintln!("oversized downstream reply refused: {err}"),
@@ -1046,8 +1216,9 @@ async fn a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied(
     let (addr, _slot) = spawn_stub("large_reply").await;
     let registry = FederationRegistry::build(vec![cfg("big", &addr, None)], "discovery-tok")
         .await
-        .expect("build should succeed against a reachable stub");
-    let result = tokio::time::timeout(deadline, registry.invoke("large_reply", "tok", None))
+        .expect("build should succeed against a reachable stub")
+        .with_token_exchange(exchange().await);
+    let result = tokio::time::timeout(deadline, registry.invoke("large_reply", &caller(), None))
         .await
         .expect("a reply under the cap is proxied in time")
         .expect("a 15 MiB downstream reply is under the cap and proxied");
@@ -1098,7 +1269,8 @@ async fn a_prefix_resolves_a_kernel_tool_name_clash() {
     let registry =
         FederationRegistry::build(vec![cfg("clashing", &addr, Some("ext__"))], "discovery-tok")
             .await
-            .expect("a prefixed name does not clash with the kernel");
+            .expect("a prefixed name does not clash with the kernel")
+            .with_token_exchange(exchange().await);
     assert!(registry.route("ext__submit_claim").is_some());
     assert!(registry.route("submit_claim").is_none());
 }
@@ -1115,7 +1287,8 @@ async fn a_reconnect_does_not_route_a_kernel_tool_name() {
     let federation = SharedFederation::new(
         FederationRegistry::build(vec![cfg("late", &addr, None)], "discovery-tok")
             .await
-            .expect("an unreachable extension must not fail the build"),
+            .expect("an unreachable extension must not fail the build")
+            .with_token_exchange(exchange().await),
     );
     let _control = stub::spawn_controlled_stub_on(&addr, &["submit_claim", "late_probe"]).await;
     federation.reconnect_tick().await;
