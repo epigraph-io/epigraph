@@ -81,6 +81,11 @@ const BINS: &[(&str, Option<&str>, &str)] = &[
         "src/bin/bootstrap_clients.rs",
     ),
     (
+        "cache_owner_audit",
+        Some(env!("CARGO_BIN_EXE_cache_owner_audit")),
+        "src/bin/cache_owner_audit.rs",
+    ),
+    (
         "cross_source_sweep",
         CROSS_SOURCE_SWEEP,
         "src/bin/cross_source_sweep.rs",
