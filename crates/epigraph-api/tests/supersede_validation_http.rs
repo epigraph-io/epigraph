@@ -10,7 +10,9 @@
 //! against a 503 stub and so proved nothing about this arm (backlog candidate
 //! B100-supersede-validation-tests).
 //!
-//! One test per check, so that removing a check fails exactly its own test.
+//! One test per check: removing or weakening a check fails at least one test,
+//! and only that check's tests (the boundary control below catches an
+//! off-by-one in either cap or in the range).
 //! The truth-value refusal is enforced twice in the handler (the explicit
 //! bounds check, then `TruthValue::new`), with the same field and text; the
 //! tests here pin the refusal, which only removing both would change.
