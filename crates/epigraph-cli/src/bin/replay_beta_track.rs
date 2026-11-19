@@ -9,16 +9,29 @@
 //! default (`truth_value_seed`, `auto_wire:creation`, `prior`,
 //! `ingest_template`; `--exclude-method` leaves out more).
 //!
-//! DRY RUN BY DEFAULT: without `--apply` it prints the counts (counted BBAs by
-//! writer label, excluded rows, claims that would move) and a sample, and
-//! writes nothing.
+//! DRY RUN ONLY: it prints the counts (counted BBAs by writer label, excluded
+//! rows, claims that would move) and a sample, and writes nothing.
 //!
-//! It writes NO `ds_bayesian_divergence` row for the history: the next live
-//! evidence write on a replayed claim records its divergence.
+//! # Not to be applied
 //!
-//! # Apply and reverse
+//! A replay `--apply` is REFUSED (backlog candidate 913-cold-start-divergence).
+//! The replay counts every stored BBA, including those of writers that never
+//! move the live track (assess discounts, unlabelled rows, the seed and edge
+//! wires), and the Beta arithmetic counts their uncommitted mass against the
+//! hypothesis. On a production-sized corpus its dry run put the replayed
+//! posteriors well below the claims' BetP, so applying it would have pushed
+//! thousands of claims INTO the top-divergent list rather than out of it. The
+//! problem it was meant to fix, a claim's first live update registering a
+//! large divergence against an empty track, is handled where the row is
+//! written instead: a cold-start update records no divergence row
+//! (`epigraph_engine::ds_divergence`). The replay arithmetic and the dry run
+//! stay, as the measurement; `--reverse` stays, to undo a run applied before
+//! this refusal.
 //!
-//! `--apply` requires `--manifest <PATH>`, a file that must not exist yet.
+//! # Apply (refused) and reverse
+//!
+//! An applying run (before the refusal) required `--manifest <PATH>`, a file
+//! that must not exist yet.
 //! Each batch's records (the parameters found and written, bit-exact) are
 //! written and synced to disk before the batch commits. `--reverse <PATH>` reads such a
 //! manifest and, with `--apply`, puts the found parameters back on every claim
@@ -36,11 +49,10 @@
 //! Keyset pages of `--batch` claims in id order, each in its own transaction,
 //! and only claims still on the prior, so a re-run skips claims already
 //! replayed. `--max-batches` bounds a run; pass its `last_id` as `--after` to
-//! continue (with a new `--manifest`).
+//! continue.
 //!
 //! Exit 0: the run finished (or stopped at `--max-batches`). Exit 1: a refusal
-//! or an error (batches already committed stay written, and are in the
-//! manifest).
+//! or an error (a reversal's batches already committed stay restored).
 
 use anyhow::{anyhow, bail, Context};
 use clap::Parser;
@@ -49,8 +61,9 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "replay_beta_track",
-    about = "Rebuild beta_alpha/beta_beta of claims still on the Beta(1,1) prior from their \
-             stored BBAs (dry run unless --apply), on the maintenance connection"
+    about = "Measure (dry run only) rebuilding beta_alpha/beta_beta of claims still on the \
+             Beta(1,1) prior from their stored BBAs, on the maintenance connection; a replay \
+             --apply is refused, --reverse --apply undoes an earlier run"
 )]
 struct Cli {
     /// PostgreSQL connection URL of the application database (names the
@@ -58,7 +71,8 @@ struct Cli {
     #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
-    /// Write. Without it, nothing is written.
+    /// With --reverse: write the reversal. A replay --apply is refused: see
+    /// the binary's docs. Without it, nothing is written.
     #[arg(long, conflicts_with = "dry_run")]
     apply: bool,
 
@@ -66,7 +80,8 @@ struct Cli {
     #[arg(long)]
     dry_run: bool,
 
-    /// With --apply: the manifest to write (must not exist). Required.
+    /// Retired with a replay --apply (the manifest an applying run wrote).
+    /// Still accepted, so an old invocation reaches the refusal.
     #[arg(long, value_name = "PATH", conflicts_with = "reverse")]
     manifest: Option<PathBuf>,
 
@@ -99,26 +114,17 @@ struct Cli {
     exclude_method: Vec<String>,
 }
 
+/// The refusal of a replay `--apply`.
+const APPLY_RETIRED: &str = "replay_beta_track --apply is retired and will not write: \
+     replaying every stored BBA builds a Beta track the live writers never would have, and \
+     pushes claims INTO the top-divergent list instead of out of it. A claim's cold-start \
+     update records no divergence row instead (epigraph_engine::ds_divergence). Run without \
+     --apply to measure; --reverse <MANIFEST> --apply still undoes an earlier run";
+
 /// The refusal when MAINTENANCE_DATABASE_URL is unset.
 const UNSET_MAINTENANCE_DSN: &str = "replay_beta_track rewrites claims across every owner, so it \
      runs only on an explicitly configured MAINTENANCE_DATABASE_URL; it is unset, and the \
      application DSN is never used for this";
-
-/// The manifest file. `flush`, which the replay calls once per batch before
-/// it commits, also syncs the file to disk, so a host crash after a commit
-/// cannot lose that batch's records.
-struct SyncedManifest(std::io::BufWriter<std::fs::File>);
-
-impl std::io::Write for SyncedManifest {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        std::io::Write::write(&mut self.0, buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        std::io::Write::flush(&mut self.0)?;
-        self.0.get_ref().sync_data()
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -128,11 +134,12 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    // First, before any other check, file or connection.
+    if cli.apply && cli.reverse.is_none() {
+        bail!(APPLY_RETIRED);
+    }
     if !(1..=10_000).contains(&cli.batch) {
         bail!("--batch must be between 1 and 10000");
-    }
-    if cli.apply && cli.reverse.is_none() && cli.manifest.is_none() {
-        bail!("--apply needs --manifest <PATH>: the record a --reverse undoes the run by");
     }
     // Refused before anything else, so an unset MAINTENANCE_DATABASE_URL
     // never creates a manifest or opens a connection on the application DSN
@@ -142,20 +149,6 @@ async fn main() -> anyhow::Result<()> {
     if dsn_source != epigraph_db::MaintenanceDsnSource::Configured {
         bail!(UNSET_MAINTENANCE_DSN);
     }
-
-    // Opened before connecting, so an existing file refuses the run before it
-    // touches the database, and a later write cannot clobber an older run's
-    // manifest.
-    let mut manifest_file = match (&cli.manifest, cli.apply) {
-        (Some(path), true) => Some(SyncedManifest(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .with_context(|| format!("create the manifest {}", path.display()))?,
-        ))),
-        _ => None,
-    };
 
     let maint = epigraph_cli::MaintenancePool::connect_to(&cli.database_url, "replay_beta_track")
         .await
@@ -189,27 +182,19 @@ async fn main() -> anyhow::Result<()> {
         out["manifest"] = serde_json::Value::String(path.display().to_string());
         out
     } else {
+        // Always a dry run: a replay --apply was refused above.
         let mut opts = epigraph_cli::beta_replay::Options::dry_run();
-        opts.apply = cli.apply;
         opts.batch = cli.batch;
         opts.after = cli.after;
         opts.max_batches = cli.max_batches;
         opts.sample = cli.sample;
         opts.excluded_methods
             .extend(cli.exclude_method.iter().cloned());
-        let report = epigraph_cli::beta_replay::run(
-            conn,
-            &opts,
-            manifest_file.as_mut().map(|w| w as &mut dyn std::io::Write),
-        )
-        .await
-        .map_err(|e| anyhow!("the replay failed; batches already committed stay written: {e}"))?;
+        let report = epigraph_cli::beta_replay::run(conn, &opts, None)
+            .await
+            .map_err(|e| anyhow!("the dry run failed: {e}"))?;
         let mut out = serde_json::to_value(&report).context("serialize the report")?;
         out["excluded_methods"] = serde_json::to_value(&opts.excluded_methods)?;
-        // Only an applying run creates the file; a dry run never names one.
-        if let (Some(path), true) = (&cli.manifest, cli.apply) {
-            out["manifest"] = serde_json::Value::String(path.display().to_string());
-        }
         out
     };
     println!(

@@ -41,11 +41,62 @@ fn refused_with(out: &Output, text: &str) {
     );
 }
 
+/// A replay `--apply` is retired (backlog candidate
+/// 913-cold-start-divergence): refused first, with or without a manifest,
+/// before any file or connection, and with the reason. Before the refusal,
+/// `--apply --manifest <new>` created the manifest and went on to connect.
 #[test]
-fn an_apply_without_a_manifest_is_refused() {
+fn a_replay_apply_is_refused_before_any_file_or_connection() {
     let dir = scratch_dir();
-    let out = run(&dir, true, &["--apply"]);
-    refused_with(&out, "--apply needs --manifest");
+    let fresh = dir.join("fresh.jsonl");
+    let older = dir.join("older.jsonl");
+    let older_text = "an older run's record\n";
+    std::fs::write(&older, older_text).expect("write the older manifest");
+    for args in [
+        vec!["--apply"],
+        vec!["--apply", "--manifest", fresh.to_str().expect("utf-8 path")],
+        vec!["--apply", "--manifest", older.to_str().expect("utf-8 path")],
+    ] {
+        let out = run(&dir, true, &args);
+        refused_with(&out, "replay_beta_track --apply is retired");
+        refused_with(&out, "cold-start update records no divergence row");
+    }
+    assert!(
+        !fresh.exists(),
+        "a refused apply must not create a manifest"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&older).expect("read the older manifest"),
+        older_text,
+        "an older manifest must be left as it was"
+    );
+}
+
+/// The reversal of an earlier run is not retired: `--reverse <PATH> --apply`
+/// passes the refusal and stops only at the (unreachable) database.
+#[test]
+fn a_reverse_apply_is_not_refused_as_retired() {
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    std::fs::write(&manifest, "").expect("write an empty manifest");
+    let out = run(
+        &dir,
+        true,
+        &[
+            "--reverse",
+            manifest.to_str().expect("utf-8 path"),
+            "--apply",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the database is unreachable: {stderr}"
+    );
+    assert!(
+        !stderr.contains("is retired"),
+        "a reversal must not be refused as a retired replay: {stderr}"
+    );
 }
 
 #[test]
@@ -65,7 +116,7 @@ fn an_unset_maintenance_dsn_is_refused_before_a_manifest_is_created() {
     let manifest = dir.join("m.jsonl");
     let manifest_arg = manifest.to_str().expect("utf-8 path");
     for args in [
-        vec!["--apply", "--manifest", manifest_arg],
+        vec!["--reverse", manifest_arg, "--apply"],
         vec!["--dry-run"],
     ] {
         let out = run(&dir, false, &args);
@@ -75,29 +126,4 @@ fn an_unset_maintenance_dsn_is_refused_before_a_manifest_is_created() {
             "a refused run must not leave a manifest behind"
         );
     }
-}
-
-/// An existing manifest (an older run's record) is refused, before any
-/// connection, and is not touched.
-#[test]
-fn an_existing_manifest_is_refused_and_left_alone() {
-    let dir = scratch_dir();
-    let manifest = dir.join("m.jsonl");
-    let older = "an older run's record\n";
-    std::fs::write(&manifest, older).expect("write the older manifest");
-    let out = run(
-        &dir,
-        true,
-        &[
-            "--apply",
-            "--manifest",
-            manifest.to_str().expect("utf-8 path"),
-        ],
-    );
-    refused_with(&out, "create the manifest");
-    assert_eq!(
-        std::fs::read_to_string(&manifest).expect("read the manifest"),
-        older,
-        "the older manifest must be left as it was"
-    );
 }
