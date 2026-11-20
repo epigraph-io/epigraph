@@ -720,7 +720,10 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
     .expect("pg_constraint lookup");
 
     let check = check.expect("agents_key_kind_check must exist").0;
-    for value in ["ed25519", "derived"] {
+    // 230 added `seed-derived` (backlog bfc2eff8): a key derived from a public
+    // seed, which `public_key_if_signer` excludes exactly as it excludes
+    // `derived`.
+    for value in ["ed25519", "derived", "seed-derived"] {
         assert!(
             check.contains(value),
             "CHECK must admit {value}; got {check}"
@@ -728,7 +731,7 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
     }
 
     // `contains` alone is the wrong shape of assertion: a CHECK widened to
-    // `key_kind IN ('ed25519','derived','legacy')` satisfies it, and a widened
+    // `key_kind IN ('ed25519','derived','seed-derived','legacy')` satisfies it, and a widened
     // CHECK is exactly the regression this test exists to catch. Prove EXCLUSION
     // by making the database reject a third value.
     let bogus = sqlx::query(
@@ -748,9 +751,9 @@ async fn agents_key_kind_discriminator_is_intact(pool: PgPool) {
         "expected a CHECK violation (23514), got {err}"
     );
 
-    // And the two real values are actually storable — otherwise a CHECK that
+    // And the three real values are actually storable — otherwise a CHECK that
     // rejects EVERYTHING would pass the assertion above.
-    for (i, kind) in ["ed25519", "derived"].iter().enumerate() {
+    for (i, kind) in ["ed25519", "derived", "seed-derived"].iter().enumerate() {
         sqlx::query(
             "INSERT INTO agents (public_key, display_name, key_kind) \
              VALUES (decode(repeat($1, 32), 'hex'), $2, $3)",

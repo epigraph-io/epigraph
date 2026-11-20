@@ -1675,6 +1675,23 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              marker) needs one of the two session arms beside it (`epigraph_bypass()` / \
              `epigraph_definer_bypass()`), i.e. the maintenance session or 207's definer.",
         ),
+        (
+            "claim_encryption_owner_scope_insert",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE insert policy: its arm (the claim exists and its owner group IS \
+             the seal row's `group_id`) narrows and grants nothing. It is AND-ed with 077's \
+             permissive `claim_encryption_tenancy`, whose WITH CHECK still requires `group_id` \
+             in `epigraph_writable_groups()`; the `claims` read inside it is the caller's, \
+             under its own row security.",
+        ),
+        (
+            "claim_encryption_owner_scope_update",
+            "owner_group_id = claim_encryption.group_id",
+            "232's RESTRICTIVE update policy, the same arm in USING and WITH CHECK, for the \
+             same reason as `claim_encryption_owner_scope_insert`: AND-ed with 077's \
+             permissive `claim_encryption_tenancy` (USING the read set, WITH CHECK the \
+             writable set), it narrows and grants nothing.",
+        ),
     ];
 
     let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
@@ -1697,7 +1714,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     );
 
     let mut offenders: Vec<String> = Vec::new();
-    let mut exemptions_hit: BTreeSet<&str> = BTreeSet::new();
+    // Keyed on (policy, needle), not the needle alone: two entries may share a
+    // needle (232's insert and update policies do), and a needle-only key
+    // would keep a dropped policy's entry "hit" through its sibling's arm.
+    let mut exemptions_hit: BTreeSet<(&str, &str)> = BTreeSet::new();
     for (table, policy, using, with_check) in &rows {
         for (clause, expr) in [("USING", using), ("WITH CHECK", with_check)] {
             let Some(expr) = expr else { continue };
@@ -1712,8 +1732,8 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
                 let exempt = ROW_ONLY_BY_DESIGN
                     .iter()
                     .find(|(p, needle, _)| p == policy && arm.contains(needle));
-                if let Some((_, needle, _)) = exempt {
-                    exemptions_hit.insert(needle);
+                if let Some((p, needle, _)) = exempt {
+                    exemptions_hit.insert((p, needle));
                     continue;
                 }
                 if !mentions_session && !allowed_constant {
@@ -1727,10 +1747,10 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
     // matches any arm is an entry that has silently stopped exempting anything,
     // and would keep excusing a future arm that happened to contain the same
     // substring.
-    let stale: Vec<&str> = ROW_ONLY_BY_DESIGN
+    let stale: Vec<(&str, &str)> = ROW_ONLY_BY_DESIGN
         .iter()
-        .map(|(_, needle, _)| *needle)
-        .filter(|n| !exemptions_hit.contains(n))
+        .map(|(p, needle, _)| (*p, *needle))
+        .filter(|k| !exemptions_hit.contains(k))
         .collect();
     assert!(
         stale.is_empty(),
@@ -2116,7 +2136,7 @@ async fn the_app_role_can_reach_every_public_table_without_the_test_fixture(pool
 ///
 /// | Site | Table | Pool | Disposition |
 /// |---|---|---|---|
-/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (since D9 the only queue is `bin/drain_jobs.rs`'s, on the configured maintenance DSN; 119 lets no application session enqueue) | **REMOVED** (backlog cbf57f24): it had no caller; the pool assertion below still pins the queue to the maintenance DSN |
+/// | `postgres_queue.rs::enqueue_unique_pending` | `jobs` | maintenance (its one caller is the operator CLI `enqueue_job --unique`, on the configured maintenance DSN after `assert_privileged`; 119 lets no application session enqueue, so off that pool it fails closed with an error) | Removed with no caller (backlog cbf57f24), RESTORED for `enqueue_job --unique` with a transaction-scoped advisory lock per job type taken before the guarded INSERT, so the check-then-insert is atomic among its callers; the pool assertion below still pins the drain's queue to the maintenance DSN |
 /// | `edge.rs::create_symmetric_if_absent` | `edges` | app | **CORRECTED — see below.** Constraint-backed from migration 090 |
 /// | `edge.rs::create_symmetric_if_absent_returning` | `edges` | app | ditto; `alternative_of` additionally carries `edges_alternative_of_symmetric_uniq`, whose predicate 091 narrowed to rows in force |
 /// | `graph_view.rs` (**3** sites, in 2 functions) | `edges` | app | already-decomposed claims reappear as undecomposed |

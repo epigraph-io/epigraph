@@ -4522,9 +4522,10 @@ impl PrivatizationRepository {
     ///
     /// # Plain enqueue, never deduplicated by `job_type`
     ///
-    /// A dedup that guards on `job_type` plus `state = 'pending'` (the queue
-    /// once had one, `enqueue_unique_pending`, removed with no caller)
-    /// discriminates nothing about the payload, so a second plan's apply would
+    /// A dedup that guards on `job_type` plus `state = 'pending'`
+    /// (`PostgresJobQueue::enqueue_unique_pending`, whose one caller is the
+    /// operator CLI `enqueue_job --unique`, which refuses the privatization
+    /// kinds) discriminates nothing about the payload, so a second plan's apply would
     /// be silently dropped while the first is queued. A privatization that
     /// reports 202 and never runs is the failure this function's shape refuses.
     ///

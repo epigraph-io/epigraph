@@ -25,6 +25,8 @@ pub mod decompose;
 pub mod edge_rewire;
 #[cfg(feature = "db")]
 pub mod embed_backfill;
+#[cfg(feature = "db")]
+pub mod enqueue_job;
 pub mod enrichment;
 #[cfg(feature = "db")]
 pub mod evidence_type_backfill;

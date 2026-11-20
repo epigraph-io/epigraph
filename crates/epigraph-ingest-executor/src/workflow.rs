@@ -975,7 +975,9 @@ async fn execute_plan(
             id
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create_conn(&mut *conn, &author_agent)
+            // The name-derived key's private half is computable from the name:
+            // the node is an identifier, never a signer (backlog bfc2eff8).
+            let created = AgentRepository::create_seed_derived_conn(&mut *conn, &author_agent)
                 .await
                 .map_err(|e| IngestExecutorError::AgentCreation(format!("author create: {e}")))?;
             created.id.into()

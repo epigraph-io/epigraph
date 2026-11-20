@@ -380,9 +380,10 @@ async fn find_or_create_org_agent(
 ) -> Result<(Uuid, bool), ApiError> {
     let canonical = format!("org:{}", normalize_author_name(org_name));
 
-    // Derive a deterministic keypair for the org
-    let signer = epigraph_crypto::did_key::keypair_from_name(&canonical);
-    let public_key = signer.public_key();
+    // The org's deterministic key. Only its PUBLIC half is used: the private
+    // half is computable from the org name, so the node is an identifier and
+    // is stored as `seed-derived`, never a signer (backlog bfc2eff8).
+    let public_key = epigraph_crypto::did_key::keypair_from_name(&canonical).public_key();
 
     if let Some(existing) = AgentRepository::get_by_public_key(&mut *conn, &public_key)
         .await
@@ -393,7 +394,7 @@ async fn find_or_create_org_agent(
 
     let mut agent = Agent::new(public_key, Some(canonical));
     agent.labels = vec!["organization".to_string()];
-    let created = AgentRepository::create_conn(conn, &agent)
+    let created = AgentRepository::create_seed_derived_conn(conn, &agent)
         .await
         .map_err(db_error)?;
     Ok((created.id.into(), true))

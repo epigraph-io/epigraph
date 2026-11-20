@@ -643,7 +643,9 @@ pub(crate) async fn resolve_document_authors(
             (id, true)
         } else {
             let author_agent = epigraph_core::Agent::new(pub_key_bytes, Some(author.name.clone()));
-            let created = AgentRepository::create_conn(conn, &author_agent)
+            // The name-derived key's private half is computable from the name:
+            // the node is an identifier, never a signer (backlog bfc2eff8).
+            let created = AgentRepository::create_seed_derived_conn(conn, &author_agent)
                 .await
                 .map_err(internal_error)?;
             (created.id.into(), false)

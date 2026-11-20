@@ -3209,6 +3209,79 @@ restart.
   `application/octet-stream` Document. Undo only after rolling every 229
   binary back. **Applied to throwaway databases only, NOT to any deployed
   database.**
+- **230**: public `agents_key_kind_seed_derived` (backlog bfc2eff8). Re-creates
+  061's `agents_key_kind_check` with `ed25519`, `derived` and a third value,
+  `seed-derived`: an agent whose `public_key` is the Ed25519 key of
+  `BLAKE3(<public seed>)` (a `did_key_for_author` name or ORCID, an `org:`
+  affiliation name, the legacy `workflow-ingest-system` constant, an unkeyed
+  LLM identity), whose private half anyone can compute. Such a key names the
+  agent and is not a signature verifier: `AgentRepository::public_key_if_signer`
+  filters `key_kind = 'ed25519'`, so it already excludes the new value. Not
+  `derived`: 077's `agents_provision` refuses that to the application role,
+  which creates author nodes, and 161 / 180 / 195 read `derived` as an LLM or
+  OAuth identity. One `ALTER TABLE` (drop and add), under `lock_timeout = 3s`;
+  the re-validation scans `agents` under the ALTER's lock. The column comment
+  names all three. Rows are marked AT INSERT
+  (`AgentRepository::create_seed_derived_conn`); existing rows are NOT
+  backfilled (PostgreSQL has no BLAKE3, and 118 bars the application role from
+  updating `key_kind`), so marking them is an operator task on the maintenance
+  role. One function changes: 161's re-runnable
+  `epigraph_backfill_legacy_agent_keys()` (SECURITY DEFINER, maintenance-owned)
+  now skips `key_kind = 'seed-derived'`, so a cut-over or `tenancy_backfill`
+  run after 230 never gives a publicly computable key an attested
+  `identity-legacy` row; otherwise 161's body verbatim, and CREATE OR REPLACE
+  keeps its owner, grants and search_path. No table, column, trigger, policy,
+  index or grant. Pinned by `epigraph-db/tests/agents_key_kind_seed_derived.rs`
+  (the CHECK admits the kind and still refuses a fourth, the verifier refuses
+  it, the repository insert on the application role, the backfill skips it
+  while still keying an ed25519 agent, the undo),
+  `epigraph-db/tests/schema_contract.rs`, and the write paths' own tests
+  (`epigraph-mcp/tests/seed_derived_author_key_kind.rs`,
+  `epigraph-ingest-executor/tests/seed_derived_agents.rs`). Undo:
+  `docs/runbooks/230-undo.sql` (tested: run twice, it returns the constraint
+  and the column comment to 061's and the backfill to 161's definition; it
+  refuses, changing nothing, while any `seed-derived` row exists). Checked before claiming: no migration on main or
+  any origin branch carries a `230`. **Deploy order:** migrate before rolling
+  out a 230 binary (its author, org, system-agent and `epigraph-operator link
+  --agent-model` inserts are refused 23514 on an unmigrated database); a
+  pre-230 binary reads a `seed-derived` row like any other. Undo only after
+  rolling every 230 binary back. **Applied to throwaway databases only, NOT
+  to any deployed database.**
+- **232**: public `claim_encryption_owner_scope` (backlog candidate
+  B90-claim-encryption-write-scope, to be filed). 077's
+  `claim_encryption_tenancy` WITH CHECK named only the sealing `group_id`
+  (`= ANY (epigraph_writable_groups())`) and never the claim, so an
+  application session writing group A could seal, under A, a claim group B
+  owns: one it cannot read (the PRV01 trigger reads no row and admits), one
+  it reads but cannot write, or, writing both, one sealed under the wrong
+  group's key; and it could UPDATE an own seal row's `claim_id` or
+  `group_id` onto such a pair. Keyed by `claim_id`, such a row squats on the
+  claim: the owner's redeliverable seal (`ON CONFLICT DO NOTHING`) then
+  writes nothing. Adds two RESTRICTIVE policies `TO PUBLIC` with 077's two
+  bypass disjuncts (115 section 8's shape):
+  `claim_encryption_owner_scope_insert` (FOR INSERT, WITH CHECK) and
+  `claim_encryption_owner_scope_update` (FOR UPDATE, USING and WITH CHECK),
+  each requiring the claim to exist with `owner_group_id = group_id`, read
+  under the caller's own row security (no definer helper, so no owner
+  oracle). With 077's permissive check that is: the claim's owner group is
+  writable to the session AND the seal is under that group. `POST /claims`
+  (`fully_private`) already stamps the owner from the sealing group, and the
+  privatization seal runs on a maintenance connection (bypassed), so no
+  shipped writer changes. No function body re-stated (no md5 guard); no
+  table, column, trigger, index or grant. `claim_version_encryption`,
+  `evidence_encryption` and `edge_encryption` keep the `group_id`-only check
+  (follow-ups). Pinned by `epigraph-db/tests/claim_encryption_write_scope.rs`
+  (as `epigraph_app`: every cross-group INSERT and UPDATE is admitted at 229
+  and refused 42501 at 232, the own-group seal and ciphertext rewrite are
+  admitted at both; the undo). Undo: `docs/runbooks/232-undo.sql` (tested:
+  run twice, it returns the table's policies to below 232). Slot 232 was
+  assigned by the 2026-11-14 backlog wave; checked before claiming: no
+  origin branch carries a `232`. **Deploy order:** none; no binary depends
+  on it. Before migrating, count existing rows in the refused state (they
+  are not repaired, and an UPDATE of one is refused after 232):
+  `SELECT count(*) FROM claim_encryption ce JOIN claims c ON c.id = ce.claim_id
+  WHERE ce.group_id IS DISTINCT FROM c.owner_group_id`. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

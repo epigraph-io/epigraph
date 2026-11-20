@@ -329,6 +329,12 @@ pub struct AppState {
     /// boot.
     #[cfg(feature = "db")]
     pub run_token_models: crate::oauth::run_token::RunTokenModels,
+    /// The federation extensions the RFC 8693 token-exchange grant may mint
+    /// for (`crate::oauth::token_exchange`). EMPTY in every constructor, which
+    /// refuses every exchange; `bin/server.rs` sets it from
+    /// `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` at boot.
+    #[cfg(feature = "db")]
+    pub token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences,
     /// Whether `POST /api/v1/bp/propagate` may WRITE its results
     /// (`apply_updates: true`). OFF in every constructor; `bin/server.rs` sets
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
@@ -1315,6 +1321,9 @@ impl AppState {
             run_tokens: epigraph_db::RunTokens::Off,
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
+            #[cfg(feature = "db")]
+            token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
+            ),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
@@ -1393,6 +1402,17 @@ impl AppState {
     #[must_use]
     pub fn with_admin_cascade(mut self, enabled: bool) -> Self {
         self.admin_cascade = enabled;
+        self
+    }
+
+    /// Set the token-exchange audiences; see [`Self::token_exchange_audiences`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_token_exchange_audiences(
+        mut self,
+        audiences: crate::oauth::token_exchange::TokenExchangeAudiences,
+    ) -> Self {
+        self.token_exchange_audiences = audiences;
         self
     }
 
@@ -1892,6 +1912,9 @@ impl AppState {
             run_tokens: epigraph_db::RunTokens::Off,
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
+            #[cfg(feature = "db")]
+            token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
+            ),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
@@ -1970,6 +1993,9 @@ impl AppState {
             run_tokens: epigraph_db::RunTokens::Off,
             #[cfg(feature = "db")]
             run_token_models: crate::oauth::run_token::RunTokenModels::default(),
+            #[cfg(feature = "db")]
+            token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
+            ),
             bp_apply: BpApply::Off,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,

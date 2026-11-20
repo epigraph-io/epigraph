@@ -11,9 +11,14 @@
 //!   tick and re-dials it when that fails. Persisting it avoids a fresh TCP +
 //!   `initialize` handshake on every list.
 //! - **Invocation** ([`invoke_once`]): a fresh, ephemeral session per federated
-//!   `tools/call`, authenticated with the *caller's* raw bearer so the
-//!   downstream sees the real principal (not the gateway). The session is
-//!   dropped immediately after the call; rmcp's transport worker issues
+//!   `tools/call`, authenticated with a token EXCHANGED for the caller's
+//!   ([`TokenExchange`], RFC 8693 at the kernel's `/oauth/token`): the same
+//!   principal, `aud` = the extension, at most five minutes, scopes no wider
+//!   than the caller's. The downstream sees the real principal (not the
+//!   gateway) but never holds a token the kernel would admit, so it cannot
+//!   replay the caller at the kernel (backlog c9b82fae: the caller's raw
+//!   bearer used to be forwarded verbatim). The session is dropped
+//!   immediately after the call; rmcp's transport worker issues
 //!   `delete_session` on drop, so downstream sessions do not leak.
 //!
 //! ## Timeouts
@@ -74,6 +79,131 @@ pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// (`a_downstream_reply_over_16_mib_fails_the_call_and_one_under_is_proxied`).
 pub const MAX_RESPONSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// How long the gateway waits for the kernel's token endpoint to answer an
+/// exchange. Loopback in every supported deployment; the bound only keeps a
+/// wedged endpoint from holding a caller's request.
+pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The gateway's client of the kernel's RFC 8693 token-exchange grant
+/// (`epigraph-api` `oauth::token_exchange`). One per gateway process, set on
+/// the registry with
+/// [`FederationRegistry::with_token_exchange`](super::FederationRegistry::with_token_exchange).
+/// A registry without one REFUSES every federated call: there is no fallback
+/// to forwarding the caller's own bearer.
+#[derive(Clone, Debug)]
+pub struct TokenExchange {
+    endpoint: String,
+    http: reqwest::Client,
+}
+
+impl TokenExchange {
+    /// A client for the token endpoint at `endpoint` (the kernel's absolute
+    /// `/oauth/token` URL). The caller's bearer is sent there on every
+    /// federated call, so the URL must be `https`, or `http` to a loopback
+    /// host (`127.0.0.0/8`, `[::1]`, `localhost`).
+    ///
+    /// # Errors
+    /// A description of why `endpoint` is refused.
+    pub fn new(endpoint: &str) -> Result<Self, String> {
+        let url = reqwest::Url::parse(endpoint)
+            .map_err(|e| format!("token exchange URL `{endpoint}` does not parse: {e}"))?;
+        let host = url.host_str().unwrap_or_default();
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || bare
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        match url.scheme() {
+            "https" => {}
+            "http" if loopback => {}
+            other => {
+                return Err(format!(
+                    "token exchange URL must be https, or http to a loopback host (it carries \
+                     every caller's bearer); got scheme `{other}` on host `{}`",
+                    url.host_str().unwrap_or_default()
+                ))
+            }
+        }
+        let http = reqwest::Client::builder()
+            .timeout(EXCHANGE_TIMEOUT)
+            .build()
+            .map_err(|e| format!("token exchange HTTP client: {e}"))?;
+        Ok(Self {
+            endpoint: url.to_string(),
+            http,
+        })
+    }
+
+    /// Exchange `caller_token` for a token whose audience is `audience` (the
+    /// extension's configured name). Returns the new access token.
+    ///
+    /// # Errors
+    /// [`FederationError::Exchange`] when the endpoint cannot be reached,
+    /// refuses (carrying its RFC `error` code, never the caller's token), or
+    /// answers with something that is not an access token.
+    pub async fn exchange(
+        &self,
+        caller_token: &str,
+        audience: &str,
+    ) -> Result<String, FederationError> {
+        let form = [
+            ("grant_type", epigraph_auth::TOKEN_EXCHANGE_GRANT_TYPE),
+            ("subject_token", caller_token),
+            ("subject_token_type", epigraph_auth::ACCESS_TOKEN_TYPE),
+            ("requested_token_type", epigraph_auth::ACCESS_TOKEN_TYPE),
+            ("audience", audience),
+        ];
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| {
+                FederationError::Exchange(format!(
+                    "token endpoint unreachable: {}",
+                    e.without_url()
+                ))
+            })?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.map_err(|e| {
+            FederationError::Exchange(format!(
+                "token endpoint answered {status} with a non-JSON body: {}",
+                e.without_url()
+            ))
+        })?;
+        if !status.is_success() {
+            let error = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            return Err(FederationError::Exchange(format!(
+                "token exchange refused ({status}, {error})"
+            )));
+        }
+        if let Some(issued) = body
+            .get("issued_token_type")
+            .and_then(serde_json::Value::as_str)
+        {
+            if issued != epigraph_auth::ACCESS_TOKEN_TYPE {
+                return Err(FederationError::Exchange(format!(
+                    "token endpoint issued `{issued}`, not an access token"
+                )));
+            }
+        }
+        match body.get("access_token").and_then(serde_json::Value::as_str) {
+            Some(token) if !token.is_empty() && token != caller_token => Ok(token.to_string()),
+            Some(_) => Err(FederationError::Exchange(
+                "token endpoint returned the caller's own token; refusing to forward it"
+                    .to_string(),
+            )),
+            None => Err(FederationError::Exchange(
+                "token endpoint answered without an access_token".to_string(),
+            )),
+        }
+    }
+}
+
 /// A live rmcp client session to one downstream extension. The `()` service
 /// handler is the no-op client handler (`impl ClientHandler for ()`), which is
 /// all we need: the gateway is a pure client of the downstream — it issues
@@ -114,6 +244,13 @@ pub enum FederationError {
     /// as the tool error it is instead of redacting it to an internal error.
     #[error("extension returned an error: {}", .0.message)]
     Downstream(rmcp::ErrorData),
+
+    /// The gateway could not obtain an extension-audience token for the
+    /// caller ([`TokenExchange`]): no exchange is configured, the kernel's
+    /// token endpoint refused or could not be reached. The downstream was
+    /// never dialled. Never carries the caller's token.
+    #[error("token exchange failed: {0}")]
+    Exchange(String),
 
     /// The downstream accepted `tool` and did not answer within `timeout`.
     /// The call was abandoned; it may still have run downstream.
@@ -189,8 +326,9 @@ pub async fn list_all_tools_on(
 }
 
 /// Proxy a single `tools/call` to the extension at `addr` on a **fresh**
-/// ephemeral session authenticated with `caller_token` (the caller's raw
-/// bearer, forwarded verbatim so the downstream sees the real principal).
+/// ephemeral session authenticated with a token `exchange` mints from
+/// `caller_token` for `audience` (the extension's name). The caller's own
+/// bearer goes ONLY to the kernel's token endpoint, never to the downstream.
 ///
 /// The session is dropped when this function returns; rmcp's transport worker
 /// issues `delete_session` on drop, so the downstream session is released and
@@ -200,18 +338,27 @@ pub async fn list_all_tools_on(
 /// elapses cancels the request and releases the downstream session.
 ///
 /// # Errors
-/// [`FederationError::Timeout`] / [`FederationError::Connect`] on handshake
-/// failure; [`FederationError::Downstream`] when the downstream answers with a
+/// [`FederationError::Exchange`] when no extension token can be obtained (the
+/// downstream is not dialled); [`FederationError::Timeout`] /
+/// [`FederationError::Connect`] on handshake failure;
+/// [`FederationError::Downstream`] when the downstream answers with a
 /// JSON-RPC error; [`FederationError::CallTimeout`] when it does not answer in
 /// time; [`FederationError::Request`] for any other failure of the call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each is a distinct input of one proxied call; a struct would only rename them"
+)]
 pub async fn invoke_once(
     addr: &str,
+    exchange: &TokenExchange,
+    audience: &str,
     caller_token: &str,
     name: &str,
     arguments: Option<rmcp::model::JsonObject>,
     call_timeout: Duration,
 ) -> Result<CallToolResult, FederationError> {
-    let client = connect(addr, Some(caller_token)).await?;
+    let forwarded = exchange.exchange(caller_token, audience).await?;
+    let client = connect(addr, Some(&forwarded)).await?;
     let mut params = CallToolRequestParams::new(name.to_string());
     params.arguments = arguments;
     let result = match tokio::time::timeout(call_timeout, client.peer().call_tool(params)).await {
@@ -257,5 +404,38 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
             cause: e.to_string(),
         }),
         Err(_elapsed) => Err(FederationError::Timeout(HANDSHAKE_TIMEOUT, uri)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TokenExchange;
+
+    /// The exchange URL carries every caller's bearer, so cleartext is
+    /// accepted only to a loopback host. Mutation: drop the loopback check
+    /// -> the remote `http` URLs are accepted and this fails.
+    #[test]
+    fn the_exchange_url_is_https_or_loopback_http() {
+        for ok in [
+            "https://kernel.example/oauth/token",
+            "http://127.0.0.1:8080/oauth/token",
+            "http://127.9.9.9/oauth/token",
+            "http://[::1]:8080/oauth/token",
+            "http://LOCALHOST:8080/oauth/token",
+        ] {
+            assert!(TokenExchange::new(ok).is_ok(), "{ok} must be accepted");
+        }
+        for refused in [
+            "http://kernel.example/oauth/token",
+            "http://10.0.0.5:8080/oauth/token",
+            "http://localhost.evil.example/oauth/token",
+            "ftp://127.0.0.1/oauth/token",
+            "not a url",
+        ] {
+            assert!(
+                TokenExchange::new(refused).is_err(),
+                "{refused} must be refused"
+            );
+        }
     }
 }

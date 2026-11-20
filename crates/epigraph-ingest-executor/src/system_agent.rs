@@ -102,7 +102,13 @@ pub async fn get_or_create_system_agent(
     }
 
     let agent = epigraph_core::Agent::new(pub_key_bytes, Some(role.legacy_seed_name().to_string()));
-    match epigraph_db::AgentRepository::create_conn(&mut *conn, &agent).await {
+    // The legacy key is derived from a public constant, so anyone can compute
+    // its private half: stored as `seed-derived`, never a signer (backlog
+    // bfc2eff8). The registered (rotatable) identity above is how a
+    // deployment gets a real key: the operator's rotation
+    // (`UPDATE agents SET public_key = <secret>`) sets `key_kind = 'ed25519'`
+    // in the same statement, or the rotated key is still not a verifier.
+    match epigraph_db::AgentRepository::create_seed_derived_conn(&mut *conn, &agent).await {
         Ok(created) => Ok(created.id.into()),
         Err(epigraph_db::DbError::DuplicateKey { .. }) => {
             epigraph_db::AgentRepository::get_by_public_key(&mut *conn, &pub_key_bytes)

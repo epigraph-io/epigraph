@@ -205,6 +205,7 @@ pub(crate) async fn handle_run_token_grant(
                     expires_in: RUN_TOKEN_MAX_SECS,
                     refresh_token: None,
                     scope: minted.scopes.join(" "),
+                    issued_token_type: None,
                 }),
             ))
         }

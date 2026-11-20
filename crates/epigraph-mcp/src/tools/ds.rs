@@ -225,6 +225,11 @@ pub async fn submit_ds_evidence(
     // (bc06ec6f). The vocabulary warning below still names what the caller sent.
     let stored_evidence_type =
         epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
+    // The STORED key must fit the column (`varchar(50)`), like the locality
+    // tag below. A longer one reached the INSERT and came back as a redacted
+    // internal error with nothing written, so this refusal changes no call
+    // that succeeds today.
+    check_stored_evidence_type_len(stored_evidence_type.as_deref())?;
 
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
@@ -926,6 +931,36 @@ fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
         return Err(invalid_params(format!(
             "locality_tag is {len} characters; at most {max} are stored. Known tags: {}.",
             epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The longest `mass_functions.evidence_type` the column stores, in
+/// characters: it is `varchar(50)` (migration 001). The stored key is the
+/// caller's `evidence_type` canonicalised
+/// (`epigraph_engine::calibration::canonical_evidence_type`: an alias maps to
+/// its canonical key, and a key the calibration does not know is stored
+/// trimmed and lowercased), so it is the caller's own string whenever the key
+/// is unknown. A column width, not a belief parameter, kept beside
+/// [`LOCALITY_TAG_MAX_CHARS`] for the same reason.
+const EVIDENCE_TYPE_MAX_CHARS: usize = 50;
+
+/// Refuse an `evidence_type` whose STORED key cannot fit the column
+/// ([`EVIDENCE_TYPE_MAX_CHARS`], counted in characters as `varchar` does, on
+/// the canonicalised key, since lowercasing can lengthen it), as a parameter
+/// error naming the limit. No stored key (omitted or blank) always passes.
+fn check_stored_evidence_type_len(stored: Option<&str>) -> Result<(), McpError> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let max = EVIDENCE_TYPE_MAX_CHARS;
+    let len = stored.chars().count();
+    if len > max {
+        return Err(invalid_params(format!(
+            "evidence_type is {len} characters as stored (trimmed and lowercased); at most {max} \
+             are stored. Known keys: {}.",
+            known_evidence_type_keys().join(", ")
         )));
     }
     Ok(())
