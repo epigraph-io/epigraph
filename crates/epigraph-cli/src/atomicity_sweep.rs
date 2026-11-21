@@ -119,9 +119,14 @@ pub async fn sweep(
             break;
         }
         let want = PAGE.min((max_scan - report.atoms_scanned) as i64);
-        let page =
-            AtomicityScreenRepository::page(pool, viewer, ScreenPopulation::Atoms, after, want)
-                .await?;
+        let page = AtomicityScreenRepository::page(
+            &mut *pool.acquire().await?,
+            viewer,
+            ScreenPopulation::Atoms,
+            after,
+            want,
+        )
+        .await?;
         let n = page.len();
         let mut add = Vec::new();
         for row in &page {
