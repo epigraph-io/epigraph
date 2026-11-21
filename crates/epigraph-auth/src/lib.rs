@@ -6,10 +6,24 @@
 //!
 //! ## Audience
 //!
-//! Tokens use audience `"epigraph-api"` regardless of which server validates
-//! them. MCP intentionally accepts API-minted tokens — there is no separate
-//! `epigraph-mcp` audience. Adding one would double minting work for clients
-//! that talk to both servers, and the threat model does not distinguish them.
+//! Kernel tokens use audience [`KERNEL_AUDIENCE`] (`"epigraph-api"`)
+//! regardless of which kernel server validates them. MCP intentionally
+//! accepts API-minted tokens — there is no separate `epigraph-mcp` audience.
+//! Adding one would double minting work for clients that talk to both
+//! servers, and the threat model does not distinguish them.
+//!
+//! Every token the kernel has ever minted carries `aud` (the field is a
+//! required `String` on [`EpiGraphClaims`] and has been since the first
+//! public release), so [`JwtConfig::validate_token`] has no "missing `aud`"
+//! case to tolerate: a token without one fails to decode.
+//!
+//! The one other audience is a mounted federation EXTENSION's, minted only by
+//! the RFC 8693 token-exchange grant ([`JwtConfig::exchange_token`]): a
+//! short-lived token the gateway forwards downstream instead of the caller's
+//! kernel bearer. [`JwtConfig::validate_token`] refuses it (its `aud` is not
+//! the kernel's), so a forwarded token replayed at the kernel acts as no one.
+//! An extension validates its own with
+//! [`JwtConfig::validate_token_for_audience`].
 
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -25,6 +39,78 @@ pub const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
 
 /// Minimum acceptable HMAC secret length, in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
+
+/// The audience of every token the kernel admits on its own routes (the HTTP
+/// API and the MCP server alike). See the crate doc.
+pub const KERNEL_AUDIENCE: &str = "epigraph-api";
+
+/// The issuer of every kernel-minted token.
+pub const KERNEL_ISSUER: &str = "epigraph";
+
+/// RFC 8693 section 2.1 `grant_type` of the token-exchange grant.
+pub const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+
+/// RFC 8693 section 3 token type identifier for an OAuth access token: the
+/// only `subject_token_type` the exchange accepts, the only
+/// `requested_token_type` it issues, and its `issued_token_type`.
+pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// The longest an exchanged (extension-audience) token lives: 5 minutes, and
+/// never past its subject token's own `exp`. The gateway exchanges once per
+/// federated call, so the bound is revocation latency, not a usability limit.
+pub const EXCHANGED_TOKEN_MAX_SECS: i64 = 300;
+
+/// Why [`JwtConfig::exchange_token`] refused. Each maps to one RFC 6749
+/// section 5.2 / RFC 8693 section 2.2.2 `error` code ([`Self::oauth_error`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExchangeRefusal {
+    /// The requested `audience` is the kernel's own, or not a configured
+    /// extension (`invalid_target`).
+    InvalidTarget(String),
+    /// The subject token does not validate as a kernel token, or is one this
+    /// grant never exchanges (delegated or elevated) (`invalid_grant`).
+    InvalidGrant(String),
+    /// A requested scope the subject token does not carry (`invalid_scope`).
+    InvalidScope(String),
+    /// A malformed request (`invalid_request`).
+    InvalidRequest(String),
+}
+
+impl ExchangeRefusal {
+    /// The RFC `error` code.
+    #[must_use]
+    pub fn oauth_error(&self) -> &'static str {
+        match self {
+            Self::InvalidTarget(_) => "invalid_target",
+            Self::InvalidGrant(_) => "invalid_grant",
+            Self::InvalidScope(_) => "invalid_scope",
+            Self::InvalidRequest(_) => "invalid_request",
+        }
+    }
+
+    /// The human-readable `error_description`.
+    #[must_use]
+    pub fn description(&self) -> &str {
+        match self {
+            Self::InvalidTarget(d)
+            | Self::InvalidGrant(d)
+            | Self::InvalidScope(d)
+            | Self::InvalidRequest(d) => d,
+        }
+    }
+}
+
+/// A token minted by [`JwtConfig::exchange_token`].
+#[derive(Debug, Clone)]
+pub struct ExchangedToken {
+    /// The signed extension-audience token.
+    pub token: String,
+    /// Its claims (`aud` = the extension).
+    pub claims: EpiGraphClaims,
+    /// The subject token's validated claims: the caller checks liveness on
+    /// them (revocation of its `jti`, its client's status) before answering.
+    pub subject: EpiGraphClaims,
+}
 
 /// Fail-closed production secret gate. Returns `Err(reason)` if the secret is
 /// empty, shorter than [`MIN_SECRET_LEN`] bytes, or equal to [`DEV_JWT_SECRET`].
@@ -252,8 +338,8 @@ impl JwtConfig {
         let jti = Uuid::new_v4();
         let claims = EpiGraphClaims {
             sub: client_id,
-            iss: "epigraph".to_string(),
-            aud: "epigraph-api".to_string(),
+            iss: KERNEL_ISSUER.to_string(),
+            aud: KERNEL_AUDIENCE.to_string(),
             exp: (now + ttl).timestamp(),
             iat: now.timestamp(),
             nbf: now.timestamp(),
@@ -270,16 +356,130 @@ impl JwtConfig {
         Ok((token, jti))
     }
 
+    /// Admit a token on a KERNEL route: signature, issuer, `exp` (no leeway)
+    /// and `aud` = [`KERNEL_AUDIENCE`]. An extension-audience token minted by
+    /// [`Self::exchange_token`] is refused here (`InvalidAudience`).
     pub fn validate_token(
         &self,
         token: &str,
     ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
+        self.validate_token_for_audience(token, KERNEL_AUDIENCE)
+    }
+
+    /// [`Self::validate_token`] for another resource server: `aud` must equal
+    /// `audience` exactly (an array audience fails to decode). For a mounted
+    /// federation extension validating the exchanged token the gateway
+    /// forwards; the kernel's own routes use [`Self::validate_token`].
+    pub fn validate_token_for_audience(
+        &self,
+        token: &str,
+        audience: &str,
+    ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&["epigraph"]);
-        validation.set_audience(&["epigraph-api"]);
+        validation.set_issuer(&[KERNEL_ISSUER]);
+        validation.set_audience(&[audience]);
         validation.leeway = 0;
         let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
         Ok(data.claims)
+    }
+
+    /// RFC 8693 token exchange, the pure half: validate `subject_token` as a
+    /// KERNEL token and mint a token for `audience` naming the same principal
+    /// (`sub`, `agent_id`, `owner_id`, `client_type`), with scopes no wider
+    /// than the subject's, living at most [`EXCHANGED_TOKEN_MAX_SECS`] and
+    /// never past the subject's `exp`.
+    ///
+    /// Refused:
+    /// * an `audience` that is [`KERNEL_AUDIENCE`] or not in
+    ///   `allowed_audiences` (the configured extensions);
+    /// * a subject token that does not validate on a kernel route, including
+    ///   one that is itself an exchanged token (so an extension cannot turn
+    ///   the token it was handed into one for another extension);
+    /// * a DELEGATED (`dlg`) or ELEVATED (`elv`) subject: neither reaches a
+    ///   federated tool, and the minted token carries neither claim, nor a
+    ///   refresh family (`fam`);
+    /// * a `requested_scopes` entry the subject does not carry. `None` or an
+    ///   empty list means the subject's own scopes.
+    ///
+    /// The caller (the token endpoint) still checks liveness on
+    /// [`ExchangedToken::subject`] (revoked `jti`, client status) before it
+    /// answers; this function reads no state.
+    ///
+    /// # Errors
+    /// [`ExchangeRefusal`] as listed; `InvalidRequest` if signing fails.
+    pub fn exchange_token(
+        &self,
+        subject_token: &str,
+        audience: &str,
+        allowed_audiences: &[String],
+        requested_scopes: Option<&[String]>,
+    ) -> Result<ExchangedToken, ExchangeRefusal> {
+        let audience = audience.trim();
+        if audience.is_empty() {
+            return Err(ExchangeRefusal::InvalidRequest(
+                "audience is required".to_string(),
+            ));
+        }
+        if audience == KERNEL_AUDIENCE || !allowed_audiences.iter().any(|a| a == audience) {
+            return Err(ExchangeRefusal::InvalidTarget(format!(
+                "audience `{audience}` is not a configured federation extension"
+            )));
+        }
+        let subject = self.validate_token(subject_token).map_err(|_| {
+            ExchangeRefusal::InvalidGrant(
+                "subject_token is not a valid, unexpired kernel access token".to_string(),
+            )
+        })?;
+        if subject.dlg.is_some() || subject.elv.is_some() {
+            return Err(ExchangeRefusal::InvalidGrant(
+                "a delegated or elevated token is not exchangeable".to_string(),
+            ));
+        }
+        let scopes = match requested_scopes.filter(|r| !r.is_empty()) {
+            None => subject.scopes.clone(),
+            Some(requested) => {
+                let mut out: Vec<String> = Vec::with_capacity(requested.len());
+                for scope in requested {
+                    if !subject.scopes.iter().any(|s| s == scope) {
+                        return Err(ExchangeRefusal::InvalidScope(format!(
+                            "scope `{scope}` is not carried by the subject token"
+                        )));
+                    }
+                    if !out.contains(scope) {
+                        out.push(scope.clone());
+                    }
+                }
+                out
+            }
+        };
+        // Belt and braces: the elevation scope never leaves an elevated token,
+        // and an elevated subject was refused above.
+        let scopes = without_elevated_only_scope(scopes);
+        let now = Utc::now().timestamp();
+        let exp = (now + EXCHANGED_TOKEN_MAX_SECS).min(subject.exp);
+        let claims = EpiGraphClaims {
+            sub: subject.sub,
+            iss: KERNEL_ISSUER.to_string(),
+            aud: audience.to_string(),
+            exp,
+            iat: now,
+            nbf: now,
+            jti: Uuid::new_v4(),
+            scopes,
+            client_type: subject.client_type.clone(),
+            owner_id: subject.owner_id,
+            agent_id: subject.agent_id,
+            fam: None,
+            elv: None,
+            dlg: None,
+        };
+        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
+            .map_err(|e| ExchangeRefusal::InvalidRequest(format!("signing failed: {e}")))?;
+        Ok(ExchangedToken {
+            token,
+            claims,
+            subject,
+        })
     }
 
     /// Verify a token for RFC 7009 revocation ONLY: signature, issuer and
@@ -296,8 +496,8 @@ impl JwtConfig {
         token: &str,
     ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
         let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&["epigraph"]);
-        validation.set_audience(&["epigraph-api"]);
+        validation.set_issuer(&[KERNEL_ISSUER]);
+        validation.set_audience(&[KERNEL_AUDIENCE]);
         // `exp` must still be present (`required_spec_claims`); only its
         // comparison with this host's clock is skipped.
         validation.validate_exp = false;
@@ -895,5 +1095,242 @@ mod tests {
         // 40 random-looking bytes, not the dev literal.
         let secret = b"R7p2-Xq9_kL4vN8wErTy6uIoP1aSdFgHjKlZ0cVb";
         assert!(assert_production_secret(secret).is_ok());
+    }
+
+    // ── RFC 8693 token exchange (backlog c9b82fae) ─────────────────────────
+
+    const EXT: &str = "episcience";
+
+    fn allowed() -> Vec<String> {
+        vec![EXT.to_string(), "other-ext".to_string()]
+    }
+
+    fn subject(
+        cfg: &JwtConfig,
+        scopes: &[&str],
+        ttl: Duration,
+        binding: AccessTokenBinding,
+    ) -> String {
+        cfg.issue_access_token(
+            Uuid::new_v4(),
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "human",
+            Some(Uuid::new_v4()),
+            Some(Uuid::new_v4()),
+            ttl,
+            binding,
+        )
+        .unwrap()
+        .0
+    }
+
+    /// The exchanged token names the SAME principal as its subject, carries
+    /// the extension's audience and no `fam`/`elv`/`dlg`, lives at most five
+    /// minutes, and is REFUSED by the kernel's own validator (and by another
+    /// extension's), while the named extension admits it. Mutations caught:
+    /// minting with the kernel audience (the kernel would admit it), copying
+    /// the subject's `fam`, dropping the 5-minute cap.
+    #[test]
+    fn an_exchanged_token_is_for_the_extension_only_and_names_the_same_principal() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let fam = Uuid::new_v4();
+        let raw = subject(
+            &cfg,
+            &["claims:read", "episcience:tools"],
+            Duration::hours(1),
+            AccessTokenBinding::family(fam),
+        );
+        let subj = cfg.validate_token(&raw).unwrap();
+        let before = Utc::now().timestamp();
+        let ex = cfg.exchange_token(&raw, EXT, &allowed(), None).unwrap();
+
+        assert_ne!(ex.token, raw, "the exchange must mint a NEW token");
+        let kernel = cfg.validate_token(&ex.token).unwrap_err();
+        assert_eq!(
+            *kernel.kind(),
+            jsonwebtoken::errors::ErrorKind::InvalidAudience,
+            "a kernel route must refuse an extension-audience token"
+        );
+        assert!(
+            cfg.validate_token_for_audience(&ex.token, "other-ext")
+                .is_err(),
+            "another extension must refuse it too"
+        );
+        let got = cfg.validate_token_for_audience(&ex.token, EXT).unwrap();
+        assert_eq!(got, ex.claims);
+        assert_eq!(got.aud, EXT);
+        assert_eq!(got.sub, subj.sub);
+        assert_eq!(got.agent_id, subj.agent_id);
+        assert_eq!(got.owner_id, subj.owner_id);
+        assert_eq!(got.client_type, subj.client_type);
+        assert_eq!(got.scopes, subj.scopes);
+        assert_ne!(got.jti, subj.jti);
+        assert_eq!((got.fam, got.elv, got.dlg), (None, None, None));
+        assert!(got.exp <= before + EXCHANGED_TOKEN_MAX_SECS + 1);
+        assert!(got.exp > before, "it must be usable now");
+        assert_eq!(ex.subject, subj);
+    }
+
+    /// The exchanged token never outlives its subject: a subject with one
+    /// minute left yields a token expiring with it, not five minutes later.
+    #[test]
+    fn an_exchanged_token_never_outlives_its_subject() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let raw = subject(
+            &cfg,
+            &["claims:read"],
+            Duration::seconds(60),
+            AccessTokenBinding::NONE,
+        );
+        let subj_exp = cfg.validate_token(&raw).unwrap().exp;
+        let ex = cfg.exchange_token(&raw, EXT, &allowed(), None).unwrap();
+        assert_eq!(ex.claims.exp, subj_exp);
+    }
+
+    /// Scopes: a request may NARROW (kept in request order, deduplicated) and
+    /// may never WIDEN: one scope the subject lacks refuses the whole
+    /// exchange with `invalid_scope`, even beside scopes it holds.
+    #[test]
+    fn an_exchange_narrows_scopes_and_refuses_a_wider_one() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let raw = subject(
+            &cfg,
+            &["claims:read", "claims:write", "episcience:tools"],
+            Duration::hours(1),
+            AccessTokenBinding::NONE,
+        );
+        let narrow = vec![
+            "episcience:tools".to_string(),
+            "claims:read".to_string(),
+            "episcience:tools".to_string(),
+        ];
+        let ex = cfg
+            .exchange_token(&raw, EXT, &allowed(), Some(&narrow))
+            .unwrap();
+        assert_eq!(ex.claims.scopes, vec!["episcience:tools", "claims:read"]);
+
+        for wider in [
+            vec!["claims:admin".to_string()],
+            vec!["claims:read".to_string(), "groups:manage".to_string()],
+            vec![ELEVATED_ONLY_SCOPE.to_string()],
+        ] {
+            let err = cfg
+                .exchange_token(&raw, EXT, &allowed(), Some(&wider))
+                .unwrap_err();
+            assert_eq!(err.oauth_error(), "invalid_scope", "{wider:?}: {err:?}");
+        }
+    }
+
+    /// Audience: only a CONFIGURED extension. The kernel's own audience, an
+    /// unknown name, a blank one, and any name under an empty allowlist are
+    /// refused, the first three before the subject is even looked at.
+    #[test]
+    fn an_exchange_refuses_an_audience_that_is_not_a_configured_extension() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let raw = subject(
+            &cfg,
+            &["claims:read"],
+            Duration::hours(1),
+            AccessTokenBinding::NONE,
+        );
+        for aud in [KERNEL_AUDIENCE, "evil-ext", "EPISCIENCE"] {
+            let err = cfg.exchange_token(&raw, aud, &allowed(), None).unwrap_err();
+            assert_eq!(err.oauth_error(), "invalid_target", "{aud}");
+        }
+        let mut with_kernel = allowed();
+        with_kernel.push(KERNEL_AUDIENCE.to_string());
+        assert_eq!(
+            cfg.exchange_token(&raw, KERNEL_AUDIENCE, &with_kernel, None)
+                .unwrap_err()
+                .oauth_error(),
+            "invalid_target",
+            "the kernel audience is never a target, even if misconfigured into the list"
+        );
+        assert_eq!(
+            cfg.exchange_token(&raw, EXT, &[], None)
+                .unwrap_err()
+                .oauth_error(),
+            "invalid_target"
+        );
+        assert_eq!(
+            cfg.exchange_token(&raw, "  ", &allowed(), None)
+                .unwrap_err()
+                .oauth_error(),
+            "invalid_request"
+        );
+    }
+
+    /// Subject: only a live KERNEL token that is neither delegated nor
+    /// elevated. An exchanged token (so an extension cannot re-exchange what
+    /// it was handed into another extension's), an expired one, another
+    /// secret's, a delegated one and an elevated one are all `invalid_grant`.
+    #[test]
+    fn an_exchange_refuses_a_subject_that_is_not_a_plain_live_kernel_token() {
+        let cfg = JwtConfig::from_secret(b"test-secret-at-least-32-bytes!!");
+        let forger = JwtConfig::from_secret(b"another-secret-at-least-32-bytes");
+        let good = subject(
+            &cfg,
+            &["claims:read"],
+            Duration::hours(1),
+            AccessTokenBinding::NONE,
+        );
+        let exchanged = cfg
+            .exchange_token(&good, EXT, &allowed(), None)
+            .unwrap()
+            .token;
+        let delegated = subject(
+            &cfg,
+            &["claims:read"],
+            Duration::hours(1),
+            AccessTokenBinding {
+                delegated_by: Some(Uuid::new_v4()),
+                ..AccessTokenBinding::NONE
+            },
+        );
+        let elevated = subject(
+            &cfg,
+            &["claims:read"],
+            Duration::hours(1),
+            AccessTokenBinding {
+                family_id: Some(Uuid::new_v4()),
+                elevation_id: Some(Uuid::new_v4()),
+                delegated_by: None,
+            },
+        );
+        let cases = [
+            ("exchanged", exchanged),
+            (
+                "expired",
+                subject(
+                    &cfg,
+                    &["claims:read"],
+                    Duration::seconds(-5),
+                    AccessTokenBinding::NONE,
+                ),
+            ),
+            (
+                "forged",
+                subject(
+                    &forger,
+                    &["claims:read"],
+                    Duration::hours(1),
+                    AccessTokenBinding::NONE,
+                ),
+            ),
+            ("delegated", delegated),
+            ("elevated", elevated),
+            ("garbage", "not-a-jwt".to_string()),
+        ];
+        for (what, token) in cases {
+            let err = cfg
+                .exchange_token(&token, "other-ext", &allowed(), None)
+                .unwrap_err();
+            assert_eq!(err.oauth_error(), "invalid_grant", "{what}: {err:?}");
+        }
+        // CONTROL: the plain token is exchangeable for the same audience, so
+        // each refusal above is the subject's, not the audience's.
+        assert!(cfg
+            .exchange_token(&good, "other-ext", &allowed(), None)
+            .is_ok());
     }
 }

@@ -24,10 +24,18 @@
 //! - **`insecure_remote=1`** — OPTIONAL, and the only accepted value is `1`.
 //!   Without it the host MUST be loopback: an IPv4 address in `127.0.0.0/8`,
 //!   `[::1]`, or `localhost` (any case). The gateway dials `http://{addr}/mcp`
-//!   in cleartext and forwards the CALLER's own bearer token on every call, so
-//!   a non-loopback host would carry every caller's token across the network
-//!   unencrypted (backlog bcff7c2b). The field is the operator saying they
-//!   accept that, and the gateway logs a warning at boot when it is set.
+//!   in cleartext and sends a bearer for the caller on every call (an
+//!   exchanged, extension-audience token since backlog c9b82fae, still good
+//!   at the extension for up to five minutes), so a non-loopback host would
+//!   carry every caller's credential across the network unencrypted (backlog
+//!   bcff7c2b). The field is the operator saying they accept that, and the
+//!   gateway logs a warning at boot when it is set.
+//!
+//! The extension's `name` is also the AUDIENCE of the token it receives: the
+//! gateway exchanges each caller's bearer at the kernel's token endpoint
+//! (RFC 8693, `audience=<name>`), and the kernel mints only for a name listed
+//! in its `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES`. The extension must validate
+//! `aud = <name>` (`epigraph_auth::JwtConfig::validate_token_for_audience`).
 //!
 //! Extension names are unique: a second entry with a name already used is an
 //! error, not a silent second mount under the same name.
@@ -247,7 +255,7 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
     }
 
     // Loopback is ENFORCED, not just advertised (backlog bcff7c2b): the dial
-    // is cleartext http and carries the caller's own bearer.
+    // is cleartext http and carries a bearer for the caller (its exchanged extension token).
     if !is_loopback_host(host) {
         if !insecure_remote {
             return Err(err(&format!(
@@ -431,8 +439,8 @@ mod tests {
 
     // ── Loopback is enforced, not just advertised (backlog bcff7c2b) ──
     //
-    // The gateway dials `http://{addr}/mcp` in cleartext and forwards the
-    // caller's own bearer, so an `addr` off this host sends every caller's
+    // The gateway dials `http://{addr}/mcp` in cleartext and sends a bearer for the
+    // caller (its exchanged token), so an `addr` off this host sends every caller's
     // token across the network. These pin that the parser refuses one.
 
     #[test]

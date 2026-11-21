@@ -252,6 +252,7 @@ pub async fn provision_external_user(
             expires_in: ttl.num_seconds(),
             refresh_token: Some(refresh_token),
             scope: effective_scopes.join(" "),
+            issued_token_type: None,
         }),
     ))
 }

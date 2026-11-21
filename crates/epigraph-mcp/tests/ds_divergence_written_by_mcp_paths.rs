@@ -16,6 +16,17 @@
 //!
 //! The expected posterior and KL are computed here by hand from the BBA the
 //! call stored, not through the code under test.
+//!
+//! A claim's COLD START records no row (backlog candidate
+//! 913-cold-start-divergence): the update that first moves the claim's Beta
+//! track off the `Beta(1, 1)` prior compares a mature BetP against a posterior
+//! holding one BBA's evidence, and that KL measures the empty track, not a
+//! disagreement. So each arm here makes a first update (no row) and a second
+//! (the row), and
+//! `a_cold_start_on_a_mature_claim_stays_out_of_top_divergent` pins the
+//! top-divergent list. Verified to fail with `record_divergence`'s
+//! cold-start return removed: every cold-start assertion here then finds the
+//! row.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -24,7 +35,7 @@ mod common;
 use common::*;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_db::{DivergenceRepository, MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::types::{GetDivergenceParams, SubmitDsEvidenceParams, UpdateWithEvidenceParams};
 use sqlx::PgPool;
@@ -166,28 +177,45 @@ fn close(a: f64, b: f64) -> bool {
     (a - b).abs() < 1e-9
 }
 
-/// `submit_ds_evidence` on the caller's own claim: `get_divergence` answers,
-/// with the BetP the call returned, the Beta posterior of the BBA it stored,
-/// and their KL; the claim's Beta parameters moved by that BBA. An identical
-/// resubmission does not count the BBA again.
+/// `submit_ds_evidence` on the caller's own claim. The first call moves the
+/// claim's Beta parameters by its BBA but, as a cold start, records no
+/// divergence row. The identical resubmission does not count the BBA again,
+/// and, its track no longer at the prior, records the row `get_divergence`
+/// answers with: the BetP the call returned, the Beta posterior of the BBA,
+/// and their KL.
 #[sqlx::test(migrations = "../../migrations")]
 async fn submit_ds_evidence_writes_a_divergence_row_get_divergence_reads(pool: PgPool) {
     let (server, group, viewer) = app_role_server(&pool).await;
     let (frame, version) = binary_truth(&pool).await;
     let claim = own_claim(&pool, group, "a claim the agent's group owns").await;
 
-    let res =
-        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
-            .await
-            .expect("submit_ds_evidence on an own claim");
-    let betp = first_text(&res)["pignistic_prob"]
-        .as_f64()
-        .expect("pignistic_prob");
+    epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+        .await
+        .expect("submit_ds_evidence on an own claim");
 
     let (a, b) = beta(&pool, claim).await;
     assert!(
         close(a, 1.8) && close(b, 1.2),
         "the stored BBA moves Beta(1,1) to Beta(1.8,1.2), got ({a}, {b})"
+    );
+    assert!(
+        divergence_rows(&pool, claim).await.is_empty(),
+        "the claim's first Beta update is a cold start and records no divergence row"
+    );
+
+    // The identical resubmission stores nothing new, so Beta stays; the
+    // track is no longer at the prior, so this call records the row.
+    let res =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("identical resubmission");
+    let betp = first_text(&res)["pignistic_prob"]
+        .as_f64()
+        .expect("pignistic_prob");
+    let (a2, b2) = beta(&pool, claim).await;
+    assert!(
+        close(a2, 1.8) && close(b2, 1.2),
+        "an identical resubmission must not count its BBA twice, got ({a2}, {b2})"
     );
 
     let got = epigraph_mcp::tools::ds::get_divergence(
@@ -221,52 +249,80 @@ async fn submit_ds_evidence_writes_a_divergence_row_get_divergence_reads(pool: P
         "recorded on the frame the BBA was filed on"
     );
     assert_eq!(rows[0].4, Some(version));
-
-    // The identical resubmission stores nothing new, so Beta stays.
-    epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
-        .await
-        .expect("identical resubmission");
-    let (a2, b2) = beta(&pool, claim).await;
-    assert!(
-        close(a2, 1.8) && close(b2, 1.2),
-        "an identical resubmission must not count its BBA twice, got ({a2}, {b2})"
-    );
 }
 
-/// `update_with_evidence` on the caller's own claim: the evidence BBA
-/// m({TRUE}) = e moves Beta(1,1) to Beta(1+e, 2-e), and `get_divergence`
-/// answers with the call's BetP against that posterior.
-#[sqlx::test(migrations = "../../migrations")]
-async fn update_with_evidence_writes_a_divergence_row_get_divergence_reads(pool: PgPool) {
-    let (server, group, viewer) = app_role_server(&pool).await;
-    let (frame, _) = binary_truth(&pool).await;
-    let claim = own_claim(&pool, group, "another claim the agent's group owns").await;
-
-    let res = epigraph_mcp::tools::claims::update_with_evidence(
-        &server,
-        &viewer,
-        uwe(claim, "an observation supporting the claim"),
-        None,
-    )
-    .await
-    .expect("update_with_evidence on an own claim");
+/// One `update_with_evidence` call; its BetP and its evidence BBA's
+/// m({TRUE}).
+async fn uwe_call(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    pool: &PgPool,
+    claim: Uuid,
+    data: &str,
+) -> (f64, f64) {
+    let res =
+        epigraph_mcp::tools::claims::update_with_evidence(server, viewer, uwe(claim, data), None)
+            .await
+            .expect("update_with_evidence on an own claim");
     let body = first_text(&res);
     let betp = body["pignistic_prob"].as_f64().expect("pignistic_prob");
     let ev = parse_uuid_field(&body, "evidence_id");
     let masses: serde_json::Value =
         sqlx::query_scalar("SELECT masses FROM mass_functions WHERE evidence_id = $1")
             .bind(ev)
-            .fetch_one(&pool)
+            .fetch_one(pool)
             .await
             .expect("the evidence's BBA");
-    let e = masses["0"].as_f64().expect("a supporting evidence BBA");
+    (
+        betp,
+        masses["0"].as_f64().expect("a supporting evidence BBA"),
+    )
+}
 
+/// `update_with_evidence` on the caller's own claim: each evidence BBA
+/// m({TRUE}) = e moves Beta by (e, 1 - e). The first call is a cold start and
+/// records no divergence row; after the second, `get_divergence` answers with
+/// that call's BetP against the posterior over both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_with_evidence_writes_a_divergence_row_get_divergence_reads(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "another claim the agent's group owns").await;
+
+    let (_, e1) = uwe_call(
+        &server,
+        &viewer,
+        &pool,
+        claim,
+        "an observation supporting the claim",
+    )
+    .await;
     let (a, b) = beta(&pool, claim).await;
     assert!(
-        close(a, 1.0 + e) && close(b, 2.0 - e),
+        close(a, 1.0 + e1) && close(b, 2.0 - e1),
         "expected Beta({}, {}), got ({a}, {b})",
-        1.0 + e,
-        2.0 - e
+        1.0 + e1,
+        2.0 - e1
+    );
+    assert!(
+        divergence_rows(&pool, claim).await.is_empty(),
+        "the claim's first Beta update is a cold start and records no divergence row"
+    );
+
+    let (betp, e2) = uwe_call(
+        &server,
+        &viewer,
+        &pool,
+        claim,
+        "a second, independent observation supporting the claim",
+    )
+    .await;
+    let (a, b) = beta(&pool, claim).await;
+    assert!(
+        close(a, 1.0 + e1 + e2) && close(b, 3.0 - e1 - e2),
+        "expected Beta({}, {}), got ({a}, {b})",
+        1.0 + e1 + e2,
+        3.0 - e1 - e2
     );
 
     let got = epigraph_mcp::tools::ds::get_divergence(
@@ -279,7 +335,7 @@ async fn update_with_evidence_writes_a_divergence_row_get_divergence_reads(pool:
     .await
     .expect("get_divergence answers for an MCP-written claim");
     let d = first_text(&got);
-    let posterior = (1.0 + e) / 3.0;
+    let posterior = (1.0 + e1 + e2) / 4.0;
     assert!(close(d["pignistic_prob"].as_f64().unwrap(), betp), "{d}");
     assert!(
         close(d["bayesian_posterior"].as_f64().unwrap(), posterior),
@@ -302,12 +358,46 @@ async fn update_with_evidence_writes_a_divergence_row_get_divergence_reads(pool:
 /// claim's group, which this caller does not write), so its insert is refused
 /// and rolled back to its savepoint without taking the submission with it,
 /// and the claim's Beta parameters are the owner's and do not move.
+///
+/// The claim's Beta track is seeded OFF the prior (as the owner's earlier
+/// evidence would leave it): on a track still at `Beta(1, 1)` every update is
+/// a cold start, `record_divergence` returns before it attempts the insert,
+/// and this arm would no longer test the refusal. The precondition below pins
+/// that the insert is reached.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(pool: PgPool) {
+    use epigraph_engine::ds_divergence::apply_beta_update;
+
     let (server, _group, viewer) = app_role_server(&pool).await;
     let (frame, _) = binary_truth(&pool).await;
 
     let claim = foreign_claim(&pool, "a world claim someone else wrote").await;
+    sqlx::query("UPDATE claims SET beta_alpha = 1.8, beta_beta = 1.2 WHERE id = $1")
+        .bind(claim)
+        .execute(&pool)
+        .await
+        .expect("seed the owner's Beta track off the prior");
+
+    // Precondition: for this caller the update is not a cold start, so the
+    // divergence insert below is attempted (and refused), not skipped.
+    let url = fixture::database_url_for(&pool).await;
+    let probe_pool =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut probe = probe_pool
+        .begin_as(&viewer)
+        .await
+        .expect("stamped probe tx");
+    let update = apply_beta_update(&mut probe, &viewer, claim, Some((0.8, 0.2)), "probe")
+        .await
+        .expect("probe update");
+    probe.rollback().await.expect("roll back the probe");
+    assert!(
+        !update.cold_start,
+        "the seeded track must not read as a cold start, or the insert is never \
+         attempted and this arm is vacuous: {update:?}"
+    );
     let res =
         epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
             .await;
@@ -335,7 +425,10 @@ async fn a_foreign_public_claim_still_takes_evidence_and_gets_no_divergence_row(
     assert_eq!(bbas, 2, "both submissions landed their BBA");
     assert!(divergence_rows(&pool, claim).await.is_empty());
     let (a, b) = beta(&pool, claim).await;
-    assert!(close(a, 1.0) && close(b, 1.0), "got ({a}, {b})");
+    assert!(
+        close(a, 1.8) && close(b, 1.2),
+        "the owner's track must not move: got ({a}, {b})"
+    );
 }
 
 /// Two Beta updates on one claim that overlap in time both land.
@@ -373,7 +466,11 @@ async fn overlapping_beta_updates_on_one_claim_lose_no_increment(pool: PgPool) {
     let pa = apply_beta_update(&mut a, &viewer, claim, Some((0.8, 0.2)), "tx A")
         .await
         .expect("A's update");
-    assert!((pa - 1.8 / 3.0).abs() < 1e-9, "A sees its own update: {pa}");
+    assert!(
+        (pa.posterior - 1.8 / 3.0).abs() < 1e-9,
+        "A sees its own update: {pa:?}"
+    );
+    assert!(pa.cold_start, "A moved the track off the prior: {pa:?}");
 
     let b = async {
         let mut b = pool_b.begin_as(&viewer).await.expect("stamped tx B");
@@ -397,7 +494,90 @@ async fn overlapping_beta_updates_on_one_claim_lose_no_increment(pool: PgPool) {
          got ({alpha}, {beta_param})"
     );
     assert!(
-        (pb - 2.3 / 4.0).abs() < 1e-9,
-        "B reports the posterior over both increments: {pb}"
+        (pb.posterior - 2.3 / 4.0).abs() < 1e-9,
+        "B reports the posterior over both increments: {pb:?}"
     );
+    assert!(
+        !pb.cold_start,
+        "B's update landed on A's, not on the prior, so it is not a cold start: {pb:?}"
+    );
+}
+
+/// The claim's entry in the viewer's top-divergent list, if any.
+async fn in_top(pool: &PgPool, viewer: &Viewer, claim: Uuid) -> Option<epigraph_db::DivergenceRow> {
+    DivergenceRepository::top_divergent(pool, viewer, 1000)
+        .await
+        .expect("top_divergent")
+        .into_iter()
+        .find(|r| r.claim_id == claim)
+}
+
+/// The case the cold-start rule exists for. A claim that already holds a BBA
+/// from a writer that does not keep the Beta track (as the seed and edge
+/// wires do) still holds the `Beta(1, 1)` prior. Its first live update
+/// compares the fold's BetP against a one-BBA posterior; on the old code that
+/// KL went into `top_divergent`, and on a claim with a long history it
+/// outranked every real disagreement.
+/// Now the first update leaves the claim out of the list, and the second,
+/// from a track that holds evidence, puts it in with the KL of that call.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cold_start_on_a_mature_claim_stays_out_of_top_divergent(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "a claim another writer already supports").await;
+    let wire = seed_agent(&pool).await;
+    MassFunctionRepository::store(
+        &pool,
+        claim,
+        frame,
+        Some(wire),
+        &serde_json::json!({"0": 0.95, "~": 0.05}),
+        None,
+        Some("auto_wire"),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a BBA from a writer that does not move Beta");
+
+    let res =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("the claim's first live evidence");
+    let betp = first_text(&res)["pignistic_prob"]
+        .as_f64()
+        .expect("pignistic_prob");
+    let (a, b) = beta(&pool, claim).await;
+    assert!(close(a, 1.8) && close(b, 1.2), "got ({a}, {b})");
+    assert!(
+        betp - 1.8 / 3.0 > 0.2 && kl(betp, 1.8 / 3.0) > 0.1,
+        "PREMISE: a BetP well above the one-BBA posterior, so the cold start's row \
+         would carry a visible KL: BetP {betp}, KL {}",
+        kl(betp, 1.8 / 3.0)
+    );
+    assert_eq!(
+        in_top(&pool, &viewer, claim).await.map(|r| r.kl_divergence),
+        None,
+        "the cold-start update must not put the claim in top_divergent"
+    );
+
+    // A different BBA from the same caller replaces its first and is counted:
+    // m({TRUE}) = 0.7 adds (0.7, 0.3).
+    let mut second = sde(claim, frame);
+    second.masses = serde_json::json!({"0": 0.7, "~": 0.3});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, second, None)
+        .await
+        .expect("the claim's second live evidence");
+    let betp2 = first_text(&res)["pignistic_prob"]
+        .as_f64()
+        .expect("pignistic_prob");
+    let (a, b) = beta(&pool, claim).await;
+    assert!(close(a, 2.5) && close(b, 1.5), "got ({a}, {b})");
+    let row = in_top(&pool, &viewer, claim)
+        .await
+        .expect("the second update, from a track holding evidence, is in top_divergent");
+    assert!(close(row.bayesian_posterior, 2.5 / 4.0), "{row:?}");
+    assert!(close(row.pignistic_prob, betp2), "{row:?}");
+    assert!(close(row.kl_divergence, kl(betp2, 2.5 / 4.0)), "{row:?}");
 }

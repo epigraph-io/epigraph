@@ -1240,6 +1240,28 @@ pub async fn submit_evidence(
         });
     }
 
+    // 2b. The key 5b STORES: the canonical key, or the caller's own key
+    //     trimmed and lowercased (bc06ec6f); blank is no key. It must fit the
+    //     column (`varchar(50)`). A longer one reached the INSERT and came back
+    //     as a 500 database error with nothing written, so this refusal
+    //     changes no call that succeeds today. Counted on the STORED form,
+    //     before anything is written (MCP `submit_ds_evidence` checks the same
+    //     shared limit).
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+    if let Err(len) = epigraph_engine::calibration::check_stored_evidence_type_len(
+        stored_evidence_type.as_deref(),
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "evidence_type".to_string(),
+            reason: format!(
+                "evidence_type is {len} characters as stored (trimmed and lowercased); at most \
+                 {} are stored",
+                epigraph_engine::calibration::EVIDENCE_TYPE_MAX_CHARS
+            ),
+        });
+    }
+
     // 3. Parse and validate the submitted mass function
     //    Keys may be prefixed with ~ to indicate CDST complement (negative) elements.
     let mut masses = std::collections::BTreeMap::new();
@@ -1564,9 +1586,7 @@ pub async fn submit_evidence(
     //     untyped, tier 4 for an uncalibrated type) must not apply
     //     `reliability` a second time.
     let masses_json = modified.masses_to_json();
-    // Canonical key, or the caller's own key lowercased (bc06ec6f).
-    let stored_evidence_type =
-        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+    // `stored_evidence_type` is step 2b's: canonical, and checked to fit.
 
     // 5a'. What the store below does to the caller's row for its key (backlog
     //      6f82db4f, the REST twin of bcbe34b2): the upsert returns only the
@@ -1788,7 +1808,7 @@ pub async fn submit_evidence(
     //      The evidence's mass on the singleton {h_i} indicates support strength.
     //      Best-effort, under a SAVEPOINT (the read included: a failed statement
     //      aborts the enclosing transaction whether it read or wrote).
-    let bayesian_posterior = {
+    let beta_update = {
         // An identical resubmission stored nothing new (backlog 33ce3f5d):
         // its Beta update was applied when the BBA was first stored, and
         // applying it again would count the same evidence twice. The
@@ -2316,6 +2336,8 @@ pub async fn submit_evidence(
         }
     }
 
+    let bayesian_posterior = beta_update.posterior;
+
     // 20. Compute and store DS vs Bayesian divergence (using live Beta posterior)
     //     and step 17's scoped beliefs: derived rows, best-effort, on ONE
     //     stamped transaction after the main COMMIT, each under a SAVEPOINT so
@@ -2368,7 +2390,7 @@ pub async fn submit_evidence(
                     request.claim_id,
                     frame_id,
                     final_betp,
-                    bayesian_posterior,
+                    beta_update,
                     Some(frame_row.version),
                     "submit_evidence",
                 )
@@ -2384,8 +2406,11 @@ pub async fn submit_evidence(
             }
         }
 
-        // Emit divergence.spike if KL exceeds threshold
-        if kl >= DIVERGENCE_SPIKE_THRESHOLD {
+        // Emit divergence.spike if KL exceeds threshold. Not on a cold start
+        // (the claim's track still at the Beta(1, 1) prior before this
+        // submission): its KL measures the empty track, not a disagreement,
+        // and `record_divergence` stores no row for it either.
+        if kl >= DIVERGENCE_SPIKE_THRESHOLD && !beta_update.cold_start {
             event_store
                 .push(
                     "divergence.spike".to_string(),
@@ -2572,6 +2597,10 @@ pub async fn frame_claims_sorted(
 /// Get latest DS vs Bayesian divergence for a claim
 ///
 /// `GET /api/v1/claims/:id/divergence`
+///
+/// `null` when no row was recorded in the TTL window. A claim's cold start
+/// (the evidence write that first moves its Beta track off the `Beta(1, 1)`
+/// prior) records no row: see `epigraph_engine::ds_divergence`.
 #[cfg(feature = "db")]
 pub async fn claim_divergence(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -2609,6 +2638,11 @@ pub async fn claim_divergence(
 /// Get claims with the highest KL divergence
 ///
 /// `GET /api/v1/divergence/top`
+///
+/// Only claims with a recorded divergence row: a claim's cold start (the
+/// evidence write that first moves its Beta track off the `Beta(1, 1)` prior,
+/// whose KL measures the empty track rather than a disagreement) records none,
+/// so it cannot crowd this list. See `epigraph_engine::ds_divergence`.
 #[cfg(feature = "db")]
 pub async fn top_divergence(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,

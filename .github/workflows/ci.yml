@@ -656,8 +656,8 @@ jobs:
         # integration-test targets link Postgres regardless of the feature
         # flag. Every bin, `server` included, declares required-features =
         # ["db"], so in practice this checks the library. The library's own
-        # unit-test target is compiled separately, by "No-db lib-test build
-        # check" in `lint-features`.
+        # unit-test target is built and run separately, by "No-db lib-test
+        # build check" in `lint-features`.
         run: cargo check -p epigraph-api --no-default-features --locked
 
   # The feature-gated checks, on their own runner. They used to follow Clippy
@@ -751,11 +751,16 @@ jobs:
         # errors (a fixture missing a new struct field, a db-only helper
         # called from a not(db) module, a test of a db-only type left
         # ungated) accumulated in the lib-test target while that check stayed
-        # green (backlog 01640684). This compiles the target without running
-        # it; several of its tests are stale at runtime and are a separate
-        # item. Warnings are not denied here: the not(db) arm carries unused
-        # imports that the db arm needs.
-        run: cargo test -p epigraph-api --no-default-features --lib --no-run --locked
+        # green (backlog 01640684). Compiling alone was not enough either:
+        # 71 of those tests then failed at runtime, unseen, because their
+        # routers carried no AuthContext (401 before the handler) or they
+        # exercised in-memory supersession the not(db) arm no longer has.
+        # So the target is RUN, not just built. The run needs no network:
+        # the webhook-registration tests vet hosts through a stub resolver,
+        # never the runner's DNS. The step keeps its old name so local CI
+        # replays need no new entry. Warnings are not denied here: the
+        # not(db) arm carries unused imports that the db arm needs.
+        run: cargo test -p epigraph-api --no-default-features --lib --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`

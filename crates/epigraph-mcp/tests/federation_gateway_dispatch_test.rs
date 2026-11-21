@@ -9,6 +9,9 @@
 #[path = "support/federation_stub.rs"]
 mod stub;
 
+#[path = "support/token_exchange_endpoint.rs"]
+mod tx;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -308,7 +311,8 @@ async fn a_downstream_internal_error_is_redacted_and_names_the_extension() {
     let (addr, _control) = stub::spawn_controlled_stub(&[stub::INTERNAL_FAIL_TOOL]).await;
     let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
-        .expect("build against a reachable stub");
+        .expect("build against a reachable stub")
+        .with_token_exchange(tx::spawn_token_endpoint(SECRET, &["ext"]).await.exchange());
     let url = spawn_gateway(SharedFederation::new(registry)).await;
 
     let error = call_for_error(
@@ -346,7 +350,8 @@ async fn a_downstream_parameter_refusal_reaches_the_caller_unchanged() {
     let (addr, _control) = stub::spawn_controlled_stub(&[stub::FAIL_TOOL]).await;
     let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
-        .expect("build against a reachable stub");
+        .expect("build against a reachable stub")
+        .with_token_exchange(tx::spawn_token_endpoint(SECRET, &["ext"]).await.exchange());
     let url = spawn_gateway(SharedFederation::new(registry)).await;
 
     let error = call_for_error(&url, stub::FAIL_TOOL, std::time::Duration::from_secs(10)).await;
@@ -375,7 +380,8 @@ async fn an_unreachable_extension_is_answered_as_unavailable_by_name() {
     let (addr, control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
     let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
-        .expect("build against a reachable stub");
+        .expect("build against a reachable stub")
+        .with_token_exchange(tx::spawn_token_endpoint(SECRET, &["ext"]).await.exchange());
     let url = spawn_gateway(SharedFederation::new(registry)).await;
     // Mounted healthy, then gone: the per-call dial fails.
     control.set_alive(false);
@@ -400,7 +406,8 @@ async fn a_call_that_never_answers_is_answered_at_the_gateways_bound() {
     let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
         .await
         .expect("build against a reachable stub")
-        .with_call_timeout(std::time::Duration::from_secs(1));
+        .with_call_timeout(std::time::Duration::from_secs(1))
+        .with_token_exchange(tx::spawn_token_endpoint(SECRET, &["ext"]).await.exchange());
     let url = spawn_gateway(SharedFederation::new(registry)).await;
 
     let error = call_for_error(&url, stub::HANG_TOOL, std::time::Duration::from_secs(15)).await;
@@ -412,5 +419,72 @@ async fn a_call_that_never_answers_is_answered_at_the_gateways_bound() {
     assert!(
         message.contains("may still have run"),
         "and that the call may have run anyway: {error}"
+    );
+}
+
+/// A call whose token exchange the kernel REFUSES (the extension is not one
+/// of its configured audiences) is answered as that, naming the extension,
+/// the tool and the RFC error, and is not run downstream: the gateway has no
+/// fallback to the caller's own bearer (backlog c9b82fae).
+///
+/// Mutation: route `FederationError::Exchange` to the generic `Request` arm
+/// in `federated_call_error` -> the caller reads "the request to extension
+/// ... failed" without the cause, and this fails.
+#[tokio::test]
+async fn a_refused_token_exchange_is_answered_by_name_and_not_run() {
+    let (addr, _control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub")
+        .with_token_exchange(
+            tx::spawn_token_endpoint(SECRET, &["not-ext"])
+                .await
+                .exchange(),
+        );
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let error = call_for_error(&url, "federated_probe", std::time::Duration::from_secs(15)).await;
+    let message = error["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("could not obtain a token for extension `ext`")
+            && message.contains("invalid_target")
+            && message.contains("`federated_probe` was not run"),
+        "the caller must be told the exchange was refused, for which extension and tool: {error}"
+    );
+}
+
+/// The kernel's MCP surface refuses an extension-audience token (backlog
+/// c9b82fae): the token a gateway forwards to an extension cannot be replayed
+/// at the gateway itself. Same key, same principal, same scopes; only `aud`
+/// differs, and the subject it was exchanged from is admitted (control).
+#[tokio::test]
+async fn the_gateways_own_bearer_layer_refuses_an_extension_audience_token() {
+    let url = spawn_gateway(SharedFederation::empty()).await;
+    let caller = mint_token(&["ext:tools"]);
+    let exchanged = epigraph_auth::JwtConfig::from_secret(SECRET)
+        .exchange_token(&caller, "ext", &["ext".to_string()], None)
+        .expect("exchange")
+        .token;
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "aud-check", "version": "0"}}
+    });
+    let client = reqwest::Client::new();
+    assert_eq!(
+        post(&client, &url, &caller, None, initialize.clone())
+            .await
+            .status()
+            .as_u16(),
+        200,
+        "CONTROL: the kernel token is admitted"
+    );
+    assert_eq!(
+        post(&client, &url, &exchanged, None, initialize)
+            .await
+            .status()
+            .as_u16(),
+        401,
+        "an extension-audience token must not be admitted on a kernel route"
     );
 }

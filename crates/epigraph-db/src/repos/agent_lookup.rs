@@ -307,8 +307,14 @@ pub enum AgentKind {
     /// (`operator_human`).
     LlmAgent,
     /// An author node the document ingest created: its key is the
-    /// deterministic name- (or ORCID-) derived key of `did_key_for_author`,
-    /// whose private half nobody holds.
+    /// deterministic name- (or ORCID-) derived key of `did_key_for_author`.
+    /// That key's private half is `BLAKE3("author:{name}")` (or
+    /// `"orcid:{id}"`), so ANYONE who knows the name or ORCID can compute it:
+    /// the key identifies the node and must never verify a signature (since
+    /// migration 230 such a node is stored with `key_kind = 'seed-derived'`,
+    /// which `AgentRepository::public_key_if_signer` refuses; `verify_claim`,
+    /// the edge verifier and the OAuth assertion check do not read
+    /// `key_kind` yet; backlog bfc2eff8).
     IngestAuthor,
     /// No visible evidence (the legacy rows; `agent_type` is not evidence).
     Unknown,

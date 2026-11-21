@@ -405,9 +405,10 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
   the `--listen` authority. Behind a reverse proxy that preserves the
   client's `Host`, add the public name with `--allowed-host`
   (`EPIGRAPH_MCP_ALLOWED_HOSTS`, comma-separated). Ports are ignored.
-- Give every stdio server a declared identity: `--agent-key`, or
-  `--agent-model` with `--agent-system-prompt` or `--agent-system-prompt-hash`,
-  or the separate-signing-key mode (section 9). Without one, every launch
+- Give every stdio server a declared identity: `--agent-key` (a random key),
+  or the separate-signing-key mode (section 9). `--agent-model` and its prompt
+  inputs are refused at startup (backlog bfc2eff8): they derived the signing
+  key from public inputs. Without one, every launch
   prints `Generated new agent keypair` and a secret key to stderr, authors as
   a new random agent, and logs that the ownership-gated tools
   (`supersede_claim`, `mark_duplicate`, `resolve_backlog_item`) do not
@@ -421,14 +422,15 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
 Nothing in a request process applies cascades or runs jobs. Create these on
 the host that holds the maintenance DSN, each with a 0600 environment file
 holding `MAINTENANCE_DATABASE_URL` and `DATABASE_URL` (naming the same
-database). All four refuse to start without `DATABASE_URL`; the three
-`epigraph-cli` binaries also accept it as `--database-url`, while `drain_jobs`
-reads it from the environment only:
+database). All of them refuse to start without `DATABASE_URL` (a
+`enqueue_job --dry-run` needs none); the `epigraph-cli` binaries also accept it
+as `--database-url`, while `drain_jobs` reads it from the environment only:
 
 | Job | Command | Cadence | Notes |
 |---|---|---|---|
 | Cascade replay | `replay_deferred_cascades --max-failures 20` | every 90 s (the binary's own documentation) | Exit 2 while a cascade is stuck: read the report and `--retire <event id> --reason <text>` it. `--report-only` is a read-only staleness check that takes no lock. |
 | Job drain | `drain_jobs` | your choice; one run drains until empty or `--max-runtime` (default 50 min) | Exit 0 drained (or `{"locked": true}`), 1 a job failed or the run could not start, 4 pending jobs of a type this run has no handler for are waiting (the report's `pending_unregistered` names each type and its count; typically `embedding_generation` on an instance whose embedding provider may not write `claims.embedding`, which wait until a drain that registers the type runs), 3 out of time with work pending. Treat 4 as a failure (do not add it to `SuccessExitStatus=`). On an instance that will never register the type, clear it once by hand with `drain_jobs --cancel-pending <TYPE>` (repeatable): that run sets the type's pending jobs `cancelled`, lists them in `cancelled_unregistered`, and refuses (exit 1, nothing written) a type it has a handler for. Cancelling an `embedding_generation` job leaves its claim's `claims.embedding` NULL; `embed_backfill` refills missing vectors, and needs an OpenAI key. `epigraph-cli reembed` does NOT restore them: it writes `embedding_3072`. |
+| Scheduled job enqueue | `enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique` (`epigraph-cli`) | your choice (e.g. nightly, before a drain) | Validates the job as an `EpiGraphJob` (an unknown or retired kind, a stray field and the privatization kinds are refused, nothing written) and enqueues it through `PostgresJobQueue`, the queue `drain_jobs` runs; never `INSERT INTO jobs` by hand. `MAINTENANCE_DATABASE_URL` is required (no fallback). `--unique` writes nothing when a job of the same type is already pending (report `outcome: already_pending`, exit 0); `--dry-run` validates and connects to nothing; the job may come on stdin. Enqueue only a type `drain_jobs` has a handler for (`cluster_graph`), or every drain exits 4. After the drain has run a `ClusterGraph`, name its neighbourhoods with `scripts/label_themes_llm.py --neighborhoods`. |
 | Embedding backfill | `embed_backfill` | as needed | Fills `NULL` claim embeddings and `workflows.goal_embedding`. Needs `OPENAI_API_KEY` (or `--allow-mock` for a non-production smoke run). |
 | Retention | `prune_recall_events` | daily | Prunes `recall_events` and telemetry `events` past `RECALL_EVENTS_RETENTION_DAYS` (default 90). Runs on a NOSUPERUSER maintenance login only from migration 186 on. |
 
@@ -515,6 +517,7 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
+| `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` | empty | The federation extensions (by their `EPIGRAPH_MCP_EXTENSIONS` name) the RFC 8693 token-exchange grant at `/oauth/token` may mint for. Empty refuses every exchange, so a gateway with mounted extensions can call none of them. The kernel's own audience is never accepted here. See `crates/epigraph-api/src/oauth/token_exchange.rs`. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_GUEST_READS` | `off` | `on` serves every `visibility = 'public'` claim, edge and theme count to signed-out callers under `GET /api/v1/guest/*` (`docs/tenancy.md`); off, each answers 404. Any other value stays off and is warned about. With no rate limit configured, the guest routes are limited at 600 a minute per client address (Step 8, "Rate limiting"). |
 | `EPIGRAPH_TENANCY_GAUGE_INTERVAL_SECS` | `30` | The tick of the tenancy gauges exported on the metrics listener. |
@@ -531,8 +534,8 @@ For the others, anything else is off.
 | `--database-url` / `DATABASE_URL` | — (required) | The application DSN. The variable keeps it out of `argv`. |
 | `MAINTENANCE_DATABASE_URL` | must be unset | Set → exit 1, on every transport. |
 | `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` | unset | The signer's Ed25519 secret key, 64 hex characters. |
-| `--agent-model` / `EPIGRAPH_AGENT_MODEL`, with `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT` or `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | unset | Derives the identity deterministically from (model, prompt). It takes precedence over `--agent-key`. The raw prompt is hashed (BLAKE3) and never logged. |
-| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes the two options above. |
+| `--agent-model` / `EPIGRAPH_AGENT_MODEL`, `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT`, `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | must be unset | Set → exit 1 (backlog bfc2eff8). They derived the signing key as BLAKE3 of public inputs (model and prompt hash), which anyone can recompute. Use the separate-signing-key mode, whose identity the host derives with a secret, or `--agent-key`. |
+| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. |
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | Required for a TCP `--listen`. At least 32 bytes. The same secret as the API. |
@@ -545,10 +548,11 @@ For the others, anything else is off.
 | `EPIGRAPH_MCP_CONNECTOR_ELEVATION` | off | `on` lets the HTTP transport elevate connector-mode sessions. Leave it unset (section 10). |
 | `EPIGRAPH_RUN_TOKENS` | `off` | As for the API. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | As for the API. |
-| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. An extension that exports a kernel tool's name (or another extension's) is a boot error too; set a `prefix=` on it. See `crates/epigraph-mcp/src/federation/config.rs`. |
+| `EPIGRAPH_MCP_EXTENSIONS` | unset | Federated downstream MCP servers. A malformed value is a boot error, and so are a repeated extension name and a host that is not loopback (`127.0.0.0/8`, `[::1]`, `localhost`): the gateway forwards each caller's bearer token over cleartext http. `insecure_remote=1` on an entry accepts a remote host and logs a warning at boot. An extension that exports a kernel tool's name (or another extension's) is a boot error too; set a `prefix=` on it. See `crates/epigraph-mcp/src/federation/config.rs`. **A mounted extension receives every caller's kernel access token verbatim** and can act as that caller on the kernel until the token expires: mount only an extension you operate and would trust with `EPIGRAPH_JWT_SECRET` (one that validates kernel tokens locally already holds it). The replacement, an exchanged extension-audience token, is backlog `c9b82fae`; see the federation section of `CLAUDE.md`. |
 | `EPIGRAPH_MCP_DISCOVERY_TOKEN` (or `EPIGRAPH_SERVICE_TOKEN`) | empty | The gateway's service token for federated tool discovery. |
 | `EPIGRAPH_MCP_RECONNECT_SECS` | `30` | Period of the federation health timer: an unhealthy extension is re-dialled, a healthy one has its tool list re-read (and is demoted if it no longer answers). |
 | `EPIGRAPH_MCP_EXTENSION_CALL_TIMEOUT_SECS` | `300` | Longest a proxied federated `tools/call` may take before the gateway abandons it and answers the caller with a timeout. |
+| `EPIGRAPH_MCP_TOKEN_EXCHANGE_URL` | unset | The kernel's absolute `/oauth/token` URL (https, or http to a loopback host; anything else is a boot error). Every federated `tools/call` exchanges the caller's bearer there for a token of at most five minutes whose audience is the extension's name, and forwards only that; the caller's own bearer never reaches an extension. Unset with extensions mounted: every federated call is refused (warned at boot). The extension must accept `aud = <its name>`. |
 | `EPIGRAPH_MCP_PROFILE_ROOT`, `EPIGRAPH_MCP_PROFILE_PIN`, `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` | unset | Label-dedup tool configuration (`crates/epigraph-mcp/src/tools/label_dedup.rs`). |
 | `EPIGRAPH_MCP_STDIO_DRAIN_SECS` | `120` | stdio, and the operator `ingest-document` CLI. After the client disconnects (or, for the CLI, after its walk returns), how long the process waits for work its tools detached (a `queued` document ingest, post-commit embedding) before exiting. `0` exits at once and abandons that work. |
 | `EPIGRAPH_MCP_LOG_PAYLOADS` | off | Lifts the INFO cap on `rmcp` logging, which then writes request and result bodies to the log. Local debugging only. |
@@ -4646,7 +4650,7 @@ Do not improvise it against a live database without that entry's context.
 | `ERROR: drain_jobs: ...` | `drain_jobs` could not start: the maintenance DSN is unset, names another database, or does not satisfy `epigraph_bypass()`. |
 | `42501 permission denied for function epigraph_live_memberships` | A login outside `epigraph_app` / `epigraph_maintenance` resolved a viewer. Use the maintenance login. |
 | Elevated tokens read nothing extra | Expected before migration 132, on a unit without the recorder declaration, on a privileged DSN, behind a transaction-mode pooler, or with a DSN role switch (section 10). |
-| The MCP server prints `Generated new agent keypair` | No declared identity. Set `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` or `--agent-model` with a prompt or prompt hash. |
+| The MCP server prints `Generated new agent keypair` | No declared identity. Set `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY`, or the separate-signing-key pair. |
 | MCP `embeddings disabled (no API key)` / `could not embed the query` | No `OPENAI_API_KEY` for the MCP server. Flat `recall` still works lexically. |
 | A burst of 400s from `POST /api/v1/webhooks` | Look for `Refusing webhook registration: target host failed egress vetting`, and check the API host's resolver first (section 7). |
 

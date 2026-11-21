@@ -2217,6 +2217,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          a caller's transaction would otherwise surface as a silent ROLLBACK at COMMIT.",
     ),
     (
+        "agent.rs",
+        "create_seed_derived_conn",
+        "WRITE. `create_conn`'s INSERT INTO `agents` with `key_kind = 'seed-derived'` (migration \
+         230, backlog bfc2eff8) for an agent whose key is derived from a public seed. `agents` is \
+         not tenant-partitioned (as `create_conn`), so there is no read predicate to splice; \
+         077's `agents_provision` WITH CHECK admits the kind (it refuses only `derived`).",
+    ),
+    (
+        "agent.rs",
+        "registered",
+        "WRITE. The shared tail of `create_conn` and `create_seed_derived_conn`: the best-effort \
+         `agent.registered` event on the caller's connection (through `publish_or_log_conn`'s \
+         SAVEPOINT) and the returned `Agent`. Reads no row.",
+    ),
+    (
         "claim.rs",
         "consolidate_conn",
         "WRITE. `ClaimRepository::consolidate`'s body, moved so `consolidate_claims` can run it \

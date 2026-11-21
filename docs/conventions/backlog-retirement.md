@@ -42,8 +42,8 @@ An owner is:
   `claims:admin` token also passes.
 
 Refused: a stdio agent that shares no operator with the author and is not its
-delegate, and a stdio server with no declared signer (`--agent-key` /
-`--agent-model`) on any claim it did not author. Over HTTP the whole label
+delegate, and a stdio server with no declared signer (`--agent-key` or the
+separate signing key) on any claim it did not author. Over HTTP the whole label
 mutation needs that ownership, whatever the labels; on stdio every other label
 stays ungated.
 

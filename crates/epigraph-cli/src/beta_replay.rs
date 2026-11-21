@@ -17,6 +17,19 @@
 //! (`epigraph_engine::ds_divergence::replay_beta_params`, which folds
 //! `beta_increments` exactly as successive live writes add them).
 //!
+//! # Not to be applied
+//!
+//! Measured on a production-sized corpus, the replay does not rebuild the
+//! track the live writers would have built: it counts BBAs from writers that
+//! never move it, and their uncommitted mass counts against the hypothesis, so
+//! replayed posteriors land well below BetP and the replay would push claims
+//! INTO `GET /divergence/top`. The crowding is handled where the row is
+//! written instead: a cold-start update (a track still at the prior) records
+//! no divergence row (`epigraph_engine::ds_divergence`). The `replay_beta_track`
+//! binary therefore refuses a replay `--apply` and only dry-runs; `run` with
+//! `apply` stays for the tests that pin the arithmetic, and `reverse` for
+//! undoing an earlier run (backlog candidate 913-cold-start-divergence).
+//!
 //! # Which claims
 //!
 //! A current claim whose parameters are still the prior (both `1.0`, or

@@ -31,11 +31,12 @@
 #             operator's personal group, DS-wired (a BBA row) and, when
 #             OPENAI_API_KEY is set, embedded.
 #
-# UNIQUE PER RUN. The agent identities are derived from `--agent-model` (plus a
-# fixed prompt hash), and agents and operator links survive the other scripts'
-# TRUNCATE. With a model derived from the label alone, a second run with the
-# same label re-derives the SAME agent, which is already linked, and OP-LIVE
-# fails. Every model below therefore carries a per-run nonce.
+# UNIQUE PER RUN. Each arm's agent is a fresh random `--agent-key` (passed in
+# EPIGRAPH_MCP_AGENT_KEY, never on the command line), because agents and
+# operator links survive the other scripts' TRUNCATE: a key reused across runs
+# would re-find an agent that is already linked, and OP-LIVE would fail. (The
+# arms used `--agent-model` with a fixed prompt hash until backlog bfc2eff8
+# refused that seed-derived signing key.)
 #
 # Each arm prints PASS or FAIL from the rows the database holds afterwards.
 
@@ -59,9 +60,9 @@ BIN="${1:?usage: probe-operator.sh <binary> <label> <a|b>}"
 LABEL="${2:?label}"
 CFG="${3:?a|b}"
 E2E="$(cd "$(dirname "$0")" && pwd)"
-# A derived, DECLARED identity per arm (stdio + --operator-id requires one).
-# The prompt hash is a fixed public test value, not a secret.
-PHASH="$(printf 'ab%.0s' $(seq 1 32))"
+# A DECLARED identity per arm (stdio + --operator-id requires one): a random
+# throwaway key for this run's disposable database.
+new_key() { python3 -c 'import secrets; print(secrets.token_hex(32))'; }
 RUN="$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 
 q() { PGPASSWORD="$E2E_SU_PW" psql -h "$E2E_SU_HOST" -p "$E2E_SU_PORT" -U "$E2E_SU_USER" -d "$E2E_DB" -tA -c "$1"; }
@@ -93,12 +94,12 @@ new_operator() {
 # Run the stdio server until it logs its link outcome or exits; print its exit
 # code (or "running" when it was still serving and had to be killed).
 run_stdio() {
-  local dsn="$1" model="$2" op="$3" err="$4" pid rc
+  local dsn="$1" key="$2" op="$3" err="$4" pid rc
   : > "$err"
   env -u EPIGRAPH_OPERATOR_ID -u EPIGRAPH_MCP_EXTENSIONS -u EPIGRAPH_SESSION_GUC_MODE \
-      -u OPENAI_API_KEY RUST_LOG=info \
-    "$BIN" --database-url "$dsn" --agent-model "$model" \
-      --agent-system-prompt-hash "$PHASH" --operator-id "$op" \
+      -u OPENAI_API_KEY -u EPIGRAPH_AGENT_MODEL -u EPIGRAPH_AGENT_SYSTEM_PROMPT \
+      -u EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH RUST_LOG=info EPIGRAPH_MCP_AGENT_KEY="$key" \
+    "$BIN" --database-url "$dsn" --operator-id "$op" \
       < <(sleep 90) > /dev/null 2> "$err" &
   pid=$!
   for _ in $(seq 1 120); do
@@ -125,7 +126,7 @@ echo "=== OP-APP: --operator-id on the least-privilege DSN must refuse and write
 OP1="$(new_operator)"
 G1="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP1'")"
 M1_BEFORE="$(q "SELECT count(*) FROM group_memberships WHERE group_id = '$G1'")"
-RC="$(run_stdio "$E2E_APP_DSN" "e2e-op-app-$LABEL-$RUN" "$OP1" "$E2E/op.app.$LABEL.err")"
+RC="$(run_stdio "$E2E_APP_DSN" "$(new_key)" "$OP1" "$E2E/op.app.$LABEL.err")"
 LINKS="$(agent_of_model "$OP1")"
 M1_AFTER="$(q "SELECT count(*) FROM group_memberships WHERE group_id = '$G1'")"
 echo "   exit=$RC links=$LINKS memberships: $M1_BEFORE -> $M1_AFTER"
@@ -151,7 +152,7 @@ OP2="$(new_operator)"
 G2="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP2'")"
 q "UPDATE group_memberships SET revoked_at = now() WHERE group_id = '$G2' AND agent_id = '$OP2'" >/dev/null
 M2_BEFORE="$(q "SELECT count(*) || '/' || count(*) FILTER (WHERE revoked_at IS NULL) FROM group_memberships WHERE group_id = '$G2'")"
-RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-rvk01-$LABEL-$RUN" "$OP2" "$E2E/op.rvk01.$LABEL.err")"
+RC="$(run_stdio "$E2E_SU_DSN" "$(new_key)" "$OP2" "$E2E/op.rvk01.$LABEL.err")"
 LINKS="$(agent_of_model "$OP2")"
 M2_AFTER="$(q "SELECT count(*) || '/' || count(*) FILTER (WHERE revoked_at IS NULL) FROM group_memberships WHERE group_id = '$G2'")"
 echo "   exit=$RC links=$LINKS memberships(total/live): $M2_BEFORE -> $M2_AFTER"
@@ -165,7 +166,7 @@ verdict "$OK" "refused at startup naming RVK01, +0 links, operator row still rev
 echo
 echo "=== OP-LIVE (calibration): the same DSN and shape with a LIVE operator row links ==="
 OP3="$(new_operator)"
-RC="$(run_stdio "$E2E_SU_DSN" "e2e-op-live-$LABEL-$RUN" "$OP3" "$E2E/op.live.$LABEL.err")"
+RC="$(run_stdio "$E2E_SU_DSN" "$(new_key)" "$OP3" "$E2E/op.live.$LABEL.err")"
 LINKS="$(agent_of_model "$OP3")"
 echo "   exit=$RC links=$LINKS"
 OK=false
@@ -178,8 +179,8 @@ echo
 echo "=== OP-AUTHOR: an operated agent, restarted on the least-privilege DSN, authors into its operator's group ==="
 OP4="$(new_operator)"
 G4="$(q "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:$OP4'")"
-MODEL4="e2e-op-author-$LABEL-$RUN"
-RC="$(run_stdio "$E2E_SU_DSN" "$MODEL4" "$OP4" "$E2E/op.author.link.$LABEL.err")"
+KEY4="$(new_key)"
+RC="$(run_stdio "$E2E_SU_DSN" "$KEY4" "$OP4" "$E2E/op.author.link.$LABEL.err")"
 AG4="$(q "SELECT agent_id FROM operator_links WHERE operator_id = '$OP4'")"
 echo "   link on the superuser DSN: exit=$RC agent=$AG4"
 # The restart: the APP DSN, NO --operator-id, the same derived identity, and one
@@ -192,9 +193,10 @@ CONTENT4="OP-AUTHOR claim $LABEL $RUN"
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
   printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/call\",\"params\":{\"name\":\"submit_claim\",\"arguments\":{\"content\":\"$CONTENT4\",\"methodology\":\"extraction\",\"evidence_data\":\"op-author probe\",\"evidence_type\":\"empirical\",\"confidence\":0.7,\"novelty_threshold\":0.0}}}"
   sleep 25
-} | env -u EPIGRAPH_OPERATOR_ID -u EPIGRAPH_MCP_EXTENSIONS -u EPIGRAPH_SESSION_GUC_MODE RUST_LOG=warn \
-    "$BIN" --database-url "$E2E_APP_DSN" --agent-model "$MODEL4" \
-      --agent-system-prompt-hash "$PHASH" \
+} | env -u EPIGRAPH_OPERATOR_ID -u EPIGRAPH_MCP_EXTENSIONS -u EPIGRAPH_SESSION_GUC_MODE \
+      -u EPIGRAPH_AGENT_MODEL -u EPIGRAPH_AGENT_SYSTEM_PROMPT -u EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH \
+      RUST_LOG=warn EPIGRAPH_MCP_AGENT_KEY="$KEY4" \
+    "$BIN" --database-url "$E2E_APP_DSN" \
     > "$E2E/op.author.$LABEL.out" 2> "$E2E/op.author.$LABEL.err"
 RESP="$(grep '"id":7' "$E2E/op.author.$LABEL.out" | tail -1)"
 CL4="$(q "SELECT id FROM claims WHERE content = '$CONTENT4'")"

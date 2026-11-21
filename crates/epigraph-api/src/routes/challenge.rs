@@ -695,15 +695,16 @@ mod tests {
 
     // ---- Handler integration tests (need AppState without DB) ----
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // not(db) arm only. CI builds AND runs these: `lint-features`, step
+    // "No-db lib-test build check" (`cargo test -p epigraph-api
+    // --no-default-features --lib`). A bare test router has no bearer
+    // middleware, so routes that read an `AuthContext` get the one it would
+    // install via `crate::middleware::bearer::test_auth_with_scopes`; the
+    // tests asserting a 401 go through `create_router` with no credential.
     #[cfg(not(feature = "db"))]
     mod handler_tests {
         use super::super::*;
+        use crate::middleware::bearer::test_auth_with_scopes;
         use crate::state::ApiConfig;
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
@@ -722,6 +723,10 @@ mod tests {
             Router::new()
                 .route("/api/v1/claims/:id/challenge", post(submit_challenge))
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&[
+                    "claims:read",
+                    "claims:write",
+                ])))
                 .with_state(state)
         }
 
@@ -895,6 +900,7 @@ mod tests {
             // Build router with the same state
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -1112,6 +1118,7 @@ mod tests {
             // Build router with same state for the GET endpoint
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             let request = Request::builder()
@@ -1177,6 +1184,7 @@ mod tests {
 
             let router = Router::new()
                 .route("/api/v1/claims/:id/challenges", get(list_challenges))
+                .layer(axum::Extension(test_auth_with_scopes(&["claims:read"])))
                 .with_state(state);
 
             // List for claim A → expect 2
@@ -1362,12 +1370,12 @@ mod tests {
         }
     } // end mod handler_tests
 
-    // NOT COMPILED, NOT RUN: `epigraph-api`'s default features are `["db"]`
-    // and the `not(feature = "db")` configuration has pre-existing compile
-    // errors, so no CI job or local run builds this module. PR-03's
-    // `OK -> UNAUTHORIZED` flips inside it are DOCUMENTATION of the intended
-    // behaviour; `tests/public_router_allowlist.rs` is what asserts it, by
-    // probing every route on the buildable variant's `protected` chain.
+    // not(db) arm only. CI builds AND runs these: `lint-features`, step
+    // "No-db lib-test build check" (`cargo test -p epigraph-api
+    // --no-default-features --lib`). A bare test router has no bearer
+    // middleware, so routes that read an `AuthContext` get the one it would
+    // install via `crate::middleware::bearer::test_auth_with_scopes`; the
+    // tests asserting a 401 go through `create_router` with no credential.
     #[cfg(not(feature = "db"))]
     mod event_tests {
         use super::super::*;
