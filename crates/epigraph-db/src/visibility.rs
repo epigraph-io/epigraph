@@ -454,6 +454,13 @@ impl Viewer {
             }
             group_ids.push(group_id);
         }
+        // Migration 234 (owner decision 2026-11-21, the read counterpart of
+        // D-V3): an operated agent also READS the teams its live human reads.
+        // READ set only: a team write still goes through
+        // `epigraph_writable_teams` and `with_team_write_grant`.
+        group_ids.extend(
+            GroupMembershipRepository::list_operator_readable_teams(pool, principal).await?,
+        );
         group_ids.sort_unstable();
         group_ids.dedup();
         writable.sort_unstable();

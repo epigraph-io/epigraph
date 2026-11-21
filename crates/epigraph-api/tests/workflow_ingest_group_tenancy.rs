@@ -599,6 +599,11 @@ struct World {
     c_embeds: EmbedCalls,
     f: Uuid,
     f_server: epigraph_mcp::server::EpiGraphMcpFull,
+    /// An agent of the OTHER human (`h2`): it writes `og2` and reads nothing of
+    /// `g`, because neither it nor its human is a member. Since migration 234 an
+    /// operated agent reads its live human's teams, so `f` (linked to `h`, `g`'s
+    /// admin) reads `g`; the "cannot read `g`" cases use `x` instead.
+    x_server: epigraph_mcp::server::EpiGraphMcpFull,
 }
 
 async fn world(pool: &PgPool) -> World {
@@ -627,6 +632,9 @@ async fn world(pool: &PgPool) -> World {
     let (f_server, _) = mcp_server(pool, 0xF1).await;
     let f = stdio_agent(pool, &f_server, 0xF1).await;
     link(pool, f, h).await;
+    let (x_server, _) = mcp_server(pool, 0xA7).await;
+    let x = stdio_agent(pool, &x_server, 0xA7).await;
+    link(pool, x, h2).await;
     let g = team_group(pool, h).await;
     add_member(pool, g, system, "writer").await;
     add_member(pool, g, c, "writer").await;
@@ -644,6 +652,7 @@ async fn world(pool: &PgPool) -> World {
         c_embeds,
         f,
         f_server,
+        x_server,
     }
 }
 
@@ -1272,11 +1281,13 @@ async fn a_reused_claim_private_to_a_group_the_caller_does_not_write_refuses_the
         "the refusal wrote no claim, edge, workflow or BBA"
     );
 
-    // A re-ingest of the owner's generation by f: refused (f cannot read the
-    // lineage), naming neither g nor the workflow, and writing nothing.
-    let refused = stdio_ingest(&w.f_server, mcp_params(owner, Some(w.og)))
+    // A re-ingest of the owner's generation by x (an agent of the other human,
+    // which reads nothing of g; f reads g through h since migration 234):
+    // refused (x cannot read the lineage), naming neither g nor the workflow,
+    // and writing nothing.
+    let refused = stdio_ingest(&w.x_server, mcp_params(owner, Some(w.og2)))
         .await
-        .expect_err("a re-ingest of a lineage f cannot read is refused");
+        .expect_err("a re-ingest of a lineage x cannot read is refused");
     assert!(refused.contains("cannot read"), "{refused}");
     assert!(
         !refused.contains(&w.g.to_string())
@@ -1697,17 +1708,19 @@ async fn a_re_ingest_reports_only_the_plan_the_caller_can_read(pool: PgPool) {
 
     let before = row_counts(&pool).await;
 
-    // f writes og but is not a member of g: undeclared, and declared into og.
-    // Workflow writes run on f's own stamp, so a lineage with generations f
-    // cannot read is refused (migration 202): the same answer for both plans,
-    // carrying nothing of the private plan (no id, no size).
-    for declared_group in [None, Some(w.og)] {
+    // x (an agent of the other human) writes og2 and reads nothing of g:
+    // undeclared, and declared into og2. (f no longer fits: since migration 234
+    // it reads g through its human h.) Workflow writes run on x's own stamp, so
+    // a lineage with generations x cannot read is refused (migration 202): the
+    // same answer for both plans, carrying nothing of the private plan (no id,
+    // no size).
+    for declared_group in [None, Some(w.og2)] {
         let mut answers = Vec::new();
         for (body, name) in [
             (&small, "acme-plan-size-small"),
             (&large, "acme-plan-size-large"),
         ] {
-            let refused = stdio_ingest(&w.f_server, mcp_params(body.clone(), declared_group))
+            let refused = stdio_ingest(&w.x_server, mcp_params(body.clone(), declared_group))
                 .await
                 .expect_err("a non-member's re-ingest of a hidden lineage is refused");
             assert!(refused.contains("cannot read"), "{refused}");
@@ -3489,17 +3502,31 @@ async fn over_mcp_deprecating_a_declared_generation_is_its_groups_alone(pool: Pg
 async fn a_stdio_cascade_into_a_descendant_the_agent_cannot_read_is_refused(pool: PgPool) {
     let w = world(&pool).await;
     let (w1, w2) = reused_step_generations_into(&w, &pool, "acme-hidden-cascade", w.g).await;
-    let reads_g: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM group_memberships WHERE group_id = $1 AND agent_id = $2)",
+    // Since migration 234 an operated agent reads its live human's teams, so f
+    // (h's delegate) would read W2 through h, g's admin. For "a descendant it
+    // cannot read" h leaves g after writing W2: then neither f nor its human
+    // reads W2's group, while f stays h's live delegate for W1's gate.
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
     )
     .bind(w.g)
-    .bind(w.f)
+    .bind(w.h)
+    .execute(&pool)
+    .await
+    .expect("h leaves g");
+    let reads_g: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = ANY($2) AND revoked_at IS NULL)",
+    )
+    .bind(w.g)
+    .bind(vec![w.f, w.h])
     .fetch_one(&pool)
     .await
-    .expect("f's membership");
+    .expect("f's and h's memberships");
     assert!(
         !reads_g,
-        "premise: the fleet agent is not a member of W2's group"
+        "premise: neither the fleet agent nor its human is a live member of W2's group"
     );
     let (t1, t2) = (
         workflow_truth(&pool, w1).await,

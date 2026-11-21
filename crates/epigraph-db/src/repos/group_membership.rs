@@ -697,6 +697,43 @@ impl GroupMembershipRepository {
         Ok(rows)
     }
 
+    /// The TEAM groups `agent_id` may READ through its LIVE human only (owner
+    /// decision 2026-11-21, migration 234's `epigraph_readable_teams`, rows
+    /// `via = 'operator'`): the read counterpart of D-V3. Teams the agent
+    /// itself is a member of are already in [`Self::list_live_for_agent`].
+    ///
+    /// On a database without migration 234 (SQLSTATE 42883, the function does
+    /// not exist) this answers EMPTY and logs once per call: it never adds
+    /// authority it cannot verify, and it never breaks every read of a binary
+    /// deployed one step ahead of its migration.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails for any other reason.
+    pub async fn list_operator_readable_teams(
+        pool: &PgPool,
+        agent_id: Uuid,
+    ) -> Result<Vec<Uuid>, DbError> {
+        let rows: Result<Vec<Uuid>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT group_id FROM public.epigraph_readable_teams($1) WHERE via = 'operator'",
+        )
+        .bind(agent_id)
+        .fetch_all(pool)
+        .await;
+        match rows {
+            Ok(v) => Ok(v),
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("42883") => {
+                tracing::warn!(
+                    target: "tenancy",
+                    agent = %agent_id,
+                    "epigraph_readable_teams is missing (migration 234 not applied): an operated \
+                     agent reads its own groups only"
+                );
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Whether `agent_id` holds a live `writer` or `admin` membership of
     /// `group_id`, on `conn` (any stamp): the same live-membership definer
     /// [`Self::list_live_for_agent`] (and so `Viewer::resolve`) reads, asked
