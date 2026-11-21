@@ -9,6 +9,7 @@
 # What it runs, in CI's terms:
 #   lint job: fmt, workspace clippy, the no-db check, the genai clippy pair,
 #             the tls clippy and the two tls tests (none needs a database);
+#   lint-features job: the two epigraph-cli no-db checks;
 #   test job: build, then (only with DATABASE_URL) the non-DB workspace tests
 #             and each DB package on its own, with CI's excludes and thread
 #             counts.
@@ -53,6 +54,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 # features, so without these a change passes here and fails CI.
 step "cargo check -p epigraph-api --no-default-features --locked"
 cargo check -p epigraph-api --no-default-features --locked
+
+# The CI `lint-features` job's epigraph-cli no-db checks: `db` is default-on,
+# so nothing else compiles the cli lib, its bins or its lib tests without it.
+step "cargo check -p epigraph-cli --no-default-features --locked"
+cargo check -p epigraph-cli --no-default-features --locked
+step "cargo test -p epigraph-cli --no-default-features --lib --no-run --locked"
+cargo test -p epigraph-cli --no-default-features --lib --no-run --locked
 
 # One invocation per package, as in ci.yml: a combined `-p a -p b` run unifies
 # features and can hide a break that only one package alone shows.

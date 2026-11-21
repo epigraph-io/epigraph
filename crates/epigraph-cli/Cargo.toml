@@ -105,17 +105,23 @@ path = "src/bin/ingest_literature.rs"
 name = "ingest_git"
 path = "src/bin/ingest_git.rs"
 
+# `db` only: queries through sqlx on a MaintenancePool, so it cannot build with the feature off.
 [[bin]]
 name = "embed_bridge"
 path = "src/bin/embed_bridge.rs"
+required-features = ["db"]
 
+# `db` only: queries through sqlx on a MaintenancePool, so it cannot build with the feature off.
 [[bin]]
 name = "analyze_graph"
 path = "src/bin/analyze_graph.rs"
+required-features = ["db"]
 
+# `db` only: queries through sqlx, so it cannot build with the feature off.
 [[bin]]
 name = "compare_routes"
 path = "src/bin/compare_routes.rs"
+required-features = ["db"]
 
 [[bin]]
 name = "rerank_bridges"
@@ -132,9 +138,11 @@ name = "bridge_sweep"
 path = "src/bin/bridge_sweep.rs"
 required-features = ["genai"]
 
+# `db` only: migrates through a MaintenancePool, so it cannot build with the feature off.
 [[bin]]
 name = "dekg"
 path = "src/bin/dekg.rs"
+required-features = ["db"]
 
 [[bin]]
 name = "method_search"

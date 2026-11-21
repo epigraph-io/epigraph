@@ -761,6 +761,25 @@ jobs:
         # replays need no new entry. Warnings are not denied here: the
         # not(db) arm carries unused imports that the db arm needs.
         run: cargo test -p epigraph-api --no-default-features --lib --locked
+      - name: epigraph-cli no-db build check
+        # epigraph-cli's `db` feature is default-on and no other step built the
+        # crate without it, so the Atlas modules (atlas_naming, atlas_nightly)
+        # landed ungated and the no-db lib stopped compiling (37 errors) with
+        # no signal. The same blind spot hid four bins that use sqlx or
+        # MaintenancePool without `required-features = ["db"]`. Same scope as
+        # the api's "No-db build check": lib+bins, NOT --all-targets, because
+        # this crate's [dev-dependencies] on epigraph-db and sqlx are
+        # non-optional. Warnings are not denied: without `db` some
+        # dependencies only db code uses are reported unused.
+        run: cargo check -p epigraph-cli --no-default-features --locked
+      - name: epigraph-cli no-db lib-test build check
+        # The step above is `cargo check` over lib+bins, so it never compiles
+        # the crate's `#[cfg(test)]` modules: an ungated test module that uses
+        # a db-only item (e.g. `crate::atlas_meaning`) would break the no-db
+        # lib-test target while that check stays green, the same blind spot
+        # the api's "No-db lib-test build check" closes. This compiles the
+        # target without running it. Warnings are not denied, as above.
+        run: cargo test -p epigraph-cli --no-default-features --lib --no-run --locked
 
   # services/kanban is standard-library-only Python with its own end-to-end
   # suite (stub `gh`/`claude` binaries, a throwaway local git origin, `urlopen`
