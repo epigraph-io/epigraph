@@ -378,6 +378,7 @@ Repo wrappers: `ClaimRepository::publicize_conn`, `share_with_team_conn` and
 * D-V1: several teams and no default → private with a note; `set_default_group` then makes
   the next write land in the default team.
 * D-V3: an operated agent writes into its live human's team.
+* D-V3 read counterpart (migration 234): the same operated agent reads its live human's teams, including one where the human is only a `reader`, and reads back the claim it just wrote there. Its writable set does not grow.
 * D-V4: a resubmit under another visibility returns the existing claim, unchanged, with a
   `visibility_note`.
 * `publicize_claims` by a team admin (D-V2) works. The claim and the edge to a public claim
@@ -434,6 +435,13 @@ now measures the stamped structural edges), and the explicit-`public` fixtures.
   → `epigraph_operator_writes_group`). The author-stamped transaction then carries T in its
   writable set for that one write (`Viewer::with_team_write_grant`, admitted only from
   `epigraph_writable_teams`), so 077's `WITH CHECK` agrees with the trigger.
+* **D-V3's read counterpart (owner decision 2026-11-21, migration 234): an operated agent reads
+  where its live human reads.** `Viewer::resolve` adds every active team or community its live
+  human holds a live DIRECT membership of, at any role, to the agent's READ set. A group the human
+  reaches only through a role binding is left to that binding's `agent_mode` (179)
+  (`epigraph_readable_teams`, `via = 'operator'`). The writable set is unchanged: a team write
+  still needs D-V3's writer rule and `with_team_write_grant`. Before 234 an operated stdio
+  signer could write into its human's team and then not read the claim back.
 * **D-V4 duplicates across visibilities: return the existing claim, flagged.** When
   `create_or_get` returns an existing claim whose `(visibility, owner_group_id)` differs from
   the request, the claim is returned unchanged. The response carries its real visibility and a
