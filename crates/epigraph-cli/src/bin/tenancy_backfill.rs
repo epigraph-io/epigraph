@@ -1714,6 +1714,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // an owner the migration's guarded `OWNER TO` failed to set.
     ("epigraph_writable_teams", 206),
     ("epigraph_default_group", 206),
+    // 234, an operated agent reads the teams its live human reads (the read
+    // counterpart of D-V3). It reads `groups` exactly as
+    // `epigraph_writable_teams` does, so under a non-member owner it fails
+    // CLOSED and SILENTLY the same way: no team is added to an operated
+    // agent's read set. The owner is load-bearing.
+    ("epigraph_readable_teams", 234),
     // 206's default-team write changes only the principal's own `agents` row
     // and writes a principal-attributed audit row, both of which 077 admits
     // for any owner, and its authority check goes through the read above, so a
@@ -2892,6 +2898,15 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_writable_teams",
             "public.epigraph_writable_teams(uuid)",
+            true,
+        ),
+        // 234: `Viewer::resolve` asks it on EVERY viewer resolution, so a
+        // missing grant would be 42501 on every request (an outage), not a
+        // feature quietly off. The repo maps only 42883 (no such function,
+        // migration not yet applied) to "no team".
+        (
+            "epigraph_readable_teams",
+            "public.epigraph_readable_teams(uuid)",
             true,
         ),
         (
