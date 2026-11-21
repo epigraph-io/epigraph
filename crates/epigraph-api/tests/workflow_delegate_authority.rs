@@ -1375,8 +1375,21 @@ async fn a_delegate_is_answered_as_unknown_on_a_row_it_cannot_read(pool: PgPool)
     assert_eq!(
         workflow_row(&pool, wf).await,
         ("group".to_string(), w.t, Some(w.p.to_string())),
-        "PREMISE: p's, private to t, which d does not read"
+        "PREMISE: p's, private to t"
     );
+    // Since migration 234 an operated agent (a live delegate included) reads its
+    // live human's teams, so d would read t through p. For "a row the delegate
+    // cannot read", p leaves t after writing the workflow: then neither d nor p
+    // reads it, and d is still p's live delegate.
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(w.t)
+    .bind(w.p)
+    .execute(&pool)
+    .await
+    .expect("p leaves t");
     let step = steps_of(&pool, wf).await[0];
     let unknown_name = "acme-delegate-hidden-in-tean";
     let unknown_step = Uuid::new_v4();
