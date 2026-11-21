@@ -40,7 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
+use rmcp::model::{CallToolRequestParams, CallToolResult, ResultType, Tool};
 use rmcp::serve_client;
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::{
@@ -362,7 +362,7 @@ pub async fn invoke_once(
     let mut params = CallToolRequestParams::new(name.to_string());
     params.arguments = arguments;
     let result = match tokio::time::timeout(call_timeout, client.peer().call_tool(params)).await {
-        Ok(Ok(result)) => Ok(result),
+        Ok(Ok(result)) => Ok(as_complete_result(result)),
         Ok(Err(rmcp::ServiceError::McpError(e))) => Err(FederationError::Downstream(e)),
         Ok(Err(e)) => Err(FederationError::Request(e.to_string())),
         Err(_elapsed) => Err(FederationError::CallTimeout {
@@ -374,6 +374,32 @@ pub async fn invoke_once(
     // is the whole point of the ephemeral-per-call model. Dropping after we have
     // the result keeps the RAII contract obvious to future readers.
     drop(client);
+    result
+}
+
+/// Give a downstream's `tools/call` result the SEP-2322 `resultType` it lacks
+/// when the downstream negotiated a revision older than `2026-07-28`.
+///
+/// Such a downstream (episcience-mcp speaks `2025-03-26`) omits the field, and
+/// rmcp deserializes the absence as `result_type: None`. Relayed as-is, the
+/// gateway answers a `2026-07-28` caller WITHOUT `resultType`, which that
+/// revision requires of every server result: claude.ai rejected exactly that
+/// (backlog e3614de6, "missing required resultType"). Kernel tools never hit
+/// this because every rmcp constructor (`CallToolResult::success`, ...) sets
+/// `Some(ResultType::COMPLETE)`.
+///
+/// `"complete"` is what an absent field means in the older revision (rmcp's
+/// `ResultType` doc: "clients MUST treat an absent field as `complete`"), and
+/// rmcp's `CallToolResult` deserializer rejects any other value, so `None` is
+/// the only case to fill. Filling it unconditionally still answers each
+/// caller in ITS revision: rmcp's server handler
+/// (`Service<RoleServer>::handle_request`) calls
+/// `ServerResult::strip_result_type_for_legacy_peer` for callers older than
+/// `2026-07-28`, removing `"complete"` again, exactly as it does for kernel
+/// results; only `2026-07-28`+ callers (the `fill_missing_cache_hints`
+/// branch) keep it.
+fn as_complete_result(mut result: CallToolResult) -> CallToolResult {
+    result.result_type.get_or_insert(ResultType::COMPLETE);
     result
 }
 
