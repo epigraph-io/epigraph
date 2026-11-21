@@ -1685,12 +1685,26 @@ pub struct AssignUnthemedRequest {
     pub batch_size: Option<i64>,
 }
 
-/// Assign all unthemed claims (with embeddings) to their nearest theme centroid.
+/// Assign unthemed claims (with embeddings) to their nearest theme centroid,
+/// as far as the CALLER may write them.
 ///
 /// POST /api/v1/themes/assign-unthemed
 ///
 /// Loops internally in batches until no more unthemed claims remain.
 /// Returns total count of newly assigned claims.
+///
+/// # Only the claims the caller can write
+///
+/// Each batch runs on the request's connection, under the caller's row
+/// security, and each commits on its own. Row security hides the claims the
+/// caller cannot read, and a batch holding a claim it can read but not write
+/// (another group's public claim) is refused by the database as a whole with
+/// SQLSTATE 42501 (prod, 2026-11-21: "new row violates row-level security
+/// policy for table claims", which this route used to answer as a 500). So no
+/// token can assign the whole corpus here. That refusal is answered 403,
+/// naming the batches already committed and the operator CLI that does the
+/// corpus-wide assignment on the maintenance connection,
+/// `assign_unthemed_themes` (crates/epigraph-cli; backlog d5f9829a).
 #[cfg(feature = "db")]
 pub async fn assign_unthemed(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -1713,7 +1727,14 @@ pub async fn assign_unthemed(
     loop {
         let assigned =
             ClaimThemeRepository::assign_unthemed_batch(&state.db_pool, &viewer, batch_size)
-                .await?;
+                .await
+                .map_err(|e| {
+                    if crate::errors::db_is_insufficient_privilege(&e) {
+                        assign_unthemed_refused(total)
+                    } else {
+                        e.into()
+                    }
+                })?;
 
         if assigned == 0 {
             break;
@@ -1724,6 +1745,22 @@ pub async fn assign_unthemed(
     Ok(Json(serde_json::json!({
         "assigned": total,
     })))
+}
+
+/// The 403 [`assign_unthemed`] answers when the database refuses a batch
+/// (SQLSTATE 42501). Not [`crate::errors::write_refused`]: the batches before
+/// the refused one committed, so "nothing was written" would be false.
+#[cfg(feature = "db")]
+fn assign_unthemed_refused(assigned_before: i64) -> ApiError {
+    ApiError::Forbidden {
+        reason: format!(
+            "the database refused a theme-assignment batch: it holds a claim this caller \
+             cannot write ({assigned_before} claims were assigned by earlier batches and stay \
+             assigned). This route only covers claims the caller can write; assign the whole \
+             corpus with the operator CLI assign_unthemed_themes on the maintenance connection \
+             (dry run by default, then --apply)"
+        ),
+    }
 }
 
 #[cfg(not(feature = "db"))]
