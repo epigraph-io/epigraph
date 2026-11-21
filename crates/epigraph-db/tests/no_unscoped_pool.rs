@@ -581,6 +581,16 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          verify and before anything is minted: the same pre-authentication reason.",
     ),
     (
+        "oauth/token_exchange.rs",
+        1,
+        "Pre-authentication, as `oauth/token.rs`: the RFC 8693 token-exchange grant (backlog \
+         c9b82fae) mints an extension-audience token from a subject token the request carries, \
+         so no Viewer precedes it. Its one pool binding is the subject client's row by id \
+         (`oauth_clients`, no RLS), read for its status before anything is returned. The \
+         revocation-denylist read goes through `middleware::bearer::access_token_is_revoked`, \
+         which is that file's site, not this one's. None reads a tenancy-partitioned row.",
+    ),
+    (
         "routes/elevate.rs",
         5,
         "Pre-authentication, BY DESIGN rather than by sequence. The passkey enrollment ceremony \

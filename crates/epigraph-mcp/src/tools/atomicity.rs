@@ -191,7 +191,7 @@ pub async fn query_compound_claims(
     // page.
     'walk: while hits.len() < limit && scanned < max_scan {
         let want = SCAN_PAGE.min((max_scan - scanned) as i64);
-        let page = AtomicityScreenRepository::page(&mut *read, viewer, population, after, want)
+        let page = AtomicityScreenRepository::page(&mut read, viewer, population, after, want)
             .await
             .map_err(internal_error)?;
         let n = page.len();

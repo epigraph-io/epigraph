@@ -1520,7 +1520,9 @@ pub struct SubmitDsEvidenceParams {
                        pre-existing caller byte-for-byte. A tag outside the calibration vocabulary \
                        (and not in the frame's evidence_type_weights override) is still stored, but \
                        is combined at the 0.5 unknown-type reliability and returned in the \
-                       response's unknown_keys and warnings."
+                       response's unknown_keys and warnings. It is stored trimmed and lowercased \
+                       (or as its canonical key), at most 50 characters; a longer one is refused \
+                       as an invalid parameter with nothing written."
     )]
     #[serde(default)]
     pub evidence_type: Option<String>,

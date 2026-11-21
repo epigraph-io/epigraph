@@ -33,8 +33,13 @@
 //!   group, not HG and not NULL. (Their OWNER is the edges trigger's call,
 //!   not this handler's: migration 120 keeps a claim -> frame or perspective
 //!   -> claim edge between public endpoints world-owned.)
-//!   The operator's own submission on that public claim lands its
+//!   The operator's own submissions on that public claim land its
 //!   perspective-scoped belief and divergence record.
+//!
+//! A claim's first Beta update (its track still at the `Beta(1, 1)` prior) is
+//! a cold start and records no divergence row (backlog candidate
+//! 913-cold-start-divergence), so the divergence assertions below count from
+//! the second update a claim's track takes.
 //! * `a_community_scoped_belief_lands_in_the_operators_group`: step 17's
 //!   community scope, on a group claim: the member BBAs are read as the
 //!   caller and the community-scoped belief lands in HG.
@@ -311,6 +316,23 @@ async fn perspective_belief_owner(w: &World, t: &Target) -> Option<Uuid> {
     .expect("read ds_combined_beliefs")
 }
 
+/// Give the target claim hypothesis 0 on its frame, as a framed write
+/// (`submit_ds_evidence`, the frame-assign route) would. The REST handler
+/// assigns the claim with no index when it has none, and a BBA with no index
+/// moves neither Beta parameter, so without this the claim's Beta track never
+/// leaves the prior and every submission is a cold start with no divergence
+/// record. The handler's `ON CONFLICT DO NOTHING` keeps this index.
+async fn assign_hypothesis_zero(w: &World, t: &Target) {
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(t.claim)
+    .bind(t.frame)
+    .execute(&w.pool)
+    .await
+    .expect("assign the claim hypothesis 0");
+}
+
 /// The owners of the divergence records for (claim, frame).
 async fn divergence_owners(w: &World, t: &Target) -> Vec<Uuid> {
     sqlx::query_scalar(
@@ -336,6 +358,7 @@ async fn bba_count(w: &World, t: &Target) -> i64 {
 async fn a_group_claims_edges_and_derived_rows_land_in_the_operators_group(pool: PgPool) {
     let w = armed_world(pool).await;
     let t = target(&w, "group").await;
+    assign_hypothesis_zero(&w, &t).await;
 
     let resp = submit(&w, &t, w.agent)
         .await
@@ -365,8 +388,8 @@ async fn a_group_claims_edges_and_derived_rows_land_in_the_operators_group(pool:
     );
     assert_eq!(
         divergence_owners(&w, &t).await,
-        vec![w.hg],
-        "one divergence record, in H's group"
+        Vec::<Uuid>::new(),
+        "the claim's first Beta update is a cold start: no divergence record"
     );
 
     // Again on the same (claim, frame), by H itself (another source agent, so
@@ -392,8 +415,9 @@ async fn a_group_claims_edges_and_derived_rows_land_in_the_operators_group(pool:
     );
     assert_eq!(
         divergence_owners(&w, &t).await,
-        vec![w.hg, w.hg],
-        "each submission records its divergence, in H's group"
+        vec![w.hg],
+        "the second submission, on a track holding evidence, records its divergence, \
+         in H's group"
     );
 }
 
@@ -401,6 +425,7 @@ async fn a_group_claims_edges_and_derived_rows_land_in_the_operators_group(pool:
 async fn attribution_follows_the_caller_not_the_claims_owner(pool: PgPool) {
     let w = armed_world(pool).await;
     let t = target(&w, "public").await;
+    assign_hypothesis_zero(&w, &t).await;
 
     submit(&w, &t, w.stranger)
         .await
@@ -420,6 +445,12 @@ async fn attribution_follows_the_caller_not_the_claims_owner(pool: PgPool) {
     submit(&w, &t, w.human)
         .await
         .expect("H submits on its own public claim");
+    // H's first submission moved the claim's Beta track off the prior (the
+    // stranger's could not write it), a cold start with no divergence record;
+    // the identical resubmission, on a track holding evidence, records one.
+    submit(&w, &t, w.human)
+        .await
+        .expect("H resubmits on its own public claim");
     assert!(
         perspective_belief_owner(&w, &t).await.is_some(),
         "the perspective-scoped belief lands on a public claim"

@@ -5,9 +5,15 @@
 //! per-invocation database target without forking the ingestion logic away from
 //! the MCP tool.
 //!
+//! It signs every claim it writes, so it needs a real key: `--agent-key-file`,
+//! `EPIGRAPH_INGEST_AGENT_KEY` or `--agent-key` (backlog bfc2eff8). There is
+//! no default signer: the old one, the `document-ingest-cli` name-derived key,
+//! was `BLAKE3("author:document-ingest-cli")`, which anyone can compute, and
+//! is refused even when given explicitly.
+//!
 //! The claims it creates take `--visibility` / `--group-id` exactly as the MCP
 //! tools take `visibility` / `group_id`, resolved for the acting agent (the
-//! `--agent-key` signer). Omitted, they resolve D-V1 (team, else private), so
+//! signer). Omitted, they resolve D-V1 (team, else private), so
 //! an operator ingest's claims are never public unless `--visibility public`
 //! says so. Where they landed is printed on stderr. The setting scopes the
 //! CLAIMS only: the `papers` row (title, DOI, journal), the author agents and
@@ -38,10 +44,24 @@ struct Cli {
     #[arg(long)]
     file: PathBuf,
 
-    /// Ed25519 secret key as 64 hex chars. If omitted, uses a deterministic
-    /// document-ingest-cli signer so repeated operator runs share attribution.
-    #[arg(long)]
+    /// The signer's Ed25519 secret key as 64 hex chars. Prefer
+    /// `--agent-key-file` or the environment: a value on the command line is
+    /// visible to every local user in the process list. One of the three is
+    /// REQUIRED (there is no default signer), and the publicly computable
+    /// `document-ingest-cli` key is refused. Make one with
+    /// `openssl rand -hex 32`, and keep it: the key IS the acting agent.
+    #[arg(
+        long,
+        env = "EPIGRAPH_INGEST_AGENT_KEY",
+        hide_env_values = true,
+        conflicts_with = "agent_key_file"
+    )]
     agent_key: Option<String>,
+
+    /// A file holding the signer's Ed25519 secret key (64 hex chars;
+    /// surrounding whitespace is ignored). Alternative to `--agent-key`.
+    #[arg(long)]
+    agent_key_file: Option<PathBuf>,
 
     /// OpenAI API key for embedding generation. If omitted, embeddings use the
     /// MCP embedder's mock/no-provider behavior.
@@ -115,7 +135,8 @@ async fn run(
     let extraction: DocumentExtraction =
         serde_json::from_str(&data).context("invalid DocumentExtraction JSON")?;
 
-    let signer = signer_from_cli(cli.agent_key.as_deref())?;
+    let key_text = agent_key_text(cli.agent_key.as_deref(), cli.agent_key_file.as_deref())?;
+    let signer = signer_from_cli(key_text.as_deref())?;
     // `on_a_privileged_pool`, not `with_scoped_pool`: `pool` here is
     // `MaintenancePool::pool()` — see the comment in `main` above, which records
     // that this bin's whole ingest deliberately runs on the maintenance pool
@@ -168,8 +189,8 @@ async fn run(
         .ok_or_else(|| anyhow!("ingest_document returned no text content"))?;
 
     // stdout stays the ingest's JSON; where the claims landed goes to stderr,
-    // because a default ingest by a teamless agent (the built-in signer with no
-    // `--agent-key`) lands PRIVATE, and an operator must not have to guess.
+    // because a default ingest by a teamless agent (a fresh key with no team)
+    // lands PRIVATE, and an operator must not have to guess.
     eprintln!("{}", tenancy_line(&tenancy));
     println!("{text}");
     Ok(())
@@ -190,15 +211,53 @@ fn tenancy_line(t: &IngestTenancy) -> String {
     line
 }
 
-fn signer_from_cli(agent_key: Option<&str>) -> anyhow::Result<AgentSigner> {
-    if let Some(raw) = agent_key {
-        let key = parse_agent_key(raw)?;
-        return AgentSigner::from_bytes(&key).context("invalid --agent-key");
+/// The key text from `--agent-key` / `EPIGRAPH_INGEST_AGENT_KEY`, or read
+/// from `--agent-key-file` (clap refuses both at once). The read error names
+/// the path, never the content.
+fn agent_key_text(
+    agent_key: Option<&str>,
+    agent_key_file: Option<&std::path::Path>,
+) -> anyhow::Result<Option<String>> {
+    match (agent_key, agent_key_file) {
+        (Some(raw), _) => Ok(Some(raw.to_string())),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map(Some)
+            .with_context(|| format!("cannot read --agent-key-file {}", path.display())),
+        (None, None) => Ok(None),
     }
+}
 
-    Ok(epigraph_crypto::did_key::keypair_from_name(
-        "document-ingest-cli",
-    ))
+/// The name the pre-bfc2eff8 default signer was derived from. Its key is
+/// `BLAKE3("author:document-ingest-cli")`, so anyone can compute it.
+const LEGACY_DEFAULT_SIGNER_NAME: &str = "document-ingest-cli";
+
+/// The signer for `agent_key` (the key text, from whichever source).
+///
+/// # Errors
+/// No key (there is no default signer), a malformed key, or the legacy
+/// default's publicly computable key. No message echoes the key.
+fn signer_from_cli(agent_key: Option<&str>) -> anyhow::Result<AgentSigner> {
+    let Some(raw) = agent_key else {
+        return Err(anyhow!(
+            "ingest-document signs every claim it writes and needs a real key: pass \
+             --agent-key-file <path> (a file holding 64 hex chars, e.g. from \
+             `openssl rand -hex 32`), set EPIGRAPH_INGEST_AGENT_KEY, or pass --agent-key. \
+             There is no default signer: the old one (the {LEGACY_DEFAULT_SIGNER_NAME:?} \
+             name-derived key) is computable by anyone and is refused"
+        ));
+    };
+    let key = parse_agent_key(raw)?;
+    let signer = AgentSigner::from_bytes(&key).context("invalid --agent-key")?;
+    if signer.public_key()
+        == epigraph_crypto::did_key::keypair_from_name(LEGACY_DEFAULT_SIGNER_NAME).public_key()
+    {
+        return Err(anyhow!(
+            "--agent-key is the {LEGACY_DEFAULT_SIGNER_NAME:?} name-derived key, whose private \
+             half anyone can compute from that name; refusing to sign with it. Use a random key \
+             (`openssl rand -hex 32`)"
+        ));
+    }
+    Ok(signer)
 }
 
 /// Parse an `--agent-key` value into its 32 bytes.
@@ -207,8 +266,8 @@ fn signer_from_cli(agent_key: Option<&str>) -> anyhow::Result<AgentSigner> {
 /// shell variable can carry a trailing space, CR or newline). What is left must
 /// be exactly 64 ASCII hex characters. Every other input is a named error,
 /// never a panic — the byte-pair slicing this replaces (`&key_hex[i..i + 2]`)
-/// panicked on an odd length and on a multi-byte character — and never the
-/// deterministic default signer, because the operator asked for one specific
+/// panicked on an odd length and on a multi-byte character — and never
+/// some other signer, because the operator asked for one specific
 /// key. No message echoes any part of the value: it is a secret, and `main`
 /// prints the error. Same rules as epigraph-mcp's `--agent-key` parsing
 /// (PR #516).
@@ -246,14 +305,53 @@ mod agent_key_tests {
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
 
+    /// Backlog bfc2eff8: there is no default signer. No key is an error that
+    /// says how to supply one, and the old default's key (the
+    /// `document-ingest-cli` name-derived key, computable by anyone) is
+    /// refused even when given explicitly, padded or in upper case.
+    /// Mutation caught: restoring the default, or dropping the literal-seed
+    /// check.
+    #[test]
+    fn no_key_and_the_literal_seeded_key_are_refused() {
+        let Err(err) = signer_from_cli(None) else {
+            panic!("no key must be refused: the old default signs with a public key");
+        };
+        let msg = format!("{err:?}");
+        for named in [
+            "--agent-key-file",
+            "EPIGRAPH_INGEST_AGENT_KEY",
+            "--agent-key",
+        ] {
+            assert!(msg.contains(named), "the refusal must name {named}: {msg}");
+        }
+
+        // The legacy default's SECRET, recomputed from the public name: what
+        // an attacker (or an operator copying old docs) would pass.
+        let legacy =
+            epigraph_crypto::did_key::keypair_from_name("document-ingest-cli").secret_key();
+        let legacy_hex = hex::encode(legacy);
+        for given in [
+            legacy_hex.clone(),
+            format!("{legacy_hex}\n"),
+            legacy_hex.to_uppercase(),
+        ] {
+            let Err(err) = signer_from_cli(Some(&given)) else {
+                panic!("the publicly computable document-ingest-cli key must be refused");
+            };
+            let msg = format!("{err:?}");
+            assert!(msg.contains("anyone can compute"), "{msg}");
+            assert!(
+                !msg.contains(&legacy_hex[..16]),
+                "the refusal must not echo the key: {msg}"
+            );
+        }
+    }
+
     /// The clean key gives the signer for exactly those 32 bytes, and a key
-    /// with surrounding whitespace gives the SAME signer: not merely `Ok`,
-    /// which the deterministic default would also be.
+    /// with surrounding whitespace gives the SAME signer: not merely `Ok`.
     #[test]
     fn well_formed_key_is_that_signer_even_when_padded() {
         let expected = AgentSigner::from_bytes(&[1u8; 32]).unwrap().public_key();
-        let default = signer_from_cli(None).unwrap().public_key();
-        assert_ne!(expected, default, "fixture must differ from the default");
         for key in [
             KEY_HEX.to_string(),
             format!("{KEY_HEX} "),
@@ -271,7 +369,7 @@ mod agent_key_tests {
 
     /// Inputs the old byte-pair slicing PANICKED on (odd length, a multi-byte
     /// character inside 64 bytes), plus the other malformed shapes, are each
-    /// a clean `Err`: no panic, and never the deterministic default signer.
+    /// a clean `Err`: no panic, and never some other signer.
     #[test]
     fn malformed_keys_are_errors_not_panics_or_the_default() {
         let odd = &KEY_HEX[..63];

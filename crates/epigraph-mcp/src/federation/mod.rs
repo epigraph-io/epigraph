@@ -136,6 +136,21 @@ pub struct FederationRegistry {
     /// Effective names no extension may route: the kernel's own tools. Kept
     /// so the health timer applies the same rule `build` refused a clash under.
     reserved: HashSet<String>,
+    /// The kernel token endpoint every federated call exchanges the caller's
+    /// bearer at (RFC 8693). `None` until
+    /// [`with_token_exchange`](Self::with_token_exchange): every federated call
+    /// is then REFUSED rather than forwarded under the caller's own bearer
+    /// (backlog c9b82fae).
+    token_exchange: Option<client::TokenExchange>,
+}
+
+/// The refusal of a federated call on a registry with no token exchange.
+fn no_token_exchange() -> FederationError {
+    FederationError::Exchange(
+        "no token exchange endpoint is configured (EPIGRAPH_MCP_TOKEN_EXCHANGE_URL); the \
+         gateway never forwards a caller's own bearer to an extension"
+            .to_string(),
+    )
 }
 
 /// One extension as the health timer sees it: an owned snapshot taken under
@@ -166,6 +181,7 @@ impl FederationRegistry {
             discovery_token: String::new(),
             call_timeout: client::DEFAULT_CALL_TIMEOUT,
             reserved: HashSet::new(),
+            token_exchange: None,
         }
     }
 
@@ -174,6 +190,15 @@ impl FederationRegistry {
     #[must_use]
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
+        self
+    }
+
+    /// Exchange each caller's bearer at `exchange` (the kernel's RFC 8693
+    /// grant) and forward only the extension-audience token it returns.
+    /// Without this every federated call is refused.
+    #[must_use]
+    pub fn with_token_exchange(mut self, exchange: client::TokenExchange) -> Self {
+        self.token_exchange = Some(exchange);
         self
     }
 
@@ -303,6 +328,7 @@ impl FederationRegistry {
             discovery_token: discovery_token.to_string(),
             call_timeout: client::DEFAULT_CALL_TIMEOUT,
             reserved,
+            token_exchange: None,
         })
     }
 
@@ -357,7 +383,8 @@ impl FederationRegistry {
     }
 
     /// Proxy a federated `tools/call` to the owning extension on a fresh
-    /// ephemeral session authenticated with `caller_token`.
+    /// ephemeral session authenticated with a token exchanged for
+    /// `caller_token` (never `caller_token` itself).
     ///
     /// # Errors
     /// [`FederationError::Request`] if `effective_name` is not a federated tool
@@ -380,8 +407,13 @@ impl FederationRegistry {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
+        let Some(exchange) = self.token_exchange.as_ref() else {
+            return Err(no_token_exchange());
+        };
         client::invoke_once(
             &config.addr,
+            exchange,
+            &config.name,
             caller_token,
             downstream_name,
             arguments,
@@ -701,9 +733,17 @@ impl SharedFederation {
             Some(p) => effective_name.strip_prefix(p).unwrap_or(effective_name),
             None => effective_name,
         };
-        let call_timeout = self.read().call_timeout;
+        let (call_timeout, exchange) = {
+            let guard = self.read();
+            (guard.call_timeout, guard.token_exchange.clone())
+        };
+        let Some(exchange) = exchange else {
+            return Err(no_token_exchange());
+        };
         let result = client::invoke_once(
             &config.addr,
+            &exchange,
+            &config.name,
             caller_token,
             downstream_name,
             arguments,
@@ -977,6 +1017,7 @@ mod generation_tests {
             discovery_token: String::new(),
             call_timeout: client::DEFAULT_CALL_TIMEOUT,
             reserved: HashSet::new(),
+            token_exchange: None,
         }
     }
 

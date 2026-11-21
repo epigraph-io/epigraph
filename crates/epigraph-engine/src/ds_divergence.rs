@@ -23,11 +23,30 @@
 //! (`auto_wire_ds_update`) and the recompute paths. Rows older than
 //! `DivergenceRepository`'s TTL are not served either.
 //!
-//! A claim whose evidence was all stored before its writer kept the Beta track
-//! still holds the `Beta(1, 1)` prior. [`replay_beta_params`] rebuilds the
-//! parameters from its stored BBAs by the same arithmetic, and the operator
-//! backfill `replay_beta_track` (`epigraph-cli`'s `beta_replay`) applies it.
-//! The backfill writes no divergence row for that history.
+//! # A cold start records no divergence row
+//!
+//! A claim whose evidence was all stored by writers that do not keep this
+//! track (the seed and edge wires, assess discounts, evidence older than the
+//! track) still holds the `Beta(1, 1)` prior while its DS fold, and so its
+//! BetP, may be mature. Its first live update then compares that BetP against
+//! a posterior carrying one BBA's evidence and nothing else, which registers a
+//! large divergence that says nothing about the two calculi disagreeing.
+//! [`apply_beta_update`] reports such an update as a cold start
+//! ([`BetaUpdate::cold_start`]), and [`record_divergence`] stores no row for
+//! it, so a cold start never reaches `get_divergence` or `GET /divergence/top`.
+//! The claim's next live update, from a track that holds evidence, records its
+//! divergence as before. (The table has no column to flag a row with, and a
+//! flagged row would only be filtered out by every reader, so the row is not
+//! written.)
+//!
+//! [`replay_beta_params`] rebuilds the parameters from a claim's stored BBAs
+//! by the same arithmetic. Its operator backfill `replay_beta_track`
+//! (`epigraph-cli`'s `beta_replay`) is NOT to be applied: counting every
+//! stored BBA builds a track the live writers never would have (a dry run on a
+//! production-sized corpus put the replayed posteriors well below BetP and
+//! would have pushed thousands of claims into the top-divergent list), so its
+//! binary refuses `--apply` and only dry-runs. The cold-start rule above is
+//! what keeps those claims out of the list instead.
 //!
 //! # Best-effort, under a SAVEPOINT
 //!
@@ -80,8 +99,37 @@ pub fn beta_increments(bba: &MassFunction, hypothesis_index: Option<i32>) -> (f6
     (m_support.max(0.0), m_complement.max(0.0))
 }
 
+/// What [`apply_beta_update`] leaves: the Beta posterior, and whether it was
+/// computed from a track that held no counted evidence before this write.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BetaUpdate {
+    /// `alpha / (alpha + beta)` after this write's increments.
+    pub posterior: f64,
+    /// The parameters this posterior was computed from were still at the
+    /// `Beta(1, 1)` prior before this write: the claim's first counted update,
+    /// a resubmission on a claim whose track was never moved, or a refused
+    /// update (whose posterior is computed from the prior). Such a posterior
+    /// holds at most this one BBA's evidence, so its divergence from a mature
+    /// BetP is an artefact of the empty track, and [`record_divergence`] does
+    /// not record it.
+    pub cold_start: bool,
+}
+
+/// How far from `1.0` a parameter may sit and still count as the prior: the
+/// increments are non-negative, so a parameter within this of `1.0` has
+/// counted no evidence (only rounding from `(1 + d) - d`).
+const PRIOR_TOLERANCE: f64 = 1e-9;
+
+/// A claim's Beta parameters before a write and after it.
+type BeforeAfter = ((f64, f64), (f64, f64));
+
+fn at_prior((alpha, beta): (f64, f64)) -> bool {
+    (alpha - 1.0).abs() < PRIOR_TOLERANCE && (beta - 1.0).abs() < PRIOR_TOLERANCE
+}
+
 /// Add `increments` (when `Some`) to the claim's Beta parameters and return
-/// the posterior `alpha / (alpha + beta)`.
+/// the posterior `alpha / (alpha + beta)`, with whether the track was cold
+/// (still at the prior) before this write ([`BetaUpdate::cold_start`]).
 ///
 /// `increments` is `None` for a BBA that is not counted: an identical
 /// resubmission, whose update was applied when it was first stored. The
@@ -107,25 +155,28 @@ pub async fn apply_beta_update(
     claim_id: Uuid,
     increments: Option<(f64, f64)>,
     context: &str,
-) -> Result<f64, sqlx::Error> {
+) -> Result<BetaUpdate, sqlx::Error> {
     let mut sp = conn.begin().await?;
-    let outcome: Result<(f64, f64), epigraph_db::DbError> = async {
+    // The parameters before this write and after it.
+    let outcome: Result<BeforeAfter, epigraph_db::DbError> = async {
         if let Some((d_alpha, d_beta)) = increments {
             if let Some(stored) =
                 ClaimRepository::add_beta_increments(&mut sp, viewer, claim_id, d_alpha, d_beta)
                     .await?
             {
-                return Ok(stored);
+                // The update adds in SQL and returns only the sum; what it
+                // added was exactly these increments.
+                return Ok(((stored.0 - d_alpha, stored.1 - d_beta), stored));
             }
         }
-        let (alpha, beta) = ClaimRepository::get_beta_params(&mut sp, viewer, claim_id)
+        let before = ClaimRepository::get_beta_params(&mut sp, viewer, claim_id)
             .await?
             .unwrap_or((1.0, 1.0));
-        Ok(with_increments((alpha, beta), increments))
+        Ok((before, with_increments(before, increments)))
     }
     .await;
 
-    let (alpha, beta) = match outcome {
+    let (before, (alpha, beta)) = match outcome {
         Ok(params) => {
             sp.commit().await?;
             params
@@ -133,10 +184,13 @@ pub async fn apply_beta_update(
         Err(e) => {
             tracing::warn!("{context}: Beta update refused: {e}");
             sp.rollback().await?;
-            with_increments((1.0, 1.0), increments)
+            ((1.0, 1.0), with_increments((1.0, 1.0), increments))
         }
     };
-    Ok(alpha / (alpha + beta))
+    Ok(BetaUpdate {
+        posterior: alpha / (alpha + beta),
+        cold_start: at_prior(before),
+    })
 }
 
 /// `params` with the positive parts of `increments` added. The arithmetic the
@@ -196,11 +250,13 @@ pub async fn frame_version(
 }
 
 /// Store one `ds_bayesian_divergence` row for `(claim_id, frame_id)`:
-/// `pignistic_prob`, `bayesian_posterior` and their
+/// `pignistic_prob`, the [`apply_beta_update`] posterior `beta` and their
 /// [`kl_divergence_bernoulli`]. Returns whether the row was stored.
 ///
-/// A refusal (the claim's group is not writable on this session, a CHECK
-/// constraint) is logged and rolled back to the savepoint.
+/// A cold start ([`BetaUpdate::cold_start`]) stores nothing and returns
+/// `false`: see the module docs. A refusal (the claim's group is not writable
+/// on this session, a CHECK constraint) is logged and rolled back to the
+/// savepoint.
 ///
 /// # Errors
 /// Only when the savepoint cannot be opened or closed.
@@ -209,10 +265,19 @@ pub async fn record_divergence(
     claim_id: Uuid,
     frame_id: Uuid,
     pignistic_prob: f64,
-    bayesian_posterior: f64,
+    beta: BetaUpdate,
     frame_version: Option<i32>,
     context: &str,
 ) -> Result<bool, sqlx::Error> {
+    if beta.cold_start {
+        tracing::debug!(
+            %claim_id,
+            "{context}: no divergence row for a cold-start Beta update (the track held no \
+             evidence before this write)"
+        );
+        return Ok(false);
+    }
+    let bayesian_posterior = beta.posterior;
     let kl = kl_divergence_bernoulli(pignistic_prob, bayesian_posterior);
     let mut sp = conn.begin().await?;
     let stored = epigraph_db::DivergenceRepository::store(
@@ -277,6 +342,20 @@ mod tests {
             (kl_forward - kl_reverse).abs() < 1e-10,
             "symmetric case: forward={kl_forward}, reverse={kl_reverse}"
         );
+    }
+
+    /// The prior check behind [`BetaUpdate::cold_start`]: `(1 + d) - d` for a
+    /// first update reads as the prior despite rounding; any counted mass, even
+    /// a small one, does not.
+    #[test]
+    fn at_prior_tolerates_rounding_and_nothing_more() {
+        let (d_alpha, d_beta) = (0.1_f64 + 0.2, 0.7_f64);
+        let after = (1.0 + d_alpha, 1.0 + d_beta);
+        assert!(at_prior((after.0 - d_alpha, after.1 - d_beta)));
+        assert!(at_prior((1.0, 1.0)));
+        assert!(!at_prior((1.0 + 1e-6, 1.0)));
+        assert!(!at_prior((1.0, 1.05)));
+        assert!(!at_prior((1.8, 1.2)));
     }
 
     #[test]

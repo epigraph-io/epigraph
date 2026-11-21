@@ -219,12 +219,27 @@ pub async fn submit_ds_evidence(
     //   into the legacy branch too rather than silently accepting a
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_submitted_masses(&frame, &params.masses)?;
-    let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+    // Trimmed BEFORE the emptiness test, the same trim the canonicaliser
+    // applies: a whitespace-only type is stored as no type (NULL), so it must
+    // also take the legacy branch and apply `reliability`, exactly as if it
+    // were omitted. Tested untrimmed, it took the calibrated branch and its
+    // undiscounted masses were then combined at the legacy tier.
+    let calibrated_evidence_type = params
+        .evidence_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
     // caller's own key lowercased when the calibration does not know it
-    // (bc06ec6f). The vocabulary warning below still names what the caller sent.
+    // (bc06ec6f). The vocabulary warning below names the trimmed key the caller
+    // sent, before canonicalisation.
     let stored_evidence_type =
         epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
+    // The STORED key must fit the column (`varchar(50)`), like the locality
+    // tag below. A longer one reached the INSERT and came back as a redacted
+    // internal error with nothing written, so this refusal changes no call
+    // that succeeds today.
+    check_stored_evidence_type_len(stored_evidence_type.as_deref())?;
 
     let stored_locality_tag = if calibrated_evidence_type.is_some() {
         params.locality_tag.as_deref().unwrap_or("unknown")
@@ -547,7 +562,7 @@ pub async fn submit_ds_evidence(
             .await
             .map_err(internal_error)?
             .and_then(|a| a.hypothesis_index);
-    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
         &mut tx,
         viewer,
         claim_id,
@@ -751,14 +766,16 @@ pub async fn submit_ds_evidence(
     // `get_divergence` had no data for a claim whose evidence came in here.
     // Best-effort, under its own savepoint: the row is claim-derived, and a
     // writer that does not write the claim's group is refused it without
-    // losing the submission.
+    // losing the submission. A cold start (the claim's track still at the
+    // Beta(1, 1) prior before this call) records no row: see
+    // `epigraph_engine::ds_divergence`.
     if let Some(p) = pignistic_prob {
         epigraph_engine::ds_divergence::record_divergence(
             &mut tx,
             claim_id,
             frame_id,
             p,
-            bayesian_posterior,
+            beta_update,
             Some(frame_row.version),
             "submit_ds_evidence",
         )
@@ -926,6 +943,36 @@ fn check_stored_locality_tag_len(stored: &str) -> Result<(), McpError> {
         return Err(invalid_params(format!(
             "locality_tag is {len} characters; at most {max} are stored. Known tags: {}.",
             epigraph_engine::edge_factor::KNOWN_LOCALITY_TAGS.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The longest `mass_functions.evidence_type` the column stores, in
+/// characters: it is `varchar(50)` (migration 001). The stored key is the
+/// caller's `evidence_type` canonicalised
+/// (`epigraph_engine::calibration::canonical_evidence_type`: an alias maps to
+/// its canonical key, and a key the calibration does not know is stored
+/// trimmed and lowercased), so it is the caller's own string whenever the key
+/// is unknown. A column width, not a belief parameter, kept beside
+/// [`LOCALITY_TAG_MAX_CHARS`] for the same reason.
+const EVIDENCE_TYPE_MAX_CHARS: usize = 50;
+
+/// Refuse an `evidence_type` whose STORED key cannot fit the column
+/// ([`EVIDENCE_TYPE_MAX_CHARS`], counted in characters as `varchar` does, on
+/// the canonicalised key, since lowercasing can lengthen it), as a parameter
+/// error naming the limit. No stored key (omitted or blank) always passes.
+fn check_stored_evidence_type_len(stored: Option<&str>) -> Result<(), McpError> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    let max = EVIDENCE_TYPE_MAX_CHARS;
+    let len = stored.chars().count();
+    if len > max {
+        return Err(invalid_params(format!(
+            "evidence_type is {len} characters as stored (trimmed and lowercased); at most {max} \
+             are stored. Known keys: {}.",
+            known_evidence_type_keys().join(", ")
         )));
     }
     Ok(())
@@ -1316,7 +1363,12 @@ pub async fn get_divergence(
     let row = DivergenceRepository::get_latest(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no divergence data for claim {claim_id}")))?;
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "no divergence data for claim {claim_id} (none recorded in the last 7 days; \
+                 a claim's first live Beta update records none)"
+            ))
+        })?;
     read.commit().await.map_err(internal_error)?;
 
     success_json(&DivergenceResponse {

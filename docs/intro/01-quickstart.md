@@ -321,8 +321,8 @@ what the API uses as the token's principal.
 ### Give the MCP server a stable identity
 
 Every claim an MCP server writes is authored by its signing agent. Without
-`--agent-key` (or `EPIGRAPH_MCP_AGENT_KEY`, or `--agent-model` with
-`--agent-system-prompt` or `--agent-system-prompt-hash`), each launch creates
+`--agent-key` (or `EPIGRAPH_MCP_AGENT_KEY`, or the host-registered
+separate-signing-key pair), each launch creates
 a fresh random agent. It prints `Generated new agent keypair` and its
 secret key to stderr. It also warns that the ownership-gated tools
 (`supersede_claim`, `mark_duplicate`, `resolve_backlog_item`) do not enforce

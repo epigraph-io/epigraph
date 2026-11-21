@@ -21,8 +21,12 @@
 //! * no `--visibility`, the agent writes no team: every claim is `group` over
 //!   its own personal group (private), none public;
 //! * `--visibility public`: public, so a caller can still ask for it;
-//! * no `--agent-key` (the built-in teamless signer): private, and the stderr
-//!   line says so; the only-team and public cases check that line too;
+//! * no key at all is REFUSED before anything is written (backlog bfc2eff8:
+//!   the old built-in `document-ingest-cli` signer's key is computable by
+//!   anyone), and so is that key given explicitly; a fresh teamless key given
+//!   in `EPIGRAPH_INGEST_AGENT_KEY` or `--agent-key-file` lands private, and
+//!   the stderr line says so; the only-team and public cases check that line
+//!   too;
 //! * `--visibility public --group-id <uuid>`: refused before any connection,
 //!   as the MCP tools refuse it.
 
@@ -161,18 +165,29 @@ async fn ingest(pool: &PgPool, agent_key: &str, extra: &[&str]) -> Run {
     run_cli(pool, Some(agent_key), extra).await
 }
 
-/// Run the binary; `agent_key: None` omits `--agent-key`, so the CLI acts as
-/// its built-in `document-ingest-cli` signer.
+/// Run the binary; `agent_key: None` passes no key at all.
 async fn run_cli(pool: &PgPool, agent_key: Option<&str>, extra: &[&str]) -> Run {
+    run_cli_with(pool, |cmd| {
+        if let Some(key) = agent_key {
+            cmd.arg("--agent-key").arg(key);
+        }
+        cmd.args(extra);
+    })
+    .await
+}
+
+/// Run the binary on `pool` with `configure` adding the key and extra
+/// arguments; the key environment variable is cleared first, so only what
+/// `configure` sets reaches the child.
+async fn run_cli_with(pool: &PgPool, configure: impl FnOnce(&mut Command)) -> Run {
     let url = fixture::database_url_for(pool).await;
     let file = extraction_file();
     let mut cmd = Command::new(BIN);
-    cmd.arg("--file").arg(&file);
-    if let Some(key) = agent_key {
-        cmd.arg("--agent-key").arg(key);
-    }
+    cmd.arg("--file")
+        .arg(&file)
+        .env_remove("EPIGRAPH_INGEST_AGENT_KEY");
+    configure(&mut cmd);
     let out = cmd
-        .args(extra)
         .env("DATABASE_URL", &url)
         .env("MAINTENANCE_DATABASE_URL", &url)
         .env("RUST_LOG", "warn")
@@ -446,45 +461,123 @@ fn assert_tenancy_line(run: &Run, visibility: &str, owner: Uuid, note: Option<&s
     );
 }
 
-/// The most common invocation: no `--agent-key`, so the CLI acts as its
-/// built-in `document-ingest-cli` agent, which writes no team. The paper's
-/// claims land PRIVATE in that agent's personal group, and the CLI says so
-/// on stderr rather than leave the operator to assume a team.
+/// Backlog bfc2eff8: the CLI has no default signer. Run with no key, it
+/// refuses before writing anything (no paper, no claim, and no row for the old
+/// built-in `document-ingest-cli` agent), naming the ways to give a key; given
+/// that agent's key explicitly (recomputed from its public name), it refuses
+/// the same way.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_default_cli_ingest_without_an_agent_key_lands_private_and_says_so(pool: PgPool) {
-    let run = run_cli(&pool, None, &[]).await;
-    assert_eq!(run.code, Some(0), "{}", run.show());
+async fn the_cli_refuses_to_ingest_without_a_real_key(pool: PgPool) {
+    let legacy = epigraph_crypto::did_key::keypair_from_name("document-ingest-cli");
+    let legacy_hex = hex::encode(legacy.secret_key());
+    let papers = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM papers")
+            .fetch_one(&pool)
+            .await
+            .expect("count papers")
+    };
+    let claims = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM claims")
+            .fetch_one(&pool)
+            .await
+            .expect("count claims")
+    };
+    let (papers_before, claims_before) = (papers().await, claims().await);
 
-    let pk = epigraph_crypto::did_key::keypair_from_name("document-ingest-cli").public_key();
-    let agent: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
-        .bind(pk.as_slice())
-        .fetch_one(&pool)
-        .await
-        .expect("the built-in signer was registered by the run");
-    let rows = authored(&pool, agent).await;
-    assert!(
-        rows.len() >= 3,
-        "claims were created: {rows:?}\n{}",
-        run.show()
-    );
-    let personal: Uuid = sqlx::query_scalar(
-        "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
-    )
-    .bind(agent)
-    .fetch_one(&pool)
-    .await
-    .expect("the built-in agent's personal group");
-    for (visibility, owner, kind) in &rows {
-        assert_eq!(
-            (visibility.as_str(), *owner, kind.as_str()),
-            ("group", personal, "personal"),
-            "the teamless built-in agent's default ingest is private, never public: {rows:?}"
+    for (what, key) in [
+        ("no key", None),
+        ("the legacy key", Some(legacy_hex.as_str())),
+    ] {
+        let run = run_cli(&pool, key, &[]).await;
+        assert_ne!(run.code, Some(0), "{what} must be refused:\n{}", run.show());
+        assert!(
+            run.stderr.contains("anyone"),
+            "{what}: the refusal says why:\n{}",
+            run.show()
+        );
+        assert!(
+            !run.stderr.contains(&legacy_hex[..16]),
+            "{what}: the refusal must not echo a key:\n{}",
+            run.show()
         );
     }
-    assert_tenancy_line(
-        &run,
-        "PRIVATE",
-        personal,
-        Some("no visibility was named and you may write no team, so this is PRIVATE"),
+    let run = run_cli(&pool, None, &[]).await;
+    assert!(
+        run.stderr.contains("--agent-key-file") && run.stderr.contains("EPIGRAPH_INGEST_AGENT_KEY"),
+        "no key: the refusal names the ways to give one:\n{}",
+        run.show()
     );
+
+    assert_eq!(papers().await, papers_before, "no paper row was written");
+    assert_eq!(claims().await, claims_before, "no claim was written");
+    let legacy_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM agents WHERE public_key = $1")
+        .bind(legacy.public_key().as_slice())
+        .fetch_one(&pool)
+        .await
+        .expect("legacy agent lookup");
+    assert_eq!(legacy_rows, 0, "the legacy signer was never registered");
+}
+
+/// A fresh, unregistered, teamless key given in the ENVIRONMENT
+/// (`EPIGRAPH_INGEST_AGENT_KEY`) or in a FILE (`--agent-key-file`) is the
+/// acting agent: its claims land PRIVATE in its own personal group, and the
+/// CLI says so on stderr rather than leave the operator to assume a team.
+/// (Before bfc2eff8 this was the no-key default's behaviour.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_teamless_key_from_env_or_file_lands_private_and_says_so(pool: PgPool) {
+    let key_file = std::env::temp_dir().join(format!("ingest-key-{}.hex", Uuid::new_v4()));
+    for source in ["env", "file"] {
+        let signer = AgentSigner::generate();
+        let key_hex = hex::encode(signer.secret_key());
+        let run = match source {
+            "env" => {
+                run_cli_with(&pool, |cmd| {
+                    cmd.env("EPIGRAPH_INGEST_AGENT_KEY", &key_hex);
+                })
+                .await
+            }
+            _ => {
+                std::fs::write(&key_file, format!("{key_hex}\n")).expect("write the key file");
+                let run = run_cli_with(&pool, |cmd| {
+                    cmd.arg("--agent-key-file").arg(&key_file);
+                })
+                .await;
+                let _ = std::fs::remove_file(&key_file);
+                run
+            }
+        };
+        assert_eq!(run.code, Some(0), "{source}: {}", run.show());
+
+        let agent: Uuid = sqlx::query_scalar("SELECT id FROM agents WHERE public_key = $1")
+            .bind(signer.public_key().as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{source}: the key is the acting agent: {e}"));
+        let rows = authored(&pool, agent).await;
+        assert!(
+            rows.len() >= 3,
+            "{source}: claims were created: {rows:?}\n{}",
+            run.show()
+        );
+        let personal: Uuid = sqlx::query_scalar(
+            "SELECT id FROM groups WHERE did_key = 'did:epigraph:personal:' || $1::text",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("the agent's personal group");
+        for (visibility, owner, kind) in &rows {
+            assert_eq!(
+                (visibility.as_str(), *owner, kind.as_str()),
+                ("group", personal, "personal"),
+                "{source}: a teamless agent's default ingest is private, never public: {rows:?}"
+            );
+        }
+        assert_tenancy_line(
+            &run,
+            "PRIVATE",
+            personal,
+            Some("no visibility was named and you may write no team, so this is PRIVATE"),
+        );
+    }
 }

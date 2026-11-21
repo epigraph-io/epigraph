@@ -12,11 +12,15 @@ Until a PATCH /api/v1/themes/:id route lands, this script needs admin DB
 creds. Reads of theme rows + sample claim content also use the same
 connection for query consistency.
 
-Why nested-CLI file-write (not stdout): Claude CLI's `result` field is
-empty when invoked from inside another agent's session. The bridge-dev
-pattern is to instruct the model to Write a JSON file, then poll for it
-on disk. `--dangerously-skip-permissions` is required so the Write tool
-runs unattended.
+Why nested-CLI file-write, with stdout as the second source: Claude CLI's
+`result` field is empty when invoked from inside another agent's session, so
+the prompt asks the model to Write a JSON file and the script polls for it on
+disk (`--dangerously-skip-permissions` lets the Write tool run unattended).
+Outside such a session the model often answers inline instead (backlog
+b6191a3c: about two answers in three on a --relabel-all run), so when no file
+appears call_claude_cli reads the first JSON value in the envelope's `result`.
+Either way the answer must be a dict with a non-empty string `label` and a
+string `description` (valid_label_answer); anything else is refused.
 
 Usage:
     DATABASE_URL=postgres://epigraph_admin:epigraph_admin@localhost:5432/epigraph \\
@@ -67,6 +71,10 @@ DEFAULT_DATABASE_URL = "postgres://epigraph_admin:epigraph_admin@localhost:5432/
 RESULT_DIR = "/tmp/theme_labels"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CLI_CWD = os.path.dirname(SCRIPT_DIR)  # repo root
+# How long call_claude_cli keeps looking for a result file the model wrote with
+# its Write tool, when it answered neither on disk nor inline.
+RESULT_POLL_ATTEMPTS = 10
+RESULT_POLL_INTERVAL = 1.0
 # Stored for a theme with no public member: there is no text every viewer may
 # read to name it from (theme_lib.public_label_source). is_placeholder_label
 # matches it, so a later run labels it once a public member joins.
@@ -120,6 +128,14 @@ def load_themes_with_samples(conn, limit=None):
     return themes
 
 
+# The placeholder values the prompt's schema shows. A model that echoes the
+# schema back has not answered, so valid_label_answer refuses this label.
+TEMPLATE_LABEL = "short topic name (3-8 words)"
+TEMPLATE_DESCRIPTION = (
+    "One sentence describing the cluster's subject matter, methodology focus, or domain."
+)
+
+
 def build_prompt(theme, kind="theme"):
     """Build the LLM prompt for theme (or, with kind="neighborhood", graph
     neighbourhood) labeling. The kind also prefixes the result file, so a
@@ -144,18 +160,89 @@ Write your response as a JSON file to: {result_path}
 
 The JSON must have exactly these fields:
 {{
-  "label": "short topic name (3-8 words)",
-  "description": "One sentence describing the cluster's subject matter, methodology focus, or domain."
+  "label": "{TEMPLATE_LABEL}",
+  "description": "{TEMPLATE_DESCRIPTION}"
 }}
 
 Write ONLY the JSON file. No other output."""
     return prompt, result_path
 
 
-def call_claude_cli(prompt, result_path, cwd, timeout=120):
-    """Call Claude CLI with the nested file-write pattern."""
+def valid_label_answer(answer):
+    """`answer` when it is a usable label answer, else None: a dict whose
+    `label` is a non-empty string other than the prompt's placeholder
+    (TEMPLATE_LABEL) and whose `description` is a string."""
+    if (
+        isinstance(answer, dict)
+        and isinstance(answer.get("label"), str)
+        and answer["label"].strip()
+        and answer["label"].strip() != TEMPLATE_LABEL
+        and isinstance(answer.get("description"), str)
+    ):
+        return answer
+    return None
+
+
+def inline_label_answer(stdout):
+    """The label answer the model gave inline, from `claude -p --output-format
+    json` stdout, or None.
+
+    stdout is the CLI's envelope; only its `result` string is the model's
+    answer (the envelope is itself the first object on stdout, so stdout is
+    never scanned raw). An error envelope is refused. In `result` the answer is
+    the first top-level JSON value (one that starts at a `{` or `[`, which
+    skips prose and a code fence around it) that valid_label_answer accepts.
+    A value it refuses (a `[1]` citation, an echo of the prompt's schema) is
+    skipped WHOLE, never searched inside, so a list wrapping a well-formed
+    answer is still refused.
+    """
     try:
-        subprocess.run(
+        envelope = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(envelope, dict) or envelope.get("is_error"):
+        return None
+    text = envelope.get("result")
+    if not isinstance(text, str):
+        return None
+    decoder = json.JSONDecoder()
+    i = 0
+    while i < len(text):
+        if text[i] not in "{[":
+            i += 1
+            continue
+        try:
+            answer, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if valid_label_answer(answer) is not None:
+            return answer
+        i = end
+    return None
+
+
+def _read_result_file(result_path):
+    """The label answer in `result_path`, or None if it is absent, not JSON
+    yet (still being written) or not a valid answer."""
+    if not os.path.exists(result_path):
+        return None
+    with open(result_path) as f:
+        try:
+            return valid_label_answer(json.load(f))
+        except json.JSONDecodeError:
+            return None
+
+
+def call_claude_cli(prompt, result_path, cwd, timeout=120):
+    """Call Claude CLI and return its label answer ({label, description}) or None.
+
+    The answer is taken from the result file the prompt asks the model to
+    Write, else from the model's inline answer on stdout (inline_label_answer),
+    else from the file once it appears within the poll window.
+    """
+    try:
+        proc = subprocess.run(
             [
                 "claude", "-p", prompt,
                 "--output-format", "json",
@@ -176,17 +263,22 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
         print("    ERROR: `claude` CLI not on PATH", file=sys.stderr)
         return None
 
-    # Poll for the result file (CLI writes it via Write tool)
-    for _ in range(10):
-        if os.path.exists(result_path):
-            with open(result_path) as f:
-                try:
-                    return json.load(f)
-                except json.JSONDecodeError:
-                    pass
-        time.sleep(1)
+    answer = _read_result_file(result_path)
+    if answer is not None:
+        return answer
+    answer = inline_label_answer(proc.stdout)
+    if answer is not None:
+        return answer
 
-    print(f"    Result file not found: {result_path}", file=sys.stderr)
+    # Neither yet: poll for the file (CLI writes it via the Write tool).
+    for _ in range(RESULT_POLL_ATTEMPTS):
+        time.sleep(RESULT_POLL_INTERVAL)
+        answer = _read_result_file(result_path)
+        if answer is not None:
+            return answer
+
+    print(f"    No valid answer: result file not found ({result_path}) "
+          f"and no usable inline answer", file=sys.stderr)
     return None
 
 
@@ -340,7 +432,7 @@ def label_neighborhoods(conn, run_id, limit=None, relabel_all=False, dry_run=Fal
         if os.path.exists(result_path):
             os.remove(result_path)
         result = call_claude_cli(prompt, result_path, cwd=cli_cwd)
-        if result and result.get("label"):
+        if result:
             update_neighborhood(conn, nbr["id"], result["label"])
             print(f"  -> {result['label']}", file=sys.stderr)
             labeled += 1
@@ -454,7 +546,7 @@ def main():
 
         result = call_claude_cli(prompt, result_path, cwd=args.cli_cwd)
 
-        if result and "label" in result and "description" in result:
+        if result:
             update_theme(conn, theme["id"], result["label"], result["description"])
             print(
                 f"  -> {result['label']}: {result['description'][:80]}",

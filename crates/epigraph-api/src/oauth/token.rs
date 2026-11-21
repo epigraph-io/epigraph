@@ -8,6 +8,9 @@
 //!   for a short, refreshless, elevated access token (elevation plan EL-5)
 //! - `urn:epigraph:grant:run-token`: a host delegator's short, refreshless, delegated token
 //!   for an operated LLM agent (`oauth::run_token`)
+//! - `urn:ietf:params:oauth:grant-type:token-exchange` (RFC 8693): a kernel token exchanged
+//!   for a short, refreshless token whose audience is a federation extension
+//!   (`oauth::token_exchange`)
 
 // UNSCOPED-POOL-EXEMPT: Pre-authentication by definition, and the largest such site. Token issuance is
 // the step that MINTS the principal; a Viewer cannot precede it.
@@ -79,6 +82,16 @@ pub struct TokenRequest {
     /// For the run-token grant: free text naming the schedule or run (audit
     /// only, at most 64 characters).
     pub run_label: Option<String>,
+    /// For the token-exchange grant (RFC 8693): the caller's kernel access token.
+    pub subject_token: Option<String>,
+    /// For the token-exchange grant: must be
+    /// `urn:ietf:params:oauth:token-type:access_token`.
+    pub subject_token_type: Option<String>,
+    /// For the token-exchange grant: the federation extension the new token is for.
+    pub audience: Option<String>,
+    /// For the token-exchange grant: if present, must be
+    /// `urn:ietf:params:oauth:token-type:access_token`.
+    pub requested_token_type: Option<String>,
 }
 
 /// The grant that redeems a confirmed grant-mode elevation ticket.
@@ -98,6 +111,10 @@ pub struct TokenResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
     pub scope: String,
+    /// RFC 8693 section 2.2.1 `issued_token_type`: REQUIRED on a
+    /// token-exchange response, absent on every other grant's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issued_token_type: Option<String>,
 }
 
 /// Pure allowlist decision for the `refresh_token` grant — re-evaluates the
@@ -353,6 +370,9 @@ pub async fn token_endpoint(
         ELEVATE_GRANT_TYPE => handle_elevate_grant(&state, &req).await,
         crate::oauth::run_token::RUN_TOKEN_GRANT_TYPE => {
             crate::oauth::run_token::handle_run_token_grant(&state, &req).await
+        }
+        epigraph_auth::TOKEN_EXCHANGE_GRANT_TYPE => {
+            crate::oauth::token_exchange::handle_token_exchange_grant(&state, &req).await
         }
         other => {
             // Look up an external provider by grant_type.
@@ -859,6 +879,7 @@ async fn handle_client_credentials(
             expires_in: ttl.num_seconds(),
             refresh_token: Some(refresh_token),
             scope: effective_scopes.join(" "),
+            issued_token_type: None,
         }),
     ))
 }
@@ -1182,6 +1203,7 @@ async fn handle_refresh_token(
             expires_in: ttl.num_seconds(),
             refresh_token: Some(new_refresh),
             scope: effective_scopes.join(" "),
+            issued_token_type: None,
         }),
     ))
 }
@@ -1468,6 +1490,7 @@ async fn handle_authorization_code(
             expires_in: ttl.num_seconds(),
             refresh_token: Some(refresh_token),
             scope: effective_scopes.join(" "),
+            issued_token_type: None,
         }),
     ))
 }
@@ -1691,6 +1714,7 @@ async fn handle_elevate_grant(
             expires_in: secs,
             refresh_token: None,
             scope: scopes.join(" "),
+            issued_token_type: None,
         }),
     ))
 }
