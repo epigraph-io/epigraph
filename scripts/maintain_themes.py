@@ -13,6 +13,21 @@ Operations (run in order):
   4.   Report remaining high-variance themes
   5.   Detect new theme candidates
 
+Phase 1 on a row-secured deployment (prod): run the CLI, not this script.
+    `POST /api/v1/themes/assign-unthemed` assigns only the claims the token
+    can write; a batch holding another group's claim is refused by row
+    security (403 since backlog d5f9829a, a 500 before), so this phase cannot
+    assign the corpus. Run the maintenance-connection CLI instead, with
+    DATABASE_URL and MAINTENANCE_DATABASE_URL set:
+
+        assign_unthemed_themes                            # dry run: counts + per-theme preview
+        assign_unthemed_themes --apply --max-batches 1    # one batch first
+        assign_unthemed_themes --apply                    # the rest
+
+    Then run this script as usual: with nothing left unthemed, Phase 1 assigns
+    nothing and the later phases run unchanged. If claims filed since the CLI
+    run make Phase 1 fail with that 403, run the CLI's `--apply` again first.
+
 Usage:
     python3 scripts/maintain_themes.py [--dry-run] [--api-url URL]
 
