@@ -15,8 +15,8 @@
 //!   request path stamps it, a group-private claim owned by the human's team is
 //!   readable: the row policy (077 `claims_tenancy`) admits it;
 //! * nothing is added for: an unlinked agent, a RETIRED link, a membership the
-//!   human no longer holds (revoked), a team that is not active, a group that
-//!   is not a team or community;
+//!   human no longer holds (revoked), a human whose registration is revoked, a
+//!   team that is not active, a group that is not a team or community;
 //! * `epigraph_readable_teams` answers `own` for the agent's own teams and
 //!   `operator` only for the human's, and is EXECUTE-able by `epigraph_app`.
 
@@ -115,7 +115,11 @@ async fn world(pool: &PgPool) -> World {
 async fn a_linked_agent_reads_its_humans_team_and_cannot_write_it(pool: PgPool) {
     let w = world(&pool).await;
     let v = Viewer::resolve(&pool, w.agent).await.expect("resolve");
-    assert!(reads(&v).contains(&w.team), "the human's team is in the read set: {:?}", reads(&v));
+    assert!(
+        reads(&v).contains(&w.team),
+        "the human's team is in the read set: {:?}",
+        reads(&v)
+    );
     assert!(
         !v.writable_groups().contains(&w.team),
         "a READ grant must never reach the writable set: {:?}",
@@ -128,7 +132,8 @@ async fn the_row_policy_admits_the_teams_claim_on_an_app_role_stamp(pool: PgPool
     let w = world(&pool).await;
     let (owner_of_claim, _) = fixture::seed_human_operator(&pool, "oart-author").await;
     add_member(&pool, w.team, owner_of_claim, "writer").await;
-    let claim = fixture::seed_group_claim(&pool, owner_of_claim, w.team, "oart team-private claim").await;
+    let claim =
+        fixture::seed_group_claim(&pool, owner_of_claim, w.team, "oart team-private claim").await;
 
     let v = Viewer::resolve(&pool, w.agent).await.expect("resolve");
     let scoped = app(&pool).await;
@@ -137,7 +142,10 @@ async fn the_row_policy_admits_the_teams_claim_on_an_app_role_stamp(pool: PgPool
         .await
         .expect("read");
     tx.rollback().await.expect("rollback");
-    assert!(got.is_some(), "the linked agent reads a claim owned by its human's team");
+    assert!(
+        got.is_some(),
+        "the linked agent reads a claim owned by its human's team"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -154,20 +162,46 @@ async fn a_retired_link_adds_nothing(pool: PgPool) {
     let w = world(&pool).await;
     let old = retired_agent(&pool, w.human, "oart-retired").await;
     let v = Viewer::resolve(&pool, old).await.expect("resolve");
-    assert!(!reads(&v).contains(&w.team), "a retired link reads nothing through the human");
+    assert!(
+        !reads(&v).contains(&w.team),
+        "a retired link reads nothing through the human"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_membership_the_human_lost_adds_nothing(pool: PgPool) {
     let w = world(&pool).await;
-    sqlx::query("UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2")
-        .bind(w.team)
-        .bind(w.human)
-        .execute(&pool)
-        .await
-        .expect("revoke the human's membership");
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(w.team)
+    .bind(w.human)
+    .execute(&pool)
+    .await
+    .expect("revoke the human's membership");
     let v = Viewer::resolve(&pool, w.agent).await.expect("resolve");
-    assert!(!reads(&v).contains(&w.team), "the agent follows its human's LIVE memberships only");
+    assert!(
+        !reads(&v).contains(&w.team),
+        "the agent follows its human's LIVE memberships only"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_whose_registration_is_revoked_adds_nothing(pool: PgPool) {
+    let w = world(&pool).await;
+    let revoked: bool =
+        sqlx::query_scalar("SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, $2)")
+            .bind(w.human)
+            .bind("234 test")
+            .fetch_one(&pool)
+            .await
+            .expect("revoke the human's registration");
+    assert!(revoked, "PREMISE: the registration was live");
+    let v = Viewer::resolve(&pool, w.agent).await.expect("resolve");
+    assert!(
+        !reads(&v).contains(&w.team),
+        "an agent stops reading through a human whose registration is revoked"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -198,11 +232,17 @@ async fn readable_teams_says_own_or_operator_and_lists_teams_only(pool: PgPool) 
             .fetch_all(&pool)
             .await
             .expect("readable teams");
-    let mut want = vec![(w.team, "operator".to_string()), (own_team, "own".to_string())];
+    let mut want = vec![
+        (w.team, "operator".to_string()),
+        (own_team, "own".to_string()),
+    ];
     want.sort();
     let mut got = rows.clone();
     got.sort();
-    assert_eq!(got, want, "exactly the human's team (operator) and the agent's own team (own)");
+    assert_eq!(
+        got, want,
+        "exactly the human's team (operator) and the agent's own team (own)"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -214,5 +254,8 @@ async fn the_application_role_may_call_readable_teams(pool: PgPool) {
         .fetch_one(&app_pool)
         .await
         .expect("epigraph_app has EXECUTE on epigraph_readable_teams");
-    assert_eq!(n, 1, "the definer answers the same on an unstamped app connection");
+    assert_eq!(
+        n, 1,
+        "the definer answers the same on an unstamped app connection"
+    );
 }

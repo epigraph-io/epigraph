@@ -31,6 +31,11 @@
 -- memberships (the 'own' arm). Following the human's derived memberships
 -- would hand a `holder_only` group to every agent of the holder
 -- (`group_role_membership.rs` pins that it must not).
+-- And only while the human is a LIVE HUMAN OPERATOR
+-- (`epigraph_is_human_operator`): when its registration is revoked, its agents
+-- stop reading through it at once, exactly as 165's `epigraph_live_memberships`
+-- drops a revoked human's verb-made groups (`team_group_verbs.rs`
+-- `a_membership_lapses_when_the_human_is_revoked`).
 -- Only teams: an active group of kind 'team' or 'community'. A human's
 -- personal group is already in the agent's set through the link's writer row;
 -- world and seed groups are never added. A RETIRED link adds nothing
@@ -70,6 +75,7 @@ SET search_path = pg_catalog, pg_temp AS $$
           JOIN public.group_memberships m ON m.agent_id = h.human
          WHERE h.human IS NOT NULL AND h.human <> p_agent
            AND m.revoked_at IS NULL
+           AND public.epigraph_is_human_operator(h.human)
     )
     SELECT g.id,
            CASE WHEN g.id IN (SELECT o.group_id FROM own o) THEN 'own' ELSE 'operator' END

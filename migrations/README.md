@@ -3373,8 +3373,8 @@ restart.
   counterpart of D-V3). Adds the SECURITY DEFINER `epigraph_readable_teams(agent)`, which
   answers the active `team`/`community` groups an agent may READ: `own` (its own live
   membership, any role) or `operator` (its LIVE human's live DIRECT membership, any role, reader
-  included; a group the human reaches only through a role binding is left to that binding's
-  179 `agent_mode`), mirroring 206's `epigraph_writable_teams`. Owned by `epigraph_maintenance`,
+  included, and only while the human is a registered human operator; a group the human reaches
+  only through a role binding is left to that binding's 179 `agent_mode`), mirroring 206's `epigraph_writable_teams`. Owned by `epigraph_maintenance`,
   EXECUTE granted to `epigraph_app` (guarded, as in 206). `Viewer::resolve` now adds the
   `operator` rows to the READ set only, never the writable set, so an operated stdio signer
   reads back what D-V3 lets it write into its human's team (measured on prod 2026-11-21:
