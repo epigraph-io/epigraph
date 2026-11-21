@@ -562,7 +562,7 @@ pub async fn submit_ds_evidence(
             .await
             .map_err(internal_error)?
             .and_then(|a| a.hypothesis_index);
-    let bayesian_posterior = epigraph_engine::ds_divergence::apply_beta_update(
+    let beta_update = epigraph_engine::ds_divergence::apply_beta_update(
         &mut tx,
         viewer,
         claim_id,
@@ -766,14 +766,16 @@ pub async fn submit_ds_evidence(
     // `get_divergence` had no data for a claim whose evidence came in here.
     // Best-effort, under its own savepoint: the row is claim-derived, and a
     // writer that does not write the claim's group is refused it without
-    // losing the submission.
+    // losing the submission. A cold start (the claim's track still at the
+    // Beta(1, 1) prior before this call) records no row: see
+    // `epigraph_engine::ds_divergence`.
     if let Some(p) = pignistic_prob {
         epigraph_engine::ds_divergence::record_divergence(
             &mut tx,
             claim_id,
             frame_id,
             p,
-            bayesian_posterior,
+            beta_update,
             Some(frame_row.version),
             "submit_ds_evidence",
         )
@@ -1361,7 +1363,12 @@ pub async fn get_divergence(
     let row = DivergenceRepository::get_latest(&mut *read, viewer, claim_id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no divergence data for claim {claim_id}")))?;
+        .ok_or_else(|| {
+            invalid_params(format!(
+                "no divergence data for claim {claim_id} (none recorded in the last 7 days; \
+                 a claim's first live Beta update records none)"
+            ))
+        })?;
     read.commit().await.map_err(internal_error)?;
 
     success_json(&DivergenceResponse {

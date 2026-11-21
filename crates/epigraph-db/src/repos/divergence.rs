@@ -120,6 +120,11 @@ impl DivergenceRepository {
     /// Get claims with the highest KL divergence, excluding entries older than
     /// `DIVERGENCE_TTL_DAYS` to prevent stale/invalid cached values from surfacing.
     ///
+    /// Cold-start updates (a claim's Beta track still at the prior before the
+    /// write) are kept out by the writer, which stores no row for them
+    /// (`epigraph_engine::ds_divergence::record_divergence`), so this reads
+    /// every row it finds.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
