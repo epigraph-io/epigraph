@@ -219,10 +219,20 @@ pub async fn submit_ds_evidence(
     //   into the legacy branch too rather than silently accepting a
     //   parameter that couldn't affect anything.
     let mut mass_fn = parse_submitted_masses(&frame, &params.masses)?;
-    let calibrated_evidence_type = params.evidence_type.as_deref().filter(|s| !s.is_empty());
+    // Trimmed BEFORE the emptiness test, the same trim the canonicaliser
+    // applies: a whitespace-only type is stored as no type (NULL), so it must
+    // also take the legacy branch and apply `reliability`, exactly as if it
+    // were omitted. Tested untrimmed, it took the calibrated branch and its
+    // undiscounted masses were then combined at the legacy tier.
+    let calibrated_evidence_type = params
+        .evidence_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     // What is STORED is the canonical key (`Testimony` -> `testimonial`), or the
     // caller's own key lowercased when the calibration does not know it
-    // (bc06ec6f). The vocabulary warning below still names what the caller sent.
+    // (bc06ec6f). The vocabulary warning below names the trimmed key the caller
+    // sent, before canonicalisation.
     let stored_evidence_type =
         epigraph_engine::calibration::canonical_evidence_type(calibrated_evidence_type);
     // The STORED key must fit the column (`varchar(50)`), like the locality

@@ -1240,6 +1240,28 @@ pub async fn submit_evidence(
         });
     }
 
+    // 2b. The key 5b STORES: the canonical key, or the caller's own key
+    //     trimmed and lowercased (bc06ec6f); blank is no key. It must fit the
+    //     column (`varchar(50)`). A longer one reached the INSERT and came back
+    //     as a 500 database error with nothing written, so this refusal
+    //     changes no call that succeeds today. Counted on the STORED form,
+    //     before anything is written (MCP `submit_ds_evidence` checks the same
+    //     shared limit).
+    let stored_evidence_type =
+        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+    if let Err(len) = epigraph_engine::calibration::check_stored_evidence_type_len(
+        stored_evidence_type.as_deref(),
+    ) {
+        return Err(ApiError::ValidationError {
+            field: "evidence_type".to_string(),
+            reason: format!(
+                "evidence_type is {len} characters as stored (trimmed and lowercased); at most \
+                 {} are stored",
+                epigraph_engine::calibration::EVIDENCE_TYPE_MAX_CHARS
+            ),
+        });
+    }
+
     // 3. Parse and validate the submitted mass function
     //    Keys may be prefixed with ~ to indicate CDST complement (negative) elements.
     let mut masses = std::collections::BTreeMap::new();
@@ -1564,9 +1586,7 @@ pub async fn submit_evidence(
     //     untyped, tier 4 for an uncalibrated type) must not apply
     //     `reliability` a second time.
     let masses_json = modified.masses_to_json();
-    // Canonical key, or the caller's own key lowercased (bc06ec6f).
-    let stored_evidence_type =
-        epigraph_engine::calibration::canonical_evidence_type(request.evidence_type.as_deref());
+    // `stored_evidence_type` is step 2b's: canonical, and checked to fit.
 
     // 5a'. What the store below does to the caller's row for its key (backlog
     //      6f82db4f, the REST twin of bcbe34b2): the upsert returns only the
