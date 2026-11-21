@@ -3247,6 +3247,37 @@ restart.
   pre-230 binary reads a `seed-derived` row like any other. Undo only after
   rolling every 230 binary back. **Applied to throwaway databases only, NOT
   to any deployed database.**
+- **231**: public `epigraph_app_nologin` (backlog bb200b7b). Asserts the end
+  state `epigraph_app` NOLOGIN. 060 creates the role NOLOGIN only `IF NOT
+  EXISTS` and never alters an existing one, so on a cluster where the role
+  could already log in (armed by the old docs/deploy.md step 4, or created
+  before 060 ran) it kept LOGIN; CI's empty Postgres never shows that.
+  No role: NOTICE, nothing changes. Already NOLOGIN: nothing changes. LOGIN
+  and a session logged in as `epigraph_app` (`pg_stat_activity.usename`,
+  cluster-wide, own backend excluded): RAISEs `55000` naming the count and the
+  sessions' `application_name`s, changing nothing, so a deploy with the API
+  still on that login stops at the migration instead of locking the API out.
+  A session that only switched to the role (a member login whose default is
+  `SET role = 'epigraph_app'`, or `SET SESSION AUTHORIZATION`) is not
+  counted. Otherwise `ALTER ROLE epigraph_app NOLOGIN`; a migration login
+  without the privilege fails it with `42501` and the fix in the message. No
+  password is touched and no login is granted
+  (`schema_contract.rs::no_migration_grants_a_role_login` still passes).
+  Pinned by `epigraph-db/tests/app_role_nologin.rs` (a pre-existing LOGIN role
+  is NOLOGIN after migrating; the refusal while a real `epigraph_app` login is
+  open, with the operator-visible message, nothing recorded, and a clean
+  re-run once it closes; a member login with the role default keeps working,
+  does not block, and still connects after 231 while a direct `epigraph_app`
+  login is refused). All three fail on the series without 231. Undo:
+  `ALTER ROLE epigraph_app LOGIN;` as a superuser. Slot 231 was assigned by the
+  2026-11-17 security wave (230 belongs to another change in the same wave,
+  `agents_key_kind_seed_derived`); checked before claiming: no migration on main,
+  on an open PR or on an origin `security/*` branch carries a `231`. 231 does not
+  depend on 230, and either may be applied first. **Deploy order (binding):** move every service that logs in as
+  `epigraph_app` to a login of its own first (docs/deploy.md, section 2, step
+  4); the check sees open sessions only, so a stopped unit or an occasional
+  timer still on that login passes it and is refused at its next connect.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 - **232**: public `claim_encryption_owner_scope` (backlog candidate
   B90-claim-encryption-write-scope, to be filed). 077's
   `claim_encryption_tenancy` WITH CHECK named only the sealing `group_id`
