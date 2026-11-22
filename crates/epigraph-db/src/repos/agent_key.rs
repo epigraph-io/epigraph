@@ -707,9 +707,9 @@ mod tests {
     /// a second row carrying the same bytes still admits it (overlapping, or
     /// opening, with the skew, exactly as the first closes).
     ///
-    /// Mutations: the first `valid_until` returned without re-asking the rule
-    /// -> the overlap and hand-over cases fail; every later `valid_until`
-    /// taken as the end -> the single-row and gap cases fail.
+    /// Verified to fail: the first `valid_until` returned without re-asking
+    /// the rule (`.find(..)` -> `.next()`) -> fails, first at the other key's
+    /// row, and the overlap and hand-over cases encode the same mistake.
     #[test]
     fn the_admission_end_is_where_the_verifier_stops_admitting() {
         static KEY: [u8; 32] = [7u8; 32];

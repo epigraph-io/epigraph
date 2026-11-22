@@ -347,9 +347,9 @@ async fn the_watch_judges_the_key_on_the_application_role(pool: PgPool) {
 /// would keep signing for up to an interval past the cut-over, and every
 /// edge in that span fails verification.
 ///
-/// Mutations: the watch sleeping the interval before its first read, or
-/// ignoring the recorded end (sleeping the full interval) -> no stop within
-/// 20 s; `STOP_LEAD_SECS` = 0 -> the stop comes at or after the cut-over.
+/// Verified to fail: the watch ignoring the recorded end (sleeping the full
+/// interval) -> no stop within 20 s; `STOP_LEAD_SECS` = 0 -> the stop comes
+/// after the cut-over.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_planned_cut_over_stops_the_signer_before_the_window_closes() {
     let (_url, pool) = pool().await;
@@ -397,8 +397,8 @@ async fn a_planned_cut_over_stops_the_signer_before_the_window_closes() {
 /// the server at once, so the unit would restart in a loop until the end.
 /// Boot refuses it; the same key with an hour left boots (positive control).
 ///
-/// Mutation: the admission read removed from `decide` -> the second
-/// decision boots.
+/// Verified to fail: the admission verdict in `decide` disabled, or
+/// `STOP_LEAD_SECS` = 0 -> the second decision boots.
 #[tokio::test(flavor = "multi_thread")]
 async fn boot_refuses_a_key_the_watch_would_stop_at_once() {
     let (_url, pool) = pool().await;
