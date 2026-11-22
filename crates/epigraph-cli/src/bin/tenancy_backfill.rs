@@ -2322,6 +2322,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 238 (backlog b5f6883b), 074's sealed-claim widening guard, re-stated as
+    // a definer trigger body. Fails OPEN and QUIETLY under a non-member owner:
+    // its only read is of the FORCEd `claim_encryption`, which 077's policy
+    // then filters exactly as the updating session's own read would, so a
+    // sealed claim whose ciphertext group the owner cannot see reads as
+    // unsealed and is made public with no error. The owner is the control.
+    ("epigraph_claims_block_widening", 238),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
