@@ -771,6 +771,36 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
     Ok(())
 }
 
+/// The tables every batch of a NARROWING or re-grouping act (`restrict-claims`
+/// and `regroup-claims`, apply, dry run and reverse) holds `SHARE ROW
+/// EXCLUSIVE` on for its duration: the derived tables with no key to claims
+/// ([`unkeyed_tables`]), plus `edges` and `harvester_fragments`.
+///
+/// Why the last two: a concurrent INSERT of an edge (or fragment) on a moving
+/// claim is stamped by its trigger from the claim as that statement reads it,
+/// so one that read the claim before the batch's commit would land on the
+/// pre-move tuple after the commit, outside every check (for a restriction: a
+/// PUBLIC edge or fragment on a claim that is now group-private). The lock
+/// makes such an INSERT either commit before the batch reads its rows (the
+/// batch then sees and moves it) or wait until the batch commits (its trigger,
+/// which reads the claim with a fresh snapshot, then sees the move). Cost: a
+/// batch, dry runs included, blocks every edge and fragment write on the
+/// instance while it runs; keep batches short.
+///
+/// `reown-claims` does not use this list: it moves public claims to another
+/// public owner, and a public edge's tuple does not depend on its endpoints'
+/// owners (migration 120), so a stale stamp there is still the right one.
+#[must_use]
+pub fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = unkeyed.to_vec();
+    for t in ["edges", "harvester_fragments"] {
+        if !out.iter().any(|u| u == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
 /// Row-change counters for the current transaction, per `public` table:
 /// `(inserted, updated, deleted)`, from `pg_stat_xact_user_tables`.
 ///

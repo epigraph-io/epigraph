@@ -65,6 +65,20 @@
 //! Pinned evidence does not narrow, so its edges are not touched. Nothing else
 //! is written; the plan reports how many evidence-endpoint edges there are.
 //!
+//! # Locks held by every batch
+//!
+//! Apply, dry run and reverse alike: the batch's claims `FOR UPDATE`, then
+//! `SHARE ROW EXCLUSIVE` on `edges`, `harvester_fragments` and the derived
+//! tables with no key to claims (`tables::batch_lock_tables`, printed as
+//! `LOCKED-PER-BATCH`), as `regroup-claims` does. Without the first two, an
+//! edge or fragment INSERT on a moving claim that its trigger stamped from the
+//! claim's PUBLIC tuple before the batch committed would land public on a
+//! claim the batch just restricted, outside every check. With them, such an
+//! insert either commits before the batch reads its rows (and is narrowed with
+//! them) or waits until the batch commits (and is stamped from the narrowed
+//! claim). Cost: every edge and fragment write on the instance waits while a
+//! batch runs, dry runs included; keep batches short.
+//!
 //! # The manifest records every row's full prior tenancy
 //!
 //! Written and `fsync`ed before the write that changes the rows it describes
@@ -1021,6 +1035,7 @@ struct Known {
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
     specs: &'a [TableSpec],
+    /// Every table each batch locks (`tables::batch_lock_tables`).
     unkeyed: &'a [String],
     target: Uuid,
     allow_non_world: bool,
@@ -1617,7 +1632,7 @@ pub async fn run(
             t.name
         );
     }
-    let unkeyed = tables::unkeyed_tables(conn, &specs).await?;
+    let unkeyed = tables::batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;
     if !guard.complete() {
@@ -1672,13 +1687,12 @@ pub async fn run(
     for (id, h) in &pre.held {
         writeln!(out, "HELD\t{id}\t{h}")?;
     }
-    if !unkeyed.is_empty() {
-        writeln!(
-            out,
-            "LOCKED-PER-BATCH\t{}\t(no key to claims: each batch holds SHARE ROW EXCLUSIVE on them)",
-            unkeyed.join(",")
-        )?;
-    }
+    writeln!(
+        out,
+        "LOCKED-PER-BATCH\t{}\t(each batch holds SHARE ROW EXCLUSIVE on them: no concurrent \
+         write to them on the instance while it runs)",
+        unkeyed.join(",")
+    )?;
     let ev_edges = evidence_endpoint_edges(conn, &pre.eligible).await?;
     writeln!(
         out,
@@ -2478,6 +2492,9 @@ pub async fn reverse_manifest(
         res.claim_posts.len(),
         res.rows.len()
     )?;
+    // Every reversal batch holds the same table locks as the apply (backlog
+    // 48f5cb6f): see `tables::batch_lock_tables`.
+    let locks = tables::batch_lock_tables(unkeyed);
     let batches: Vec<&[(Uuid, Record)]> = res.claims.chunks(opts.batch_size).collect();
     let total = batches.len();
     let mut audited = false;
@@ -2488,7 +2505,7 @@ pub async fn reverse_manifest(
         let r = reverse_batch(
             &mut tx,
             specs,
-            unkeyed,
+            &locks,
             &res,
             batch,
             &opts.lock_timeout,
