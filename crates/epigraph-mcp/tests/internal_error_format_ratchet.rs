@@ -21,9 +21,10 @@
 //! recognise a `DbError::Refused` (or a coded database refusal) routed
 //! through it and the caller gets the redacted message instead of the
 //! refusal. `.map_err(internal_error)`, handing over the typed error, is the
-//! shape that keeps it. Only a path expression (`e`, `x.source`) before
-//! `.to_string()` is flagged; a string literal's `"..".to_string()` is
-//! designed text and is not.
+//! shape that keeps it. The receiver before `.to_string()` is an expression
+//! of identifiers, `.` and call parentheses (`e`, `x.source`,
+//! `e.message()`); a string literal's `"..".to_string()` is designed text and
+//! is not flagged, nor is a `.to_string()` followed by a further call.
 //!
 //! Known limits: it sees the `format!` or `.to_string()` only as the call's
 //! own argument. A string built first (`let m = format!(..);
@@ -94,9 +95,10 @@ fn sites(text: &str) -> Vec<usize> {
     out
 }
 
-/// Whether `arg` opens with a path expression (`e`, `err.source`,
-/// `self.e`) stringified with `.to_string()`: the error's type is erased
-/// before `internal_error` can recognise a designed refusal by it. A string
+/// Whether `arg` opens with an expression (`e`, `err.source`,
+/// `e.message()`, `f(e)`) stringified with `.to_string()`: the error's type
+/// is erased before `internal_error` can recognise a designed refusal by it.
+/// The receiver is identifiers, `.` and balanced `(..)` groups. A string
 /// literal (`"text".to_string()`) does not start with an identifier and is
 /// not matched.
 fn stringified_path(arg: &str) -> bool {
@@ -107,10 +109,24 @@ fn stringified_path(arg: &str) -> bool {
     {
         return false;
     }
-    let run = arg
-        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .unwrap_or(arg.len());
-    arg[..run].ends_with(".to_string") && arg[run..].trim_start().starts_with("()")
+    let mut depth = 0usize;
+    let mut end = arg.len();
+    for (i, c) in arg.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                end = i;
+                break;
+            }
+            ')' => depth -= 1,
+            c if depth > 0 || c.is_alphanumeric() || c == '_' || c == '.' => {}
+            _ => {
+                end = i;
+                break;
+            }
+        }
+    }
+    arg[..end].ends_with(".to_string()")
 }
 
 /// The source with `//` and `/* */` comments removed, string literals kept
@@ -211,11 +227,14 @@ fn the_scanner_tells_the_helper_from_the_rmcp_constructor() {
     // `.to_string()` on the error erases its type (backlog 0bc4636e).
     let stringified = "a.map_err(|e| internal_error(e.to_string()))?;\n\
                        E::Db(_) => internal_error(\n    err.source.to_string(),\n),\n\
-                       c.map_err(|e| internal_error(&e.to_string()))?;";
-    assert_eq!(sites(&strip(stringified)), vec![1, 2, 5]);
+                       c.map_err(|e| internal_error(&e.to_string()))?;\n\
+                       d.map_err(|e| internal_error(e.message().to_string()))?;\n\
+                       f.map_err(|e| internal_error(describe(&e, 2).to_string()))?;";
+    assert_eq!(sites(&strip(stringified)), vec![1, 2, 5, 6, 7]);
     let designed = "internal_error(\"no pool\".to_string());\n\
                     internal_error(e);\n\
                     internal_error(e.to_string_lossy());\n\
+                    internal_error(e.to_string().len());\n\
                     McpError::internal_error(e.to_string(), None);";
     assert!(
         sites(&strip(designed)).is_empty(),
