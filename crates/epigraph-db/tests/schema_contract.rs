@@ -3677,7 +3677,10 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// the group (fail-closed, but quiet). 165 itself refuses to apply over a
 /// body it was not written from (its precondition block); this pin is the
 /// other order, a re-statement applied after 165. A reconciling migration
-/// keeps every fragment below (and adds its own to this list).
+/// keeps every fragment below (and adds its own to this list). 235 re-states
+/// `epigraph_live_memberships` (the personal-group lapse) and 164's
+/// `epigraph_team_group_add_member` (the personal-group arm); their fragments
+/// are pinned here too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3699,6 +3702,20 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 "did:epigraph:group:%",
                 // 165's derived rows.
                 "public.epigraph_role_derived_memberships(p_agent, now())",
+                // 235's lapse of an allowlisted agent's personal-group row.
+                "public.author_binding_clients r",
+                "public.epigraph_human_of(p_agent, true) = g.created_by_agent_id",
+            ][..],
+        ),
+        (
+            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+            &[
+                // 164's team-group gate.
+                "did:epigraph:group:%",
+                // 235's personal-group arm, conditions (d), (a), (b).
+                "p_role = 'writer'",
+                "v_binding = 'client_allowlist'",
+                "v_human = v_owner",
             ][..],
         ),
     ] {
