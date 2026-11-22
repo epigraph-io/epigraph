@@ -26,14 +26,17 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN python -c "import sys, torch; \
   sys.exit(None if torch.version.cuda is None else 'CUDA torch ' + torch.__version__ + ' installed; expected the CPU wheel')"
 
-COPY app.py ./
+COPY app.py precache_model.py ./
 
-# Pre-cache the model into the image so first request is not a cold pull.
-# Skipped automatically when NLI_STUB=1 is set at build time.
+# Pre-cache the model into the image so first request is not a cold pull, and
+# fail the build if it does not load and score (precache_model.py). Pass
+# --build-arg NLI_STUB=1 to skip the model for a stub image. NLI_STUB is a
+# build argument only, never a runtime ENV, so a model image does not serve
+# stub scores.
 ARG NLI_MODEL=MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli
 ENV NLI_MODEL=${NLI_MODEL}
-RUN python -c "import os; \
-  os.environ.get('NLI_STUB')=='1' or __import__('transformers').pipeline('text-classification', model=os.environ['NLI_MODEL'], top_k=None, device=-1)" || true
+ARG NLI_STUB=0
+RUN python precache_model.py
 
 EXPOSE 8000
 # 2 workers keeps RAM bounded; the model is loaded per-worker on first call.

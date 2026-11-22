@@ -7,16 +7,19 @@ Standard-library only:
 The image is too heavy to build in CI, so these tests pull the RUN commands
 out of the Dockerfile and execute them with /bin/sh (the shell Docker uses
 for the shell form), with `python` and `pip` on PATH replaced where needed.
-They check that:
+They check three things:
   * torch (the wheel alone, not its dependencies) is installed from the
     PyTorch CPU wheel index, at the version requirements.txt pins, before the
     rest of the requirements, and the build fails if a CUDA build of torch
-    ends up in the image.
+    ends up in the image;
+  * a failing model pre-cache fails the build instead of being masked;
+  * the NLI_STUB build argument reaches the pre-cache step and skips it.
 """
 from __future__ import annotations
 
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +31,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 DOCKERFILE = HERE / "Dockerfile"
 REQUIREMENTS = HERE / "requirements.txt"
 CPU_INDEX = "https://download.pytorch.org/whl/cpu"
+PRECACHE_FAILED = "NLI model pre-cache failed"
+PRECACHE_SKIPPED = "NLI_STUB=1: skipping the model pre-cache"
 
 
 def _instructions() -> list[tuple[str, str]]:
@@ -61,6 +66,10 @@ def _run_index(predicate) -> int:
 
 def _is_requirements_install(args: str) -> bool:
     return "pip install" in args and "-r requirements.txt" in args
+
+
+def _is_precache(args: str) -> bool:
+    return "NLI_MODEL" in args or "precache_model.py" in args
 
 
 def _is_cpu_index_install(args: str) -> bool:
@@ -183,6 +192,49 @@ class TorchCpuWheelTest(unittest.TestCase):
                 else:
                     self.assertNotEqual(res.returncode, 0)
                     self.assertIn("CUDA", res.stderr)
+
+
+class ModelPrecacheTest(unittest.TestCase):
+    def test_a_failing_model_load_fails_the_build(self):
+        # A model that cannot load (here: a path that does not exist, offline)
+        # must stop the build with the pre-cache's own error, not ship an image
+        # without a working model.
+        command = _instructions()[_run_index(_is_precache)][1]
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = _shim_dir(pathlib.Path(tmp))
+            env = _clean_env(
+                PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
+                NLI_MODEL=str(pathlib.Path(tmp) / "no-such-model"),
+            )
+            res = _sh(command, cwd=HERE, env=env)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn(PRECACHE_FAILED, res.stderr)
+
+    def test_nli_stub_build_arg_reaches_the_precache_and_skips_it(self):
+        instructions = _instructions()
+        precache = _run_index(_is_precache)
+        # Docker only exposes a --build-arg to RUN steps after a matching ARG.
+        declared = [
+            i
+            for i, (kw, args) in enumerate(instructions)
+            if kw == "ARG" and re.match(r"NLI_STUB(=|$)", args)
+        ]
+        self.assertTrue(declared and declared[0] < precache, "ARG NLI_STUB missing before the pre-cache")
+        # Build-time only: a stub-built image must not serve stub scores.
+        self.assertFalse(
+            [a for kw, a in instructions if kw == "ENV" and "NLI_STUB" in a],
+            "NLI_STUB must not be baked into the runtime ENV",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = _shim_dir(pathlib.Path(tmp))
+            env = _clean_env(
+                PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
+                NLI_STUB="1",
+                NLI_MODEL=str(pathlib.Path(tmp) / "no-such-model"),
+            )
+            res = _sh(instructions[precache][1], cwd=HERE, env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn(PRECACHE_SKIPPED, res.stdout)
 
 
 if __name__ == "__main__":
