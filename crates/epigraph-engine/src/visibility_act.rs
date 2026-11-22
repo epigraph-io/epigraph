@@ -191,7 +191,8 @@ async fn refold_moved(
         // audience (see the module doc, "truth_value"): replace it with the
         // refolded value, which is admissible by construction.
         if written {
-            ClaimRepository::mirror_refolded_cache_into_truth_conn(&mut *conn, claim_id).await?;
+            ClaimRepository::mirror_refolded_cache_into_truth_conn(&mut *conn, viewer, claim_id)
+                .await?;
         }
     }
     Ok(())

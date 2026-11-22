@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::errors::{DbError, RefusalKind};
 use crate::repos::ClaimRepository;
+use crate::visibility::Viewer;
 
 /// Proof that `agent` may write a claim into team `group` ONLY through its
 /// live human (owner decision D-V3: an operated agent writes where its human
@@ -760,41 +761,51 @@ impl ClaimRepository {
     ///   `executes` in-edge or the `workflow` label) or a procedural one
     ///   ([`crate::repos::claim_role::is_procedural_sql`]): its `truth_value`
     ///   tracks execution outcomes;
-    /// * a claim whose `truth_value` already equals the new value.
+    /// * a claim whose `truth_value` already equals the new value;
+    /// * a claim whose owner group `viewer` does not write (the write gate).
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the write fails.
     pub async fn mirror_refolded_cache_into_truth_conn(
         conn: &mut PgConnection,
+        viewer: &Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
-        let sql = format!(
-            "WITH n AS ( \
-                 SELECT c.id, \
-                        CASE WHEN c.pignistic_prob = 'NaN'::float8 THEN 0.5::float8 \
-                             ELSE LEAST(GREATEST(c.pignistic_prob, 0.0::float8), 1.0::float8) \
-                        END AS tv \
-                   FROM claims c \
-                  WHERE c.id = $1 \
-                    AND c.pignistic_prob IS NOT NULL \
-                    AND NOT (NOT c.is_current AND abs(c.truth_value - 0.05) <= 1e-9) \
-                    AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
-                    AND c.step_lineage_id IS NULL \
-                    AND NOT EXISTS (SELECT 1 FROM edges e \
-                                     WHERE e.target_id = c.id AND e.relationship = 'executes') \
-                    AND NOT COALESCE('workflow' = ANY (c.labels), false) \
-                    AND NOT {procedural}) \
-             UPDATE claims c SET truth_value = n.tv, updated_at = NOW() \
-               FROM n \
-              WHERE c.id = n.id AND c.truth_value IS DISTINCT FROM n.tv \
-             RETURNING c.id",
-            procedural = crate::repos::claim_role::is_procedural_sql("c"),
-        );
-        let written = sqlx::query_scalar::<_, Uuid>(&sql)
-            .bind(claim_id)
-            .fetch_optional(&mut *conn)
-            .await?;
-        Ok(written.is_some())
+        let sql = viewer
+            .splice_write(
+                "WITH n AS ( \
+                     SELECT c.id, \
+                            CASE WHEN c.pignistic_prob = 'NaN'::float8 THEN 0.5::float8 \
+                                 ELSE LEAST(GREATEST(c.pignistic_prob, 0.0::float8), 1.0::float8) \
+                            END AS tv \
+                       FROM claims c \
+                      WHERE c.id = $1 \
+                        AND c.pignistic_prob IS NOT NULL \
+                        AND NOT (NOT c.is_current AND abs(c.truth_value - 0.05) <= 1e-9) \
+                        AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
+                        AND c.step_lineage_id IS NULL \
+                        AND NOT EXISTS (SELECT 1 FROM edges e \
+                                         WHERE e.target_id = c.id \
+                                           AND e.relationship = 'executes') \
+                        AND NOT COALESCE('workflow' = ANY (c.labels), false) \
+                        AND NOT __PROCEDURAL__) \
+                 UPDATE claims AS u SET truth_value = n.tv, updated_at = NOW() \
+                   FROM n \
+                  WHERE u.id = n.id AND u.truth_value IS DISTINCT FROM n.tv \
+                  /* {WRITABLE:u} */ \
+                 RETURNING u.id",
+                2,
+            )
+            .replace(
+                "__PROCEDURAL__",
+                &crate::repos::claim_role::is_procedural_sql("c"),
+            );
+        let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(claim_id);
+        // Conditional: a `Bypass` viewer renders no `$2`.
+        if let Some(w) = viewer.writable_bind() {
+            q = q.bind(w);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?.is_some())
     }
 }
 
