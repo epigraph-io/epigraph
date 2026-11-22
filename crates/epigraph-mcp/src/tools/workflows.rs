@@ -511,7 +511,10 @@ pub use epigraph_ingest_executor::STORE_WORKFLOW_MATCH_THRESHOLD;
 /// there, shared with REST `POST /api/v1/workflows` (backlog 51d599a9). Here
 /// the caller is the write identity (on stdio this server's own agent,
 /// whatever viewer a driver passed), read on a transaction stamped from it
-/// and rolled back.
+/// and rolled back. A failed match READ is logged and matches nothing, so the
+/// store goes on as it would without matching, as REST does: one input, one
+/// answer on either transport (review of 51d599a9). Resolving the caller and
+/// opening its transaction still fail the call, as the store itself would.
 async fn matching_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -539,10 +542,18 @@ async fn matching_workflow(
         canonical_name,
         qvec,
     )
-    .await
-    .map_err(internal_error)?;
-    tx.rollback().await.map_err(internal_error)?;
-    Ok(found)
+    .await;
+    // Read-only: roll back whatever the read left, before branching on it.
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(error = %e, "store_workflow: could not end the match read");
+    }
+    match found {
+        Ok(found) => Ok(found),
+        Err(e) => {
+            tracing::warn!(error = %e, "store_workflow: goal match failed; not matching");
+            Ok(None)
+        }
+    }
 }
 
 pub async fn find_workflow(

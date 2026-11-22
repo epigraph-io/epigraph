@@ -387,3 +387,59 @@ async fn a_provider_that_does_not_own_the_goal_column_matches_nothing(pool: PgPo
     assert_eq!(r["matched_existing"], false, "{r}");
     assert_ne!(r["workflow_id"], first["workflow_id"], "{r}");
 }
+
+/// An embedding service of another dimension than the stored goal vectors.
+struct OtherDimensionEmbedder;
+
+#[async_trait::async_trait]
+impl EmbeddingService for OtherDimensionEmbedder {
+    async fn generate(&self, _text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        Ok(vec![1.0; 8])
+    }
+    async fn batch_generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        Ok(texts.iter().map(|_| vec![1.0; 8]).collect())
+    }
+    fn dimension(&self) -> usize {
+        8
+    }
+    fn token_usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+    fn reset_token_usage(&self) {}
+    async fn health_check(&self) -> Result<(), EmbeddingError> {
+        Ok(())
+    }
+}
+
+/// A failed match READ matches nothing and the store goes on, the answer MCP
+/// `store_workflow` gives the same input (review of 51d599a9: one input, one
+/// answer on either transport). The failure is real: pgvector refuses to
+/// compare the 8-dimension query with the first store's 1536-dimension goal
+/// embedding.
+///
+/// VERIFIED TO FAIL with the match error returned instead of logged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_match_read_stores_as_without_matching(pool: PgPool) {
+    let (caller, _) = fixture::seed_agent_with_group(&pool, "store-match-fail").await;
+    let router = app(&pool).await;
+    let (status, first) = store(&router, caller, &request(GOAL)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let state = AppState::with_scoped_pool(scoped, ApiConfig::default())
+        .with_embedding_service(std::sync::Arc::new(OtherDimensionEmbedder));
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    let other = epigraph_api::routes::create_router(state);
+
+    let (status, r) = store(&other, caller, &request(REWORDED)).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["matched_existing"], false, "{r}");
+    assert_ne!(r["workflow_id"], first["workflow_id"], "{r}");
+}
