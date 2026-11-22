@@ -1519,6 +1519,81 @@ async fn the_unmark_cli_unmarks_a_backfilled_legacy_mark_and_strips_its_marker(p
     drop_login(&pool, &maint_role).await;
 }
 
+/// The preflight reads what the act reads, in the act's order, before the
+/// legacy rule admits a mark: a backfilled legacy mark that also has a revert
+/// record naming no applied row fails the act's read, so it fails the dry run
+/// (exit 1, no plan) and the apply (before any write), instead of dry-running
+/// admissible and failing at the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_preflight_fails_on_a_revert_record_the_act_cannot_read(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (canonical, dup) = claim_pair(&pool, "legacy, bad record").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, \
+                           labels = COALESCE(labels, ARRAY[]::text[]) || ARRAY['deduped'], \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims') \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let edge = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let b = epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(
+            &mut conn, true,
+        )
+        .await
+        .expect("backfill");
+        assert_eq!(b.inserted, 1, "CALIBRATION: {b:?}");
+        b.duplicates[0].identity_edge.expect("the backfilled edge")
+    };
+    sqlx::query(
+        "INSERT INTO security_events (id, event_type, agent_id, success, details) \
+         VALUES (gen_random_uuid(), 'cascade.dedup_revert_record', NULL, true, \
+                 jsonb_build_object('cause', 'dedup', \
+                                    'subject_id', $1::text, 'identity_edge', $2::text, \
+                                    'revert', '{}'::jsonb))",
+    )
+    .bind(dup)
+    .bind(edge)
+    .execute(&pool)
+    .await
+    .expect("a revert record naming no applied row");
+    let (d, c) = (dup.to_string(), canonical.to_string());
+
+    for apply in [false, true] {
+        let mut args = vec!["--acting-agent", &op, "--claim-id", &d, "--canonical", &c];
+        if apply {
+            args.push("--apply");
+        }
+        let r = run(UNMARK, &args, &app_url, Some(&maint_url));
+        assert_eq!(r.code, Some(1), "apply={apply}\n{}\n{}", r.stdout, r.stderr);
+        assert!(
+            r.stderr.contains("names no applied row"),
+            "apply={apply}\n{}",
+            r.stderr
+        );
+        assert!(
+            !r.stdout.contains("\"admissible\""),
+            "apply={apply}: a plan was printed\n{}",
+            r.stdout
+        );
+        assert_eq!(claim_state(&pool, dup).await, (false, Some(canonical)));
+        assert_eq!(identity_edge(&pool, dup).await, Some(edge));
+        assert!(undedup_rows(&pool, dup).await.is_empty());
+    }
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
 /// The preflight's open-cascade arm: a mark whose repair never ran (its
 /// cascade is still deferred) has no revert record, but the un-mark retires
 /// the cascade, so it is admissible and is un-marked.

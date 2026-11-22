@@ -1153,27 +1153,21 @@ pub async fn apply_unmark_authorized(
 /// Maintenance connection only (the audit reads are unfiltered).
 ///
 /// # Errors
-/// `DbError::QueryFailed` on a failed read, or a revert record without a
-/// readable applied row id ([`audit::dedup_revert_record`]).
+/// `DbError::QueryFailed` on a failed read; `DbError::InvalidData` for a
+/// revert record without an applied row id ([`audit::dedup_revert_record`]),
+/// which the act fails on too.
 pub async fn predict_no_record(
     conn: &mut sqlx::PgConnection,
     dup_id: Uuid,
     identity_edge: Uuid,
     legacy_backfill: bool,
 ) -> Result<Option<UnmarkRefusal>, DbError> {
-    if legacy_backfill {
-        return Ok(None);
-    }
-    if audit::dedup_revert_record(&mut *conn, dup_id, identity_edge)
-        .await?
-        .is_some()
-    {
-        return Ok(None);
-    }
-    if !audit::open_dedup_cascades(&mut *conn, dup_id)
-        .await?
-        .is_empty()
-    {
+    // Both reads first, in the act's order, so a read the act fails on (a
+    // revert record with no applied row id) fails the preflight too, even for
+    // a mark the legacy rule would admit.
+    let record = audit::dedup_revert_record(&mut *conn, dup_id, identity_edge).await?;
+    let open = audit::open_dedup_cascades(&mut *conn, dup_id).await?;
+    if record.is_some() || legacy_backfill || !open.is_empty() {
         return Ok(None);
     }
     Ok(Some(UnmarkRefusal::NoRecord))
