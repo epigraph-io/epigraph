@@ -11,15 +11,17 @@
 //!   before the upgrade it still lists after it, a report triage had already
 //!   moved out of the intake group included (which 207's list had lost). A
 //!   claim the reporter authored by another path gets no marker, and neither
-//!   does an audit row whose claim is gone or is no longer the reporter's.
+//!   does an audit row whose claim is gone
+//!   or is no longer the reporter's. The filed labels are rebuilt from the
+//!   audit row exactly as the write composed them.
 //! * `the_265_undo_returns_the_catalog_below_265`: `docs/runbooks/265-undo.sql`
 //!   leaves the `public` catalog exactly as it was below 265 (function bodies
 //!   compared by `pg_get_functiondef` md5, so 211's write and 207's list are
 //!   restored byte for byte), and a second run changes nothing.
 //!
 //! Verified to fail: with 265's backfill INSERT removed, the first test's
-//! post-upgrade list is empty; with the undo's re-statement of 207's list
-//! dropped, the second names `epigraph_my_bug_reports` in the diff.
+//! post-upgrade list is empty; with the undo's re-statement of 207's list dropped, the
+//! undo test names `epigraph_my_bug_reports` in the diff.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -116,14 +118,26 @@ fn report(title: &str) -> BugReportInput {
 }
 
 async fn submit_as(pool: &PgPool, agent: Uuid, title: &str) -> BugReportReceipt {
+    submit_input(pool, agent, &report(title)).await
+}
+
+async fn submit_input(pool: &PgPool, agent: Uuid, input: &BugReportInput) -> BugReportReceipt {
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
     let scoped = app(pool).await;
     let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
-    let r = BugReportRepository::submit_conn(&mut tx, &report(title))
+    let r = BugReportRepository::submit_conn(&mut tx, input)
         .await
         .expect("filed");
     tx.commit().await.expect("commit");
     r
+}
+
+async fn labels_of(pool: &PgPool, claim: Uuid) -> Vec<String> {
+    sqlx::query_scalar("SELECT labels FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("labels")
 }
 
 async fn list_as(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
@@ -165,7 +179,11 @@ async fn the_265_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
         .expect("arm");
 
     let first = submit_as(&pool, reporter, "first").await;
-    let second = submit_as(&pool, reporter, "second").await;
+    let mut graded = report("second");
+    graded.severity = Some("minor".into());
+    graded.component = Some("theme-scripts".into());
+    let second = submit_input(&pool, reporter, &graded).await;
+    let second_filed = labels_of(&pool, second.claim_id).await;
     let theirs = submit_as(&pool, other, "theirs").await;
     let own = fixture::seed_group_claim(&pool, reporter, home, "not a report").await;
     // Triage moves the first report before the upgrade: 207's list loses it.
@@ -199,6 +217,30 @@ async fn the_265_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
         ],
         "one marker per filed report, from its audit row (the claim authored by another path, \
          {own}, has none)"
+    );
+    let filed: Vec<(Uuid, Option<String>, Vec<String>)> = sqlx::query_as(
+        "SELECT claim_id, title, filed_labels FROM bug_report_intake_marks ORDER BY submitted_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("filed columns");
+    let plain: Vec<String> = ["backlog", "bug-report", "intake"]
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect();
+    assert_eq!(
+        filed,
+        vec![
+            (first.claim_id, Some("first".into()), plain.clone()),
+            (second.claim_id, Some("second".into()), second_filed.clone()),
+            (theirs.claim_id, Some("theirs".into()), plain),
+        ],
+        "title and labels as filed, severity and component rebuilt from the audit row"
+    );
+    assert_eq!(
+        second_filed.len(),
+        5,
+        "CALIBRATION: the graded report carries severity and component: {second_filed:?}"
     );
     assert_eq!(
         list_as(&pool, reporter).await,
@@ -295,3 +337,4 @@ async fn the_265_undo_returns_the_catalog_below_265(pool: PgPool) {
         );
     }
 }
+

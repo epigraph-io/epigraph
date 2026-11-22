@@ -15,8 +15,9 @@
 --
 -- Both now key on a marker recorded when the report is FILED:
 -- `public.bug_report_intake_marks`, one row per report (claim id, reporter,
--- the intake group it was filed into, when). The definer writes it in the
--- same statement sequence as the row; nothing else can.
+-- the intake group it was filed into, when, and the title and labels it was
+-- filed with). The definer writes it in the same statement sequence as the
+-- row; nothing else can.
 --
 -- WHY A TABLE, NOT 207's `bug_report.submitted` AUDIT ROW. That row is
 -- already unforgeable, and the list could read it, but the theme scripts
@@ -40,16 +41,20 @@
 --       role holds SELECT and INSERT; no role but a superuser may change or
 --       delete a marker.
 --   (b) the backfill: one marker per existing `bug_report.submitted` row
---       whose claim still exists and is still authored by the row's agent
---       (207's own list conditions minus the owner group), with the event's
---       timestamp as `submitted_at`, so every report a reporter sees before
---       this migration it still sees after it. Read with row security OFF:
---       on a migration login that row security would filter, the read fails
---       instead of silently missing rows. `bug_report_intake_settings` is
---       locked ACCESS EXCLUSIVE first: every write definer call reads that
---       row before it writes anything and holds its lock to commit, so a
---       report in flight on 207's/211's body commits before the backfill
---       reads, and none starts until the new body below is in place.
+--       whose claim still exists and is still authored by the row's agent,
+--       with the event's timestamp as `submitted_at`, the claim's title and the
+--       labels the write put on it rebuilt from the audit row's severity and
+--       component, so every report a reporter sees before this migration it
+--       still sees after it. The title can only come from the claim's
+--       `properties`, which its owner can rewrite: a report triage had
+--       already moved before 265 keeps whatever title it holds now. Read with
+--       row security OFF: on a migration login that row security would
+--       filter, the read fails instead of silently missing rows.
+--       `bug_report_intake_settings` is locked ACCESS EXCLUSIVE first: every
+--       write definer call reads that row before it writes anything and
+--       holds its lock to commit, so a report in flight on 207's/211's body
+--       commits before the backfill reads, and none starts until the new body
+--       below is in place.
 --   (c) `epigraph_submit_bug_report`, redefined from 211's body with two
 --       changes: the marker INSERT after the audit row, and the blank test
 --       for the repro and the evidence (backlog 64584278 part 2): an
@@ -71,11 +76,19 @@
 --       `submitted_at` is the marker's (the same `now()` the audit row was
 --       stamped with).
 --
--- NOT CHANGED, deliberately: the list still returns the claim's CURRENT
--- labels, so whatever triage writes into them is shown to the reporter.
+--       WHAT A LISTED REPORT SHOWS does not widen 207's disclosure. While the
+--       claim is owned by the CURRENT intake group the row shows its live
+--       title and labels, exactly as 207 did. Once another group owns it
+--       (triage moved it, or the operator named a different intake group),
+--       207 did not list it at all; 265 lists it with only what was filed
+--       (the marker's title and labels) and `resolved`/`is_current`, never
+--       a label or title its new owner wrote.
+--
+-- NOT DECIDED HERE: the labels triage writes while the report is in the
+-- current intake group are still shown to the reporter, as 207 showed them.
 -- Whether that disclosure is acceptable, or the reporter view should filter
--- triage labels, is an open operator question (backlog e690866c part 2); this
--- migration does not decide it.
+-- triage labels there too, is an open operator question (backlog e690866c
+-- part 2).
 --
 -- (c) and (d) keep 172's form: SECURITY DEFINER, owned by
 -- `epigraph_maintenance`, `SET search_path = pg_catalog, pg_temp`, every
@@ -87,9 +100,8 @@
 -- ===================================================================
 --
 -- docs/runbooks/265-undo.sql: re-applies 211's write body and 207's list
--- body, then drops the marker table (its rows are rebuilt by re-applying (b)
--- if 265 is applied again). Roll every binary and script that reads the
--- marker table back first (`scripts/theme_lib.py`).
+-- body, then drops the marker table with its rows. Roll every binary and
+-- script that reads the marker table back first (`scripts/theme_lib.py`).
 
 SET LOCAL lock_timeout = '3s';
 
@@ -104,14 +116,21 @@ CREATE TABLE public.bug_report_intake_marks (
     claim_id        uuid PRIMARY KEY,
     reporter_id     uuid NOT NULL,
     intake_group_id uuid NOT NULL,
-    submitted_at    timestamptz NOT NULL
+    submitted_at    timestamptz NOT NULL,
+    -- What the reporter FILED, which is all a report owned outside the
+    -- current intake group shows it (section 2 (d)): the title it gave and the
+    -- labels the definer put on the row. Kept here because the claim's own
+    -- `properties` and `labels` are its owner's to rewrite.
+    title           text,
+    filed_labels    text[] NOT NULL
 );
 COMMENT ON TABLE public.bug_report_intake_marks IS
     'Migration 265: one row per bug report filed through the intake (207), written by '
     'epigraph_submit_bug_report in the report''s own transaction: the claim, its reporter, '
-    'the intake group it was filed into and when. The reporter''s list and the theme '
-    'scripts'' label exclusion key on it, not on the intake group configured now. No '
-    'foreign keys: a marker outlives a claim or group delete (readers join to claims).';
+    'the intake group it was filed into and when, and the title and labels it was filed '
+    'with. The reporter''s list and the theme scripts'' label exclusion key on it, not on '
+    'the intake group configured now. No foreign keys: a marker outlives a claim or group '
+    'delete (readers join to claims).';
 CREATE INDEX bug_report_intake_marks_reporter
     ON public.bug_report_intake_marks (reporter_id, submitted_at DESC);
 
@@ -142,13 +161,24 @@ BEGIN
     -- reads error instead of silently missing reports.
     PERFORM pg_catalog.set_config('row_security', 'off', true);
     INSERT INTO public.bug_report_intake_marks (claim_id, reporter_id, intake_group_id,
-                                                submitted_at)
+                                                submitted_at, title, filed_labels)
     SELECT DISTINCT ON (c.id)
            c.id, e.agent_id,
            CASE WHEN (e.details ->> 'intake_group_id') ~ v_uuid
                 THEN (e.details ->> 'intake_group_id')::uuid
                 ELSE c.owner_group_id END,
-           e.created_at
+           e.created_at,
+           -- The title is only in the claim's properties (see the header).
+           (c.properties -> 'bug_report' ->> 'title'),
+           -- The labels the write put on the row, rebuilt from the audit row
+           -- (definer-written only, 207 (b)), as the write composes them.
+           ARRAY['backlog', 'bug-report', 'intake']::text[]
+           || CASE WHEN (e.details ->> 'severity') IN ('blocker', 'major', 'minor')
+                   THEN ARRAY['severity:' || (e.details ->> 'severity')]
+                   ELSE '{}'::text[] END
+           || CASE WHEN (e.details ->> 'component') ~ '^[a-z0-9][a-z0-9-]{0,47}$'
+                   THEN ARRAY['component:' || (e.details ->> 'component')]
+                   ELSE '{}'::text[] END
       FROM public.security_events e
       -- Joined on the uuid, so `claims_pkey` serves the probe (a cast on the
       -- claims side would read the whole heap); a malformed value joins nothing.
@@ -372,8 +402,8 @@ BEGIN
     -- group, or one filed under an intake group the operator has since
     -- replaced, is still known for what it is.
     INSERT INTO public.bug_report_intake_marks (claim_id, reporter_id, intake_group_id,
-                                                submitted_at)
-    VALUES (v_claim, v_principal, v_group, v_now);
+                                                submitted_at, title, filed_labels)
+    VALUES (v_claim, v_principal, v_group, v_now, p_title, v_labels);
 
     RETURN QUERY SELECT v_claim, v_now;
 END $$;
@@ -413,12 +443,22 @@ BEGIN
     END IF;
     -- 265: the reports the caller FILED (its markers), wherever triage has
     -- moved them since and whichever intake group they were filed into; the
-    -- claim must still be authored by the caller. Not keyed on `v_group`.
+    -- claim must still be authored by the caller. Which reports are listed is
+    -- not keyed on `v_group`; what each one SHOWS is: the live title and
+    -- labels only while the claim is owned by the CURRENT intake group (207's
+    -- surface, unchanged), otherwise only what was filed (the marker's title
+    -- and labels) plus `resolved`. A report another group now owns is that
+    -- group's information, and 207 never showed it to the reporter at all.
     RETURN QUERY
     SELECT c.id,
-           (c.properties -> 'bug_report' ->> 'title'),
+           CASE WHEN c.owner_group_id = v_group
+                THEN (c.properties -> 'bug_report' ->> 'title')
+                ELSE m.title END,
            m.submitted_at,
-           c.labels,
+           CASE WHEN c.owner_group_id = v_group THEN c.labels
+                WHEN 'resolved' = ANY (c.labels)
+                THEN m.filed_labels || ARRAY['resolved']::text[]
+                ELSE m.filed_labels END,
            'resolved' = ANY (c.labels),
            c.is_current
       FROM public.bug_report_intake_marks m
@@ -431,7 +471,9 @@ END $$;
 COMMENT ON FUNCTION public.epigraph_my_bug_reports(integer) IS
     'Migration 207: the session principal''s own intake reports (claim id, title, '
     'submitted_at, current labels, resolved, is_current), newest first, at most 200. '
-    '265: keyed on the intake marker recorded at filing, not on the current intake group.';
+    '265: keyed on the intake marker recorded at filing, not on the current intake group; '
+    'a report owned outside the current intake group shows only its filed title and labels '
+    'plus resolved.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_my_bug_reports(integer) FROM PUBLIC;
 
 -- `CREATE OR REPLACE` keeps owners and grants; re-asserted, as 211 does, so a

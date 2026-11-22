@@ -141,8 +141,8 @@ def test_a_moved_or_earlier_intake_report_stays_out_of_the_theme_label_sample(db
         for claim, group in ((moved, old_intake), (earlier, old_intake)):
             cur.execute(
                 "INSERT INTO bug_report_intake_marks "
-                "(claim_id, reporter_id, intake_group_id, submitted_at) "
-                "VALUES (%s, %s, %s, now())",
+                "(claim_id, reporter_id, intake_group_id, submitted_at, filed_labels) "
+                "VALUES (%s, %s, %s, now(), ARRAY['backlog', 'bug-report', 'intake'])",
                 (claim, seed_agent, group),
             )
     assert sampled() == [PUBLIC_TEXT]

@@ -262,8 +262,10 @@ impl BugReportRepository {
     /// `limit` (clamped to 1..=200 by the definer). Keyed on the intake
     /// marker recorded when each report was filed (migration 265), so a
     /// report triage has moved out of the intake group, or one filed under an
-    /// earlier intake group, is still listed. The labels are the claim's
-    /// CURRENT labels, triage's included.
+    /// earlier intake group, is still listed. While a report is owned by the
+    /// CURRENT intake group its title and labels are the claim's live ones,
+    /// triage's included (as before 265); once another group owns it, only
+    /// what was filed (title, the write's labels) plus `resolved`.
     ///
     /// # Errors
     /// [`DbError::Refused`] when the session has no principal (BUG01) or the

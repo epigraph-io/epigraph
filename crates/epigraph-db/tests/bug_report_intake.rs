@@ -558,10 +558,11 @@ async fn the_list_holds_only_the_callers_intake_reports(pool: PgPool) {
 /// The list is keyed on the intake marker recorded when the report was
 /// FILED, not on the intake group configured NOW (backlog e690866c): a report
 /// triage moved out of the intake group, and one filed under an intake group
-/// the operator has since replaced, both stay in their reporter's list, with
-/// their current labels. Neither the move nor the reconfiguration lets a claim
-/// that was not filed through the intake in: a claim the reporter authored by
-/// another path, moved INTO the intake group, stays out.
+/// the operator has since replaced, both stay in their reporter's list.
+/// Neither the move nor the reconfiguration lets a claim that was not filed
+/// through the intake in: a claim the reporter authored by another path,
+/// moved INTO the intake group, stays out. (What each listed row SHOWS is
+/// pinned by `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn moved_and_earlier_intake_reports_stay_in_the_list(pool: PgPool) {
     let w = world(&pool).await;
@@ -621,11 +622,115 @@ async fn moved_and_earlier_intake_reports_stay_in_the_list(pool: PgPool) {
         "every report the reporter filed, newest first, and nothing else"
     );
     assert_eq!(mine[2].title.as_deref(), Some("moved by triage"));
-    assert!(
-        mine[2].labels.contains(&"bug".to_string()),
-        "the moved report's labels are read live: {:?}",
-        mine[2].labels
+}
+
+/// A listed report shows the reporter no more than 207 did (review of
+/// backlog e690866c: listing moved reports must not widen the label
+/// disclosure). While the claim is owned by the CURRENT intake group the row
+/// shows its live title and labels, triage's included, as 207 did. Once
+/// another group owns it, whether triage moved it or the operator named a
+/// different intake group, the row shows only what was filed (title and the
+/// write's labels) plus `resolved`: never a label or title its new owner
+/// wrote.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(pool: PgPool) {
+    let w = world(&pool).await;
+    let triaged = team_group(&pool, w.ops, "bri-private-team").await;
+    let next_intake = team_group(&pool, w.ops, "bri-intake-next").await;
+    let filed: Vec<String> = [
+        "backlog",
+        "bug-report",
+        "intake",
+        "severity:major",
+        "component:mcp",
+    ]
+    .iter()
+    .map(|l| (*l).to_string())
+    .collect();
+
+    let in_intake = submit_as(&pool, w.reporter, &report("still in the intake"))
+        .await
+        .expect("in intake");
+    let moved = submit_as(&pool, w.reporter, &report("adopted by a private team"))
+        .await
+        .expect("moved");
+    let old_intake = submit_as(&pool, w.reporter, &report("left under the old intake"))
+        .await
+        .expect("old intake");
+
+    // Intake triage labels a report it keeps (shown while its group is the
+    // intake: see `current` below; this one's group is replaced later).
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['bug'] WHERE id = $1")
+        .bind(in_intake.claim_id)
+        .execute(&pool)
+        .await
+        .expect("intake triage labels");
+    // A private team adopts a report, labels it with an internal reference,
+    // rewrites its title, and resolves it.
+    sqlx::query(
+        "UPDATE claims SET owner_group_id = $2, \
+                labels = labels || ARRAY['dup-of:internal-ref', 'resolved'], \
+                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"') \
+          WHERE id = $1",
+    )
+    .bind(moved.claim_id)
+    .bind(triaged)
+    .execute(&pool)
+    .await
+    .expect("a private team adopts a report");
+    // The operator names another intake group; the old one labels what it
+    // still holds.
+    configure(&pool, next_intake, 20, 200).await;
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['old-team-note'] WHERE id = $1")
+        .bind(old_intake.claim_id)
+        .execute(&pool)
+        .await
+        .expect("the old intake group labels its report");
+    // And one more report into the new intake, labelled by its triage.
+    let current = submit_as(&pool, w.reporter, &report("in the new intake"))
+        .await
+        .expect("current");
+    sqlx::query("UPDATE claims SET labels = labels || ARRAY['bug'] WHERE id = $1")
+        .bind(current.claim_id)
+        .execute(&pool)
+        .await
+        .expect("new intake triage labels");
+
+    let mine = list_as(&pool, w.reporter).await.expect("list");
+    let row = |id: Uuid| {
+        mine.iter()
+            .find(|r| r.claim_id == id)
+            .unwrap_or_else(|| panic!("{id} listed: {mine:?}"))
+    };
+
+    // CALIBRATION: in the current intake group the live labels are shown.
+    let cur = row(current.claim_id);
+    assert!(cur.labels.contains(&"bug".to_string()), "{:?}", cur.labels);
+    assert_eq!(cur.title.as_deref(), Some("in the new intake"));
+
+    // Moved to a private team: what was filed plus `resolved`, nothing else.
+    let m = row(moved.claim_id);
+    let mut want = filed.clone();
+    want.push("resolved".into());
+    assert_eq!(m.labels, want, "the new owner's labels are not disclosed");
+    assert!(m.resolved);
+    assert_eq!(
+        m.title.as_deref(),
+        Some("adopted by a private team"),
+        "the new owner's title is not disclosed"
     );
+
+    // Under the replaced intake group: what was filed (207 listed none of
+    // these, so neither 'bug'-style triage nor the old group's later note).
+    for (id, title) in [
+        (old_intake.claim_id, "left under the old intake"),
+        (in_intake.claim_id, "still in the intake"),
+    ] {
+        let r = row(id);
+        assert_eq!(r.labels, filed, "{title}: only what was filed");
+        assert!(!r.resolved);
+        assert_eq!(r.title.as_deref(), Some(title));
+    }
 }
 
 /// A repro or evidence with nothing visible in it (zero-width, format, filler
@@ -760,8 +865,9 @@ async fn the_application_role_cannot_read_or_forge_an_intake_marker(pool: PgPool
         (
             "forge",
             "WITH i AS (INSERT INTO bug_report_intake_marks \
-                            (claim_id, reporter_id, intake_group_id, submitted_at) \
-                        SELECT $1, epigraph_principal_id(), $1, now() RETURNING 1) \
+                            (claim_id, reporter_id, intake_group_id, submitted_at, \
+                             filed_labels) \
+                        SELECT $1, epigraph_principal_id(), $1, now(), '{}' RETURNING 1) \
              SELECT count(*)::bigint FROM i",
         ),
     ] {

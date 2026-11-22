@@ -3405,8 +3405,8 @@ restart.
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
 - **265**: public `bug_report_intake_marker` (backlog e690866c). Adds
   `bug_report_intake_marks` (claim id PK, reporter, the intake group the report was filed
-  into, `submitted_at`; no row security, no foreign keys; the application role holds
-  NOTHING on it, the maintenance role SELECT and INSERT), written by
+  into, `submitted_at`, the filed title and labels; no row security, no foreign keys; the
+  application role holds NOTHING on it, the maintenance role SELECT and INSERT), written by
   `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
   SECURITY DEFINER from 211's body (one added INSERT; and an invisible-only repro or evidence,
   `c_invisible`, is now absent as an invisible-only title is refused, backlog 64584278, with
@@ -3414,17 +3414,23 @@ restart.
   which now lists the caller's markers joined to their claims (author still the caller)
   instead of the claims owned by the CURRENT intake group: a report triage moved out of the
   intake group, or one filed under an intake group the operator replaced, stays listed.
+  What a listed row shows does not widen 207's disclosure: the live title and labels only
+  while the claim is owned by the CURRENT intake group (as 207), otherwise only the marker's
+  filed title and labels plus `resolved`, never a label or title a later owner wrote.
   `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
-  existing `bug_report.submitted` audit row whose claim is still authored by its agent, with
-  `row_security` off (fails closed on a filtered migration login), after an ACCESS EXCLUSIVE
-  lock on `bug_report_intake_settings` (every write definer call reads it first, so none is
-  in flight across the backfill). Not changed: the list still shows the claim's current
-  labels (the label-disclosure question, e690866c part 2, is open). Owners and grants
-  re-asserted as 211 does. Pinned by `epigraph-db/tests/bug_report_intake.rs`
-  (`moved_and_earlier_intake_reports_stay_in_the_list`,
+  existing `bug_report.submitted` audit row whose claim is still authored by its agent
+  (filed labels rebuilt from the audit row's
+  severity and component; the title from the claim, so a report moved before 265 keeps the
+  title it has now), with `row_security` off (fails closed on a filtered migration login),
+  after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call
+  reads it first, so none is in flight across the backfill). Not decided: the list still shows the labels intake triage writes while a
+  report is in the current intake group (the label-disclosure question, e690866c part 2, is
+  open). Owners and grants re-asserted as 211 does. Pinned by
+  `epigraph-db/tests/bug_report_intake.rs` (`moved_and_earlier_intake_reports_stay_in_the_list`,
+  `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`,
   `the_application_role_cannot_read_or_forge_an_intake_marker`) and
-  `bug_report_intake_marker.rs` (the backfill across an upgrade from 264, the undo); the
-  intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
+  `bug_report_intake_marker.rs` (the backfill across an upgrade from 264,
+  the undo); the intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
   this file. Undo: `docs/runbooks/265-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 265). Checked before claiming: no migration on main or an origin branch
   carries a `265`. **Deploy order:** the MCP binary of this change ships with or BEFORE the
@@ -3435,8 +3441,8 @@ restart.
   this change (they read the table: 42P01 below 265), and while NO theme run is in progress (a
   maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
   600 s statement timeout, so 265's ACCESS EXCLUSIVE lock times out after 3 s and the migration
-  fails, safely: re-run it). The backfill reads `security_events` through
-  `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
+  fails, safely: re-run it). The backfill reads
+  `security_events` through `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
   on a deployed database is a measurement still to make. A
   read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
   **Applied to throwaway databases only, NOT to any deployed database.**
