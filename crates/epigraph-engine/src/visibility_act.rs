@@ -99,9 +99,11 @@
 //!   until the next computation that stores it.
 //! * `ds_bayesian_divergence` rows are not written afresh. Their posterior is
 //!   the claim's Beta track (`claims.beta_alpha` / `beta_beta`), which moves
-//!   with the claim and was accumulated from every BBA the old audience could
-//!   read, so a recompute would re-serve what stayed behind. The claim's next
-//!   live evidence write records one.
+//!   with the claim unchanged and was accumulated from every BBA the old
+//!   audience could read. That track is itself an open leak this act does not
+//!   close: the claim's next live evidence write returns its posterior to the
+//!   writer and records a divergence row from it, both served to the new
+//!   audience. Recomputing the row here would only serve it sooner.
 
 use std::collections::HashMap;
 
