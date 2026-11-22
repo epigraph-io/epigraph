@@ -3398,7 +3398,9 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `ClusterRunRepository::claim_placement`, the caller that matters, takes a `&Viewer` and \
          splices it onto both of them plus the `claims` existence probe. SCOPE: the Explorer \
          branch widened the executor from `&PgPool` so the three `expand` handlers can pass their \
-         viewer-stamped connection and keep one connection per request. The SQL is unchanged.",
+         viewer-stamped connection and keep one connection per request. Backlog 523dcb4f later \
+         added `WHERE algo = 'louvain'`, a filter on the same single table that joins nothing \
+         new.",
     ),
     (
         "method.rs",

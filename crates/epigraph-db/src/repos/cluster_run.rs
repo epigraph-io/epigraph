@@ -1,28 +1,23 @@
 //! The "latest cluster run" lookup, and where a claim sits inside it.
 //!
-//! Every graph `expand` route resolves the run the same way — newest
-//! `graph_cluster_runs.completed_at` — and answers 404 for anything that is
-//! not in *that* run. Four copies of that `ORDER BY completed_at DESC LIMIT 1`
-//! are still inlined into the routes today: `routes/graph.rs` `overview`,
-//! `expand` and `themes_expand`, and `routes/graph_neighborhood.rs` `expand`,
-//! the last as a subquery inside a larger statement. This is the shared
-//! spelling, and `GET /claims/:id/placement` reads it, so the ids that route
-//! hands out are ones `expand` accepts at that moment and both go stale
-//! together when the next run lands.
+//! Every graph `expand` route resolves the run the same way and answers 404
+//! for anything that is not in *that* run: `routes/graph.rs` `overview`,
+//! `expand` and `themes_expand`, `routes/graph_neighborhood.rs` `expand`, and
+//! `GET /claims/:id/placement` all call [`ClusterRunRepository::latest`]
+//! (`epigraph-api/tests/cluster_run_lookup_is_shared_test.rs` pins that none
+//! of them inlines its own spelling). So the ids `placement` hands out are ones
+//! `expand` accepts at that moment, and both go stale together when the next
+//! run lands. `atlas_layout.rs` records the same run id on a layout run.
 //!
-//! Converting those four call sites is a separate change — the neighborhood
-//! one has to be split out of its enclosing statement before that statement
-//! runs — and until it happens the agreement above is a property of this
-//! function matching their SQL, not of them calling it. Do not let the two
-//! spellings drift: a `cluster_id` or `neighborhood_id` resolved against a
-//! different run than the one `expand` recognises is a live 404.
-//!
-//! Note what the lookup does NOT do: it does not filter on
-//! `graph_cluster_runs.algo` (migration 028). A `louvain_bridge` run from
-//! `POST /api/v1/clusters/build-from-bridges` therefore becomes "latest" and
-//! has no neighborhoods. That is pre-existing behaviour, preserved
-//! deliberately so this function and the expand routes agree; filtering is a
-//! separate decision for all five call sites at once.
+//! "Latest" means the newest **Louvain** run: `graph_cluster_runs.algo =
+//! 'louvain'` (migration 028's column default, which the `cluster_graph` jobs
+//! runner relies on by not naming the column). `POST
+//! /api/v1/clusters/build-from-bridges` writes `algo = 'louvain_bridge'` rows
+//! into the same table; those runs have no neighbourhoods, and before the
+//! filter a bridge run completing after the Louvain run became "latest" and
+//! every expand route answered 404 for the real run's clusters and
+//! neighbourhoods (backlog 523dcb4f). Migration 028's
+//! `(algo, completed_at DESC)` index serves the filtered lookup.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -57,8 +52,10 @@ pub struct ClaimPlacement {
 pub struct ClusterRunRepository;
 
 impl ClusterRunRepository {
-    /// The run every graph `expand` route treats as current, or `None` when
-    /// no run has ever completed.
+    /// The run every graph `expand` route treats as current: the newest
+    /// completed run with `algo = 'louvain'`, or `None` when no Louvain run
+    /// has completed. A `louvain_bridge` run is never current, however recent
+    /// (see the module doc).
     ///
     /// # This function takes no `Viewer`, deliberately
     ///
@@ -82,6 +79,7 @@ impl ClusterRunRepository {
         let row = sqlx::query_as::<_, ClusterRunRow>(
             "SELECT run_id, completed_at, degraded
              FROM graph_cluster_runs
+             WHERE algo = 'louvain'
              ORDER BY completed_at DESC
              LIMIT 1",
         )
