@@ -17,7 +17,7 @@
 
 mod viewer_fixture;
 
-use epigraph_db::ClusterRunRepository;
+use epigraph_db::{ClaimRepository, ClusterRunRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -150,5 +150,42 @@ async fn placement_resolves_the_louvain_cluster_not_the_bridge_one(pool: PgPool)
         placement.cluster_id,
         Some(louvain_cluster),
         "placement handed out the bridge cluster {bridge_cluster}, which expand 404s"
+    );
+}
+
+/// A 1536-d pgvector literal; the semantic read ranks on `claims.embedding`
+/// and decodes `similarity` as a non-null `f64`, so the claim needs one.
+fn probe_vec() -> String {
+    format!("[{}]", vec!["0.1"; 1536].join(","))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn semantic_search_cluster_id_comes_from_the_louvain_run(pool: PgPool) {
+    // `ClaimRepository::semantic_selected_claims` (the diverse
+    // `/search/semantic` row) carries its own "newest run" subquery for
+    // `cluster_id`. The bridge clusterer makes paragraph claims members of a
+    // bridge run too; without the algo filter the newer bridge cluster id
+    // came back here, and `routes/graph.rs::expand` (pinned to
+    // `ClusterRunRepository::latest`) answers 404 for it.
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "search-algo").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, agent, "search algo claim").await;
+    let vec = probe_vec();
+    viewer_fixture::set_claim_embedding(&pool, claim, &vec).await;
+
+    let louvain = seed_run(&pool, "louvain", -60).await;
+    let louvain_cluster = seed_membership(&pool, louvain, claim).await;
+    let bridge = seed_run(&pool, "louvain_bridge", 0).await;
+    let bridge_cluster = seed_membership(&pool, bridge, claim).await;
+
+    let rows =
+        ClaimRepository::semantic_selected_claims(&pool, &viewer, "embedding", &vec, &[claim])
+            .await
+            .expect("semantic_selected_claims");
+    assert_eq!(rows.len(), 1, "the public claim is selected: {rows:?}");
+    assert_eq!(
+        rows[0].cluster_id,
+        Some(louvain_cluster),
+        "search handed out the bridge cluster {bridge_cluster}, which expand 404s"
     );
 }
