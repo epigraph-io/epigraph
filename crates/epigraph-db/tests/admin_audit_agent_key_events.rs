@@ -226,7 +226,10 @@ async fn migration_252_refuses_over_another_body(pool: PgPool) {
     let err = migrate(&pool, &MIGRATOR)
         .await
         .expect_err("252 must refuse over another body");
-    assert!(err.contains("252"), "{err}");
+    assert!(
+        err.contains("55000") && err.contains("is not the body 252 re-states"),
+        "the guard's own refusal, not some other failure: {err}"
+    );
     assert_eq!(body_md5(&pool).await, other, "nothing was changed");
 }
 
@@ -263,4 +266,84 @@ async fn the_252_undo_restores_112s_body(pool: PgPool) {
             .await
             .unwrap_or_else(|e| panic!("{run} run: the workflow event must still write: {e}"));
     }
+}
+
+/// A pool logged in as the application role, UNSTAMPED: the session the API's
+/// key handlers run their transaction on (`state.db_pool.begin()`).
+async fn app_pool(pool: &PgPool) -> PgPool {
+    use sqlx::Executor;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .expect("current_database()");
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let prefix = base
+        .split_once('?')
+        .map_or(base.as_str(), |(a, _)| a)
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .expect("DATABASE_URL must carry a database path")
+        .0
+        .to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&format!("{prefix}/{db}"))
+        .await
+        .expect("app pool")
+}
+
+/// The handler's shape on the APPLICATION role (row security on, not a
+/// superuser): one unstamped transaction holding the admin audit row and the
+/// key's status change commits both. Before 252 the audit is ADM03 here; a
+/// row-security refusal of the definer's INSERT would surface as 42501.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_audit_and_the_key_change_commit_together_on_the_application_role(pool: PgPool) {
+    let (admin, client) = seed_client(&pool, true).await;
+    let (target, _) = seed_client(&pool, false).await;
+    // An `encryption` key: a `signing` key is attested state the application
+    // role cannot move (161, AK02), whoever asks.
+    let key = Uuid::new_v4();
+    let pk: Vec<u8> = key.as_bytes().repeat(2);
+    sqlx::query(
+        "INSERT INTO agent_keys (id, agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, $3, 'encryption', 'active', now())",
+    )
+    .bind(key)
+    .bind(target)
+    .bind(&pk)
+    .execute(&pool)
+    .await
+    .expect("seed key");
+
+    let app = app_pool(&pool).await;
+    let jti = Uuid::new_v4();
+    let mut tx = app.begin().await.expect("begin on the application role");
+    epigraph_db::SecurityEventRepository::admin_audit_write(
+        &mut tx,
+        client,
+        jti,
+        admin,
+        "agent_keys.admin_revoke",
+        &serde_json::json!({"target_agent_id": target, "key_id": key}),
+    )
+    .await
+    .expect("the admin audit row on the application role");
+    let revoked =
+        epigraph_db::AgentKeyRepository::update_status(&mut *tx, key, "revoked", Some("r"), None)
+            .await
+            .expect("the revoke on the same transaction");
+    assert_eq!(revoked.status, "revoked");
+    tx.commit().await.expect("commit");
+
+    let rows = rows_for(&pool, jti).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, "agent_keys.admin_revoke");
+    assert_eq!(rows[0].1, Some(admin));
 }
