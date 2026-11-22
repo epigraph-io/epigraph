@@ -2061,13 +2061,20 @@ async fn a_concurrent_edge_insert_on_a_restricted_claim_is_waited_for_and_narrow
         "the edge committed during the batch was narrowed with its claim\n{}",
         run.show()
     );
-    assert!(
-        run.stdout.contains("LOCKED-PER-BATCH\t")
-            && run.stdout.contains("edges")
-            && run.stdout.contains("harvester_fragments"),
-        "the plan names edges and harvester_fragments among the locked tables\n{}",
-        run.show()
-    );
+    let locked: Vec<&str> = run
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("LOCKED-PER-BATCH\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .map(|list| list.split(',').collect())
+        .unwrap_or_default();
+    for t in ["edges", "harvester_fragments"] {
+        assert!(
+            locked.contains(&t),
+            "every batch locks {t}; the plan's LOCKED-PER-BATCH list is {locked:?}\n{}",
+            run.show()
+        );
+    }
 }
 
 /// The dry run runs the same batches (rolled back), so it holds the same
