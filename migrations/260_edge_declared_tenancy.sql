@@ -38,8 +38,9 @@
 --      public (`epigraph_node_tenancy`) is exactly the row 072's no-widening
 --      arm kept, so its (owner, co-owner) is recorded as the declaration.
 --      Every other INSERT records none, WHATEVER the caller bound (a caller
---      cannot forge one). A re-point keeps a recorded declaration; a re-point
---      the no-widening arm kept group records the tuple it kept.
+--      cannot forge one). A re-point carries the row's record unchanged: it
+--      never discards a declaration and never creates one (a derived edge the
+--      no-widening arm keeps narrow across a re-point stays derived).
 --      `epigraph_edges_tenancy` and `epigraph_propagate_tenancy` are NOT
 --      re-stated (both are shared, md5-guarded bodies).
 --   3. The existing declarations are recorded once: every `group` edge whose
@@ -130,15 +131,21 @@ CREATE OR REPLACE FUNCTION public.epigraph_edges_record_declaration() RETURNS tr
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE sv character varying(16); tv character varying(16);
 BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        -- A re-point neither discards nor creates a declaration: the record
+        -- is the one the INSERT made (NULL for a derived edge). A derived
+        -- edge that 072's no-widening arm keeps narrow across a re-point onto
+        -- public endpoints (e.g. a dedup re-point) is still derived, and a
+        -- caller-bound value never survives.
+        NEW.declared_owner_group_id := OLD.declared_owner_group_id;
+        NEW.declared_co_owner_group_id := OLD.declared_co_owner_group_id;
+        RETURN NEW;
+    END IF;
     IF NEW.visibility = 'group' THEN
         SELECT n.v INTO sv FROM public.epigraph_node_tenancy(NEW.source_id, NEW.source_type) n;
         SELECT n.v INTO tv FROM public.epigraph_node_tenancy(NEW.target_id, NEW.target_type) n;
     END IF;
-    IF TG_OP = 'UPDATE' AND OLD.declared_owner_group_id IS NOT NULL THEN
-        -- A re-point never discards a recorded declaration.
-        NEW.declared_owner_group_id := OLD.declared_owner_group_id;
-        NEW.declared_co_owner_group_id := OLD.declared_co_owner_group_id;
-    ELSIF NEW.visibility = 'group' AND sv = 'public' AND tv = 'public' THEN
+    IF NEW.visibility = 'group' AND sv = 'public' AND tv = 'public' THEN
         -- `edges_tenancy` kept a group tuple between two public endpoints:
         -- that is its no-widening arm, i.e. a declaration.
         NEW.declared_owner_group_id := NEW.owner_group_id;

@@ -332,6 +332,40 @@ async fn a_non_privileged_session_cannot_rewrite_a_declaration(pool: PgPool) {
     assert_eq!(declaration(&pool, edge).await, (Some(h), None));
 }
 
+/// A re-point never CREATES a declaration. A derived `('group', G)` edge
+/// between a claim private to G and a public claim, re-pointed (as a dedup
+/// does) onto another public claim, is kept narrow by 072's no-widening arm,
+/// but it is still derived: no declaration is recorded, so a later re-meet
+/// is not bound to G by a record nobody declared.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_re_point_never_records_a_declaration(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, g) = fixture::seed_agent_with_group(&pool, "writer-g").await;
+    let private = fixture::seed_group_claim(&pool, w, g, "G's private claim").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B, the dedup survivor").await;
+    let edge = fixture::seed_edge(&pool, private, a).await;
+    assert_eq!(tuple(&pool, edge).await, t(g, "group", None));
+    assert_eq!(declaration(&pool, edge).await, (None, None));
+
+    sqlx::query("UPDATE edges SET source_id = $2 WHERE id = $1")
+        .bind(edge)
+        .bind(b)
+        .execute(&pool)
+        .await
+        .expect("re-point the edge onto a public claim");
+    assert_eq!(
+        tuple(&pool, edge).await.1,
+        "group",
+        "CALIBRATION: the no-widening arm keeps the re-pointed edge narrow"
+    );
+    assert_eq!(
+        declaration(&pool, edge).await,
+        (None, None),
+        "a re-point must not turn a derived edge into a declared one"
+    );
+}
+
 // ===========================================================================
 // 2. The privatization re-meet honours it
 // ===========================================================================

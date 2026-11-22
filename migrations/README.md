@@ -3410,7 +3410,8 @@ restart.
   `epigraph_maintenance`), BEFORE INSERT OR UPDATE OF source_id, target_id, firing right after
   `edges_tenancy`: a `group` row whose endpoints are both public (the tuple 072's no-widening
   arm kept) records its (owner, co-owner) as the declaration; every other INSERT records none,
-  whatever the caller bound; a re-point keeps a recorded declaration. Records the existing
+  whatever the caller bound; a re-point carries the row's record unchanged (never creates
+  or discards one). Records the existing
   declarations once (every `group` edge whose endpoints are both public now; edges with a
   dangling endpoint are skipped and counted in a NOTICE). `edges_owner_immutable` also watches
   the two columns (a non-privileged change is 42501). `epigraph_edges_tenancy` and
