@@ -412,41 +412,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         DEFINER_RESOLUTION,
     ),
     (
-        "epigraph-mcp/src/tools/memory.rs",
-        "recall_post_embed",
-        1,
-        "NO_ROW_SECURITY: the `&server.pool` argument to themes::resolve_theme_selector, for its \
-         claim_themes label lookup (a registry with no tenancy); every claim-derived read of \
-         the page runs on the caller's stamped read.",
-    ),
-    (
         "epigraph-mcp/src/tools/paper_queries.rs",
         "query_paper",
         1,
         "NO_ROW_SECURITY: the `papers` lookup (find_paper_by_document_key); every claim-derived \
          read below it runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "get_theme",
-        1,
-        "NO_ROW_SECURITY: the `&server.pool` argument to resolve_theme_selector, for its \
-         claim_themes label lookup; the summary and member reads run on the caller's stamped \
-         read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "list_themes",
-        1,
-        "NO_ROW_SECURITY: ClaimThemeRepository::count_summaries over claim_themes, corpus-wide by \
-         design; the page itself runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/themes.rs",
-        "resolve_theme_selector",
-        1,
-        "NO_ROW_SECURITY: its `pool` parameter serves only ClaimThemeRepository::find_by_label \
-         over claim_themes; the viewer-filtered summary read takes the caller's stamped `conn`.",
     ),
     (
         "epigraph-mcp/src/tools/matching.rs",
@@ -601,8 +571,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. Backlog
+/// 06f5c5b2 moved the theme label lookup and `count_summaries` onto the
+/// caller's stamped read, removing four more: 82 -> 78.
+const HIGH_WATER: usize = 78;
 
 // ===========================================================================
 // The scanner.

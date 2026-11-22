@@ -539,7 +539,6 @@ async fn recall_post_embed(
     // resolver with `get_theme` is what makes `theme_label` mean the same thing
     // on both tools.
     let theme = crate::tools::themes::resolve_theme_selector(
-        &server.pool,
         &mut read,
         viewer,
         params.theme_id.as_deref(),

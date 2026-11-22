@@ -1870,6 +1870,11 @@ pub struct SplitCandidatesQuery {
 /// Find themes with high intra-cluster variance.
 ///
 /// GET /api/v1/themes/split-candidates
+///
+/// Per viewer: `claim_count` and the `min_claims` floor count the current
+/// members the caller can read, never the stored corpus-wide
+/// `claim_themes.claim_count`, and a theme with no readable member is not
+/// listed (backlog 06f5c5b2; see `ClaimThemeRepository::find_split_candidates`).
 #[cfg(feature = "db")]
 pub async fn get_split_candidates(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
