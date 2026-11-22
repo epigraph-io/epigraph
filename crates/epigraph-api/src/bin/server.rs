@@ -1001,6 +1001,17 @@ async fn main() {
         // SIGTERM or SIGINT stops accepting and drains in-flight requests
         // for at most the shutdown grace, as on the plain listener below.
         let handle = axum_server::Handle::new();
+        // The bound address, logged with the plain listener's line: with
+        // EPIGRAPH_PORT=0 the kernel picks the port, and this line is how a
+        // caller (the TLS boot test, an operator) learns it.
+        {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                if let Some(bound) = handle.listening().await {
+                    tracing::info!("Server listening on {}", bound);
+                }
+            });
+        }
         {
             let handle = handle.clone();
             let grace = serve.shutdown_grace;
