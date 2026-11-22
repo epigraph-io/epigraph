@@ -37,6 +37,8 @@ async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
+        // No live embedder: the verb's `embedded=` field is deterministic.
+        .env_remove("OPENAI_API_KEY")
         .env(DSN_ENV, url)
         .output()
         .expect("spawn epigraph-operator");
@@ -219,6 +221,19 @@ async fn custodial_supersede_replaces_the_hand_sql(pool: PgPool) {
     // Applied, on the retired-linked author's corpus claim.
     let applied = supersede(&pool, &c_ret_s, &ia_s, &a_s, true).await;
     assert_eq!(applied.code, 0, "{}", applied.show());
+    // Backlog 5fd3e2b4: the verb reports whether it embedded the successor.
+    // With no OPENAI_API_KEY (the helper removes it) there is no embedder, so
+    // `embedded=false` and the backfill note is printed; the dry run above
+    // never embeds.
+    assert!(
+        applied.stdout.contains("\tembedded=false\n")
+            && applied
+                .stdout
+                .contains("NOTE: the successor was not embedded"),
+        "{}",
+        applied.show()
+    );
+    assert!(dry.stdout.contains("\tembedded=false\n"), "{}", dry.show());
     let successor: (Uuid, Uuid, Uuid, String, bool) = sqlx::query_as(
         "SELECT id, agent_id, owner_group_id, visibility, COALESCE(is_current, true) \
            FROM claims WHERE supersedes = $1",
@@ -430,6 +445,7 @@ fn run_op_on(dsn: &str, args: &[&str]) -> Run {
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
         .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
+        .env_remove("OPENAI_API_KEY")
         .env(DSN_ENV, dsn)
         .output()
         .expect("spawn epigraph-operator");
@@ -1242,6 +1258,9 @@ async fn embedded(pool: &PgPool, claim: Uuid) -> bool {
 /// configured the act still commits and reports `embedded: false`, leaving the
 /// row to the backfill.
 ///
+/// The session is opened on a real maintenance login, so the store is
+/// exercised under row security, not as a superuser.
+///
 /// Verified to fail on the base: the verb never embedded, so the applied run's
 /// successor kept `embedding IS NULL`; and with the post-commit store removed
 /// from `custodial_supersede`, `embedded` is false and the vector NULL.
@@ -1264,7 +1283,13 @@ async fn a_custodial_supersede_embeds_its_successor(pool: PgPool) {
     })
     .await;
 
-    let scoped = fixture::scoped_pool(&pool).await;
+    // The session the verb opens, on a REAL maintenance login (`NOSUPERUSER
+    // NOBYPASSRLS`), so the store runs under row security on a world-owned
+    // claim, as in production.
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let scoped = epigraph_db::ScopedPool::connect(&maint_dsn, epigraph_db::SessionGucMode::Session)
+        .await
+        .expect("connect as the maintenance login");
     let mut session = scoped
         .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
         .await
@@ -1336,4 +1361,8 @@ async fn a_custodial_supersede_embeds_its_successor(pool: PgPool) {
         !embedded(&pool, r.new).await,
         "no embedder: no vector (the control)"
     );
+
+    drop(session);
+    scoped.inner().close().await;
+    drop_login(&pool, &maint_role).await;
 }

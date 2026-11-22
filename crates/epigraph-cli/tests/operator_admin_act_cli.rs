@@ -48,6 +48,9 @@ async fn run_op(pool: &PgPool, args: &[&str]) -> Run {
         .env("RUST_LOG", "warn")
         .env_remove("DATABASE_URL")
         .env_remove("MAINTENANCE_DATABASE_URL")
+        // `custodial-supersede` embeds its successor when a key is set; these
+        // tests never reach a live provider.
+        .env_remove("OPENAI_API_KEY")
         .env(DSN_ENV, url)
         .output()
         .expect("spawn");
