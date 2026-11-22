@@ -49,6 +49,11 @@ as for themes.
 Environment:
     DATABASE_URL  - Postgres connection string. epigraph_admin is required
                     for the UPDATE; epigraph_ro is sufficient for --dry-run.
+
+Exit status: 0 when every theme (or neighbourhood) considered was labelled,
+given the placeholder or skipped; EXIT_SOME_FAILED when at least one got no
+valid answer and kept its old label. theme_pipeline reports a label step as
+failed from this status alone, so a partial failure must not exit 0.
 """
 
 import argparse
@@ -79,6 +84,13 @@ RESULT_POLL_INTERVAL = 1.0
 # read to name it from (theme_lib.public_label_source). is_placeholder_label
 # matches it, so a later run labels it once a public member joins.
 NO_PUBLIC_MEMBER_LABEL = theme_lib.NO_PUBLIC_MEMBER_LABEL
+# Exit status when at least one theme or neighbourhood got no valid answer.
+EXIT_SOME_FAILED = 1
+
+
+def exit_status(failed):
+    """The process exit status for a run that left `failed` items unlabelled."""
+    return EXIT_SOME_FAILED if failed else 0
 
 
 def load_themes_with_samples(conn, limit=None):
@@ -443,6 +455,7 @@ def label_neighborhoods(conn, run_id, limit=None, relabel_all=False, dry_run=Fal
 
 
 def main():
+    """Run the labeller; return the process exit status (exit_status)."""
     parser = argparse.ArgumentParser(description="Label themes with LLM summaries")
     parser.add_argument(
         "--database-url",
@@ -484,7 +497,7 @@ def main():
         if run_id is None:
             print("No clustering run: nothing to label", file=sys.stderr)
             conn.close()
-            return
+            return 0
         labeled, placeholders, skipped, failed = label_neighborhoods(
             conn, run_id, limit=args.limit, relabel_all=args.relabel_all,
             dry_run=args.dry_run, cli_cwd=args.cli_cwd,
@@ -495,7 +508,7 @@ def main():
             file=sys.stderr,
         )
         conn.close()
-        return
+        return exit_status(failed)
 
     print("Loading themes with sample claims...", file=sys.stderr)
     themes = load_themes_with_samples(conn, limit=args.limit)
@@ -563,7 +576,8 @@ def main():
         file=sys.stderr,
     )
     conn.close()
+    return exit_status(failed)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
