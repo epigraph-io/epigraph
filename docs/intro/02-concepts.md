@@ -144,7 +144,7 @@ the agent's bare public key.
 
 A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
 
-1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with `EPIGRAPH_AGENT_SIGNING_KEY`: the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with `--agent-key`.
+1. `EPIGRAPH_AGENT_IDENTITY_PUBKEY` together with the signing key, from the 0600 file `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names or from `EPIGRAPH_AGENT_SIGNING_KEY` (one of the two): the agent is named by the identity key and signs with a separate random key. Both are required, and they cannot be combined with `--agent-key`.
 2. `--agent-model` (with `--agent-system-prompt` or `--agent-system-prompt-hash`) is REFUSED: it derived the signing key from the public seed above. It is checked first, so it never falls through to another rung.
 3. `--agent-key` (`EPIGRAPH_MCP_AGENT_KEY`): a fixed 32-byte secret key that you generate once and keep. This is what the [quickstart](01-quickstart.md) sets up.
 4. None of these: the server generates a fresh keypair on every launch and says so on stderr. Each launch then authors as a different agent, and the server warns that ownership cannot be decided for such a signer.
