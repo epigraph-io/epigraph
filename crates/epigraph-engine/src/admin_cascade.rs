@@ -436,8 +436,10 @@ fn uuids_in(s: &str) -> Vec<Uuid> {
 }
 
 /// Filter a belief report to what `caller` may read: claim ids outside its
-/// view are dropped, and an error that names anything but a claim or an edge
-/// it can read is replaced by a generic line. A bypass caller (a replay, a
+/// view are dropped, an error keeps only its context (the step and the ids it
+/// ran on, never the error's own text; backlog f9acb220), and an error whose
+/// context names anything but a claim or an edge it can read is replaced by a
+/// generic line ([`caller_error_line`]). A bypass caller (a replay, a
 /// maintenance job) gets the report unchanged. If the filter itself cannot
 /// run, the caller gets no ids at all.
 ///
@@ -460,8 +462,12 @@ pub async fn report_for_caller(
         .chain(&report.unbacked)
         .copied()
         .collect();
+    // Only the context's ids decide an entry (`caller_error_line`); ids inside
+    // the error text never reach the caller.
     for e in &report.errors {
-        ids.extend(uuids_in(e));
+        ids.extend(uuids_in(
+            e.split_once(": ").map_or("", |(context, _)| context),
+        ));
     }
     ids.sort_unstable();
     ids.dedup();
@@ -499,17 +505,33 @@ pub async fn report_for_caller(
         errors: report
             .errors
             .iter()
-            .map(|e| {
-                if uuids_in(e).iter().all(|id| visible.contains(id)) {
-                    e.clone()
-                } else {
-                    "a cascade step failed on a row outside the caller's view; the details are \
-                     in the audit row"
-                        .to_string()
-                }
-            })
+            .map(|e| caller_error_line(e, |id| visible.contains(id)))
             .collect(),
         retracted_key_kept: report.retracted_key_kept,
+    }
+}
+
+/// What a non-bypass caller is told about one [`CascadeReport::errors`] entry.
+///
+/// An entry is `"{context}: {error}"` (`CascadeReport::note_error`). The
+/// context is the engine's own text: the step and the claim or edge ids it ran
+/// on. The error is whatever the step returned, usually a driver error, which
+/// can spell SQL, a constraint, a statement timeout or another writer's row.
+/// The caller gets the context and a fixed tail; the full entry stays in the
+/// server log and in the agent-less belief-ids audit row (`record_belief`).
+/// Splitting at the first `": "` never shows error text: everything before
+/// that separator was written by the context, which holds none.
+///
+/// An entry whose context names an id `visible` refuses, or that has no
+/// context at all, becomes the generic line, with no ids in it.
+fn caller_error_line(entry: &str, visible: impl Fn(&Uuid) -> bool) -> String {
+    match entry.split_once(": ") {
+        Some((context, _error)) if uuids_in(context).iter().all(visible) => {
+            format!("{context}: failed; the details are in the audit row")
+        }
+        _ => "a cascade step failed on a row outside the caller's view; the details are in \
+              the audit row"
+            .to_string(),
     }
 }
 
@@ -1600,6 +1622,36 @@ mod tests {
         let found = uuids_in(&format!("target {a}: failed (edge {b}); code 42501"));
         assert_eq!(found, vec![a, b]);
         assert!(uuids_in("no ids here, just 42501").is_empty());
+    }
+
+    #[test]
+    fn a_caller_error_line_keeps_the_context_and_withholds_the_error_text() {
+        let (seen, hidden) = (Uuid::new_v4(), Uuid::new_v4());
+        let visible = |id: &Uuid| *id == seen;
+        // The error text names a row the caller cannot read; only the context
+        // decides, and none of the error's text survives.
+        let entry = format!(
+            "recompute claim {seen}: error returned from database: canary-f9ac relation \
+             secret_shadow row {hidden}"
+        );
+        let line = caller_error_line(&entry, visible);
+        assert_eq!(
+            line,
+            format!("recompute claim {seen}: failed; the details are in the audit row")
+        );
+        // A context naming a row the caller cannot read, and an entry with no
+        // context, both become the generic line, with no id in it.
+        for entry in [
+            format!("repair claim {seen} after invalidating edge {hidden}: canary-f9ac"),
+            "canary-f9ac with no context".to_string(),
+        ] {
+            let line = caller_error_line(&entry, visible);
+            assert!(
+                line.contains("outside the caller's view") && uuids_in(&line).is_empty(),
+                "{entry:?} -> {line:?}"
+            );
+            assert!(!line.contains("canary-f9ac"), "{line:?}");
+        }
     }
 
     #[test]
