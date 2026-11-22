@@ -462,7 +462,10 @@ pub fn drift_legacy_grouping_betp(
     two_sided: bool,
     with_compound_source: bool,
 ) -> Result<f64, String> {
-    let items: Vec<(Option<crate::source_dependence::SourceKey>, MassFunction)> = rows
+    // Each row with its legacy source key AND who it speaks for: the legacy
+    // claim fold this models (`edge_factor::compute_combined_belief_over`)
+    // applies the same-human rule too, so the comparison does.
+    let items: Vec<(BbaSource, MassFunction)> = rows
         .iter()
         .filter(|r| !r.attributed)
         .filter(|r| with_compound_source || !r.is_compound_source())
@@ -472,7 +475,12 @@ pub fn drift_legacy_grouping_betp(
             } else {
                 r.axiom.bba.clone()
             };
-            (r.legacy_key.clone(), bba)
+            let source = BbaSource {
+                agent_id: r.axiom.agent_id,
+                owner_id: r.axiom.owner_id,
+                source: r.legacy_key.clone(),
+            };
+            (source, bba)
         })
         .collect();
     if items.is_empty() {
@@ -480,11 +488,11 @@ pub fn drift_legacy_grouping_betp(
     }
     // The legacy fold's conflict threshold, from the served profile as the
     // atom fold here takes it ([`atom_fold`]).
-    let (combined, _) = crate::source_dependence::combine_with_source_dependence(
+    let (combined, _) = combine_with_owner_dependence(
         items,
         BeliefProfile::served().combination.conflict_threshold,
     )
-    .map_err(|e| format!("combine_with_source_dependence: {e}"))?;
+    .map_err(|e| format!("combine_with_owner_dependence: {e}"))?;
     Ok(measures::pignistic_probability(&combined, 0))
 }
 
@@ -1182,6 +1190,31 @@ mod tests {
             );
         }
         assert_eq!(v(&[], true, true), 0.5, "no row is the vacuous .5");
+    }
+
+    /// Backlog c2ef65a0: the legacy-grouping comparison folds like the legacy
+    /// claim fold it models, so two agents of one owner keep the stronger
+    /// support (BetP .85 for .6 and .7) instead of Dempster's product (.94),
+    /// and agents of two owners still reinforce.
+    #[test]
+    fn the_legacy_grouping_comparison_applies_the_same_human_rule() {
+        let atom = Uuid::new_v4();
+        let frame = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let by = |agent: Uuid, owner: Uuid, t: f64| {
+            let m = serde_json::json!({ "0": t, "0,1": 1.0 - t });
+            let mut r = drift_row(atom, frame, AxiomClass::Evidence, &m, &m, None, false);
+            r.axiom.agent_id = Some(agent);
+            r.axiom.owner_id = Some(owner);
+            r
+        };
+        let (a1, a2) = (Uuid::new_v4(), Uuid::new_v4());
+        let siblings = [by(a1, owner, 0.6), by(a2, owner, 0.7)];
+        let v = drift_legacy_grouping_betp(&siblings, false, true).expect("fold");
+        assert!((v - 0.85).abs() < 1e-9, "siblings: {v}");
+        let independent = [by(a1, a1, 0.6), by(a2, a2, 0.7)];
+        let v = drift_legacy_grouping_betp(&independent, false, true).expect("fold");
+        assert!((v - 0.94).abs() < 1e-9, "different owners: {v}");
     }
 
     /// The scoped resync's selection (SPEC §7.2 per-frame rows): the fold of

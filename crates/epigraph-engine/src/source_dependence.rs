@@ -39,8 +39,9 @@
 //! rule alone ([`reduce_same_owner_siblings`]) before combining: the BP seed's
 //! pairwise adaptive combine (REST `routes/computation.rs`) and MCP
 //! `compare_methods`, which then folds the reduced inputs under each method it
-//! compares. The atom fold (`atom_items`) still calls
-//! [`combine_with_source_dependence`] for its legacy-grouping comparison.
+//! compares. The atom evidence fold (`atom_items::atom_fold`) and its
+//! legacy-grouping comparison go through [`combine_with_owner_dependence`]
+//! too (backlog c2ef65a0).
 //!
 //! Source keys are read through the caller's viewer
 //! ([`source_keys_for_rows`]). A BBA can be visible while its evidence row is
