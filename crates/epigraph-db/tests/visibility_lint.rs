@@ -2369,9 +2369,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
         "lock_dedup_sources_conn",
-        "WRITE. Locks (FOR UPDATE) the claims a batch of dedup acts will mark, on the caller's \
-         stamped transaction, so the lock takes claims_tenancy's UPDATE policy; it projects only \
-         each locked source's own supersedes pointer and is_current, which the act re-checks.",
+        "WRITE. Locks (FOR NO KEY UPDATE) the claims a batch of dedup acts will mark, and their \
+         canonical, on the caller's stamped transaction, so the lock takes claims_tenancy's UPDATE \
+         policy; it projects only each locked row's own supersedes pointer and is_current, which \
+         the acts re-check.",
     ),
     (
         "claim.rs",

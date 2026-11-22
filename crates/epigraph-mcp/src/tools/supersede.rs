@@ -511,20 +511,22 @@ async fn mark_duplicate_preflight(
 ///    the pairs must share that stamp: a `claims:admin` caller that writes
 ///    some duplicates' owning groups and not others' would need two stamps,
 ///    and is refused with nothing written (split the call).
-/// 3. Inside it, every duplicate is locked in id order and re-checked
-///    ([`ClaimRepository::lock_dedup_sources_conn`]): one another writer
-///    marked, revised or retired after the gates refuses the whole batch.
-///    Any refusal before the commit rolls back every mark; the answer says
-///    no source was marked.
+/// 3. Inside it, every duplicate, and the canonical where the stamp can lock
+///    it, is locked in id order and re-checked
+///    ([`ClaimRepository::lock_dedup_sources_conn`]): a duplicate another
+///    writer marked, revised or retired after the gates, or a canonical
+///    another writer retired, refuses the whole batch. Any refusal before the
+///    commit rolls back every mark; the answer says no source was marked.
 /// 4. The administrative session is asked for once, before the commit; with
 ///    none, each duplicate's cascade deferral is recorded inside the same
 ///    transaction. After the commit the cascades run one by one on that
 ///    session, best-effort, as for a single mark.
 ///
-/// The canonical is not locked (a caller may mark onto a canonical it can
-/// read but not write, and a lock takes the UPDATE policy). Each act still
-/// refuses a canonical that is not current when it runs, which rolls the
-/// batch back too.
+/// A canonical the stamp cannot write (a `claims:admin` caller marking onto
+/// a claim it may only read) cannot be locked, since a lock takes the UPDATE
+/// policy. Each act still refuses a canonical that is not current when it
+/// runs, which rolls the batch back too; only a retirement between the last
+/// act and the commit is then not seen, as for a single `mark_duplicate`.
 ///
 /// `dups` must be distinct and must not contain `canon`; the caller checks.
 pub(crate) async fn mark_duplicates_onto(
@@ -600,7 +602,7 @@ pub(crate) async fn mark_duplicates_onto(
     };
 
     // 3. Lock and re-check every duplicate, then every act.
-    ClaimRepository::lock_dedup_sources_conn(&mut tx, dups)
+    ClaimRepository::lock_dedup_sources_conn(&mut tx, dups, canon)
         .await
         .map_err(rolled_back)?;
     let provenance = DuplicateProvenance::new(tool, DuplicateProvenance::RULE_CALLER_ASSERTED)

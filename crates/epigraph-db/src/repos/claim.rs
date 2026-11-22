@@ -9475,47 +9475,72 @@ impl ClaimRepository {
         Ok(identity_edge)
     }
 
-    /// Lock every claim a batch of dedup acts is about to mark, in id order,
-    /// and re-check under the lock that each one can still be marked: it is
-    /// current and supersedes nothing. A caller that marks several duplicates
-    /// in ONE transaction (`consolidate_claims(mode='identity')`) calls this on
-    /// that transaction before its first act, so a source another writer
-    /// changed after the caller's own checks refuses the whole batch with
-    /// nothing marked, and the locks hold every source as checked until the
+    /// Lock every claim a batch of dedup acts is about to mark, and the
+    /// canonical they are marked onto where the session can lock it, all in
+    /// one id-ordered statement, and re-check under the lock that each source
+    /// can still be marked (it is current and supersedes nothing) and that the
+    /// canonical is still current. A caller that marks several duplicates in
+    /// ONE transaction (`consolidate_claims(mode='identity')`) calls this on
+    /// that transaction before its first act, so a source or canonical another
+    /// writer changed after the caller's own checks refuses the whole batch
+    /// with nothing marked, and the locks hold every row as checked until the
     /// commit (backlog 635dbfae). Id order, so two batches over overlapping
-    /// sources queue rather than deadlock.
+    /// claims queue rather than deadlock; two batches with swapped roles (each
+    /// one's canonical is the other's source) queue too, and the second reads
+    /// its canonical retired and refuses, rather than both committing a
+    /// cycle with no current claim.
     ///
     /// The re-check matters beyond the lock: [`Self::mark_duplicate_act_conn`]
     /// refuses a duplicate that already supersedes a claim, but not one that
     /// was retired with `supersedes` left NULL (a revision's predecessor, a
     /// deprecated claim), which it would mark.
     ///
+    /// `FOR NO KEY UPDATE`, as [`Self::current_state_locked`]: it conflicts
+    /// with every retirement (an `UPDATE` of `supersedes` / `is_current`) and
+    /// not with another writer's foreign-key insert that references the row.
+    ///
     /// Runs on the CALLER's stamped transaction. Under row security a lock
-    /// takes the UPDATE policy, so a source the session cannot write is
-    /// missing from the result and refused as not found, exactly as the act's
-    /// own lock would refuse it. The canonical is not locked here for the same
-    /// reason: a caller may mark onto a canonical it can read but not write.
+    /// takes the UPDATE policy, so a row the session cannot write is missing
+    /// from the result: a source is then refused as not found, exactly as the
+    /// act's own lock would refuse it, while a canonical is left unlocked
+    /// (a `claims:admin` caller may mark onto a canonical it can read but not
+    /// write), and the act's own read of it still refuses one not current.
     ///
     /// # Errors
     /// `DbError::NotFound` for a source missing (or not writable) under the
     /// lock; `DbError::Refused` of kind `State` naming the first source, in id
-    /// order, that is no longer current or now supersedes a claim;
-    /// `DbError::QueryFailed` on a failed statement.
+    /// order, that is no longer current or now supersedes a claim, or the
+    /// locked canonical when it is no longer current; `DbError::QueryFailed`
+    /// on a failed statement.
     pub async fn lock_dedup_sources_conn(
         conn: &mut sqlx::PgConnection,
         dups: &[Uuid],
+        canonical: Uuid,
     ) -> Result<(), DbError> {
         let mut ordered = dups.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
+        let mut lock_ids = ordered.clone();
+        lock_ids.push(canonical);
         let rows: Vec<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this lock is part of the mutation it guards, not a disclosure to a caller.
             SELECT id, supersedes, COALESCE(is_current, true)
-              FROM claims WHERE id = ANY($1) ORDER BY id FOR UPDATE"#,
+              FROM claims WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE"#,
         )
-        .bind(&ordered)
+        .bind(&lock_ids)
         .fetch_all(&mut *conn)
         .await?;
+        // The canonical, when this session could lock it: it may supersede a
+        // claim (a revision), so only `is_current` is asked.
+        if let Some((_, _, false)) = rows.iter().find(|(row, _, _)| *row == canonical) {
+            return Err(DbError::Refused {
+                kind: crate::RefusalKind::State,
+                message: format!(
+                    "mark_duplicate: canonical {canonical} is no longer current (changed since \
+                     it was checked)"
+                ),
+            });
+        }
         for id in &ordered {
             match rows.iter().find(|(row, _, _)| row == id) {
                 None => {

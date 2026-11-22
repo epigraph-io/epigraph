@@ -408,8 +408,8 @@ async fn identity_mode_checks_authority_over_every_pair_before_marking(pool: PgP
     assert_eq!(identity_edges(&pool, dup_own, survivor).await, 0);
 }
 
-/// What another writer does to the last source of an identity call while the
-/// call waits on that source's row.
+/// What another writer does to a claim of an identity call while the call
+/// waits on that claim's row.
 #[derive(Clone, Copy)]
 enum ConcurrentChange {
     /// Marked a duplicate of some other claim (`supersedes` set).
@@ -419,16 +419,30 @@ enum ConcurrentChange {
     Retired,
 }
 
+/// Which claim of the identity call the other writer changes.
+#[derive(Clone, Copy, PartialEq)]
+enum RaceTarget {
+    /// The last non-survivor source.
+    LastSource,
+    /// The survivor (the canonical every source is marked onto).
+    Survivor,
+}
+
 /// Run `consolidate_claims(mode='identity')` over `[survivor, first, last]`
-/// while a second connection holds `last`'s row lock, and apply `change` to
-/// `last` on that connection once the call is waiting on the lock: after the
-/// call's checks read every source as markable, before its act on `last`.
-/// Returns the call's result and the ids.
-async fn identity_call_racing_a_change_to_the_last_source(
+/// (over `[survivor, last]` when the target is the survivor: see
+/// [`identity_mode_marks_nothing_when_the_survivor_is_marked_elsewhere_concurrently`])
+/// while a second connection holds `target`'s row lock, and apply `change` to
+/// it on that connection once the call is waiting on a lock (after the call's
+/// checks read every claim as markable, before its acts commit), or, if the
+/// call never waits, once it has returned. Returns the call's result, whether
+/// it waited on a lock, and the ids.
+async fn identity_call_racing_a_change(
     pool: &PgPool,
+    target: RaceTarget,
     change: ConcurrentChange,
 ) -> (
     Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>,
+    bool,
     [Uuid; 4],
 ) {
     let server = build_scoped_test_server(
@@ -445,25 +459,42 @@ async fn identity_call_racing_a_change_to_the_last_source(
     let elsewhere = seed_claim(pool, "another writer's canonical", 0.5).await;
     let (auth, viewer) = common::granted_server_admin(&server, pool).await;
 
-    // The other writer, on its own connection: it holds `last`'s row lock
-    // from before the call starts.
+    let changed = match target {
+        RaceTarget::LastSource => last,
+        RaceTarget::Survivor => survivor,
+    };
+    // The other writer, on its own connection: it holds the target's row
+    // lock from before the call starts.
     let mut writer = pool.begin().await.expect("writer tx");
     sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
-        .bind(last)
+        .bind(changed)
         .execute(&mut *writer)
         .await
-        .expect("lock the last source");
+        .expect("lock the target claim");
     let mut watcher = pool.acquire().await.expect("watcher connection");
 
-    let call = consolidate_claims(
-        &server,
-        &viewer,
-        params("identity", &[survivor, first, last], "", Some(survivor)),
-        Some(&auth),
-    );
-    let interfere = async move {
+    let sources = match target {
+        RaceTarget::LastSource => vec![survivor, first, last],
+        RaceTarget::Survivor => vec![survivor, last],
+    };
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let call = async {
+        let r = consolidate_claims(
+            &server,
+            &viewer,
+            params("identity", &sources, "", Some(survivor)),
+            Some(&auth),
+        )
+        .await;
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        r
+    };
+    let interfere = async {
         let mut waited = false;
         for _ in 0..400 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity \
                   WHERE datname = current_database() AND pid <> pg_backend_pid() \
@@ -478,31 +509,28 @@ async fn identity_call_racing_a_change_to_the_last_source(
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        assert!(
-            waited,
-            "the identity call never waited on the last source's row lock"
-        );
         match change {
             ConcurrentChange::MarkedElsewhere => {
                 sqlx::query("UPDATE claims SET supersedes = $2, is_current = false WHERE id = $1")
-                    .bind(last)
+                    .bind(changed)
                     .bind(elsewhere)
                     .execute(&mut *writer)
                     .await
-                    .expect("mark the last source elsewhere");
+                    .expect("mark the target elsewhere");
             }
             ConcurrentChange::Retired => {
                 sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
-                    .bind(last)
+                    .bind(changed)
                     .execute(&mut *writer)
                     .await
-                    .expect("retire the last source");
+                    .expect("retire the target");
             }
         }
         writer.commit().await.expect("commit the concurrent change");
+        waited
     };
-    let (result, ()) = tokio::join!(call, interfere);
-    (result, [survivor, first, last, elsewhere])
+    let (result, waited) = tokio::join!(call, interfere);
+    (result, waited, [survivor, first, last, elsewhere])
 }
 
 /// The call is all-or-nothing under concurrency (backlog 635dbfae): a source
@@ -516,9 +544,13 @@ async fn identity_call_racing_a_change_to_the_last_source(
 async fn identity_mode_marks_nothing_when_a_later_source_is_marked_elsewhere_concurrently(
     pool: PgPool,
 ) {
-    let (result, [survivor, first, last, elsewhere]) =
-        identity_call_racing_a_change_to_the_last_source(&pool, ConcurrentChange::MarkedElsewhere)
-            .await;
+    let (result, waited, [survivor, first, last, elsewhere]) = identity_call_racing_a_change(
+        &pool,
+        RaceTarget::LastSource,
+        ConcurrentChange::MarkedElsewhere,
+    )
+    .await;
+    assert!(waited, "the call waited on the last source's row lock");
     let err = result.expect_err("the changed source refuses the call");
     assert_eq!(
         standing(&pool, first).await,
@@ -548,8 +580,10 @@ async fn identity_mode_marks_nothing_when_a_later_source_is_marked_elsewhere_con
 /// onto the survivor and reported success.
 #[sqlx::test(migrations = "../../migrations")]
 async fn identity_mode_marks_nothing_when_a_later_source_is_retired_concurrently(pool: PgPool) {
-    let (result, [survivor, first, last, _]) =
-        identity_call_racing_a_change_to_the_last_source(&pool, ConcurrentChange::Retired).await;
+    let (result, waited, [survivor, first, last, _]) =
+        identity_call_racing_a_change(&pool, RaceTarget::LastSource, ConcurrentChange::Retired)
+            .await;
+    assert!(waited, "the call waited on the last source's row lock");
     let err = result.expect_err("the retired source refuses the call");
     assert_eq!(
         standing(&pool, first).await,
@@ -672,4 +706,47 @@ async fn identity_mode_refuses_sources_that_need_different_write_identities(pool
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
     assert!(err.message.contains("Split the call"), "{err:?}");
     assert!(err.message.contains("nothing was written"), "{err:?}");
+}
+
+/// The survivor is locked with the sources (review of 635dbfae): another
+/// writer that marks the SURVIVOR elsewhere while the call runs (the shape of
+/// a second identity call with the roles swapped, which would leave the
+/// cluster with no current claim) refuses the whole call, and no source is
+/// marked onto the retired survivor.
+///
+/// One non-survivor source, so the survivor's retirement can land only after
+/// the call's one act has read the survivor as current. Without the survivor
+/// in the call's lock, that act passes its own (plain) check of the
+/// survivor, waits at most on its identity edge's foreign-key check, and
+/// commits once the other writer has: the source stands marked onto a
+/// non-current claim and the call reports success. (With two sources the
+/// second act's own check would catch the retirement too, so that shape does
+/// not tell the lock from the acts.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_marks_nothing_when_the_survivor_is_marked_elsewhere_concurrently(
+    pool: PgPool,
+) {
+    let (result, waited, [survivor, _, last, elsewhere]) = identity_call_racing_a_change(
+        &pool,
+        RaceTarget::Survivor,
+        ConcurrentChange::MarkedElsewhere,
+    )
+    .await;
+    assert_eq!(
+        standing(&pool, last).await,
+        (None, true),
+        "the source is not left marked onto the retired survivor: {result:?}"
+    );
+    assert_eq!(identity_edges(&pool, last, survivor).await, 0);
+    let err = result.expect_err("the retired survivor refuses the call");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains(&survivor.to_string()), "{err:?}");
+    assert!(err.message.contains("no longer current"), "{err:?}");
+    assert!(err.message.contains("no source was marked"), "{err:?}");
+    assert!(waited, "the call waited on the survivor's row lock");
+    assert_eq!(
+        standing(&pool, survivor).await,
+        (Some(elsewhere), false),
+        "the other writer's mark of the survivor stands"
+    );
 }
