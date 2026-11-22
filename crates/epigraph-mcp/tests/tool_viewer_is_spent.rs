@@ -730,17 +730,22 @@ const TOOLS: Surface = Surface {
 /// spends its viewer ONCE; this names every other call, so a content read
 /// running beside the spend without it cannot pass unseen.
 ///
-/// The population is every fn under `src/tools/` that takes a `Viewer` or
-/// binds one (`request_viewer`, `Viewer::resolve`, a `unwrap_or(viewer)`
-/// fallback). The `#[tool]` methods in `server.rs` are not in it: each resolves
-/// the viewer and hands it to a fn here, and none touches a pool, a connection
-/// or a repository itself (measured 2026-11-22).
+/// The population is every fn under `src/tools/`, and in the crate-root files
+/// a tool hands its viewer to (`claim_helper.rs`, `maintenance.rs`, ..; see
+/// [`root_files`]), that takes a `Viewer` or binds one (`request_viewer`,
+/// `Viewer::resolve`, a `unwrap_or(viewer)` fallback). The `#[tool]` methods
+/// in `server.rs` are not in it: each resolves the viewer and hands it to a fn
+/// here, and none touches a pool, a connection or a repository itself
+/// (measured 2026-11-22). Viewer-taking fns in other crates a tool calls
+/// (`epigraph-engine`, `epigraph-ingest-executor`) are not followed either: a
+/// call that hands one the viewer counts as viewed here.
 ///
 /// Asserted as an exact multiset per fn. The comment above each entry is the
 /// review, by reason class:
 ///
 /// * **write** — the call writes, on the author-stamped transaction the fn
-///   opened, a row about a target the fn read through its viewer first. Write
+///   opened (or on `server.pool`, where the entry says "Raw pool"), a row
+///   about a target the fn read through its viewer first. Write
 ///   authority is the stamp's `WITH CHECK` plus the write registers
 ///   (`residual_unstamped_writes.rs`; the few writes on `server.pool` are
 ///   named in `raw_pool_register.rs`). A write returns at most the ids and
@@ -755,6 +760,9 @@ const TOOLS: Surface = Surface {
 ///   tenancy or the caller's own default (`tenancy_on_session_conn`,
 ///   `default_decl_for_author`), a hidden-row or foreign-owner boolean. It
 ///   returns allow or refuse, never row content.
+/// * **stamped or raw-pool fallback** — a `stamped` read that, on a server
+///   built without a `ScopedPool` (a fixture), falls back to `server.pool`,
+///   as `raw_pool_register.rs` registers it.
 /// * **stamped** — a read on the caller's viewer-stamped connection
 ///   (`server.read_as`) or author-stamped transaction, of a table whose forced
 ///   row security carries its tenancy (`workflows`, migration 183), or of the
@@ -1080,12 +1088,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "scoped",
         ],
     ),
-    // audit: `EventRepository::insert`.
+    // audit: `EventRepository::insert`. Raw pool: `EventRepository::insert` runs on
+    // `server.pool` (registered in `raw_pool_register.rs`).
     ("events.rs", "publish_event", &["EventRepository::insert"]),
     // write: `ClaimRepository::evolve_step_conn`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority: `require_lineage_authority`; audit:
     // `record_lineage_writes`; maintenance: `supersede::admin_session_or_deferral`; no SQL:
-    // `workflow_ingest::embed_created_workflow_claims`.
+    // `workflow_ingest::embed_created_workflow_claims`. With no ScopedPool the write
+    // transaction is `server.pool.begin()` (registered in `raw_pool_register.rs`).
     (
         "evolve_step.rs",
         "evolve_step",
@@ -1130,7 +1140,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "retract_replaced_name_nodes",
         &["AgentRepository::get_by_public_key"],
     ),
-    // untenanted: `find_paper_by_document_key`.
+    // untenanted: `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads
+    // `papers` on `server.pool`; the paper id is returned only if the viewer-filtered pipeline
+    // read matches.
     (
         "ingestion.rs",
         "check_already_ingested",
@@ -1146,7 +1158,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
     // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
-    // `spawn_ingest_embeds`.
+    // `spawn_ingest_embeds`. Raw pool: `PaperRepository::get_or_create` writes `papers` on
+    // `server.pool` (registered in `raw_pool_register.rs`).
     (
         "ingestion.rs",
         "do_ingest_document_reporting",
@@ -1184,7 +1197,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
     // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
-    // `spawn_ingest_embeds`.
+    // `spawn_ingest_embeds`. Raw pool: `PaperRepository::get_or_create` writes `papers` on
+    // `server.pool` (registered in `raw_pool_register.rs`).
     (
         "ingestion.rs",
         "do_ingest_document_spine",
@@ -1219,14 +1233,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "ingest_document_inline",
         &["ensure_paper_node"],
     ),
-    // untenanted: `find_paper_by_document_key`.
+    // untenanted: `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads
+    // `papers` on `server.pool`.
     (
         "ingestion.rs",
         "paper_already_ingested",
         &["find_paper_by_document_key"],
     ),
     // opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`; untenanted:
-    // `find_paper_by_document_key`.
+    // `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads `papers` on
+    // `server.pool`.
     (
         "ingestion.rs",
         "preflight_write_authority",
@@ -1330,7 +1346,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // write: `MatchCandidateRepo::promote_if_pending_conn`,
     // `MatchCandidateRepo::reject_if_pending`; opener: `claim_helper::begin_author_stamped_tx`;
-    // untenanted: `MatchCandidateRepo::get`, `MatchCandidateRepo::new`.
+    // untenanted: `MatchCandidateRepo::get`, `MatchCandidateRepo::new`. Raw pool: the
+    // `MatchCandidateRepo` is built on `server.pool` (registered in `raw_pool_register.rs`).
     (
         "matching.rs",
         "decide_match_candidate",
@@ -1345,7 +1362,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // opener: `claim_helper::begin_author_stamped_tx`; untenanted: `MatchCandidateRepo::get`,
     // `MatchCandidateRepo::new`; audit: `admin_cascade::record_deferral`; maintenance:
-    // `maintenance::admin_cascade_session`.
+    // `maintenance::admin_cascade_session`. Raw pool: the `MatchCandidateRepo` is built on
+    // `server.pool` (registered in `raw_pool_register.rs`).
     (
         "matching.rs",
         "retire_match_candidate",
@@ -1377,13 +1395,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::resolve_claim_visibility",
         ],
     ),
-    // untenanted: `ingestion::find_paper_by_document_key`.
+    // untenanted: `ingestion::find_paper_by_document_key`. Raw pool:
+    // `find_paper_by_document_key` reads `papers` on `server.pool`; every claim-derived read
+    // runs on the stamped read.
     (
         "paper_queries.rs",
         "query_paper",
         &["ingestion::find_paper_by_document_key"],
     ),
-    // write: `EdgeRepository::create_signed`, `PerspectiveRepository::create`.
+    // write: `EdgeRepository::create_signed`, `PerspectiveRepository::create`. Raw pool: both
+    // writes run on `server.pool` (registered in `raw_pool_register.rs`).
     (
         "perspectives.rs",
         "create_perspective",
@@ -1520,13 +1541,15 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::session_may_unmark_conn",
         ],
     ),
-    // untenanted: `ClaimThemeRepository::count_summaries`.
+    // untenanted: `ClaimThemeRepository::count_summaries`. Raw pool: `count_summaries` reads
+    // `claim_themes` on `server.pool`.
     (
         "themes.rs",
         "list_themes",
         &["ClaimThemeRepository::count_summaries"],
     ),
-    // untenanted: `ClaimThemeRepository::find_by_label`.
+    // untenanted: `ClaimThemeRepository::find_by_label`. Raw pool: `find_by_label` reads
+    // `claim_themes` on its `pool` parameter.
     (
         "themes.rs",
         "resolve_theme_selector",
@@ -1555,14 +1578,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "share_claims_with_team",
         &["claim_helper::begin_author_stamped_tx"],
     ),
-    // resolves: `Viewer::resolve`.
+    // resolves: `Viewer::resolve`. Raw pool: `Viewer::resolve` reads memberships on
+    // `server.pool`.
     (
         "workflow_authority.rs",
         "caller_view_of",
         &["Viewer::resolve"],
     ),
     // authority: `claims::operator_arm_allows`, `delegate_arm`, `owner_group_arm`,
-    // `unrecorded_row_owner_group_arm`; resolves: `Viewer::resolve`.
+    // `unrecorded_row_owner_group_arm`; resolves: `Viewer::resolve`. Raw pool:
+    // `Viewer::resolve` reads memberships on `server.pool`.
     (
         "workflow_authority.rs",
         "stdio_workflow_authority",
@@ -1590,7 +1615,8 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::search_hierarchical_by_text",
         ],
     ),
-    // resolves: `Viewer::resolve`.
+    // resolves: `Viewer::resolve`. Raw pool: `Viewer::resolve` reads memberships on
+    // `server.pool`.
     ("workflow_ingest.rs", "caller_viewer", &["Viewer::resolve"]),
     // no SQL: `embed_created_workflow_claims`, `store_workflow_goal_embedding`.
     (
@@ -1644,7 +1670,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "improve_workflow_hierarchy_via_pool",
         &["WorkflowRepository::max_generation_by_canonical"],
     ),
-    // stamped: `WorkflowRepository::max_generation_by_canonical`.
+    // stamped or raw-pool fallback: `WorkflowRepository::max_generation_by_canonical`. Raw
+    // pool: the second `max_generation_by_canonical` is the no-ScopedPool fallback on
+    // `server.pool` (registered in `raw_pool_register.rs`); with a ScopedPool the read runs on
+    // the stamped transaction.
     (
         "workflow_ingest.rs",
         "lineage_max_generation",
@@ -1707,7 +1736,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "owner::resolve_caller_owner",
         ],
     ),
-    // write: `ClaimRepository::merge_properties`.
+    // write: `ClaimRepository::merge_properties`. Raw pool: `merge_properties` writes the
+    // `promotion` property on `server.pool` after the viewer-gated assessment (registered in
+    // `raw_pool_register.rs`; a write-authority question, not a read).
     (
         "workflows.rs",
         "refresh_workflow_promotion",
@@ -1716,7 +1747,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write: `BehavioralExecutionRepository::create`,
     // `ClaimRepository::update_truth_value_conn`, `EvidenceRepository::create`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority:
-    // `foreign_attach::is_foreign_public_claim`; stamped: `WorkflowRepository::exists`.
+    // `foreign_attach::is_foreign_public_claim`; stamped or raw-pool fallback:
+    // `WorkflowRepository::exists`. Raw pool: `WorkflowRepository::exists` here is the
+    // no-ScopedPool fallback on `server.pool`, and `BehavioralExecutionRepository::create`
+    // writes on `server.pool` (both registered in `raw_pool_register.rs`).
     (
         "workflows.rs",
         "report_workflow_outcome",
@@ -1739,13 +1773,69 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "workflow_ingest::store_workflow_goal_embedding",
         ],
     ),
+    // ── crate-root helpers a tool hands its viewer to (`src/*.rs`) ──
+    //
+    // The author's own viewer, resolved from the author id for a write stamped
+    // from it; the two writes are on the author-stamped transaction, after the
+    // claim was read or created through the viewer.
+    // resolves: `Viewer::resolve`.
+    (
+        "src/claim_helper.rs",
+        "author_write_authority",
+        &["Viewer::resolve"],
+    ),
+    // write: `emit_verb_edge_best_effort`.
+    (
+        "src/claim_helper.rs",
+        "create_claim_idempotent",
+        &["emit_verb_edge_best_effort"],
+    ),
+    // write: `ClaimRepository::update_truth_value_conn`.
+    (
+        "src/claim_helper.rs",
+        "wire_ds_for_new_claim_in_tx",
+        &["ClaimRepository::update_truth_value_conn"],
+    ),
+    // resolves: `Viewer::resolve`.
+    ("src/claim_helper.rs", "write_viewer", &["Viewer::resolve"]),
 ];
+
+/// The crate-root helpers a tool hands its viewer to (`claim_helper.rs`,
+/// `maintenance.rs`, `write_identity.rs`, ..), keyed `src/<name>.rs` so they
+/// cannot collide with a `tools/` file. Without them a tool's call that passes
+/// the viewer into one would count as viewed with the helper's own body never
+/// read. `server.rs` is left out: its `#[tool]` methods take `&self` and only
+/// resolve the viewer and delegate to `src/tools/` (measured 2026-11-22).
+fn root_files() -> Vec<(String, String)> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).expect("read src dir") {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf-8 file name")
+            .to_string();
+        if name == "server.rs" {
+            continue;
+        }
+        out.push((
+            format!("src/{name}"),
+            std::fs::read_to_string(&path).expect("read src file"),
+        ));
+    }
+    out.sort();
+    out
+}
 
 fn measure_tools() -> (Measured, usize, usize, Population) {
     let mut out = Measured::new();
     let mut pop = Population::new();
     let (mut n_fns, mut n_calls) = (0, 0);
-    for (file, src) in tool_files() {
+    for (file, src) in tool_files().into_iter().chain(root_files()) {
         let (f, c) = viewer_calls::measure_source(&file, &src, &TOOLS, &mut out, &mut pop);
         n_fns += f;
         n_calls += c;
@@ -1807,11 +1897,12 @@ fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
     );
     assert!(
         fns >= 180,
-        "found {fns} viewer-holding tool fns; measured 198 on 2026-11-22"
+        "found {fns} viewer-holding tool fns; measured 210 on 2026-11-22 (198 under \
+         src/tools/, 12 in the crate-root helpers)"
     );
     assert!(
         calls >= 650,
-        "found {calls} database calls in them; measured 767 on 2026-11-22"
+        "found {calls} database calls in them; measured 775 on 2026-11-22"
     );
 }
 
