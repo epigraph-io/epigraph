@@ -420,7 +420,7 @@ pub async fn assess_claim(
     // assesses for a human (backlog 840bc5ed). Written while the agent was
     // bound to no human, it is keyed on the agent's slot, not the human's,
     // so the upsert below does not reach it, and the human would hold two
-    // assessments that combine as independent evidence (ruling Q-U027F-2:
+    // assessments that combine as independent evidence (the slot rule above:
     // one per claim, frame and owner). It is retracted (migration 184: kept
     // for audit, a `mass_functions.retract` security event, out of every
     // fold) on this transaction, under the owner's slot lock, and reported.
@@ -558,8 +558,8 @@ pub async fn assess_claim(
     // `preview_claim_belief_on_frame` runs exactly the fold the cache refresh
     // writes (each row discounted by its effective reliability, each agent's
     // own rows folded first, same-human sibling agents reduced by the
-    // cautious rule (ruling R-36), only the rows the derivation scope admits
-    // (ruling R-22)). So when this frame owns the cache, the response IS the
+    // cautious rule, only the rows the derivation scope admits to the cache).
+    // So when this frame owns the cache, the response IS the
     // cached value; on another frame it is this frame's fold, as the framed
     // `get_belief` serves it. The handler used to fold the raw masses of its
     // `'discount'` rows itself: with no reliability discount (so it disagreed
