@@ -155,22 +155,36 @@ pub async fn list_agent_keys(
     })
 }
 
-/// Since migration 161 a `signing` (or `identity-legacy`) key is attested
-/// state: the host's identity registration binds it and a maintenance session
-/// retires it. On an application session its status change or a new signing
-/// row is refused with SQLSTATE 42501 (AK02). Answer that as a 403 naming the
-/// right path, not as an opaque 500. Nothing was written: the refusal comes
-/// from the first statement of each act.
+/// The database's two refusals of a key write, both SQLSTATE 42501, answered
+/// as a 403 naming the right path rather than as an opaque 500. Nothing was
+/// written: each refusal comes before the definer's first write, and the
+/// transaction is never committed.
+///
+/// * `AK02` (migration 161): a `signing` (or `identity-legacy`) key is
+///   attested state. The host's identity registration binds it and a
+///   maintenance session retires it.
+/// * `AK03` (migration 239): the key's agent is not the stamped principal
+///   and the database does not hold the caller to be an admin. The route has
+///   already admitted the caller (`require_self_or_admin`), so this is an
+///   admin token whose principal is not a live instance admin (or, while the
+///   admin-scope switch is armed, not elevated).
 #[cfg(feature = "db")]
-fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
-    if crate::errors::db_is_insufficient_privilege(&e) {
+fn key_write_refusal(e: epigraph_db::DbError) -> ApiError {
+    if !crate::errors::db_is_insufficient_privilege(&e) {
+        return e.into();
+    }
+    if e.to_string().contains("AK03") {
+        ApiError::Forbidden {
+            reason: "the database admits a change to an agent's key only for that agent \
+                     or an instance admin; this caller is neither"
+                .to_string(),
+        }
+    } else {
         ApiError::Forbidden {
             reason: "this is an attested signing key: it is rotated through the host's \
                      identity registration, and revoked by a maintenance session"
                 .to_string(),
         }
-    } else {
-        e.into()
     }
 }
 
@@ -182,10 +196,15 @@ fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
 /// touched) by:
 /// 1. Verifying the old key signature over the canonical rotation message
 /// 2. Verifying the new key signature over the same message
-/// 3. Marking the old key as `rotated`, which closes its validity window
-///    (`valid_until`, migration 162)
-/// 4. Storing and activating the new key, valid from no earlier than the
-///    old key's window closed
+/// 3. In one definer call (migration 239), marking the old key as
+///    `rotated`, which closes its validity window (`valid_until`, migration
+///    162), and recording the new key, of the same agent and type, valid
+///    from where the old window closed
+///
+/// The lookup and the definer call run on one transaction stamped with the
+/// caller's viewer; the database admits the key's own agent or an admin, and
+/// moves a `signing` key only on a maintenance session (migration 161), so on
+/// the application role a `signing` rotation answers 403.
 ///
 /// Requires `agents:write` scope. Caller must be the target agent
 /// (auth.agent_id == :id) or have `claims:admin` (unarmed admin-scope switch
@@ -198,7 +217,8 @@ fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
 /// - 400 Bad Request: a field is not valid hex or has the wrong length
 /// - 401 Unauthorized: Missing or invalid Bearer token, or the old-key or
 ///   new-key signature does not verify (`SignatureError`)
-/// - 403 Forbidden: Missing scope or caller is not the target agent
+/// - 403 Forbidden: Missing scope or caller is not the target agent, or the
+///   database refused the rotation (`AK02` attested key, `AK03` caller)
 /// - 404 Not Found: The agent has no active signing key
 /// - 422 Unprocessable Entity: the body does not deserialize (missing field
 ///   or wrong JSON type); refused by the extractor, the same for every caller
@@ -208,6 +228,7 @@ fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
 pub async fn rotate_agent_key(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path(id): Path<Uuid>,
     Json(request): Json<RotateKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
@@ -275,8 +296,16 @@ pub async fn rotate_agent_key(
 
     let agent_id = AgentId::from_uuid(id);
 
+    // Every read and write below runs on ONE transaction stamped with the
+    // caller's viewer: since migration 239 the rotation definer admits only
+    // the key's own agent (the stamped principal) or an admin, and refuses an
+    // unstamped application session.
+    let mut tx = state
+        .write_as(&viewer, "agent_keys::rotate_agent_key")
+        .await?;
+
     // Look up the current active key
-    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id, "signing")
+    let active_key = AgentKeyRepository::get_active_key(&mut *tx, agent_id, "signing")
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "ActiveAgentKey".to_string(),
@@ -318,32 +347,18 @@ pub async fn rotate_agent_key(
         });
     }
 
-    // Mark old key as rotated. Since migration 162 this also closes its
-    // validity window (`valid_until`) on the database clock.
-    let retired =
-        AgentKeyRepository::update_status(&state.db_pool, active_key.id, "rotated", None, None)
-            .await
-            .map_err(attested_key_refusal)?;
-
-    // Store the new active key. Its window opens no earlier than the old one
-    // closed, so the two never overlap even if this host's clock is behind
-    // the database's.
-    let now = Utc::now();
-    let valid_from = retired.valid_until.map_or(now, |closed| closed.max(now));
-    let new_key_id = Uuid::new_v4();
-    let new_key_row = AgentKeyRepository::store(
-        &state.db_pool,
-        new_key_id,
-        agent_id,
-        &new_key_array,
-        "signing",
-        "active",
-        valid_from,
-        None,
-        now,
-    )
-    .await
-    .map_err(attested_key_refusal)?;
+    // Retire the old key and record the new one in ONE definer call
+    // (migration 239): the old key becomes `rotated` with its window closed on
+    // the database clock, and the new key, of the same agent and type, opens
+    // where it closed. A failure leaves both rows as they were.
+    let new_key_row = AgentKeyRepository::rotate(&mut *tx, active_key.id, &new_key_array)
+        .await
+        .map_err(key_write_refusal)?
+        .ok_or_else(|| ApiError::NotFound {
+            entity: "ActiveAgentKey".to_string(),
+            id: id.to_string(),
+        })?;
+    tx.commit().await?;
 
     Ok(Json(new_key_row.into()))
 }
@@ -386,6 +401,7 @@ pub async fn rotate_agent_key(
 pub async fn revoke_agent_key(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path((id, key_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<RevokeKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
@@ -398,8 +414,15 @@ pub async fn revoke_agent_key(
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
     require_self_or_admin(auth, id)?;
 
+    // One transaction stamped with the caller's viewer: since migration 239
+    // the status definer moves a key only for the key's own agent (the
+    // stamped principal) or an admin.
+    let mut tx = state
+        .write_as(&viewer, "agent_keys::revoke_agent_key")
+        .await?;
+
     // Look up the key to verify it belongs to this agent
-    let key = AgentKeyRepository::get_by_id(&state.db_pool, key_id)
+    let key = AgentKeyRepository::get_by_id(&mut *tx, key_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "AgentKey".to_string(),
@@ -427,14 +450,15 @@ pub async fn revoke_agent_key(
         .as_ref()
         .is_some_and(|axum::Extension(auth)| auth.agent_id == Some(id));
     let updated = AgentKeyRepository::update_status(
-        &state.db_pool,
+        &mut *tx,
         key_id,
         "revoked",
         Some(request.reason.as_str()),
         caller_is_agent.then_some(id),
     )
     .await
-    .map_err(attested_key_refusal)?;
+    .map_err(key_write_refusal)?;
+    tx.commit().await?;
 
     Ok(Json(updated.into()))
 }

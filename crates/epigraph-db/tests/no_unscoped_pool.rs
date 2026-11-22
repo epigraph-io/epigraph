@@ -814,7 +814,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 182 (backlog 54018ca1, migration 239): the key rotate and revoke
+/// routes run their reads and the key definers on the caller's stamped
+/// transaction (`routes/agent_keys.rs` 6 -> 1, the list read left). No file
+/// reached zero.
+const HIGH_WATER: usize = 182;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -896,7 +900,7 @@ const HIGH_WATER_FILES: usize = 34;
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
     ("routes/admin.rs", 4),
-    ("routes/agent_keys.rs", 6),
+    ("routes/agent_keys.rs", 1),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
