@@ -669,6 +669,10 @@ impl ClaimRepository {
     /// classified (`VIS04`; retry), `Input` for a bad request) with nothing
     /// changed;
     /// `DbError::QueryFailed` for faults.
+    ///
+    /// Call `epigraph_engine::visibility_act::publicize_claims` instead: this
+    /// does not refold the moved claims' cached belief for their new audience.
+    /// `tests/visibility_act_callers_ratchet.rs` fails on any other caller.
     pub async fn publicize_conn(
         conn: &mut PgConnection,
         claim_ids: &[Uuid],
@@ -691,6 +695,9 @@ impl ClaimRepository {
     ///
     /// # Errors
     /// As [`Self::publicize_conn`].
+    ///
+    /// Call `epigraph_engine::visibility_act::share_claims_with_team` instead,
+    /// for the same reason; the same ratchet holds it.
     pub async fn share_with_team_conn(
         conn: &mut PgConnection,
         claim_ids: &[Uuid],
