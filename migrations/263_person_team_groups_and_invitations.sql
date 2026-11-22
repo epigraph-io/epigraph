@@ -45,6 +45,22 @@
 -- people is the Person's own act, not something an agent acting for them
 -- gives. Decline needs only that the caller is the invitee.
 --
+-- THIS REVERSES 164'S BOUNDARY FOR THESE GROUPS. 164 made roster writes
+-- maintenance-only because the application credential is not a roster
+-- boundary: any holder of it can stamp any principal. 263 puts roster writes
+-- for Person-made groups back on the application role, keyed on that same
+-- self-settable stamp. A process holding the application database credential
+-- can therefore stamp itself as an admin and invite, then stamp itself as the
+-- invitee and accept, and the invitation row will read as genuine consent.
+-- The consent this file enforces is consent as the API and MCP servers
+-- authenticate it (a verified token resolved to a viewer), not consent
+-- against a holder of the database credential. What is left for that case is
+-- detection: every audit row carries `session_user`, so a forgery from a
+-- login role other than the request servers' shows after the fact. It is the
+-- same class as every other 077 policy keyed on the stamp (206's header), not
+-- a new primitive, and it covers only groups made through this file: an
+-- operator-made group's roster stays maintenance-only (section 1).
+--
 -- ===================================================================
 -- 3. THE RULES
 --
@@ -81,6 +97,10 @@
 --     meanwhile. Otherwise ONE new membership row at the next epoch for the
 --     pair (164 section 3: the roster is a ledger) with the invited
 --     role, and the invitation becomes `accepted` naming that row.
+--     What accepting reaches: per 234 (reads) and 206 (writes), the
+--     invitee's LIVE-linked operated agents then read the group too, and
+--     write in it at `writer` or `admin`. The route and tool descriptions
+--     say so.
 --   * DECLINE (`epigraph_decline_group_invitation(invitation)`): only the
 --     invitee; `pending` -> `declined` (TGP05 otherwise).
 --   * READS: `epigraph_my_groups()` lists the caller's live memberships
@@ -117,8 +137,13 @@
 --   * `epigraph_team_group_roster_granted(group, agent)`: true when such a
 --     row exists for THIS transaction. Read by both guards, on INSERT only.
 --
--- Every other path through the two guards is byte-identical to 176's text:
--- the same order, the same GRM05 / GRM06 message and SQLSTATE 42501. A
+-- For the application and maintenance roles, every other path through the two
+-- guards behaves as 176's text: the same order, the same GRM05 / GRM06
+-- message and SQLSTATE 42501. (A third role inserting a selected `groups`
+-- row would now get "permission denied for function
+-- epigraph_team_group_roster_granted" instead of GRM06, SQLSTATE 42501
+-- either way; no migration grants any other role INSERT or UPDATE on
+-- `groups`.) A
 -- direct application INSERT, even one issued in the same transaction right
 -- after one of these definers returned, finds no grant and is refused as
 -- before. This file refuses to apply over any body other than 176's (md5 of

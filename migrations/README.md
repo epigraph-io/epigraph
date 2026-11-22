@@ -3418,6 +3418,11 @@ restart.
   `epigraph_my_group_invitations()`. All SECURITY DEFINER on 172's path, owned by
   `epigraph_maintenance`, EXECUTE to `epigraph_app` only; the caller is
   `epigraph_principal_id()`; operated agents and delegated run tokens are refused TGP01.
+  **This reverses 164's boundary for Person-made groups:** 164 kept roster writes
+  maintenance-only because a holder of the application credential can stamp any principal;
+  263 keys them on that stamp, so such a holder can forge an invite and its acceptance (header
+  section 2). Detection only: every audit row carries `session_user`. Accepting also gives
+  the invitee's live-linked agents read access (234), and write access at writer/admin (206).
   Re-states 176's two team-group guards (md5 precondition) with one admission each, on
   INSERT only: a row of the new `team_group_roster_grants` (194's purge-grant shape, keyed
   on `pg_current_xact_id()`, no application privilege) that the definer writes for the one
