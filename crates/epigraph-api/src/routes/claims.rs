@@ -1660,16 +1660,18 @@ pub async fn get_claim(
     // ones the response is built from. Nothing that answers the request is
     // split.
     //
-    // `GroupMembershipRepository::is_member` takes a concrete `&PgPool`, so
-    // threading the stamped connection into it would mean widening it to
-    // `E: PgExecutor` and adding a `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`
-    // row. Every existing row in that register argues one of two things: the
-    // relation carries no RLS, or it carries RLS whose SELECT policy does not
-    // narrow. `group_memberships` is neither — migration 077 gives it a
-    // narrowing SELECT policy — so no truthful row exists in the register's
-    // current form, and the alternative (splicing a `Viewer` into a membership
-    // EXISTENCE check) would make an authorization answer a function of
-    // visibility. Both repairs are worse than leaving the gate where it is.
+    // `GroupMembershipRepository::is_member` takes a concrete `&PgPool`, and
+    // since backlog f712db53 it asks the `SECURITY DEFINER`
+    // `epigraph_live_memberships` (the read `ViewerExtractor` already made on
+    // this same pool) rather than reading `group_memberships`. The definer's
+    // answer does not depend on the connection's stamp, so moving the gate
+    // onto the stamped connection would change nothing it decides; and
+    // splicing a `Viewer` into a membership EXISTENCE check would make an
+    // authorization answer a function of visibility. So the gate stays where
+    // it is. (Before f712db53 the gate read `group_memberships`, whose
+    // migration 077 SELECT policy narrows, which is why it could not move to
+    // a stamped connection without an `EXECUTOR_WITHOUT_VIEWER` row no
+    // truthful wording fitted.)
     //
     // A hazard a reviewer will look for and which is NOT present: the
     // `.or(Some(ctx.client_id))` fallback above cannot diverge from the
@@ -1871,12 +1873,11 @@ pub async fn list_claims(
     // THE MEMBERSHIP GATE ABOVE STAYS ON THE RAW POOL — the SITE-level decline
     // documented at length on `get_claim`, which runs the identical gate. The
     // short form: `is_member` is an authorization check that completes before
-    // any content read starts, so nothing is split across two connections;
-    // widening it to take the stamped connection would require an
-    // `EXECUTOR_WITHOUT_VIEWER` row no truthful wording fits, because
-    // `group_memberships` DOES carry a narrowing RLS policy; and splicing a
-    // `Viewer` into a membership existence check would make an authorization
-    // answer a function of visibility.
+    // any content read starts, so nothing is split across two connections; it
+    // asks the `SECURITY DEFINER` `epigraph_live_memberships` (backlog
+    // f712db53), whose answer does not depend on the connection's stamp; and
+    // splicing a `Viewer` into a membership existence check would make an
+    // authorization answer a function of visibility.
 
     // A VIEWER-STAMPED connection, replacing a bare `db_pool.begin()`. The
     // statements below still share one connection, and that connection now

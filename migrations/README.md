@@ -1540,8 +1540,9 @@ restart.
   `epigraph_live_memberships(uuid)`: a verb-made group's live row counts in a
   viewer's group set only while the member still belongs to a registered
   human operator, so a revoked allowance or registration ends claim access at
-  the next resolve without a write (REST group routes that read the roster
-  table directly still see the row until it is removed). Callers: `epigraph-operator create-group` and
+  the next resolve without a write (since backlog 93ed2ec3 the REST group-admin
+  check and group info read the same live set, so they refuse a lapsed admin
+  at once too). Callers: `epigraph-operator create-group` and
   `group-member add|remove|set-role`. Pinned by
   `epigraph-db/tests/team_group_verbs.rs` and
   `epigraph-cli/tests/operator_team_group.rs`; registered in
