@@ -731,7 +731,7 @@ fn named_source(raw: &str, bare_is_doi: fn(&str) -> bool) -> Option<ItemKey> {
 /// `properties.doi` is written by ingest (a DOI, an arXiv-style id, a
 /// synthesized document key or a URI), so any bare value is a document
 /// identifier unless it is a placeholder ([`normalize_doi`] rejects those).
-fn doi_field_key(doi: &str) -> Option<ItemKey> {
+pub(crate) fn doi_field_key(doi: &str) -> Option<ItemKey> {
     named_source(doi, |_| true)
 }
 

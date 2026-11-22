@@ -363,8 +363,18 @@ pub fn finish_edge_bba(
 }
 
 /// Whether the edge `source → target` is intra-source: the source claim has
-/// an evidence row whose `properties->>'doi'` matches the DOI of the paper
-/// that asserts the target claim. Read-only.
+/// an evidence row whose `properties->>'doi'` names the same document as the
+/// DOI of a paper that asserts the target claim. Read-only.
+///
+/// "Names the same document" is the same-source key both values give as a
+/// document identifier (`source_dependence::doi_field_key`: the shared
+/// case-folded DOI identity,
+/// [`epigraph_db::repos::paper::document_identity_key`], or for a document
+/// keyed on its URI, the normalized URL; backlog e34fd66e). `papers.doi`
+/// holds the canonical stored key while an evidence row's `doi` holds
+/// whatever its writer passed (a doi.org link, a `doi:` label, another case),
+/// so the exact string join this replaced silently missed the paper. A
+/// placeholder ("unknown", "n/a") names no document and matches nothing.
 ///
 /// Equivalent semantic: "the supporter is supported by data from the
 /// target's own paper", so its contribution is correlated with the target's
@@ -382,28 +392,33 @@ pub async fn edge_source_is_intra(
     source_id: Uuid,
     target_id: Uuid,
 ) -> Result<bool, String> {
-    sqlx::query_scalar::<_, bool>(
+    let (paper_dois, evidence_dois): (Vec<String>, Vec<String>) = sqlx::query_as(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-              FROM evidence e
-              JOIN edges ed_asserts
-                ON ed_asserts.target_id = $2
-               AND ed_asserts.relationship = 'asserts'
-               AND ed_asserts.source_type = 'paper'
-              JOIN papers p
-                ON p.id = ed_asserts.source_id
-               AND p.doi = e.properties->>'doi'
-             WHERE e.claim_id = $1
-               AND e.properties ? 'doi'
-        )
+        SELECT
+            ARRAY(SELECT p.doi
+                    FROM edges ed_asserts
+                    JOIN papers p ON p.id = ed_asserts.source_id
+                   WHERE ed_asserts.target_id = $2
+                     AND ed_asserts.relationship = 'asserts'
+                     AND ed_asserts.source_type = 'paper'
+                     AND p.doi IS NOT NULL),
+            ARRAY(SELECT e.properties->>'doi'
+                    FROM evidence e
+                   WHERE e.claim_id = $1
+                     AND e.properties->>'doi' IS NOT NULL)
         "#,
     )
     .bind(source_id)
     .bind(target_id)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|e| format!("intra-source evidence lookup: {e}"))
+    .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
+    let key = |d: &String| crate::source_dependence::doi_field_key(d);
+    let papers: std::collections::HashSet<_> = paper_dois.iter().filter_map(key).collect();
+    Ok(evidence_dois
+        .iter()
+        .filter_map(key)
+        .any(|k| papers.contains(&k)))
 }
 
 /// The intra-evidence locality factor an edge wire on `frame_id` composes.
