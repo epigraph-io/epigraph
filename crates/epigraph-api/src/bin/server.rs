@@ -121,6 +121,9 @@ async fn main() {
     for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
         tracing::error!("calibration: {problem}");
     }
+    for warning in epigraph_engine::calibration::CalibrationConfig::startup_warnings() {
+        tracing::warn!("calibration: {warning}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN. Checked before any other gate and before any connection,

@@ -61,15 +61,21 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          BeliefProfile::served)",
     ),
     (
-        "crates/epigraph-engine/src/matching/calibration.rs",
-        "Self::load_from(Path::new(\"calibration.toml\"))",
-        "MatcherConfig ([matcher] section, cross-source matcher), a separate loader that \
-         fails loudly instead of falling back; not the evidence-type calibration",
+        "crates/epigraph-cli/src/bin/cross_source_sweep.rs",
+        "MatcherConfig::load_from(p)",
+        "an explicit, optional `--calibration <PATH>` operator argument for the [matcher] \
+         section; without it the sweep takes [matcher] from the served calibration \
+         (`MatcherConfig::load_default` -> `CalibrationConfig::served_matcher`)",
     ),
 ];
 
 const NEEDLES: &[&str] = &[
-    "\"CALIBRATION_PATH\"",
+    // Any variable NAMED like the override (`"CALIBRATION_PATH"`, and a second
+    // one such as `"EPIGRAPH_CALIBRATION_PATH"`, backlog 26a12f41).
+    "CALIBRATION_PATH\"",
+    // A path read of the cross-source matcher's `[matcher]` section (backlog
+    // 26a12f41): `MatcherConfig::load_default` resolves it with the rest.
+    "MatcherConfig::load_from(",
     "CalibrationConfig::load(",
     "calibration.toml\"",
     "CalibrationConfig::embedded(",
@@ -159,13 +165,18 @@ const COPY: &str = include_str!("../../../calibration.toml");
 fn compiled_in_only() -> f64 { CalibrationConfig::embedded().get_evidence_type_weight("empirical") }
 fn empty_maps() -> CalibrationConfig { CalibrationConfig::default_for_phase2_fallback() }
 fn parsed(p: &Path) -> CalibrationConfig { toml::from_str::<CalibrationConfig>(&std::fs::read_to_string(p).unwrap()).unwrap() }
+    #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH", hide_env_values = true)]
+fn matcher_cwd() -> MatcherConfig { Self::load_from(Path::new("calibration.toml")).unwrap() }
+fn matcher_path(p: &Path) -> MatcherConfig { MatcherConfig::load_from(p).unwrap() }
 "#;
     let hits = scan("x.rs", removed);
     assert_eq!(
         hits.iter().map(|h| h.line).collect::<Vec<_>>(),
-        vec![3, 4, 9, 10, 11, 12],
+        vec![3, 4, 9, 10, 11, 12, 13, 14, 15],
         "env + cwd literal (line 3), path load (line 4), embedded copy (line 9), \
-         compiled-in only (line 10), empty maps (line 11), text parse (line 12): {hits:?}"
+         compiled-in only (line 10), empty maps (line 11), text parse (line 12), a second \
+         override variable (line 13), the old cwd [matcher] read (line 14), a [matcher] \
+         path read (line 15): {hits:?}"
     );
 
     let quiet = r#"
@@ -199,4 +210,110 @@ fn after_tests() -> &'static str { "{" }
         !is_allowed(&allowed_elsewhere),
         "an ALLOWED fragment is per file"
     );
+}
+
+/// Every `DsAutoInput { .. }` literal in `src`, from its opening brace to the
+/// matching closing one, with its 1-based starting line.
+fn ds_auto_inputs(src: &str) -> Vec<(usize, String)> {
+    const OPEN: &str = "DsAutoInput {";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = src[from..].find(OPEN) {
+        let start = from + at;
+        let body_start = start + OPEN.len();
+        let mut depth = 1usize;
+        let mut end = src.len();
+        for (i, ch) in src[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push((
+            src[..start].matches('\n').count() + 1,
+            src[body_start..end].to_string(),
+        ));
+        from = body_start;
+    }
+    out
+}
+
+/// True when a struct-literal body sets `weight` to a numeric literal.
+fn sets_a_literal_weight(body: &str) -> bool {
+    body.split(',').any(|field| {
+        let mut kv = field.splitn(2, ':');
+        let key = kv.next().unwrap_or("").trim();
+        let value = kv.next().unwrap_or("").trim_start();
+        key == "weight" && value.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// Ratchet (backlog 26a12f41): no production `DsAutoInput` passes a literal
+/// `weight`. The weight is the evidence type's reliability, which the served
+/// calibration owns; `memorize` passed `weight: 0.6`, which matched the
+/// shipped `testimonial` weight but ignored a `CALIBRATION_PATH` retune.
+///
+/// Scope: a source-text scan of `DsAutoInput { .. }` struct literals whose
+/// `weight:` field is a numeric literal. It does NOT see a literal routed
+/// through a named constant (`weight: TESTIMONY_W`) or a weight passed
+/// positionally to a `ds_auto` helper; review those by hand. When added, no
+/// production call site did either.
+#[test]
+fn no_ds_auto_input_hardcodes_its_evidence_type_weight() {
+    let root = workspace_root();
+    let mut seen = 0;
+    let mut offending = Vec::new();
+    for (file, src) in production_sources(&root) {
+        for (line, body) in ds_auto_inputs(&production_code(&src)) {
+            seen += 1;
+            if sets_a_literal_weight(&body) {
+                offending.push(format!("  {file}:{line}: DsAutoInput {{{}}}", body.trim()));
+            }
+        }
+    }
+    assert!(
+        seen >= 2,
+        "found {seen} DsAutoInput literals; the scan no longer sees the writers (moved? \
+         update this ratchet)"
+    );
+    assert!(
+        offending.is_empty(),
+        "DsAutoInput with a literal weight (use CalibrationConfig::cached()\
+         .get_evidence_type_weight(<the evidence row's tag>)):\n{}",
+        offending.join("\n")
+    );
+}
+
+/// The `DsAutoInput` scanner: a literal weight is a hit, a resolved one,
+/// a shorthand field and a `weight_*` field are not, and a nested brace does
+/// not end the literal early.
+#[test]
+fn the_ds_auto_input_scanner_flags_only_a_literal_weight() {
+    let src = "fn a() {\n    f(DsAutoInput {\n        confidence,\n        weight: 0.6,\n        \
+               supports: true,\n        evidence_type: Some(\"testimony\"),\n    });\n}\n\
+               fn b() { g(ds_auto::DsAutoInput { confidence, weight, supports: true, \
+               evidence_type: None, evidence_id: None }); }\n\
+               fn c() { g(DsAutoInput { confidence: { 0.5 }, weight: w(), supports: true, \
+               evidence_type: None, evidence_id: None }); }\n\
+               fn d() { g(DsAutoInput { weight_hint: 1.0, weight: cached().get_evidence_type_weight(t), \
+               supports: true, evidence_type: None, evidence_id: None }); }\n";
+    let found = ds_auto_inputs(src);
+    assert_eq!(
+        found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec![2, 9, 10, 11]
+    );
+    let literal: Vec<bool> = found
+        .iter()
+        .map(|(_, b)| sets_a_literal_weight(b))
+        .collect();
+    assert_eq!(literal, vec![true, false, false, false], "{found:?}");
+    // After the nested `{ 0.5 }` block the scan still reaches `weight: w()`.
+    assert!(found[2].1.contains("weight: w()"), "{:?}", found[2]);
 }

@@ -66,12 +66,36 @@ struct CalibrationFile {
 }
 
 impl MatcherConfig {
+    /// `[matcher]` of the calibration the process serves: the file
+    /// `CALIBRATION_PATH` names when it loads, else the copy compiled into the
+    /// binary ([`crate::calibration::CalibrationConfig::served_matcher`]). It
+    /// used to read `calibration.toml` relative to the working directory, so
+    /// the matcher's settings depended on where the process was started
+    /// (backlog 26a12f41).
+    ///
+    /// # Errors
+    /// When the served file has no (or a malformed) `[matcher]` section; the
+    /// error names the source.
     pub fn load_default() -> anyhow::Result<Self> {
-        Self::load_from(Path::new("calibration.toml"))
+        crate::calibration::CalibrationConfig::served_matcher()
     }
+
+    /// `[matcher]` of the calibration file at `p` (an explicit operator path,
+    /// e.g. `cross_source_sweep --calibration`).
+    ///
+    /// # Errors
+    /// When the file cannot be read or has no valid `[matcher]` section.
     pub fn load_from(p: &Path) -> anyhow::Result<Self> {
         let raw = std::fs::read_to_string(p)?;
-        let file: CalibrationFile = toml::from_str(&raw)?;
+        Self::from_toml_str(&raw)
+    }
+
+    /// `[matcher]` of a calibration file's text.
+    ///
+    /// # Errors
+    /// When the text has no valid `[matcher]` section.
+    pub fn from_toml_str(raw: &str) -> anyhow::Result<Self> {
+        let file: CalibrationFile = toml::from_str(raw)?;
         Ok(file.matcher)
     }
 }
