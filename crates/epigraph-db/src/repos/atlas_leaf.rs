@@ -121,7 +121,9 @@
 //! [`fallback_split`] cuts on edges as well as nodes. A leaf of ONE claim
 //! whose own attachments carry more edges cannot be split: it is returned as
 //! [`LeafOutcome::Fits`] with [`LeafCounts::edges`] over the limit, and the
-//! contract refuses the document it makes (the caller reports it).
+//! builder of the served document caps it (the nightly keeps the heaviest
+//! edges and reports the cut: `epigraph_cli::atlas_nightly::leaves::cap_leaf_edges`,
+//! backlog 8d09e6bc).
 //!
 //! # Determinism
 //!

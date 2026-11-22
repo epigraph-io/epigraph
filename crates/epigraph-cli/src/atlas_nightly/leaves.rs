@@ -4,11 +4,21 @@
 //! the agents that asserted or authored them, the evidence a stored edge
 //! links to them) with W7's weighted edges (`weigh_leaf_edges`), labelled
 //! from map-scoped reads. Positions stay for W6's fill and names for W8's.
+//!
+//! A leaf whose weighted edges exceed the contract's
+//! [`MAX_LEAF_EDGES`] keeps its heaviest ones and reports the cut
+//! ([`cap_leaf_edges`]), as the cross-group link caps do. W3 splits a leaf of
+//! two or more claims on edges, so in practice only a leaf of ONE claim,
+//! whose own agents and evidence carry more edges among them than the
+//! contract allows, reaches the cap (backlog 8d09e6bc: such a claim used to
+//! fail its theme on every night).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{bail, Context};
-use epigraph_atlas_contract::{ClaimNode, LeafLevel, Node, PlainNode};
+use epigraph_atlas_contract::{
+    ClaimNode, Edge, LeafLevel, Node, NodeKind, PlainNode, MAX_LEAF_EDGES,
+};
 use epigraph_db::repos::atlas_flow::FlowInputs;
 use epigraph_db::repos::atlas_leaf::{
     assemble_leaf, LeafNodeKind, LeafNodeSet, LeafOutcome, LeafRows,
@@ -74,6 +84,10 @@ pub fn node_set(rows: &LeafRows, claims: &[Uuid], cap: usize) -> anyhow::Result<
 /// without it). A claim `truths` does not hold, or a value outside [0, 1],
 /// carries none.
 ///
+/// The edges are capped at the contract's [`MAX_LEAF_EDGES`]
+/// ([`cap_leaf_edges`]); the number cut is returned (0 for almost every
+/// leaf).
+///
 /// # Errors
 /// A claim of `set` the skeleton does not label.
 pub fn fill_leaf(
@@ -83,7 +97,7 @@ pub fn fill_leaf(
     agents: &BTreeMap<Uuid, String>,
     evidence: &BTreeMap<Uuid, String>,
     truths: &BTreeMap<Uuid, f64>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let claim_labels: BTreeMap<Uuid, String> = leaf
         .nodes
         .iter()
@@ -126,9 +140,78 @@ pub fn fill_leaf(
             }),
         });
     }
+    let (edges, cut) = cap_leaf_edges(&nodes, weigh_leaf_edges(set, inputs), MAX_LEAF_EDGES);
     leaf.nodes = nodes;
-    leaf.edges = weigh_leaf_edges(set, inputs);
-    Ok(())
+    leaf.edges = edges;
+    Ok(cut)
+}
+
+/// The edges of a leaf over `max`: its heaviest `max`, in their input order,
+/// and how many were cut (0, and `edges` unchanged, when they fit).
+///
+/// The contract wants every agent and evidence node to keep an edge to a
+/// claim, so the cut never orphans one: first each such node keeps its
+/// heaviest edge to a claim (a leaf holds at most
+/// [`epigraph_atlas_contract::MAX_LEAF_NODES`] nodes, so these always fit),
+/// then the rest are kept by `flow_weight`, an edge at a claim before one
+/// between two attachments, ties to the smaller (source, target,
+/// relationship). The order is total, so the same input always keeps the same
+/// edges (a night over unchanged input writes nothing).
+///
+/// Whatever is cut stays out of the served leaf only: the claim keeps every
+/// one of its agents and evidence nodes. (A `max` below the number of agent
+/// and evidence nodes still keeps one edge for each, so the result is over
+/// `max` then; the nightly passes [`MAX_LEAF_EDGES`], far above any leaf's
+/// node count.)
+#[must_use]
+pub fn cap_leaf_edges(nodes: &[Node], edges: Vec<Edge>, max: usize) -> (Vec<Edge>, usize) {
+    if edges.len() <= max {
+        return (edges, 0);
+    }
+    let kinds: BTreeMap<Uuid, NodeKind> = nodes.iter().map(|n| (n.id(), n.kind())).collect();
+    let is_claim = |id: &Uuid| kinds.get(id) == Some(&NodeKind::Claim);
+    let at_claim = |e: &Edge| is_claim(&e.source) || is_claim(&e.target);
+    // Heaviest first; at a claim before not; then the smaller key.
+    let rank = |a: &Edge, b: &Edge| {
+        b.flow_weight
+            .total_cmp(&a.flow_weight)
+            .then_with(|| at_claim(b).cmp(&at_claim(a)))
+            .then_with(|| {
+                (a.source, a.target, &a.relationship).cmp(&(b.source, b.target, &b.relationship))
+            })
+    };
+    let mut order: Vec<usize> = (0..edges.len()).collect();
+    order.sort_by(|&i, &j| rank(&edges[i], &edges[j]));
+
+    let mut keep: BTreeSet<usize> = BTreeSet::new();
+    let mut anchored: BTreeSet<Uuid> = BTreeSet::new();
+    for &i in &order {
+        let e = &edges[i];
+        if !at_claim(e) {
+            continue;
+        }
+        let other = if is_claim(&e.source) {
+            e.target
+        } else {
+            e.source
+        };
+        if !is_claim(&other) && anchored.insert(other) {
+            keep.insert(i);
+        }
+    }
+    for &i in &order {
+        if keep.len() >= max {
+            break;
+        }
+        keep.insert(i);
+    }
+    let cut = edges.len() - keep.len();
+    let kept = edges
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, e)| keep.contains(&i).then_some(e))
+        .collect();
+    (kept, cut)
 }
 
 /// The node ids and `(source, target, relationship)` of a leaf document:
@@ -218,6 +301,166 @@ mod tests {
         epigraph_atlas_contract::LevelDocument::Leaf(leaf)
             .validate()
             .expect("a filled leaf validates");
+    }
+
+    /// A skeleton leaf of `claims` (claim nodes only), as W4/W5 store it.
+    fn skeleton(claims: &[Uuid]) -> LeafLevel {
+        let nodes: Vec<serde_json::Value> = claims
+            .iter()
+            .map(|c| {
+                serde_json::json!({"kind": "claim", "id": c, "label": "c", "x": 0.0,
+                                        "y": 0.0, "truth_value": null})
+            })
+            .collect();
+        let doc =
+            serde_json::from_value::<epigraph_atlas_contract::LevelDocument>(serde_json::json!({
+                "kind": "leaf", "schema_version": 1, "map_scope": "public", "map_group_id": null,
+                "hierarchy": "meaning", "theme_id": Uuid::nil(), "run_id": Uuid::nil(),
+                "level_id": Uuid::from_u128(5), "depth": 0, "name": null, "needs_naming": true,
+                "breadcrumbs": [], "switch": {"hierarchy": "links", "level_id": Uuid::from_u128(6)},
+                "nodes": nodes, "edges": [], "outgoing": []
+            }))
+            .unwrap();
+        let epigraph_atlas_contract::LevelDocument::Leaf(leaf) = doc else {
+            panic!("a leaf")
+        };
+        leaf
+    }
+
+    /// Backlog 8d09e6bc: ONE claim whose own evidence carries more edges
+    /// among them than the contract allows (33 evidence rows, each linked to
+    /// the claim and citing the 32 others: 33 + 1,056 + the filer's derived
+    /// edge = 1,090) cannot be split, and its leaf used to break the
+    /// contract. It now fills to a valid leaf of exactly the contract's
+    /// 1,024 edges, every node kept and every attachment still anchored to
+    /// the claim, the 66 cut edges reported, and the same edges on every
+    /// fill.
+    #[test]
+    fn a_one_claim_leaf_over_the_edge_limit_keeps_its_heaviest_edges_and_validates() {
+        let c = Uuid::from_u128(1);
+        let ag = Uuid::from_u128(2);
+        let ev: Vec<Uuid> = (0..33).map(|i| Uuid::from_u128(1_000 + i)).collect();
+        let mut rows = LeafRows::default();
+        rows.claims.insert(c, Some(ag));
+        rows.agents.insert(ag);
+        let mut n = 0_u128;
+        let mut edge = |source: LeafNode, target: LeafNode, rel: &str| {
+            n += 1;
+            epigraph_db::repos::atlas_leaf::StoredLeafEdge {
+                id: Uuid::from_u128(10_000 + n),
+                source,
+                target,
+                relationship: rel.into(),
+            }
+        };
+        for &e in &ev {
+            rows.evidence.insert(e, Some(c));
+            rows.edges
+                .push(edge(LeafNode::evidence(e), LeafNode::claim(c), "supports"));
+        }
+        for &a in &ev {
+            for &b in &ev {
+                if a != b {
+                    rows.edges
+                        .push(edge(LeafNode::evidence(a), LeafNode::evidence(b), "cites"));
+                }
+            }
+        }
+        let set = node_set(&rows, &[c], 100).expect("one claim always fits the node cap");
+        assert_eq!(set.counts.edges, 1_090, "the seed is over the edge limit");
+
+        let fill = || {
+            let mut leaf = skeleton(&[c]);
+            let cut = fill_leaf(
+                &mut leaf,
+                &set,
+                &FlowInputs::default(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            (leaf, cut)
+        };
+        let (leaf, cut) = fill();
+        assert_eq!(cut, 1_090 - MAX_LEAF_EDGES);
+        assert_eq!(leaf.edges.len(), MAX_LEAF_EDGES);
+        assert_eq!(leaf.nodes.len(), 35, "the cut drops edges, never a node");
+        let at_claim = leaf
+            .edges
+            .iter()
+            .filter(|e| e.source == c || e.target == c)
+            .count();
+        assert_eq!(at_claim, 34, "every attachment keeps its edge to the claim");
+        assert_eq!(fill().0, leaf, "the cut is deterministic");
+        epigraph_atlas_contract::LevelDocument::Leaf(leaf)
+            .validate()
+            .expect("a capped leaf validates");
+    }
+
+    fn edge(source: Uuid, target: Uuid, rel: &str, w: f64) -> Edge {
+        Edge {
+            source,
+            target,
+            relationship: rel.into(),
+            sign: if w > 0.0 { 1 } else { 0 },
+            flow_weight: w,
+            flow_basis: if w > 0.0 {
+                epigraph_atlas_contract::FlowBasis::Proxy
+            } else {
+                epigraph_atlas_contract::FlowBasis::None
+            },
+        }
+    }
+
+    /// The cap keeps the heaviest edges, but never by orphaning an agent or
+    /// evidence node: a weight-0 authorship edge outranked by every
+    /// claim-to-claim link is kept anyway, since without it the agent has no
+    /// edge to a claim and the contract refuses the leaf. Pure top-k by
+    /// weight would keep the three links here.
+    #[test]
+    fn the_edge_cap_keeps_an_edge_for_every_attachment_then_the_heaviest() {
+        let (c1, c2, c3, a) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(3),
+            Uuid::from_u128(9),
+        );
+        let claim = |id| {
+            Node::Claim(ClaimNode {
+                id,
+                label: "c".into(),
+                x: 0.0,
+                y: 0.0,
+                truth_value: None,
+            })
+        };
+        let nodes = vec![
+            claim(c1),
+            claim(c2),
+            claim(c3),
+            Node::Agent(PlainNode {
+                id: a,
+                label: "a".into(),
+                x: 0.0,
+                y: 0.0,
+            }),
+        ];
+        let edges = vec![
+            edge(c1, c2, "supports", 0.5),
+            edge(c1, c3, "supports", 0.9),
+            edge(c2, c3, "supports", 0.5),
+            edge(a, c1, "asserts", 0.0),
+        ];
+        let (kept, cut) = cap_leaf_edges(&nodes, edges.clone(), 3);
+        assert_eq!(cut, 1);
+        assert_eq!(
+            kept,
+            vec![edges[0].clone(), edges[1].clone(), edges[3].clone()],
+            "the anchor, then the heaviest, ties to the smaller key, in input order"
+        );
+        let (same, none) = cap_leaf_edges(&nodes, edges.clone(), 4);
+        assert_eq!((same, none), (edges, 0), "a leaf that fits is untouched");
     }
 
     /// A leaf claim's `truth_value` is its stored one; a claim the truth read

@@ -768,10 +768,10 @@ async fn grow_t1_by_a_clique(pool: &PgPool, c: &Corpus) -> Vec<Uuid> {
 }
 
 /// One new team-A claim in `t1`, near `u`, with 33 evidence rows of its own
-/// that all cite each other: 33 + 1,056 + 1 edges among its own 35 nodes.
-/// No split can bring ONE claim under the contract's 1,024 edges, so theme
-/// `t1`'s update fails. One more claim joins `t2`.
-async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
+/// that all cite each other: 33 + 1,056 + 1 edges among its own 35 nodes,
+/// past the contract's 1,024 per leaf. No split can bring ONE claim under
+/// the limit. Returns the claim.
+async fn dense_claim_in_t1(pool: &PgPool, c: &Corpus) -> Uuid {
     let fx = agent(pool, "Filer X").await;
     let dense = claims(pool, Some(c.t1), fx, Some(c.a_team), 1, 200).await;
     let ev = evidence_on_each(pool, &vec![dense[0]; 33]).await;
@@ -787,6 +787,19 @@ async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
     .execute(pool)
     .await
     .expect("seed the dense evidence");
+    dense[0]
+}
+
+/// One new team-A claim in `t1`, near `u`, whose evidence is linked to it
+/// under a relationship name the contract's pattern refuses (`edges` takes
+/// any non-empty name, and the leaf passes the stored name through: the
+/// atlas_leaf module documentation's "relationship spelling" gap), so theme
+/// `t1`'s update fails. One more claim joins `t2`.
+async fn break_t1_and_grow_t2(pool: &PgPool, c: &Corpus) -> Uuid {
+    let fx = agent(pool, "Filer X").await;
+    let bad = claims(pool, Some(c.t1), fx, Some(c.a_team), 1, 200).await;
+    let ev = evidence_on_each(pool, &bad).await;
+    link(pool, ev[0], "evidence", bad[0], "not-a-contract-name").await;
     claims(pool, Some(c.t2), c.fa, Some(c.a_team), 1, 300).await[0]
 }
 
@@ -847,6 +860,74 @@ async fn a_leaf_over_the_edge_limit_is_split_not_frozen(pool: PgPool) {
     );
 }
 
+/// Backlog 8d09e6bc: a claim whose OWN agents and evidence carry more than
+/// the contract's 1,024 edges among them used to fail its theme on every
+/// night (carried stale or dropped), and no split or operator build could
+/// clear it. Now the theme builds: the claim's leaf keeps its heaviest 1,024
+/// edges (every attachment still anchored to the claim), the cut is reported
+/// per theme, per map and in the run's params, every stored level validates,
+/// and the next night over the same input writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_over_the_edge_limit_builds_its_theme_with_its_heaviest_edges(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let backend = namer();
+    night(&pool, &viewer, &backend, &opts()).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dense = dense_claim_in_t1(&pool, &c).await;
+
+    let summary = night(&pool, &viewer, &backend, &opts()).await;
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    for k in ["carried", "dropped", "unbuilt"] {
+        assert!(r["themes"][k].as_array().unwrap().is_empty(), "{k}: {r:#}");
+    }
+    let run = latest(&pool, a_map).await;
+    let after = levels(&pool, run).await;
+    let mut dense_leaves = 0;
+    for (_, payload) in after.values() {
+        let LevelDocument::Leaf(l) = parse(payload) else {
+            continue;
+        };
+        if !l.nodes.iter().any(|n| n.id() == dense) {
+            continue;
+        }
+        dense_leaves += 1;
+        assert_eq!(l.edges.len(), 1_024, "the leaf keeps exactly the limit");
+        assert_eq!(l.nodes.len(), 35, "every attachment of the claim is drawn");
+        let anchored = l
+            .edges
+            .iter()
+            .filter(|e| e.source == dense || e.target == dense)
+            .count();
+        assert_eq!(anchored, 34, "every attachment keeps its edge to the claim");
+    }
+    assert_eq!(dense_leaves, 2, "the claim is drawn in both hierarchies");
+    let want = serde_json::json!({"capped_leaves": 2, "dropped_edges": 2 * (1_090 - 1_024)});
+    assert_eq!(r["leaf_edge_cap"], want, "{r:#}");
+    let t1 = r["themes"]["built"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["theme_id"] == serde_json::json!(c.t1))
+        .expect("t1 built");
+    assert_eq!(t1["stats"]["leaf_edge_cap"], want, "{r:#}");
+    let params: Value = sqlx::query_scalar("SELECT params FROM atlas_map_runs WHERE id = $1")
+        .bind(run)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(params["leaf_edge_cap"], want);
+
+    let again = night(&pool, &viewer, &backend, &opts()).await;
+    assert_eq!(
+        map_report(&again, a_map)["status"],
+        "unchanged",
+        "{again:#}"
+    );
+}
+
 /// Done when: a drifted theme does not fail the night. Theme `t1` fails;
 /// its leaves are unchanged, so its previous levels are carried (both
 /// hierarchies, documents equal to the previous run's) while `t2` is
@@ -869,7 +950,10 @@ async fn a_theme_that_fails_is_carried_and_the_night_completes(pool: PgPool) {
     assert_eq!(carried.len(), 1, "{r:#}");
     assert_eq!(carried[0]["theme_id"], serde_json::json!(c.t1));
     assert!(
-        carried[0]["error"].as_str().unwrap().contains("1024"),
+        carried[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("relationship"),
         "{r:#}"
     );
     let run = latest(&pool, a_map).await;
