@@ -3408,7 +3408,8 @@ restart.
   `epigraph_publicize_claims` and `epigraph_share_claims_with_team` (an md5 precondition
   refuses to apply over any other body, 55000). (1) An operated agent, one whose
   `epigraph_human_of(principal, false)` is another agent (an operator link of any state, or a
-  client allowance), is refused by both acts with the new outcome `refused_operated_agent`
+  client allowance), is refused by both acts with the new outcome `refused_not_human`
+  (the spec's name for R1's refusal)
   (403 / INVALID_REQUEST), whatever memberships it holds itself; before, an operated agent that
   was itself a writer of the target team (share) or an admin of the owning team (publicize)
   acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole

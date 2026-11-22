@@ -5,7 +5,7 @@
 --
 -- READ FIRST: no binary needs rolling back. A 242 binary calls the same two
 -- functions with the same signatures; it only knows one more refusal text
--- (`refused_operated_agent`), which 215's bodies never return. This undo
+-- (`refused_not_human`), which 215's bodies never return. This undo
 -- RE-OPENS backlog ecd842bf (an operated agent that writes the target team, or
 -- admins the owning team, shares or publicizes on its own authority) and
 -- fc33ef1a (a fragment a non-moving claim cites moves with the moved claim).

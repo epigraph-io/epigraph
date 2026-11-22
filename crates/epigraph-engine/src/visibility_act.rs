@@ -39,7 +39,7 @@
 //! spec ruling R1, backlog ecd842bf): when the session principal belongs to
 //! another agent (`epigraph_human_of(principal, false)`: a live or retired
 //! operator link, or a client allowance), 242's definers classify every
-//! readable claim `refused_operated_agent` and the call changes nothing,
+//! readable claim `refused_not_human` and the call changes nothing,
 //! whatever memberships the agent holds itself. Its human makes the same
 //! call. That is the definer's decision, not this module's: both transports
 //! reach it through these functions, and a caller that skipped them would

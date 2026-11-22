@@ -297,10 +297,10 @@ fn refusal_text(outcome: &str) -> &'static str {
             "the target is not a team you may write (your own live writer or admin membership)"
         }
         // Migration 242 (spec ruling R1, backlog ecd842bf).
-        "refused_operated_agent" => {
-            "you are an operated agent, and an operated agent does not share or publish work on \
-             its own authority, whatever memberships it holds; your human operator makes this \
-             call"
+        "refused_not_human" => {
+            "only a human moves existing work out of its group: you are an operated agent, and \
+             an operated agent does not share or publish work on its own authority, whatever \
+             memberships it holds; your human operator makes this call"
         }
         _ => "refused",
     }
@@ -802,7 +802,7 @@ mod tests {
     /// catch-all "refused".
     #[test]
     fn an_operated_agent_refusal_is_an_authority_refusal_that_says_why() {
-        let rows = vec![(g(1), "refused_operated_agent".to_string())];
+        let rows = vec![(g(1), "refused_not_human".to_string())];
         match outcomes_or_refusal("share_claims_with_team", rows, &["shared"]) {
             Err(DbError::Refused {
                 kind: RefusalKind::Authority,

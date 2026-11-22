@@ -35,7 +35,7 @@
 -- of ANY state (a retired link confers no authority either, 107); the
 -- allowlisted operator for a client-allowlisted agent (149); NULL for an
 -- agent that belongs to no human. When that is another agent, every readable
--- claim of the call is classified `refused_operated_agent`, so the call
+-- claim of the call is classified `refused_not_human`, so the call
 -- refuses as a whole and changes nothing. Its human makes the same call
 -- itself. `not_found` still wins (an unreadable claim must not read as
 -- "exists, forbidden").
@@ -46,12 +46,16 @@
 -- already refused, so this changes no outcome; it says in the body what the
 -- rule is.
 --
--- WHAT IT IS NOT. It is not R1's whole human gate (`refused_not_human`, every
--- caller must satisfy `epigraph_is_human_operator`): an agent that belongs to
--- no human (no operator link, no client allowance; for example a
--- role-attached agent, 166, that has neither) is still judged by its own
--- memberships, and a human's delegated run token is a transport question.
--- Those wait on the spec's phase P1.
+-- The outcome is the spec's own name for R1's refusal (`refused_not_human`,
+-- spec test 12 and the `share_preview` row), so phase P1 widens who receives
+-- it without changing the API's vocabulary a second time.
+--
+-- WHAT IT IS NOT. It is not R1's whole human gate (every caller must satisfy
+-- `epigraph_is_human_operator`): an agent that belongs to no human (no
+-- operator link, no client allowance; for example a role-attached agent, 166,
+-- that has neither) is still judged by its own memberships, and a human's
+-- delegated run token is a transport question. Those wait on the spec's
+-- phase P1.
 --
 -- ===================================================================
 -- 2. A FRAGMENT A CLAIM THAT STAYS ALSO CITES IS HELD (fc33ef1a)
@@ -196,7 +200,7 @@ BEGIN
                   OR NOT (c.visibility::text = 'public'
                           OR c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[])))
                THEN 'not_found'
-             WHEN v_operated THEN 'refused_operated_agent'
+             WHEN v_operated THEN 'refused_not_human'
              WHEN c.visibility::text = 'public' THEN 'already_public'
              WHEN NOT EXISTS (SELECT 1 FROM public.epigraph_live_memberships(v_principal) m
                                WHERE m.group_id = c.owner_group_id AND m.role = 'admin')
@@ -485,7 +489,7 @@ BEGIN
                   OR NOT (c.visibility::text = 'public'
                           OR c.owner_group_id = ANY(COALESCE(v_readable, ARRAY[]::uuid[])))
                THEN 'not_found'
-             WHEN v_operated THEN 'refused_operated_agent'
+             WHEN v_operated THEN 'refused_not_human'
              WHEN c.visibility::text <> 'group' OR c.owner_group_id IS DISTINCT FROM v_home
                THEN 'refused_not_private'
              WHEN c.agent_id IS DISTINCT FROM v_principal AND NOT v_home_admin
