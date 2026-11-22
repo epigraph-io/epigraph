@@ -13,8 +13,10 @@
 //! If `embedder.generate_query` fails (e.g. no API key), the function falls
 //! back to an ILIKE text search over **current** claims via
 //! `ClaimRepository::list_filtered`. Both legs serve current rows only: the
-//! semantic leg reads `search_by_embedding_current`, and the fallback filters
-//! `is_current` in SQL before `LIMIT` (supersede SPEC K11).
+//! semantic leg reads `search_by_embedding_current` and drops any row a
+//! concurrent retire left non-current by the time it is loaded (backlog
+//! 5554a6ea), and the fallback filters `is_current` in SQL before `LIMIT`
+//! (supersede SPEC K11).
 //!
 //! # Routes (backlog a47df8ed)
 //!
@@ -108,10 +110,11 @@ pub struct RecallResult {
     /// The three strongest contesters (by their own `truth_value`).
     pub contesting_claim_ids: Vec<uuid::Uuid>,
     /// The claim row's own `is_current`, as read on the row this result was
-    /// built from (never a literal). Both legs select current rows only, so it
-    /// is `true` unless the claim was retired between the semantic leg's ANN
-    /// page and its `get_by_id` read; it is carried so that a consumer can
-    /// check currency without a second read rather than assume it.
+    /// built from (never a literal). Every leg serves current rows only, so it
+    /// is always `true`: a claim retired between the semantic leg's ANN page
+    /// and its `get_by_id` read is dropped, not served (backlog 5554a6ea). It
+    /// is carried so that a consumer can check currency without a second read
+    /// rather than assume it.
     pub is_current: bool,
     /// `true` iff the theme-traversal leg ranked this claim (backlog
     /// a47df8ed), alone or together with the ANN leg. Always `false` on the
@@ -565,6 +568,14 @@ async fn materialize(
         if let Ok(Some(claim)) =
             ClaimRepository::get_by_id(&mut *conn, viewer, ClaimId::from_uuid(hit.claim_id)).await
         {
+            // The page was read current-only, but on a separate statement: a
+            // claim retired (superseded, marked duplicate, deprecated) since
+            // then is dropped here rather than served (backlog 5554a6ea), so
+            // every leg serves current rows only. The page may come back
+            // shorter than `limit`, as it does when `min_truth` drops a row.
+            if !claim.is_current {
+                continue;
+            }
             let tv = claim.truth_value.value();
             // Absent key == not visible to this viewer / deleted mid-page.
             // Fall back to the `truth_value` already in hand so a claim with
@@ -582,7 +593,8 @@ async fn materialize(
                     dispute_count: 0,
                     is_contested: false,
                     contesting_claim_ids: Vec::new(),
-                    // `get_by_id` post-fixes the row's real state.
+                    // Always `true` past the drop guard above; read from the
+                    // row, never a literal.
                     is_current: claim.is_current,
                     via_theme_traversal: hit.via_theme,
                 });
@@ -952,5 +964,120 @@ mod tests {
         let provider = MockProvider::new(config);
         let _: &dyn EmbeddingService = &provider;
         // If this compiles, recall(&pool, &scoped, &viewer, &provider, ...) will also compile.
+    }
+}
+
+/// The semantic leg's page/load race (backlog 5554a6ea), driven directly.
+///
+/// The ANN page (`search_by_embedding_scoped`, current rows only) and the
+/// per-row `get_by_id` in [`materialize`] are separate statements, so a claim
+/// can be retired between them. No public entry point can drive that window
+/// deterministically, so these tests hand [`materialize`] the page the ANN read
+/// produced BEFORE the retire, and run it AFTER: exactly the state the race
+/// leaves.
+#[cfg(test)]
+mod materialize_db_tests {
+    use super::*;
+    use epigraph_core::TruthValue;
+    use epigraph_db::{SupersedeActor, SupersedeTool, Viewer};
+
+    async fn seed_agent(pool: &PgPool) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO agents (id, public_key) VALUES ($1, decode($2, 'hex'))")
+            .bind(id)
+            .bind("ee".repeat(32))
+            .execute(pool)
+            .await
+            .expect("seed agent");
+        id
+    }
+
+    /// A current, public (migration 062's default) claim.
+    async fn seed_claim(pool: &PgPool, agent: uuid::Uuid, content: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        let mut hash = vec![0u8; 32];
+        hash[..16].copy_from_slice(id.as_bytes());
+        sqlx::query(
+            "INSERT INTO claims (id, content, content_hash, agent_id, truth_value, is_current) \
+             VALUES ($1, $2, $3, $4, 0.7, true)",
+        )
+        .bind(id)
+        .bind(content)
+        .bind(hash)
+        .bind(agent)
+        .execute(pool)
+        .await
+        .expect("seed claim");
+        id
+    }
+
+    fn ann_hit(claim_id: uuid::Uuid, rank: f64) -> MergedCandidate {
+        MergedCandidate {
+            claim_id,
+            rrf_score: 1.0 / (RRF_K + rank),
+            similarity: 0.9,
+            via_ann: true,
+            via_theme: false,
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn materialize_drops_a_claim_retired_after_the_ann_page(pool: PgPool) {
+        let viewer = Viewer::resolve(&pool, uuid::Uuid::nil())
+            .await
+            .expect("public viewer");
+        let agent = seed_agent(&pool).await;
+        let kept = seed_claim(&pool, agent, "halvering lattice, the standing claim").await;
+        let doomed = seed_claim(&pool, agent, "halvering lattice, the first draft").await;
+
+        // The page as the ANN read returned it, while both rows were current.
+        let page = vec![ann_hit(doomed, 1.0), ann_hit(kept, 2.0)];
+
+        // Control: materialised while both are current, the page is served
+        // whole and in page order, so an absence below is currency deciding,
+        // not the fixture being unreadable to this viewer.
+        let mut conn = pool.acquire().await.expect("conn");
+        let before = materialize(&mut conn, &viewer, page.clone(), 0.0).await;
+        let before_ids: Vec<String> = before.iter().map(|r| r.claim_id.clone()).collect();
+        assert_eq!(
+            before_ids,
+            vec![doomed.to_string(), kept.to_string()],
+            "control: both rows of the page are served while both are current"
+        );
+
+        // The race: the first hit is retired through the real supersede act
+        // after the page was read and before its rows are loaded.
+        ClaimRepository::supersede(
+            &pool,
+            ClaimId::from_uuid(doomed),
+            "a reworded revision of the first draft",
+            TruthValue::clamped(0.7),
+            "revision",
+            SupersedeActor::new(agent, SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("supersede");
+        let still_current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+            .bind(doomed)
+            .fetch_one(&pool)
+            .await
+            .expect("read is_current");
+        assert!(
+            !still_current,
+            "fixture: the supersede act retired the draft"
+        );
+
+        let after = materialize(&mut conn, &viewer, page, 0.0).await;
+        let after_ids: Vec<String> = after.iter().map(|r| r.claim_id.clone()).collect();
+        assert_eq!(
+            after_ids,
+            vec![kept.to_string()],
+            "the semantic leg must not serve a claim retired between its ANN page and the \
+             row load; the current hit must still be served"
+        );
+        assert!(
+            after.iter().all(|r| r.is_current),
+            "every served row is current"
+        );
     }
 }
