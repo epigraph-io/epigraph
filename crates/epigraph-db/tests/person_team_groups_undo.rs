@@ -9,6 +9,8 @@
 //! restores 176's two team-group guards byte for byte, which 263 re-states.
 //! [`the_263_undo_keeps_the_groups_and_memberships_it_made`]: what the undo
 //! leaves behind is ordinary verb-made state the 164 verbs still manage.
+//! [`the_263_undo_refuses_over_a_later_guard_body`]: the undo does not
+//! silently revert a guard that a later migration re-bodied.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -249,4 +251,61 @@ async fn the_263_undo_keeps_the_groups_and_memberships_it_made(pool: PgPool) {
         .await
         .expect("reset");
     assert!(applied);
+}
+
+/// The undo refuses (55000, nothing changed) when either guard carries a body
+/// that is neither 263's nor 176's, as after a later migration re-bodied it;
+/// re-stating 176's text over it would silently drop that migration's change.
+/// Mutation: the undo's precondition block deleted -> the undo applies and
+/// this test fails on the first assertion.
+#[sqlx::test(migrations = false)]
+async fn the_263_undo_refuses_over_a_later_guard_body(pool: PgPool) {
+    migrate(&pool, &up_to(263)).await;
+    // A "later migration" re-bodies the group-row guard: 263's body with one
+    // added comment line, which changes the md5 and nothing else.
+    let later_src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = 'public.epigraph_team_group_row_verbs_only()'::regprocedure",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("263's group-row guard body");
+    let later_src = format!("{later_src}-- a later migration's change\n");
+    sqlx::raw_sql(&format!(
+        "CREATE OR REPLACE FUNCTION public.epigraph_team_group_row_verbs_only() \
+         RETURNS trigger LANGUAGE plpgsql SET search_path = public, pg_temp \
+         AS $later${later_src}$later$"
+    ))
+    .execute(&pool)
+    .await
+    .expect("re-body the guard");
+    let before = catalog(&pool).await;
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = sqlx::raw_sql(&repo_file("docs/runbooks/263-undo.sql"))
+        .execute(&mut *conn)
+        .await;
+    // The undo's BEGIN is left aborted on this connection; end it.
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the aborted undo transaction");
+    drop(conn);
+    let code = r.as_ref().err().and_then(|e| {
+        e.as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .map(|c| c.to_string())
+    });
+    assert_eq!(code.as_deref(), Some("55000"), "{r:?}");
+    assert!(
+        format!("{r:?}").contains("epigraph_team_group_row_verbs_only is neither 263's body"),
+        "{r:?}"
+    );
+    // The catalog is exactly what it was before the undo ran.
+    let after = catalog(&pool).await;
+    assert_eq!(
+        after.symmetric_difference(&before).collect::<Vec<_>>(),
+        Vec::<&String>::new(),
+        "the refused undo changed nothing"
+    );
 }

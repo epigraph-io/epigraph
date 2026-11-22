@@ -3423,7 +3423,8 @@ restart.
   263 keys them on that stamp, so such a holder can forge an invite and its acceptance (header
   section 2). Detection only: every audit row carries `session_user`. Accepting also gives
   the invitee's live-linked agents read access (234), and write access at writer/admin (206).
-  Re-states 176's two team-group guards (md5 precondition) with one admission each, on
+  Re-states 176's two team-group guards (md5 precondition; the undo has one too, accepting
+  263's or 176's bodies) with one admission each, on
   INSERT only: a row of the new `team_group_roster_grants` (194's purge-grant shape, keyed
   on `pg_current_xact_id()`, no application privilege) that the definer writes for the one
   row it inserts and deletes before it returns; every other path keeps 176's GRM05 / GRM06
@@ -3435,7 +3436,8 @@ restart.
   Pinned by `epigraph-db/tests/person_team_groups.rs`,
   `epigraph-db/tests/person_team_groups_undo.rs`, and the REST and MCP twins'
   app-role tests. Undo: `docs/runbooks/263-undo.sql` (tested: run twice, it returns the
-  `public` catalog to below 263, restoring 176's guards byte for byte; it LOSES every invitation row and the
+  `public` catalog to below 263, restoring 176's guards byte for byte, and refuses 55000
+  over a guard a later migration re-bodied; it LOSES every invitation row and the
   `person_team_groups` record, and keeps the groups and memberships). Checked before claiming: slot 263
   was assigned to this change. **Deploy order:** migrate, then roll out the binary that
   serves the routes and tools (a binary ahead of the migration answers 42883 on them); human

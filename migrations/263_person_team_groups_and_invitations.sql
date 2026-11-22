@@ -202,7 +202,8 @@
 -- neither mark a group invitable nor grant itself a roster row.
 --
 -- ===================================================================
--- UNDO: `docs/runbooks/263-undo.sql` (re-states 176's two guard bodies).
+-- UNDO: `docs/runbooks/263-undo.sql` (re-states 176's two guard bodies after
+-- checking that they are still 263's, or already 176's).
 -- **Applied to throwaway databases only, NOT to any deployed database.**
 -- ===================================================================
 

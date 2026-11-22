@@ -4,6 +4,9 @@
 -- (superuser) DSN.
 --
 -- WHAT IT DOES:
+--   * refuses (55000, nothing changed) unless each of the two guards still
+--     has 263's body or already has 176's (a re-run): a later migration that
+--     re-bodied either one is not silently reverted;
 --   * re-states 176's two team-group guards verbatim
 --     (`epigraph_team_group_roster_verbs_only`,
 --     `epigraph_team_group_row_verbs_only`; CREATE OR REPLACE keeps owner and
@@ -36,6 +39,37 @@
 
 BEGIN;
 SET LOCAL lock_timeout = '3s';
+
+-- Refuse over any guard body that is neither 263's nor 176's.
+DO $$
+DECLARE
+    v_roster text;
+    v_row    text;
+BEGIN
+    SELECT md5(p.prosrc) INTO v_roster FROM pg_catalog.pg_proc p
+     WHERE p.oid = to_regprocedure('public.epigraph_team_group_roster_verbs_only()');
+    SELECT md5(p.prosrc) INTO v_row FROM pg_catalog.pg_proc p
+     WHERE p.oid = to_regprocedure('public.epigraph_team_group_row_verbs_only()');
+    -- 263's body, or 176's (this undo already ran).
+    IF v_roster IS NULL OR v_roster NOT IN ('ed5f2a9a128232968427fb38f4c65660',
+                                            'dcf4d5722ee28c8a3999fc6bc26ba911') THEN
+        RAISE EXCEPTION '263-undo: epigraph_team_group_roster_verbs_only is neither 263''s body '
+                        '(md5 ed5f2a9a128232968427fb38f4c65660) nor 176''s; found md5 %. A later '
+                        'migration re-bodied it; nothing was changed', COALESCE(v_roster, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Undo the later migration first, or write an undo that re-states its body '
+                         'without 263''s admission.';
+    END IF;
+    IF v_row IS NULL OR v_row NOT IN ('23639cf787d773df330453dabc050d0c',
+                                      'f66b4e61de3a9528627b3a9de8a208a6') THEN
+        RAISE EXCEPTION '263-undo: epigraph_team_group_row_verbs_only is neither 263''s body '
+                        '(md5 23639cf787d773df330453dabc050d0c) nor 176''s; found md5 %. A later '
+                        'migration re-bodied it; nothing was changed', COALESCE(v_row, '(absent)')
+            USING ERRCODE = '55000',
+                  HINT = 'Undo the later migration first, or write an undo that re-states its body '
+                         'without 263''s admission.';
+    END IF;
+END $$;
 
 -- 176's bodies, verbatim.
 CREATE OR REPLACE FUNCTION public.epigraph_team_group_roster_verbs_only()
