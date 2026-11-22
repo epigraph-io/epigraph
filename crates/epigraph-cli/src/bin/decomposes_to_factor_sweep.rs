@@ -25,9 +25,9 @@
 //!
 //! The sweep for rows minted later is the same dry run and apply again.
 //!
-//! Output files are created new: an existing file is refused before any
-//! connection. Manifests name claim ids: keep them in the operator's private
-//! directory, never in a repository.
+//! Output files are created new, owner-only (0600): an existing file is
+//! refused before any connection. Manifests name claim ids: keep them in the
+//! operator's private directory, never in a repository.
 //!
 //! # Authority
 //!
@@ -43,6 +43,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::BufReader;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -139,10 +140,13 @@ fn failure(e: &SweepError) -> Failure {
     Failure(code, e.to_string())
 }
 
+/// Create an output manifest: new (an existing file is refused) and owner-only
+/// (0600, whatever the umask), since every row names private claim and edge ids.
 fn create_new(path: &Path) -> Result<File, String> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o600)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))
 }

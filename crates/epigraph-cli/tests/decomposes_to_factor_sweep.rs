@@ -527,7 +527,12 @@ struct Run {
 }
 
 fn run_bin(dir: &Path, args: &[&str], database_url: &str, maintenance_url: Option<&str>) -> Run {
-    let mut cmd = Command::new(BIN);
+    // Under a permissive umask (022), as on a typical operator shell, so the
+    // owner-only manifest mode is the binary's doing, not the test host's.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("umask 022 && exec \"$0\" \"$@\"")
+        .arg(BIN);
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("DATABASE_URL", database_url)
@@ -543,6 +548,24 @@ fn run_bin(dir: &Path, args: &[&str], database_url: &str, maintenance_url: Optio
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
     }
+}
+
+/// A manifest names private claim and edge ids, so the binary creates it
+/// owner-only whatever the umask (a 0644 file in a shared directory would let
+/// any local user list another group's private decomposition).
+fn assert_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .expect("manifest metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode,
+        0o600,
+        "{} is created owner-only, got {mode:o}",
+        path.display()
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -589,6 +612,7 @@ async fn the_binary_exports_then_deletes_on_the_maintenance_login(pool: PgPool) 
     );
     let (h, _) = manifest(&dry);
     assert_eq!((h.rows, h.keyed, h.legacy), (2, 1, 1));
+    assert_owner_only(&dry);
 
     // An existing output is refused before connecting.
     let again = run_bin(
@@ -627,6 +651,7 @@ async fn the_binary_exports_then_deletes_on_the_maintenance_login(pool: PgPool) 
         .await
         .expect("count");
     assert_eq!(gone, 0, "the apply deleted both rows");
+    assert_owner_only(&applied);
     let r = run_bin(&dir.0, &["--remaining"], &app_url, Some(&maint_url));
     assert_eq!(r.code, Some(0), "{}", r.stderr);
     assert!(
