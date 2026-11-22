@@ -200,10 +200,13 @@ impl AgentKeyRepository {
     /// # Errors
     /// Returns `DbError::DuplicateKey` if a key with the same ID already exists.
     /// Returns `DbError::QueryFailed` for other database errors.
+    ///
+    /// Generic over the executor so a handler can run it on the same
+    /// transaction as the key's other writes and its audit row.
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, public_key))]
-    pub async fn store(
-        pool: &PgPool,
+    #[instrument(skip(executor, public_key))]
+    pub async fn store<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         id: Uuid,
         agent_id: AgentId,
         public_key: &[u8],
@@ -235,7 +238,7 @@ impl AgentKeyRepository {
             valid_until,
             created_at,
         )
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
         .map_err(|err| {
             if let sqlx::Error::Database(ref db_err) = err {
@@ -452,9 +455,12 @@ impl AgentKeyRepository {
     /// # Errors
     /// Returns `DbError::NotFound` if no key with the given ID exists.
     /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool))]
-    pub async fn update_status(
-        pool: &PgPool,
+    ///
+    /// Generic over the executor so a handler can run it on the same
+    /// transaction as the key's other writes and its audit row.
+    #[instrument(skip(executor))]
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         key_id: Uuid,
         status: &str,
         revocation_reason: Option<&str>,
@@ -473,7 +479,7 @@ impl AgentKeyRepository {
         .bind(status)
         .bind(revocation_reason)
         .bind(revoked_by)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         row.ok_or_else(|| DbError::NotFound {
