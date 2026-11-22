@@ -25,17 +25,17 @@
 //! visibility. The full argument, including a hazard a reviewer will look for
 //! and which is NOT present, is written at the site.
 //!
-//! **THE SITE-LEVEL DECLINE HAS AN EXPIRY, AND IT IS NAMED RATHER THAN LEFT
-//! FOR A LATER READER TO REDISCOVER.** `is_member` still reads
-//! `group_memberships` through `state.db_pool` while every content statement
-//! moved to `read_as`. Migration 077's `group_memberships_tenancy` USING clause
-//! admits a row only via a bypass, a session-group match, a principal match or
-//! the group-creator predicate — none of which an UNSTAMPED session can satisfy
-//! if its role is subject to RLS. So the gate is correct today because
-//! `AppState.db_pool` runs as an RLS-exempt role, which is precisely the
-//! property this programme exists to remove. Downgrading `db_pool` turns the
-//! gate into a blanket 403 for legitimate group members — fail-closed, not a
-//! leak, but the decline must be revisited at that point rather than inherited.
+//! **THE SITE-LEVEL DECLINE HAD AN EXPIRY, AND IT HAS BEEN MET.** `is_member`
+//! still runs on `state.db_pool` while every content statement moved to
+//! `read_as`. It used to read `group_memberships` directly, and migration
+//! 077's `group_memberships_tenancy` USING clause admits a row only via a
+//! bypass, a session-group match, a principal match or the group-creator
+//! predicate, none of which an UNSTAMPED session satisfies when its role is
+//! subject to RLS: on a downgraded `db_pool` the gate answered every member
+//! 403. Since backlog f712db53 it asks the `SECURITY DEFINER`
+//! `epigraph_live_memberships` (the read `ViewerExtractor` makes on the same
+//! pool), which answers the same on any connection, admits a member derived
+//! from a role binding and refuses a lapsed row.
 //!
 //! **THE PROPAGATE-DON'T-DEFAULT RULE HAS A DELIBERATE EXEMPTION HERE, RECORDED
 //! SO IT IS A DECISION AND NOT AN OVERSIGHT.** `routes/workflows.rs` and

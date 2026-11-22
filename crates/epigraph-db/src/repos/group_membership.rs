@@ -489,7 +489,8 @@ impl GroupMembershipRepository {
         Ok(row.0)
     }
 
-    /// Get active (non-revoked) members of a group
+    /// The group's EXPLICIT members whose membership is live: see
+    /// [`Self::get_members_conn`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -503,6 +504,21 @@ impl GroupMembershipRepository {
     /// `GET /api/v1/groups/:id` on the caller's stamped read (backlog
     /// 323773fe).
     ///
+    /// The unrevoked `group_memberships` rows of the group that still COUNT:
+    /// each row is kept only while `epigraph_live_memberships(agent)` (the
+    /// definer `Viewer::resolve` reads) still answers the group for its agent.
+    /// A row LAPSES without being revoked (migration 164: a row in a verb-made
+    /// team group while its human is no longer a live human operator;
+    /// migration 235: a personal-group row of an allowlisted agent once the
+    /// allowance stops naming the owner), and a lapsed row is not a member
+    /// (backlog f712db53).
+    ///
+    /// This is the EXPLICIT roster, and only that: a member DERIVED from a
+    /// role binding (migration 165) holds no row and no key share, so it is
+    /// not listed. Counting derived members needs a group-scoped roster read
+    /// the application role does not have (165's roster definer is
+    /// maintenance-only, by design: no roster oracle).
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(conn))]
@@ -512,10 +528,13 @@ impl GroupMembershipRepository {
     ) -> Result<Vec<MembershipRow>, DbError> {
         let rows: Vec<MembershipRow> = sqlx::query_as(
             r#"
-            SELECT id, group_id, agent_id, wrapped_key_share, epoch, role, joined_at, revoked_at
-            FROM group_memberships
-            WHERE group_id = $1 AND revoked_at IS NULL
-            ORDER BY joined_at ASC
+            SELECT m.id, m.group_id, m.agent_id, m.wrapped_key_share, m.epoch, m.role,
+                   m.joined_at, m.revoked_at
+            FROM group_memberships m
+            WHERE m.group_id = $1 AND m.revoked_at IS NULL
+              AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(m.agent_id) l
+                           WHERE l.group_id = m.group_id)
+            ORDER BY m.joined_at ASC
             "#,
         )
         .bind(group_id)
@@ -525,7 +544,8 @@ impl GroupMembershipRepository {
         Ok(rows)
     }
 
-    /// Check whether an agent is an active member of a group
+    /// Whether an agent is a LIVE member of a group: see
+    /// [`Self::is_member_conn`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -537,9 +557,21 @@ impl GroupMembershipRepository {
 
     /// [`Self::is_member`] over a borrowed connection, for
     /// `GET /api/v1/groups/:id`'s membership gate on the caller's stamped read
-    /// (backlog 323773fe). On the unstamped application pool
-    /// `group_memberships_tenancy` shows no row and every member reads as a
-    /// non-member.
+    /// (backlog 323773fe).
+    ///
+    /// Decided by `epigraph_live_memberships(agent)`, the definer
+    /// `Viewer::resolve` builds every viewer's group set from (backlog
+    /// f712db53), so this gate and the claim reads it guards agree on who is
+    /// a member:
+    ///
+    /// * a member DERIVED from a role binding (migration 165), which holds no
+    ///   `group_memberships` row, IS a member;
+    /// * an unrevoked row that has LAPSED (migrations 164 and 235) is NOT.
+    ///
+    /// The raw roster read this replaces (`revoked_at IS NULL`) refused the
+    /// first and admitted the second. The definer is `SECURITY DEFINER`, so
+    /// the answer does not depend on the connection's stamp; on an unstamped
+    /// application connection the raw read saw no row at all.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -552,8 +584,8 @@ impl GroupMembershipRepository {
         let row: (bool,) = sqlx::query_as(
             r#"
             SELECT EXISTS (
-                SELECT 1 FROM group_memberships
-                WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL
+                SELECT 1 FROM public.epigraph_live_memberships($2)
+                WHERE group_id = $1
             )
             "#,
         )
@@ -565,7 +597,8 @@ impl GroupMembershipRepository {
         Ok(row.0)
     }
 
-    /// Get the role of an active member within a group
+    /// The LIVE role of a member within a group: see
+    /// [`Self::get_member_role_conn`].
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -575,19 +608,8 @@ impl GroupMembershipRepository {
         group_id: Uuid,
         agent_id: Uuid,
     ) -> Result<Option<String>, DbError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            r#"
-            SELECT role FROM group_memberships
-            WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL
-            LIMIT 1
-            "#,
-        )
-        .bind(group_id)
-        .bind(agent_id)
-        .fetch_optional(pool)
-        .await?;
-
-        Ok(row.map(|r| r.0))
+        let mut conn = pool.acquire().await?;
+        Self::get_member_role_conn(&mut conn, group_id, agent_id).await
     }
 
     /// [`Self::get_member_role`] over a borrowed connection.
@@ -606,6 +628,22 @@ impl GroupMembershipRepository {
     /// `visibility_lint.rs`'s `EXECUTOR_WITHOUT_VIEWER` register and rewrite
     /// two call sites this PR has no reason to touch.
     ///
+    /// # The role is the LIVE one (backlogs 93ed2ec3, f712db53)
+    ///
+    /// Read from `epigraph_live_memberships(agent)`, the definer
+    /// `Viewer::resolve` reads, not from the raw roster row. So an unrevoked
+    /// ADMIN row that has lapsed (migration 164: its human is no longer a live
+    /// human operator; migration 235: an allowlisted agent's allowance no
+    /// longer names the owner) answers `None`, and `require_group_admin_conn`
+    /// refuses it on every REST group admin route, exactly as claim reads
+    /// already end at its next resolve. A member derived from a role binding
+    /// (migration 165) answers its derived role (`reader` or `writer`, never
+    /// `admin`).
+    ///
+    /// The definer may answer two rows for one group (a direct row and a
+    /// derived one); the STRONGEST role is the member's role: `admin`, then
+    /// `writer`, then `reader`.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(conn))]
@@ -616,8 +654,9 @@ impl GroupMembershipRepository {
     ) -> Result<Option<String>, DbError> {
         let row: Option<(String,)> = sqlx::query_as(
             r#"
-            SELECT role FROM group_memberships
-            WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL
+            SELECT role FROM public.epigraph_live_memberships($2)
+            WHERE group_id = $1
+            ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'writer' THEN 1 ELSE 2 END
             LIMIT 1
             "#,
         )

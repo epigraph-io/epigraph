@@ -698,7 +698,14 @@ async fn the_removal_route_refuses_a_non_admin_and_a_stranger_on_the_application
 /// SUPERUSER pool (a privileged session, which those verbs' triggers admit)
 /// exactly as `epigraph_create_team_group` shapes it, with `creator` as its
 /// admin and `member` as a reader.
+///
+/// `creator` is made a registered human first, as the verb requires of an
+/// admin: a row in a verb-made group counts only while its human is a live
+/// human operator (164's conjunct in `epigraph_live_memberships`), and since
+/// backlog 93ed2ec3 the REST admin check reads that live answer, so a creator
+/// that is not one is refused as a lapsed admin before the database is asked.
 async fn seeded_verb_made_group(pool: &PgPool, creator: Uuid, member: Uuid) -> Uuid {
+    viewer_fixture::make_human_operator(pool, creator).await;
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \

@@ -1221,13 +1221,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "group_membership.rs",
         "get_member_role_conn",
-        "READ of `group_memberships`, which carries neither `visibility` nor `owner_group_id` — it \
-         is not in migration 062's tier_a array and schema_contract.rs pins its eight columns — so \
-         there is no predicate a Viewer could be spent on. It answers the authorization question \
-         itself (is this principal an admin of THIS group) for POST /groups/:id/rotate and the \
-         two member routes, on the same ScopedPool::begin_as transaction that performs the \
-         write, so the decision and the write cannot be taken on different connections. Its tenancy backstop is migration \
-         077 section 7's group_memberships_tenancy policy, which selects on the CONNECTION.",
+        "READ of one principal's LIVE role in one group through the `epigraph_live_memberships` \
+         definer (the read `Viewer::resolve` is built from; backlog 93ed2ec3). Memberships carry \
+         neither `visibility` nor `owner_group_id` — `group_memberships` is not in migration \
+         062's tier_a array — so there is no predicate a Viewer could be spent on. It answers the \
+         authorization question itself (is this principal an admin of THIS group) for POST \
+         /groups/:id/rotate and the two member routes, on the same ScopedPool::begin_as \
+         transaction that performs the write, so the decision and the write cannot be taken on \
+         different connections; a lapsed admin row answers no role.",
     ),
     (
         "group_key_epoch.rs",
@@ -2693,18 +2694,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "group_membership.rs",
         "get_members_conn",
-        "READ of a group's live roster for GET /api/v1/groups/:id. `group_memberships` carries \
-         neither `visibility` nor `owner_group_id`, and narrowing the roster to the viewer's own \
-         row would make `member_count` wrong; the route has checked live membership on the same \
-         stamped connection, and group_memberships_tenancy selects on that CONNECTION.",
+        "READ of a group's live explicit roster for GET /api/v1/groups/:id: unrevoked rows that \
+         `epigraph_live_memberships` still counts (a lapsed row is dropped; backlog f712db53). \
+         `group_memberships` carries neither `visibility` nor `owner_group_id`, and narrowing \
+         the roster to the viewer's own row would make `member_count` wrong; the route has \
+         checked live membership on the same stamped connection, and group_memberships_tenancy \
+         selects on that CONNECTION.",
     ),
     (
         "group_membership.rs",
         "is_member_conn",
         "READ answering the authorization question itself (is this agent a live member of THIS \
-         group) for GET /api/v1/groups/:id, on the caller's stamped connection. \
-         `group_memberships` has no tenancy column for a Viewer to filter on; on an unstamped \
-         connection group_memberships_tenancy shows no row and the answer fails closed.",
+         group) for GET /api/v1/groups/:id, through the `epigraph_live_memberships` definer the \
+         caller's own viewer was resolved from (backlog f712db53): a role-derived member is a \
+         member and a lapsed row is not. Memberships have no tenancy column for a Viewer to \
+         filter on, and the answer is the same on any connection.",
     ),
     (
         "group_membership.rs",
