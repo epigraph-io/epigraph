@@ -3673,7 +3673,10 @@ impl PrivatizationRepository {
     ///
     /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
     /// guard refusing an unrestricted claim; a `55P03` from the first lock is
-    /// a lock wait that timed out (above).
+    /// a lock wait that timed out (above). A `40P01` is still possible against
+    /// a writer that does not take claim rows in id order, or that locks other
+    /// rows first (edge rows are not ordered here): nothing is written and the
+    /// commit may be retried.
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
