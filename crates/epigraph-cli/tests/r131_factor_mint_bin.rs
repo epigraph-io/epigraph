@@ -1260,6 +1260,65 @@ async fn undo_counts_a_bp_message_written_while_it_runs(pool: PgPool) {
     );
 }
 
+/// Backlog 1097d3c2: after creating the undo record the tool syncs the
+/// record's directory, before it connects, so a host crash right after the
+/// apply's COMMIT cannot lose the record's directory entry. A directory it
+/// cannot open for that sync (write and search permission, no read) refuses
+/// the apply with exit 1 before any connection, and leaves no record.
+#[test]
+fn apply_refuses_a_record_whose_directory_cannot_be_synced() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = Dir::new();
+    let plan = dir.path("plan.json");
+    let empty = MintPlan {
+        kind: r131_factor_mint::PLAN_KIND.into(),
+        edges: 0,
+        by_relationship: BTreeMap::new(),
+        likely_migrated: 0,
+        slots_minted: 0,
+        edges_on_held_slots: 0,
+        slots: Vec::new(),
+        held_edges: Vec::new(),
+    };
+    std::fs::write(&plan, serde_json::to_vec(&empty).expect("plan json")).expect("plan");
+    let locked = dir.0.join("no-read");
+    std::fs::create_dir(&locked).expect("dir");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).expect("chmod");
+    assert!(
+        std::fs::File::open(&locked).is_err(),
+        "PREMISE: a 0300 directory cannot be opened (not running as a privileged user)"
+    );
+    let record = locked.join("record.jsonl");
+
+    let r = run(
+        &dir.0,
+        &[
+            "--apply",
+            "--plan",
+            &plan,
+            "--record",
+            record.to_str().expect("utf-8"),
+        ],
+        "postgres://nobody@127.0.0.1:1/none",
+        None,
+    );
+    let exists = record.exists();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stderr, r.stdout);
+    assert!(
+        r.stderr.contains("cannot sync the undo record's directory"),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        !r.stderr.contains(REFUSAL),
+        "refused before the directory sync, at the connection: {}",
+        r.stderr
+    );
+    assert!(!exists, "a refused apply left its record");
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_library_refuses_an_application_session_before_any_write(pool: PgPool) {
     let _w = world(&pool).await;

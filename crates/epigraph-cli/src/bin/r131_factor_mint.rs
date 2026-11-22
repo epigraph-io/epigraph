@@ -29,8 +29,13 @@
 //!         them. Without `--apply` it runs the deletes and rolls back.
 //!
 //! Output files are created new: an existing file is refused before any
-//! connection. They name claim and edge ids: keep them in the operator's
-//! private directory, never in a repository.
+//! connection. The apply's undo record is the only authority for reversing a
+//! mint, so after creating it the tool also syncs its directory (a directory
+//! it cannot sync refuses the apply before connecting), and the apply syncs
+//! the record's contents before its COMMIT: a host crash right after the
+//! COMMIT cannot lose the record's directory entry. They name claim and edge
+//! ids: keep them in the operator's private directory, never in a
+//! repository.
 //!
 //! # Authority
 //!
@@ -123,6 +128,23 @@ fn create_new(path: &Path) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Make `path`'s directory entry durable: open its parent directory (`.` for
+/// a bare file name) and fsync it (backlog 1097d3c2). Without this, the
+/// record's contents are synced before the COMMIT but the entry naming them
+/// may not be, and a crash could lose the only record of what was minted.
+fn sync_parent_dir(path: &Path) -> Result<(), String> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent).and_then(|d| d.sync_all()).map_err(|e| {
+        format!(
+            "{}: cannot sync the undo record's directory: {e}",
+            parent.display()
+        )
+    })
+}
+
 fn counts_line(prefix: &str, edges: usize, slots: usize, held: usize) -> String {
     format!(
         "{prefix}: {edges} factorless edges, {slots} slots a mint would fill, {held} on held slots"
@@ -194,6 +216,11 @@ async fn run(cli: Cli) -> Result<(), Failure> {
                 return Err(format!("{}: not an r131_factor_mint plan", plan.display()).into());
             }
             let mut file = create_new(record)?;
+            if let Err(e) = sync_parent_dir(record) {
+                drop(file);
+                let _ = std::fs::remove_file(record);
+                return Err(e.into());
+            }
             let result = apply(&cli, &expected, record, &mut file).await;
             if remove_record_after(&result) {
                 drop(file);
@@ -341,6 +368,16 @@ mod tests {
             "an unknown outcome keeps the record"
         );
         assert!(!remove_record_after(&Ok(())), "a mint keeps its record");
+    }
+
+    #[test]
+    fn a_bare_record_name_syncs_the_working_directory() {
+        // `Path::parent` of a bare name is "", which cannot be opened.
+        assert_eq!(Path::new("undo.jsonl").parent(), Some(Path::new("")));
+        sync_parent_dir(Path::new("undo.jsonl")).expect("syncs `.`");
+        let missing = Path::new("no-such-dir-r131").join("undo.jsonl");
+        let err = sync_parent_dir(&missing).expect_err("a missing directory");
+        assert!(err.contains("no-such-dir-r131"), "{err}");
     }
 
     #[test]
