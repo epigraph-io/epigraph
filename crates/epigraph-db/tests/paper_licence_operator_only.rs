@@ -1,0 +1,350 @@
+//! Migration 255 (backlog 9ee6799d): `papers.licence`, which decides whether
+//! document ingest may keep a verbatim publisher passage in evidence, is
+//! written only by the operator, through the audited maintenance definer
+//! `epigraph_set_paper_licence`. Before 255 the application role held
+//! table-level INSERT and UPDATE on the registry table `papers`, so any
+//! application session could mark a paper open-licensed.
+//!
+//! Every application write here runs on a pool whose connections are
+//! `SET SESSION AUTHORIZATION epigraph_app`, the operator's on one that is
+//! `SET SESSION AUTHORIZATION epigraph_maintenance`. Fixtures are seeded and
+//! read back on the superuser pool.
+//!
+//! # Verified to fail
+//!
+//! Each mutation of migration 255 applied alone, then restored. The first
+//! three also drop section 8 (the end-state check), which otherwise refuses
+//! the mutated migration itself: with section 4 removed and section 8 kept,
+//! every test fails at migrate time with `LIC09` (measured).
+//!
+//! Without 255 at all, every test here fails except the positive control
+//! `the_app_role_still_registers_and_fills_papers`.
+//!
+//! * section 4 (the REVOKE and column re-grant) removed: fails
+//!   `the_app_role_cannot_write_a_paper_licence` (the UPDATE succeeds) and
+//!   `every_paper_column_but_licence_is_app_writable`.
+//! * section 4 revoking UPDATE only (table-level INSERT kept): fails
+//!   `the_app_role_cannot_write_a_paper_licence` (the INSERT naming
+//!   `licence` succeeds) and the catalog ratchet.
+//! * `licence` left in the re-granted column list: fails both, as above.
+//! * EXECUTE on the definer granted to `epigraph_app`: fails
+//!   `the_app_role_cannot_write_a_paper_licence`.
+//! * section 6 (the reserved `paper.licence` prefix) removed: fails
+//!   `the_app_role_cannot_forge_a_licence_audit_row`.
+//! * the definer's audit INSERT removed: fails
+//!   `the_operator_definer_sets_clears_and_audits_a_licence`.
+
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
+use epigraph_db::PaperRepository;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+/// A pool whose connections are `SET SESSION AUTHORIZATION <role>` (a
+/// test-local literal).
+async fn role_pool(pool: &PgPool, role: &'static str) -> PgPool {
+    use sqlx::Executor;
+    let url = fixture::database_url_for(pool).await;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            Box::pin(async move {
+                conn.execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("role pool")
+}
+
+fn sqlstate<T: std::fmt::Debug>(r: Result<T, sqlx::Error>) -> Option<String> {
+    match r {
+        Ok(v) => panic!("expected a database error, got Ok({v:?})"),
+        Err(e) => e
+            .as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string())),
+    }
+}
+
+async fn seed_paper(pool: &PgPool, doi: &str) -> Uuid {
+    sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'Seeded') RETURNING id")
+        .bind(doi)
+        .fetch_one(pool)
+        .await
+        .expect("seed paper")
+}
+
+async fn licence_of(pool: &PgPool, doi: &str) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT licence FROM papers WHERE doi = $1")
+        .bind(doi)
+        .fetch_optional(pool)
+        .await
+        .expect("licence read")
+        .flatten()
+}
+
+async fn licence_events(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE lower(btrim(event_type)) LIKE 'paper.licence%' ORDER BY created_at, id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("audit read")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_write_a_paper_licence(pool: PgPool) {
+    let existing = seed_paper(&pool, "10.9999/t67-existing").await;
+    let app = role_pool(&pool, "epigraph_app").await;
+
+    // An existing paper's licence.
+    let r = sqlx::query("UPDATE papers SET licence = 'CC0-1.0' WHERE id = $1")
+        .bind(existing)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE licence");
+
+    // A not-yet-ingested DOI pre-registered as open.
+    let r = sqlx::query("INSERT INTO papers (doi, title, licence) VALUES ($1, 't', 'CC0-1.0')")
+        .bind("10.9999/t67-preregistered")
+        .execute(&app)
+        .await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "INSERT naming licence"
+    );
+
+    // An upsert whose conflict arm sets it.
+    let r = sqlx::query(
+        "INSERT INTO papers (doi, title) VALUES ($1, 't') \
+         ON CONFLICT (doi) DO UPDATE SET licence = 'CC-BY-4.0'",
+    )
+    .bind("10.9999/t67-existing")
+    .execute(&app)
+    .await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "ON CONFLICT DO UPDATE SET licence"
+    );
+
+    // The operator definer.
+    let r = sqlx::query("SELECT epigraph_set_paper_licence($1, 'CC0-1.0', 'app attempt')")
+        .bind(existing)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "EXECUTE the definer");
+
+    assert_eq!(licence_of(&pool, "10.9999/t67-existing").await, None);
+    assert_eq!(licence_of(&pool, "10.9999/t67-preregistered").await, None);
+    assert!(licence_events(&pool).await.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_forge_a_licence_audit_row(pool: PgPool) {
+    let app = role_pool(&pool, "epigraph_app").await;
+    for event_type in ["paper.licence_set", " Paper.Licence_set", "PAPER.LICENCE"] {
+        let r = sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, NULL, true, '{}'::jsonb)",
+        )
+        .bind(event_type)
+        .execute(&app)
+        .await;
+        assert_eq!(sqlstate(r).as_deref(), Some("42501"), "{event_type:?}");
+    }
+    assert!(licence_events(&pool).await.is_empty());
+
+    // CONTROL: the application still appends its own unattributed events
+    // (077's anti-suppression arm), including a look-alike that is not the
+    // reserved prefix.
+    for event_type in ["paper_licence_probe", "paper.title_filled"] {
+        sqlx::query(
+            "INSERT INTO security_events (event_type, agent_id, success, details) \
+             VALUES ($1, NULL, true, '{}'::jsonb)",
+        )
+        .bind(event_type)
+        .execute(&app)
+        .await
+        .unwrap_or_else(|e| panic!("{event_type}: {e}"));
+    }
+}
+
+/// The application's own paper writes keep working on the application role:
+/// `PaperRepository::get_or_create` (both arms) and the two statements of
+/// `POST /api/v1/papers` (`epigraph-api/src/routes/papers.rs::create_paper`),
+/// copied as written there.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_still_registers_and_fills_papers(pool: PgPool) {
+    let app = role_pool(&pool, "epigraph_app").await;
+
+    // get_or_create: a new paper (the INSERT arm) ...
+    let new_id = PaperRepository::get_or_create(&app, "10.9999/t67-new", Some("New"), Some("J"))
+        .await
+        .expect("get_or_create inserts on the application role");
+    // ... and an existing row whose NULL title it fills (the UPDATE arm).
+    let bare: Uuid = sqlx::query_scalar("INSERT INTO papers (doi) VALUES ($1) RETURNING id")
+        .bind("10.9999/t67-bare")
+        .fetch_one(&pool)
+        .await
+        .expect("seed bare paper");
+    let hit = PaperRepository::get_or_create(&app, "10.9999/t67-bare", Some("Filled"), None)
+        .await
+        .expect("get_or_create fills on the application role");
+    assert_eq!(hit, bare);
+    let title: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE id = $1")
+        .bind(bare)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(title.as_deref(), Some("Filled"));
+
+    // create_paper's fill-only UPDATE and its upsert, as written.
+    sqlx::query(
+        r#"UPDATE papers
+                   SET title   = COALESCE(title, $2),
+                       journal = COALESCE(journal, $3)
+                   WHERE id = $1"#,
+    )
+    .bind(new_id)
+    .bind(Some("ignored"))
+    .bind(Some("ignored"))
+    .execute(&app)
+    .await
+    .expect("create_paper's fill-only UPDATE on the application role");
+    let row: (Uuid,) = sqlx::query_as(
+        r#"INSERT INTO papers (doi, title, journal)
+               VALUES ($1, $2, $3)
+               ON CONFLICT (doi) DO UPDATE SET
+                   title   = COALESCE(papers.title, EXCLUDED.title),
+                   journal = COALESCE(papers.journal, EXCLUDED.journal)
+               RETURNING id"#,
+    )
+    .bind("10.9999/t67-new")
+    .bind(Some("Other"))
+    .bind(None::<String>)
+    .fetch_one(&app)
+    .await
+    .expect("create_paper's upsert on the application role");
+    assert_eq!(row.0, new_id);
+
+    // The read the ingest writers make still works, and reads NULL.
+    assert_eq!(
+        PaperRepository::licence(&app, new_id)
+            .await
+            .expect("licence read"),
+        None
+    );
+}
+
+/// CATALOG RATCHET: the application role holds INSERT and UPDATE on every
+/// `papers` column except `licence`, and neither on `licence`. A migration
+/// that adds a `papers` column the request path writes must grant it (255's
+/// grants are column-level, so a new column is not covered); one that
+/// re-grants table-level INSERT or UPDATE re-opens the licence and fails here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_paper_column_but_licence_is_app_writable(pool: PgPool) {
+    let rows: Vec<(String, bool, bool)> = sqlx::query_as(
+        "SELECT a.attname::text, \
+                has_column_privilege('epigraph_app', 'public.papers'::regclass, a.attnum, 'INSERT'), \
+                has_column_privilege('epigraph_app', 'public.papers'::regclass, a.attnum, 'UPDATE') \
+           FROM pg_attribute a \
+          WHERE a.attrelid = 'public.papers'::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+          ORDER BY a.attnum",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("privilege read");
+    assert!(
+        rows.iter().any(|(c, _, _)| c == "licence"),
+        "papers.licence is missing: {rows:?}"
+    );
+    for (col, ins, upd) in &rows {
+        if col == "licence" {
+            assert!(
+                !ins && !upd,
+                "epigraph_app can write papers.licence (INSERT {ins}, UPDATE {upd}); only \
+                 epigraph_set_paper_licence on the maintenance DSN may"
+            );
+        } else {
+            assert!(
+                *ins && *upd,
+                "epigraph_app lacks INSERT ({ins}) or UPDATE ({upd}) on papers.{col}; grant it \
+                 column-level (never table-level, which re-opens papers.licence)"
+            );
+        }
+    }
+    let table_level: (bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('epigraph_app', 'public.papers', 'INSERT'), \
+                has_table_privilege('epigraph_app', 'public.papers', 'UPDATE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        table_level,
+        (false, false),
+        "table-level INSERT/UPDATE on papers"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_operator_definer_sets_clears_and_audits_a_licence(pool: PgPool) {
+    let doi = "10.9999/t67-operator";
+    let paper = seed_paper(&pool, doi).await;
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+
+    let prev: Option<String> =
+        sqlx::query_scalar("SELECT epigraph_set_paper_licence($1, 'CC-BY-4.0', 'publisher page')")
+            .bind(paper)
+            .fetch_one(&maint)
+            .await
+            .expect("operator sets a licence");
+    assert_eq!(prev, None);
+    assert_eq!(licence_of(&pool, doi).await.as_deref(), Some("CC-BY-4.0"));
+
+    let prev: Option<String> =
+        sqlx::query_scalar("SELECT epigraph_set_paper_licence($1, NULL, 'withdrawn')")
+            .bind(paper)
+            .fetch_one(&maint)
+            .await
+            .expect("operator clears a licence");
+    assert_eq!(prev.as_deref(), Some("CC-BY-4.0"));
+    assert_eq!(licence_of(&pool, doi).await, None);
+
+    let events = licence_events(&pool).await;
+    assert_eq!(events.len(), 2, "one audit row per set: {events:#?}");
+    let paper_s = paper.to_string();
+    assert_eq!(events[0]["paper_id"], paper_s.as_str());
+    assert_eq!(events[0]["doi"], doi);
+    assert_eq!(events[0]["previous"], serde_json::Value::Null);
+    assert_eq!(events[0]["licence"], "CC-BY-4.0");
+    assert_eq!(events[0]["reason"], "publisher page");
+    assert_eq!(events[0]["session_user"], "epigraph_maintenance");
+    assert_eq!(events[1]["previous"], "CC-BY-4.0");
+    assert_eq!(events[1]["licence"], serde_json::Value::Null);
+    assert_eq!(events[1]["reason"], "withdrawn");
+
+    // Refusals change nothing and write no audit row.
+    for (args, want) in [
+        ("$1, 'CC0-1.0', '  '", "22023"),               // blank reason
+        ("$1, 'CC0-1.0', NULL", "22023"),               // no reason
+        ("gen_random_uuid(), 'CC0-1.0', 'x'", "22023"), // unknown paper
+        ("$1, ' CC0-1.0', 'padded'", "23514"),          // 226's CHECK
+    ] {
+        let sql = format!("SELECT epigraph_set_paper_licence({args})");
+        let mut q = sqlx::query(&sql);
+        if args.starts_with("$1") {
+            q = q.bind(paper);
+        }
+        let r = q.execute(&maint).await;
+        assert_eq!(sqlstate(r).as_deref(), Some(want), "{args}");
+    }
+    assert_eq!(licence_of(&pool, doi).await, None);
+    assert_eq!(licence_events(&pool).await.len(), 2);
+}

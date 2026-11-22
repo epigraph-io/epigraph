@@ -2322,6 +2322,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 255 (backlog 9ee6799d), the operator's audited write of
+    // `papers.licence`, whose application-role INSERT and UPDATE 255 revokes.
+    // Under a non-member owner it fails CLOSED: its `security_events` audit
+    // INSERT is refused by `security_events_paper_licence_privileged` (no
+    // `epigraph_definer_bypass()`), so every set errors 42501 and the licence
+    // UPDATE rolls back with it (loud). Under the migration runner's
+    // superuser it keeps working with more authority than intended.
+    ("epigraph_set_paper_licence", 255),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3225,6 +3233,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_step_lineage_executors",
             "public.epigraph_step_lineage_executors(uuid)",
             true,
+        ),
+        // 255: setting a paper's licence is a maintenance act; an app grant
+        // would let the request DSN mark any source open-licensed, and so make
+        // ingest retain its publisher text.
+        (
+            "epigraph_set_paper_licence",
+            "public.epigraph_set_paper_licence(uuid, text, text)",
+            false,
         ),
     ];
 

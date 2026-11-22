@@ -753,6 +753,10 @@ fn parse_ingest_visibility(
 /// non-commercial or no-derivatives variant however it is spelled, and any
 /// free text. The graph is exported as a unit, so a licence that restricts
 /// reuse cannot ride along. An unrecognised spelling fails closed.
+///
+/// The value comes from `papers.licence`, which the application role cannot
+/// write (migration 255, backlog 9ee6799d): only an operator sets it, through
+/// the audited maintenance definer `epigraph_set_paper_licence`.
 #[must_use]
 pub fn passage_retention_permitted(licence: Option<&str>) -> bool {
     let Some(licence) = licence else {

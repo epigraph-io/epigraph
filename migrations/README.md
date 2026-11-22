@@ -3116,9 +3116,10 @@ restart.
   passage (`passage_retention_permitted`: an exact allowlist of public
   domain, CC0, CC BY and CC BY-SA SPDX ids; never NC/ND, and free text fails
   closed); otherwise the row carries the citation, a locator and the
-  passage's BLAKE3 hash only. Ingest never writes the column; by convention
-  an operator sets it (not enforced: the application role keeps UPDATE on
-  the REGISTRY table `papers`). `papers` carries no tenancy, so no policy
+  passage's BLAKE3 hash only. Ingest never writes the column; an operator
+  sets it (a convention at 226: the application role kept UPDATE on the
+  REGISTRY table `papers`; enforced since 255, which also audits each set
+  through `epigraph_set_paper_licence`). `papers` carries no tenancy, so no policy
   changes. Sets `lock_timeout = '3s'`. **Scope:** evidence rows only; a
   level-2 paragraph claim's `content` still holds the paragraph text. The
   locator's byte span (a reproducible hash check) exists for Tier-1
@@ -3403,6 +3404,35 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **255**: public `paper_licence_operator_only` (backlog 9ee6799d). Makes 226's
+  "an operator sets `papers.licence`" an enforced rule. `epigraph_app` loses table-level
+  INSERT and UPDATE on `papers` and gets both back column-level on every column except
+  `licence` (read from the catalog), so an application session can neither UPDATE a
+  paper's licence, nor INSERT a paper naming one (pre-registering a not-yet-ingested DOI as
+  open), nor set it in an `ON CONFLICT DO UPDATE`; SELECT and DELETE are unchanged, and the
+  request path's writers (`PaperRepository::get_or_create`, `POST /api/v1/papers`) name only
+  `doi`, `title` and `journal`. The operator path is the SECURITY DEFINER
+  `epigraph_set_paper_licence(paper uuid, licence text, reason text)` on 172's form, owned by
+  `epigraph_maintenance`, EXECUTE revoked from PUBLIC and `epigraph_app`: it refuses a blank
+  reason or an unknown paper (`LIC01`..`LIC03`, 22023), sets or clears (NULL) the licence
+  (226's CHECK still applies), writes one `security_events` row `paper.licence_set`
+  (paper, DOI, previous, new, reason, session user) and returns the previous licence. A
+  RESTRICTIVE insert policy `security_events_paper_licence_privileged` reserves the
+  `paper.licence` event prefix (case- and blank-insensitive) for a privileged or definer
+  frame stamped `now()`, as 123 does for `platform.`. Re-states the column comment. Refuses
+  (`LIC09`, 55000, nothing applied) if `epigraph_app` can still write `licence` by any route
+  afterwards. A later migration that adds a `papers` column the request path writes must
+  grant it to `epigraph_app` column-level (`paper_licence_operator_only.rs` fails until it
+  does). **Not closed:** the maintenance DSN can still UPDATE `licence` directly, without
+  the audit row (as in 123); the application role can still write publisher text into
+  `evidence.raw_content` directly; licences set before 255 carry no audit row. Pinned by
+  `epigraph-db/tests/paper_licence_operator_only.rs` (each refusal mutation-tested, the
+  application writers as controls, the column ratchet, the definer's audit) and
+  `paper_licence_operator_only_undo.rs`; `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`
+  now sets licences through the definer. Undo: `docs/runbooks/255-undo.sql`. **Operator
+  path:** on the maintenance DSN, `SELECT epigraph_set_paper_licence('<paper id>',
+  'CC-BY-4.0', '<where the licence was read>');` (by id: DOI spellings are canonicalised in
+  the application). **Deploy order:** none required; no binary depends on it.
 
 ## `-- no-transaction` migrations
 
