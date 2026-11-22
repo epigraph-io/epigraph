@@ -1480,8 +1480,9 @@ pub async fn find_workflow_hierarchical(
 /// the missing-id 404 before anything is written. A reader of the plan
 /// resolves its steps, and any
 /// `step_index` that matches no step the caller can read is listed in
-/// `unresolved_step_indices` with a `warning` (out of range and not visible are
-/// deliberately not told apart). Shared with MCP:
+/// `unresolved_step_indices` with a `warning` (out of range, not visible, and
+/// a readable step whose plan position cannot be established from the steps
+/// the caller can read are deliberately not told apart). Shared with MCP:
 /// `WorkflowRepository::plan_step_claim_ids` and
 /// `epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning`.
 #[cfg(feature = "db")]
@@ -1712,8 +1713,8 @@ pub async fn report_hierarchical_outcome(
             workflow_id = %workflow_id,
             principal = ?viewer.principal(),
             unresolved_step_indices = ?unresolved,
-            "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
-             (step_index out of range, or the step is not visible to the reporter)"
+            "{}",
+            epigraph_mcp::tools::workflow_hierarchical::UNRESOLVED_STEPS_LOG
         );
     }
 
