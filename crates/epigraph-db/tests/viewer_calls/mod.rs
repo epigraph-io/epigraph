@@ -514,8 +514,7 @@ pub fn struct_fields(code: &str) -> Structs {
                 continue;
             };
             let fname = part[..colon].trim();
-            if fname.is_empty() || !fname.bytes().all(is_ident) || part[colon..].starts_with("::")
-            {
+            if fname.is_empty() || !fname.bytes().all(is_ident) || part[colon..].starts_with("::") {
                 continue;
             }
             fields.push((fname.to_string(), flat_type(&part[colon + 1..])));

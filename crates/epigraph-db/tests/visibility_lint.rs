@@ -5088,12 +5088,16 @@ fn the_per_call_scanner_sees_the_whole_repo_viewer_surface() {
             "{file}::{f} takes a `&Viewer` and must be in the measured population"
         );
     }
+    // Floors about 2% under the measurement: a scanner regression that drops
+    // fns with no unviewed call (which the register cannot see) fails here.
+    // Removing real repo code can trip them too; re-measure and lower them in
+    // the same change, with the new numbers.
     assert!(
-        fns >= 400,
+        fns >= 447,
         "found {fns} viewer-taking repo fns; measured 456 on 2026-11-22"
     );
     assert!(
-        calls >= 500,
+        calls >= 570,
         "found {calls} database calls in them; measured 582 on 2026-11-22"
     );
 }

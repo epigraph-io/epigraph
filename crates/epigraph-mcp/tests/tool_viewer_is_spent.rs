@@ -1445,7 +1445,11 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // audit: `recall::write_recall_audit`, handed `server.scoped`: the
     // caller's own recall event, written on a transaction stamped as the
     // caller (`principal`), which resolves only the caller's owner group.
-    ("memory.rs", "recall_post_embed", &["recall::write_recall_audit"]),
+    (
+        "memory.rs",
+        "recall_post_embed",
+        &["recall::write_recall_audit"],
+    ),
     // untenanted: `ingestion::find_paper_by_document_key`. Raw pool:
     // `find_paper_by_document_key` reads `papers` on `server.pool`; every claim-derived read
     // runs on the stamped read.
@@ -1949,13 +1953,17 @@ fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
         "the maintenance-session open in revert_label_dedup must be measured: {:?}",
         measured.get(&key)
     );
+    // Floors about 2% under the measurement: a scanner regression that drops
+    // fns with no unviewed call (which the register cannot see) fails here.
+    // Removing real tool code can trip them too; re-measure and lower them in
+    // the same change, with the new numbers.
     assert!(
-        fns >= 180,
+        fns >= 206,
         "found {fns} viewer-holding tool fns; measured 211 on 2026-11-22 (199 under \
          src/tools/, 12 in the crate-root helpers)"
     );
     assert!(
-        calls >= 650,
+        calls >= 773,
         "found {calls} database calls in them; measured 789 on 2026-11-22"
     );
 }
@@ -2258,4 +2266,42 @@ fn viewer_carrier_structs_are_reviewed() {
         takers.contains(&("label_dedup.rs".to_string(), "apply_unit".to_string())),
         "the carrier check found no taker: {takers:?}"
     );
+}
+
+/// Tool fns that bind a maintenance viewer beside another viewer. The per-call
+/// check counts a call spent with ANY viewer a fn holds as viewed, so in such
+/// a fn a statement spent with the maintenance viewer would pass for one
+/// spent with the caller's.
+fn maintenance_beside_another_viewer(file: &str, src: &str) -> Vec<String> {
+    let (code, sql) = viewer_calls::views(src);
+    let structs = viewer_calls::struct_fields(&code);
+    viewer_calls::holders(&code, &sql, &TOOLS, &structs)
+        .into_iter()
+        .filter(|h| code[h.body.0..h.body.1].contains("maintenance_viewer(") && h.viewers.len() > 1)
+        .map(|h| format!("{file}::{} holds {:?}", h.name, h.viewers))
+        .collect()
+}
+
+/// No tool fn holds a maintenance viewer beside the caller's (measured
+/// 2026-11-22: none does). If one must, split it, so the per-call register
+/// stays a statement about the caller's viewer.
+#[test]
+fn no_tool_fn_holds_a_maintenance_viewer_beside_another() {
+    let fixture = r##"
+pub async fn both(server: &EpiGraphMcpFull, viewer: &Viewer) -> R {
+    let admin = crate::maintenance::maintenance_viewer(server, SystemReason::X).await?;
+    Repo::sweep_as(&server.pool, &admin).await
+}
+"##;
+    assert_eq!(
+        maintenance_beside_another_viewer("fixture.rs", fixture).len(),
+        1,
+        "the check sees a maintenance viewer bound beside the caller's"
+    );
+    let offenders: Vec<String> = tool_files()
+        .into_iter()
+        .chain(root_files())
+        .flat_map(|(f, src)| maintenance_beside_another_viewer(&f, &src))
+        .collect();
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }
