@@ -126,9 +126,9 @@ def public_label_source(alias="c"):
         already read.
     Labels stored before this rule existed are not rewritten by it: re-run
     label_themes_llm with --relabel-all (and re-label cluster runs) to replace
-    them. That run reads only themes with a 1536-d `centroid`; a seeded theme
-    whose section had only 3072-d embeddings has none and needs a separate
-    relabel.
+    them. That run reads every theme, whatever its centroid (1536-d, 3072-d
+    only, or none), so a seeded theme whose section had only 3072-d
+    embeddings is relabelled too.
     """
     return f"({alias}.visibility = 'public' AND {not_intake_owned(alias)})"
 

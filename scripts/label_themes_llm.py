@@ -94,16 +94,24 @@ def exit_status(failed):
 
 
 def load_themes_with_samples(conn, limit=None):
-    """Load themes (ordered by claim_count desc) and their top-10 nearest
-    PUBLIC claims (theme_lib.public_label_source). A theme with no public
-    member comes back with no samples."""
+    """Load EVERY theme (ordered by claim_count desc) and its top-10 nearest
+    PUBLIC current claims (theme_lib.public_label_source). A theme with no
+    public member comes back with no samples.
+
+    Every theme, whatever its centroid: a theme whose centroid is 3072-d only
+    (seed_themes_from_textbooks, for a section embedded only at 3072-d) or
+    absent shows its stored label like any other, so --relabel-all must reach
+    it too. Members are ranked by distance to the 1536-d centroid, else to the
+    3072-d one, then by id, so a member with no embedding of the theme's
+    dimension is still sampled, after the ranked ones. is_current is stated
+    rather than implied by `embedding IS NOT NULL` (a superseded claim has no
+    embedding)."""
     themes = []
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         sql = """
             SELECT id, label, description, claim_count
             FROM claim_themes
-            WHERE centroid IS NOT NULL
-            ORDER BY claim_count DESC
+            ORDER BY claim_count DESC, id
         """
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -122,13 +130,17 @@ def load_themes_with_samples(conn, limit=None):
                        COALESCE(a.display_name, 'unknown') AS agent
                 FROM claims c
                 LEFT JOIN agents a ON c.agent_id = a.id
-                WHERE c.theme_id = %s
-                  AND c.embedding IS NOT NULL
+                CROSS JOIN claim_themes t
+                WHERE t.id = %s
+                  AND c.theme_id = t.id
+                  AND c.is_current
                   AND {theme_lib.public_label_source("c")}
-                ORDER BY c.embedding <=> (SELECT centroid FROM claim_themes WHERE id = %s)
+                ORDER BY COALESCE(c.embedding <=> t.centroid,
+                                  c.embedding_3072 <=> t.centroid_3072) NULLS LAST,
+                         c.id
                 LIMIT 10
                 """,
-                (theme_id, theme_id),
+                (theme_id,),
             )
             samples = cur.fetchall()
             themes.append({
