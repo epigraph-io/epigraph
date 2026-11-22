@@ -575,7 +575,11 @@ pub async fn assess_claim(
     // cautious rule, only the rows the derivation scope admits to the cache).
     // So when this frame owns the cache, the response IS the
     // cached value; on another frame it is this frame's fold, as the framed
-    // `get_belief` serves it. The handler used to fold the raw masses of its
+    // `get_belief` serves it. One exception: a compound claim's cache is not
+    // refolded from its own BBAs (the refresh above writes nothing for it),
+    // while this preview still folds them, so for a compound the response is
+    // that fold and the cache keeps whatever its decomposition derived.
+    // The handler used to fold the raw masses of its
     // `'discount'` rows itself: with no reliability discount (so it disagreed
     // with the cache even for one assessment), without the edge-factor rows
     // the cache folds, and with all of a sibling group's rows in one cautious
