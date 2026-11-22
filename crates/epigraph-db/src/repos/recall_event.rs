@@ -37,6 +37,10 @@ pub const DEFAULT_RETENTION_DAYS: i32 = 90;
 /// `conflict.*` / `synthesis.*` / `workflow.*` — these are the graph's
 /// provenance record, and deleting them destroys history that cannot be
 /// reconstructed.
+///
+/// The database holds the list the prune actually deletes by
+/// (`epigraph_prunable_event_types()`, migration 250); changing it is a
+/// migration, and `events_telemetry_prune_definer.rs` pins the two equal.
 pub const PRUNABLE_EVENT_TYPES: &[&str] = &["tool.invoked"];
 
 /// One logged recall query.
@@ -290,54 +294,48 @@ impl RecallEventRepository {
     /// accumulated since 2026-03-06 with nothing pruning them — but most of
     /// its volume (`claim.created`, 51k rows) is provenance and must survive.
     ///
+    /// The delete is migration 250's SECURITY DEFINER
+    /// `epigraph_prune_telemetry_events`, which holds the type allowlist and
+    /// the age filter itself: the maintenance role has no DELETE (or UPDATE)
+    /// on `events` of its own since 250, so a maintenance session cannot
+    /// remove or rewrite a provenance event (backlog 062d7767). Only a
+    /// session `epigraph_bypass()` admits may call it.
+    ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the delete fails.
+    /// Returns `DbError::QueryFailed` if the call fails (42501 on a session
+    /// that is not a maintenance login; 42883 on a database below 250).
     #[instrument(skip(pool))]
     pub async fn prune_telemetry_events(
         pool: &PgPool,
         retention_days: i32,
     ) -> Result<u64, DbError> {
         let days = retention_days.max(1);
-        let types: Vec<String> = PRUNABLE_EVENT_TYPES
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let result = sqlx::query!(
-            r#"
-            DELETE FROM events
-            WHERE event_type = ANY($1)
-              AND created_at < NOW() - make_interval(days => $2)
-            "#,
-            &types[..],
-            days,
-        )
-        .execute(pool)
-        .await?;
-        Ok(result.rows_affected())
+        let n: i64 = sqlx::query_scalar("SELECT public.epigraph_prune_telemetry_events($1)")
+            .bind(days)
+            .fetch_one(pool)
+            .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     /// Count telemetry rows that [`Self::prune_telemetry_events`] would delete.
+    ///
+    /// Filters on the database's own allowlist
+    /// (`epigraph_prunable_event_types()`, migration 250), the one the prune
+    /// definer deletes by, so the dry run and the real run cannot disagree.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
     #[instrument(skip(pool))]
     pub async fn count_prunable_events(pool: &PgPool, retention_days: i32) -> Result<i64, DbError> {
         let days = retention_days.max(1);
-        let types: Vec<String> = PRUNABLE_EVENT_TYPES
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let row = sqlx::query!(
-            r#"
-            SELECT COUNT(*) AS "n!" FROM events
-            WHERE event_type = ANY($1)
-              AND created_at < NOW() - make_interval(days => $2)
-            "#,
-            &types[..],
-            days,
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+              WHERE event_type = ANY (public.epigraph_prunable_event_types()) \
+                AND created_at < NOW() - make_interval(days => $1)",
         )
+        .bind(days)
         .fetch_one(pool)
         .await?;
-        Ok(row.n)
+        Ok(n)
     }
 }

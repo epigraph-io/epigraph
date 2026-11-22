@@ -2233,7 +2233,8 @@ restart.
   DELETE on `events`) is not added here; the maintenance role can still delete
   or rewrite any `events` row (follow-up, file header). Pinned by
   `app_role_table_lockdown.rs::the_app_role_cannot_delete_or_rewrite_events`,
-  `::the_maintenance_role_still_deletes_events_the_app_role_cannot`, the
+  `::the_maintenance_role_still_deletes_events_the_app_role_cannot` (renamed
+  `::neither_role_deletes_a_provenance_event_directly` and inverted by 250), the
   allowlist ratchet, and
   `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the retention job
   still prunes on a maintenance login; an application login's own DELETE on
@@ -3403,6 +3404,39 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **250**: public `events_telemetry_prune_definer`.
+  **Section 1** (backlog 062d7767): the maintenance role prunes `events` only
+  through the SECURITY DEFINER `epigraph_prune_telemetry_events(retention_days)`,
+  which deletes rows whose `event_type` is exactly one of
+  `epigraph_prunable_event_types()` (`{tool.invoked}`, equal to
+  `epigraph_db::PRUNABLE_EVENT_TYPES`) older than the window, and
+  `REVOKE DELETE, UPDATE, TRUNCATE ON public.events FROM epigraph_maintenance`
+  (it keeps SELECT and INSERT). Before this any maintenance session could
+  delete or rewrite any `events` row, provenance included, and UPDATE alone
+  could re-type a provenance row so the prune deleted it. The definer is owned
+  by the owner of `events` (read from `pg_class`), never by the maintenance
+  role, whose DELETE the revoke removes; the migration refuses (42501) if that
+  owner is or is a member of `epigraph_maintenance`. EXECUTE to
+  `epigraph_maintenance` only; the body also requires `epigraph_bypass()`. Its
+  path is `pg_catalog, public, pg_temp` because each delete fires 001's
+  INVOKER `cascade_delete_edges` (unqualified `DELETE FROM edges`); registered
+  in `definer_search_path_ratchet.rs`. `RecallEventRepository::
+  prune_telemetry_events` calls the definer and `count_prunable_events` reads
+  the same list. `AgentRepository::delete`'s `actor_id` detach now needs the
+  owner DSN (its callers are superuser test fixtures). Pinned by
+  `epigraph-db/tests/events_telemetry_prune_definer.rs` (a maintenance
+  session's DELETE / UPDATE / TRUNCATE of a `claim.created` row refused 42501;
+  the prune on a maintenance session deletes only the expired telemetry row and
+  its cascade still runs; the app role cannot execute it; the owner and
+  grants; the type list; the undo),
+  `app_role_table_lockdown.rs::neither_role_deletes_a_provenance_event_directly`
+  and `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the real binary
+  on a non-superuser maintenance login). Undo: `docs/runbooks/250-undo.sql`.
+  **Deploy order (coupled):** apply 250 and deploy the binary that calls the
+  definer together, before the next `prune_recall_events` run; out of order
+  the job exits non-zero having deleted nothing from `events` (no data loss).
+  Before migrating, measure who owns `public.events` and whether that role is
+  a member of `epigraph_maintenance` (the migration refuses if so).
 
 ## `-- no-transaction` migrations
 
