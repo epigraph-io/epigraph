@@ -152,6 +152,25 @@ fn standing_refused(refusal: &StandingRefusal) -> Response {
     }
 }
 
+/// The refusal of an assertion the library verified for a credential that is
+/// not among the rows the definer served (unreachable today: the library
+/// matches the credential the response names, which was already required to
+/// be one of them). Refused rather than skipped, so the standing check can
+/// never be bypassed by a mismatch; the ceremony is left live.
+fn unmatched_assertion(target: &'static str, id: Uuid) -> Response {
+    tracing::error!(
+        target: "elevate",
+        ceremony = target,
+        id = %id,
+        "the verified assertion's credential is not among the served passkeys"
+    );
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "assertion_passkey_unmatched",
+        "the verified assertion's passkey could not be matched to a stored passkey",
+    )
+}
+
 /// The ceremony pages' Content-Security-Policy.
 ///
 /// The elevation plan's policy (§1.3) plus two directives: `style-src 'self'`
@@ -870,17 +889,19 @@ pub async fn ticket_assert(
         // (an Android key whose batch certificate was revoked after it
         // enrolled no longer elevates), read from the row the definer serves,
         // never the ceremony state.
-        if let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) {
-            if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
-                tracing::warn!(
-                    target: "elevate.ticket",
-                    ticket = %id,
-                    code = refusal.code(),
-                    reason = %refusal,
-                    "assertion refused: the passkey's attestation is not in good standing"
-                );
-                return standing_refused(&refusal);
-            }
+        // No matching row refuses: the check is never skipped.
+        let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
+            return unmatched_assertion("elevate.ticket", id);
+        };
+        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+            tracing::warn!(
+                target: "elevate.ticket",
+                ticket = %id,
+                code = refusal.code(),
+                reason = %refusal,
+                "assertion refused: the passkey's attestation is not in good standing"
+            );
+            return standing_refused(&refusal);
         }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
@@ -1313,17 +1334,18 @@ pub async fn act_assert(
             }
         };
         // As at the elevation: the passkey's attestation in good standing.
-        if let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) {
-            if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
-                tracing::warn!(
-                    target: "elevate.act",
-                    act = %id,
-                    code = refusal.code(),
-                    reason = %refusal,
-                    "act assertion refused: the passkey's attestation is not in good standing"
-                );
-                return standing_refused(&refusal);
-            }
+        let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
+            return unmatched_assertion("elevate.act", id);
+        };
+        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+            tracing::warn!(
+                target: "elevate.act",
+                act = %id,
+                code = refusal.code(),
+                reason = %refusal,
+                "act assertion refused: the passkey's attestation is not in good standing"
+            );
+            return standing_refused(&refusal);
         }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
