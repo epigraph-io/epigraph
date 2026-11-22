@@ -6,8 +6,8 @@
 //! Which claims, which BBAs, and what is left out are in
 //! `epigraph_cli::beta_replay`. In short: current claims still on the prior,
 //! their live non-cached BBAs, with the priors and placeholders left out by
-//! default (`truth_value_seed`, `auto_wire:creation`, `prior`,
-//! `ingest_template`; `--exclude-method` leaves out more).
+//! default (`truth_value_seed`, `prior`, `ingest_template`;
+//! `--exclude-method` leaves out more).
 //!
 //! DRY RUN ONLY: it prints the counts (counted BBAs by writer label, excluded
 //! rows, claims that would move) and a sample, and writes nothing.
@@ -15,10 +15,10 @@
 //! # Not to be applied
 //!
 //! A replay `--apply` is REFUSED (backlog candidate 913-cold-start-divergence).
-//! The replay counts every stored BBA, including those of writers that never
-//! move the live track (assess discounts, unlabelled rows, the seed and edge
-//! wires), and the Beta arithmetic counts their uncommitted mass against the
-//! hypothesis. On a production-sized corpus its dry run put the replayed
+//! The replay counts every stored BBA, including those of writers that did
+//! not move the live track when they were stored (assess discounts, unlabelled
+//! rows, and the seed and edge wires before backlog d3648d3c), and the Beta
+//! arithmetic counts their uncommitted mass against the hypothesis. On a production-sized corpus its dry run put the replayed
 //! posteriors well below the claims' BetP, so applying it would have pushed
 //! thousands of claims INTO the top-divergent list rather than out of it. The
 //! problem it was meant to fix, a claim's first live update registering a
@@ -106,10 +106,10 @@ struct Cli {
     sample: usize,
 
     /// Also leave out BBAs with this replay label (repeatable): a
-    /// `combination_method`, `<null>` for an unlabelled row, or
-    /// `auto_wire:workflow_outcome`. `auto_wire` names only the remaining
-    /// auto_wire evidence rows. `truth_value_seed`, `auto_wire:creation`,
-    /// `prior` and `ingest_template` are always left out.
+    /// `combination_method`, `<null>` for an unlabelled row,
+    /// `auto_wire:creation` or `auto_wire:workflow_outcome`. `auto_wire` names
+    /// only the remaining auto_wire evidence rows. `truth_value_seed`, `prior`
+    /// and `ingest_template` are always left out.
     #[arg(long, value_name = "LABEL")]
     exclude_method: Vec<String>,
 }

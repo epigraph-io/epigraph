@@ -76,11 +76,6 @@
 //!   the claim's authored `truth_value` restated as a BBA. It is a prior, not
 //!   evidence; the Beta track has its own prior, and `update_with_evidence`,
 //!   which writes the seed, does not count it live;
-//! * `auto_wire:creation` rows: the same role as the seed. A claim created
-//!   through `submit_claim` or ingest gets its creation BBA (built from the
-//!   claim's own confidence) and therefore never a seed; no creation writer
-//!   moves the Beta track live, and the first `update_with_evidence` after it
-//!   counts only its own BBA;
 //! * `prior` rows: a vacuous hypothesis prior. The live arithmetic counts a
 //!   vacuous BBA's whole mass against the hypothesis, so counting one would
 //!   move the claim toward false on no evidence;
@@ -95,10 +90,14 @@
 //! lists the counted rows by label, so the operator sees which writers the
 //! replay would count before applying it.
 //!
-//! Counted by default although the live track does not count them yet (they
-//! are evidence; the live gap is theirs): `report_workflow_outcome`
-//! (`auto_wire:workflow_outcome`), `backfill_factors` (under `auto_wire`), the
-//! edge wire (`edge_factor`), propagated rows and assessment `discount` rows.
+//! Counted by default, as the live track counts them since backlog d3648d3c
+//! (`epigraph_engine::ds_divergence`): `auto_wire:creation` rows (the seed
+//! wire of `submit_claim` / `memorize` and the batch ingest wire count the
+//! creation BBA live), `report_workflow_outcome` (`auto_wire:workflow_outcome`)
+//! and the edge wire (`edge_factor`, counted live at its first
+//! materialization). Counted by default although the live track does not
+//! count them (they are evidence; the live gap is theirs): `backfill_factors`
+//! (under `auto_wire`), propagated rows and assessment `discount` rows.
 //!
 //! # What the replay is and is not
 //!
@@ -117,7 +116,7 @@
 //! row security bypassed and counts that BBA like any other. And an `auto_wire`
 //! row with no perspective that a legacy `update_with_evidence` wrote (before
 //! evidence rows were filed under their own perspective) is labelled as a
-//! creation row and left out.
+//! creation row (and counted, as both are).
 //!
 //! # What it writes
 //!
@@ -180,9 +179,8 @@ pub const INGEST_TEMPLATE_LABEL: &str = "ingest_template";
 /// The replay labels left out unless the operator says otherwise. See the
 /// module documentation for why each one is a prior or a placeholder, not
 /// evidence.
-pub const DEFAULT_EXCLUDED_METHODS: [&str; 4] = [
+pub const DEFAULT_EXCLUDED_METHODS: [&str; 3] = [
     epigraph_mcp::tools::ds_auto::TRUTH_VALUE_SEED_METHOD,
-    CREATION_LABEL,
     "prior",
     INGEST_TEMPLATE_LABEL,
 ];

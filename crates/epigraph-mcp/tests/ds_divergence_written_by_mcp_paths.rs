@@ -609,6 +609,207 @@ async fn app_role_pool(pool: &PgPool) -> ScopedPool {
         .expect("app-role ScopedPool")
 }
 
+/// The divergence `get_divergence` serves for `claim`, as
+/// `(pignistic_prob, bayesian_posterior, kl_divergence)`.
+async fn served_divergence(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    claim: Uuid,
+) -> (f64, f64, f64) {
+    let got = epigraph_mcp::tools::ds::get_divergence(
+        server,
+        viewer,
+        GetDivergenceParams {
+            claim_id: claim.to_string(),
+        },
+    )
+    .await
+    .expect("get_divergence answers");
+    let d = first_text(&got);
+    (
+        d["pignistic_prob"].as_f64().expect("pignistic_prob"),
+        d["bayesian_posterior"]
+            .as_f64()
+            .expect("bayesian_posterior"),
+        d["kl_divergence"].as_f64().expect("kl_divergence"),
+    )
+}
+
+/// The seed wire (`submit_claim`) counts the claim's creation BBA: the track
+/// leaves the prior by that BBA's masses, as a cold start with no row. The
+/// claim's FIRST `update_with_evidence` is then not a cold start and records
+/// the row `get_divergence` reads, with the posterior over both BBAs. On the
+/// old code the track stayed at `Beta(1, 1)`, that update was a cold start,
+/// and `get_divergence` had no data.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_seed_wire_counts_the_creation_bba_so_the_first_update_records_a_row(pool: PgPool) {
+    let (server, _group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+
+    let res = epigraph_mcp::tools::claims::submit_claim(
+        &server,
+        &viewer,
+        epigraph_mcp::types::SubmitClaimParams {
+            content: "A claim whose creation BBA the seed wire stores.".into(),
+            methodology: "deductive_logic".into(),
+            evidence_data: "the creation evidence".into(),
+            evidence_type: "logical".into(),
+            confidence: 0.8,
+            source_url: None,
+            reasoning: None,
+            labels: vec![],
+            novelty_threshold: None,
+            visibility: None,
+            group_id: None,
+            dataset: None,
+        },
+        None,
+    )
+    .await
+    .expect("submit_claim on the app role");
+    let claim = parse_uuid_field(&first_text(&res), "claim_id");
+    let masses: serde_json::Value =
+        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE claim_id = $1")
+            .bind(claim)
+            .fetch_one(&pool)
+            .await
+            .expect("the seed wire's one BBA");
+    let (s, c) = support_and_conflict(&masses);
+    assert!(
+        s > 0.0,
+        "PREMISE: the creation BBA supports the claim: {masses}"
+    );
+
+    let (a, b) = beta(&pool, claim).await;
+    assert!(
+        close(a, 1.0 + s) && close(b, 2.0 - s - c),
+        "the seed wire counts its BBA: expected Beta({}, {}), got ({a}, {b})",
+        1.0 + s,
+        2.0 - s - c
+    );
+    assert!(
+        divergence_rows(&pool, claim).await.is_empty(),
+        "the creation is the claim's cold start and records no row"
+    );
+
+    let (betp, e1) = uwe_call(
+        &server,
+        &viewer,
+        &pool,
+        claim,
+        "the first observation after creation",
+    )
+    .await;
+    let (alpha, beta_param) = (1.0 + s + e1, 3.0 - s - c - e1);
+    let (a, b) = beta(&pool, claim).await;
+    assert!(close(a, alpha) && close(b, beta_param), "got ({a}, {b})");
+    let (p, q, d) = served_divergence(&server, &viewer, claim).await;
+    let posterior = alpha / (alpha + beta_param);
+    assert!(close(p, betp), "served BetP {p}, the call's {betp}");
+    assert!(
+        close(q, posterior),
+        "served posterior {q}, want {posterior}"
+    );
+    assert!(close(d, kl(betp, posterior)), "served KL {d}");
+}
+
+/// The batch ingest wire (`auto_wire_ds_batch`) counts each entry's BBA on the
+/// hypothesis the entry asserts: index 0 on `binary_truth`, the declared index
+/// on an axis frame (counting it on index 0 would put none of its support in
+/// alpha). The wire is the claims' cold start; the binary claim's next live
+/// update records the row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_batch_wire_counts_each_entry_on_its_own_hypothesis(pool: PgPool) {
+    use epigraph_mcp::tools::ds_auto::{auto_wire_ds_batch, BatchDsEntry};
+
+    let (server, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let on_binary = own_claim(&pool, group, "an ingested atom on the binary frame").await;
+    let on_axis = own_claim(&pool, group, "an ingested atom placed on a declared axis").await;
+    let axis = epigraph_ingest::common::plan::PlannedAxis {
+        frame: "t96_batch_potency".into(),
+        hypotheses: vec!["none".into(), "mild".into(), "strong".into()],
+        hypothesis_index: 2,
+    };
+
+    let app = app_role_pool(&pool).await;
+    let mut tx = app.begin_as(&viewer).await.expect("stamped tx");
+    let (_, wired) = auto_wire_ds_batch(
+        &mut tx,
+        &viewer,
+        &[
+            BatchDsEntry {
+                claim_id: on_binary,
+                confidence: 0.8,
+                weight: 0.9,
+                evidence_type: None,
+                axis: None,
+            },
+            BatchDsEntry {
+                claim_id: on_axis,
+                confidence: 0.7,
+                weight: 1.0,
+                evidence_type: None,
+                axis: Some(axis),
+            },
+        ],
+        server.server_agent_id().await.expect("server agent"),
+    )
+    .await
+    .expect("batch wire");
+    tx.commit().await.expect("commit the batch");
+    assert_eq!(wired, 2, "both entries wired");
+
+    for (claim, key) in [(on_binary, "0"), (on_axis, "2")] {
+        let masses: serde_json::Value =
+            sqlx::query_scalar("SELECT masses FROM mass_functions WHERE claim_id = $1")
+                .bind(claim)
+                .fetch_one(&pool)
+                .await
+                .expect("the entry's BBA");
+        let m = masses[key]
+            .as_f64()
+            .expect("support on the asserted hypothesis");
+        let (a, b) = beta(&pool, claim).await;
+        assert!(
+            close(a, 1.0 + m) && close(b, 2.0 - m),
+            "claim {claim}: expected Beta({}, {}) from m({{{key}}}) = {m}, got ({a}, {b})",
+            1.0 + m,
+            2.0 - m
+        );
+        assert!(
+            divergence_rows(&pool, claim).await.is_empty(),
+            "the batch wire is the claim's cold start"
+        );
+    }
+
+    // The binary atom's next live evidence is not a cold start: it records.
+    let m: f64 =
+        sqlx::query_scalar("SELECT (masses->>'0')::float8 FROM mass_functions WHERE claim_id = $1")
+            .bind(on_binary)
+            .fetch_one(&pool)
+            .await
+            .expect("the batch BBA's support");
+    let (betp, e) = uwe_call(
+        &server,
+        &viewer,
+        &pool,
+        on_binary,
+        "an observation on the ingested atom",
+    )
+    .await;
+    let (alpha, beta_param) = (1.0 + m + e, 3.0 - m - e);
+    let (a, b) = beta(&pool, on_binary).await;
+    assert!(close(a, alpha) && close(b, beta_param), "got ({a}, {b})");
+    let (p, q, d) = served_divergence(&server, &viewer, on_binary).await;
+    let posterior = alpha / (alpha + beta_param);
+    assert!(
+        close(p, betp) && close(q, posterior),
+        "({p}, {q}) vs ({betp}, {posterior})"
+    );
+    assert!(close(d, kl(betp, posterior)), "served KL {d}");
+}
+
 /// A target whose track already holds evidence, and a believed source.
 async fn edge_fixture(pool: &PgPool, group: Uuid) -> (Uuid, Uuid) {
     let source = seed_claim_with_belief(pool, 0.8, 0.95, Some(0.9)).await;

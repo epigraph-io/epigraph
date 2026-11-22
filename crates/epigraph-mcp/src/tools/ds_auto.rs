@@ -576,6 +576,29 @@ pub async fn auto_wire_ds_for_claim(
     .await
     .map_err(|e| format!("update_claim_belief: {e}"))?;
 
+    // The claim's Beta-Bernoulli track counts its creation BBA (backlog
+    // d3648d3c), on hypothesis 0, as every later evidence write counts its
+    // own. Without it the track stayed at the prior while the DS fold held
+    // this BBA, so the claim's first evidence update was a cold start and
+    // recorded no divergence row. The claim is new (the caller's
+    // `was_created` gate), so THIS update is the cold start and records no
+    // row either; the next update does. Best-effort, under savepoints
+    // (`epigraph_engine::ds_divergence`).
+    epigraph_engine::ds_divergence::track_counted_bba(
+        &mut *conn,
+        viewer,
+        epigraph_engine::ds_divergence::CountedBba {
+            claim_id,
+            frame_id,
+            bba: &bba,
+            hypothesis_index: Some(0),
+            pignistic_prob: Some(betp),
+        },
+        "new-claim seed wire",
+    )
+    .await
+    .map_err(|e| format!("Beta track: {e}"))?;
+
     Ok(DsAutoResult {
         belief: bel,
         plausibility: pl,
@@ -1143,6 +1166,28 @@ async fn wire_single_batch_entry(
     )
     .await
     .map_err(|e| format!("recompute initial cache: {e}"))?;
+
+    // The claim's Beta-Bernoulli track counts this BBA on the hypothesis it
+    // asserts (backlog d3648d3c), as the seed wire counts a submitted claim's.
+    // Every batch entry is a claim the caller's walk just created (both
+    // callers wire only newly inserted atoms), so this update is the claim's
+    // cold start and would record no divergence row: the BetP is not read
+    // back for it. What it changes is the claim's NEXT update, whose track
+    // then holds this evidence as the DS fold does.
+    epigraph_engine::ds_divergence::track_counted_bba(
+        &mut *conn,
+        viewer,
+        epigraph_engine::ds_divergence::CountedBba {
+            claim_id: entry.claim_id,
+            frame_id,
+            bba: &bba,
+            hypothesis_index: Some(idx_i32),
+            pignistic_prob: None,
+        },
+        "ingest batch wire",
+    )
+    .await
+    .map_err(|e| format!("Beta track: {e}"))?;
 
     Ok(())
 }
