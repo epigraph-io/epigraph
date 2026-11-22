@@ -2204,9 +2204,21 @@ pub struct BatchedContext {
 /// `Viewer::edge_predicate_fragment`, spelled as statement 7b already spells
 /// it, on the same two binds. In statements 4, 7 and 7b the predicate sits
 /// BEFORE the window functions, so `total` never counts a hidden edge. The
-/// paper-attribution `LEFT JOIN edges asserts_e` in statement 7 carries it in
-/// the `ON`: a hidden attribution leaves `paper_doi` empty rather than dropping
-/// the readable neighbour.
+/// paper attribution in statement 7 carries it inside its `LEFT JOIN LATERAL`:
+/// a hidden attribution leaves `paper_doi` empty rather than dropping the
+/// readable neighbour.
+///
+/// # One row per neighbour (backlog 11402482)
+///
+/// Statement 7 used to `LEFT JOIN edges asserts_e` straight onto the
+/// neighbour, so a neighbour with two visible `paper -asserts->` rows was
+/// listed twice, took two of the paragraph's `corroborates_limit` slots and
+/// counted twice in `total`. That happens whenever two papers assert one claim,
+/// and whenever two ingest principals ingest one paper (the ingest keeps one
+/// marked row of a fact per principal, `epigraph_db::ingest_written`). The
+/// attribution is now ONE paper per neighbour, picked by a lateral subquery
+/// (the oldest visible asserting row), so the neighbour list and `total` count
+/// each neighbour once; a claim two papers assert shows one of their DOIs.
 ///
 /// # A deliberate deviation, recorded
 ///
@@ -2518,15 +2530,20 @@ pub async fn fetch_batched_context(
                   ON c.id = n.neighbor_id
                  AND ($3::bool OR c.visibility = 'public'
                       OR c.owner_group_id = ANY($4::uuid[]))
-                LEFT JOIN edges asserts_e
-                  ON asserts_e.target_id = c.id
-                  AND asserts_e.relationship = 'asserts'
-                  AND asserts_e.source_type = 'paper'
-                  AND ($3::bool OR asserts_e.visibility = 'public'
-                       OR (asserts_e.owner_group_id = ANY($4::uuid[])
-                           AND (asserts_e.co_owner_group_id IS NULL
-                                OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
-                LEFT JOIN papers p ON p.id = asserts_e.source_id
+                LEFT JOIN LATERAL (
+                    SELECT pp.doi
+                    FROM edges asserts_e
+                    JOIN papers pp ON pp.id = asserts_e.source_id
+                    WHERE asserts_e.target_id = c.id
+                      AND asserts_e.relationship = 'asserts'
+                      AND asserts_e.source_type = 'paper'
+                      AND ($3::bool OR asserts_e.visibility = 'public'
+                           OR (asserts_e.owner_group_id = ANY($4::uuid[])
+                               AND (asserts_e.co_owner_group_id IS NULL
+                                    OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
+                    ORDER BY asserts_e.created_at, asserts_e.id
+                    LIMIT 1
+                ) p ON true
             ),
             ranked AS (
                 SELECT *,
