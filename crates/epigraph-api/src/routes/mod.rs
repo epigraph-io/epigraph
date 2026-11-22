@@ -422,7 +422,7 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// token is refused 401 by the bearer layer before it reaches the limiter.
 ///
 /// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
-/// request except the liveness probes is ALSO charged to its client address,
+/// request except `/health` is ALSO charged to its client address,
 /// outside the bearer layers and routing, so 401s and unknown-path 404s are
 /// counted and refused before any token is read.
 ///
@@ -1502,7 +1502,7 @@ pub fn create_router_with_extensions(
 /// token is refused 401 by the bearer layer before it reaches the limiter.
 ///
 /// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
-/// request except the liveness probes is ALSO charged to its client address,
+/// request except `/health` is ALSO charged to its client address,
 /// outside the bearer layers and routing, so 401s and unknown-path 404s are
 /// counted and refused before any token is read.
 #[cfg(not(feature = "db"))]

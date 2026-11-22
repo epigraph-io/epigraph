@@ -339,8 +339,9 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   bearer layer, so the bearer layer's own work (token verification and the
   revocation, admin-scope and delegation reads), the 401s it answers and
   requests to unknown paths (404) are never counted by it. With this variable
-  set, EVERY request except `/health`, `/readiness` and `/liveness` (matched
-  exactly) is first charged to its client address (keyed as above, through
+  set, EVERY request except `/health` (matched exactly: `/health/...`,
+  `/readiness` and `/liveness` are not routes, so they are counted) is first
+  charged to its client address (keyed as above, through
   `EPIGRAPH_TRUSTED_PROXIES`), outside authentication and routing, and
   refused 429 past the limit before any token is read. It writes no
   `X-RateLimit-*` headers, does not turn the principal limiter on (nor does

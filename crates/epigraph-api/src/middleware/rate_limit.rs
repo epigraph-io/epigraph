@@ -343,9 +343,9 @@ pub async fn guest_rate_limit_middleware(
 /// would overwrite the principal limiter's, which describe the bucket a
 /// client can do something about.
 ///
-/// Exempt: the liveness probes, matched exactly (`/health` and anything
-/// under `/health/`, `/readiness`, `/liveness`), not by prefix as
-/// [`should_bypass_rate_limit`] does, so `/healthXYZ` is a counted 404. CORS
+/// Exempt: the liveness route `/health`, matched exactly, not by prefix as
+/// [`should_bypass_rate_limit`] does: `/healthXYZ`, `/health/<anything>`,
+/// `/readiness` and `/liveness` are not routes, so each is a counted 404. CORS
 /// preflights are NOT exempt: this process answers no CORS (it is the
 /// reverse proxy's), so an `OPTIONS` request is one more request.
 ///
@@ -369,15 +369,17 @@ pub async fn address_rate_limit_middleware(
     Ok(next.run(request).await)
 }
 
-/// Whether `path` is one of [`BYPASS_ROUTES`] exactly, or under one of them
-/// (`/health/ready`), as opposed to merely starting with its text
-/// (`/healthXYZ`).
+/// Whether `path` is the liveness route, `/health`, exactly. Only a route
+/// that exists is exempt: every other path the router does not serve
+/// (`/health/ready`, `/readiness`, `/liveness`, `/healthXYZ`) is a 404, and
+/// exempting one would let an address send unknown-path requests without
+/// limit.
 fn is_liveness_probe(path: &str) -> bool {
-    BYPASS_ROUTES.iter().any(|route| {
-        path.strip_prefix(route)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-    })
+    path == LIVENESS_ROUTE
 }
+
+/// The one route [`address_rate_limit_middleware`] does not count.
+const LIVENESS_ROUTE: &str = "/health";
 
 /// The bucket of a request no key could be read for. Reachable only for a
 /// router served WITHOUT connect info, which `bin/server.rs` never does; it is
@@ -532,12 +534,14 @@ mod tests {
 
     #[test]
     fn the_address_limiter_exempts_the_probes_exactly() {
-        for exempt in ["/health", "/health/ready", "/readiness", "/liveness"] {
-            assert!(is_liveness_probe(exempt), "{exempt}");
-        }
+        assert!(is_liveness_probe("/health"));
         for counted in [
             "/healthXYZ",
             "/health-check",
+            "/health/",
+            "/health/ready",
+            "/readiness",
+            "/liveness",
             "/readinessjunk",
             "/",
             "/api/v1/claims",

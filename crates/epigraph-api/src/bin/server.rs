@@ -187,7 +187,7 @@ async fn main() {
         (Some(_), Some(rpm)) => tracing::info!(
             per_address_rpm = rpm,
             trusted_proxies = %rate_limit.trusted_proxies,
-            "per-address rate limiter ON: every request but the liveness probes, 401s and \
+            "per-address rate limiter ON: every request but /health, 401s and \
              unknown paths included, is charged to its client address before authentication"
         ),
         (None, Some(_)) => tracing::warn!(

@@ -436,3 +436,43 @@ async fn the_address_limiter_keeps_the_principal_limiters_headers() {
         "the address bucket ({LIMIT}) is spent before the principal one (50)"
     );
 }
+
+/// A router with only the per-address limiter, over a lazy pool that is never
+/// connected; the state is returned so a test can read its audit log.
+fn address_only_router(limiter: AgentRateLimiter) -> (Router, AppState) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let state = AppState::with_db(pool, ApiConfig::default()).with_address_rate_limiter(limiter);
+    (create_router(state.clone()), state)
+}
+
+/// Only the real liveness route, `/health`, is exempt from the per-address
+/// limiter. `/health/<anything>`, `/readiness` and `/liveness` are not routes
+/// (each is a 404), so exempting them let one address send unknown-path
+/// requests without limit.
+///
+/// Fails when the exemption covers `/health/...`, `/readiness` or
+/// `/liveness` (the fourth request is answered 404, not 429).
+#[tokio::test]
+async fn the_address_limiter_exempts_only_the_real_probe_route() {
+    let (router, _) = address_only_router(limiter());
+    let peer = "203.0.113.80:1000";
+    for path in ["/health/x1", "/readiness", "/liveness"] {
+        assert_eq!(
+            from_peer(&router, "GET", path, peer, None).await.0,
+            StatusCode::NOT_FOUND,
+            "CALIBRATION: {path} is not a route"
+        );
+    }
+    assert_eq!(
+        from_peer(&router, "GET", "/health/x2", peer, None).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the address has spent its bucket on probe-looking 404s"
+    );
+    assert_eq!(
+        from_peer(&router, "GET", "/health", peer, None).await.0,
+        StatusCode::OK,
+        "the real liveness route is still exempt"
+    );
+}
