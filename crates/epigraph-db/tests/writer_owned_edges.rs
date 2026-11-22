@@ -1318,6 +1318,184 @@ async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
     assert_eq!(refused, Err("42501".to_string()));
 }
 
+/// Migration 253 (backlog 2f39eee7): the server signers are excluded by the
+/// FUNCTION, not by whoever calls it. An HTTP edge writer signs with a
+/// server's key whatever its caller, so a server signer is never an edge's
+/// author, and a run that forgets one in `p_exclude_signers` must not re-own
+/// that server's edges to the server agent's group.
+///
+/// Three server-signer shapes, each signing a legacy-shaped world edge:
+///   * `api_named`: the agent `epigraph-api` registers for its key (display
+///     name `epigraph-api-signer`), with no other history;
+///   * `api_unnamed`: an API key that resolved to an agent under another name
+///     (an attested signing row), recognised because it signed an edge a
+///     stamped caller W wrote (`writer_group_id` = W's group, not its own);
+///   * `mcp`: the MCP server's agent, recognised because it signed a claim
+///     another agent authored (D1: the caller authors, the server signs).
+///
+/// The control, `genuine`, signs its own claim and its own stamped edge, and
+/// its legacy edge IS re-owned, so the exclusions are not vacuous. A run with
+/// an EMPTY list and one with a PARTIAL list each leave the three server
+/// edges world-owned.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (caller, caller_g) = fixture::seed_agent_with_group(&pool, "http-caller").await;
+    let (genuine, genuine_g) = fixture::seed_agent_with_group(&pool, "genuine-signer").await;
+    let (api_named, _) = fixture::seed_agent_with_group(&pool, "api-named").await;
+    let (api_unnamed, _) = fixture::seed_agent_with_group(&pool, "api-unnamed").await;
+    let (mcp, _) = fixture::seed_agent_with_group(&pool, "mcp-server").await;
+    sqlx::query("UPDATE agents SET display_name = 'epigraph-api-signer' WHERE id = $1")
+        .bind(api_named)
+        .execute(&pool)
+        .await
+        .expect("name the API signer");
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    assert_app_role_does_not_bypass(&pool).await;
+
+    // History that identifies (or, for `genuine`, clears) each signer.
+    let p = pool.clone();
+    let (callers_edge, genuines_edge) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            stamp(&mut conn, &p, caller).await;
+            let c = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
+                .await
+                .expect("the HTTP caller links two public claims");
+            stamp(&mut conn, &p, genuine).await;
+            let g = insert_edge(&mut conn, (b, "claim"), (a, "claim"))
+                .await
+                .expect("the genuine signer links two public claims itself");
+            unstamp(&mut conn).await;
+            (conn, (c, g))
+        })
+        .await;
+    assert_eq!(
+        tuple(&pool, callers_edge).await.3,
+        Some(caller_g),
+        "the caller's edge records the caller as its writer"
+    );
+    assert_eq!(tuple(&pool, genuines_edge).await.3, Some(genuine_g));
+    sign_as(&pool, callers_edge, api_unnamed).await;
+    sign_as(&pool, genuines_edge, genuine).await;
+    let callers_claim = fixture::seed_public_claim(&pool, caller, "the caller's claim").await;
+    let genuines_claim = fixture::seed_public_claim(&pool, genuine, "the genuine claim").await;
+    for (claim, signer) in [(callers_claim, mcp), (genuines_claim, genuine)] {
+        sqlx::query(
+            "UPDATE claims SET signature = decode(repeat('ab', 64), 'hex'), signer_id = $2 \
+              WHERE id = $1",
+        )
+        .bind(claim)
+        .bind(signer)
+        .execute(&pool)
+        .await
+        .expect("sign the claim (privileged)");
+    }
+
+    // The legacy (principal-less, world-owned) edges the re-own considers.
+    let by_genuine = fixture::seed_edge(&pool, a, b).await;
+    let by_api_named = fixture::seed_edge(&pool, a, b).await;
+    let by_api_unnamed = fixture::seed_edge(&pool, a, b).await;
+    let by_mcp = fixture::seed_edge(&pool, a, b).await;
+    for (edge, signer) in [
+        (by_genuine, genuine),
+        (by_api_named, api_named),
+        (by_api_unnamed, api_unnamed),
+        (by_mcp, mcp),
+    ] {
+        sign_as(&pool, edge, signer).await;
+        assert_eq!(
+            tuple(&pool, edge).await,
+            t(WORLD, "public", None, None),
+            "a legacy-shaped edge before the run"
+        );
+    }
+
+    assert_eq!(
+        reown(&pool, Some(100), Some(vec![])).await,
+        Ok(1),
+        "an EMPTY exclusion list re-owns the genuine signer's edge and no server's"
+    );
+    assert_eq!(
+        reown(&pool, Some(100), Some(vec![api_named])).await,
+        Ok(0),
+        "a PARTIAL exclusion list re-owns no server's edge either"
+    );
+    assert_eq!(
+        tuple(&pool, by_genuine).await,
+        t(genuine_g, "public", None, Some(genuine_g)),
+        "the control: a signer that signs only its own work is still followed"
+    );
+    for (edge, why) in [
+        (by_api_named, "the API's registered signer"),
+        (by_api_unnamed, "a signer that signed another writer's edge"),
+        (by_mcp, "a signer that signed another author's claim"),
+    ] {
+        assert_eq!(
+            tuple(&pool, edge).await,
+            t(WORLD, "public", None, None),
+            "{why} is never followed"
+        );
+    }
+    let auto: Vec<i64> = sqlx::query_scalar(
+        "SELECT (details->>'auto_excluded_signers')::bigint FROM security_events \
+          WHERE event_type = 'edges.legacy_signer_reown'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(
+        auto,
+        vec![3],
+        "one event, counting the three server signers the function excluded itself"
+    );
+}
+
+/// `docs/runbooks/253-undo.sql` puts 120's body back, byte for byte, on the
+/// path 190 gave it, keeping owner and grant; at head the body is not 120's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_253_undo_restores_120s_body_on_190s_path(pool: PgPool) {
+    const BODY_120: &str = "7dc872eea3f514c5bedd2cc656ac5df7";
+    let read = |pool: PgPool| async move {
+        sqlx::query_as::<_, (String, String, Vec<String>)>(
+            "SELECT md5(p.prosrc), pg_get_userbyid(p.proowner)::text, \
+                    COALESCE(p.proconfig, '{}'::text[]) FROM pg_proc p \
+              WHERE p.oid = to_regprocedure(\
+                    'public.epigraph_reown_legacy_edges_to_signer(integer, uuid[])')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_proc")
+    };
+    let path = vec!["search_path=pg_catalog, public, pg_temp".to_string()];
+    let head = read(pool.clone()).await;
+    assert_ne!(head.0, BODY_120, "at head the body is 253's, not 120's");
+    assert_eq!((head.1.as_str(), &head.2), ("epigraph_maintenance", &path));
+
+    let undo = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/runbooks/253-undo.sql"
+    ))
+    .expect("read the undo");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("apply the undo");
+    let undone = read(pool.clone()).await;
+    assert_eq!(
+        (undone.0.as_str(), undone.1.as_str(), &undone.2),
+        (BODY_120, "epigraph_maintenance", &path)
+    );
+    let maintenance_may_run: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('epigraph_maintenance', \
+                'public.epigraph_reown_legacy_edges_to_signer(integer, uuid[])', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("acl");
+    assert!(maintenance_may_run);
+}
+
 // ===========================================================================
 // 13. Retract, then link the same triple again.
 // ===========================================================================
@@ -1623,6 +1801,11 @@ async fn the_trigger_and_the_reown_carry_the_writer_rule_and_the_one_scope(pool:
         "public.epigraph_edge_writer_scope(e.source_type, e.target_type)",
         "<> ALL (p_exclude_signers)",
         "writer_group_id = cand.w",
+        // 253: the server signers are looked up, never only passed.
+        "e.signer_id <> ALL (v_auto)",
+        "a.display_name = 'epigraph-api-signer'",
+        "c.signer_id <> c.agent_id",
+        "x.writer_group_id IS DISTINCT FROM COALESCE(",
     ] {
         assert!(
             reown.contains(needle),
