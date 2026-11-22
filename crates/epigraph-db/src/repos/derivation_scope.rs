@@ -35,9 +35,9 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::errors::DbError;
-use crate::repos::claim_role::is_compound_sql;
 use crate::repos::mass_function::{
     cached_combination_predicate, ingest_template_predicate, not_retracted_predicate,
+    IS_COMPOUND_DEFINER_CALL,
 };
 use crate::visibility::Viewer;
 
@@ -276,6 +276,15 @@ impl DerivationScopeRepository {
     /// owner rule never refolds it), so it is never a fold cache here. A claim
     /// the viewer cannot read has none.
     ///
+    /// The compound role is read with definer rights, through migration 193's
+    /// [`IS_COMPOUND_DEFINER_CALL`] (the cache owner rule's own test): role is
+    /// structure. On an application connection row security filters `edges`
+    /// and `claims`, so the inline `claim_role::IS_COMPOUND_SQL` read there
+    /// found no compound when every child was private to a group the caller
+    /// is not in, and a vacate gate then took the compound's cache for a fold
+    /// of its own BBAs (backlog bbece56a). The definer decides the role on the
+    /// whole graph on every connection.
+    ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
     pub async fn claim_has_fold_cache<'e, E: sqlx::PgExecutor<'e>>(
@@ -289,9 +298,8 @@ impl DerivationScopeRepository {
                      WHERE c.id = $1 \
                        AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
                             OR c.pignistic_prob IS NOT NULL) \
-                       AND NOT {compound} \
+                       AND NOT (SELECT {IS_COMPOUND_DEFINER_CALL}) \
                        /* {{VISIBILITY:c}} */)",
-                compound = is_compound_sql("c"),
             ),
             2,
         );
