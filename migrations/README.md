@@ -3410,12 +3410,16 @@ restart.
   covered the window (166's follow copies into gaps only), so recovery was the manual
   detach-the-stale-copy-then-attach-by-name pair. The verb does that pair in ONE audited act,
   under 107's and 166's advisory locks: it attaches the root by name (or keeps its live row made
-  by name), then, only where a copy written fresh from the root's row would admit the successor
+  by name; a root that never held a row made by name for the role is refused, so a middle
+  identity cannot be named to undo its own detach), then, only where a copy written fresh from
+  the root's row would admit the successor
   (179's folder rule against the root; 195's sticky detach on the successor; every row of its
   covering copies' chains below the root's row live; 195's walk up `agent_succession` reaching no
   other detached identity), detaches the successor's covering rows and attaches it by name until
-  the root row's end. Refusals are `ROL04`, nothing written. Writes one
-  `platform.role_successor_restored` audit row beside 166's per-row events, and reports
+  the root row's end (a finite end ends the successor with the root). The walk runs before the
+  "nothing to do" answer, so `successor_unchanged` means admitted. Refusals are `ROL04`, nothing
+  written. Writes one `platform.role_successor_restored` audit row (with its `outcome`, also when
+  only the root was attached) beside 166's per-row events, and reports
   registered descendants still out. No body is re-stated: the derivation, the registration and
   the follow are unchanged (so it does not depend on any re-statement of
   `epigraph_role_derived_memberships`). `epigraph-operator restore-role-successor` drives it

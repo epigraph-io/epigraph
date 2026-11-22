@@ -99,6 +99,18 @@
 -- successor is no longer cut off by a later detach of the root alone (detach
 -- the successor too, as 195's "what cuts a job off" says).
 --
+-- TWO MORE CONSEQUENCES of the restored row being made by name, accepted:
+--   * A FINITE WINDOW. The covering copies are detached whole (a detach is
+--     whole; `role_agents` is append-only), and the successor's new row ends
+--     with the root's. After that end the successor is unattached, exactly
+--     as the root is; its old copy, had it stayed, would have kept it under
+--     the role's restriction (ROL01 while the role has no holder) past it.
+--     Pass NULL (the default) to keep the restriction open-ended.
+--   * 179'S FOLDER RULE is judged once, now. A copy is judged at every read,
+--     so a successor that later also runs in another group folder (a shared
+--     identity) would lose a copy's grant; a row made by name keeps it.
+--     Detach the successor if it is reused elsewhere.
+--
 -- Locks: 107's `operator_links` advisory lock, then 166's `role_agents` one,
 -- in the order 166's insert guard takes them, BEFORE the first read, so a
 -- registration or another attach cannot land between the decision and the

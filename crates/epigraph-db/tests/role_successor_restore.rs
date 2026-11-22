@@ -27,6 +27,13 @@
 //!   middle identity the operator detached, one with a second, detached
 //!   parent (195's lineage walk), one not copied through the named root, and
 //!   any transaction but READ COMMITTED;
+//! * the review's additions: a `root` that never held a row made by name
+//!   (a middle identity) is refused, so it cannot undo its own detach or
+//!   step around the real root's; a successor still out through 195's walk
+//!   is refused, never reported `successor_unchanged`; the root's re-attach
+//!   is audited when the successor needs nothing; a `valid_to` the kept root
+//!   row does not end at is refused 22023; a finite window ends the
+//!   successor with the root;
 //! * only the maintenance role executes it.
 //!
 //! Every write runs on a session whose `session_user` is the deployed role
@@ -195,22 +202,37 @@ async fn detach_from_role(pool: &PgPool, agent: Uuid) -> i32 {
 
 type Step = (String, Uuid, Option<Uuid>);
 
-/// The verb, on a session whose `session_user` is `role`.
+/// The verb, on a session whose `session_user` is `role`, with `valid_to`
+/// NULL.
 async fn restore_as(
     pool: &PgPool,
     role: &str,
     root: Uuid,
     successor: Uuid,
 ) -> Result<Vec<Step>, sqlx::Error> {
+    restore_until(pool, role, root, successor, None).await
+}
+
+/// The verb with `valid_to` = `now() + valid_in` (an interval literal), or
+/// NULL.
+async fn restore_until(
+    pool: &PgPool,
+    role: &str,
+    root: Uuid,
+    successor: Uuid,
+    valid_in: Option<&str>,
+) -> Result<Vec<Step>, sqlx::Error> {
+    let valid_in = valid_in.map(str::to_string);
     fixture::as_role(pool, role, |mut conn| async move {
         let r = sqlx::query_as::<_, Step>(
             "SELECT out_step, out_agent_id, out_attachment_id \
-               FROM public.epigraph_restore_role_successor($1, $2, $3, NULL, \
-                                                           'restore test: job is back')",
+               FROM public.epigraph_restore_role_successor($1, $2, $3, \
+                        now() + $4::interval, 'restore test: job is back')",
         )
         .bind(ROLE)
         .bind(root)
         .bind(successor)
+        .bind(valid_in)
         .fetch_all(&mut *conn)
         .await;
         (conn, r)
@@ -962,4 +984,85 @@ async fn a_root_attached_for_a_successor_that_needs_nothing_is_audited(pool: PgP
     assert_eq!(events.len(), 1, "the root's re-attach audited: {events:?}");
     assert_eq!(events[0]["outcome"], "successor_already_attached");
     assert_eq!(events[0]["root_attached_now"], true);
+}
+
+/// A `valid_to` THAT WOULD NOT APPLY IS REFUSED. With the root's live row
+/// made by name kept, a `valid_to` other than NULL or that row's end is
+/// refused 22023, nothing written. CONTROL: NULL restores.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_valid_to_other_than_the_kept_roots_end_is_refused(pool: PgPool) {
+    let (h, group) = attached_group_held(&pool, "Synthetic Restore Window Team").await;
+    let [root, _, newest] = lineage(&pool, h, group, "g-job").await;
+    assert_eq!(detach_from_role(&pool, root).await, 1, "root detached");
+    attach_to_role(&pool, root).await;
+
+    let before = footprint(&pool).await;
+    assert_refused(
+        &restore_until(&pool, "epigraph_maintenance", root, newest, Some("1 hour")).await,
+        "22023",
+        "would not apply",
+        "a valid_to the kept root row does not end at",
+    );
+    assert_eq!(footprint(&pool).await, before, "nothing written");
+    restore(&pool, root, newest).await.expect("CONTROL: NULL");
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (true, true),
+        "CONTROL"
+    );
+}
+
+/// A FINITE WINDOW ENDS THE SUCCESSOR WITH THE ROOT (264's documented
+/// consequence). The verb attaches the root until `valid_to` and the
+/// successor until the same instant; past it the successor is judged
+/// exactly as the root is (`epigraph_role_agent_gate`), and inside it both
+/// are members.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_finite_window_ends_the_successor_with_the_root(pool: PgPool) {
+    let (h, group) = attached_group_held(&pool, "Synthetic Restore Finite Team").await;
+    let [root, _, newest] = lineage(&pool, h, group, "g-job").await;
+    assert_eq!(detach_from_role(&pool, root).await, 1, "root detached");
+
+    let out = restore_until(&pool, "epigraph_maintenance", root, newest, Some("1 hour"))
+        .await
+        .expect("the restore");
+    let names: Vec<&str> = out.iter().map(|(s, _, _)| s.as_str()).collect();
+    assert_eq!(names.first(), Some(&"root_attached"), "{out:?}");
+    assert_eq!(names.last(), Some(&"successor_attached"), "{out:?}");
+    let root_row = out[0].2.expect("root row");
+    let succ_row = out.last().expect("step").2.expect("successor row");
+    let ends: (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT (SELECT valid_to FROM role_agents WHERE id = $1), \
+                    (SELECT valid_to FROM role_agents WHERE id = $2)",
+    )
+    .bind(root_row)
+    .bind(succ_row)
+    .fetch_one(&pool)
+    .await
+    .expect("ends");
+    assert!(ends.0.is_some(), "the root's row is finite: {ends:?}");
+    assert_eq!(ends.1, ends.0, "the successor's row ends with the root's");
+    assert_eq!(resolves(&pool, newest, group).await, (true, true), "inside");
+
+    let gate = |agent: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
+                "SELECT may_run, role, reason \
+                   FROM public.epigraph_role_agent_gate($1, now() + interval '2 hours')",
+            )
+            .bind(agent)
+            .fetch_one(&pool)
+            .await
+            .expect("gate")
+        }
+    };
+    assert_eq!(
+        gate(newest).await,
+        gate(root).await,
+        "past the window the successor is judged as the root is"
+    );
 }
