@@ -391,3 +391,41 @@ async fn each_refusal_reaches_the_caller_by_its_kind(pool: PgPool) {
     .await;
     assert_eq!(refusal(r).0, ErrorCode::INVALID_PARAMS);
 }
+
+/// Input is normalised exactly as the REST twin normalises it: the role is
+/// trimmed, and the echoed `display_name` is what was stored (SQL `btrim`
+/// strips spaces only, so a trailing tab stays).
+#[sqlx::test(migrations = "../../migrations")]
+async fn input_is_normalised_as_the_rest_twin_normalises_it(pool: PgPool) {
+    let server = app_server(&pool).await;
+    let mcp = Mcp {
+        pool: &pool,
+        server: &server,
+    };
+    let a = human(&pool, "mcp-parity-a").await;
+    let b = human(&pool, "mcp-parity-b").await;
+
+    let created = json_of(
+        mcp.create(a, "  Synthetic Parity Team\t ")
+            .await
+            .expect("create"),
+    );
+    let group = id(&created, "group_id");
+    let stored: String = sqlx::query_scalar("SELECT display_name::text FROM groups WHERE id = $1")
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .expect("stored name");
+    assert_eq!(
+        stored, "Synthetic Parity Team\t",
+        "PREMISE: btrim strips spaces only"
+    );
+    assert_eq!(created["display_name"], stored, "the echo is the stored name");
+
+    let invited = json_of(
+        mcp.invite(a, group, b, Some(" writer "))
+            .await
+            .expect("invite"),
+    );
+    assert_eq!(invited["role"], "writer");
+}

@@ -179,7 +179,8 @@ pub async fn create_team_group(
         Json(CreateTeamGroupResponse {
             group_id,
             did_key: format!("did:epigraph:group:{group_id}"),
-            display_name: body.name.trim().to_string(),
+            // SQL `btrim` strips spaces only, so echo exactly what was stored.
+            display_name: body.name.trim_matches(' ').to_string(),
             role: "admin",
         }),
     ))
@@ -253,6 +254,8 @@ pub async fn invite_to_group(
     Path(group_id): Path<Uuid>,
     Json(body): Json<InviteToGroupRequest>,
 ) -> Result<(StatusCode, Json<InvitationResponse>), ApiError> {
+    // Trimmed as the MCP twin trims it, so `" writer"` means the same on both.
+    let role = body.role.trim().to_string();
     let mut tx = state
         .write_as(&viewer, "team_groups::invite_to_group")
         .await?;
@@ -260,7 +263,7 @@ pub async fn invite_to_group(
         &mut tx,
         group_id,
         body.agent_id,
-        &body.role,
+        &role,
         body.reason.as_deref(),
     )
     .await?;
@@ -271,7 +274,7 @@ pub async fn invite_to_group(
             invitation_id,
             group_id,
             agent_id: body.agent_id,
-            role: body.role,
+            role,
             status: "pending",
         }),
     ))

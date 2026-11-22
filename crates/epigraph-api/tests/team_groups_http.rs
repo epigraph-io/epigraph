@@ -257,6 +257,51 @@ async fn a_person_creates_invites_and_the_membership_goes_live_on_accept(pool: P
     assert_eq!(live_rows(&pool, group, c).await, 0);
 }
 
+/// Input is normalised exactly as the MCP twin normalises it: the role is
+/// trimmed (`" writer "` is `writer`, not a 400), and the echoed
+/// `display_name` is what was stored (SQL `btrim` strips spaces only, so a
+/// trailing tab stays).
+#[sqlx::test(migrations = "../../migrations")]
+async fn input_is_normalised_as_the_mcp_twin_normalises_it(pool: PgPool) {
+    let (addr, _stop) = spawn_app(&pool).await;
+    let a = human(&pool, "http-parity-a").await;
+    let b = human(&pool, "http-parity-b").await;
+
+    let (status, body) = post(
+        addr,
+        "/api/v1/groups/team",
+        a,
+        json!({"name": "  Synthetic Parity Team\t "}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let group = id_of(&body, "group_id");
+    let stored: String = sqlx::query_scalar("SELECT display_name::text FROM groups WHERE id = $1")
+        .bind(group)
+        .fetch_one(&pool)
+        .await
+        .expect("stored name");
+    assert_eq!(stored, "Synthetic Parity Team\t", "PREMISE: btrim strips spaces only");
+    assert_eq!(body["display_name"], stored, "the echo is the stored name");
+
+    let (status, body) = post(
+        addr,
+        &format!("/api/v1/groups/{group}/invitations"),
+        a,
+        json!({"agent_id": b, "role": " writer "}),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["role"], "writer");
+    let role: String =
+        sqlx::query_scalar("SELECT role FROM group_invitations WHERE invitee_agent_id = $1")
+            .bind(b)
+            .fetch_one(&pool)
+            .await
+            .expect("invitation row");
+    assert_eq!(role, "writer");
+}
+
 /// Each designed refusal answers by its kind, carries its code, and writes
 /// nothing.
 #[sqlx::test(migrations = "../../migrations")]

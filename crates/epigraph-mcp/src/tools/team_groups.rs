@@ -37,8 +37,10 @@ fn uuid_param(field: &str, raw: &str) -> Result<Uuid, McpError> {
         .map_err(|_| invalid_params(format!("{field} {raw:?} is not a uuid")))
 }
 
+/// Spaces only, as SQL `btrim` and the REST twin (which passes the reason
+/// through to it) strip them.
 fn reason_param(raw: Option<&str>) -> Option<&str> {
-    raw.map(str::trim).filter(|s| !s.is_empty())
+    raw.map(|s| s.trim_matches(' ')).filter(|s| !s.is_empty())
 }
 
 /// `create_team_group`: a keyless team group whose one admin is the caller.
@@ -67,7 +69,9 @@ pub async fn create_team_group(
     success_json(&serde_json::json!({
         "group_id": group.to_string(),
         "did_key": format!("did:epigraph:group:{group}"),
-        "display_name": params.name.trim(),
+        // SQL `btrim` strips spaces only, so echo exactly what was stored
+        // (as the REST twin does).
+        "display_name": params.name.trim_matches(' '),
         "role": "admin",
     }))
 }
