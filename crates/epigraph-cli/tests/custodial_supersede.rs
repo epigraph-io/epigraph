@@ -787,3 +787,191 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
     drop_login(&pool, &maint_role).await;
     drop_login(&pool, &app_role).await;
 }
+
+/// BP factors keyed on `edge` over exactly the pair `(a, b)`.
+async fn factors_on(pool: &PgPool, edge: Uuid, a: Uuid, b: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM factors \
+          WHERE properties->>'source_edge_id' = $1::text \
+            AND variable_ids @> ARRAY[$2, $3]::uuid[] AND cardinality(variable_ids) = 2",
+    )
+    .bind(edge)
+    .bind(a)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("count factors")
+}
+
+/// The `--report-only` pending count of the deferred-cascade replay.
+fn pending_replays(dsn: &str) -> i64 {
+    let r = Command::new(REPLAY)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("DATABASE_URL", dsn)
+        .env("MAINTENANCE_DATABASE_URL", dsn)
+        .env("RUST_LOG", "warn")
+        .arg("--report-only")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .expect("spawn the report");
+    assert_eq!(
+        r.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&r.stdout).trim()).expect("JSON");
+    v["pending"].as_i64().expect("pending count")
+}
+
+/// Backlog 6a670eab: a custodial supersede of a GROUP-owned claim
+/// (`--allow-owned`) leaves a group-owned successor that a group writer can
+/// supersede again before the custodial deferral replays. The replay then
+/// moves the predecessor's edges onto the CURRENT head of the successor's
+/// supersedes chain, not onto the successor it recorded (now retired, where
+/// traversal and belief from the head would never reach them): the
+/// strengthening edges land on the head with their BP factors on the head,
+/// `contradicts` stays on the predecessor, the deferral still names the
+/// recorded successor, and the replay's audit names the head (the applied
+/// row counts the one later replacement it followed; its ids row names it).
+///
+/// The intermediate supersede (successor -> head) runs with its own edge
+/// migration inline (`supersede_conn`), as a request path's applied cascade
+/// does, so only the custodial deferral is pending when the replay runs.
+///
+/// Verified to fail on the base: the replay migrated onto the recorded
+/// successor (`migrate_superseded_edges_conn(old, new)`), so the edges ended on
+/// the retired successor, no factor was minted (the successor is not current)
+/// and no audit row named the head.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool: PgPool) {
+    let (a, a_group) = fixture::seed_human_operator(&pool, "head-custodian-a").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "head-legacy").await;
+    let owned = insert_claim(&pool, a, a_group).await;
+    let supporter = insert_claim(&pool, legacy, WORLD).await;
+    let target = insert_claim(&pool, legacy, WORLD).await;
+    let critic = insert_claim(&pool, legacy, WORLD).await;
+    let incoming = edge(&pool, supporter, owned, "supports").await;
+    let outgoing = edge(&pool, owned, target, "corroborates").await;
+    let contradicts = edge(&pool, critic, owned, "contradicts").await;
+    let ia = fixture::make_custodian(&pool, a).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    // The custodial revision of the owned claim: its cascade is deferred.
+    let mut args = supersede_args(&owned.to_string(), &ia.to_string(), &a.to_string(), true);
+    args.push("--allow-owned".to_string());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let run = run_op(&pool, &refs).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    let new: Uuid = sqlx::query_scalar("SELECT id FROM claims WHERE supersedes = $1")
+        .bind(owned)
+        .fetch_one(&pool)
+        .await
+        .expect("the custodial successor");
+
+    // A group writer revises the group-owned successor before the replay,
+    // with its own edge migration applied.
+    let head = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let (head, _) = epigraph_db::ClaimRepository::supersede_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(new),
+            "the group's later revision of the successor",
+            epigraph_core::TruthValue::new(0.6).expect("truth"),
+            "a later revision",
+            epigraph_db::SupersedeActor::new(a, epigraph_db::SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("supersede the successor");
+        head
+    };
+    assert!(!current(&pool, new).await && current(&pool, head).await);
+    let dsn = fixture::database_url_for(&pool).await;
+    assert_eq!(
+        pending_replays(&dsn),
+        1,
+        "precondition: only the custodial deferral is pending"
+    );
+
+    let r = replay(&dsn, &dsn);
+    assert_eq!(r.code, 0, "{}", r.show());
+    let report: serde_json::Value = serde_json::from_str(r.stdout.trim()).expect("replay JSON");
+    assert_eq!(report["applied"], 1, "{report}");
+
+    let ends: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT (SELECT target_id FROM edges WHERE id = $1), \
+                (SELECT source_id FROM edges WHERE id = $2), \
+                (SELECT target_id FROM edges WHERE id = $3)",
+    )
+    .bind(incoming)
+    .bind(outgoing)
+    .bind(contradicts)
+    .fetch_one(&pool)
+    .await
+    .expect("edge ends");
+    assert_eq!(
+        ends,
+        (head, head, owned),
+        "the strengthening edges land on the current head (not the retired successor {new}); \
+         contradicts stays"
+    );
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, head).await,
+            factors_on(&pool, outgoing, head, target).await,
+        ),
+        (1, 1),
+        "the moved edges' factors are minted on the head"
+    );
+
+    let (deferred_object,): (Option<String>,) = sqlx::query_as(
+        "SELECT details->'trigger'->>'object_id' FROM security_events \
+          WHERE event_type = 'cascade.deferred' AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(owned.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the deferral");
+    assert_eq!(
+        deferred_object,
+        Some(new.to_string()),
+        "the deferral still names the successor it recorded"
+    );
+    let (applied_id, touched): (Uuid, serde_json::Value) = sqlx::query_as(
+        "SELECT id, details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied' AND details->>'cause' = 'supersede' \
+            AND details->'trigger'->>'subject_id' = $1",
+    )
+    .bind(owned.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the applied row");
+    assert_eq!(
+        touched["superseded_onto"],
+        serde_json::json!(1),
+        "the applied row counts the later replacement it followed: {touched}"
+    );
+    let ids: serde_json::Value = sqlx::query_scalar(
+        "SELECT details->'touched' FROM security_events \
+          WHERE event_type = 'cascade.admin_applied_ids' \
+            AND details->>'applied_event_id' = $1",
+    )
+    .bind(applied_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("the applied ids row");
+    assert_eq!(
+        ids["superseded_onto"],
+        serde_json::json!([head]),
+        "the ids row names the head: {ids}"
+    );
+}

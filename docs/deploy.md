@@ -2246,7 +2246,9 @@ role").
      is given, and the act records whether it was.
    - The same transaction records a `supersede` cascade deferral naming the
      custodian. The edge migration and the belief cascade run from it in the
-     next `replay_deferred_cascades` run, as for any deferred supersede.
+     next `replay_deferred_cascades` run, as for any deferred supersede. The
+     replay moves the edges onto the current head of the successor's
+     supersedes chain, should the successor have been superseded since.
    - The successor has no embedding until the next embedding backfill.
 
 `end-role-assignment` ends an assignment. Once migration 130 is applied and
