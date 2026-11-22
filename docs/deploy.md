@@ -364,8 +364,15 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
      and restart them. Only now can an extension no longer mint a kernel
      token. Rotate the old secret out of every store that held it.
 
-  To rotate the Ed25519 key, repeat with the new key's JWKS: tokens signed
-  by the old key stop verifying when the API restarts on the new one.
+  To rotate the Ed25519 key, first give every verifier a JWKS holding BOTH
+  keys (join the two documents' `keys` arrays; a verifier accepts any key
+  in its set), then restart the API on the new key, and drop the old key
+  from the verifiers an hour later. A verifier holding only the new key
+  while the API still signs with the old one refuses every fresh token. The
+  API itself verifies only its current key, so tokens it signed with the old
+  one stop working on its own routes when it restarts; clients refresh.
+  In a systemd `EnvironmentFile`, wrap the JWKS value in single quotes:
+  bare double quotes are stripped, and the mangled value then refuses boot.
 - **Never set `MAINTENANCE_DATABASE_URL`** in this unit's environment. Watch
   out for a `.env` file in its working directory too: the server loads one if
   it exists.
