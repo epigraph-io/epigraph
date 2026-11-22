@@ -274,3 +274,64 @@ async fn link_hierarchical_requires_edges_write_scope() {
         "missing edges:write scope must 403; got {status} — body={text}"
     );
 }
+
+/// `supersedes` is written only by the supersede, dedup and merge acts, never
+/// by a generic edge writer. This endpoint refuses it through its tight
+/// allow-list, with no edge written; nothing pinned that (backlog 86a26e69
+/// part 3). The fixture runs as a superuser, so the database's own guards on
+/// `supersedes` edges would not catch an allow-list that admitted it: the edge
+/// count is what does.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_hierarchical_refuses_supersedes_and_writes_nothing() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _client_id) =
+        common::test_bearer_token_with_seeded_client(&pool, &["edges:write"]).await;
+
+    let source_id = common::seed_claim(&pool, "link_hierarchical supersedes source").await;
+    let target_id = common::seed_claim(&pool, "link_hierarchical supersedes target").await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/edges/hierarchical"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "source_claim_id": source_id,
+            "target_claim_id": target_id,
+            "relationship": "supersedes",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert_eq!(status, 400, "supersedes must 400; got {status}: {text}");
+    assert!(
+        text.contains("decomposes_to"),
+        "the refusal lists the hierarchical types: {text}"
+    );
+
+    let written: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges \
+          WHERE (source_id = $1 OR target_id = $1 OR source_id = $2 OR target_id = $2) \
+            AND relationship = 'supersedes'",
+    )
+    .bind(source_id)
+    .bind(target_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(written, 0, "no supersedes edge was written");
+    let (sup, current): (Option<uuid::Uuid>, bool) =
+        sqlx::query_as("SELECT supersedes, COALESCE(is_current, true) FROM claims WHERE id = $1")
+            .bind(target_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((sup, current), (None, true), "the target is not retired");
+}
