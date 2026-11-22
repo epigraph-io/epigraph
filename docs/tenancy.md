@@ -1608,9 +1608,29 @@ same "at any time" reading as the sticky detach itself).
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
 whose old copy still covers the window (166's lineage follow copies only
-into gaps): detach the running identity's old copy first, then attach it by
-name. The copies its later identities inherit from that attachment count
-again.
+into gaps, and that copy chains to the root's detached row). Since
+migration 264 one audited verb does the whole restore:
+
+    epigraph-operator restore-role-successor --role role:K --root <root> \
+        --successor <running identity> --reason TEXT [--apply]
+
+(`epigraph_restore_role_successor` on a maintenance session). It attaches
+the root by name (or keeps its live row made by name), detaches the
+successor's covering copies and attaches the successor by name, in one
+transaction, with one `platform.role_successor_restored` audit row; without
+`--apply` it rolls back and prints what it would do. It refuses (`ROL04`,
+nothing written) unless a copy written fresh from the root's row would admit
+the successor: it must run in exactly one group folder, one the root runs
+in; it must hold no detached row of its own; every copy below the root's row
+on its chain must be live; and no other identity it descends from (195's
+walk) may hold a detached row. A successor whose copies already chain
+through live rows is left as it is. A registered descendant still out after
+the restore is reported, not changed: restore it with the restored identity
+as `--root`. The restored successor holds a row made BY NAME, so, like any
+such row, a later detach of the root alone no longer cuts it off: detach the
+successor too. The manual pair (detach the running identity's old copy, then
+attach it by name) still works and has the same effect, without those checks.
+The copies its later identities inherit from that attachment count again.
 
 The lineage walk reads only recorded successions. A copy written by hand
 for an identity with no recorded parent is judged by its copy chain alone
