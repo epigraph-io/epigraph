@@ -690,17 +690,25 @@ pub struct RecallWithContextResponse {
     pub corpus_scope: CorpusScope,
     pub centroid_dim_used: u32,
     /// How many retrieved candidates the `min_truth` belief floor dropped
-    /// from this page (backlog 75920ad6). Counts only that gate: a hit removed
-    /// by `exclude_contested` or `diversity_radius`, or one whose row vanished
-    /// mid-request, is not counted. `0` when the floor dropped nothing,
-    /// including on a page with no candidates at all.
+    /// (backlog 75920ad6), counted over every candidate this request
+    /// retrieved, not only the returned page (backlog d830c073): the floor
+    /// runs BEFORE the cut to `limit`, and a dropped candidate's slot is
+    /// back-filled from the ranked candidates behind it. The retrieved set is
+    /// `limit` candidates on the default flat path, the over-fetched pool
+    /// with `rerank`, and the expanded set with `graph_expansion_depth`.
+    /// Counts only that gate: a hit removed by `exclude_contested` or
+    /// `diversity_radius`, or one whose row vanished mid-request, is not
+    /// counted. `0` when the floor dropped nothing, including when there were
+    /// no candidates at all.
     pub below_confidence_floor: usize,
     /// `true` exactly when candidates WERE retrieved but none cleared the
     /// `min_truth` floor: "relevant material exists, none believed enough",
     /// as distinct from "nothing relevant" (`false` with
-    /// `below_confidence_floor: 0`). Read from the floor alone, so a page
-    /// later emptied by `exclude_contested` or `diversity_radius` is not
-    /// reported as insufficient confidence.
+    /// `below_confidence_floor: 0`). Since the floor runs before the cut, it
+    /// means no retrieved candidate cleared it, not only none on the page.
+    /// Read from the floor alone, so a page later emptied by
+    /// `exclude_contested` or `diversity_radius` is not reported as
+    /// insufficient confidence.
     pub insufficient_confidence: bool,
     /// Id the audit row for this retrieval is written under (backlog
     /// 8cbffa0e), so a caller can cite which recall fed a downstream decision.
@@ -1557,8 +1565,9 @@ async fn recall_with_context_core(
     }
 
     // Stage 4.5: cross-encoder rerank + optional groundedness gate over the
-    // widened pool. Reorders by RELEVANCE and truncates to `want` BEFORE the
-    // expensive fetch_batched_context. Belief/truth fields are untouched here:
+    // widened pool. Reorders by RELEVANCE; the cut to `want` happens after the
+    // belief floor below (backlog d830c073), still BEFORE the expensive
+    // fetch_batched_context. Belief/truth fields are untouched here:
     // rerank_score/verdict are surfaced as SEPARATE metadata.
     let mut rerank_meta: std::collections::HashMap<
         Uuid,
@@ -1630,7 +1639,8 @@ async fn recall_with_context_core(
                                 );
                             }
                         }
-                        merged.truncate(want);
+                        // No cut here: the belief floor below runs over the
+                        // whole reranked pool and cuts to `want` after it.
                         for h in &merged {
                             rerank_meta.insert(h.id, (h.rerank_score, h.verdict));
                         }
@@ -1648,8 +1658,58 @@ async fn recall_with_context_core(
             _ => tracing::warn!("rerank requested but RERANK_API_KEY absent/disabled; flat order"),
         }
     }
-    // Cap to `want` even when rerank is off (or skipped), since the flat pool
-    // may have been widened above.
+    // Stage 4.6: the `min_truth` belief floor, over the WHOLE ranked pool and
+    // BEFORE the cut to `want` (backlog d830c073). It used to run after the
+    // cut, on the page alone, so a better-ranked candidate below the floor
+    // took a page slot a candidate past the cut would have filled, and
+    // `below_confidence_floor` / `insufficient_confidence` described only the
+    // page. Now a dropped candidate's slot is back-filled from the ranked
+    // pool, and the count covers every retrieved candidate.
+    //
+    // "Retrieved" is the pool this request already fetched: `want` on the
+    // default flat path, the over-fetched pool when `rerank` is set, the
+    // expanded set under `graph_expansion_depth`. The floor does not widen the
+    // kNN itself, so on the default path there is nothing past the cut to
+    // back-fill from and the count already covers every candidate.
+    //
+    // Backlog 14b98adc: the floor reads the DS pignistic probability, not
+    // `claims.truth_value` — which no DS write path refreshes, so a paragraph
+    // refuted by epistemic edges kept clearing a floor set against its
+    // pre-edge authored value. One round-trip for the whole pool.
+    // Degrade-not-fail: an error yields an empty map, nothing is dropped here,
+    // and every hit is floored after the context fetch on the `truth_value` it
+    // carries, i.e. on the page alone, as before this fix. An id absent from
+    // the map (invisible, or deleted mid-request) is kept here for the same
+    // fall-back.
+    let pool_ids: Vec<Uuid> = raw_hits.iter().map(|h| h.claim_id).collect();
+    let mut belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
+        &mut *read, viewer, &pool_ids,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
+            );
+            std::collections::HashMap::new()
+        }
+    };
+    // Candidates the belief floor dropped (backlog 75920ad6). Only the
+    // `min_truth` drop counts; a vanished core is not a confidence fact.
+    let mut below_confidence_floor = 0_usize;
+    raw_hits.retain(|h| match belief_by_claim.get(&h.claim_id) {
+        Some(&score) if score < min_truth => {
+            below_confidence_floor += 1;
+            false
+        }
+        _ => true,
+    });
+    // The ids the floor already judged; only the others are floored after the
+    // context fetch, so no candidate is counted twice.
+    let floored_before_cut: std::collections::HashSet<Uuid> =
+        belief_by_claim.keys().copied().collect();
     raw_hits.truncate(want);
 
     // Stage 5: batch context fetches.
@@ -1665,53 +1725,31 @@ async fn recall_with_context_core(
     .await
     .map_err(|e| recall_fault("could not fetch the context batch", e))?;
 
-    // Backlog 14b98adc: the min_truth gate below reads the DS pignistic
-    // probability, not `claims.truth_value` — which no DS write path refreshes,
-    // so a paragraph refuted by epistemic edges kept clearing a gate set
-    // against its pre-edge authored value. One round-trip for the whole page,
-    // over the ids the batch context fetch already resolved. Degrade-not-fail:
-    // an error yields an empty map and every hit falls back to the
-    // `core.truth_value` the context fetch already carries, i.e. to exactly the
-    // pre-fix behaviour.
-    //
-    // The same round-trip also resolves the context atoms' effective belief,
-    // so each atom is reported on the scale the hit itself is gated on. The
-    // atom ids come from `fetch_batched_context`, which already applied the
-    // viewer's visibility; `effective_belief_batch` applies it again, and an
-    // atom it does not return keeps its `truth_value` fall-back.
-    let belief_ids: Vec<Uuid> = paragraph_ids
-        .iter()
-        .copied()
-        .chain(
-            ctx.atoms_by_paragraph
-                .values()
-                .flat_map(|atoms| atoms.iter().map(|a| a.atom_id)),
-        )
+    // The context atoms' effective belief, so each atom is reported on the
+    // scale the hit itself is gated on. The atom ids come from
+    // `fetch_batched_context`, which already applied the viewer's visibility;
+    // `effective_belief_batch` applies it again, and an atom it does not return
+    // keeps its `truth_value` fall-back. Degrade-not-fail, as above.
+    let atom_ids: Vec<Uuid> = ctx
+        .atoms_by_paragraph
+        .values()
+        .flat_map(|atoms| atoms.iter().map(|a| a.atom_id))
+        .filter(|id| !belief_by_claim.contains_key(id))
         .collect::<std::collections::HashSet<Uuid>>()
         .into_iter()
         .collect();
-    let belief_by_claim = match epigraph_db::ClaimRepository::effective_belief_batch(
-        &mut *read,
-        viewer,
-        &belief_ids,
-    )
-    .await
+    match epigraph_db::ClaimRepository::effective_belief_batch(&mut *read, viewer, &atom_ids).await
     {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "DS belief batch failed; min_truth falls back to claims.truth_value for this page"
-            );
-            std::collections::HashMap::new()
-        }
-    };
+        Ok(m) => belief_by_claim.extend(m),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "DS belief batch for context atoms failed; atoms report claims.truth_value"
+        ),
+    }
 
-    // Stage 4 + 6: filter min_truth, drop hits whose core vanished, assemble.
+    // Stage 6: drop hits whose core vanished, floor the ones the pool batch
+    // could not score, assemble.
     let mut results = Vec::with_capacity(raw_hits.len());
-    // Candidates the belief floor dropped (backlog 75920ad6). Only the
-    // `min_truth` drop below counts; a vanished core is not a confidence fact.
-    let mut below_confidence_floor = 0_usize;
     for hit in raw_hits {
         let paragraph_id = hit.claim_id;
         let (rerank_score, verdict) = rerank_meta
@@ -1728,7 +1766,9 @@ async fn recall_with_context_core(
             .get(&paragraph_id)
             .copied()
             .unwrap_or(core.truth_value);
-        if belief_score < min_truth {
+        // Only a hit the pool batch did not score (it failed, or the id was
+        // absent) is floored here; the rest already cleared the floor above.
+        if !floored_before_cut.contains(&paragraph_id) && belief_score < min_truth {
             below_confidence_floor += 1;
             continue;
         }
@@ -1844,7 +1884,9 @@ async fn recall_with_context_core(
         });
     }
     // Read here, straight after the floor and before any later filter, so the
-    // flag means "the floor emptied the page" and nothing else.
+    // flag means "the floor left the page empty" and nothing else. With the
+    // floor ahead of the cut, an empty page means NO retrieved candidate
+    // cleared it, not only the ones that happened to fall on this page.
     let insufficient_confidence = below_confidence_floor > 0 && results.is_empty();
 
     // Bounded lens post-pass: when a lens is active, annotate each already-built
@@ -1960,13 +2002,14 @@ async fn recall_with_context_core(
     // corroborates and neighbour fan-out in `fetch_batched_context`. It is also
     // WRONG, and the test
     // `a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one` pins the
-    // exact failure: on this surface `min_truth` is applied AFTER context
-    // assembly, so a low-truth paragraph ranked first could evict its
-    // high-truth near-duplicate and then be dropped itself by `min_truth`. The
-    // measured result was a page that returned the 0.9 paragraph WITHOUT the
-    // radius and nothing at all WITH it — switching on a de-duplication filter
-    // deleted the good hit. `exclude_contested` has the same shape (as did the
-    // missing-paper drop, removed in drain U082).
+    // exact failure: `min_truth` was then applied AFTER context assembly, so
+    // a low-truth paragraph ranked first could evict its high-truth
+    // near-duplicate and then be dropped itself by `min_truth`. The measured
+    // result was a page that returned the 0.9 paragraph WITHOUT the radius and
+    // nothing at all WITH it — switching on a de-duplication filter deleted
+    // the good hit. `min_truth` now runs before the cut (backlog d830c073),
+    // but `exclude_contested` still has that shape, and so would any later
+    // post-filter (as did the missing-paper drop, removed in drain U082).
     //
     // Running last makes the rule "a hit may only be suppressed by a hit that
     // is itself being returned", and makes this surface agree with

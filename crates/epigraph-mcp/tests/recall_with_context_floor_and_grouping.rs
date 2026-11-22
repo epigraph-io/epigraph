@@ -262,6 +262,73 @@ async fn a_page_emptied_by_the_belief_floor_says_so(pool: PgPool) {
     );
 }
 
+// ── d830c073 (part 1) ───────────────────────────────────────────────────────
+
+/// The floor runs over every RETRIEVED candidate before the cut to `limit`,
+/// so a candidate below it gives its slot to the next-ranked one that clears
+/// it, and the count covers the whole retrieved set, not the page.
+///
+/// `rerank: true` with no `RERANK_API_KEY` widens the flat kNN pool to
+/// `limit * rerank_pool_factor` and keeps the flat order (the rerank itself is
+/// skipped), so this is a pool with candidates past the cut and no network.
+/// Ranked: L1 (0.1), S (0.9), L2 (0.1). With `limit: 1` and `min_truth: 0.5`
+/// the old code cut to L1 first and then dropped it: an empty page flagged
+/// `insufficient_confidence`, `below_confidence_floor: 1`, while S, which
+/// clears the floor, sat one place past the cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_belief_floor_runs_before_the_limit_cut(pool: PgPool) {
+    assert!(
+        std::env::var("RERANK_API_KEY").map_or(true, |k| k.is_empty()),
+        "calibration: with a rerank key set this test would call a live reranker"
+    );
+    let agent = seed_agent(&pool).await;
+    seed_claim(&pool, agent, "d830 low-belief first", 0.1, Some(1.0)).await;
+    let strong = seed_claim(&pool, agent, "d830 well-believed second", 0.9, Some(2.0)).await;
+    seed_claim(&pool, agent, "d830 low-belief third", 0.1, Some(3.0)).await;
+
+    let body = recall(
+        &pool,
+        json!({ "limit": 1, "min_truth": 0.5, "rerank": true, "rerank_pool_factor": 3 }),
+    )
+    .await
+    .expect("recall");
+    assert_eq!(
+        hit_ids(&body["results"]),
+        vec![strong.to_string()],
+        "the candidate past the cut that clears the floor must fill the page; got {body}"
+    );
+    assert_eq!(
+        body["below_confidence_floor"].as_u64(),
+        Some(2),
+        "both retrieved candidates below the floor are counted, not only the page's; got {body}"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(false),
+        "a retrieved candidate cleared the floor; got {body}"
+    );
+
+    // Calibration partner: the same pool with nothing above the floor is
+    // still "insufficient", with every retrieved candidate counted.
+    let body = recall(
+        &pool,
+        json!({ "limit": 1, "min_truth": 0.95, "rerank": true, "rerank_pool_factor": 3 }),
+    )
+    .await
+    .expect("recall");
+    assert_eq!(body["results"], json!([]), "got {body}");
+    assert_eq!(
+        body["below_confidence_floor"].as_u64(),
+        Some(3),
+        "got {body}"
+    );
+    assert_eq!(
+        body["insufficient_confidence"].as_bool(),
+        Some(true),
+        "got {body}"
+    );
+}
+
 /// No candidates at all: the floor dropped nothing, so the signal is 0/false
 /// and the page is the ordinary empty one.
 #[sqlx::test(migrations = "../../migrations")]
