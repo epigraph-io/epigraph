@@ -57,6 +57,15 @@
 -- it needs no EXECUTE, so a definer trigger body adds no such surface.
 -- EXECUTE stays revoked from PUBLIC (074).
 --
+-- WHAT THE CALLER NOW LEARNS. A session that writes a claim's owner group but
+-- is not in the group its ciphertext is keyed to, and that tries to make the
+-- claim public WITHOUT the declassify GUC, got arm (b)'s "refusing to
+-- declassify" below 238; at 238 it gets arm (a)'s "is SEALED", so it learns
+-- that a ciphertext row it cannot read exists for that claim. One bit, and
+-- only about a claim the caller can already read and UPDATE under row
+-- security (the trigger fires on no other row), so it is no general oracle;
+-- any form of this fix, the sketch's helper included, answers the same bit.
+--
 -- Under READ COMMITTED the EXISTS is a fresh statement of a VOLATILE plpgsql
 -- body, run after the claim row's lock is held, so 227's serialization
 -- argument (a seal holding the row lock commits first, and this then sees

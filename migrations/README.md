@@ -3424,7 +3424,13 @@ restart.
   `public` catalog to below 238; run it as the migration runner, which gets the function
   back). It repairs no existing row: measure claims that are public with a
   `claim_encryption` row, and seal rows whose `group_id` differs from the claim's
-  `owner_group_id`, before and after. **Deploy order:** none; no binary depends on it.
+  `owner_group_id`, before and after. At 238 a caller outside the ciphertext's group that
+  tries the make-public without the declassify GUC gets the SEALED text instead of the
+  declassify text: one bit about a claim it can already update. **Pre-deploy check:** the
+  live body must be 074's, or the guard refuses (55000) and 238 does not apply:
+  `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  'public.epigraph_claims_block_widening()'::regprocedure` must be
+  `7d9079127fe7ad6c7195047421e87c0e`. **Deploy order:** none; no binary depends on it.
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
