@@ -1518,6 +1518,30 @@ pub async fn report_workflow_outcome(
     .await
     .map_err(internal_error)?;
 
+    // The workflow claim's Beta-Bernoulli track and its DS-vs-Bayesian
+    // divergence row (backlog d3648d3c), kept exactly as
+    // `update_with_evidence` keeps them after the same `ds_auto` update: the
+    // outcome BBA (stored under this call's own evidence perspective, so it is
+    // always a new row and always counted) moves the track on hypothesis 0,
+    // and the row records this call's BetP against the posterior on the
+    // cache's frame. A failed outcome's BBA sits on FALSE, so all its
+    // non-conflict mass goes to beta. Best-effort, under savepoints; a cold
+    // start records no row (`epigraph_engine::ds_divergence`).
+    epigraph_engine::ds_divergence::track_counted_bba(
+        &mut tx,
+        viewer,
+        epigraph_engine::ds_divergence::CountedBba {
+            claim_id: workflow_id,
+            frame_id: ds.frame_id,
+            bba: &ds.evidence_bba,
+            hypothesis_index: Some(0),
+            pignistic_prob: Some(ds.pignistic_prob),
+        },
+        "report_workflow_outcome",
+    )
+    .await
+    .map_err(internal_error)?;
+
     // Derive truth_value from CDST pignistic probability. `UPDATE claims`, and it
     // commits in the SAME stamped transaction as the evidence INSERT and the DS
     // wiring above — there is no longer an unstamped write before it, and no

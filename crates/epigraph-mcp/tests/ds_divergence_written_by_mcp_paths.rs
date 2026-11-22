@@ -776,3 +776,108 @@ async fn a_cascade_re_derivation_does_not_count_the_edge_again(pool: PgPool) {
     );
 }
 
+/// `report_workflow_outcome` counts its outcome BBA as `update_with_evidence`
+/// counts its evidence: the first report moves the track (a cold start, no
+/// row), and the second, from a track holding the first, records the row.
+/// A failed outcome's BBA sits on FALSE, so all its non-conflict mass goes to
+/// beta.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_counts_its_outcome_bba(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let wf = seed_workflow_claim(&pool, "ship a team workflow", &["build", "test"]).await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("re-own the workflow claim into the server agent's group");
+
+    let report = |success: bool, details: &str| epigraph_mcp::types::ReportWorkflowOutcomeParams {
+        idempotency_key: None,
+        workflow_id: wf.to_string(),
+        success,
+        execution_log: vec![epigraph_mcp::types::StepExecution {
+            step_index: 0,
+            planned: "build".into(),
+            actual: "build".into(),
+            deviated: false,
+            deviation_reason: None,
+        }],
+        outcome_details: details.into(),
+        quality: Some(0.9),
+        goal_text: None,
+    };
+    let outcome_masses = |body: serde_json::Value| {
+        let ev = parse_uuid_field(&body, "evidence_id");
+        let pool = pool.clone();
+        async move {
+            let m: serde_json::Value =
+                sqlx::query_scalar("SELECT masses FROM mass_functions WHERE evidence_id = $1")
+                    .bind(ev)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the outcome's BBA");
+            m
+        }
+    };
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        report(true, "ran clean"),
+        None,
+    )
+    .await
+    .expect("first outcome");
+    let (s1, c1) = support_and_conflict(&outcome_masses(first_text(&res)).await);
+    assert!(
+        s1 > 0.0,
+        "PREMISE: a successful outcome supports the workflow"
+    );
+    let (a, b) = beta(&pool, wf).await;
+    assert!(
+        close(a, 1.0 + s1) && close(b, 2.0 - s1 - c1),
+        "the outcome BBA is counted: expected Beta({}, {}), got ({a}, {b})",
+        1.0 + s1,
+        2.0 - s1 - c1
+    );
+    assert!(
+        divergence_rows(&pool, wf).await.is_empty(),
+        "the first counted outcome is the workflow's cold start"
+    );
+
+    let res = epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        report(false, "the test step failed"),
+        None,
+    )
+    .await
+    .expect("second outcome");
+    let body = first_text(&res);
+    let (s2, c2) = support_and_conflict(&outcome_masses(body.clone()).await);
+    assert!(
+        close(s2, 0.0),
+        "PREMISE: a failed outcome puts nothing on TRUE"
+    );
+    let (alpha, beta_param) = (1.0 + s1, 3.0 - s1 - c1 - c2);
+    let (a, b) = beta(&pool, wf).await;
+    assert!(close(a, alpha) && close(b, beta_param), "got ({a}, {b})");
+
+    let rows = divergence_rows(&pool, wf).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let posterior = alpha / (alpha + beta_param);
+    assert_eq!(rows[0].0, frame);
+    assert!(close(rows[0].2, posterior), "{rows:?} vs {posterior}");
+    assert!(close(rows[0].3, kl(rows[0].1, posterior)), "{rows:?}");
+    let cached: f64 = sqlx::query_scalar("SELECT pignistic_prob FROM claims WHERE id = $1")
+        .bind(wf)
+        .fetch_one(&pool)
+        .await
+        .expect("the workflow's cache");
+    assert!(
+        close(rows[0].1, cached),
+        "the row's BetP is the cached one: {rows:?}"
+    );
+}
