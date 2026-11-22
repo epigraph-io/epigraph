@@ -1439,6 +1439,20 @@ async fn registry_edge_remeet(
     Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
 }
 
+/// Whether migration 258 is applied: `epigraph_node_tenancy` meets a `frame`
+/// endpoint with its own row. Read from the catalog (the oracle's body), not
+/// from `_sqlx_migrations` (see the 086 gate); a later re-statement of the
+/// oracle keeps the arm.
+async fn registry_endpoints_met(pool: &PgPool) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc p \
+                         WHERE p.oid = to_regprocedure('public.epigraph_node_tenancy(uuid, text)') \
+                           AND p.prosrc LIKE '%p_type = ''frame''%')",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
 /// `(re-met or to re-meet, held)` totals of [`registry_edge_remeet`]'s rows.
 fn registry_edge_totals(rows: &[(String, String, i64)]) -> (i64, i64) {
     rows.iter().fold((0, 0), |(n, h), (_, t, c)| {
@@ -3913,8 +3927,23 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     // 258's section 4 re-met every one, but a registry row re-tenanted after
     // it does not re-meet its edges by itself. Read from the endpoints' own
     // rows, as above, never through `epigraph_node_tenancy`.
-    let registry_rows = registry_edge_remeet(pool, false).await?;
-    let (registry_stale, registry_held) = registry_edge_totals(&registry_rows);
+    //
+    // Below 258 the check is SKIPPED, and says so: this pre-flight runs before
+    // the migrations of a release, and on a database whose oracle still meets
+    // a registry row as public every edge onto a private one is off its meet
+    // until 258's own re-meet runs. Read from the catalog (the oracle's body),
+    // not from `_sqlx_migrations`, as the 086 gate does.
+    let registry_met = registry_endpoints_met(pool).await?;
+    let (registry_stale, registry_held) = if registry_met {
+        registry_edge_totals(&registry_edge_remeet(pool, false).await?)
+    } else {
+        eprintln!(
+            "NOTE: skipping the registry-edge check: migration 258, which meets a frame, \
+             context, perspective or community endpoint with its own row, has not been \
+             applied. Until it is, this check is UNCHECKED, not passing."
+        );
+        (0, 0)
+    };
     if registry_stale > 0 {
         failures += 1;
         eprintln!(

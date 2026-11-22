@@ -2120,3 +2120,52 @@ async fn verify_flags_a_registry_edge_off_its_meet_and_the_registry_arm_repairs_
     assert_eq!(code, 1, "stderr:\n{stderr}");
     assert!(stderr.contains("need three groups"), "stderr:\n{stderr}");
 }
+
+/// Below migration 258 the registry-edge check is SKIPPED and says so: this
+/// pre-flight runs before a release's migrations, and on a database whose
+/// oracle still meets a registry row as public every edge onto a private one
+/// is off its meet until 258's own re-meet runs. The gate reads the oracle's
+/// body (the catalog), so 258's undo runbook, which puts 219's body back, is
+/// what "below 258" looks like here.
+///
+/// Verified to fail without the gate: `verify` exits 1 after the undo.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_skips_the_registry_edge_check_before_migration_258(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-gate").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the pre-258 world-owned stamp");
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "CALIBRATION: at head the stale edge fails; stderr:\n{stderr}"
+    );
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
+    )
+    .expect("read 258's undo runbook");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("undo 258's function bodies");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "below 258 the registry-edge check must not block the pre-flight; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("skipping the registry-edge check"),
+        "and it must SAY it skipped; stderr:\n{stderr}"
+    );
+}
