@@ -3403,6 +3403,26 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **261**: public `jobs_run_after` (backlog 6cf042a9). Adds `jobs.run_after
+  timestamptz` (nullable, no default, no CHECK: a catalog change, no scan), the
+  earliest time a pending row may be claimed; NULL means due now. The drain
+  (`jobs_drain::drain`) used to put a retryable failure straight back to
+  `pending`, so the next timer run re-ran it whatever `JobHandler::backoff`
+  declared; it now writes `now() + handler.backoff(retry_count - 1)` on the
+  database clock (`PostgresJobQueue::requeue_after`), and the claims
+  (`dequeue_of_types`, `JobQueue::dequeue`) and `count_pending_of_types` skip a
+  row whose time has not come. Enqueuers never write it. No grant, policy,
+  function or trigger. Pinned by `epigraph-jobs/tests/requeue_after_test.rs`,
+  `epigraph-api/tests/drain_jobs.rs` and
+  `epigraph-db/tests/jobs_run_after_undo.rs`. Undo: `docs/runbooks/261-undo.sql`
+  (tested: run twice, it returns the `public` catalog to below 261); a deferred
+  row becomes due at once, as under the older drain. Slot 261 was assigned to
+  this batch; checked before claiming: no migration on main or any origin
+  branch carries a `261`. **Deploy order:** migrate before rolling out the 261
+  `drain_jobs` (its claim names the column; on an older schema every run fails
+  with 42703); an older `drain_jobs` ignores it; undo only after rolling every
+  261 `drain_jobs` back. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
