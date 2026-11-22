@@ -387,13 +387,18 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
   permissions are the trust gate; TCP may not.
 - An `--allow-unauthenticated-http` listener reads PUBLIC rows only. No
   request on it names a caller, so it acts as a dedicated agent that belongs
-  to no group (`mcp-unauthenticated-reader`, created on first boot), and it
-  refuses every content call if that agent is ever given a group membership
-  (revoke it to reopen the listener). That refusal is fail-closed on purpose,
-  and it means any holder of `groups:admin` on a group can close every
-  read-only listener on the database by adding `mcp-unauthenticated-reader`
-  to that group; nothing is exposed, and revoking the membership reopens the
-  listener. Its write tools are refused, it records no `OPERATED_BY`
+  to no group (`mcp-unauthenticated-reader`). Migration 241 creates that
+  agent and reserves its public key (no other agent row may take it), and
+  the database refuses it every live group membership, on every role: a
+  `groups:admin` holder can no longer close the read-only listeners by adding
+  it to a group (backlog 37844e1d, 14a38166). Apply the migrations before
+  deploying a binary of that change: the listener only looks the agent up,
+  and without it every content call is refused. The listener still refuses
+  every content call, fail-closed, when the agent holds a membership or is
+  the principal of an OAuth client that is not revoked; only a row created
+  before migration 241 can (241's header has the query to check one). Revoke
+  the membership or client on the maintenance DSN to reopen the listener.
+  Its write tools are refused, it records no `OPERATED_BY`
   auth-lineage edge (nobody authenticated), and `recall` audit rows on it are
   dropped (the reader has no personal group to own them). Group reads
   and writes go through a `--jwt-secret` listener. With
