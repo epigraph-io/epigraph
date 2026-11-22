@@ -1,10 +1,12 @@
 """
-Tests for the pre-commit sensitive-data check (.githooks/pre-commit ->
-scripts/check_sensitive.py).
+Tests for the pre-commit sensitive-data check (scripts/install-sensitive-hooks.sh
+-> .git/hooks/pre-commit -> scripts/check_sensitive.py at the trusted ref).
 
-Every test drives a REAL `git commit` in a throwaway repository whose
-core.hooksPath points at this checkout's .githooks directory, so what is
-exercised is the installed hook path end to end, not the scanner in isolation.
+Every test drives a REAL `git commit` in a throwaway repository set up the way
+scripts/README.md documents: the scanner is committed, `origin/main` points at
+that commit, and this checkout's installer has written the hook wrappers into
+the repository's own hooks directory. What is exercised is the installed hook
+path end to end, not the scanner in isolation.
 
 All sensitive-looking values below are synthetic (documentation IP ranges,
 AWS's own example-shaped ids, a made-up org term). They are assembled by
@@ -23,6 +25,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HOOKS_DIR = REPO_ROOT / ".githooks"
 SCANNER = REPO_ROOT / "scripts" / "check_sensitive.py"
+INSTALLER = REPO_ROOT / "scripts" / "install-sensitive-hooks.sh"
+SCANNER_PATH = "scripts/check_sensitive.py"
 TEMPLATE = REPO_ROOT / ".check_sensitive_local.example.yaml"
 LOCAL_YAML = ".check_sensitive_local.yaml"
 
@@ -71,16 +75,29 @@ def git(repo, *args, check=True):
     )
 
 
+def install_hooks(repo, env=None):
+    return subprocess.run(
+        ["bash", str(INSTALLER)],
+        cwd=repo, capture_output=True, text=True, env=env or _env(),
+    )
+
+
 def init_repo(path):
+    """A repository shaped like a maintainer's clone: the scanner committed on
+    main, `origin/main` pointing at it, and the hooks installed."""
     path.mkdir(parents=True, exist_ok=True)
     git(path, "init", "-q", "-b", "main")
     git(path, "config", "user.name", "Test")
     git(path, "config", "user.email", "test@example.invalid")
     git(path, "config", "commit.gpgsign", "false")
-    git(path, "config", "core.hooksPath", str(HOOKS_DIR))
     (path / "README").write_text("baseline\n")
-    git(path, "add", "README")
+    (path / "scripts").mkdir()
+    shutil.copy2(SCANNER, path / SCANNER_PATH)
+    git(path, "add", "README", SCANNER_PATH)
     git(path, "commit", "-q", "--no-verify", "-m", "baseline")
+    git(path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    installed = install_hooks(path)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
     return path
 
 
@@ -470,6 +487,7 @@ def copy_check_into(repo):
         HOOKS_DIR / "pre-commit",
         HOOKS_DIR / "pre-merge-commit",
         SCANNER,
+        INSTALLER,
         Path(__file__).resolve(),
         TEMPLATE,
     ]
@@ -490,17 +508,148 @@ def test_this_change_does_not_trip_its_own_check(repo):
     assert head_count(repo) == before + 1
 
 
-def test_documented_relative_hookspath_install_blocks(repo):
-    # scripts/README.md documents `git config core.hooksPath .githooks` (relative),
-    # where the hook must locate the scanner from the repo it lives in.
+# ── Hook code comes from the trusted ref, never the checked-out branch ──────
+#
+# A maintainer reviews a contributor's branch by checking it out. Whatever that
+# branch carries in .githooks/ or scripts/check_sensitive.py must not run when
+# the maintainer then commits or merges there: it would execute with the
+# maintainer's privileges before anyone reviewed it.
+
+HOSTILE_SCANNER = (
+    "import pathlib, sys\n"
+    "pathlib.Path({marker!r}).write_text('branch scanner ran')\n"
+    "sys.exit(0)\n"
+)
+HOSTILE_HOOK = "#!/bin/sh\necho 'branch hook ran' > {marker!r}\nexit 0\n"
+
+
+def contributor_branch(repo, tmp_path):
+    """Check out a branch whose scanner and .githooks/ both drop a marker file
+    and wave every commit through. Returns the marker paths."""
+    markers = [tmp_path / "scanner-ran", tmp_path / "hook-ran"]
+    git(repo, "checkout", "-q", "-b", "contrib")
+    (repo / SCANNER_PATH).write_text(HOSTILE_SCANNER.format(marker=str(markers[0])))
+    (repo / ".githooks").mkdir(exist_ok=True)
+    for name in ("pre-commit", "pre-merge-commit"):
+        hook = repo / ".githooks" / name
+        hook.write_text(HOSTILE_HOOK.format(marker=str(markers[1])))
+        hook.chmod(0o755)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "--no-verify", "-m", "contributor change")
+    return markers
+
+
+def test_a_branch_cannot_replace_the_scanner_or_the_hooks(repo, tmp_path):
+    markers = contributor_branch(repo, tmp_path)
+    before = head_count(repo)
+    result = commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n")
+    # The trusted scanner ran (and blocked); the branch's code did not.
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+    for marker in markers:
+        assert not marker.exists(), marker.read_text()
+
+
+def test_a_branch_cannot_replace_the_scanner_for_a_merge_commit(repo, tmp_path):
+    markers = contributor_branch(repo, tmp_path)
+    git(repo, "checkout", "-q", "-b", "side", "main")
+    (repo / "infra.md").write_text("host " + INSTANCE_ID + "\n")
+    git(repo, "add", "infra.md")
+    git(repo, "commit", "-q", "--no-verify", "-m", "dirty on side")
+    git(repo, "checkout", "-q", "contrib")
+    before = head_count(repo)
+    result = git(repo, "merge", "--no-ff", "-m", "merge side", "side", check=False)
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+    for marker in markers:
+        assert not marker.exists(), marker.read_text()
+
+
+def test_the_trusted_ref_is_what_runs_after_it_moves(repo):
+    # A reviewed change to the scanner reaches the hook once it is on the
+    # trusted ref: here a main whose scanner rejects every commit.
+    (repo / SCANNER_PATH).write_text("import sys\nsys.exit(7)\n")
+    git(repo, "commit", "-q", "--no-verify", "-am", "scanner rejects all")
+    before = head_count(repo)
+    assert commit_file(repo, "a.txt", "clean\n").returncode == 0
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    assert_blocked(commit_file(repo, "b.txt", "clean\n"), repo, before + 1)
+
+
+def test_a_configured_trusted_ref_is_honoured(repo):
+    git(repo, "branch", "reviewed")
+    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    git(repo, "config", "epigraph.sensitiveHookRef", "reviewed")
+    before = head_count(repo)
+    result = commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n")
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+
+
+def test_a_missing_trusted_ref_fails_closed(repo):
+    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    before = head_count(repo)
+    result = commit_file(repo, "notes.txt", "nothing sensitive here\n")
+    assert_blocked(result, repo, before)
+    assert "origin/main" in result.stderr
+    assert "refusing" in result.stderr
+
+
+def test_installer_drops_a_hookspath_into_the_tree(tmp_path):
+    # The old setup, core.hooksPath=.githooks, runs the checked-out branch's
+    # hooks; the installer must turn it off or its own hooks never run.
+    repo = init_repo(tmp_path / "repo")
+    git(repo, "config", "core.hooksPath", ".githooks")
+    result = install_hooks(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert git(repo, "config", "--get", "core.hooksPath", check=False).returncode == 1
+    assert "core.hooksPath" in result.stdout + result.stderr
+
+
+def test_installer_refuses_a_hookspath_it_cannot_unset(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text("[core]\n\thooksPath = " + str(tmp_path / "elsewhere") + "\n")
+    env = dict(_env(), GIT_CONFIG_GLOBAL=str(global_config))
+    result = install_hooks(repo, env=env)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "core.hooksPath" in result.stderr
+
+
+def test_installer_keeps_a_hook_it_did_not_write(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\n# someone else's hook\nexit 0\n")
+    result = install_hooks(repo)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "someone else's hook" in hook.read_text()
+
+
+def test_installer_is_idempotent(repo):
+    result = install_hooks(repo)
+    assert result.returncode == 0, result.stdout + result.stderr
+    before = head_count(repo)
+    assert_blocked(commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n"),
+                   repo, before)
+
+
+def test_the_retired_in_tree_hooks_refuse_and_point_at_the_installer(repo):
+    # Anyone still on `core.hooksPath .githooks` is running branch-controlled
+    # hook code; the in-tree hooks stop every commit and say how to migrate.
     copy_check_into(repo)
     git(repo, "commit", "-q", "--no-verify", "-m", "vendor the check")
     git(repo, "config", "core.hooksPath", ".githooks")
     before = head_count(repo)
-    result = commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n")
+    result = commit_file(repo, "notes.txt", "nothing sensitive here\n")
     assert_blocked(result, repo, before)
-    assert "infra.md:1" in result.stderr
-    assert "aws-resource-id" in result.stderr
+    assert "install-sensitive-hooks.sh" in result.stderr
+    git(repo, "checkout", "-q", "-b", "side")
+    git(repo, "commit", "-q", "--no-verify", "--allow-empty", "-m", "side")
+    git(repo, "checkout", "-q", "main")
+    before = head_count(repo)
+    result = git(repo, "merge", "--no-ff", "-m", "merge side", "side", check=False)
+    assert_blocked(result, repo, before)
+    assert "install-sensitive-hooks.sh" in result.stderr
 
 
 def test_this_checkout_passes_its_own_audit():

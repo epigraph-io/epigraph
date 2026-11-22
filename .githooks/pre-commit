@@ -1,7 +1,17 @@
 #!/bin/sh
-# Pre-commit sensitive-data check: blocks commits whose staged content holds
-# AWS resource ids, EC2 hostnames, ARN account ids, or org terms listed in the
-# gitignored .check_sensitive_local.yaml. See scripts/README.md.
+# RETIRED. Do not enable `git config core.hooksPath .githooks`.
 #
-# Enable once per clone:  git config core.hooksPath .githooks
-exec python3 "$(dirname "$0")/../scripts/check_sensitive.py"
+# With core.hooksPath pointing into the working tree, git runs whatever this
+# file says on the CHECKED-OUT branch: a contributor's branch under review
+# could replace it (or the scanner it called) and run its own code with your
+# privileges the moment you commit or merge there. This file therefore stops
+# every commit, and the sensitive-data hooks are installed outside the working
+# tree instead, running the scanner from a trusted ref:
+#
+#   git config --unset core.hooksPath
+#   bash scripts/install-sensitive-hooks.sh     # from a trusted checkout (main)
+#
+# See scripts/README.md, "check_sensitive.py".
+echo "check-sensitive: core.hooksPath=.githooks runs hook code from the checked-out branch and is retired." >&2
+echo "check-sensitive: run \`git config --unset core.hooksPath\` and \`bash scripts/install-sensitive-hooks.sh\` from main (see scripts/README.md)." >&2
+exit 1
