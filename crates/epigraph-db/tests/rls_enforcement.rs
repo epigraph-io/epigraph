@@ -320,6 +320,16 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          DELETE and TRUNCATE for every role, a superuser included, short of disabling \
          triggers.",
     ),
+    // ---- Migration 240: a workflow's recorded runs. --------------------------
+    (
+        "behavioral_executions",
+        "DELETE",
+        "A recorded run (240) is never deleted by the application: 118 revoked its DELETE \
+         grant, and no route or tool removes a run. Under FORCE the absent permissive \
+         DELETE policy default-denies every non-superuser role, and 240's restrictive \
+         `behavioral_executions_delete_owner` would hold a delete to the owner group's \
+         writers if one were ever added.",
+    ),
     // ---- Migration 221: hierarchical outcome reports. ----------------------
     (
         "workflow_outcome_reports",
@@ -435,6 +445,7 @@ const PROTECTED: &[&str] = &[
     "atlas_map_runs",
     "atlas_map_levels",
     "workflow_outcome_reports",
+    "behavioral_executions",
 ];
 
 // ===========================================================================

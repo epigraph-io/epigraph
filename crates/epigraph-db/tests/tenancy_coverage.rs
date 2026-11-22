@@ -39,7 +39,7 @@
 //! `every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt` extends the
 //! covered-or-registered rule to that neighbourhood,
 //! `the_harvester_neighbours_carry_the_fragment_row_security` pins the posture,
-//! and `the_registry_is_exactly_the_twelve_measured_rows` pins the registry's
+//! and `the_registry_is_exactly_the_measured_rows` pins the registry's
 //! whole membership, so a row for any other table is a visible diff.
 //!
 //! # Deliberately non-macro
@@ -205,7 +205,8 @@ async fn every_columns_tier_registry_row_has_both_not_null_columns(pool: PgPool)
 /// `claim_encryption`, `claim_version_encryption`, `behavioral_executions`,
 /// `counterfactual_scenarios`, `experiments`, `learning_events`,
 /// `match_candidates`. All nine are seeded into `tenancy_exempt` by migration
-/// 069. The plan's own three-row seed (claim_themes / agents / jobs) is found
+/// 069. Migration 240 covers `behavioral_executions` (backlog 88cf603b), so
+/// eight remain. The plan's own three-row seed (claim_themes / agents / jobs) is found
 /// by NEITHER generator and would have left this test red on its first run with
 /// nine violations; 069 seeds twelve rows for that reason.
 #[sqlx::test(migrations = "../../migrations")]
@@ -404,8 +405,8 @@ async fn tenancy_exempt_rows_state_a_residual(pool: PgPool) {
 /// it is the tenancy OWNER every tier-A row points at, not a derivation.
 ///
 /// The neighbour set is pinned exactly so that a new neighbour is a visible
-/// diff to this constant, as `the_generated_exemptions_are_exactly_the_nine_
-/// measured` does for the generators.
+/// diff to this constant, as `the_generated_exemptions_are_exactly_the_measured`
+/// does for the generators.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt(pool: PgPool) {
     const NEIGHBOURS: &[&str] = &[
@@ -557,18 +558,18 @@ async fn the_harvester_neighbours_carry_the_fragment_row_security(pool: PgPool) 
 /// registry to the generated protected set and seeded twelve rows. The two FK
 /// neighbours of the manual tier-A addition `harvester_fragments`, which no
 /// generator finds, are covered by migration 173 (ruling R-66) and carry no
-/// row. `the_generated_exemptions_are_exactly_the_nine_measured` sees only
+/// row, and migration 240 covers `behavioral_executions` (backlog 88cf603b) and
+/// drops its row. `the_generated_exemptions_are_exactly_the_measured` sees only
 /// generator-found tables and
 /// `every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt` only that
 /// neighbourhood, so without this pin a row for any OTHER table would pass
 /// every test. Adding one is a diff to this constant, which a reviewer reads.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_registry_is_exactly_the_twelve_measured_rows(pool: PgPool) {
+async fn the_registry_is_exactly_the_measured_rows(pool: PgPool) {
     const REGISTRY: &[&str] = &[
         "agents",
         "alt_set_decisions",
         "alternative_set",
-        "behavioral_executions",
         "claim_encryption",
         "claim_themes",
         "claim_version_encryption",
@@ -588,16 +589,15 @@ async fn the_registry_is_exactly_the_twelve_measured_rows(pool: PgPool) {
     );
 }
 
-/// The nine relations the generators find but 062 did not widen are exactly the
-/// nine 069 seeds. Pinned so that "add a table, add an exemption" cannot become
+/// The relations the generators find but 062 did not widen are exactly the
+/// nine 069 seeds, less `behavioral_executions`, which migration 240 covers. Pinned so that "add a table, add an exemption" cannot become
 /// the reflex: a NEW unlisted exemption is a diff to this constant, which a
 /// reviewer reads.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_generated_exemptions_are_exactly_the_nine_measured(pool: PgPool) {
+async fn the_generated_exemptions_are_exactly_the_measured(pool: PgPool) {
     const GENERATED_EXEMPT: &[&str] = &[
         "alt_set_decisions",
         "alternative_set",
-        "behavioral_executions",
         "claim_encryption",
         "claim_version_encryption",
         "counterfactual_scenarios",
@@ -864,7 +864,8 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
     let mut tx = pool.begin().await.expect("begin");
     // Measured BEFORE the replay as well as pinned: the replay must not change
     // the count, and the count itself is the registry's cardinality at head
-    // (069's twelve; 173 covers the two harvester neighbours and adds none).
+    // (069's twelve; 173 covers the two harvester neighbours and adds none;
+    // 240 covers `behavioral_executions` and drops its row).
     let exempt_before: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM tenancy_exempt")
         .fetch_one(&mut *tx)
         .await
@@ -933,19 +934,28 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
     .expect("dupe probe");
     assert_eq!(dupe_groups, 0);
 
-    let exempt: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM tenancy_exempt")
-        .fetch_one(&mut *tx)
-        .await
-        .expect("exempt count");
+    // Replaying 069's seed over a head database re-inserts the row of a table
+    // a LATER migration covered and removed (240: `behavioral_executions`):
+    // 069's seed is `ON CONFLICT DO NOTHING`, so it cannot know. That is the
+    // replay restoring a frozen file's text, not the seed doubling, so the
+    // covered tables are set aside before the count is compared.
+    const COVERED_AFTER_069: &[&str] = &["behavioral_executions"];
+    let exempt: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM tenancy_exempt WHERE table_name <> ALL($1)",
+    )
+    .bind(COVERED_AFTER_069)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("exempt count");
     assert_eq!(
         exempt, exempt_before,
         "the 069 seed must not double on replay"
     );
     assert_eq!(
-        exempt, 12,
-        "069 seeds twelve rows and 173 covers the two tables it once registered; a new \
-         tenancy_exempt row anywhere is a visible diff to this number and to \
-         the_registry_is_exactly_the_twelve_measured_rows"
+        exempt, 11,
+        "069 seeds twelve rows, 173 covers the two tables it once registered and 240 \
+         covers behavioral_executions; a new tenancy_exempt row anywhere is a visible diff \
+         to this number and to the_registry_is_exactly_the_measured_rows"
     );
 }
 

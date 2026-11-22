@@ -924,6 +924,10 @@ async fn every_tier_a_table_has_both_columns(pool: PgPool) {
         // Plus migration 210's Atlas team-map tables (backlog 77f4bf09): new
         // tables declared at creation, so there is nothing to backfill.
         .chain(["atlas_map_epochs", "atlas_map_runs", "atlas_map_levels"])
+        // Plus migration 240's `behavioral_executions` (backlog 88cf603b): its
+        // runs are derived from their workflow by that migration itself, which
+        // refuses when it cannot, so it has no ledger row either.
+        .chain(std::iter::once("behavioral_executions"))
         .collect();
     assert_eq!(
         observed, expected,

@@ -203,8 +203,10 @@
 //!   (`harvester_sources`, `harvester_audit_reports`), which no generator
 //!   finds, are covered (tenancy columns and `harvester_fragments`'s row
 //!   security) and hold no registry row; the cardinality pin stays 12 and
-//!   `tenancy_coverage.rs::the_registry_is_exactly_the_twelve_measured_rows`
-//!   pins the membership. `webhook_subscriptions` is still not in it.
+//!   `tenancy_coverage.rs::the_registry_is_exactly_the_measured_rows`
+//!   pins the membership. AMENDED by migration 240 (backlog 88cf603b):
+//!   `behavioral_executions` is covered (its workflow's tenancy, FORCEd row
+//!   security) and its row goes, so the pin is 11. `webhook_subscriptions` is still not in it.
 //! * **No route moved between the `public` and `protected` chains.** The four
 //!   webhook routes were already on `protected` in both `create_router`
 //!   variants and still are; `public_router_allowlist.rs` is untouched.
@@ -1935,17 +1937,25 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // re-stamps the reports when the fragment's pair changes; both are named
     // inside the pattern so that a disabled one is visible here like every
     // other stamping trigger.
+    // 26 SINCE MIGRATION 240 (backlog 88cf603b), arm (c)'s set again unmoved:
+    // `behavioral_executions_inherit_tenancy` stamps a run with its WORKFLOW's
+    // tenancy at INSERT, and `workflows_behavioral_executions_inherit_tenancy`
+    // and `claims_behavioral_executions_inherit_tenancy` re-stamp the runs when
+    // their workflow row or flat workflow claim changes its pair.
     assert_eq!(
         rows.len(),
-        23,
-        "expected 23 tenancy triggers — 3 named (claims_require_tenancy, \
+        26,
+        "expected 26 tenancy triggers — 3 named (claims_require_tenancy, \
          edges_tenancy, claims_propagate_tenancy) plus one \
          *_inherit_tenancy per claim-derived tier-A table (17), plus migration \
          089's harvester_claim_provenance_fragment_inherit_tenancy, plus \
          migration 173's harvester_audit_reports_inherit_tenancy and \
-         harvester_fragments_audit_reports_inherit_tenancy. Found {}: \
+         harvester_fragments_audit_reports_inherit_tenancy, plus migration 240's \
+         behavioral_executions_inherit_tenancy, \
+         workflows_behavioral_executions_inherit_tenancy and \
+         claims_behavioral_executions_inherit_tenancy. Found {}: \
          {rows:?}. A different count means migration 070 arm (c)'s table set \
-         moved or an 089 or 173 trigger is gone, which is a D1 change and \
+         moved or an 089, 173 or 240 trigger is gone, which is a D1 change and \
          needs a decision, not a silent edit.",
         rows.len()
     );
@@ -2364,6 +2374,10 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // them; their tenancy is inherited from the workflow row, so they carry no
     // tenancy columns and are reached through WORKFLOW_REPORT_TABLES below.
     "workflow_outcome_reports",
+    // Workflow runs (240, backlog 88cf603b): tier-A since that migration, which
+    // gives them their workflow's tenancy and FORCEs the table itself; reached
+    // through `tier_a` in the test below.
+    "behavioral_executions",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2516,11 +2530,14 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     // 28 -> 31 (Atlas W2, backlog 77f4bf09): migration 210's three
     // `atlas_map_*` tables carry both columns and are FORCEd by it.
+    // 31 -> 32 (backlog 88cf603b): migration 240 gives `behavioral_executions`
+    // both columns (its workflow's pair) and FORCEs it.
     assert_eq!(
         tier_a.len(),
-        31,
+        32,
         "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours, \
-         183 adds workflows and 210 the three atlas_map_* tables; got {}: {tier_a:?}",
+         183 adds workflows, 210 the three atlas_map_* tables and 240 \
+         behavioral_executions; got {}: {tier_a:?}",
         tier_a.len()
     );
 

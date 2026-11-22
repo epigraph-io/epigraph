@@ -207,7 +207,9 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   `protocol_source`, `counterfactual_scenarios.scenario_a` / `scenario_b`,
   `learning_events.lesson` / `resolution`, `match_candidates.verifier_rationale`
   (whose `(claim_a, claim_b)` pair is itself a near-duplicate oracle over the
-  private corpus), and `behavioral_executions.goal_text` / `goal_embedding`.
+  private corpus), and `behavioral_executions.goal_text` / `goal_embedding`
+  (CLOSED by migration 240, backlog 88cf603b: each run carries its workflow's
+  tenancy under FORCEd row security, and its exemption row is gone).
   This is exactly the failure class the plan's §12 summary names — *"a derived
   table nobody listed keeps the plaintext public after privatization"*. The
   registry CATCHES it; it does not CLOSE it. All twelve `tenancy_exempt` rows

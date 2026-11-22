@@ -3403,6 +3403,23 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **240**: `behavioral_executions_tenancy` (backlog 88cf603b). A workflow's recorded runs had
+  no tenancy and no row security (069 ledgered the table in `tenancy_exempt`), so every
+  application session read every run (goal text and embedding, step beliefs, tool pattern) of
+  every workflow, group-private plans included. Adds `owner_group_id` and `visibility` (062's
+  shape and constraints, NOT NULL, no default), backfilled from each run's workflow (the
+  `workflows` row, else the flat workflow claim; an orphan run refuses the migration, `BEX01`),
+  a BEFORE INSERT stamp from the workflow over any declaration (a run of no workflow is
+  `23503`), and two follow triggers that re-stamp a workflow's runs when its `workflows` row or
+  flat workflow claim changes its pair. Row security ENABLEd and FORCEd: read is public or a
+  session group; INSERT uses the same READ predicate (a reader of a public plan records a run
+  of it, a non-reader is refused `42501`); UPDATE only by the maintenance session and its
+  definers; 115's `_delete_owner` and owner guard; 126's three refusal-only elevated policies
+  (T-PLAN). The `tenancy_exempt` row goes. Pinned by
+  `epigraph-db/tests/behavioral_executions_tenancy.rs` (the app-role leak test, the follow on
+  narrowing and restore, the stamp, the orphan refusal, the write rule, the undo) and the
+  tenancy ratchets. Undo: `docs/runbooks/240-undo.sql`. **Deploy order:** migrate before, or
+  with, the binary built with it (see `docs/deploy.md`).
 
 ## `-- no-transaction` migrations
 

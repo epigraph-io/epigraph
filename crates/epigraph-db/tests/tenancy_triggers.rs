@@ -1030,12 +1030,19 @@ async fn every_tenancy_trigger_is_enabled(pool: PgPool) {
     // `harvester_fragments_audit_reports_inherit_tenancy` re-stamps the reports
     // when the fragment's pair changes; both are named inside the pattern for
     // the same reason as 089's.
+    //
+    // 26 SINCE MIGRATION 240 (backlog 88cf603b): `behavioral_executions_inherit_
+    // tenancy` stamps a run from its workflow at INSERT, and
+    // `workflows_behavioral_executions_inherit_tenancy` /
+    // `claims_behavioral_executions_inherit_tenancy` re-stamp the runs when the
+    // workflow row or flat workflow claim changes its pair.
     assert_eq!(
-        armed, 23,
-        "expected 23 tenancy triggers (3 named + 17 claim-derived inheritors + \
+        armed, 26,
+        "expected 26 tenancy triggers (3 named + 17 claim-derived inheritors + \
          migration 089's provenance→fragment inheritor + migration 173's two \
-         fragment→audit-report inheritors); found {armed}. A changed count means \
-         arm (c)'s table set moved, or an 089 or 173 trigger is gone."
+         fragment→audit-report inheritors + migration 240's three workflow→run \
+         inheritors); found {armed}. A changed count means arm (c)'s table set \
+         moved, or an 089, 173 or 240 trigger is gone."
     );
 }
 
