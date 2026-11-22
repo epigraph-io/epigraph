@@ -1,5 +1,6 @@
-//! No repository function compares a CALLER-SUPPLIED relationship
-//! byte-exactly (backlog 5ff9c9d9; the defect class of backlog 3ce5e00c).
+//! No repository function compares a relationship byte-exactly unless the
+//! value has one spelling or the site is a pinned, reasoned exception
+//! (backlog 5ff9c9d9; the defect class of backlog 3ce5e00c).
 //!
 //! `edges.relationship` stores the case-folded relationships
 //! (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`) in two
@@ -7,15 +8,18 @@
 //! `relationship: &str` and binds it to `relationship = $N` silently drops the
 //! rows stored in the other spelling. Every such reader matches
 //! `= ANY($N)` over `relationship_spellings(..)` instead.
-//! `EdgeRepository::get_current_edges` was the last one; it had no caller and
-//! was removed rather than converted.
+//! `EdgeRepository::get_current_edges` was the last such reader that took a
+//! `relationship` parameter; it had no caller and was removed rather than
+//! converted.
 //!
-//! Static, no database: every `fn` under `crates/epigraph-db/src` whose
-//! signature takes a parameter named `relationship` and whose body (comments
-//! stripped) contains a `relationship = $<n>` comparison must also call
-//! `relationship_spellings`. A function that binds a constant such as
-//! `DUPLICATE_IDENTITY_RELATIONSHIP` (`same_as`, not case-folded) takes no
-//! `relationship` parameter and is out of scope by construction.
+//! Static, no database: every `fn` under `crates/epigraph-db/src` whose body
+//! (comments stripped) contains a `relationship = $<n>` comparison must call
+//! `relationship_spellings`, or bind a single-spelling constant such as
+//! `DUPLICATE_IDENTITY_RELATIONSHIP` (`same_as`, not case-folded) and take no
+//! `relationship` parameter, or be listed in [`KNOWN_BYTE_EXACT`] with its
+//! reason. The parameter name is not what makes a site risky: a `link_type`
+//! mapped to `"supports"` and bound to `relationship = $1` drops `SUPPORTS`
+//! rows just the same, so such a site is flagged too.
 
 use std::path::{Path, PathBuf};
 
@@ -124,18 +128,46 @@ fn byte_exact_placeholder_compare(body: &str) -> bool {
     })
 }
 
-/// The functions in `src` that take a relationship and match it byte-exactly.
+/// Relationship constants with exactly one stored spelling (not in
+/// `CASE_FOLDED_RELATIONSHIPS`), so binding one to `relationship = $N` is a
+/// complete match.
+const SINGLE_SPELLING_CONSTANTS: &[&str] = &["DUPLICATE_IDENTITY_RELATIONSHIP"];
+
+/// Does `body` bind one of [`SINGLE_SPELLING_CONSTANTS`]?
+fn binds_single_spelling_constant(body: &str) -> bool {
+    SINGLE_SPELLING_CONSTANTS.iter().any(|c| body.contains(c))
+}
+
+/// The functions in `src` that compare `relationship = $N` without going
+/// through `relationship_spellings`, unless the bound value is a
+/// single-spelling constant. A function that takes a `relationship` parameter
+/// is flagged even when it also names such a constant; one that derives the
+/// relationship some other way (a `link_type` mapped to a string, a `rel`
+/// parameter) is flagged because it binds no allowed constant.
 fn offenders(src: &str) -> Vec<String> {
     functions(src)
         .into_iter()
         .filter(|f| {
-            takes_relationship_param(&f.signature)
-                && byte_exact_placeholder_compare(&f.body)
+            byte_exact_placeholder_compare(&f.body)
                 && !f.body.contains("relationship_spellings")
+                && (takes_relationship_param(&f.signature)
+                    || !binds_single_spelling_constant(&f.body))
         })
         .map(|f| f.name)
         .collect()
 }
+
+/// Byte-exact sites that are deliberate, as `(path under src, fn, reason)`.
+/// Each entry must still be flagged (a stale entry fails the ratchet), so the
+/// list shrinks when a site is converted.
+const KNOWN_BYTE_EXACT: &[(&str, &str, &str)] = &[(
+    "repos/semantic_link.rs",
+    "get_by_type",
+    "claim->claim reader kept lower-case-only on purpose (see the scope guard in \
+     tests/relationship_spelling_readers.rs); `str_to_link_type` has no upper-case \
+     arms, so widening the match would turn a silent miss of a `SUPPORTS` row into \
+     an error for the whole call. Converting it needs the row mapping changed too.",
+)];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
@@ -182,16 +214,37 @@ fn no_repo_function_matches_a_relationship_parameter_byte_exactly() {
          relationship (found {readers_seen}); if it sees none it is not parsing \
          signatures and every check below is vacuous"
     );
+    let known: Vec<String> = KNOWN_BYTE_EXACT
+        .iter()
+        .map(|(path, name, _)| format!("{path}::{name}"))
+        .collect();
+    let stale: Vec<&String> = known.iter().filter(|k| !found.contains(k)).collect();
     assert!(
-        found.is_empty(),
-        "these functions take a `relationship` and compare it with `relationship = $N`, \
+        stale.is_empty(),
+        "KNOWN_BYTE_EXACT lists sites that are no longer flagged (converted, renamed or \
+         removed); delete these entries:\n  {}",
+        stale
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    let unexpected: Vec<&String> = found.iter().filter(|f| !known.contains(f)).collect();
+    assert!(
+        unexpected.is_empty(),
+        "these functions compare `relationship = $N` without `relationship_spellings`, \
          which misses rows stored in the other spelling of a case-folded relationship; \
-         bind `relationship_spellings(relationship)` to `= ANY($N)` instead:\n  {}",
-        found.join("\n  ")
+         bind `relationship_spellings(..)` to `= ANY($N)` instead:\n  {}",
+        unexpected
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
 }
 
-/// The detector itself: the removed `get_current_edges` shape is flagged, the
+/// The detector itself: the removed `get_current_edges` shape and a
+/// relationship derived from a non-`relationship` parameter are flagged; the
 /// spelling-aware shape and a constant-bound `same_as` reader are not.
 #[test]
 fn the_detector_flags_the_removed_shape_and_only_it() {
@@ -230,6 +283,23 @@ fn the_detector_flags_the_removed_shape_and_only_it() {
     }
     "#;
     assert!(offenders(constant_bound).is_empty());
+
+    let derived = r#"
+    pub async fn get_by_type(executor: E, link_type: SemanticLinkType) -> Result<(), DbError> {
+        let rel = link_type_to_str(link_type);
+        let q = sqlx::query("SELECT id FROM edges WHERE relationship = $1").bind(rel);
+    }
+    "#;
+    assert_eq!(offenders(derived), vec!["get_by_type".to_string()]);
+
+    let param_beats_constant = r#"
+    pub async fn mixed(executor: E, relationship: &str) -> Result<(), DbError> {
+        let q = sqlx::query("SELECT 1 FROM edges WHERE relationship = $1 AND kind = $2")
+            .bind(relationship)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP);
+    }
+    "#;
+    assert_eq!(offenders(param_beats_constant), vec!["mixed".to_string()]);
 
     let comment_only = r#"
     pub fn doc(relationship: &str) -> bool {

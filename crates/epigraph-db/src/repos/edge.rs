@@ -71,8 +71,8 @@ pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until
 /// this predicate existed the column was decorative: exactly ONE query in the
 /// workspace filtered on it (`EdgeRepository::get_current_edges`, since removed:
-/// it had no caller, and it was also the last byte-exact relationship filter,
-/// backlog 5ff9c9d9), and 6 of 987,857 production rows carried a value. Every belief-bearing read saw retracted edges as live.
+/// it had no caller, and it was also the last byte-exact relationship filter
+/// that took a `relationship` parameter, backlog 5ff9c9d9), and 6 of 987,857 production rows carried a value. Every belief-bearing read saw retracted edges as live.
 ///
 /// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
 /// than retracting them — a soft retraction that nothing honours retracts
