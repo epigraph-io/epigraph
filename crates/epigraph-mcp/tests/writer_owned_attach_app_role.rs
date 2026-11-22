@@ -648,6 +648,48 @@ async fn report_workflow_outcome_seeds_a_writable_workflow_claim(pool: PgPool) {
     assert_eq!(seed_count(&pool, wf).await, 1, "one seed row: {body}");
 }
 
+/// The run row of a flat report (backlog 88cf603b, migration 240). Since 240
+/// `behavioral_executions` takes its workflow's tenancy under FORCEd row
+/// security, so a run of a GROUP-PRIVATE workflow claim is admitted only on a
+/// session that reads it. The tool wrote it best-effort on the raw pool (an
+/// unstamped application session, which reads public rows only), so a member's
+/// run of its own group's workflow was refused and only logged, while the tool
+/// answered success. Verified to fail with the write on `&server.pool`: 0 rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn report_workflow_outcome_records_the_run_of_a_group_workflow_claim(pool: PgPool) {
+    let (server, _agent, group, viewer) = app_role_server(&pool).await;
+    binary_truth(&pool).await;
+    let wf = workflow_claim_with_truth(&pool, "ship a private team workflow").await;
+    sqlx::query("UPDATE claims SET owner_group_id = $2, visibility = 'group' WHERE id = $1")
+        .bind(wf)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("make the workflow claim private to the server agent's group");
+
+    epigraph_mcp::tools::workflows::report_workflow_outcome(
+        &server,
+        &viewer,
+        clean_outcome(wf),
+        None,
+    )
+    .await
+    .expect("reporting on a private team workflow lands on the app role");
+    let runs: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT owner_group_id, visibility::text FROM behavioral_executions \
+          WHERE workflow_id = $1",
+    )
+    .bind(wf)
+    .fetch_all(&pool)
+    .await
+    .expect("read the runs on the superuser pool");
+    assert_eq!(
+        runs,
+        vec![(group, "group".to_string())],
+        "one run, recorded with its workflow's tenancy"
+    );
+}
+
 /// A non-owner reporting on a SHARED workflow claim does not seed it (scope
 /// Q2), exactly as update_with_evidence's foreign attach does not.
 #[sqlx::test(migrations = "../../migrations")]

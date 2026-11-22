@@ -389,7 +389,8 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
 ///
 /// # Why the transaction is stamped
 ///
-/// `behavioral_executions` has no row security; the counter write on
+/// `behavioral_executions` rows take the workflow's tenancy and are admitted
+/// only for a session that reads it (migration 240); the counter write on
 /// `workflows` (row security since migration 183) reaches only a row the
 /// stamp reads. The step LOOKUP reads `claims` and `edges`,
 /// and on an UNSTAMPED application session row security admits only public

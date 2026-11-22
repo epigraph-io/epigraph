@@ -290,13 +290,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/workflows.rs",
-        "BehavioralExecutionRepository::create",
-        1,
-        "`report_workflow_outcome`. `behavioral_executions` is not claim-derived and carries no \
-         `owner_group_id`, so there is no `WITH CHECK` for a stamp to satisfy.",
-    ),
-    (
-        "tools/workflows.rs",
         "ClaimRepository::merge_properties",
         1,
         "`refresh_workflow_promotion`'s `properties.promotion` overwrite. Surfaced when `merge` \

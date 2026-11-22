@@ -33,9 +33,10 @@ fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpErro
 /// proposing a variant; an invalid `workflow_id` errors rather than returning
 /// an empty set (which would read as "no runs" and mislead the proposer).
 ///
-/// Read as the CALLER (`server.read_as`). `behavioral_executions` has no row
-/// security of its own, so the repo admits a run only when its workflow (a
-/// `workflows` row or a flat workflow claim) is one `viewer` reads: a workflow
+/// Read as the CALLER (`server.read_as`). A run carries its workflow's tenancy
+/// under row security (migration 240), and the repo also admits a run only
+/// when its workflow (a `workflows` row or a flat workflow claim) is one
+/// `viewer` reads, so the two agree: a workflow
 /// private to a group the caller is not in answers exactly like an unknown id,
 /// with no rows, and its `goal_text` / `step_beliefs` never leave the database.
 pub async fn get_workflow_executions(
@@ -201,9 +202,9 @@ async fn assess_workflow_promotion(
     // a lineage root ("nothing to promote over"), and refresh skipped its
     // write, all without an error.
     //
-    // The run counts come from `behavioral_executions`, which has no row
-    // security of its own (and `epigraph_app` keeps SELECT on it), so
-    // `success_stats` counts only the runs of a workflow `viewer` reads: a
+    // The run counts come from `behavioral_executions`, whose rows carry
+    // their workflow's tenancy (migration 240), and `success_stats` also
+    // counts only the runs of a workflow `viewer` reads: a
     // public `variant_of` edge to a private parent no longer discloses that
     // parent's success record. All three reads share this one stamped read,
     // released before refresh's write, so the tool never holds two pooled
@@ -1523,10 +1524,9 @@ pub async fn report_workflow_outcome(
     // wiring above — there is no longer an unstamped write before it, and no
     // self-committing unit of its own. It is the tool's last HARD write: what
     // follows the commit is `BehavioralExecutionRepository::create`, which is
-    // warn-only and targets `behavioral_executions`: `relrowsecurity = f` with
-    // zero policies, so it is refused on neither configuration. That site is
-    // registered as a residual in
-    // `crates/epigraph-mcp/tests/residual_unstamped_writes.rs` with that reason.
+    // warn-only and runs on a fresh transaction on the same author stamp
+    // (`behavioral_executions` is under FORCEd row security since migration
+    // 240, keyed on its workflow's tenancy).
     // After the DS wiring necessarily, because the value comes from it.
     //
     // MIGRATION 114: skipped for a public workflow claim this caller does not
@@ -1614,13 +1614,29 @@ pub async fn report_workflow_outcome(
         run_label: None,
     };
 
-    if let Err(e) = BehavioralExecutionRepository::create(
-        &server.pool,
-        behavioral_row,
-        goal_embedding_pgvec.as_deref(),
-    )
-    .await
-    {
+    // On the author's stamp (migration 240): the row takes the workflow
+    // claim's tenancy under FORCEd row security, and its INSERT policy admits
+    // it only for a session that reads the claim. On the raw pool (an
+    // unstamped session, which reads public rows only) a member's run of its
+    // own group-private workflow was refused and only logged. A fresh
+    // transaction after the commit above, so the embedder call stays out of
+    // that one; still best-effort.
+    let recorded = async {
+        let mut run_tx =
+            crate::claim_helper::begin_author_stamped_tx(server, author, "report_workflow_outcome")
+                .await
+                .map_err(|e| e.message.to_string())?;
+        BehavioralExecutionRepository::create(
+            &mut *run_tx,
+            behavioral_row,
+            goal_embedding_pgvec.as_deref(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        run_tx.commit().await.map_err(|e| e.to_string())
+    }
+    .await;
+    if let Err(e) = recorded {
         tracing::warn!(workflow_id = %workflow_id, "behavioral execution write failed: {e}");
     }
 

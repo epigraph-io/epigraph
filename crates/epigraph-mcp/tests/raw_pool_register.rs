@@ -565,10 +565,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/workflows.rs",
         "report_workflow_outcome",
-        2,
+        1,
         "One NO_SCOPED_POOL_FALLBACK (WorkflowRepository::exists without a ScopedPool; with one \
-         the existence check is viewer_reads_row on read_as) and one REGISTERED_WRITE \
-         (BehavioralExecutionRepository::create, a table with no tenancy).",
+         the existence check is viewer_reads_row on read_as). The run row \
+         (BehavioralExecutionRepository::create) moved onto the author's stamp when migration \
+         240 gave behavioral_executions its workflow's tenancy (backlog 88cf603b).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
@@ -601,8 +602,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. Migration 240
+/// moved `report_workflow_outcome`'s run row onto the author's stamp: 82 -> 81.
+const HIGH_WATER: usize = 81;
 
 // ===========================================================================
 // The scanner.
