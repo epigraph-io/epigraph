@@ -67,8 +67,10 @@ use thiserror::Error;
 /// Errors from the library-level `recall` function.
 ///
 /// Embedding failures (e.g. no API key, mock mode) trigger silent fallback to
-/// text search; they are not surfaced as a `RecallError`. The only failure
-/// mode this function can return is a database error from the fallback path.
+/// text search; they are not surfaced as a `RecallError`. Every failure is a
+/// [`RecallError::Db`]: no connection or stamped read could be opened, the
+/// fallback text search failed, or [`recall`] refused a `Bypass` viewer on a
+/// connection that does not satisfy `epigraph_bypass()` (backlog ef57f3b9).
 #[derive(Debug, Error)]
 pub enum RecallError {
     /// Database access failed (either embedding-search or text-search fallback).
@@ -316,10 +318,15 @@ async fn theme_leg_reads(
 ///   stamped. See [`log_recall_event`].
 /// - `viewer`    — who the recall runs as; its principal is the audit row's
 ///   `agent_id`. A `Bypass` viewer has no principal: its audit row is
-///   agent-less and is written on `pool`, so a `Bypass` viewer MUST be paired
-///   with the maintenance connection pool its lease came from. On an
-///   application-role `pool` that row is refused by `recall_events_tenancy`
-///   (the recall is still served; the audit row is lost with a warning).
+///   agent-less and is written on `pool`, so a `Bypass` viewer must be paired
+///   with the maintenance connection pool its lease came from. That is
+///   ENFORCED (backlog ef57f3b9): with a `Bypass` viewer the connection taken
+///   from `pool` is probed once, by the rule
+///   `MaintenanceSession::assert_privileged` applies, and the recall is
+///   refused when row security is active and that connection does not satisfy
+///   `epigraph_bypass()`. Without the check an application-role `pool` served
+///   the recall and `recall_events_tenancy` refused its audit row, which was
+///   lost with only a warning.
 /// - `embedder`  — embedding service; only `generate_query` is called
 /// - `query`     — natural-language query string
 /// - `limit`     — maximum number of results to return (clamped 1–50 by callers)
@@ -330,9 +337,10 @@ async fn theme_leg_reads(
 ///   (backlog `14b98adc`).
 ///
 /// # Errors
-/// Returns `RecallError::Db` if no connection can be taken from `pool` or the
-/// fallback text search fails. Embedding errors cause silent fallback, not a
-/// returned error.
+/// Returns `RecallError::Db` if no connection can be taken from `pool`, if
+/// `viewer` is `Bypass` and that connection cannot spend it (see `viewer`
+/// above; `DbError::InvalidData`), or if the fallback text search fails.
+/// Embedding errors cause silent fallback, not a returned error.
 pub async fn recall(
     pool: &PgPool,
     scoped: &ScopedPool,
@@ -343,6 +351,9 @@ pub async fn recall(
     min_truth: f64,
 ) -> Result<Vec<RecallResult>, RecallError> {
     let mut conn = pool.acquire().await.map_err(epigraph_db::DbError::from)?;
+    if viewer.is_bypass() {
+        assert_conn_spends_bypass(&mut conn).await?;
+    }
     recall_on(
         &mut conn,
         scoped,
@@ -354,6 +365,33 @@ pub async fn recall(
         RecallRoute::Similarity,
     )
     .await
+}
+
+/// Refuse a `Bypass` viewer on a connection that cannot spend it (backlog
+/// ef57f3b9).
+///
+/// A `Bypass` viewer emits no predicate and names no principal, so both what
+/// it reads and whether its agent-less audit row lands are decided by the
+/// connection alone. The question and the rule are
+/// `MaintenanceSession::assert_privileged`'s, asked of the connection [`recall`]
+/// is about to read and audit on: refused when row security is active and the
+/// session user is not a member of `epigraph_maintenance`. Checked here rather
+/// than in [`log_recall_event`] so the misuse is refused before anything is
+/// served, not discovered afterwards by a failed audit write.
+async fn assert_conn_spends_bypass(conn: &mut PgConnection) -> Result<(), RecallError> {
+    let privilege = epigraph_db::probe_maintenance_privilege_conn(conn).await?;
+    epigraph_db::maintenance_verdict(privilege, epigraph_db::MaintenanceDsnSource::Configured)
+        .map_err(|e| match e {
+            epigraph_db::DbError::InvalidData { reason } => epigraph_db::DbError::InvalidData {
+                reason: format!(
+                    "engine recall refused a Bypass viewer: the `pool` passed to recall() \
+                     must be the maintenance pool its lease came from, or its agent-less \
+                     audit row is refused by row security and lost. {reason}"
+                ),
+            },
+            other => other,
+        })?;
+    Ok(())
 }
 
 /// [`recall`] with an explicit [`RecallRoute`] (backlog a47df8ed), read on
@@ -594,9 +632,10 @@ enum AuditNotWritten {
 /// instance-wide, written on `conn`, the connection [`recall`] took from its
 /// `pool` (only [`recall`] reaches this with one: [`recall_routed`]'s stamped
 /// read refuses a `Bypass` viewer). That is the only agent-less row this path
-/// writes, and it is admitted only through the bypass arm, so it lands only
-/// when the caller honours [`recall`]'s contract and passes the maintenance
-/// pool with a `Bypass` viewer. It is not routed through `scoped` instead:
+/// writes, and it is admitted only through the bypass arm; [`recall`] has
+/// already refused a `Bypass` viewer whose connection does not satisfy
+/// `epigraph_bypass()` (backlog ef57f3b9), so the row is not silently lost to
+/// an application-role pool. It is not routed through `scoped` instead:
 /// `ScopedPool::begin_as` refuses a `Bypass` viewer, and minting a maintenance
 /// lease inside this library would grant a bypass the caller never asked for.
 #[allow(clippy::too_many_arguments)]
