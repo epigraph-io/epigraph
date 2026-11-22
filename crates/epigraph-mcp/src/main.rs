@@ -192,10 +192,12 @@ struct Cli {
     /// `EPIGRAPH_AGENT_SIGNING_KEY`, and excludes `--agent-key`. Stdio only:
     /// refused with `--listen`.
     ///
-    /// The SIGNING private key (64 hex chars) is read from
-    /// `EPIGRAPH_AGENT_SIGNING_KEY` in the environment ONLY, never from the
-    /// command line, where `ps` and `/proc/<pid>/cmdline` would show it (see
-    /// [`signing_key_from_env`]). Every signature this process makes is by it;
+    /// The SIGNING private key (64 hex chars) is read from the 0600 file
+    /// `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names (preferred: the key stays out
+    /// of `/proc/<pid>/environ`), or from `EPIGRAPH_AGENT_SIGNING_KEY` in the
+    /// environment, never both and never from the command line, where `ps`
+    /// and `/proc/<pid>/cmdline` would show it (see [`signing_key_source`]).
+    /// Every signature this process makes is by it;
     /// its public half must be an ACTIVE `signing` key of the identity's agent
     /// in `agent_keys`, registered by the host before the container starts.
     #[arg(long, env = "EPIGRAPH_AGENT_IDENTITY_PUBKEY", hide_env_values = true)]
@@ -343,15 +345,17 @@ fn select_signer(
 const SIGNING_KEY_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY";
 
 /// Read the separate-signing-key mode's signing PRIVATE key from
-/// [`SIGNING_KEY_ENV`], and only from there: it is deliberately not a clap
-/// argument, so it cannot be passed on the command line (visible in `ps` and
+/// [`SIGNING_KEY_ENV`] (the other source is [`SIGNING_KEY_FILE_ENV`], see
+/// [`signing_key_source`]). It is deliberately not a clap argument, so it
+/// cannot be passed on the command line (visible in `ps` and
 /// `/proc/<pid>/cmdline` to every process in the container). An empty value
 /// counts as unset, as clap treats the other env-backed arguments. The value
 /// is held in a [`Zeroizing`] string, wiped when dropped.
 ///
 /// The variable itself is left in place: removing it would not clear
 /// `/proc/<pid>/environ` (that shows the environment the process was started
-/// with) and would race the runtime's worker threads.
+/// with) and would race the runtime's worker threads. A deployment that must
+/// keep the key out of the environment uses the file instead.
 ///
 /// # Errors
 /// The variable is set but is not valid UTF-8 (refused rather than read as
@@ -369,6 +373,135 @@ fn signing_key_from_env(
              the value is not shown"
         )),
     }
+}
+
+/// The environment variable naming a FILE that holds the signing PRIVATE key
+/// (backlog 8bd859e5, 8331811d): the alternative to [`SIGNING_KEY_ENV`] that
+/// keeps the key out of this process's environment. `/proc/<pid>/environ`
+/// shows the environment a process was started with for its whole life, to
+/// its own uid and to root; a path there shows only where the key is, and the
+/// file is readable by its owner alone.
+///
+/// The file holds the key as 64 hex characters (surrounding whitespace, such
+/// as a trailing newline, is ignored), the format `EPIGRAPH_API_SIGNING_KEY_FILE`
+/// uses for the API's key. It is read once at boot (see
+/// [`read_signing_key_file`]). Setting both this and [`SIGNING_KEY_ENV`] is
+/// refused: two sources of one key leave it unclear which one signs.
+const SIGNING_KEY_FILE_ENV: &str = "EPIGRAPH_AGENT_SIGNING_KEY_FILE";
+
+/// Read cap for the key file: 64 hex characters and a line ending, with room
+/// for surrounding whitespace. A larger file is refused, not truncated.
+const SIGNING_KEY_FILE_MAX_BYTES: usize = 1024;
+
+/// The separate-signing-key mode's signing PRIVATE key, from
+/// [`SIGNING_KEY_ENV`] (`env_value`) or from the file [`SIGNING_KEY_FILE_ENV`]
+/// names (`file`), never both. An empty file variable counts as unset, as an
+/// empty key variable does. `expected_uid` is the uid the file must belong to
+/// (this process's effective uid in `main`; a parameter so the owner check is
+/// testable without a second user).
+///
+/// # Errors
+/// Both sources are set; the key variable is not valid UTF-8; or the file is
+/// refused by [`read_signing_key_file`]. No message includes the key.
+fn signing_key_source(
+    env_value: Result<String, std::env::VarError>,
+    file: Option<&std::ffi::OsStr>,
+    expected_uid: u32,
+) -> Result<Option<Zeroizing<String>>, String> {
+    let from_env = signing_key_from_env(env_value)?;
+    match (from_env, file.filter(|path| !path.is_empty())) {
+        (Some(_), Some(_)) => Err(format!(
+            "{SIGNING_KEY_ENV} and {SIGNING_KEY_FILE_ENV} are both set; set exactly one source \
+             of the signing key (the file keeps it out of this process's environment)"
+        )),
+        (from_env, None) => Ok(from_env),
+        (None, Some(path)) => {
+            read_signing_key_file(std::path::Path::new(path), expected_uid).map(Some)
+        }
+    }
+}
+
+/// Read the signing key file once, into memory wiped on drop.
+///
+/// The file is opened without following a symlink (`O_NOFOLLOW`) and without
+/// blocking on a FIFO (`O_NONBLOCK`), and the checks run on the OPEN
+/// descriptor (`fstat`), so the file checked is the file read. Refused:
+///
+/// - anything but a regular file, or a path whose last component is a symlink;
+/// - a file owned by another uid than `expected_uid`;
+/// - any group or other permission bit (`mode & 0o077`; want 0600 or 0400);
+/// - more than [`SIGNING_KEY_FILE_MAX_BYTES`] bytes, or bytes that are not UTF-8.
+///
+/// The bytes are read straight into a fixed [`Zeroizing`] buffer (no growing
+/// buffer that would leave copies behind), and the returned string is
+/// allocated once at its final length. Its content is parsed by the caller
+/// (`select_signer`, via `parse_hex32`).
+///
+/// # Errors
+/// Each refusal above, and an open or read failure. Messages name the path,
+/// the owner and the mode, never the content.
+fn read_signing_key_file(
+    path: &std::path::Path,
+    expected_uid: u32,
+) -> Result<Zeroizing<String>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let shown = path.display();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                format!("{SIGNING_KEY_FILE_ENV} {shown} is a symlink; it is never followed")
+            } else {
+                format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be opened: {e}")
+            }
+        })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be inspected: {e}"))?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} is not a regular file"
+        ));
+    }
+    if meta.uid() != expected_uid {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} is owned by uid {}, not by this process's uid \
+             {expected_uid}",
+            meta.uid()
+        ));
+    }
+    let perms = meta.mode() & 0o7777;
+    if perms & 0o077 != 0 {
+        return Err(format!(
+            "{SIGNING_KEY_FILE_ENV} {shown} has mode {perms:04o}; group and others must have no \
+             access (want 0600 or 0400)"
+        ));
+    }
+
+    let mut buf = Zeroizing::new([0u8; SIGNING_KEY_FILE_MAX_BYTES + 1]);
+    let mut len = 0;
+    loop {
+        let n = file
+            .read(&mut buf[len..])
+            .map_err(|e| format!("{SIGNING_KEY_FILE_ENV} {shown} cannot be read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        len += n;
+        if len > SIGNING_KEY_FILE_MAX_BYTES {
+            return Err(format!(
+                "{SIGNING_KEY_FILE_ENV} {shown} is larger than {SIGNING_KEY_FILE_MAX_BYTES} \
+                 bytes; it must hold only the 64 hex characters of the key"
+            ));
+        }
+    }
+    let text = std::str::from_utf8(&buf[..len])
+        .map_err(|_| format!("{SIGNING_KEY_FILE_ENV} {shown} is not valid UTF-8"))?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 /// The separate-signing-key mode (rung 0) is stdio-only.
@@ -595,7 +728,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it runs here, before the DB connect, and only its side effects (printing a
     // generated key) stay below; that lets the gate read the rung off
     // `select_signer`'s own answer instead of re-deriving it.
-    let agent_signing_key = match signing_key_from_env(std::env::var(SIGNING_KEY_ENV)) {
+    let agent_signing_key = match signing_key_source(
+        std::env::var(SIGNING_KEY_ENV),
+        std::env::var_os(SIGNING_KEY_FILE_ENV).as_deref(),
+        rustix::process::geteuid().as_raw(),
+    ) {
         Ok(key) => key,
         Err(reason) => {
             eprintln!("ERROR: {reason}");
@@ -1373,8 +1510,8 @@ mod unauthenticated_writes_gate_tests {
 #[cfg(test)]
 mod signer_selection_tests {
     use super::{
-        check_separate_key_transport, select_signer, signing_key_from_env, SelectedSigner,
-        SeparateSigningKey,
+        check_separate_key_transport, read_signing_key_file, select_signer, signing_key_from_env,
+        signing_key_source, SelectedSigner, SeparateSigningKey,
     };
 
     const KEY_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
@@ -1746,6 +1883,222 @@ mod signer_selection_tests {
                 .expect_err("a non-UTF-8 key is refused");
             assert!(err.contains("not valid UTF-8"), "{err}");
         }
+    }
+
+    /// A per-test private directory under the system temp dir, removed on drop.
+    struct KeyDir(std::path::PathBuf);
+
+    impl KeyDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "epigraph-mcp-signing-key-file-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).expect("create the test dir");
+            Self(dir)
+        }
+
+        /// Write `content` to `name` and set its mode.
+        fn file(&self, name: &str, content: &[u8], mode: u32) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join(name);
+            std::fs::write(&path, content).expect("write the key file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod the key file");
+            path
+        }
+    }
+
+    impl Drop for KeyDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn my_uid() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    const FILE_SECRET: [u8; 32] = [0x5c; 32];
+
+    /// Backlog 8bd859e5 / 8331811d: the key file is a SOURCE of the signing
+    /// key, so a process can start with no key in its environment. A 0600 or
+    /// 0400 file owned by this uid, with a trailing newline, selects exactly
+    /// the signer the same key in the environment would.
+    #[test]
+    fn a_private_key_file_selects_the_signer() {
+        use epigraph_crypto::AgentSigner;
+        use std::env::VarError;
+
+        let dir = KeyDir::new("ok");
+        let identity = AgentSigner::from_bytes(&[0x5b; 32]).unwrap().public_key();
+        let identity_hex = hex::encode(identity);
+        let want = AgentSigner::from_bytes(&FILE_SECRET).unwrap().public_key();
+        for (name, mode) in [("rw", 0o600), ("ro", 0o400)] {
+            let content = format!("{}\n", hex::encode(FILE_SECRET));
+            let path = dir.file(name, content.as_bytes(), mode);
+            let key =
+                signing_key_source(Err(VarError::NotPresent), Some(path.as_os_str()), my_uid())
+                    .unwrap_or_else(|e| panic!("mode {mode:o}: {e}"))
+                    .expect("the file is a source");
+            let selected = select_signer(
+                None,
+                None,
+                None,
+                None,
+                SeparateSigningKey {
+                    identity_pubkey: Some(&identity_hex),
+                    signing_key: Some(key.as_str()),
+                },
+            )
+            .unwrap_or_else(|e| panic!("mode {mode:o}: {e}"));
+            assert_eq!(selected.signer.public_key(), want, "mode {mode:o}");
+            assert_eq!(selected.identity_public_key, Some(identity));
+        }
+    }
+
+    /// Any group or other permission bit refuses the file, by mode, without
+    /// echoing the key.
+    #[test]
+    fn a_key_file_open_to_group_or_others_is_refused() {
+        let dir = KeyDir::new("mode");
+        let key_hex = hex::encode(FILE_SECRET);
+        for mode in [0o640, 0o620, 0o610, 0o604, 0o602, 0o601, 0o644, 0o660] {
+            let path = dir.file(&format!("m{mode:o}"), key_hex.as_bytes(), mode);
+            let err = read_signing_key_file(&path, my_uid())
+                .expect_err("a group/other bit must be refused");
+            assert!(
+                err.contains(&format!("mode {mode:04o}")) && err.contains("group and others"),
+                "mode {mode:o}: {err}"
+            );
+            assert!(
+                !err.contains(&key_hex[..16]),
+                "the key is never echoed: {err}"
+            );
+        }
+    }
+
+    /// A file owned by another uid is refused (the uid is a parameter so this
+    /// runs without a second user).
+    #[test]
+    fn a_key_file_owned_by_another_uid_is_refused() {
+        let dir = KeyDir::new("owner");
+        let path = dir.file("k", hex::encode(FILE_SECRET).as_bytes(), 0o600);
+        let other = my_uid().wrapping_add(1);
+        let err = read_signing_key_file(&path, other).expect_err("foreign owner");
+        assert!(
+            err.contains(&format!("not by this process's uid {other}")),
+            "{err}"
+        );
+        assert!(read_signing_key_file(&path, my_uid()).is_ok());
+    }
+
+    /// A symlink is never followed (even to a valid key file), and a
+    /// directory or a FIFO is not a key file. The FIFO has no writer: without
+    /// `O_NONBLOCK` the open would block forever instead of being refused.
+    #[test]
+    fn a_symlink_or_non_regular_key_file_is_refused() {
+        let dir = KeyDir::new("kind");
+        let target = dir.file("target", hex::encode(FILE_SECRET).as_bytes(), 0o600);
+        let link = dir.0.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        let err = read_signing_key_file(&link, my_uid()).expect_err("symlink");
+        assert!(err.contains("symlink"), "{err}");
+
+        let sub = dir.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let err = read_signing_key_file(&sub, my_uid()).expect_err("directory");
+        assert!(err.contains("not a regular file"), "{err}");
+
+        let fifo = dir.0.join("fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed");
+        let err = read_signing_key_file(&fifo, my_uid()).expect_err("fifo");
+        assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// Too large, not UTF-8, or missing: each is a refusal, never "no key"
+    /// (which would fall through to another identity).
+    #[test]
+    fn an_oversized_non_utf8_or_missing_key_file_is_refused() {
+        use std::env::VarError;
+        let dir = KeyDir::new("content");
+        let key_hex = hex::encode(FILE_SECRET);
+
+        // At the cap: read whole.
+        let at_cap = format!("{key_hex}{}", " ".repeat(1024 - key_hex.len()));
+        let path = dir.file("at-cap", at_cap.as_bytes(), 0o600);
+        assert_eq!(
+            read_signing_key_file(&path, my_uid()).unwrap().trim(),
+            key_hex
+        );
+
+        let over = format!("{at_cap} ");
+        let path = dir.file("over", over.as_bytes(), 0o600);
+        let err = read_signing_key_file(&path, my_uid()).expect_err("oversized");
+        assert!(err.contains("larger than 1024 bytes"), "{err}");
+
+        let path = dir.file("binary", &[0x30, 0xff, 0x31], 0o600);
+        let err = read_signing_key_file(&path, my_uid()).expect_err("non-UTF-8");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+
+        let missing = dir.0.join("missing");
+        let err = signing_key_source(
+            Err(VarError::NotPresent),
+            Some(missing.as_os_str()),
+            my_uid(),
+        )
+        .expect_err("a missing file is an error, not an unset source");
+        assert!(err.contains("cannot be opened"), "{err}");
+    }
+
+    /// The two sources are exclusive: both set is refused (naming both, not
+    /// the key); an EMPTY variable on either side counts as unset.
+    #[test]
+    fn the_key_variable_and_the_key_file_are_exclusive() {
+        let dir = KeyDir::new("both");
+        let key_hex = hex::encode(FILE_SECRET);
+        let env_hex = "0d".repeat(32);
+        let path = dir.file("k", key_hex.as_bytes(), 0o600);
+
+        let err = signing_key_source(Ok(env_hex.clone()), Some(path.as_os_str()), my_uid())
+            .expect_err("both sources");
+        assert!(
+            err.contains(
+                "EPIGRAPH_AGENT_SIGNING_KEY and EPIGRAPH_AGENT_SIGNING_KEY_FILE are both set"
+            ),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&env_hex[..16]) && !err.contains(&key_hex[..16]),
+            "{err}"
+        );
+
+        let from_file = signing_key_source(Ok(String::new()), Some(path.as_os_str()), my_uid())
+            .unwrap()
+            .expect("an empty key variable leaves the file as the source");
+        assert_eq!(from_file.as_str(), key_hex);
+
+        let from_env = signing_key_source(
+            Ok(env_hex.clone()),
+            Some(std::ffi::OsStr::new("")),
+            my_uid(),
+        )
+        .unwrap()
+        .expect("an empty file variable leaves the env as the source");
+        assert_eq!(from_env.as_str(), env_hex);
+
+        assert!(
+            signing_key_source(Err(std::env::VarError::NotPresent), None, my_uid())
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The separate-signing-key mode is refused on every listener kind and
