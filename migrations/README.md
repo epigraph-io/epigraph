@@ -3417,7 +3417,9 @@ restart.
   `unmark_duplicate.rs::mark_gives_the_canonical_a_factor_for_every_edge_it_inherits`,
   `epigraph-api/tests/bp_atom_level_retire_apply.rs::bp_parallel_supports_and_decomposes_to`
   and `epigraph-cli/tests/decomposes_to_factor_sweep.rs`. Undo: `docs/runbooks/262-undo.sql`
-  (re-states 217's body; swept rows come back only through `--restore`). **Deploy order:**
+  (re-states 217's body; swept rows come back only through `--restore`). Undo 262 BEFORE
+  217: `217-undo.sql` re-states 038's body with no precondition, so run first on a database
+  at 262 it silently drops the skip too. **Deploy order:**
   migrate; deploy the binaries (the cascade change); then `decomposes_to_factor_sweep
   --manifest-out <file>` (dry run; EXPLAIN its selection and pass `--statement-timeout-ms`
   on a large corpus), review, `--manifest-out <new file> --apply --expect <file>` (refused

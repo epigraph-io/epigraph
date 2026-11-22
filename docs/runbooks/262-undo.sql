@@ -18,6 +18,11 @@
 --     migration, never a re-run of 262.
 --
 -- The precondition refuses unless the live body is 262's (md5 of `prosrc`).
+--
+-- ORDER: undo 262 BEFORE 217. `217-undo.sql` has no body precondition and
+-- re-states 038's body unconditionally, so run on a database at 262 it would
+-- silently drop 262's skip as well (new decomposes_to edges would mint
+-- factors again) and leave this undo refusing on a body that is no longer 262's.
 -- ===================================================================
 
 BEGIN;
