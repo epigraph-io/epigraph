@@ -218,12 +218,18 @@ cp .check_sensitive_local.example.yaml .check_sensitive_local.yaml   # then edit
 
 The installer writes both hooks into the clone's own hooks directory
 (`.git/hooks`, shared by linked worktrees), outside the working tree, and they
-run `scripts/check_sensitive.py` from the blob at a **trusted ref**, `origin/main`
-by default (`git config epigraph.sensitiveHookRef <ref>` to change it), never
-from the working tree. A scanner change therefore takes effect once it is
-reviewed and merged (and fetched); a missing ref or blob blocks the commit
-(exit 2). Re-run the installer after updating it; it never overwrites a hook it
-did not write.
+run `scripts/check_sensitive.py` from the blob at a **trusted ref**, never from
+the working tree: `refs/remotes/origin/main` by default. To use another branch,
+`git config epigraph.sensitiveHookRef <branch>` and re-run the installer, which
+expands it to a full refname; the hooks accept only full names under
+`refs/remotes/` or `refs/heads/`, because a short name such as `origin/main` can
+be shadowed by a tag or branch of that name (fetching a fork's remote brings its
+tags). The blob runs under `python3 -I` from a private temp directory, so no
+module planted in a shared temp directory or named by `PYTHON*` variables is
+imported in its place. A scanner change therefore takes effect once it is
+reviewed and merged (and fetched); a missing ref or blob, or a ref that is not
+a full branch name, blocks the commit (exit 2). Re-run the installer after
+updating it; it never overwrites a hook it did not write.
 
 **Do not use `git config core.hooksPath .githooks`** (the setup this section
 used to document), and do not enable any in-tree hooks path in a clone you use

@@ -14,8 +14,10 @@
 #
 # The hooks this script writes live outside the working tree, so no branch can
 # change them, and they run scripts/check_sensitive.py from the blob at a
-# TRUSTED ref (default origin/main; override with
-# `git config epigraph.sensitiveHookRef <ref>`), never from the working tree.
+# TRUSTED ref (default refs/remotes/origin/main; override with
+# `git config epigraph.sensitiveHookRef <branch>` and re-run this script, which
+# expands it to a full refname), never from the working tree, under
+# `python3 -I` from a private temp directory.
 # A missing ref or blob blocks the commit (exit 2) rather than skipping the
 # check. Re-running the script is safe; it never overwrites a hook it did not
 # write.
@@ -59,29 +61,69 @@ for name in pre-commit pre-merge-commit; do
   fi
 done
 
+# The trusted ref is always a FULL refname under refs/remotes/ or refs/heads/:
+# a short name such as `origin/main` can be shadowed by a tag or branch of that
+# name (a remote added to review a fork brings its tags), which git's
+# short-name lookup prefers. A configured short name is expanded here, once,
+# from a trusted state; the hook refuses anything else.
+if configured="$(git config --get epigraph.sensitiveHookRef)"; then
+  case "$configured" in
+    refs/remotes/?*|refs/heads/?*) full="$configured" ;;
+    -*) full= ;;
+    *) full="$(git rev-parse --verify --symbolic-full-name "$configured" 2>/dev/null)" || full= ;;
+  esac
+  case "$full" in
+    refs/remotes/?*|refs/heads/?*) ;;
+    *)
+      say "epigraph.sensitiveHookRef=$configured does not name a branch under refs/remotes/ or refs/heads/"
+      exit 1 ;;
+  esac
+  if [ "$full" != "$configured" ]; then
+    git config epigraph.sensitiveHookRef "$full"
+    say "expanded epigraph.sensitiveHookRef to $full"
+  fi
+fi
+ref="$(git config --get epigraph.sensitiveHookRef || echo refs/remotes/origin/main)"
+if ! git cat-file -e "$ref:scripts/check_sensitive.py" 2>/dev/null; then
+  say "warning: $ref:scripts/check_sensitive.py does not exist yet; commits are blocked until it does (git fetch origin)"
+fi
+
 for name in pre-commit pre-merge-commit; do
   tmp="$(mktemp "$hooks/.$name.XXXXXX")"
-  cat > "$tmp" <<HOOK
-#!/bin/sh
-$MARK
-# Sensitive-data check ($name). Runs scripts/check_sensitive.py from the blob
-# at a trusted ref (git config epigraph.sensitiveHookRef, default origin/main),
+  {
+    printf '#!/bin/sh\n%s\n# Sensitive-data check (%s).\n' "$MARK" "$name"
+    cat <<'HOOK'
+# Runs scripts/check_sensitive.py from the blob at a trusted ref (git config
+# epigraph.sensitiveHookRef, a full refname; default refs/remotes/origin/main),
 # never from the working tree, so a checked-out branch cannot change the code
 # that runs here. Re-run the installer from a trusted checkout to update this
-# file; edit the scanner through a reviewed change to the trusted ref.
-ref=\$(git config --get epigraph.sensitiveHookRef) || ref=origin/main
-blob="\$ref:scripts/check_sensitive.py"
-if ! git cat-file -e "\$blob" 2>/dev/null; then
-  echo "check-sensitive: cannot read \$blob -- refusing to continue (git fetch origin, or set epigraph.sensitiveHookRef)" >&2
+# file; change the scanner through a reviewed change to the trusted ref.
+ref=$(git config --get epigraph.sensitiveHookRef) || ref=refs/remotes/origin/main
+case "$ref" in
+  refs/remotes/?*|refs/heads/?*) ;;
+  *)
+    echo "check-sensitive: epigraph.sensitiveHookRef=$ref is not a full refname under refs/remotes/ or refs/heads/ -- refusing to continue (re-run scripts/install-sensitive-hooks.sh)" >&2
+    exit 2 ;;
+esac
+if ! commit=$(git rev-parse --verify --quiet --end-of-options "$ref^{commit}"); then
+  echo "check-sensitive: cannot resolve $ref -- refusing to continue (git fetch origin, or set epigraph.sensitiveHookRef)" >&2
   exit 2
 fi
-scanner=\$(mktemp "\${TMPDIR:-/tmp}/check_sensitive.XXXXXX") || exit 2
-trap 'rm -f "\$scanner"' EXIT
+if ! git cat-file -e "$commit:scripts/check_sensitive.py" 2>/dev/null; then
+  echo "check-sensitive: $ref has no scripts/check_sensitive.py -- refusing to continue" >&2
+  exit 2
+fi
+# A private directory (mktemp -d is mode 0700) and `python3 -I`: the scanner's
+# own directory and PYTHON* variables stay off sys.path, so no module planted
+# in a shared temp directory or the environment is imported in its place.
+dir=$(mktemp -d "${TMPDIR:-/tmp}/check_sensitive.XXXXXX") || exit 2
+trap 'rm -rf "$dir"' EXIT
 trap 'exit 2' HUP INT TERM
-git cat-file blob "\$blob" > "\$scanner" || exit 2
-python3 "\$scanner"
+git cat-file blob "$commit:scripts/check_sensitive.py" > "$dir/check_sensitive.py" || exit 2
+python3 -I "$dir/check_sensitive.py"
 HOOK
+  } > "$tmp"
   chmod 755 "$tmp"
   mv -f "$tmp" "$hooks/$name"
 done
-say "installed pre-commit and pre-merge-commit in $hooks (scanner from ref: $(git config --get epigraph.sensitiveHookRef || echo origin/main))"
+say "installed pre-commit and pre-merge-commit in $hooks (scanner from $ref)"

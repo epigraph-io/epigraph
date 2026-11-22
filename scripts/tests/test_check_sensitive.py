@@ -576,14 +576,79 @@ def test_the_trusted_ref_is_what_runs_after_it_moves(repo):
     assert_blocked(commit_file(repo, "b.txt", "clean\n"), repo, before + 1)
 
 
-def test_a_configured_trusted_ref_is_honoured(repo):
-    git(repo, "branch", "reviewed")
-    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
-    git(repo, "config", "epigraph.sensitiveHookRef", "reviewed")
+@pytest.mark.parametrize("shadow", ["refs/tags/origin/main", "refs/heads/origin/main"])
+def test_a_ref_named_like_the_trusted_ref_does_not_shadow_it(repo, tmp_path, shadow):
+    # A remote added to review a fork fetches that fork's tags, and a branch
+    # can be named anything. A tag or branch spelled `origin/main` outranks
+    # refs/remotes/origin/main in git's short-name lookup, so the hooks must
+    # resolve the full refname.
+    marker = tmp_path / "scanner-ran"
+    git(repo, "checkout", "-q", "-b", "fork")
+    (repo / SCANNER_PATH).write_text(HOSTILE_SCANNER.format(marker=str(marker)))
+    git(repo, "commit", "-q", "--no-verify", "-am", "hostile scanner")
+    git(repo, "update-ref", shadow, "HEAD")
+    git(repo, "checkout", "-q", "main")
     before = head_count(repo)
     result = commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n")
     assert_blocked(result, repo, before)
     assert "infra.md:1: aws-resource-id" in result.stderr
+    assert not marker.exists(), marker.read_text()
+
+
+def test_the_scanner_does_not_import_modules_from_the_temp_dir(repo, tmp_path):
+    # The scanner blob is written to a temp file; running it must not put a
+    # shared temp directory on sys.path, where another local user could plant
+    # a module the scanner imports (it imports `subprocess`).
+    marker = tmp_path / "module-ran"
+    shared = tmp_path / "shared-tmp"
+    shared.mkdir()
+    (shared / "subprocess.py").write_text(
+        "import pathlib\npathlib.Path(%r).write_text('planted module ran')\n"
+        "raise SystemExit(0)\n" % str(marker))
+    (repo / "infra.md").write_text("host " + INSTANCE_ID + "\n")
+    git(repo, "add", "infra.md")
+    before = head_count(repo)
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add infra.md"],
+        capture_output=True, text=True, env=dict(_env(), TMPDIR=str(shared)),
+    )
+    assert not marker.exists(), marker.read_text()
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+
+
+def test_a_configured_trusted_ref_is_honoured(repo):
+    # Configured by short name, then expanded to its full refname by the
+    # installer, which is what the hooks accept.
+    git(repo, "branch", "reviewed")
+    git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    git(repo, "config", "epigraph.sensitiveHookRef", "reviewed")
+    installed = install_hooks(repo)
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    assert git(repo, "config", "--get", "epigraph.sensitiveHookRef").stdout.strip() \
+        == "refs/heads/reviewed"
+    before = head_count(repo)
+    result = commit_file(repo, "infra.md", "host " + INSTANCE_ID + "\n")
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["origin/main", "HEAD", "--output=x", "refs/tags/v1"])
+def test_a_configured_ref_that_is_not_a_full_branch_name_is_refused(repo, value):
+    git(repo, "config", "epigraph.sensitiveHookRef", value)
+    before = head_count(repo)
+    result = commit_file(repo, "notes.txt", "nothing sensitive here\n")
+    assert_blocked(result, repo, before)
+    assert "refusing" in result.stderr
+
+
+@pytest.mark.parametrize("value", ["refs/tags/v1", "-x"])
+def test_installer_refuses_a_configured_ref_that_is_not_a_branch(repo, value):
+    git(repo, "tag", "v1")
+    git(repo, "config", "epigraph.sensitiveHookRef", value)
+    result = install_hooks(repo)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "epigraph.sensitiveHookRef" in result.stderr
 
 
 def test_a_missing_trusted_ref_fails_closed(repo):

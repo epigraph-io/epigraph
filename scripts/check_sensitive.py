@@ -23,7 +23,7 @@ Enable once per clone:   bash scripts/install-sensitive-hooks.sh   (from main)
 Audit the whole tree:    python3 scripts/check_sensitive.py --all-files
 
 The installed hooks run this file from the blob at a trusted ref (default
-origin/main), not from the working tree, so a checked-out branch cannot change
+refs/remotes/origin/main) under `python3 -I`, not from the working tree, so a checked-out branch cannot change
 the code a commit runs. Do NOT use `git config core.hooksPath .githooks`: that
 runs the checked-out branch's hook code (see scripts/README.md).
 
