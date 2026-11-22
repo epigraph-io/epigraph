@@ -1691,6 +1691,31 @@ pub async fn do_ingest_document_reporting(
     let decl = tx
         .owner_decl(agent_id, "ingest_document", &resolution)
         .await?;
+    // Every NEW atom's `(content_hash, agent)` dedup lock, taken here at once
+    // and in key order, before the walk takes any claim row lock (an edge's
+    // foreign-key share lock, a label merge). Taken one atom at a time in
+    // document order instead, they could deadlock (40P01) against another
+    // multi-pair writer meeting the same new atoms in another order, or
+    // against a consolidation that holds one of them while it waits on a row
+    // this walk already locked (backlog 5b587ae8; see
+    // `ClaimRepository::lock_content_hash_agent`, "Deadlocks and lock-table
+    // use"). The pairs are the ones `persist_planned_claim`'s
+    // `create_signed_reporting_conn` would lock on a miss: the content hash
+    // of the atom's text and the ingesting agent.
+    let atom_pairs: Vec<(Vec<u8>, Uuid)> = plan
+        .claims
+        .iter()
+        .filter(|planned| !planned.id_is_document_scoped())
+        .map(|planned| {
+            (
+                ContentHasher::hash(planned.content.as_bytes()).to_vec(),
+                agent_id,
+            )
+        })
+        .collect();
+    ClaimRepository::lock_new_content_hash_agents(&mut tx, &atom_pairs)
+        .await
+        .map_err(internal_error)?;
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
