@@ -339,14 +339,49 @@ struct EpistemicPacket {
     signature: String,
 }
 
+/// The server's `routes::submit::ClaimSubmission` in the shape the server
+/// RE-serializes it, because the packet signature covers the server's
+/// canonical bytes (`EpistemicPacket::signable_bytes`): `idempotency_key`,
+/// `properties` (`null`) and `labels` (`[]`) are always present, as the
+/// server writes them; an absent `initial_truth` is skipped (the server
+/// refuses `null`).
 #[derive(Debug, Serialize)]
 struct ClaimSubmission {
     content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     initial_truth: Option<f64>,
     agent_id: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
     idempotency_key: Option<String>,
+    properties: Option<serde_json::Value>,
+    labels: Vec<String>,
+}
+
+/// The bytes the submit route verifies a packet signature over: the canonical
+/// JSON of `(claim, evidence, reasoning_trace)`, signature excluded, as the
+/// server's `EpistemicPacket::signable_bytes` builds them.
+#[derive(Serialize)]
+struct PacketSignable<'a> {
+    claim: &'a ClaimSubmission,
+    evidence: &'a [EvidenceSubmission],
+    reasoning_trace: &'a ReasoningTraceSubmission,
+}
+
+/// The packet signature: raw Ed25519 by the claim's agent over
+/// [`PacketSignable`], which the server checks when
+/// `EPIGRAPH_REQUIRE_SIGNATURES` is on.
+fn packet_signature(
+    signer: &AgentSigner,
+    claim: &ClaimSubmission,
+    evidence: &[EvidenceSubmission],
+    reasoning_trace: &ReasoningTraceSubmission,
+) -> String {
+    let canonical = epigraph_crypto::to_canonical_bytes(&PacketSignable {
+        claim,
+        evidence,
+        reasoning_trace,
+    })
+    .expect("a packet of strings, numbers and JSON values always serializes");
+    hex::encode(signer.sign(&canonical))
 }
 
 #[derive(Debug, Serialize)]
@@ -626,12 +661,14 @@ fn build_packets(
                 initial_truth: None, // Let the engine calculate from evidence
                 agent_id,
                 idempotency_key: None,
+                properties: None,
+                labels: Vec::new(),
             };
 
-            // The submit/packet endpoint requires a placeholder signature (128 hex zeros)
-            // until Ed25519 verification is wired up server-side. Real signatures are
-            // rejected by the current server implementation (see submit.rs validation).
-            let packet_signature = "0".repeat(128);
+            // Signed over the submit route's canonical bytes, so the packet
+            // passes with EPIGRAPH_REQUIRE_SIGNATURES on.
+            let packet_signature =
+                packet_signature(signer, &claim_submission, &evidence_items, &trace);
 
             EpistemicPacket {
                 claim: claim_submission,
@@ -1942,5 +1979,46 @@ mod tests {
         );
         assert_eq!(packets[0].evidence.len(), 2, "passage + figure");
         assert_eq!(withheld_summary(&extraction, true), None);
+    }
+
+    // =========================================================================
+    // PACKET SIGNATURE (sibling of backlog 7d9e60c6)
+    // =========================================================================
+
+    /// What `routes/submit.rs` does with `require_packet_signatures` on: parse
+    /// the wire JSON into the server's packet, recompute `signable_bytes()`,
+    /// verify the signature under the claim agent's key.
+    fn server_accepts(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
+        let wire = serde_json::to_value(packet).expect("client packet serializes");
+        let server: epigraph_api::routes::submit::EpistemicPacket =
+            serde_json::from_value(wire).expect("server parses the client packet");
+        let canonical = server.signable_bytes().expect("canonical bytes");
+        let Ok(sig) = <[u8; 64]>::try_from(hex::decode(&server.signature).unwrap()) else {
+            return false;
+        };
+        epigraph_crypto::SignatureVerifier::verify(&signer.public_key(), &canonical, &sig)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn literature_packets_verify_like_the_server() {
+        let signer = AgentSigner::generate();
+        // Open licence: a text passage AND a figure in the signed evidence.
+        let open = build_packets(
+            &licensed_extraction(Some("CC-BY-4.0")),
+            &signer,
+            Uuid::new_v4(),
+            false,
+        );
+        // Withheld: the locator + hash body.
+        let withheld = build_packets(&licensed_extraction(None), &signer, Uuid::new_v4(), false);
+        for p in open.iter().chain(&withheld) {
+            assert_ne!(p.signature, "0".repeat(128), "no placeholder signature");
+            assert!(
+                server_accepts(p, &signer),
+                "a literature packet must pass require_packet_signatures verification"
+            );
+            assert!(!server_accepts(p, &AgentSigner::generate()));
+        }
     }
 }
