@@ -878,7 +878,8 @@ fn pending_replays(dsn: &str) -> i64 {
 ///
 /// The intermediate supersede (successor -> head) runs with its own edge
 /// migration inline (`supersede_conn`), as a request path's applied cascade
-/// does, so only the custodial deferral is pending when the replay runs.
+/// does, so only the custodial deferral is pending when the replay runs. The
+/// replay runs on real maintenance and application logins.
 ///
 /// Verified to fail on the base: the replay migrated onto the recorded
 /// successor (`migrate_superseded_edges_conn(old, new)`), so the edges ended on
@@ -941,7 +942,12 @@ async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool:
         "precondition: only the custodial deferral is pending"
     );
 
-    let r = replay(&dsn, &dsn);
+    // The replay as production runs it: REAL maintenance and application
+    // logins (`NOSUPERUSER NOBYPASSRLS`), so the chain walk reads the retired
+    // successor through row security, not as a superuser.
+    let (maint_role, maint_dsn) = create_login(&pool, "epigraph_maintenance").await;
+    let (app_role, app_dsn) = create_login(&pool, "epigraph_app").await;
+    let r = replay(&app_dsn, &maint_dsn);
     assert_eq!(r.code, 0, "{}", r.show());
     let report: serde_json::Value = serde_json::from_str(r.stdout.trim()).expect("replay JSON");
     assert_eq!(report["applied"], 1, "{report}");
@@ -1013,6 +1019,9 @@ async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool:
         serde_json::json!([head]),
         "the ids row names the head: {ids}"
     );
+
+    drop_login(&pool, &maint_role).await;
+    drop_login(&pool, &app_role).await;
 }
 
 /// Whether `claim` carries an embedding.
