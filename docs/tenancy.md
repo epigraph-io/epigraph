@@ -2318,9 +2318,11 @@ order of the two steps is the one §6.5.5 gives for any stop:
    a sealed item is refused until those items are unsealed.
 
 Both are privatization lifecycle routes, so they answer only on a deployment
-that attaches a maintenance pool to the API; under operator decision D9 the
-server attaches none and they answer 501. Before deploying a `drain_jobs` with
-this check, list the plans it will report (`SELECT id, state FROM
-privatization_plans WHERE state IN ('applying', 'reverting')` on the
-maintenance login, then look for a live job naming each one): every one of
-them makes every run exit 5 until it is recovered.
+that attaches a maintenance pool to the API; the stock server attaches none
+(see "Maintenance work lives in timers and operator CLIs" above), and there
+they answer 501. On such a deployment no route recovers a stranded plan
+yet, and the drain keeps reporting it (exit 5). Before deploying a
+`drain_jobs` with this check, list the plans it will report (`SELECT id,
+state FROM privatization_plans WHERE state IN ('applying', 'reverting')` on
+the maintenance login, then look for a live job naming each one): every one
+of them makes every run exit 5 until it is recovered.
