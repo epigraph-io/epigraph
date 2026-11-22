@@ -2322,6 +2322,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 254 (backlog 7149132e), the cycle walk of MCP `link_hierarchical`'s
+    // workflow references (`EdgeRepository::reaches_in_force_conn`). Its read
+    // of the FORCEd `edges` is admitted by `epigraph_definer_bypass()` (the
+    // owner). Under a non-member owner the walk is row-security filtered to
+    // the calling session's stamp, so a cycle closed through an edge that
+    // session cannot read is admitted: fail OPEN, the defect the function
+    // closes. The owner is load-bearing.
+    ("epigraph_edges_reach", 254),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

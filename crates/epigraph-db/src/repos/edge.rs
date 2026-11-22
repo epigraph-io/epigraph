@@ -2292,10 +2292,13 @@ impl EdgeRepository {
     /// discards a node already reached, so it terminates on a graph that
     /// already holds a cycle.
     ///
-    /// Run it on the writer's STAMPED transaction: `edges_tenancy` bounds the
-    /// walk to edges that session reads, so an edge it cannot see does not
-    /// count toward a cycle (a cycle closed only through another group's
-    /// private edge is not refused).
+    /// The walk runs in migration 254's SECURITY DEFINER
+    /// `public.epigraph_edges_reach`, which reads every in-force edge whatever
+    /// the session's stamp (backlog 7149132e): a cycle closed through an edge
+    /// the caller cannot read is still a cycle. It returns only the boolean,
+    /// so the caller learns nothing about which edges closed the path. The
+    /// definer walks only `invokes`, `executes` and `depends_on` and refuses
+    /// any other relationship (22023, surfaced as `QueryFailed`).
     ///
     /// It first takes a transaction-scoped advisory lock keyed on the walked
     /// relationship set, held until the caller's transaction ends. Two
@@ -2303,10 +2306,13 @@ impl EdgeRepository {
     /// insert one after the other: the second's walk runs on a fresh READ
     /// COMMITTED snapshot that sees the first's committed edge, so the pair
     /// cannot both pass and commit a 2-cycle. Call it on the transaction that
-    /// then writes the edge.
+    /// then writes the edge. The lock and the walk are two statements on
+    /// purpose: the definer is STABLE and reads its calling statement's
+    /// snapshot, so the walk's statement must start after the lock is held.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
+    /// Returns `DbError::QueryFailed` if the database query fails, including
+    /// on a database without migration 254 (42883): the guard fails closed.
     #[instrument(skip(conn))]
     pub async fn reaches_in_force_conn(
         conn: &mut sqlx::PgConnection,
@@ -2321,21 +2327,12 @@ impl EdgeRepository {
             .bind(format!("edges.reaches:{}", key.join(",")))
             .execute(&mut *conn)
             .await?;
-        let reached: bool = sqlx::query_scalar(&format!(
-            "WITH RECURSIVE reach(node) AS ( \
-                 SELECT $1::uuid \
-               UNION \
-                 SELECT e.target_id FROM reach r \
-                   JOIN edges e ON e.source_id = r.node \
-                  WHERE e.relationship = ANY($3) AND {EDGE_IN_FORCE} \
-             ) \
-             SELECT EXISTS (SELECT 1 FROM reach WHERE node = $2)"
-        ))
-        .bind(from)
-        .bind(to)
-        .bind(&rels)
-        .fetch_one(&mut *conn)
-        .await?;
+        let reached: bool = sqlx::query_scalar("SELECT public.epigraph_edges_reach($1, $2, $3)")
+            .bind(from)
+            .bind(to)
+            .bind(&rels)
+            .fetch_one(&mut *conn)
+            .await?;
         Ok(reached)
     }
 
