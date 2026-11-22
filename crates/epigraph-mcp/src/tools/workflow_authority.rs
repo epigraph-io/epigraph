@@ -732,10 +732,14 @@ pub(crate) async fn audit_admin_workflow_write(
             "{tool_name}: an admin workflow write with no token to audit. Nothing was written."
         )));
     };
+    // The admin arm needs a token, so its row is always an authenticated
+    // call's; it states so, as every `workflows.caller_write` row states its
+    // transport (backlog 26a436c6).
     let record = serde_json::json!({
         "action": tool_name,
         "workflow_id": workflow_id,
         "submitter": submitter,
+        "transport": "http",
         "write": details,
     });
     // Migration 112's definer, not an INSERT: the audit row is written with

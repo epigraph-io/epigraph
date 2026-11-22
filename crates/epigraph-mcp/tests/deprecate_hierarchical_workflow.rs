@@ -288,10 +288,13 @@ fn ids(body: &serde_json::Value, key: &str) -> Vec<String> {
     v
 }
 
+/// The `workflows.admin_write` rows attributed to `admin`. Every one must state
+/// its transport (backlog 26a436c6), so a row without it is not counted.
 async fn workflow_admin_audits(pool: &PgPool, admin: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM security_events \
-          WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
+          WHERE event_type = 'workflows.admin_write' AND agent_id = $1 \
+            AND details->>'transport' = 'http'",
     )
     .bind(admin)
     .fetch_one(pool)

@@ -308,6 +308,7 @@ fn assert_provenance(
         "{d}"
     );
     assert!(d.get("binding").is_none(), "no binding field: {d}");
+    assert_eq!(d["transport"], "http", "{d}");
     assert_eq!(d["client_id"], auth.client_id.to_string(), "{d}");
     assert_eq!(d["token_jti"], auth.jti.to_string(), "{d}");
 }

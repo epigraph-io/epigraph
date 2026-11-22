@@ -3246,6 +3246,9 @@ async fn record_api_caller_workflow_write(
         "acting_agent": acting,
         "operator": operator,
         "owner_group": owner_group,
+        // Every row states its transport, as the MCP twin's rows do (backlog
+        // 26a436c6): a reader never infers "http" from an absent field.
+        "transport": "http",
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
         "write": details,
@@ -3318,6 +3321,7 @@ async fn audit_api_admin_workflow_write(
         "action": action,
         "workflow_id": workflow_id,
         "submitter": submitter,
+        "transport": "http",
         "write": details,
     });
     // Migration 112's definer: this transaction is stamped from the system
@@ -5688,8 +5692,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, before + 1);
-        let submitter_kinds: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT jsonb_typeof(details->'submitter') FROM security_events \
+        let submitter_kinds: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT jsonb_typeof(details->'submitter'), details->>'transport' \
+               FROM security_events \
               WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
         )
         .bind(admin_agent)
@@ -5698,8 +5703,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             submitter_kinds,
-            vec![Some("null".to_string())],
-            "one audit row, \"submitter\": null"
+            vec![(Some("null".to_string()), Some("http".to_string()))],
+            "one audit row, \"submitter\": null, stating its transport"
         );
 
         // The ingester writes the row's owner group: admitted through the
@@ -5968,6 +5973,7 @@ mod tests {
         assert_eq!(d["operator"], serde_json::Value::Null);
         assert_eq!(d["client_id"], h_client.to_string());
         assert_eq!(d["token_jti"], auth.jti.to_string());
+        assert_eq!(d["transport"], "http", "the row states its transport");
         assert_eq!(d["write"]["step_claim_id"], step.as_str());
     }
 }
