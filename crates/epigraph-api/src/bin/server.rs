@@ -644,6 +644,7 @@ async fn main() {
             .with_run_tokens(run_tokens_from_env())
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
+            .with_oauth_redirect_origins(oauth_redirect_origins_from_env())
             .with_bp_apply(bp_apply_from_env())
             .with_guest_reads(guest_reads)
             .with_passkeys(passkeys)
@@ -1072,6 +1073,24 @@ fn token_exchange_audiences_from_env() -> epigraph_api::oauth::token_exchange::T
         );
     }
     audiences
+}
+
+/// `EPIGRAPH_OAUTH_REDIRECT_ORIGINS`, read once at boot: the extra HTTPS
+/// origins `/oauth/register` accepts redirect URIs on. An entry that is not
+/// exactly an https origin REFUSES the boot, so a typo never silently changes
+/// the allowlist. Logged when set.
+#[cfg(feature = "db")]
+fn oauth_redirect_origins_from_env() -> epigraph_api::oauth::redirect::RedirectOrigins {
+    let origins = epigraph_api::oauth::redirect::RedirectOrigins::from_env()
+        .unwrap_or_else(|e| panic!("refusing to start: {e}"));
+    if !origins.to_strings().is_empty() {
+        tracing::warn!(
+            origins = ?origins.to_strings(),
+            "extra OAuth redirect origins configured: dynamic client registration accepts \
+             redirect URIs on these origins"
+        );
+    }
+    origins
 }
 
 /// `EPIGRAPH_RUN_TOKENS`, read once at boot: whether this process admits a
