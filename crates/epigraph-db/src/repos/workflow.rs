@@ -3038,12 +3038,23 @@ impl WorkflowRepository {
     ///   walked from its head, and the paths are concatenated in the plan
     ///   order of their EARLIEST member, so a phase's chain stays in its
     ///   phase's place even when `add_step` put an unindexed step at its head.
-    /// * When the pairs do not describe disjoint simple paths over the set (a
-    ///   step with two successors or two predecessors, or a cycle), there is
-    ///   no single chain to follow, and `plan_order` is returned unchanged.
-    ///   That is the shape two generations of one `canonical_name` produce
-    ///   when they keep the same step texts in a different order: their step
-    ///   claims, and so their `step_follows` edges, are shared.
+    /// * A pair IMPLIED by a longer path over the set is dropped before the
+    ///   walk: with `a -> x -> b` present, `a -> b` says nothing more. That is
+    ///   the shape `add_step` leaves when it inserts `x` between `a` and `b`
+    ///   while another generation of the same `canonical_name` still executes
+    ///   both: the shared `a -> b` edge stays, because that generation's own
+    ///   chain is `a -> b` (backlog 14335111). The reduction is computed only
+    ///   on an acyclic pair set, where it is unique; it can change no answer
+    ///   that was already a chain, because in disjoint simple paths every
+    ///   step has at most one successor and no pair is implied by another
+    ///   path.
+    /// * When the remaining pairs do not describe disjoint simple paths over
+    ///   the set (a step with two successors or two predecessors, or a
+    ///   cycle), there is no single chain to follow, and `plan_order` is
+    ///   returned unchanged. That is the shape two generations of one
+    ///   `canonical_name` produce when they keep the same step texts in a
+    ///   different order: their step claims, and so their `step_follows`
+    ///   edges, are shared.
     #[must_use]
     pub fn order_by_step_follows(plan_order: &[Uuid], follows: &[(Uuid, Uuid)]) -> Vec<Uuid> {
         let rank: HashMap<Uuid, usize> = plan_order
@@ -3055,12 +3066,13 @@ impl WorkflowRepository {
             // One claim on two `executes` edges: no single position to give it.
             return plan_order.to_vec();
         }
+        let Some(follows) = Self::reduce_implied_follows(&rank, follows) else {
+            // A cycle: no order to walk.
+            return plan_order.to_vec();
+        };
         let mut next: HashMap<Uuid, Uuid> = HashMap::new();
         let mut prev: HashMap<Uuid, Uuid> = HashMap::new();
-        for (a, b) in follows {
-            if a == b || !rank.contains_key(a) || !rank.contains_key(b) {
-                continue;
-            }
+        for (a, b) in &follows {
             match next.get(a) {
                 Some(existing) if existing != b => return plan_order.to_vec(),
                 _ => {}
@@ -3098,6 +3110,82 @@ impl WorkflowRepository {
         }
         paths.sort_by_key(|(earliest, _)| *earliest);
         paths.into_iter().flat_map(|(_, path)| path).collect()
+    }
+
+    /// The distinct `follows` pairs over `rank`'s members (self-pairs and
+    /// pairs with an end outside the set dropped), minus every pair `a -> b`
+    /// for which `b` is also reachable from another successor of `a`: the
+    /// transitive reduction of the pair graph. `None` when the pairs contain a
+    /// cycle, where no reduction is unique and the caller falls back to plan
+    /// order anyway.
+    fn reduce_implied_follows(
+        rank: &HashMap<Uuid, usize>,
+        follows: &[(Uuid, Uuid)],
+    ) -> Option<Vec<(Uuid, Uuid)>> {
+        let mut pairs: Vec<(Uuid, Uuid)> = Vec::new();
+        let mut distinct: std::collections::HashSet<(Uuid, Uuid)> =
+            std::collections::HashSet::new();
+        let mut succ: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for (a, b) in follows {
+            if a == b || !rank.contains_key(a) || !rank.contains_key(b) || !distinct.insert((*a, *b))
+            {
+                continue;
+            }
+            pairs.push((*a, *b));
+            succ.entry(*a).or_default().push(*b);
+        }
+
+        // Kahn's algorithm: every node is removed exactly when the pairs are
+        // acyclic.
+        let mut indegree: HashMap<Uuid, usize> = rank.keys().map(|id| (*id, 0)).collect();
+        for (_, b) in &pairs {
+            *indegree.entry(*b).or_default() += 1;
+        }
+        let mut ready: Vec<Uuid> = indegree
+            .iter()
+            .filter(|(_, d)| **d == 0)
+            .map(|(id, _)| *id)
+            .collect();
+        let mut removed = 0usize;
+        while let Some(id) = ready.pop() {
+            removed += 1;
+            for n in succ.get(&id).map(Vec::as_slice).unwrap_or_default() {
+                let d = indegree.get_mut(n).expect("every successor is a member");
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(*n);
+                }
+            }
+        }
+        if removed != rank.len() {
+            return None;
+        }
+
+        // `b` reachable from `from` without using the direct pair `a -> b`.
+        let reaches = |from: Uuid, target: Uuid| -> bool {
+            let mut stack = vec![from];
+            let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+            while let Some(cur) = stack.pop() {
+                if cur == target {
+                    return true;
+                }
+                if seen.insert(cur) {
+                    stack.extend(succ.get(&cur).into_iter().flatten().copied());
+                }
+            }
+            false
+        };
+        Some(
+            pairs
+                .iter()
+                .copied()
+                .filter(|(a, b)| {
+                    !succ[a]
+                        .iter()
+                        .any(|other| other != b && reaches(*other, *b))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -3246,6 +3334,52 @@ mod tests {
             vec![(a, b), (a, c)],
             vec![(a, c), (b, c)],
             vec![(a, b), (b, c), (c, a)],
+        ] {
+            assert_eq!(
+                WorkflowRepository::order_by_step_follows(&plan, &follows),
+                plan,
+                "{follows:?}"
+            );
+        }
+    }
+
+    /// `add_step` inserted `x` between `a` and `b` in one generation and kept
+    /// `a -> b` because another generation still executes both: the pair is
+    /// implied by `a -> x -> b` and the chain is `a, x, b, c`. A pair implied
+    /// through a longer detour is dropped the same way. The other generation,
+    /// which does not execute `x`, still reads `a -> b`.
+    #[test]
+    fn a_pair_implied_by_a_longer_path_does_not_fork_the_chain() {
+        let v = ids(5);
+        let (a, b, c, x, y) = (v[0], v[1], v[2], v[3], v[4]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[a, b, c, x],
+            &[(a, b), (a, x), (x, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, x, b, c]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[a, b, c, x, y],
+            &[(a, b), (a, x), (x, y), (y, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, x, y, b, c]);
+        let got = WorkflowRepository::order_by_step_follows(
+            &[c, b, a],
+            &[(a, b), (a, x), (x, b), (b, c)],
+        );
+        assert_eq!(got, vec![a, b, c], "the generation without x");
+    }
+
+    /// The reduction drops only IMPLIED pairs: a fork whose branches never
+    /// meet, or a cycle with an implied-looking chord, still falls back.
+    #[test]
+    fn the_reduction_does_not_resolve_a_real_fork_or_a_cycle() {
+        let v = ids(4);
+        let (a, b, c, d) = (v[0], v[1], v[2], v[3]);
+        let plan = vec![a, b, c, d];
+        for follows in [
+            vec![(a, b), (a, c), (c, d)],
+            vec![(a, b), (b, c), (a, c), (c, a)],
+            vec![(a, b), (b, c), (c, d), (a, d), (d, b)],
         ] {
             assert_eq!(
                 WorkflowRepository::order_by_step_follows(&plan, &follows),
