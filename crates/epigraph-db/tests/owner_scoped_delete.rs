@@ -2455,7 +2455,15 @@ async fn endpoints(pool: &PgPool, edge: Uuid) -> (Uuid, Uuid) {
 /// that is not the repair of a committed act: before the act, with a pair the
 /// claims do not record, and (the supersede migration) on the application role
 /// after the act. Only the matching pair on the maintenance connection moves
-/// the other writer's edge.
+/// the other writer's edge. The administrative cascade's entry point
+/// (`migrate_superseded_edges_to_head_conn`, which follows the replacement's
+/// supersedes chain to its current head) refuses the same three calls, with
+/// the same reasons.
+///
+/// Verified to fail with `require_privileged_session` removed from
+/// `migrate_superseded_edges_to_head_conn` (the application-role call no
+/// longer refuses as unprivileged) and with its act verification removed (the
+/// pre-act `(old, decoy)` call moves X's edge onto the decoy).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -2469,9 +2477,13 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
     let into_old = fixture::seed_edge(&pool, xc, old).await;
     let into_dup = fixture::seed_edge(&pool, xc, dup).await;
     assert_app_role_does_not_bypass(&pool).await;
+    // The maintenance session's bypass viewer, which the cascade's entry
+    // point reads the act and the chain through.
+    let (_scoped, bv) = fixture::bypass(&pool).await;
 
     // Before any act: both repairs refuse on the maintenance connection.
-    let (sup_pre, dup_pre) =
+    let v = &bv;
+    let (sup_pre, dup_pre, head_pre) =
         fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
             let a =
                 epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
@@ -2482,10 +2494,18 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
                 epigraph_core::ClaimId::from_uuid(canonical),
             )
             .await;
-            (conn, (a, b))
+            let c = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, decoy,
+            )
+            .await;
+            (conn, (a, b, c))
         })
         .await;
     let e = sup_pre.expect_err("no supersession happened: the migration refuses");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
+    let e = head_pre
+        .map(|_| ())
+        .expect_err("no supersession happened: the cascade's migration refuses");
     assert!(e.to_string().contains("does not supersede"), "{e}");
     let e = dup_pre.expect_err("no dedup happened: the repair refuses");
     assert!(e.to_string().contains("not a retired duplicate"), "{e}");
@@ -2494,45 +2514,56 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
 
     // W's two acts, on the application role.
     let p = pool.clone();
-    let (new_id, on_app) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-        use sqlx::Acquire;
-        stamp(&mut conn, &p, w).await;
-        let new_id = {
-            let mut tx = conn.begin().await.expect("begin");
-            let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
-                &mut tx,
-                None,
-                epigraph_core::ClaimId::from_uuid(old),
-                "W's corrected claim",
-                epigraph_core::TruthValue::clamped(0.6),
-                "a correction",
-                epigraph_db::SupersedeActor::new(w, epigraph_db::SupersedeTool::SupersedeClaim),
+    let v = &bv;
+    let (new_id, on_app, head_on_app) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            use sqlx::Acquire;
+            stamp(&mut conn, &p, w).await;
+            let new_id = {
+                let mut tx = conn.begin().await.expect("begin");
+                let (n, _) = epigraph_db::ClaimRepository::supersede_act_conn(
+                    &mut tx,
+                    None,
+                    epigraph_core::ClaimId::from_uuid(old),
+                    "W's corrected claim",
+                    epigraph_core::TruthValue::clamped(0.6),
+                    "a correction",
+                    epigraph_db::SupersedeActor::new(w, epigraph_db::SupersedeTool::SupersedeClaim),
+                )
+                .await
+                .expect("W supersedes its own claim on the app role");
+                tx.commit().await.expect("commit the act");
+                n
+            };
+            epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+                &mut conn,
+                epigraph_core::ClaimId::from_uuid(dup),
+                epigraph_core::ClaimId::from_uuid(canonical),
             )
             .await
-            .expect("W supersedes its own claim on the app role");
-            tx.commit().await.expect("commit the act");
-            n
-        };
-        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
-            &mut conn,
-            epigraph_core::ClaimId::from_uuid(dup),
-            epigraph_core::ClaimId::from_uuid(canonical),
-        )
-        .await
-        .expect("W marks its own duplicate on the app role");
-        // The supersede migration on W's own application session, AFTER the act.
-        let on_app =
-            epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
-                .await;
-        (conn, (new_id, on_app))
-    })
-    .await;
+            .expect("W marks its own duplicate on the app role");
+            // The supersede migration on W's own application session, AFTER the act.
+            let on_app =
+                epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, new_id)
+                    .await;
+            let head_on_app = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, new_id,
+            )
+            .await;
+            (conn, (new_id, on_app, head_on_app))
+        })
+        .await;
     let e = on_app.expect_err("the supersede migration is not the application role's to run");
+    assert!(e.to_string().contains("privileged"), "{e}");
+    let e = head_on_app
+        .map(|_| ())
+        .expect_err("the cascade's migration is not the application role's to run");
     assert!(e.to_string().contains("privileged"), "{e}");
     assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
 
     // After the acts, a mismatched pair still refuses.
-    let (sup_bad, dup_bad) =
+    let v = &bv;
+    let (sup_bad, dup_bad, head_bad) =
         fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
             let a =
                 epigraph_db::ClaimRepository::migrate_superseded_edges_conn(&mut conn, old, decoy)
@@ -2543,10 +2574,18 @@ async fn the_repairs_refuse_every_call_that_is_not_a_committed_acts_repair(pool:
                 epigraph_core::ClaimId::from_uuid(decoy),
             )
             .await;
-            (conn, (a, b))
+            let c = epigraph_db::ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut conn, v, old, decoy,
+            )
+            .await;
+            (conn, (a, b, c))
         })
         .await;
     assert!(sup_bad.is_err(), "a replacement the claims do not record");
+    let e = head_bad
+        .map(|_| ())
+        .expect_err("the cascade's migration: a replacement the claims do not record");
+    assert!(e.to_string().contains("does not supersede"), "{e}");
     assert!(dup_bad.is_err(), "a canonical the claims do not record");
     assert_eq!(endpoints(&pool, into_old).await.0, old, "nothing moved");
     assert_eq!(endpoints(&pool, into_dup).await.0, dup, "nothing moved");
