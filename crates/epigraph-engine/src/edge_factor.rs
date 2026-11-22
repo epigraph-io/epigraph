@@ -2117,11 +2117,11 @@ pub async fn recompute_atom_cache(
 /// site is wired (PR-5b1), as `retraction_cascade` chooses it today.
 ///
 /// **Derivation scope.** Under the AEF the fold reads only the rows
-/// [`crate::derivation_scope::retain_atom_rows_for_cache`] admits (every
-/// source at least as widely readable as the atom), whoever `viewer` is: a
-/// group member's write never carries its group's sources into the one
-/// cache everyone reads. When the atom has AEF input and none of it is
-/// admitted, an atom with a fold cache gets the explicit vacuous value
+/// [`crate::atom_items::atom_cache_rows_under`] admits (every source at least
+/// as widely readable as the atom, decided before the seed rule), whoever
+/// `viewer` is: a group member's write never carries its group's sources into
+/// the one cache everyone reads. When the atom has AEF input and none of it
+/// is admitted, an atom with a fold cache gets the explicit vacuous value
 /// ([`AtomCacheOutcome::Vacated`], logged under target
 /// `epigraph::atom_cache::scope_vacate` when the cache took it, apart from
 /// the evidence-removal vacate list); one without a cache is left without.
@@ -2144,7 +2144,7 @@ pub async fn recompute_atom_cache_with(
     legacy: LegacyFold,
     settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    use crate::atom_items::{atom_axiom_rows_under, atom_fold_under, AtomFoldMode, AxiomMode};
+    use crate::atom_items::{atom_cache_rows_under, atom_fold_under, AtomFoldMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     if let CacheWriteCause::EvidenceRemoved(before) = cause {
@@ -2194,35 +2194,37 @@ pub async fn recompute_atom_cache_with(
     let ctx = crate::belief_query::FramedBeliefContext::global();
     // The classifier reads the same profile the fold runs under.
     let thresholds = ctx.profile().classifier.thresholds();
-    let rows = atom_axiom_rows_under(
-        &mut *conn,
-        viewer,
-        &[claim_id],
-        AxiomMode::Display,
-        &ctx,
-        settings.compound_source_edges,
-    )
-    .await?
-    .remove(&claim_id)
-    .unwrap_or_default();
-
     // The derivation-scope rule (backlog c2ef65a0, as the claim cache applies
     // it in `compute_combined_belief_over`): the cache is served to everyone
     // who can read the atom, so it folds only the rows whose every source is
-    // at least as widely readable as the atom. Filtered before anything reads
-    // the rows: `has_opposing` below iterates them too. The empty-fold rule
-    // below still reads the unfiltered input, as `aef_input_before` does.
-    let had_rows = !rows.is_empty();
-    let rows = crate::derivation_scope::retain_atom_rows_for_cache(&mut *conn, rows)
-        .await
-        .map_err(|e| format!("derivation scope read: {e}"))?;
-    if had_rows && rows.is_empty() {
+    // at least as widely readable as the atom. The read applies it BEFORE the
+    // seed rule, so a seed is never dropped for input the cache does not
+    // fold. Filtered before anything reads the rows: `has_opposing` below
+    // iterates them too. `had_input` is the input before the rule, as
+    // `aef_input_before` reads it.
+    let mut read = atom_cache_rows_under(
+        &mut *conn,
+        viewer,
+        &[claim_id],
+        &ctx,
+        settings.compound_source_edges,
+    )
+    .await?;
+    let had_input = read.had_input.contains(&claim_id);
+    let rows = read.rows.remove(&claim_id).unwrap_or_default();
+    if had_input && rows.is_empty() {
         // Input exists but none of it may enter the cache. The cache, if any,
         // was folded from sources narrower than the atom (a source narrowed
         // after the fact, or a cache written before the rule), so it is
-        // vacated, as the claim cache's recompute vacates it. An atom with no
-        // cache gets none: a vacuous value written where there was none
-        // would tell its readers that an unseen BBA exists.
+        // vacated. The gate is the claim cache's widening-act gate
+        // (`VacateGate::OwnerFrame`: any fold cache), stricter than its
+        // ordinary recompute gate (`VacateGate::ClaimWide`, which keeps the
+        // cache when an input on a frame this fold does not read is
+        // admissible), and it does not wait for `vacate_on_evidence_removal`:
+        // a cache this fold cannot reproduce from rows its readers may see is
+        // not kept. An atom with no cache gets none: a vacuous value written
+        // where there was none would tell its readers that an unseen BBA
+        // exists.
         let has_cache =
             epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_has_fold_cache(
                 &mut *conn, viewer, claim_id,
@@ -2331,8 +2333,8 @@ pub enum VacateOutcome {
 /// it for those. The single atom-cache writer writes it on its own in two
 /// cases only, neither of them residue: an atom that lost all its AEF input
 /// to a lifecycle act, and an atom that HAS AEF input of which the
-/// derivation-scope rule admits none to its cache (as the claim cache's
-/// recompute vacates such a claim); see [`recompute_atom_cache_with`].
+/// derivation-scope rule admits none to its cache (under the claim cache's
+/// widening-act gate: any fold cache); see [`recompute_atom_cache_with`].
 ///
 /// # Errors
 /// A database read or write.

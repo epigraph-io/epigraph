@@ -315,6 +315,85 @@ async fn an_atom_whose_only_input_is_private_derived_is_vacated_or_left_without_
     );
 }
 
+/// The scope rule runs BEFORE the seed rule. A public atom whose only public
+/// input is its reliability-1 `truth_value_seed` of .7 folds to BetP .85; a
+/// group-private edge factor beside it is no input to the cache, so it must
+/// not count against the seed either. Before the fix the read dropped the
+/// seed (other input existed), the scope filter then dropped the private
+/// row, and the writer vacated the atom to .5.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_seed_still_folds_beside_a_private_edge_factor(pool: PgPool) {
+    let s = seed(&pool, "atom-scope-seed").await;
+    let target = fixture::seed_public_claim(&pool, s.author, "atom scope seeded target").await;
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &s.public)
+        .await
+        .expect("binary_truth");
+    let seed_row = MassFunctionRepository::store_with_perspective(
+        &pool,
+        target,
+        frame,
+        Some(s.author),
+        None,
+        &serde_json::json!({"0": 0.7, "0,1": 0.3}),
+        None,
+        Some("truth_value_seed"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store the seed");
+
+    // The oracle: the seed alone.
+    let AtomCacheOutcome::Folded {
+        interval: seed_only,
+        written: true,
+    } = write_as(&pool, &s.public, target).await
+    else {
+        panic!("PREMISE: the seed folds and is written");
+    };
+    assert!(
+        (seed_only.pignistic_prob() - 0.85).abs() < TOL,
+        "PREMISE: a reliability-1 seed of .7 is BetP .85, got {}",
+        seed_only.pignistic_prob()
+    );
+
+    let private_row = private_edge_factor(&pool, &s, target).await;
+    let member_rows = aef_rows(&pool, &s.member_viewer, target).await;
+    assert!(
+        member_rows.iter().any(|r| r.row_id() == private_row)
+            && member_rows.iter().all(|r| r.row_id() != seed_row),
+        "PREMISE: the member's AEF input is the private row, which displaces the seed"
+    );
+
+    set_sentinel(&pool, target).await;
+    let out = write_as(&pool, &s.member_viewer, target).await;
+    let AtomCacheOutcome::Folded {
+        interval,
+        written: true,
+    } = out
+    else {
+        panic!(
+            "the seed is the atom's sole admissible input, so the write folds it; a private \
+             row the cache never folds must not vacate it: {out:?}"
+        );
+    };
+    assert!(
+        (interval.pignistic_prob() - seed_only.pignistic_prob()).abs() < TOL
+            && (interval.belief() - seed_only.belief()).abs() < TOL
+            && (interval.plausibility() - seed_only.plausibility()).abs() < TOL,
+        "the cache is the seed's fold: {seed_only:?} -> {interval:?}"
+    );
+    let (betp, bel, pl) = cache(&pool, target).await;
+    assert!(
+        (betp.expect("betp") - seed_only.pignistic_prob()).abs() < TOL
+            && (bel.expect("bel") - seed_only.belief()).abs() < TOL
+            && (pl.expect("pl") - seed_only.plausibility()).abs() < TOL,
+        "the stored cache is the seed's fold"
+    );
+}
+
 // ── the same-human rule ─────────────────────────────────────────────────────
 
 async fn bare_agent(pool: &PgPool) -> Uuid {

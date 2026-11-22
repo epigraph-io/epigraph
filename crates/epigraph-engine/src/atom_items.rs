@@ -317,6 +317,10 @@ pub async fn atom_axiom_rows(
 ///    reads.
 /// 4. **Mode**: [`AxiomMode::Pure`] keeps evidence and the seed only.
 ///
+/// No derivation-scope rule applies here: these are the rows `viewer` can
+/// see. The rows a CACHE folds are [`atom_cache_rows_under`]'s, which applies
+/// that rule between steps 2 and 3.
+///
 /// Each kept row is coarsened to `binary_truth` (a claim at hypothesis
 /// index 1 of a 2-hypothesis frame has its literals swapped;
 /// `claim_validity` maps supported → T, refuted → F, uncertain → Θ),
@@ -346,12 +350,87 @@ pub async fn atom_axiom_rows_under(
     ctx: &FramedBeliefContext,
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
-    let kept = select_atom_rows(&mut *conn, viewer, ids, mode, compound_source_edges).await?;
+    let kept = select_atom_rows(
+        &mut *conn,
+        viewer,
+        ids,
+        mode,
+        compound_source_edges,
+        RowScope::Viewer,
+    )
+    .await?
+    .rows;
     let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
     for row in key_and_discount(conn, viewer, kept, ctx).await? {
         out.entry(row.atom_id).or_default().push(row);
     }
     Ok(out)
+}
+
+/// Which rows a selection keeps: what the viewer can see, or what may enter
+/// the atom's cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowScope {
+    /// Every row the viewer can see ([`atom_axiom_rows_under`]).
+    Viewer,
+    /// Only the rows that may enter the atom's CACHED belief: those whose
+    /// every derivation source is at least as widely readable as the atom
+    /// (`epigraph_db::repos::derivation_scope::cache_admissible_predicate`,
+    /// the rule the claim cache folds under). Applied BEFORE the seed rule,
+    /// so a seed dropped only because of inadmissible input is kept.
+    Cache,
+}
+
+/// An atom's AEF input as the single atom-cache writer folds it
+/// ([`atom_cache_rows_under`]).
+#[derive(Debug, Clone, Default)]
+pub struct AtomCacheRows {
+    /// Per atom, the [`AxiomMode::Display`] rows that may enter its cache.
+    /// An atom with none is absent.
+    pub rows: HashMap<Uuid, Vec<AxiomRow>>,
+    /// The atoms with AEF input as `viewer` sees it, before the
+    /// derivation-scope rule: exactly those [`atom_axiom_rows_under`] returns
+    /// rows for in [`AxiomMode::Display`]. An atom here and absent from
+    /// `rows` has input, none of which may enter its cache.
+    pub had_input: BTreeSet<Uuid>,
+}
+
+/// The [`AxiomMode::Display`] rows of each atom that may enter its CACHED
+/// belief: [`atom_axiom_rows_under`]'s steps, with the derivation-scope rule
+/// applied after step 2 and BEFORE the seed rule (step 3). So the seed rule
+/// is decided over the admissible rows only: a seed beside input that may not
+/// enter the cache is the atom's sole cache input and is kept, never dropped
+/// for input the cache does not fold.
+///
+/// The scope rule does not depend on `viewer`: a group member's read and a
+/// public read admit the same rows to the one cache everyone reads.
+///
+/// # Errors
+/// A database read.
+pub async fn atom_cache_rows_under(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    ctx: &FramedBeliefContext,
+    compound_source_edges: CompoundSourceEdges,
+) -> Result<AtomCacheRows, String> {
+    let Selected { rows, had_input } = select_atom_rows(
+        &mut *conn,
+        viewer,
+        ids,
+        AxiomMode::Display,
+        compound_source_edges,
+        RowScope::Cache,
+    )
+    .await?;
+    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
+    for row in key_and_discount(conn, viewer, rows, ctx).await? {
+        out.entry(row.atom_id).or_default().push(row);
+    }
+    Ok(AtomCacheRows {
+        rows: out,
+        had_input,
+    })
 }
 
 /// One row of an atom's AEF input as the drift decomposition reads it
@@ -420,8 +499,10 @@ pub async fn atom_drift_rows(
         ids,
         AxiomMode::Display,
         compound_source_edges,
+        RowScope::Viewer,
     )
-    .await?;
+    .await?
+    .rows;
     let stored: Vec<epigraph_db::MassFunctionRow> =
         kept.iter().map(|(r, _, _)| r.row.clone()).collect();
     // In input order, one per kept row: aligned with `stored`.
@@ -541,12 +622,21 @@ pub fn drift_scope_fold(
     atom_fold(&axioms).map(Some)
 }
 
+/// What [`select_atom_rows`] kept.
+struct Selected {
+    /// The kept rows, in row order.
+    rows: Vec<ReadRow>,
+    /// The atoms with input before the derivation-scope rule (under
+    /// [`RowScope::Viewer`], the atoms of `rows`).
+    had_input: BTreeSet<Uuid>,
+}
+
 /// Steps 1 to 4 of [`atom_axiom_rows_under`] (see there): the stored rows
 /// some fold of `ids` reads under `mode` and `compound_source_edges`, each
 /// classified and coarsened by [`read_rows`], in row order, not yet
-/// discounted or keyed. [`atom_axiom_rows_under`] and [`atom_drift_rows`]
-/// both select through this, so the drift decomposition reads exactly the
-/// rows the single atom-cache writer folds.
+/// discounted or keyed. Under [`RowScope::Cache`] the derivation-scope rule
+/// runs between steps 2 and 3. [`atom_cache_rows_under`] selects through this
+/// under the cache scope.
 ///
 /// # Errors
 /// A database read.
@@ -556,12 +646,16 @@ async fn select_atom_rows(
     ids: &[Uuid],
     mode: AxiomMode,
     compound_source_edges: CompoundSourceEdges,
-) -> Result<Vec<ReadRow>, String> {
+    scope: RowScope,
+) -> Result<Selected, String> {
     let inputs = atom_input_rows(&mut *conn, viewer, ids, CLAIM_VALIDITY_FRAME_ID)
         .await
         .map_err(|e| format!("atom_input_rows: {e}"))?;
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Selected {
+            rows: Vec::new(),
+            had_input: BTreeSet::new(),
+        });
     }
 
     // Step 1, the class of each row, and its coarsening. A row that cannot be
@@ -603,6 +697,36 @@ async fn select_atom_rows(
             })
     });
 
+    if scope == RowScope::Viewer {
+        let rows = seed_then_mode(kept, mode);
+        let had_input = rows.iter().map(|(r, _, _)| r.row.claim_id).collect();
+        return Ok(Selected { rows, had_input });
+    }
+
+    // The atoms with input as the viewer reads them, before the scope rule.
+    let had_input: BTreeSet<Uuid> = seed_then_mode(kept.clone(), mode)
+        .iter()
+        .map(|(r, _, _)| r.row.claim_id)
+        .collect();
+    // The derivation-scope rule (the cache scope only), BEFORE the seed rule:
+    // a row the cache may not fold is no input to it, so it must not count
+    // against the atom's seed either.
+    let row_ids: Vec<Uuid> = kept.iter().map(|(r, _, _)| r.row.id).collect();
+    let admissible =
+        epigraph_db::repos::derivation_scope::DerivationScopeRepository::cache_admissible(
+            &mut *conn, &row_ids,
+        )
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
+    kept.retain(|(r, _, _)| admissible.contains(&r.row.id));
+    Ok(Selected {
+        rows: seed_then_mode(kept, mode),
+        had_input,
+    })
+}
+
+/// Steps 3 and 4 of [`atom_axiom_rows_under`] over the rows still kept.
+fn seed_then_mode(mut kept: Vec<ReadRow>, mode: AxiomMode) -> Vec<ReadRow> {
     // Step 3: the seed, over the rows some fold still reads.
     let with_other_input: BTreeSet<Uuid> = kept
         .iter()
@@ -617,7 +741,7 @@ async fn select_atom_rows(
     if mode == AxiomMode::Pure {
         kept.retain(|(_, class, _)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
     }
-    Ok(kept)
+    kept
 }
 
 /// A stored row read for a fold: the row, its class, and its BBA coarsened to

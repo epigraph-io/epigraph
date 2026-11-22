@@ -38,32 +38,6 @@ pub async fn retain_for_cache(
         .collect())
 }
 
-/// [`retain_for_cache`] over an atom's AEF input
-/// ([`crate::atom_items::AxiomRow`], one per stored row): the rows whose
-/// stored BBA may enter the atom's CACHED belief, in order. The single
-/// atom-cache writer folds only these, so the atom cache obeys the same
-/// derivation-scope rule as the claim cache.
-///
-/// # Errors
-/// `DbError` if the read fails.
-pub async fn retain_atom_rows_for_cache(
-    conn: &mut sqlx::PgConnection,
-    rows: Vec<crate::atom_items::AxiomRow>,
-) -> Result<Vec<crate::atom_items::AxiomRow>, DbError> {
-    if rows.is_empty() {
-        return Ok(rows);
-    }
-    let ids: Vec<uuid::Uuid> = rows
-        .iter()
-        .map(crate::atom_items::AxiomRow::row_id)
-        .collect();
-    let admissible = DerivationScopeRepository::cache_admissible(&mut *conn, &ids).await?;
-    Ok(rows
-        .into_iter()
-        .filter(|r| admissible.contains(&r.row_id()))
-        .collect())
-}
-
 /// The rows `viewer` may see a belief folded from: those whose every
 /// derivation source it can read. Order is kept.
 ///
