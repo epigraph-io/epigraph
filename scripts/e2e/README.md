@@ -250,7 +250,7 @@ partial-state shape the R3 gate forbids, or an authority leak.
 | POST /workflows/:id/outcome owner own flat private | 404 | 200 | 200 |
 | POST /bp/propagate apply, own factor | **200 `applied:true`, 0 rows** | 200, BetP 0.20→0.39 | same |
 | POST /bp/propagate apply, factor into a stranger's claim | **200 `applied:true`, 0 rows** | 403, nothing written | 200 |
-| POST /bp/propagate apply, factor naming a non-claim id | **200 `applied:true`, 0 rows** | 200, real claims written, `skipped_not_visible: 1` | same (**was 409 at 2fe34e17**) |
+| POST /bp/propagate apply, factor naming a non-claim id | **200 `applied:true`, 0 rows** | 200, real claims written, `skipped_not_visible: 0`: the factor is no longer loaded (backlog 073d24a3; was `1` before it) | same (**was 409 at 2fe34e17**) |
 | POST /bp/propagate apply on a server WITHOUT `EPIGRAPH_BP_APPLY=on` (atom-level belief retired BP apply) | n/a | **409**, nothing written | 409 |
 | POST /themes/create-with-centroid own / other's claims | **500 with `claim_themes +1`** / same | 201, themed / 403, +0 | 201 / 201 |
 | PATCH /labels owner own public / own private | 200 / 200 | 200 / 200 | 200 / 200 |
