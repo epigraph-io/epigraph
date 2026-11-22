@@ -1459,6 +1459,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
         approve_client::validate(scopes, reason)?;
     }
+    // delete-frames: a reason outside the purge definer's 1..2000-character
+    // bound, before any connection is made (not at the apply's purge).
+    if let Command::DeleteFrames { reason, .. } = &cli.command {
+        delete_frames::validate_reason(reason)?;
+    }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
         role,
