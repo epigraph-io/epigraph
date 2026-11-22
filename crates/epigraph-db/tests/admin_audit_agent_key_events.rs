@@ -5,6 +5,9 @@
 //! precondition; and `docs/runbooks/252-undo.sql`. Each test measures the
 //! catalog or the rows the definer wrote.
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -268,44 +271,24 @@ async fn the_252_undo_restores_112s_body(pool: PgPool) {
     }
 }
 
-/// A pool logged in as the application role, UNSTAMPED: the session the API's
-/// key handlers run their transaction on (`state.db_pool.begin()`).
-async fn app_pool(pool: &PgPool) -> PgPool {
-    use sqlx::Executor;
-    let db: String = sqlx::query_scalar("SELECT current_database()")
-        .fetch_one(pool)
-        .await
-        .expect("current_database()");
-    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let prefix = base
-        .split_once('?')
-        .map_or(base.as_str(), |(a, _)| a)
-        .trim_end_matches('/')
-        .rsplit_once('/')
-        .expect("DATABASE_URL must carry a database path")
-        .0
-        .to_string();
-    sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                conn.execute("SET SESSION AUTHORIZATION epigraph_app")
-                    .await?;
-                Ok(())
-            })
-        })
-        .connect(&format!("{prefix}/{db}"))
-        .await
-        .expect("app pool")
-}
-
 /// The handler's shape on the APPLICATION role (row security on, not a
-/// superuser): one unstamped transaction holding the admin audit row and the
-/// key's status change commits both. Before 252 the audit is ADM03 here; a
-/// row-security refusal of the definer's INSERT would surface as 42501.
+/// superuser): one transaction, stamped with the admin's viewer the way
+/// `AppState::write_as` stamps it (an application-role `ScopedPool`'s
+/// `begin_as`), holding the admin audit row and the key's status change,
+/// commits both. Before 252 the audit is ADM03 here; a row-security refusal
+/// of the definer's INSERT would surface as 42501.
+///
+/// The admin is also a live instance admin (the holder of
+/// `role:platform-custodian`), as a real `claims:admin` principal is: a
+/// database gate on the key's status that admits only the key's own agent or
+/// an instance admin, keyed on the stamped principal, admits this
+/// transaction, where an unstamped one would carry no principal at all.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_audit_and_the_key_change_commit_together_on_the_application_role(pool: PgPool) {
+    use epigraph_db::{ScopedPool, SessionGucMode, Viewer};
+
     let (admin, client) = seed_client(&pool, true).await;
+    fixture::make_custodian(&pool, admin).await;
     let (target, _) = seed_client(&pool, false).await;
     // An `encryption` key: a `signing` key is attested state the application
     // role cannot move (161, AK02), whoever asks.
@@ -322,9 +305,26 @@ async fn the_audit_and_the_key_change_commit_together_on_the_application_role(po
     .await
     .expect("seed key");
 
-    let app = app_pool(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("application-role ScopedPool");
+    let viewer = Viewer::resolve(&pool, admin)
+        .await
+        .expect("the admin's viewer");
     let jti = Uuid::new_v4();
-    let mut tx = app.begin().await.expect("begin on the application role");
+    let mut tx = scoped.begin_as(&viewer).await.expect("begin_as the admin");
+    let (role, principal): (String, Option<Uuid>) =
+        sqlx::query_as("SELECT current_user::text, public.epigraph_principal_id()")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("session identity");
+    assert_eq!(
+        role, "epigraph_app",
+        "the application role, not a superuser"
+    );
+    assert_eq!(principal, Some(admin), "stamped with the admin's principal");
     epigraph_db::SecurityEventRepository::admin_audit_write(
         &mut tx,
         client,
