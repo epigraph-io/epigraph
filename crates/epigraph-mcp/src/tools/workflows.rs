@@ -1778,12 +1778,19 @@ pub async fn deprecate_workflow(
     // `find_workflow_hierarchical` keeps returning the deprecated row.
     // `workflows` has row security since migration 183, and since 237 its
     // UPDATE reaches only a row whose owner group this stamp WRITES; any other
-    // row matches nothing here (0, reported as unchanged). It is in the
-    // transaction so the two halves of one deprecation cannot land apart.
+    // row matches nothing here, without an error. It is in the transaction so
+    // the two halves of one deprecation cannot land apart: a row this caller
+    // READS that matched nothing and is not already deprecated refuses the
+    // whole call (`refuse_a_live_row_left_behind`) instead of committing the
+    // claim's half alone. A row it cannot read was never written on this
+    // stamp, before 237 either, and reads here as a flat-only id.
     let row_rows =
         epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
             .await
             .map_err(internal_error)?;
+    if row_rows == 0 {
+        refuse_a_live_row_left_behind(&mut tx, workflow_id, None).await?;
+    }
     // REPORT ONLY WHAT CHANGED (U017). The id used to be listed whether or not
     // anything was written.
     if root_rows > 0 || row_rows > 0 {
@@ -1915,6 +1922,46 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
     ))
 }
 
+/// After a `truth_value` write on the caller's stamp that changed nothing,
+/// refuse the deprecation (nothing is committed: the error drops the
+/// transaction) unless `workflow_id`'s row already reads deprecated.
+///
+/// Since migration 237 a `workflows` UPDATE reaches only a row whose owner
+/// group the session WRITES, and a filtered row raises nothing. The workflow
+/// authority gate admits callers that write no such group (the submitter, its
+/// operator, a delegate), so their write can match no row while the claims of
+/// the same deprecation are retired: the claim / row split the transaction
+/// exists to prevent. A row the caller cannot read gets `not_found` when one is
+/// given (the hierarchical path, where the row is known to exist and the
+/// answer must not tell a hidden row from a missing one) and passes otherwise
+/// (the flat path, where no row is the normal answer).
+async fn refuse_a_live_row_left_behind(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: uuid::Uuid,
+    not_found: Option<&(dyn Fn() -> McpError + Send + Sync)>,
+) -> Result<(), McpError> {
+    let truth = epigraph_db::WorkflowRepository::truth_value_of(&mut *conn, workflow_id)
+        .await
+        .map_err(internal_error)?;
+    match truth {
+        Some(t) if (t - epigraph_db::WorkflowRepository::DEPRECATED_TRUTH).abs() < f64::EPSILON => {
+            Ok(())
+        }
+        None => match not_found {
+            Some(answer) => Err(answer()),
+            None => Ok(()),
+        },
+        Some(_) => Err(invalid_params(format!(
+            "deprecate_workflow: hierarchical workflow {workflow_id} was not deprecated: the \
+             database admits a change to a workflows row only from a writer of the row's owner \
+             group, and this caller does not write it (it was admitted as the workflow's \
+             submitter, the submitter's operator or an agent acting for one of them). Ask a \
+             writer of the workflow's owner group, or use the audited claims:admin path. Nothing \
+             was written."
+        ))),
+    }
+}
+
 /// `deprecate_workflow` for a HIERARCHICAL workflow id (a `workflows` row):
 /// retire the workflow as a unit (U017; backlog fe874d2a).
 ///
@@ -1989,6 +2036,7 @@ async fn deprecate_hierarchical_workflow(
     //    the lineage until its refusal rolled back, a repeatable contention
     //    lever on anyone's workflow.
     let not_found = || deprecate_target_not_found(workflow_id);
+    let not_found_answer: &(dyn Fn() -> McpError + Send + Sync) = &not_found;
     for &row in &targets {
         crate::tools::workflow_authority::require_workflow_authority(
             server, &mut tx, auth, caller, row, TOOL, &not_found,
@@ -2054,9 +2102,22 @@ async fn deprecate_hierarchical_workflow(
     let mut retired_claim_ids = Vec::new();
     let mut kept_shared_claim_ids: Vec<String> = Vec::new();
     for (&row, grant) in targets.iter().zip(&grants) {
-        let row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
-            .await
-            .map_err(internal_error)?;
+        // THE ROW. Since migration 237 a `workflows` UPDATE on the stamp reaches
+        // only a row whose owner group the caller WRITES. The admin arm admits
+        // a caller that writes none, so its write goes through 237's audited
+        // admin definer, after the claims below so that the one audit row the
+        // definer writes carries them. Any other arm writes here, and a write
+        // that matched nothing refuses the call unless the row already reads
+        // deprecated (`refuse_a_live_row_left_behind`).
+        let mut row_changed = 0;
+        if !grant.is_admin() {
+            row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
+                .await
+                .map_err(internal_error)?;
+            if row_changed == 0 {
+                refuse_a_live_row_left_behind(&mut tx, row, Some(not_found_answer)).await?;
+            }
+        }
         let claims = WorkflowRepository::executed_structural_claims(&mut *tx, row, &targets)
             .await
             .map_err(internal_error)?;
@@ -2077,25 +2138,52 @@ async fn deprecate_hierarchical_workflow(
                 row_retired.push(c.id.to_string());
             }
         }
-        // From the post-lock grant only (step 3): the admin arm's audit row,
-        // or the provenance row of any other authenticated arm.
-        crate::tools::workflow_authority::record_workflow_write(
-            &mut tx,
-            auth,
-            caller,
-            TOOL,
-            row,
-            *grant,
-            serde_json::json!({
-                "truth_value_after": 0.05,
-                "workflow_row_changed": row_changed > 0,
-                "retired_claim_ids": row_retired,
-                "kept_shared_claim_ids": row_kept,
-                "cascade": cascade,
-                "reason": params.reason,
-            }),
-        )
-        .await?;
+        // From the post-lock grant only (step 3): the admin arm's row write and
+        // its audit row (one definer call), or the provenance row of any other
+        // authenticated arm.
+        let mut details = serde_json::json!({
+            "truth_value_after": 0.05,
+            "retired_claim_ids": row_retired,
+            "kept_shared_claim_ids": row_kept,
+            "cascade": cascade,
+            "reason": params.reason,
+        });
+        if grant.is_admin() {
+            let Some(token) = auth else {
+                return Err(crate::errors::internal_error_text(format!(
+                    "{TOOL}: an admin workflow write with no token to audit. Nothing was written."
+                )));
+            };
+            let record = crate::tools::workflow_authority::admin_workflow_audit_record(
+                TOOL,
+                row,
+                grant.owner,
+                details,
+            );
+            row_changed = WorkflowRepository::admin_deprecate_row(
+                &mut tx,
+                token.client_id,
+                token.jti,
+                row,
+                &record,
+            )
+            .await
+            .map_err(|e| {
+                crate::errors::internal_error_logged(
+                    format!(
+                        "{TOOL}: the audited admin deprecation of workflow {row} was refused. \
+                         Nothing was written."
+                    ),
+                    e,
+                )
+            })?;
+        } else {
+            details["workflow_row_changed"] = serde_json::json!(row_changed > 0);
+            crate::tools::workflow_authority::record_workflow_write(
+                &mut tx, auth, caller, TOOL, row, *grant, details,
+            )
+            .await?;
+        }
         if row_changed > 0 {
             deprecated_ids.push(row.to_string());
         }

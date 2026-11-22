@@ -707,11 +707,215 @@ async fn the_lineage_lock_holds_every_readable_generation_across_owner_groups(po
 }
 
 // ===================================================================
+// The audited admin deprecation of a row
+// (`epigraph_admin_deprecate_workflow_row`).
+// ===================================================================
+
+async fn admin_client(pool: &PgPool, agent: Uuid, scopes: &[&str], status: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+    sqlx::query(
+        "INSERT INTO oauth_clients (id, client_id, client_name, client_type, allowed_scopes, \
+                                    granted_scopes, status, agent_id) \
+         VALUES ($1, $2, 'wf237 admin', 'human', $3, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(format!("wf237-admin-{id}"))
+    .bind(&scopes)
+    .bind(status)
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("seed the admin's client");
+    id
+}
+
+/// `Ok(rows changed)` or `Err(SQLSTATE)` of the admin definer, on a
+/// transaction stamped from `viewer`, committed when it succeeds.
+async fn admin_deprecate(
+    w: &World,
+    viewer: &Viewer,
+    client: Uuid,
+    id: Uuid,
+    details: serde_json::Value,
+) -> Result<u64, String> {
+    let mut tx = w.scoped.begin_as(viewer).await.expect("stamped tx");
+    let r = epigraph_db::WorkflowRepository::admin_deprecate_row(
+        &mut tx,
+        client,
+        Uuid::new_v4(),
+        id,
+        &details,
+    )
+    .await
+    .map_err(|e| {
+        e.as_database_error()
+            .and_then(|d| d.code().map(|c| c.to_string()))
+            .unwrap_or_else(|| e.to_string())
+    });
+    if r.is_ok() {
+        tx.commit().await.expect("commit");
+    }
+    r
+}
+
+/// The audit rows the admin definer wrote for `agent`, oldest first.
+async fn admin_audits(pool: &PgPool, agent: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'workflows.admin_write' AND agent_id = $1 ORDER BY created_at, id",
+    )
+    .bind(agent)
+    .fetch_all(pool)
+    .await
+    .expect("audit rows")
+}
+
+/// 237's carve-out for the audited admin path. A caller that writes none of
+/// the row's groups (here a stranger to a group row it cannot even read, and
+/// to a public row) deprecates it only through the definer, and only with a
+/// live `claims:admin` grant through its client: no client, a de-scoped one
+/// and a revoked one are refused (42501) with nothing written and no audit
+/// row. With the grant it sets `truth_value` to 0.05 (and only that), and
+/// writes one `workflows.admin_write` row naming the admin, the client and
+/// the row before and after, under which the caller's own details sit; a
+/// clash is decided by the definer's facts. A re-run changes nothing and says
+/// so. A direct UPDATE by the same session still reaches no row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_admin_deprecation_rechecks_the_live_grant_and_audits(pool: PgPool) {
+    let w = world(&pool).await;
+    let admin = w.stranger.principal().expect("the stranger's principal");
+    let details = serde_json::json!({"reason": "obsolete", "workflow_id": "forged"});
+
+    // No live grant: refused, nothing written, nothing audited.
+    let none = Uuid::new_v4();
+    let descoped = admin_client(&pool, admin, &["claims:write"], "active").await;
+    let revoked = admin_client(&pool, admin, &["claims:admin"], "revoked").await;
+    let others = admin_client(
+        &pool,
+        w.member.principal().expect("member"),
+        &["claims:admin"],
+        "active",
+    )
+    .await;
+    for (label, client) in [
+        ("no client", none),
+        ("de-scoped", descoped),
+        ("revoked", revoked),
+        ("another agent's client", others),
+    ] {
+        assert_eq!(
+            admin_deprecate(&w, &w.stranger, client, w.private, details.clone()).await,
+            Err("42501".into()),
+            "{label}"
+        );
+    }
+    assert!(
+        (row(&pool, w.private).await.1 - 1.0).abs() < 1e-12,
+        "row untouched"
+    );
+    assert!(
+        admin_audits(&pool, admin).await.is_empty(),
+        "nothing audited"
+    );
+
+    // Details that are not an object are refused.
+    let granted = admin_client(&pool, admin, &["claims:admin"], "active").await;
+    assert_eq!(
+        admin_deprecate(&w, &w.stranger, granted, w.private, serde_json::json!([1])).await,
+        Err("22023".into())
+    );
+
+    // CALIBRATION: the same session's direct UPDATE reaches no row.
+    assert_eq!(write(&w, &w.stranger, DEPRECATE, w.public).await, Ok(0));
+
+    // With a live grant: deprecated, audited, only `truth_value` moved.
+    let (meta_before, _) = row(&pool, w.public).await;
+    assert_eq!(
+        admin_deprecate(&w, &w.stranger, granted, w.public, details.clone()).await,
+        Ok(1)
+    );
+    let (meta_after, truth) = row(&pool, w.public).await;
+    assert!((truth - 0.05).abs() < 1e-12, "deprecated: {truth}");
+    assert_eq!(meta_after, meta_before, "metadata untouched");
+    let audits = admin_audits(&pool, admin).await;
+    assert_eq!(audits.len(), 1, "{audits:?}");
+    let a = &audits[0];
+    assert_eq!(a["reason"], "obsolete", "the caller's details are kept");
+    assert_eq!(
+        a["workflow_id"],
+        serde_json::json!(w.public.to_string()),
+        "the definer's facts win"
+    );
+    assert_eq!(a["admin_agent_id"], serde_json::json!(admin.to_string()));
+    assert_eq!(a["client_id"], serde_json::json!(granted.to_string()));
+    assert_eq!(
+        a["workflow_row"]["owner_group_id"],
+        serde_json::json!(w.g.to_string())
+    );
+    assert_eq!(a["workflow_row"]["truth_value_before"].as_f64(), Some(1.0));
+    assert_eq!(a["workflow_row"]["changed"], serde_json::json!(true));
+
+    // A re-run changes nothing, and its audit row says so.
+    assert_eq!(
+        admin_deprecate(&w, &w.stranger, granted, w.public, details.clone()).await,
+        Ok(0)
+    );
+    let audits = admin_audits(&pool, admin).await;
+    assert_eq!(audits.len(), 2);
+    assert_eq!(
+        audits[1]["workflow_row"]["changed"],
+        serde_json::json!(false)
+    );
+
+    // An unknown row: P0002, nothing audited.
+    assert_eq!(
+        admin_deprecate(&w, &w.stranger, granted, Uuid::new_v4(), details).await,
+        Err("P0002".into())
+    );
+    assert_eq!(admin_audits(&pool, admin).await.len(), 2);
+}
+
+/// The definer reads the admin from the SESSION principal, never from an
+/// argument: an application session with no principal stamped is refused
+/// (42501), whatever client it names.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_admin_deprecation_needs_the_session_principal(pool: PgPool) {
+    let w = world(&pool).await;
+    let admin = w.stranger.principal().expect("the stranger's principal");
+    let granted = admin_client(&pool, admin, &["claims:admin"], "active").await;
+    let public = w.public;
+    let r = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = sqlx::query_scalar::<_, i64>(
+            "SELECT public.epigraph_admin_deprecate_workflow_row($1, $2, $3, '{}'::jsonb)",
+        )
+        .bind(granted)
+        .bind(Uuid::new_v4())
+        .bind(public)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+                .unwrap_or_default()
+        });
+        (conn, r)
+    })
+    .await;
+    assert_eq!(r, Err("42501".into()));
+    assert!(
+        (row(&pool, w.public).await.1 - 1.0).abs() < 1e-12,
+        "row untouched"
+    );
+}
+
+// ===================================================================
 // The undo (`docs/runbooks/237-undo.sql`).
 // ===================================================================
 
-/// `(policy, trigger, guard, lock definer, counter definer)` present.
-async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool) {
+/// `(policy, trigger, guard, lock definer, counter definer, admin
+/// deprecation definer)` present.
+async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool, bool) {
     sqlx::query_as(
         "SELECT \
            EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' \
@@ -722,6 +926,9 @@ async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool) {
            to_regprocedure('public.epigraph_workflow_lock_readable(uuid)') IS NOT NULL, \
            to_regprocedure('public.epigraph_workflow_record_outcome(uuid, boolean, \
                                                                     double precision)') \
+             IS NOT NULL, \
+           to_regprocedure('public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, \
+                                                                         jsonb)') \
              IS NOT NULL",
     )
     .fetch_one(pool)
@@ -735,7 +942,10 @@ async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_237_undo_returns_the_table_to_below_237(pool: PgPool) {
     let w = world(&pool).await;
-    assert_eq!(objects_237(&pool).await, (true, true, true, true, true));
+    assert_eq!(
+        objects_237(&pool).await,
+        (true, true, true, true, true, true)
+    );
     let undo = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/runbooks/237-undo.sql"
@@ -748,7 +958,7 @@ async fn the_237_undo_returns_the_table_to_below_237(pool: PgPool) {
             .unwrap_or_else(|e| panic!("undo run {run}: {e}"));
         assert_eq!(
             objects_237(&pool).await,
-            (false, false, false, false, false),
+            (false, false, false, false, false, false),
             "after undo run {run}"
         );
     }

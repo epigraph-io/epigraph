@@ -182,10 +182,15 @@
 //! 237's `workflows_update_owner` admits an UPDATE (or a row lock) only from a
 //! writer of the row's owner group, public rows included, so the database
 //! backs the owner-group writer arm. The identity arms (submitter, operator,
-//! delegate) and the admin arm are NOT backed there: a caller they admit that
-//! does not write the owner group writes nothing to the row (its UPDATE
-//! matches no row). An entry point must still never update an existing row on
-//! a path these arms did not admit (a re-ingest stores no goal embedding).
+//! delegate) are NOT backed there: a caller they admit that does not write
+//! the owner group writes nothing to the row (its UPDATE matches no row,
+//! without an error), so `deprecate_workflow` refuses such a call unless the
+//! row already reads deprecated, rather than retire the plan's claims and
+//! leave the row live. The admin arm writes the row through 237's audited
+//! admin definer (`WorkflowRepository::admin_deprecate_row`), which re-checks
+//! the live grant and writes the audit row itself. An entry point must still
+//! never update an existing row on a path these arms did not admit (a
+//! re-ingest stores no goal embedding).
 
 use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
@@ -714,6 +719,24 @@ async fn admin_arm(
     )))
 }
 
+/// The `details` of a `workflows.admin_write` audit row: the tool, the
+/// target, its recorded submitter and the tool's own before / after facts.
+/// Shared by [`audit_admin_workflow_write`] and the admin deprecation of a
+/// row (`deprecate_workflow`), whose definer writes the row itself.
+pub(crate) fn admin_workflow_audit_record(
+    tool_name: &'static str,
+    workflow_id: uuid::Uuid,
+    submitter: Option<uuid::Uuid>,
+    details: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": tool_name,
+        "workflow_id": workflow_id,
+        "submitter": submitter,
+        "write": details,
+    })
+}
+
 /// Record a cross-owner workflow write made through the audited admin arm
 /// (`workflows.admin_write`), on the SAME transaction as the write, so the two
 /// commit together or not at all. `details` carries the tool's own before /
@@ -736,12 +759,7 @@ pub(crate) async fn audit_admin_workflow_write(
             "{tool_name}: an admin workflow write with no token to audit. Nothing was written."
         )));
     };
-    let record = serde_json::json!({
-        "action": tool_name,
-        "workflow_id": workflow_id,
-        "submitter": submitter,
-        "write": details,
-    });
+    let record = admin_workflow_audit_record(tool_name, workflow_id, submitter, details);
     // Migration 112's definer, not an INSERT: the audit row is written with
     // the definer's own guarantees (the token's live grant re-checked) on
     // whatever stamp the write runs on; it used to be the system agent's, where

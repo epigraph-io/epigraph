@@ -2,7 +2,8 @@
 -- report moves its counters through two definers (backlog 524f89c1).
 --
 -- Sections: 0 why; 1 the outcome definers (why); 2 their bodies; 3 the
--- policy (why); 4 the policy; 5 the recorded submitter is write-once.
+-- policy and its admin carve-out (why); 4 the policy and the admin definer;
+-- 5 the recorded submitter is write-once.
 --
 -- ===================================================================
 -- 0. WHY
@@ -97,37 +98,40 @@
 -- permissive policy is not restated, so its read-set rule still holds as
 -- well (a writable group is always a read group).
 --
--- THE CARVE-OUT is 077's two bypass arms, unchanged: a maintenance session
+-- THE CARVE-OUTS. 077's two bypass arms, unchanged: a maintenance session
 -- (`epigraph_bypass()`) and a body owned by `epigraph_maintenance`
--- (`epigraph_definer_bypass()`). Every application path that must write a
--- row the caller does not own goes through one of them: the outcome counters
--- (section 1), the privatization and re-own verbs, `set-workflow-submitter`
--- and `embed_backfill` (maintenance connections). An audited admin write of
--- another group's rows takes the same road as 111's `epigraph_admin_patch_claim`:
--- a definer that re-checks the live `claims:admin` grant. None exists for
--- `workflows` yet. Measured before this file, as `epigraph_app`: the admin
--- arm's hierarchical `deprecate_workflow` of another group's public plan
--- already FAILS, because retiring the plan's claims is refused by
--- `claims_tenancy`'s WITH CHECK (42501) on the admin's own stamp; the
--- `workflows` row was the one write row security did not stop. So this file
--- removes no admin deprecation that worked for a plan with a claim left to
--- retire; for a plan with none (every claim shared or already retired) the
--- admin's `truth_value` write now matches no row too.
+-- (`epigraph_definer_bypass()`). Every application path that must write or
+-- lock a row the caller does not own goes through one of them: the outcome
+-- counters and the plan and lineage row locks (section 1), the privatization
+-- and re-own verbs, `set-workflow-submitter` and `embed_backfill`
+-- (maintenance connections), and the AUDITED ADMIN path below.
+--
+-- THE AUDITED ADMIN PATH. The workflow authority gate's admin arm (a live
+-- `claims:admin` grant) admits a caller that writes none of the row's
+-- groups. Its one write to the row is a deprecation (`truth_value` to 0.05),
+-- and it goes through `epigraph_admin_deprecate_workflow_row`, the shape of
+-- 111's `epigraph_admin_patch_claim`: SECURITY DEFINER, it re-checks that the
+-- SESSION principal holds an active `claims:admin` grant through the token's
+-- client (ADM01 no principal, ADM02 no live grant, 42501), refuses an
+-- elevated session (WFO01), writes `truth_value = 0.05` and nothing else (a
+-- fixed value, so it cannot un-deprecate a row), and writes the
+-- `workflows.admin_write` audit row itself on the same transaction, so a
+-- direct call is audited exactly as the tool's is. The caller's own details
+-- go under the definer's facts (admin, client, token, row before and after),
+-- which win on a clash. Retiring the plan's CLAIMS is unchanged: on the
+-- admin's own stamp, so `claims_tenancy` refuses a claim of a group the admin
+-- does not write, as it did before this file.
 --
 -- WHAT THE ENTRY POINTS ADMIT AND THIS DOES NOT. The workflow authority gate
 -- (REST `workflow_authority`, MCP `require_workflow_authority`) admits, after
 -- the owner-group writer, the recorded SUBMITTER, its OPERATOR and a DELEGATE
--- (operator ruling R-183) by identity, and the audited admin arm. A caller
+-- (an agent acting through a live operator link) by identity. A caller
 -- admitted by one of those arms that does not write the row's owner group now
--- writes nothing to the row itself: its `truth_value` UPDATE (deprecation)
--- and the deprecation's lineage lock match no row. `add_step` keeps its plan
--- lock through the definer (section 1) and writes no `workflows` row. The
--- callers at stake: a legacy row's recorded submitter that does not write its
--- owner group, a delegate or operator acting on a plan in a team its
--- principal writes and it does not, and the admin. Retiring the plan's claims
--- is refused to every one of them already, by the same `claims_tenancy` rule
--- as the admin's (above; for the delegate, pinned by
--- `workflow_delegate_authority.rs::a_delegate_deprecates_its_operators_workflow`).
+-- writes nothing to the row itself: its `truth_value` UPDATE matches no row.
+-- The deprecation entry points therefore refuse such a call (nothing written)
+-- unless the row already reads 0.05, instead of retiring the plan's claims and
+-- leaving the row live. `add_step` keeps its plan lock through the definer
+-- (section 1) and writes no `workflows` row.
 --
 -- 126's elevated census is unaffected: the policy's name has no `_elevated_`
 -- and it names no elevation helper.
@@ -306,6 +310,108 @@ CREATE POLICY workflows_update_owner ON public.workflows AS RESTRICTIVE FOR UPDA
         (SELECT public.epigraph_bypass())
         OR (SELECT public.epigraph_definer_bypass())
         OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]));
+
+-- ===================================================================
+-- 4b. THE AUDITED ADMIN DEPRECATION OF A ROW (section 3)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_admin_deprecate_workflow_row(
+    p_client_id uuid,
+    p_token_jti uuid,
+    p_workflow  uuid,
+    p_details   jsonb)
+RETURNS bigint
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    v_admin uuid := public.epigraph_principal_id();
+    v_owner_group uuid;
+    v_visibility text;
+    v_before double precision;
+    v_changed bigint;
+BEGIN
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'WFO01: an elevated session writes no workflow row'
+            USING ERRCODE = '42501';
+    END IF;
+    IF v_admin IS NULL THEN
+        RAISE EXCEPTION 'ADM01: the admin workflow deprecation needs the session principal '
+            '(epigraph.principal_id) set to the admin; nothing was written'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM public.oauth_clients c
+         WHERE c.id = p_client_id
+           AND c.agent_id = v_admin
+           AND c.status = 'active'
+           AND 'claims:admin' = ANY (c.granted_scopes)) THEN
+        RAISE EXCEPTION 'ADM02: principal % holds no active claims:admin grant through '
+            'client %; nothing was written', v_admin, p_client_id
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_details IS NOT NULL AND pg_catalog.jsonb_typeof(p_details) <> 'object' THEN
+        RAISE EXCEPTION 'ADM05: the audit details must be a JSON object; nothing was written'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT w.owner_group_id, w.visibility::text, w.truth_value
+      INTO v_owner_group, v_visibility, v_before
+      FROM public.workflows w
+     WHERE w.id = p_workflow
+       FOR UPDATE OF w;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'ADM04: workflow % not found; nothing was written', p_workflow
+            USING ERRCODE = 'P0002';
+    END IF;
+
+    UPDATE public.workflows w
+       SET truth_value = 0.05
+     WHERE w.id = p_workflow
+       AND w.truth_value IS DISTINCT FROM 0.05::double precision;
+    GET DIAGNOSTICS v_changed = ROW_COUNT;
+    IF v_changed = 0 AND v_before IS DISTINCT FROM 0.05::double precision THEN
+        -- Only under an owner that is not a maintenance member: loud.
+        RAISE EXCEPTION 'WFO04: workflow % was not deprecated (0 rows); '
+                        'is this function owned by epigraph_maintenance?', p_workflow
+            USING ERRCODE = '42501';
+    END IF;
+
+    INSERT INTO public.security_events (event_type, agent_id, success, details, correlation_id)
+    VALUES (
+        'workflows.admin_write',
+        v_admin,
+        true,
+        COALESCE(p_details, '{}'::jsonb) || pg_catalog.jsonb_build_object(
+            'admin_agent_id', v_admin,
+            'client_id',      p_client_id,
+            'token_jti',      p_token_jti,
+            'workflow_id',    p_workflow,
+            'workflow_row',   pg_catalog.jsonb_build_object(
+                'owner_group_id',     v_owner_group,
+                'visibility',         v_visibility,
+                'truth_value_before', v_before,
+                'truth_value_after',  0.05,
+                'changed',            v_changed > 0)),
+        pg_catalog.left(p_token_jti::text, 64));
+
+    RETURN v_changed;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)
+    FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb) '
+                'OWNER TO epigraph_maintenance';
+    ELSE
+        RAISE NOTICE 'epigraph tenancy: role epigraph_maintenance absent; the 237 admin '
+                     'deprecation body stays owned by the migration runner.';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION '
+                'public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb) '
+                'TO epigraph_app';
+    END IF;
+END $$;
 
 -- ===================================================================
 -- 5. THE RECORDED SUBMITTER IS WRITE-ONCE (section 5 above)

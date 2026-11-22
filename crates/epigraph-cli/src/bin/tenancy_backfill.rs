@@ -1845,6 +1845,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // The owner is load-bearing.
     ("epigraph_workflow_lock_readable", 237),
     ("epigraph_workflow_record_outcome", 237),
+    // 237, the audited admin deprecation of a `workflows` row the admin does
+    // not write (the workflow authority gate's admin arm). Fails CLOSED under
+    // a non-member owner: its UPDATE is row-security filtered, so the
+    // deprecation is refused as unchanged-but-live, and its audit INSERT is
+    // refused by `security_events_append`. The owner is load-bearing.
+    ("epigraph_admin_deprecate_workflow_row", 237),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3248,6 +3254,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_workflow_record_outcome",
             "public.epigraph_workflow_record_outcome(uuid, boolean, double precision)",
+            true,
+        ),
+        // 237: the MCP `deprecate_workflow` admin arm calls it on the request
+        // DSN; without the grant every admin deprecation of a row the admin
+        // does not write is 42501.
+        (
+            "epigraph_admin_deprecate_workflow_row",
+            "public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)",
             true,
         ),
     ];

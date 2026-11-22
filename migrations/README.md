@@ -3421,25 +3421,32 @@ restart.
   row lock reaches a row only for a writer of its owner group (public rows included), a
   maintenance session or a maintenance-owned body. (3) `workflows_submitter_immutable`, a
   BEFORE UPDATE OF metadata trigger: an ordinary session may not change or remove a
-  recorded submitter (recording a first one is unchanged). NOT backed by the database: the
-  entry points' submitter, operator, delegate and admin arms for a caller that does not
-  write the row's owner group; such a caller's `truth_value` UPDATE (deprecation) and the
-  deprecation's lineage lock now match no row (`add_step`'s plan lock goes through
-  `epigraph_workflow_lock_readable` and still holds). Measured on 235's tree as `epigraph_app`: the admin
-  arm's hierarchical `deprecate_workflow` of another group's public plan already failed,
-  at `claims_tenancy` (42501 retiring the plan's claims). Pinned by
+  recorded submitter (recording a first one is unchanged). (4) The audited admin path:
+  `epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)` (111's shape) re-checks
+  the session principal's live `claims:admin` grant through the token's client, refuses an
+  elevated session, sets `truth_value = 0.05` and nothing else, and writes the
+  `workflows.admin_write` audit row itself; the MCP `deprecate_workflow` admin arm calls it.
+  NOT backed by the database: the entry points' submitter, operator and delegate arms for a
+  caller that does not write the row's owner group; such a caller's `truth_value` UPDATE
+  matches no row, so both `deprecate_workflow` entry points (MCP hierarchical and flat, REST
+  flat mirror) now refuse the call, nothing written, unless the row already reads 0.05. The
+  plan lock (`add_step`) and a deprecation's lineage lock go through
+  `epigraph_workflow_lock_readable`, so they still hold every row the caller reads. The
+  admin's retirement of a plan's CLAIMS in a group it does not write was refused by
+  `claims_tenancy` before 237 and still is. Pinned by
   `epigraph-db/tests/workflows_update_owner_scope.rs` (as `epigraph_app`: counter parity
   on odd stored shapes, unreadable rows, the variance bound, non-writer UPDATEs and locks
-  refused, writer and maintenance admitted, the submitter guard, the undo; each part
-  mutation- or removal-tested), `workflows_tenancy.rs` and
-  `epigraph-api/tests/workflow_pin_read_contract.rs` (h). Undo:
+  refused, writer and maintenance admitted, the submitter guard, the lineage lock across
+  owner groups, the admin definer's grant check and audit, the undo; each part mutation-
+  or removal-tested), `epigraph-mcp/tests/deprecate_workflow_owner_scope_app_role.rs`,
+  `workflows_tenancy.rs` and `epigraph-api/tests/workflow_pin_read_contract.rs` (h). Undo:
   `docs/runbooks/237-undo.sql` (tested: run twice). Slot 237 was assigned by the
-  2026-11-22 backlog triage; checked before claiming: no origin branch carries a 236 or
-  higher. **Deploy order (binding): migrate and roll out the binary TOGETHER.** A
-  pre-237 binary on a 237 database answers every outcome report from a caller that does
-  not write the plan's owner group 404 (its `FOR UPDATE` sees no row) and runs such a
-  caller's `add_step` without its plan lock; a 237 binary on a pre-237 database fails
-  every outcome report and every `add_step` 42883 (no definer). `embed_backfill` writes
+  2026-11-22 backlog triage. **Deploy order (binding): migrate and roll out the binary
+  TOGETHER.** A pre-237 binary on a 237 database answers every outcome report from a caller
+  that does not write the plan's owner group 404 (its `FOR UPDATE` sees no row), runs such a
+  caller's `add_step` without its plan lock, and commits such a caller's deprecation with
+  the row left live; a 237 binary on a pre-237 database fails every outcome report, every
+  `add_step` and every hierarchical deprecation 42883 (no definer). `embed_backfill` writes
   `goal_embedding` on its maintenance connection (`MaintenancePool` refuses an
   unprivileged one), so 237 does not narrow it. Before migrating,
   measure the rows whose recorded submitter does not write the owner group (they lose the

@@ -2365,7 +2365,8 @@ impl WorkflowRepository {
     /// # The executor is generic for COHESION, not because `workflows` is protected
     ///
     /// Since migration 183 `workflows` has row security keyed on the plan's
-    /// tenancy (an UPDATE reaches only a row the session reads), so the
+    /// tenancy, and since 237 an UPDATE reaches only a row whose owner group
+    /// the session WRITES (any other row matches nothing), so the
     /// connection matters here as for the `claims` UPDATE this call cascades
     /// from. It is generic so that the two
     /// halves of one deprecation can share a transaction: a `claims` row flipped
@@ -2407,6 +2408,67 @@ impl WorkflowRepository {
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// The `truth_value` of `workflows` row `id` as this connection reads it,
+    /// `None` when it reads no such row (unknown, or hidden by row security).
+    ///
+    /// A deprecation asks it after a `truth_value` write that changed nothing,
+    /// to tell "already deprecated" (0.05) apart from "the database filtered
+    /// the write out": since migration 237 an UPDATE reaches only a row whose
+    /// owner group the session writes, so a caller the entry point admitted
+    /// by another arm can match no row without any error.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn truth_value_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT truth_value FROM workflows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
+    /// The truth value a deprecation leaves on a `workflows` row.
+    pub const DEPRECATED_TRUTH: f64 = 0.05;
+
+    /// Deprecate `workflows` row `id` (`truth_value` to
+    /// [`Self::DEPRECATED_TRUTH`]) through migration 237's audited admin
+    /// definer, `epigraph_admin_deprecate_workflow_row`, on the caller's
+    /// stamped transaction. Returns the rows CHANGED (0 for a row already
+    /// deprecated).
+    ///
+    /// For the workflow authority gate's admin arm only: since 237 the
+    /// `workflows` UPDATE policy admits only a writer of the row's owner
+    /// group, and the admin arm admits a caller that writes none. The definer
+    /// re-checks the session principal's live `claims:admin` grant through
+    /// `client_id` (111's predicate) and writes the `workflows.admin_write`
+    /// audit row itself, with `details` under its own facts, on the same
+    /// transaction. It writes `truth_value` only, and only that one value.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` carrying the definer's refusal: `42501` (`ADM01`
+    /// no principal, `ADM02` no live grant, `WFO01` an elevated session) or
+    /// `P0002` (`ADM04`, no such row); nothing is written then.
+    pub async fn admin_deprecate_row(
+        conn: &mut sqlx::PgConnection,
+        client_id: Uuid,
+        token_jti: Uuid,
+        id: Uuid,
+        details: &serde_json::Value,
+    ) -> Result<u64, sqlx::Error> {
+        let changed: i64 = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_deprecate_workflow_row($1, $2, $3, $4)",
+        )
+        .bind(client_id)
+        .bind(token_jti)
+        .bind(id)
+        .bind(details)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(u64::try_from(changed).unwrap_or(0))
     }
 
     /// Whether a hierarchical `workflows` row with this id is visible on this

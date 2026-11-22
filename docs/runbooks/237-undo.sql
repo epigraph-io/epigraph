@@ -7,9 +7,11 @@
 -- ROLL THE BINARY BACK FIRST. A binary built with 237 moves every
 -- hierarchical outcome report's counters through
 -- `epigraph_workflow_lock_readable` and `epigraph_workflow_record_outcome`,
--- and takes every `add_step`'s plan lock through the first; with them
--- dropped, each of those (REST and MCP) fails 42883. A binary built without
--- 237 needs neither, and works below 237 as before.
+-- and takes every `add_step`'s plan lock and every deprecation's lineage
+-- lock through the first, and an admin-arm deprecation of a row through
+-- `epigraph_admin_deprecate_workflow_row`; with them dropped, each of those
+-- (REST and MCP) fails 42883. A binary built without 237 needs none of them,
+-- and works below 237 as before.
 --
 -- WHAT IT DOES:
 --   * drops `workflows_submitter_immutable` and its function
@@ -17,10 +19,12 @@
 --   * drops the RESTRICTIVE policy `workflows_update_owner` (section 4).
 --     183's `workflows_update`, `workflows_read`, `workflows_insert`,
 --     `workflows_delete_owner` and `workflows_elevated_no_*` are not touched;
+--   * drops the audited admin deprecation definer (section 4b);
 --   * drops the two outcome definers (section 2).
 --
 -- WHAT IT LEAVES:
---   * every `workflows` row as it stands, counters included;
+--   * every `workflows` row as it stands, counters included, and every
+--     `workflows.admin_write` audit row the admin definer wrote;
 --   * 237's `_sqlx_migrations` row. Re-introducing the rule is a NEW
 --     migration, never a re-run of 237.
 --
@@ -38,6 +42,8 @@ DROP TRIGGER IF EXISTS workflows_submitter_immutable ON public.workflows;
 DROP FUNCTION IF EXISTS public.epigraph_workflows_submitter_guard();
 
 DROP POLICY IF EXISTS workflows_update_owner ON public.workflows;
+
+DROP FUNCTION IF EXISTS public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb);
 
 DROP FUNCTION IF EXISTS public.epigraph_workflow_record_outcome(uuid, boolean, double precision);
 DROP FUNCTION IF EXISTS public.epigraph_workflow_lock_readable(uuid);
