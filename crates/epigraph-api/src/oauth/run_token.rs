@@ -50,8 +50,13 @@ pub const REFUSED_EVENT: &str = "oauth_run_token_refused";
 /// for, read ONCE at boot ([`RunTokenModels::from_env`]).
 pub const RUN_TOKEN_MODELS_ENV: &str = "EPIGRAPH_RUN_TOKEN_MODELS";
 
-/// The LLM models (`agents.properties ->> 'llm_model'`) a run token may be
-/// minted for. EMPTY in every constructor and when the variable is unset or
+/// The LLM models a run token may be minted for, matched against the model
+/// the agent's identity was ATTESTED under (migration 161's
+/// `agent_prompt_snapshots`, written only by the host attestor; read by
+/// `AgentRepository::run_token_principal_pool`), never against
+/// `agents.properties ->> 'llm_model'`, which the application role may
+/// rewrite on the agent's own row. An agent with no attested registration is
+/// refused. EMPTY in every constructor and when the variable is unset or
 /// blank, and an empty list refuses EVERY mint: an operator who arms the
 /// grant names the models it serves.
 ///
@@ -373,10 +378,17 @@ async fn decide(
             format!("{RUN_TOKEN_MODELS_ENV} lists no model on this server"),
         )));
     }
-    if !model
-        .as_deref()
-        .is_some_and(|m| state.run_token_models.contains(m))
-    {
+    // The ATTESTED model (see `RunTokenModels`); display properties are
+    // never consulted.
+    let Some(model) = model else {
+        return Ok(Err(refusal(
+            "invalid_grant",
+            "no_attested_model",
+            "the agent has no attested identity registration: the host registers an identity \
+             through the attestor before it runs it",
+        )));
+    };
+    if !state.run_token_models.contains(&model) {
         return Ok(Err(refusal(
             "invalid_grant",
             "model_not_allowed",
