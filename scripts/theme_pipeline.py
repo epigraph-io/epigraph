@@ -127,24 +127,39 @@ LABEL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "label_themes_llm.py")
 
 
-def label_command(database_url):
-    """argv for the label step, on the SAME database the pipeline wrote to.
+def label_command():
+    """argv for the label step. It carries NO database URL: argv is readable
+    by every local user (`ps`, /proc/<pid>/cmdline), so a URL with a password
+    goes to the child through its environment instead (label_env)."""
+    return [sys.executable, LABEL_SCRIPT, "--relabel-all"]
 
-    label_themes_llm.py resolves its own DSN when none is passed
-    (MAINTENANCE_DATABASE_URL, DATABASE_URL, else a hard-coded default), so
-    without --database-url a `grow --database-url <scratch>` run clustered and
+
+def label_env(database_url):
+    """The label step's environment: this process's, with the database pinned
+    to the SAME one the pipeline wrote to.
+
+    label_themes_llm.py resolves its DSN with maintenance_dsn
+    (MAINTENANCE_DATABASE_URL, then DATABASE_URL, else a hard-coded default),
+    so left to itself a `grow --database-url <scratch>` run clustered and
     projected the scratch database and then relabelled every theme of another.
+    Both variables are set: with only the first, a DATABASE_URL naming another
+    database makes maintenance_dsn refuse to start. An environment is readable
+    only by the same user and root.
     """
     if not database_url:
         raise ValueError("label step needs the pipeline's database URL")
-    return [sys.executable, LABEL_SCRIPT, "--relabel-all",
-            "--database-url", database_url]
+    env = dict(os.environ)
+    env["MAINTENANCE_DATABASE_URL"] = database_url
+    env["DATABASE_URL"] = database_url
+    return env
 
 
 def run_label_step(database_url):
-    """Run the label step; return its exit code (non-zero = it did not finish)."""
+    """Run the label step; return its exit code (non-zero = it did not finish,
+    or left a theme unlabelled: label_themes_llm's exit status)."""
+    env = label_env(database_url)
     try:
-        return subprocess.run(label_command(database_url), check=False).returncode
+        return subprocess.run(label_command(), check=False, env=env).returncode
     except OSError as e:
         print(f"  label step could not start: {e}", file=sys.stderr)
         return 127
@@ -224,8 +239,9 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    # Resolved once, so the label subprocess is handed the URL this connection
-    # uses instead of resolving its own.
+    # Resolved once, so the label subprocess is handed (through its
+    # environment, label_env) the URL this connection uses instead of
+    # resolving its own.
     args.database_url = args.database_url or theme_lib.maintenance_dsn()
     conn = theme_lib.connect(args.database_url)
     theme_lib.set_statement_timeout(conn, ms=900000)

@@ -103,27 +103,28 @@ def test_stop_reason_continue():
 
 # --- label step: same database, absolute script path, failure surfaced --------
 
-def test_label_command_forwards_the_pipeline_database_url():
-    """Without --database-url the label script resolves its own DSN and
-    relabels a different database than the one just clustered."""
-    cmd = T.label_command("postgres://u:p@localhost/scratch_test")
-    assert cmd[cmd.index("--database-url") + 1] == "postgres://u:p@localhost/scratch_test"
-    assert "--relabel-all" in cmd
+def test_label_env_forwards_the_pipeline_database_url():
+    """Left to itself the label script resolves its own DSN and relabels a
+    different database than the one just clustered. The URL goes through the
+    child's environment, not argv (tests/theme/test_label_step_dsn.py)."""
+    env = T.label_env("postgres://u:p@localhost/scratch_test")
+    assert env["MAINTENANCE_DATABASE_URL"] == "postgres://u:p@localhost/scratch_test"
+    assert "--relabel-all" in T.label_command()
 
 
 def test_label_command_script_path_does_not_depend_on_cwd(tmp_path, monkeypatch):
     import os
     monkeypatch.chdir(tmp_path)
-    script = T.label_command("postgres://u:p@localhost/scratch_test")[1]
+    script = T.label_command()[1]
     assert os.path.isabs(script)
     assert os.path.isfile(script)
     assert os.path.basename(script) == "label_themes_llm.py"
 
 
-def test_label_command_refuses_a_missing_url():
+def test_run_label_step_refuses_a_missing_url():
     import pytest
     with pytest.raises(ValueError):
-        T.label_command(None)
+        T.run_label_step(None)
 
 
 def test_run_label_step_returns_the_subprocess_exit_code(monkeypatch):
@@ -132,17 +133,18 @@ def test_run_label_step_returns_the_subprocess_exit_code(monkeypatch):
     class Done:
         returncode = 3
 
-    def fake_run(cmd, check):
-        seen["cmd"], seen["check"] = cmd, check
+    def fake_run(cmd, check, env=None):
+        seen["cmd"], seen["check"], seen["env"] = cmd, check, env
         return Done()
 
     monkeypatch.setattr(T.subprocess, "run", fake_run)
     assert T.run_label_step("postgres://u:p@localhost/scratch_test") == 3
-    assert seen["cmd"] == T.label_command("postgres://u:p@localhost/scratch_test")
+    assert seen["cmd"] == T.label_command()
+    assert seen["env"]["DATABASE_URL"] == "postgres://u:p@localhost/scratch_test"
 
 
 def test_run_label_step_reports_a_step_that_could_not_start(monkeypatch):
-    def fake_run(cmd, check):
+    def fake_run(cmd, check, env=None):
         raise FileNotFoundError("no interpreter")
 
     monkeypatch.setattr(T.subprocess, "run", fake_run)
