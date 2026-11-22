@@ -2279,6 +2279,21 @@ pub async fn fetch_batched_context(
         });
     }
 
+    // Liveness (backlog bc76b481). Every leg below that joins a claim it hands
+    // back as context requires `is_current` on that claim: the section parent,
+    // atoms, bridge parents, siblings, corroborating and epistemic neighbours,
+    // and the neighbour paragraphs reached by `continues_argument` or an
+    // atom-atom bridge (legs 8-10). A superseded claim is retired content;
+    // returned as a hit's context, a caller reads it as current support.
+    // Supersession (and the dedup / merge cascades) re-points `decomposes_to`
+    // and `corroborates` onto the replacement, so a superseded claim still
+    // hanging off a parent is a stale row whose successor is returned instead.
+    // The CORROBORATES leg also applies `EDGE_IN_FORCE` to the edge, as leg 7b
+    // does: a retracted edge (`delete_edge` sets `valid_to`) is not live
+    // support. Leg 1 (`paragraph_meta`) deliberately has no `is_current`:
+    // `claim_context` pins a claim by id and must still resolve a superseded
+    // one.
+
     // 3. Section parents (level=1 via decomposes_to incoming).
     {
         let rows = sqlx::query!(
@@ -2289,6 +2304,7 @@ pub async fn fetch_batched_context(
             WHERE e.target_id = ANY($1)
               AND e.relationship = 'decomposes_to'
               AND (c.properties->>'level')::int = 1
+              AND c.is_current
               AND ($2::bool OR c.visibility = 'public'
                    OR c.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2332,6 +2348,7 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 3
+                  AND c.is_current
                   AND ($3::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($4::uuid[]))
                   AND ($3::bool OR e.visibility = 'public'
@@ -2388,6 +2405,7 @@ pub async fn fetch_batched_context(
                 JOIN claims cp ON cp.id = e.source_id
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
+                  AND cp.is_current
                   AND ($2::bool OR cp.visibility = 'public'
                        OR cp.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'
@@ -2438,6 +2456,7 @@ pub async fn fetch_batched_context(
                 WHERE e.source_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND c.is_current
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'
@@ -2494,6 +2513,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.source_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -2503,6 +2523,7 @@ pub async fn fetch_batched_context(
                        COALESCE((e.properties->>'strength')::float8, 0.0) AS strength
                 FROM edges e
                 WHERE e.target_id = ANY($1) AND e.relationship IN ('CORROBORATES', 'corroborates')
+                  AND (e.valid_to IS NULL OR e.valid_to > now())
                   AND ($3::bool OR e.visibility = 'public'
                        OR (e.owner_group_id = ANY($4::uuid[])
                            AND (e.co_owner_group_id IS NULL
@@ -2516,6 +2537,7 @@ pub async fn fetch_batched_context(
                 FROM neighbors n
                 JOIN claims c
                   ON c.id = n.neighbor_id
+                 AND c.is_current
                  AND ($3::bool OR c.visibility = 'public'
                       OR c.owner_group_id = ANY($4::uuid[]))
                 LEFT JOIN edges asserts_e
@@ -2688,6 +2710,7 @@ pub async fn fetch_batched_context(
             FROM edges e
             JOIN claims cn ON cn.id = e.target_id
             WHERE e.source_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND cn.is_current
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2699,6 +2722,7 @@ pub async fn fetch_batched_context(
             FROM edges e
             JOIN claims cn ON cn.id = e.source_id
             WHERE e.target_id = ANY($1) AND e.relationship = 'continues_argument'
+              AND cn.is_current
               AND ($2::bool OR cn.visibility = 'public'
                    OR cn.owner_group_id = ANY($3::uuid[]))
               AND ($2::bool OR e.visibility = 'public'
@@ -2740,6 +2764,7 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND cb.is_current
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
                       AND ($2::bool OR e.visibility = 'public'
@@ -2756,6 +2781,7 @@ pub async fn fetch_batched_context(
                       AND e.relationship != 'decomposes_to'
                       AND (ca.properties->>'level')::int = 3
                       AND (cb.properties->>'level')::int = 3
+                      AND cb.is_current
                       AND ($2::bool OR cb.visibility = 'public'
                            OR cb.owner_group_id = ANY($3::uuid[]))
                       AND ($2::bool OR e.visibility = 'public'
@@ -2800,6 +2826,7 @@ pub async fn fetch_batched_context(
                 WHERE e.target_id = ANY($1)
                   AND e.relationship = 'decomposes_to'
                   AND (c.properties->>'level')::int = 2
+                  AND c.is_current
                   AND ($2::bool OR c.visibility = 'public'
                        OR c.owner_group_id = ANY($3::uuid[]))
                   AND ($2::bool OR e.visibility = 'public'
