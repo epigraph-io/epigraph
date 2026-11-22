@@ -146,3 +146,205 @@ async fn derive_keeps_every_asserting_paper_doi(pool: PgPool) {
         "claims sharing paper 10.2/shared must be same-source, got {ka:?} vs {kb:?}"
     );
 }
+
+// --- 9da3cf2b: intra-source closure (migration 041's edge set) ---
+
+/// Insert a claim-to-claim edge of `relationship`.
+async fn insert_claim_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'claim', $2, 'claim', $3)",
+    )
+    .bind(source)
+    .bind(target)
+    .bind(relationship)
+    .execute(pool)
+    .await
+    .expect("insert claim edge");
+}
+
+/// The `agent -asserts-> claim` attribution edge ingest writes on every
+/// planned claim. It is NOT a paper anchor: a walk that treated any `asserts`
+/// edge as an anchor would stop at every real claim and catch nothing.
+async fn insert_agent_asserts(pool: &PgPool, agent_id: Uuid, claim_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship)
+         VALUES ($1, 'agent', $2, 'claim', 'asserts')",
+    )
+    .bind(agent_id)
+    .bind(claim_id)
+    .execute(pool)
+    .await
+    .expect("insert agent asserts edge");
+}
+
+/// A claim by a fresh agent that also carries that agent's attribution edge.
+/// Every claim gets its own agent, so the same-agent non-paper rule can never
+/// be what makes a pair same-source here.
+async fn claim_by_fresh_agent(pool: &PgPool) -> Uuid {
+    let agent = insert_agent(pool).await;
+    let claim = insert_claim(pool, agent).await;
+    insert_agent_asserts(pool, agent, claim).await;
+    claim
+}
+
+/// 9da3cf2b: claims that reach paper P only through `section_follows`,
+/// `continues_argument` or `same_source` edges (no paper `asserts` edge on
+/// them or on a `decomposes_to` ancestor) are same-source with P's claims.
+/// The edges point both ways along the chain, so the walk must be undirected
+/// over those relationships. Before the fix, `paper_dois` for `y`, `z` and `v`
+/// was empty and, with distinct agents, every pair below passed as
+/// cross-source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn claims_linked_to_a_paper_only_by_intra_source_edges_are_same_source(pool: PgPool) {
+    use epigraph_engine::matching::source_key::{is_same_source, SourceFilterConfig};
+
+    let paper = insert_paper(&pool, "10.9/intra-source").await;
+    let x = claim_by_fresh_agent(&pool).await;
+    let w = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, paper, x).await;
+    insert_asserts_edge(&pool, paper, w).await;
+
+    // x -section_follows-> y            (forward from the anchor)
+    // z -continues_argument-> y         (reached against the edge direction)
+    // x -same_source-> v
+    let y = claim_by_fresh_agent(&pool).await;
+    let z = claim_by_fresh_agent(&pool).await;
+    let v = claim_by_fresh_agent(&pool).await;
+    insert_claim_edge(&pool, x, y, "section_follows").await;
+    insert_claim_edge(&pool, z, y, "continues_argument").await;
+    insert_claim_edge(&pool, x, v, "same_source").await;
+
+    let kw = derive_source_key(&pool, w).await.expect("derive w");
+    for (name, id) in [("y", y), ("z", z), ("v", v)] {
+        let k = derive_source_key(&pool, id).await.expect("derive");
+        assert_eq!(
+            k.paper_dois,
+            vec!["10.9/intra-source".to_string()],
+            "{name} reaches the paper only through intra-source edges"
+        );
+        assert!(
+            is_same_source(&k, &kw, SourceFilterConfig::default()),
+            "{name} and w are claims of one paper; got {k:?} vs {kw:?}"
+        );
+    }
+}
+
+/// A paper-asserted claim's DOIs are its own asserting papers (plus its
+/// `decomposes_to` ancestry). A lateral edge to a claim asserted by ANOTHER
+/// paper does not add that paper: the walk stops at paper-anchored claims, so
+/// two papers are never merged through their anchored claims. (Mutation: walk
+/// on through anchored claims and `x` picks up `10.9/q`.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_anchored_claim_does_not_inherit_a_neighbours_paper(pool: PgPool) {
+    use epigraph_engine::matching::source_key::{is_same_source, SourceFilterConfig};
+
+    let p = insert_paper(&pool, "10.9/p").await;
+    let q = insert_paper(&pool, "10.9/q").await;
+    let x = claim_by_fresh_agent(&pool).await;
+    let y = claim_by_fresh_agent(&pool).await;
+    let w = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, p, x).await;
+    insert_asserts_edge(&pool, q, y).await;
+    insert_asserts_edge(&pool, q, w).await;
+    insert_claim_edge(&pool, x, y, "section_follows").await;
+
+    let kx = derive_source_key(&pool, x).await.expect("derive x");
+    let kw = derive_source_key(&pool, w).await.expect("derive w");
+    assert_eq!(kx.paper_dois, vec!["10.9/p".to_string()]);
+    assert!(!is_same_source(&kx, &kw, SourceFilterConfig::default()));
+}
+
+/// `decomposes_to` is followed child -> parent only. Atoms dedupe on content
+/// hash, so one atom can sit under compounds of two papers; walking DOWN into
+/// it and back UP would merge both papers' hierarchies. The shared atom `s`
+/// belongs to both papers; its sibling `t`, under P's paragraph only, must not
+/// pick up Q. (Mutation: follow `decomposes_to` parent -> child too and `t`
+/// gains `10.9/q`.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn decomposes_to_is_walked_upward_only(pool: PgPool) {
+    let p = insert_paper(&pool, "10.9/p").await;
+    let q = insert_paper(&pool, "10.9/q").await;
+    let section_p = claim_by_fresh_agent(&pool).await;
+    let section_q = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, p, section_p).await;
+    insert_asserts_edge(&pool, q, section_q).await;
+    // Unanchored paragraphs under each section, a shared atom under both
+    // paragraphs and an atom under P's paragraph only.
+    let para_p = claim_by_fresh_agent(&pool).await;
+    let para_q = claim_by_fresh_agent(&pool).await;
+    let s = claim_by_fresh_agent(&pool).await;
+    let t = claim_by_fresh_agent(&pool).await;
+    insert_claim_edge(&pool, section_p, para_p, "decomposes_to").await;
+    insert_claim_edge(&pool, section_q, para_q, "decomposes_to").await;
+    insert_claim_edge(&pool, para_p, s, "decomposes_to").await;
+    insert_claim_edge(&pool, para_q, s, "decomposes_to").await;
+    insert_claim_edge(&pool, para_p, t, "decomposes_to").await;
+
+    let ks = derive_source_key(&pool, s).await.expect("derive s");
+    let kt = derive_source_key(&pool, t).await.expect("derive t");
+    assert_eq!(
+        ks.paper_dois,
+        vec!["10.9/p".to_string(), "10.9/q".to_string()]
+    );
+    assert_eq!(kt.paper_dois, vec!["10.9/p".to_string()]);
+}
+
+/// 9da3cf2b cost measurement, not a correctness test: `#[ignore]`d, run with
+/// `cargo test -p epigraph-engine --test source_key_derivation -- --ignored
+/// --nocapture measure_intra_source_walk_cost`.
+///
+/// Builds, per size N, one paper-asserted head claim followed by a chain of N
+/// unanchored claims linked by `section_follows`, and times
+/// `derive_source_key` on the head (anchored: the closure walk stops at hop
+/// zero) and on the far end of the chain (the walk visits all N claims).
+///
+/// Recorded 2026-11-22 on a freshly migrated CI-configured pgvector database
+/// (mean of 20 calls, small idle tables, so these are lower bounds for a
+/// loaded corpus):
+///
+/// | N    | anchored head | unanchored tail |
+/// |------|---------------|-----------------|
+/// | 10   | 1.28 ms       | 0.67 ms         |
+/// | 100  | 1.41 ms       | 2.75 ms         |
+/// | 1000 | 0.85 ms       | 3.75 ms         |
+///
+/// A prod-sized figure depends on the size of the largest unanchored
+/// component, which only the operator can measure.
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "measurement; run explicitly with --ignored --nocapture"]
+async fn measure_intra_source_walk_cost(pool: PgPool) {
+    const CALLS: u32 = 20;
+    let agent = insert_agent(&pool).await;
+    for n in [10_usize, 100, 1000] {
+        let paper = insert_paper(&pool, &format!("10.9/measure-{n}")).await;
+        let head = insert_claim(&pool, agent).await;
+        insert_asserts_edge(&pool, paper, head).await;
+        let mut prev = head;
+        for _ in 0..n {
+            let next = insert_claim(&pool, agent).await;
+            insert_claim_edge(&pool, prev, next, "section_follows").await;
+            prev = next;
+        }
+        let tail = prev;
+        sqlx::query("ANALYZE edges")
+            .execute(&pool)
+            .await
+            .expect("analyze");
+
+        let time = |claim: Uuid| {
+            let pool = pool.clone();
+            async move {
+                let t0 = std::time::Instant::now();
+                for _ in 0..CALLS {
+                    let k = derive_source_key(&pool, claim).await.expect("derive");
+                    assert_eq!(k.paper_dois.len(), 1);
+                }
+                t0.elapsed() / CALLS
+            }
+        };
+        let anchored = time(head).await;
+        let unanchored = time(tail).await;
+        eprintln!("N={n}: anchored head {anchored:?}, unanchored tail {unanchored:?}");
+    }
+}
