@@ -506,7 +506,11 @@ pub struct SemanticSelectedClaim {
     pub claim_type: Option<String>,
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub theme_id: Option<Uuid>,
-    /// The claim's cluster in the most recently completed cluster run.
+    /// The claim's cluster in the most recently completed **Louvain** run it
+    /// is a member of. `louvain_bridge` runs (`POST
+    /// /api/v1/clusters/build-from-bridges`) are skipped, as
+    /// `ClusterRunRepository::latest` skips them: `expand` resolves only
+    /// Louvain runs, so a bridge cluster id handed out here would 404 there.
     pub cluster_id: Option<Uuid>,
     pub similarity: f64,
 }
@@ -3541,6 +3545,7 @@ impl ClaimRepository {
                            FROM claim_cluster_membership m
                            JOIN graph_cluster_runs r ON r.run_id = m.run_id
                            WHERE m.claim_id = c.id
+                             AND r.algo = 'louvain'
                            ORDER BY r.completed_at DESC
                            LIMIT 1
                        ) AS cluster_id,

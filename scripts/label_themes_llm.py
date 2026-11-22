@@ -341,10 +341,16 @@ def is_neighborhood_placeholder_label(label):
 
 def latest_cluster_run(conn):
     """The clustering run the expand route serves (ClusterRunRepository::latest:
-    newest completed_at), or None."""
+    the newest completed run with algo = 'louvain'), or None.
+
+    A louvain_bridge run (POST /api/v1/clusters/build-from-bridges) has no
+    graph_neighborhoods rows and is never the run expand serves, so it must
+    not be picked here either: labelling it would label nothing while expand
+    kept serving the Louvain run's neighborhood-N placeholders."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT run_id::text FROM graph_cluster_runs ORDER BY completed_at DESC LIMIT 1"
+            "SELECT run_id::text FROM graph_cluster_runs WHERE algo = 'louvain' "
+            "ORDER BY completed_at DESC LIMIT 1"
         )
         row = cur.fetchone()
     return row[0] if row else None
@@ -472,7 +478,7 @@ def main():
     parser.add_argument(
         "--run-id", default=None,
         help="With --neighborhoods: the graph_cluster_runs run to label "
-             "(default: the latest, the one the expand route serves)",
+             "(default: the latest Louvain run, the one the expand route serves)",
     )
     args = parser.parse_args()
 

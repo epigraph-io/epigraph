@@ -1,6 +1,13 @@
 //! Integration tests for the `claim_themes` READ path
 //! (`ClaimThemeRepository::list_summaries` / `count_summaries` /
-//! `get_summary` / `find_by_label` / `member_claim_ids` / `overview_page`).
+//! `get_summary` / `find_by_label` / `member_claim_ids` / `overview_page` /
+//! `find_split_candidates`).
+//!
+//! Backlog 06f5c5b2 brought `list_summaries`, `count_summaries`,
+//! `get_summary`, `find_by_label` and `find_split_candidates` under the
+//! overview's rule: a theme with no current member the viewer can read is
+//! absent, and every count is over readable members, never the stored
+//! `claim_themes.claim_count`. Those arms are at the end of this file.
 //!
 //! `overview_page` (backlog 57917c13) backs `GET /api/v1/graph/themes/overview`:
 //! live, viewer-scoped member counts, themes with no readable member absent,
@@ -133,10 +140,6 @@ async fn summary_reports_live_member_count_not_the_stale_column(pool: PgPool) {
         "member_count must be the live COUNT(*) over claims.theme_id, not claim_themes.claim_count"
     );
     assert_eq!(
-        summary.stored_claim_count, 0,
-        "the stale denormalised column must still be reported verbatim so drift is visible"
-    );
-    assert_eq!(
         summary.centroid_dim,
         Some(1536),
         "centroid_dim is derived from which centroid column is populated"
@@ -253,17 +256,17 @@ async fn list_summaries_filters_by_prefix_and_orders_by_live_count(pool: PgPool)
          (big=2) over the stale claim_count (small=9999)"
     );
 
-    let total = ClaimThemeRepository::count_summaries(&pool, Some("px-"))
+    let total = ClaimThemeRepository::count_summaries(&pool, &viewer, Some("px-"))
         .await
         .expect("count_summaries");
     assert_eq!(total, 2, "count must apply the same prefix predicate");
 
-    let unfiltered = ClaimThemeRepository::count_summaries(&pool, None)
+    let unfiltered = ClaimThemeRepository::count_summaries(&pool, &viewer, None)
         .await
         .expect("count_summaries unfiltered");
     assert_eq!(unfiltered, 3, "None must mean no filter");
 
-    let blank = ClaimThemeRepository::count_summaries(&pool, Some("   "))
+    let blank = ClaimThemeRepository::count_summaries(&pool, &viewer, Some("   "))
         .await
         .expect("count_summaries blank");
     assert_eq!(
@@ -277,10 +280,15 @@ async fn find_by_label_surfaces_duplicate_labels_instead_of_picking_one(pool: Pg
     // `claim_themes` has no UNIQUE(label); the retired k-means tool's additive
     // runs (`theme_cluster(wipe_first=false)`) left exactly this state. A resolver that returned Option would
     // silently pick one of two distinct themes.
+    // Each needs a readable member: a theme with none is hidden (06f5c5b2).
+    let viewer = viewer_fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
     let a = seed_theme(&pool, "auto-00", 0, None).await;
     let b = seed_theme(&pool, "auto-00", 0, None).await;
+    seed_member(&pool, agent, a, "auto-00 a member", true).await;
+    seed_member(&pool, agent, b, "auto-00 b member", true).await;
 
-    let mut found = ClaimThemeRepository::find_by_label(&pool, "auto-00")
+    let mut found = ClaimThemeRepository::find_by_label(&pool, &viewer, "auto-00")
         .await
         .expect("find_by_label");
     found.sort();
@@ -291,7 +299,7 @@ async fn find_by_label_surfaces_duplicate_labels_instead_of_picking_one(pool: Pg
         "both duplicate-label themes must be returned"
     );
 
-    let none = ClaimThemeRepository::find_by_label(&pool, "auto-nonexistent")
+    let none = ClaimThemeRepository::find_by_label(&pool, &viewer, "auto-nonexistent")
         .await
         .expect("find_by_label miss");
     assert!(none.is_empty(), "a miss is an empty Vec, not an error");
@@ -677,11 +685,11 @@ async fn get_summary_on_an_executor_counts_only_visible_members(pool: PgPool) {
     let seen_by_stranger = ClaimThemeRepository::get_summary(&mut *conn, &stranger, theme)
         .await
         .expect("get_summary as stranger")
-        .expect("the theme row is corpus-wide");
+        .expect("the stranger reads two members, so the theme is visible");
     let seen_by_member = ClaimThemeRepository::get_summary(&mut *conn, &member, theme)
         .await
         .expect("get_summary as member")
-        .expect("the theme row is corpus-wide");
+        .expect("the member reads all three");
 
     assert_eq!(
         seen_by_stranger.member_count, 2,
@@ -692,4 +700,434 @@ async fn get_summary_on_an_executor_counts_only_visible_members(pool: PgPool) {
         seen_by_member.member_count, 3,
         "the owning group's member must count its own private member too"
     );
+}
+
+// ---- viewer-scoped theme reads (backlog 06f5c5b2) -------------------------------
+
+/// The corpus every 06f5c5b2 arm reads. Stored `claim_count`s are wrong in
+/// both directions, so an implementation that reads the column fails.
+struct ScopedThemes {
+    member: Uuid,
+    /// One public member; stored count 0.
+    public: Uuid,
+    /// Two members, both private to the member's group; stored count 9999.
+    private_only: Uuid,
+    /// One public and two private members; stored count 9999.
+    mixed: Uuid,
+    /// No members at all; stored count 5.
+    empty: Uuid,
+    /// One member, public but retired (`is_current = false`); stored count 7.
+    retired_only: Uuid,
+}
+
+async fn seed_scoped_themes(pool: &PgPool, prefix: &str) -> ScopedThemes {
+    let agent = seed_agent(pool).await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(pool, prefix).await;
+    let public = seed_theme(pool, &format!("{prefix}-public"), 0, Some(1536)).await;
+    let private_only = seed_theme(pool, &format!("{prefix}-private"), 9999, Some(1536)).await;
+    let mixed = seed_theme(pool, &format!("{prefix}-mixed"), 9999, Some(1536)).await;
+    let empty = seed_theme(pool, &format!("{prefix}-empty"), 5, Some(1536)).await;
+    let retired_only = seed_theme(pool, &format!("{prefix}-retired"), 7, Some(1536)).await;
+
+    seed_member(pool, agent, public, &format!("{prefix} public m0"), true).await;
+    for i in 0..2 {
+        seed_group_member(
+            pool,
+            member,
+            group,
+            private_only,
+            &format!("{prefix} priv m{i}"),
+        )
+        .await;
+        seed_group_member(
+            pool,
+            member,
+            group,
+            mixed,
+            &format!("{prefix} mixed priv m{i}"),
+        )
+        .await;
+    }
+    seed_member(
+        pool,
+        agent,
+        mixed,
+        &format!("{prefix} mixed public m0"),
+        true,
+    )
+    .await;
+    seed_member(
+        pool,
+        agent,
+        retired_only,
+        &format!("{prefix} retired m0"),
+        false,
+    )
+    .await;
+
+    ScopedThemes {
+        member,
+        public,
+        private_only,
+        mixed,
+        empty,
+        retired_only,
+    }
+}
+
+fn summary_pairs(rows: &[epigraph_db::ThemeSummaryRow]) -> Vec<(Uuid, i64)> {
+    rows.iter().map(|r| (r.id, r.member_count)).collect()
+}
+
+/// `member_count DESC, label ASC, id ASC` over `(id, count, label)`.
+fn summary_order(v: &mut [(Uuid, i64, String)]) -> Vec<(Uuid, i64)> {
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+    v.iter().map(|(id, n, _)| (*id, *n)).collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn summaries_list_only_themes_with_a_readable_member(pool: PgPool) {
+    let p = "scoped-list";
+    let t = seed_scoped_themes(&pool, p).await;
+    let stranger = viewer_fixture::public_viewer(&pool).await;
+    let member = Viewer::resolve(&pool, t.member).await.expect("resolve");
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+
+    let as_stranger = ClaimThemeRepository::list_summaries(&pool, &stranger, Some(p), 50, 0)
+        .await
+        .expect("list as stranger");
+    let want = summary_order(&mut [
+        (t.public, 1, format!("{p}-public")),
+        (t.mixed, 1, format!("{p}-mixed")),
+    ]);
+    assert_eq!(
+        summary_pairs(&as_stranger),
+        want,
+        "a stranger sees only the themes it can read a current member of, counted over \
+         those members: no private-only, empty or retired-only theme, and mixed counts 1 \
+         (not its 3 members, not the stored 9999)"
+    );
+
+    let as_member = ClaimThemeRepository::list_summaries(&pool, &member, Some(p), 50, 0)
+        .await
+        .expect("list as member");
+    let want = summary_order(&mut [
+        (t.public, 1, format!("{p}-public")),
+        (t.private_only, 2, format!("{p}-private")),
+        (t.mixed, 3, format!("{p}-mixed")),
+    ]);
+    assert_eq!(
+        summary_pairs(&as_member),
+        want,
+        "the group member also sees its own private-only theme; empty and retired-only \
+         themes stay absent for every viewer"
+    );
+
+    let as_bypass = ClaimThemeRepository::list_summaries(&pool, &bypass, Some(p), 50, 0)
+        .await
+        .expect("list as bypass (no predicate, no group bind)");
+    assert_eq!(
+        summary_pairs(&as_bypass),
+        want,
+        "the bypass viewer reads every member, and still lists no memberless theme"
+    );
+
+    for (v, n, who) in [
+        (&stranger, 2, "stranger"),
+        (&member, 3, "member"),
+        (&bypass, 3, "bypass"),
+    ] {
+        let total = ClaimThemeRepository::count_summaries(&pool, v, Some(p))
+            .await
+            .expect("count_summaries");
+        assert_eq!(
+            total, n,
+            "count_summaries must count exactly the themes list_summaries pages for the \
+             {who}, or has_more promises themes that never come"
+        );
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_summary_is_none_for_a_theme_with_no_readable_member(pool: PgPool) {
+    let t = seed_scoped_themes(&pool, "scoped-get").await;
+    let stranger = viewer_fixture::public_viewer(&pool).await;
+    let member = Viewer::resolve(&pool, t.member).await.expect("resolve");
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+
+    async fn get(pool: &PgPool, v: &Viewer, id: Uuid) -> Option<i64> {
+        ClaimThemeRepository::get_summary(pool, v, id)
+            .await
+            .expect("get_summary")
+            .map(|s| s.member_count)
+    }
+    assert_eq!(
+        get(&pool, &stranger, t.private_only).await,
+        None,
+        "a stranger must get the same None for an all-private theme as for a missing one"
+    );
+    assert_eq!(get(&pool, &member, t.private_only).await, Some(2));
+    assert_eq!(get(&pool, &stranger, t.mixed).await, Some(1));
+    assert_eq!(get(&pool, &bypass, t.mixed).await, Some(3));
+    for v in [&stranger, &member, &bypass] {
+        assert_eq!(
+            get(&pool, v, t.empty).await,
+            None,
+            "a memberless theme is absent"
+        );
+        assert_eq!(
+            get(&pool, v, t.retired_only).await,
+            None,
+            "a theme whose only member is retired is absent"
+        );
+    }
+    assert_eq!(get(&pool, &stranger, Uuid::new_v4()).await, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn find_by_label_never_names_a_hidden_theme(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    let (member, group) = viewer_fixture::seed_agent_with_group(&pool, "scoped-label").await;
+    // Two themes share a label: one public, one made only of private members.
+    let open = seed_theme(&pool, "scoped-label-dup", 0, None).await;
+    let hidden = seed_theme(&pool, "scoped-label-dup", 0, None).await;
+    seed_member(&pool, agent, open, "scoped label open member", true).await;
+    seed_group_member(&pool, member, group, hidden, "scoped label hidden member").await;
+    // And one label whose only theme is all-private.
+    let lone = seed_theme(&pool, "scoped-label-lone", 0, None).await;
+    seed_group_member(&pool, member, group, lone, "scoped label lone member").await;
+
+    let stranger = viewer_fixture::public_viewer(&pool).await;
+    let member_v = Viewer::resolve(&pool, member).await.expect("resolve");
+
+    let found = ClaimThemeRepository::find_by_label(&pool, &stranger, "scoped-label-dup")
+        .await
+        .expect("find_by_label as stranger");
+    assert_eq!(
+        found,
+        vec![open],
+        "the stranger's duplicate-label candidates must not include the all-private theme"
+    );
+    let lone_found = ClaimThemeRepository::find_by_label(&pool, &stranger, "scoped-label-lone")
+        .await
+        .expect("find_by_label lone");
+    assert!(
+        lone_found.is_empty(),
+        "a label whose only theme is hidden is a miss for the stranger: {lone_found:?}"
+    );
+
+    let mut both = ClaimThemeRepository::find_by_label(&pool, &member_v, "scoped-label-dup")
+        .await
+        .expect("find_by_label as member");
+    both.sort();
+    let mut want = vec![open, hidden];
+    want.sort();
+    assert_eq!(both, want, "the member sees both, and so the ambiguity");
+}
+
+/// A 1536-d vector orthogonal to the all-`0.1` centroid `seed_theme` writes:
+/// cosine distance 1.0, far above any split threshold.
+fn far_vec() -> String {
+    let v: Vec<&str> = (0..1536)
+        .map(|i| if i % 2 == 0 { "1" } else { "-1" })
+        .collect();
+    format!("[{}]", v.join(","))
+}
+
+async fn embed_members(pool: &PgPool, theme: Uuid) {
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM claims WHERE theme_id = $1")
+        .bind(theme)
+        .fetch_all(pool)
+        .await
+        .expect("members");
+    for id in ids {
+        viewer_fixture::set_claim_embedding(pool, id, &far_vec()).await;
+    }
+}
+
+fn split_pairs(rows: &[epigraph_db::repos::SplitCandidateRow]) -> Vec<(Uuid, i64)> {
+    let mut v: Vec<(Uuid, i64)> = rows.iter().map(|r| (r.theme_id, r.claim_count)).collect();
+    v.sort();
+    v
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn split_candidates_count_and_filter_on_readable_members(pool: PgPool) {
+    let t = seed_scoped_themes(&pool, "scoped-split").await;
+    // The retired-only theme's member stays unembedded: migration 052 refuses
+    // an embedding on a retired row. Its theme is absent on the count alone.
+    for th in [t.public, t.private_only, t.mixed] {
+        embed_members(&pool, th).await;
+    }
+    // A current public member with NO embedding, added after embedding so it
+    // stays unembedded. It has no distance, so it must not count toward
+    // claim_count or the min_claims floor: public stays at 1 for everyone,
+    // and a COUNT over every current member (2) fails both asserts below.
+    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "scoped-split-extra").await;
+    seed_member(&pool, agent, t.public, "scoped-split unembedded", true).await;
+    let stranger = viewer_fixture::public_viewer(&pool).await;
+    let member = Viewer::resolve(&pool, t.member).await.expect("resolve");
+    let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
+
+    async fn split(pool: &PgPool, v: &Viewer, min: i64) -> Vec<(Uuid, i64)> {
+        split_pairs(
+            &ClaimThemeRepository::find_split_candidates(pool, v, 0.35, min, 50)
+                .await
+                .expect("find_split_candidates"),
+        )
+    }
+
+    let mut want = vec![(t.public, 1), (t.mixed, 1)];
+    want.sort();
+    assert_eq!(
+        split(&pool, &stranger, 1).await,
+        want,
+        "the stranger's claim_count is its readable embedded member count: 1 for mixed, \
+         never the stored 9999; public (stored 0) passes a min_claims of 1 on its live count \
+         and its unembedded member does not lift it to 2"
+    );
+    assert_eq!(
+        split(&pool, &stranger, 2).await,
+        vec![],
+        "min_claims filters on the readable embedded count: mixed's stored 9999 must not \
+         lift it over 2 for a viewer who reads one member, nor public's unembedded member"
+    );
+
+    let mut want = vec![(t.private_only, 2), (t.mixed, 3)];
+    want.sort();
+    assert_eq!(split(&pool, &member, 2).await, want);
+    assert_eq!(
+        split(&pool, &bypass, 2).await,
+        want,
+        "bypass: every current member counts; the retired-only theme stays out"
+    );
+}
+
+/// The POLICY half for every 06f5c5b2 read: on a `read_as`-stamped
+/// connection downgraded to `epigraph_app`, the member's private-only theme is
+/// listed, counted, resolvable and a split candidate; on an UNSTAMPED
+/// downgraded connection, the same calls with the same viewer hide it.
+async fn scoped_policy_half(pool: PgPool, mode: epigraph_db::SessionGucMode) {
+    let p = format!("scoped-policy-{mode:?}").to_lowercase();
+    let t = seed_scoped_themes(&pool, &p).await;
+    for th in [t.public, t.private_only, t.mixed] {
+        embed_members(&pool, th).await;
+    }
+    // Resolve on the superuser pool, BEFORE any downgrade.
+    let viewer = Viewer::resolve(&pool, t.member).await.expect("resolve");
+
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        list: Vec<(Uuid, i64)>,
+        total: i64,
+        private_summary: Option<i64>,
+        private_label: Vec<Uuid>,
+        split: Vec<(Uuid, i64)>,
+    }
+    async fn read_all(
+        conn: &mut sqlx::PgConnection,
+        viewer: &Viewer,
+        p: &str,
+        private_only: Uuid,
+    ) -> Seen {
+        let list = ClaimThemeRepository::list_summaries(&mut *conn, viewer, Some(p), 50, 0)
+            .await
+            .expect("list_summaries");
+        let total = ClaimThemeRepository::count_summaries(&mut *conn, viewer, Some(p))
+            .await
+            .expect("count_summaries");
+        let private_summary = ClaimThemeRepository::get_summary(&mut *conn, viewer, private_only)
+            .await
+            .expect("get_summary")
+            .map(|s| s.member_count);
+        let private_label =
+            ClaimThemeRepository::find_by_label(&mut *conn, viewer, &format!("{p}-private"))
+                .await
+                .expect("find_by_label");
+        let split = ClaimThemeRepository::find_split_candidates(&mut *conn, viewer, 0.35, 1, 50)
+            .await
+            .expect("find_split_candidates");
+        let mut list = summary_pairs(&list);
+        list.sort();
+        Seen {
+            list,
+            total,
+            private_summary,
+            private_label,
+            split: split_pairs(&split),
+        }
+    }
+
+    // Stamped arm.
+    let scoped = viewer_fixture::scoped_pool_with_mode(&pool, mode).await;
+    let mut r = scoped.read_as(&viewer).await.expect("read_as");
+    r.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade the stamped connection");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *r)
+        .await
+        .expect("epigraph_bypass()");
+    assert!(!bypass, "CALIBRATION: the stamped session must not bypass");
+    let stamped = read_all(&mut r, &viewer, &p, t.private_only).await;
+    r.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    r.commit().await.expect("commit");
+
+    // Unstamped arm.
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("downgrade the unstamped connection");
+    let bypass: bool = sqlx::query_scalar("SELECT epigraph_bypass()")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("epigraph_bypass()");
+    assert!(
+        !bypass,
+        "CALIBRATION: the unstamped session must not bypass"
+    );
+    let unstamped = read_all(&mut conn, &viewer, &p, t.private_only).await;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+
+    let mut three = vec![(t.public, 1), (t.private_only, 2), (t.mixed, 3)];
+    three.sort();
+    assert_eq!(
+        stamped,
+        Seen {
+            list: three.clone(),
+            total: 3,
+            private_summary: Some(2),
+            private_label: vec![t.private_only],
+            split: three,
+        },
+        "COHERENCE ({mode:?}): stamped, the member's own private members count everywhere"
+    );
+    let mut public_only = vec![(t.public, 1), (t.mixed, 1)];
+    public_only.sort();
+    assert_eq!(
+        unstamped,
+        Seen {
+            list: public_only.clone(),
+            total: 2,
+            private_summary: None,
+            private_label: vec![],
+            split: public_only,
+        },
+        "THE DIFFERENTIAL ({mode:?}): unstamped, the policy hides the private members the \
+         $V predicate admits, and with them the private-only theme"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn scoped_theme_reads_policy_half_in_session_mode(pool: PgPool) {
+    scoped_policy_half(pool, epigraph_db::SessionGucMode::Session).await;
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn scoped_theme_reads_policy_half_in_transaction_mode(pool: PgPool) {
+    scoped_policy_half(pool, epigraph_db::SessionGucMode::Transaction).await;
 }

@@ -90,15 +90,12 @@ pub struct ThemeSummaryOut {
     pub theme_id: String,
     pub label: String,
     pub description: String,
-    /// Live `COUNT(*)` of `is_current` claims assigned to this theme. This is
-    /// the authoritative figure.
+    /// Live `COUNT(*)` of the `is_current` claims assigned to this theme that
+    /// the caller can read. Always at least 1: a theme with no readable
+    /// member is not returned at all. The stored, corpus-wide
+    /// `claim_themes.claim_count` is deliberately not on this shape (backlog
+    /// 06f5c5b2): it disclosed the size of members the caller cannot read.
     pub member_count: i64,
-    /// The denormalised `claim_themes.claim_count` column. Reported ONLY so
-    /// drift is visible: the assignment writers (`assign_claim`,
-    /// `bulk_assign`, `unassign_claim`) never update it, so it is stale
-    /// whenever anything other than a full k-means run touched membership.
-    /// Do not rank or budget on it.
-    pub stored_claim_count: i32,
     /// `1536`, `3072`, or `null` when the theme has no centroid at all.
     /// Derived from which centroid column is populated — `claim_themes` has no
     /// `centroid_dim` column.
@@ -114,7 +111,6 @@ impl From<ThemeSummaryRow> for ThemeSummaryOut {
             label: r.label,
             description: r.description,
             member_count: r.member_count,
-            stored_claim_count: r.stored_claim_count,
             centroid_dim: r.centroid_dim,
             created_at: r.created_at.to_rfc3339(),
             updated_at: r.updated_at.to_rfc3339(),
@@ -151,12 +147,16 @@ pub struct ResolvedTheme {
 ///   picking the first match would silently scope to one of several distinct
 ///   themes.
 ///
-/// `conn` is the caller's viewer-stamped read (`EpiGraphMcpFull::read_as`):
-/// the member count is a claim-derived read, which row security filters. The
-/// label lookup reads `claim_themes` alone, a registry with no tenancy
-/// (plan §2.4's `tenancy_exempt`), on `pool`.
+/// Only themes the caller can see resolve (backlog 06f5c5b2): a theme is
+/// visible when the caller can read at least one of its current members, the
+/// rule `list_themes` lists by. An unknown id and a hidden one get the same
+/// error, and a label lookup never names a hidden theme's id, neither in the
+/// duplicate-label candidates nor in a miss.
+///
+/// `conn` is the caller's viewer-stamped read (`EpiGraphMcpFull::read_as`),
+/// and both lookups run on it: each is a claim-derived read, which row
+/// security filters.
 pub async fn resolve_theme_selector(
-    pool: &sqlx::PgPool,
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     theme_id: Option<&str>,
@@ -164,6 +164,14 @@ pub async fn resolve_theme_selector(
 ) -> Result<Option<ResolvedTheme>, McpError> {
     let id_raw = theme_id.map(str::trim).filter(|s| !s.is_empty());
     let label_raw = theme_label.map(str::trim).filter(|s| !s.is_empty());
+
+    let unmatched_label = |label: &str| {
+        invalid_params(format!(
+            "no theme has label {label:?}. Call list_themes to see the current themes; \
+             an unmatched label is rejected rather than treated as \"no filter\", \
+             which would widen the query to the whole corpus."
+        ))
+    };
 
     let resolved_id =
         match (id_raw, label_raw) {
@@ -175,17 +183,11 @@ pub async fn resolve_theme_selector(
             (Some(raw), None) => Uuid::parse_str(raw)
                 .map_err(|e| invalid_params(format!("invalid theme_id {raw:?}: {e}")))?,
             (None, Some(label)) => {
-                let matches = ClaimThemeRepository::find_by_label(pool, label)
+                let matches = ClaimThemeRepository::find_by_label(&mut *conn, viewer, label)
                     .await
                     .map_err(internal_error)?;
                 match matches.len() {
-                    0 => {
-                        return Err(invalid_params(format!(
-                        "no theme has label {label:?}. Call list_themes to see the current themes; \
-                         an unmatched label is rejected rather than treated as \"no filter\", \
-                         which would widen the query to the whole corpus."
-                    )))
-                    }
+                    0 => return Err(unmatched_label(label)),
                     1 => matches[0],
                     n => {
                         let ids: Vec<String> = matches.iter().map(ToString::to_string).collect();
@@ -199,10 +201,16 @@ pub async fn resolve_theme_selector(
             }
         };
 
+    // `None` here means unknown or hidden, indistinguishably. On the label
+    // path it can only be a member retired between the two statements; the
+    // answer is still the label miss, so no id reaches the caller.
     let summary = ClaimThemeRepository::get_summary(&mut *conn, viewer, resolved_id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("no theme with id {resolved_id}")))?;
+        .ok_or_else(|| match label_raw {
+            Some(label) => unmatched_label(label),
+            None => invalid_params(format!("no theme with id {resolved_id}")),
+        })?;
 
     Ok(Some(ResolvedTheme {
         id: summary.id,
@@ -251,9 +259,10 @@ pub async fn list_themes(
     .await
     .map_err(internal_error)?;
 
-    // `claim_themes` carries no tenancy: the total is corpus-wide by design
-    // (see `ClaimThemeRepository::count_summaries`).
-    let total = ClaimThemeRepository::count_summaries(&server.pool, prefix)
+    // Same viewer, same connection, same predicate as the page: only themes
+    // with a current member the caller can read are counted (backlog
+    // 06f5c5b2), so `has_more` never promises hidden themes.
+    let total = ClaimThemeRepository::count_summaries(&mut *read, viewer, prefix)
         .await
         .map_err(internal_error)?;
     read.commit().await.map_err(internal_error)?;
@@ -311,7 +320,6 @@ pub async fn get_theme(
 ) -> Result<CallToolResult, McpError> {
     let mut read = server.read_as(viewer, "get_theme").await?;
     let resolved = resolve_theme_selector(
-        &server.pool,
         &mut read,
         viewer,
         params.theme_id.as_deref(),
