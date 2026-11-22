@@ -28,6 +28,9 @@
 //! - `invokes`, `depends_on` and `executes` refuse an edge that would close a
 //!   cycle through `invokes` / `executes` (or `depends_on`) edges the caller
 //!   reads; the check and the insert are serialized per relationship set,
+//! - `properties` may not carry a reserved key
+//!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`), refused with the HTTP edges
+//!   route's text (`epigraph_db::reserved_edge_property_refusal`),
 //! - the call is idempotent on `(source, target, relationship)`.
 //!
 //! Intentionally side-effect-free vs the generic POST: no DS recomputation,
@@ -183,6 +186,16 @@ pub async fn do_link_hierarchical(
         return Err(invalid_params(
             "self-loops are not allowed (source and target are the same entity)",
         ));
+    }
+    // The keys only an act or the document ingest writes (backlog 3676c459),
+    // checked on the caller's own `properties` before `at_step` is merged in:
+    // refused with the HTTP edges route's text, as `patch_edge` refuses them.
+    if let Some(reason) = params
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(invalid_params(reason));
     }
     if params.at_step.is_some() && params.relationship != "invokes" {
         return Err(invalid_params(format!(

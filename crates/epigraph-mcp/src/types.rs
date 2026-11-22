@@ -2668,7 +2668,7 @@ pub struct LinkHierarchicalParams {
 
     #[schemars(
         with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
-        description = "Optional arbitrary JSON object attached to the edge."
+        description = "Optional JSON object attached to the edge. Keys reserved for a supersession act or the document ingest (for example dedup, supersede_act, ingest_written) are refused, and nothing is written."
     )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
@@ -2847,7 +2847,7 @@ pub struct LinkEpistemicParams {
 
     #[schemars(
         with = "Option<std::collections::BTreeMap<String, serde_json::Value>>",
-        description = "Optional arbitrary JSON object attached to the edge."
+        description = "Optional JSON object attached to the edge. Keys reserved for a supersession act or the document ingest (for example dedup, supersede_act, ingest_written) are refused, and nothing is written."
     )]
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
