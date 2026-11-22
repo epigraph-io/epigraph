@@ -845,6 +845,9 @@ async fn apply_in(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = tables::app_readable(conn, specs, in_scope, &keys).await?;
     let counters_before = tables::xact_counters(conn).await?;
+    // Migration 240: the recorded runs of a flat workflow claim this batch
+    // re-tenants follow it, and the census accounts for them.
+    let runs = tables::RunsFollow::before(conn, in_scope).await?;
     // Migration 210's Atlas map epochs, as they stand before the write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
 
@@ -935,6 +938,9 @@ async fn apply_in(
             }
         }
         me.expect_into(conn, &mut expect).await?;
+    }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect).await?);
     }
     v.extend(super::reown::counter_violations(
         &super::reown::counter_delta(&counters_before, &counters_after),
@@ -1163,6 +1169,9 @@ pub async fn reverse_manifest(
     let keys: BTreeSet<RowKey> = s0.keys().cloned().collect();
     let readable_before = tables::app_readable(conn, &specs, &claims, &keys).await?;
     let counters_before = tables::xact_counters(conn).await?;
+    // Migration 240: the recorded runs of a flat workflow claim this batch
+    // re-tenants follow it, and the census accounts for them.
+    let runs = tables::RunsFollow::before(conn, &claims).await?;
     // Migration 210's Atlas map epochs, as they stand before the write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
     let ids: Vec<Uuid> = restore
@@ -1234,6 +1243,9 @@ pub async fn reverse_manifest(
             }
         }
         me.expect_into(conn, &mut expect).await?;
+    }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect).await?);
     }
     v.extend(super::reown::counter_violations(
         &super::reown::counter_delta(&counters_before, &counters_after),

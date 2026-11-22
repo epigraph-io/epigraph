@@ -817,6 +817,120 @@ pub async fn layout_epoch_bump_due(conn: &mut PgConnection) -> anyhow::Result<bo
     .await?)
 }
 
+/// `(run id, run owner, run visibility, parent owner, parent visibility)`; the
+/// parent half is `None` for a run whose workflow no longer exists.
+type RunAndParentPair = (Uuid, Uuid, String, Option<Uuid>, Option<String>);
+
+/// The recorded workflow runs (`behavioral_executions`) a batch's tenancy
+/// changes re-stamp (migration 240, backlog 88cf603b), accounted exactly.
+///
+/// A run carries its workflow's `(owner_group_id, visibility)`: the
+/// `workflows` row when one has the run's `workflow_id`, else the flat
+/// workflow claim. 240's follow triggers re-stamp a parent's runs when the
+/// parent's pair changes, so a batch that narrows, moves or restores a claim
+/// or a workflow row also updates every run of it whose pair differs. Those
+/// updates are rows the batch's census must account for.
+///
+/// A batch takes [`RunsFollow::before`] with its `counters_before` (before its
+/// first write), naming every parent it may re-tenant (a superset is fine: the
+/// count is a before/after difference, not a prediction), and adds
+/// [`RunsFollow::expect_into`] to its expected counts. That also CHECKS the
+/// follow: each of those runs must now carry its parent's pair, so a run left
+/// behind (a follow trigger lost or disabled) fails the batch rather than
+/// staying readable to its parent's old readers. A no-op on a database before
+/// 240, where the table carries no tenancy.
+#[derive(Debug, Default)]
+pub struct RunsFollow {
+    /// Run id -> `(owner_group_id, visibility)` before the batch's first write.
+    before: BTreeMap<Uuid, (Uuid, String)>,
+}
+
+impl RunsFollow {
+    /// The current pair of every run of `parents` (claim or workflow ids).
+    /// `None` before migration 240.
+    ///
+    /// # Errors
+    /// A query fails.
+    pub async fn before(conn: &mut PgConnection, parents: &[Uuid]) -> anyhow::Result<Option<Self>> {
+        let tenanted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                             WHERE table_schema = 'public' \
+                               AND table_name = 'behavioral_executions' \
+                               AND column_name = 'owner_group_id')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .context("probing behavioral_executions for migration 240")?;
+        if !tenanted {
+            return Ok(None);
+        }
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT id, owner_group_id, visibility::text FROM behavioral_executions \
+              WHERE workflow_id = ANY($1)",
+        )
+        .bind(parents)
+        .fetch_all(&mut *conn)
+        .await
+        .context("reading the runs of the batch's parents")?;
+        Ok(Some(Self {
+            before: rows.into_iter().map(|(id, g, v)| (id, (g, v))).collect(),
+        }))
+    }
+
+    /// Add the runs whose pair changed to `expected["behavioral_executions"]`
+    /// (one UPDATE each), and return one violation per run that does not now
+    /// carry its parent's pair.
+    ///
+    /// # Errors
+    /// A query fails.
+    pub async fn expect_into(
+        &self,
+        conn: &mut PgConnection,
+        expected: &mut BTreeMap<String, (i64, i64, i64)>,
+    ) -> anyhow::Result<Vec<String>> {
+        if self.before.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = self.before.keys().copied().collect();
+        let rows: Vec<RunAndParentPair> = sqlx::query_as(
+            "SELECT be.id, be.owner_group_id, be.visibility::text, \
+                    COALESCE(w.owner_group_id, c.owner_group_id), \
+                    COALESCE(w.visibility::text, c.visibility::text) \
+               FROM behavioral_executions be \
+               LEFT JOIN workflows w ON w.id = be.workflow_id \
+               LEFT JOIN claims c ON c.id = be.workflow_id \
+              WHERE be.id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *conn)
+        .await
+        .context("re-reading the runs of the batch's parents")?;
+        let mut changed = 0_i64;
+        let mut v = Vec::new();
+        for (id, g, vis, pg, pv) in rows {
+            if self.before.get(&id) != Some(&(g, vis.clone())) {
+                changed += 1;
+            }
+            if let (Some(pg), Some(pv)) = (pg, pv) {
+                if (pg, pv.as_str()) != (g, vis.as_str()) {
+                    v.push(format!(
+                        "behavioral_executions {id}: the run carries ({vis}, {g}) but its \
+                         workflow is ({pv}, {pg}); migration 240's follow trigger did not \
+                         re-stamp it"
+                    ));
+                }
+            }
+        }
+        if changed > 0 {
+            expected
+                .entry("behavioral_executions".to_string())
+                .or_default()
+                .1 += changed;
+        }
+        Ok(v)
+    }
+}
+
 /// The world group: the key of the public Atlas map (migration 210).
 const WORLD_GROUP: Uuid = Uuid::from_u128(0);
 

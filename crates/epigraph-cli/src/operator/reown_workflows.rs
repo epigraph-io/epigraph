@@ -40,11 +40,14 @@
 //!   With the target equal to the source this is the in-place narrowing: no
 //!   `workflows` row, plan claim, or row that follows its claim changes owner.
 //!
-//!   NOT COVERED: `behavioral_executions` (a plan's recorded runs: goal text,
-//!   goal embedding, step beliefs, tool pattern) has no tenancy columns and no
-//!   row security (migration 069 ledgers it PENDING), so no narrowing can hide
-//!   its rows. The dry run counts them (`BEHAVIORAL-EXECUTIONS`); the read
-//!   paths must gate them on the workflow's readability.
+//!   `behavioral_executions` (a plan's recorded runs: goal text, goal
+//!   embedding, step beliefs, tool pattern) carries its workflow's tenancy
+//!   since migration 240 (backlog 88cf603b): its follow triggers re-stamp a
+//!   generation's runs (and a flat workflow claim's) when the narrowing writes
+//!   the parent, every batch accounts for and checks those re-stamps
+//!   (`tables::RunsFollow`), and the dry run counts them
+//!   (`BEHAVIORAL-EXECUTIONS`). On a database before 240 they carry no
+//!   tenancy, and the dry run says they stay readable.
 //!
 //! # A private move (`--from-visibility group`)
 //!
@@ -2630,11 +2633,34 @@ async fn still_public(
     Ok(out.into_iter().collect())
 }
 
+/// Whether `behavioral_executions` carries its workflow's tenancy (migration
+/// 240, backlog 88cf603b). Before 240 the table has no tenancy columns and no
+/// row security, so a narrowing cannot hide a plan's recorded runs.
+async fn runs_follow_their_plan(conn: &mut PgConnection) -> anyhow::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+                         WHERE table_schema = 'public' \
+                           AND table_name = 'behavioral_executions' \
+                           AND column_name = 'owner_group_id')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .context("probing behavioral_executions for migration 240")
+}
+
 /// `behavioral_executions` rows about `comps`' plans: a run of one of their
-/// generations or of a narrowed claim (a flat workflow), or one recorded
-/// against a narrowed step. The table has no tenancy columns and no row
-/// security, so a narrowing cannot hide them.
-async fn behavioral_rows(conn: &mut PgConnection, comps: &[&Component]) -> anyhow::Result<i64> {
+/// generations or of a narrowed claim (a flat workflow).
+///
+/// Since migration 240 such a run carries its workflow's tenancy and narrows
+/// with it (each batch checks the follow, `tables::RunsFollow`). A run of
+/// ANOTHER plan that names a narrowed step is that other plan's, and keeps
+/// its plan's tenancy, so it is not counted. Before 240 nothing hides a run,
+/// and the count also takes the runs recorded against a narrowed step.
+async fn behavioral_rows(
+    conn: &mut PgConnection,
+    comps: &[&Component],
+    follow: bool,
+) -> anyhow::Result<i64> {
     let claims: Vec<Uuid> = comps.iter().flat_map(|c| c.narrowed_claim_ids()).collect();
     let ids: Vec<Uuid> = comps
         .iter()
@@ -2648,15 +2674,18 @@ async fn behavioral_rows(conn: &mut PgConnection, comps: &[&Component]) -> anyho
     if !exists {
         return Ok(0);
     }
-    sqlx::query_scalar(
+    let sql = if follow {
+        "SELECT count(*) FROM behavioral_executions WHERE workflow_id = ANY($1)"
+    } else {
         "SELECT count(*) FROM behavioral_executions \
-          WHERE workflow_id = ANY($1) OR step_claim_id = ANY($2)",
-    )
-    .bind(&ids)
-    .bind(&claims)
-    .fetch_one(&mut *conn)
-    .await
-    .context("counting behavioral_executions")
+          WHERE workflow_id = ANY($1) OR step_claim_id = ANY($2)"
+    };
+    sqlx::query_scalar(sql)
+        .bind(&ids)
+        .bind(&claims)
+        .fetch_one(&mut *conn)
+        .await
+        .context("counting behavioral_executions")
 }
 
 async fn atlas_epoch(conn: &mut PgConnection) -> anyhow::Result<Option<i64>> {
@@ -3137,6 +3166,10 @@ pub async fn run_batch(
     let counters_before = xact_counters(conn).await?;
     // Migration 210's Atlas map epochs, as they stand before the first write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    // Migration 240: the recorded runs of every generation and plan claim
+    // this batch may re-tenant follow it, and the census accounts for them.
+    let parents: Vec<Uuid> = wf_ids.iter().chain(claim_ids.iter()).copied().collect();
+    let runs = tables::RunsFollow::before(conn, &parents).await?;
 
     // Each row compare-and-swapped on the prior the plan read (the FROM state,
     // or under --catch-up the source's private state).
@@ -3440,6 +3473,9 @@ pub async fn run_batch(
         }
         me.expect_into(conn, &mut expect).await?;
     }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect).await?);
+    }
     expect.retain(|_, d| *d != (0, 0, 0));
     v.extend(counter_violations(
         &counter_delta(&counters_before, &counters_after),
@@ -3555,8 +3591,11 @@ pub struct RunReport {
     pub held_hand_off: Vec<String>,
     /// Plan rows of narrowed lineages still public after the writes.
     pub left_public: Vec<RowKey>,
-    /// `behavioral_executions` rows about the narrowed plans (no tenancy).
+    /// `behavioral_executions` rows about the narrowed plans.
     pub behavioral_rows: i64,
+    /// Whether those rows follow their plan's tenancy (migration 240); before
+    /// 240 they carry none and stay readable.
+    pub behavioral_follow: bool,
 }
 
 /// The process exit code of a run: 2 when a batch was rolled back; 3 when an
@@ -3770,27 +3809,48 @@ pub async fn run(
         .map(|(n, _)| n.clone())
         .collect();
     if act.narrows() {
-        // behavioral_executions has no tenancy: report, never claim to hide.
+        // Since migration 240 a plan's recorded runs follow its tenancy, and
+        // every batch checks that they did; before it, report, never claim to
+        // hide.
+        let follow = runs_follow_their_plan(conn).await?;
+        report.behavioral_follow = follow;
         for c in &p.components {
-            let n = behavioral_rows(conn, &[c]).await?;
+            let n = behavioral_rows(conn, &[c], follow).await?;
             if n > 0 {
                 writeln!(
                     out,
-                    "BEHAVIORAL-EXECUTIONS\t{n}\t{}\trow(s) stay publicly readable (no RLS)",
-                    c.lineages.join(",")
+                    "BEHAVIORAL-EXECUTIONS\t{n}\t{}\t{}",
+                    c.lineages.join(","),
+                    if follow {
+                        "row(s) follow their workflow's tenancy (migration 240)"
+                    } else {
+                        "row(s) stay publicly readable (no RLS)"
+                    }
                 )?;
             }
         }
         let all: Vec<&Component> = p.components.iter().collect();
-        report.behavioral_rows = behavioral_rows(conn, &all).await?;
-        writeln!(
-            out,
-            "BEHAVIORAL-EXECUTIONS-TOTAL\t{}\trow(s) recording runs of these plans (goal text, \
-             goal embedding, step beliefs, tool pattern) stay readable to every application \
-             session: behavioral_executions has no tenancy columns and no row security, so this \
-             narrowing cannot hide them",
-            report.behavioral_rows
-        )?;
+        report.behavioral_rows = behavioral_rows(conn, &all, follow).await?;
+        if follow {
+            writeln!(
+                out,
+                "BEHAVIORAL-EXECUTIONS-TOTAL\t{}\trow(s) recording runs of these plans (goal \
+                 text, goal embedding, step beliefs, tool pattern) follow their workflow's \
+                 tenancy (migration 240): they narrow with their generation or flat workflow \
+                 claim, and every batch checks that they did",
+                report.behavioral_rows
+            )?;
+        } else {
+            writeln!(
+                out,
+                "BEHAVIORAL-EXECUTIONS-TOTAL\t{}\trow(s) recording runs of these plans (goal \
+                 text, goal embedding, step beliefs, tool pattern) stay readable to every \
+                 application session: behavioral_executions has no tenancy columns and no row \
+                 security on this database (before migration 240), so this narrowing cannot \
+                 hide them",
+                report.behavioral_rows
+            )?;
+        }
     }
     if act.narrows() {
         if act.from_private {
@@ -3925,7 +3985,16 @@ pub async fn run(
         "visibility": act.visibility.as_str(),
         "from_visibility": act.from_state().visibility,
         "catch_up": act.catch_up,
-        "behavioral_executions_unhidden": report.behavioral_rows,
+        "behavioral_executions_unhidden": if report.behavioral_follow {
+            0
+        } else {
+            report.behavioral_rows
+        },
+        "behavioral_executions_followed": if report.behavioral_follow {
+            report.behavioral_rows
+        } else {
+            0
+        },
         "ruling": opts.ruling,
         "reason": opts.reason,
         "operator_person": opts.operator,
@@ -4074,12 +4143,21 @@ pub async fn run(
                 "{} batch(es) violated and were rolled back",
                 report.batch_failures.len()
             )
+        } else if act.narrows() && report.behavioral_follow {
+            format!(
+                "all held in every batch: the rows this run narrowed became unreadable to an \
+                 unstamped session, the atlas epoch bumped once per batch that narrowed a \
+                 public row, and the {} behavioral_executions row(s) about these plans followed \
+                 their workflow's tenancy",
+                report.behavioral_rows
+            )
         } else if act.narrows() {
             format!(
                 "all held in every batch: the rows this run narrowed became unreadable to an \
                  unstamped session, and the atlas epoch bumped once per batch that narrowed a \
                  public row. NOT covered: {} behavioral_executions row(s) about these plans, \
-                 which carry no tenancy and stay readable",
+                 which carry no tenancy on this database (before migration 240) and stay \
+                 readable",
                 report.behavioral_rows
             )
         } else {
@@ -4775,6 +4853,10 @@ async fn reverse_tx(
     let counters_before = xact_counters(conn).await?;
     // Migration 210's Atlas map epochs, as they stand before the first write.
     let mut map_epochs = tables::MapEpochs::before(conn).await?;
+    // Migration 240: the recorded runs of every generation and plan claim
+    // this batch may re-tenant follow it, and the census accounts for them.
+    let parents: Vec<Uuid> = wf_ids.iter().chain(claim_ids.iter()).copied().collect();
+    let runs = tables::RunsFollow::before(conn, &parents).await?;
     let claims_prior = fetch_claims(conn, &claim_ids, false).await?;
 
     let to_vis = act.to_vis();
@@ -5021,6 +5103,9 @@ async fn reverse_tx(
             }
         }
         me.expect_into(conn, &mut expect).await?;
+    }
+    if let Some(r) = runs.as_ref() {
+        v.extend(r.expect_into(conn, &mut expect).await?);
     }
     expect.retain(|_, d| *d != (0, 0, 0));
     v.extend(counter_violations(

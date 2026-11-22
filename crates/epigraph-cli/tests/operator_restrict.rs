@@ -1906,3 +1906,63 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
         "nodes and links reversed",
     );
 }
+
+/// Migration 240 (backlog 88cf603b): a recorded run of a flat workflow claim
+/// (`behavioral_executions.workflow_id` = the claim) follows the claim's
+/// tenancy. Restricting the claim re-stamps the run, and the batch's census
+/// accounts for that update rather than rolling the batch back as "a row
+/// outside the eligible set changed"; the reversal restores it the same way.
+/// Verified to fail without `tables::RunsFollow` wired into restrict's batch:
+/// exit 2, `table behavioral_executions: ... (0, 1, 0) rows, the batch
+/// accounts for (0, 0, 0)`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_flat_workflow_claims_recorded_run_follows_restrict_and_reverse(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let run: Uuid = sqlx::query_scalar(
+        "INSERT INTO behavioral_executions (workflow_id, goal_text, success) \
+         VALUES ($1, 'a run of a flat workflow', true) RETURNING id",
+    )
+    .bind(fx.a)
+    .fetch_one(&pool)
+    .await
+    .expect("a recorded run");
+    assert_eq!(
+        row(&pool, "behavioral_executions", run).await,
+        row(&pool, "claims", fx.a).await,
+        "PREMISE: the run carries its claim's pair"
+    );
+    let before = row(&pool, "claims", fx.a).await;
+    assert_eq!(before.1, "public", "PREMISE: the claim starts public");
+
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.target));
+    assert_eq!(
+        row(&pool, "behavioral_executions", run).await,
+        grp(fx.target),
+        "the run narrows with its flat workflow claim"
+    );
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, before);
+    assert_eq!(
+        row(&pool, "behavioral_executions", run).await,
+        before,
+        "the reversal restores the run with its claim"
+    );
+}
