@@ -150,7 +150,11 @@ BEGIN
                 ELSE c.owner_group_id END,
            e.created_at
       FROM public.security_events e
-      JOIN public.claims c ON c.id::text = e.details ->> 'claim_id'
+      -- Joined on the uuid, so `claims_pkey` serves the probe (a cast on the
+      -- claims side would read the whole heap); a malformed value joins nothing.
+      JOIN public.claims c
+        ON c.id = CASE WHEN (e.details ->> 'claim_id') ~ v_uuid
+                       THEN (e.details ->> 'claim_id')::uuid END
      WHERE e.event_type = 'bug_report.submitted'
        AND e.agent_id IS NOT NULL
        AND c.agent_id = e.agent_id

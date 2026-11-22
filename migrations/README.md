@@ -3429,8 +3429,15 @@ restart.
   catalog to below 265). Checked before claiming: no migration on main or an origin branch
   carries a `265`. **Deploy order:** the MCP binary of this change ships with or BEFORE the
   migration (an older binary's invisible-only repro is refused BUG05 by 265's body; the new
-  binary on 211's body composes what 211 does); migrate before running the theme scripts of
-  this change (they read the table: 42P01 below 265). A
+  binary on 211's body composes what 211 does; an older binary's invisible-only EVIDENCE is
+  not refused but stored as the description under the digest of the invisible text, silently,
+  so the binary must not trail the migration); migrate before running the theme scripts of
+  this change (they read the table: 42P01 below 265), and while NO theme run is in progress (a
+  maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
+  600 s statement timeout, so 265's ACCESS EXCLUSIVE lock times out after 3 s and the migration
+  fails, safely: re-run it). The backfill reads `security_events` through
+  `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
+  on a deployed database is a measurement still to make. A
   read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
