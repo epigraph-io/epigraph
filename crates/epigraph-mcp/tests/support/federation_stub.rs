@@ -16,19 +16,25 @@
 //! - `hang_list = true`: `tools/list` never answers;
 //! - a request whose bearer is [`REJECTED_BEARER`] gets `401`.
 //!
+//! [`spawn_legacy_stub`] serves the same stub speaking ONLY protocol
+//! `2025-03-26`, as episcience-mcp does: its results carry no SEP-2322
+//! `resultType`, the shape the gateway must not relay bare to a `2026-07-28`
+//! caller (backlog e3614de6).
+//!
 //! Tool behaviour is keyed by name: [`HANG_TOOL`] never answers,
 //! [`FAIL_TOOL`] answers with [`fail_error`], [`INTERNAL_FAIL_TOOL`] with
 //! [`internal_fail_error`], and any other name echoes
 //! `stub handled `<name>``.
 #![allow(dead_code)]
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
-    ServerCapabilities, ServerConfig, Tool,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -87,14 +93,31 @@ impl StubControl {
     }
 }
 
+/// The one revision [`spawn_legacy_stub`] speaks: episcience-mcp's.
+pub const LEGACY_PROTOCOL: ProtocolVersion = ProtocolVersion::V_2025_03_26;
+
 #[derive(Clone)]
 struct ControlledStub {
     control: Arc<StubControl>,
+    /// Speak only [`LEGACY_PROTOCOL`] instead of every revision rmcp knows.
+    legacy: bool,
 }
 
 impl ServerHandler for ControlledStub {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+        let mut info = ServerConfig::new(ServerCapabilities::builder().enable_tools().build());
+        if self.legacy {
+            info.protocol_version = LEGACY_PROTOCOL;
+        }
+        info
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        if self.legacy {
+            Cow::Owned(vec![LEGACY_PROTOCOL])
+        } else {
+            Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
+        }
     }
 
     async fn list_tools(
@@ -162,14 +185,22 @@ async fn gate(
 pub async fn spawn_controlled_stub(tools: &[&str]) -> (String, Arc<StubControl>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
-    (addr, serve_controlled_stub(listener, tools))
+    (addr, serve_controlled_stub(listener, tools, false))
+}
+
+/// As [`spawn_controlled_stub`], but the stub speaks only [`LEGACY_PROTOCOL`]
+/// (`2025-03-26`), so its `tools/call` results carry no `resultType`.
+pub async fn spawn_legacy_stub(tools: &[&str]) -> (String, Arc<StubControl>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    (addr, serve_controlled_stub(listener, tools, true))
 }
 
 /// As [`spawn_controlled_stub`], on a caller-chosen `host:port`: brings an
 /// extension up on the address a gateway already failed to reach.
 pub async fn spawn_controlled_stub_on(addr: &str, tools: &[&str]) -> Arc<StubControl> {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    serve_controlled_stub(listener, tools)
+    serve_controlled_stub(listener, tools, false)
 }
 
 /// A loopback `host:port` nothing listens on: bound, then released.
@@ -180,7 +211,11 @@ pub async fn dead_addr() -> String {
     format!("127.0.0.1:{port}")
 }
 
-fn serve_controlled_stub(listener: tokio::net::TcpListener, tools: &[&str]) -> Arc<StubControl> {
+fn serve_controlled_stub(
+    listener: tokio::net::TcpListener,
+    tools: &[&str],
+    legacy: bool,
+) -> Arc<StubControl> {
     let control = Arc::new(StubControl {
         tools: Mutex::new(tools.iter().map(|n| (*n).to_string()).collect()),
         alive: AtomicBool::new(true),
@@ -192,6 +227,7 @@ fn serve_controlled_stub(listener: tokio::net::TcpListener, tools: &[&str]) -> A
         move || {
             Ok(ControlledStub {
                 control: for_service.clone(),
+                legacy,
             })
         },
         Arc::new(LocalSessionManager::default()),

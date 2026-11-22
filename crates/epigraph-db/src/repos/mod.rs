@@ -198,7 +198,7 @@ pub use claim_theme::{
     centroid_columns_for_dim, BoundaryClaimRow, ClaimThemeRepository, ClaimThemeRow,
     DistantClaimsRow, NeighbourhoodThemeCoverage, RecomputedThemeRow, SplitCandidateRow,
     ThemeMemberRow, ThemeOverviewCursor, ThemeOverviewPage, ThemeOverviewRow, ThemeSummaryRow,
-    THEME_OVERVIEW_PAGE_MAX,
+    UnthemedAssignmentPreviewRow, THEME_OVERVIEW_PAGE_MAX,
 };
 pub use claim_version::{ClaimVersionRepository, ClaimVersionRow};
 pub use claim_visibility::{

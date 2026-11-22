@@ -488,3 +488,183 @@ async fn the_gateways_own_bearer_layer_refuses_an_extension_audience_token() {
         "an extension-audience token must not be admitted on a kernel route"
     );
 }
+
+// ── Backlog e3614de6: a relayed result answers in the CALLER's revision ──────
+//
+// Prod 2026-11-21: claude.ai, on protocol 2026-07-28, called episcience's
+// `list_syntheses` through the gateway and rejected the answer: "Invalid
+// result for tools/call: missing required resultType". episcience-mcp speaks
+// 2025-03-26, whose results carry no `resultType`, and the gateway relayed the
+// result as it came.
+
+/// The tool the legacy stub serves, named after the prod call.
+const LEGACY_TOOL: &str = "list_syntheses";
+
+/// The JSON-RPC answer in an HTTP reply body, JSON or SSE.
+fn json_rpc_answer(body: &str) -> serde_json::Value {
+    let data = if body.trim_start().starts_with('{') {
+        body.trim()
+    } else {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_else(|| panic!("no JSON-RPC answer in:\n{body}"))
+    };
+    serde_json::from_str(data).expect("JSON-RPC answer")
+}
+
+/// Call `tool` as a `2026-07-28` client does: no `initialize`, no session,
+/// the revision and capabilities in the request's `_meta` and in the
+/// SEP-2243 headers. Returns the JSON-RPC answer.
+async fn call_as_2026_07_28(url: &str, token: &str, tool: &str) -> serde_json::Value {
+    let mut resp = reqwest::Client::new()
+        .post(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", ACCEPT)
+        .header("Content-Type", "application/json")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", tool)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }))
+        .send()
+        .await
+        .expect("POST");
+    assert_eq!(resp.status().as_u16(), 200, "2026-07-28 tools/call");
+    json_rpc_answer(&read_sse_data(&mut resp, std::time::Duration::from_secs(10)).await)
+}
+
+/// Call `tool` as a session client on `2024-11-05` (the `initialize`
+/// handshake). Returns the JSON-RPC answer.
+async fn call_as_legacy_session(url: &str, token: &str, tool: &str) -> serde_json::Value {
+    let client = reqwest::Client::new();
+    let session = handshake(&client, url, token).await;
+    let mut resp = post(
+        &client,
+        url,
+        token,
+        Some(&session),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": {}}
+        }),
+    )
+    .await;
+    json_rpc_answer(&read_sse_data(&mut resp, std::time::Duration::from_secs(10)).await)
+}
+
+/// What the legacy stub answers a client that dials it DIRECTLY: the
+/// negotiated revision and the `tools/call` result.
+async fn direct_legacy_answer(addr: &str) -> (String, rmcp::model::CallToolResult) {
+    use rmcp::transport::streamable_http_client::StreamableHttpClientTransport;
+    let transport = StreamableHttpClientTransport::from_uri(format!("http://{addr}/mcp"));
+    let client = rmcp::serve_client((), transport)
+        .await
+        .expect("dial the legacy stub");
+    let negotiated = client
+        .peer()
+        .peer_info()
+        .expect("handshake result")
+        .protocol_version
+        .to_string();
+    let result = client
+        .peer()
+        .call_tool(rmcp::model::CallToolRequestParams::new(LEGACY_TOOL))
+        .await
+        .expect("direct call");
+    (negotiated, result)
+}
+
+async fn legacy_gateway() -> (String, String) {
+    let (addr, _control) = stub::spawn_legacy_stub(&[LEGACY_TOOL]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub")
+        .with_token_exchange(tx::spawn_token_endpoint(SECRET, &["ext"]).await.exchange());
+    (addr, spawn_gateway(SharedFederation::new(registry)).await)
+}
+
+/// A `2026-07-28` caller of a tool whose extension speaks `2025-03-26` gets a
+/// result WITH `resultType: "complete"` (the value an absent field means in
+/// the extension's revision), and the extension's content unchanged.
+///
+/// Mutation: relay the downstream result as it came (`Ok(Ok(result)) =>
+/// Ok(result)` in `invoke_once`, the pre-fix code) -> the answer has no
+/// `resultType` and this fails, as claude.ai did.
+#[tokio::test]
+async fn a_2026_07_28_caller_gets_result_type_from_a_2025_03_26_extension() {
+    let (addr, url) = legacy_gateway().await;
+
+    // CALIBRATION: the stub really is a 2025-03-26 server whose result carries
+    // no `resultType`, so the gateway has one to fill in.
+    let (negotiated, direct) = direct_legacy_answer(&addr).await;
+    assert_eq!(
+        negotiated,
+        stub::LEGACY_PROTOCOL.to_string(),
+        "CALIBRATION: the stub speaks only 2025-03-26"
+    );
+    assert!(
+        direct.result_type.is_none(),
+        "CALIBRATION: a 2025-03-26 result carries no resultType: {direct:?}"
+    );
+    let direct_content = serde_json::to_value(&direct.content).unwrap();
+    assert_eq!(
+        direct_content,
+        serde_json::json!([{"type": "text", "text": format!("stub handled `{LEGACY_TOOL}`")}]),
+        "CALIBRATION: the stub's echo"
+    );
+
+    let answer = call_as_2026_07_28(&url, &mint_token(&["ext:tools"]), LEGACY_TOOL).await;
+    let result = answer
+        .get("result")
+        .unwrap_or_else(|| panic!("expected a result, got {answer}"));
+    assert_eq!(
+        result.get("resultType").and_then(serde_json::Value::as_str),
+        Some("complete"),
+        "a 2026-07-28 caller must get resultType on a relayed result \
+         (missing required resultType): {answer}"
+    );
+    assert_eq!(
+        result["content"], direct_content,
+        "the extension's content is relayed unchanged: {answer}"
+    );
+    assert_ne!(
+        result.get("isError"),
+        Some(&serde_json::Value::Bool(true)),
+        "a successful call: {answer}"
+    );
+}
+
+/// The other side of "the caller's revision": a session caller on an
+/// older revision is answered in its own shape, WITHOUT `resultType`, and
+/// with the same content. Guards against a fix that adds the field past
+/// rmcp's legacy-peer strip.
+#[tokio::test]
+async fn a_legacy_session_caller_gets_no_result_type_from_the_same_relay() {
+    let (addr, url) = legacy_gateway().await;
+    let (_, direct) = direct_legacy_answer(&addr).await;
+
+    let answer = call_as_legacy_session(&url, &mint_token(&["ext:tools"]), LEGACY_TOOL).await;
+    let result = answer
+        .get("result")
+        .unwrap_or_else(|| panic!("expected a result, got {answer}"));
+    assert!(
+        result.get("resultType").is_none(),
+        "a pre-2026-07-28 caller keeps the legacy shape: {answer}"
+    );
+    assert_eq!(
+        result["content"],
+        serde_json::to_value(&direct.content).unwrap(),
+        "the extension's content is relayed unchanged: {answer}"
+    );
+}
