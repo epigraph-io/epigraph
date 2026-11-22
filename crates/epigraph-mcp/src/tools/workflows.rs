@@ -1757,8 +1757,16 @@ pub async fn deprecate_workflow(
         if !is_row {
             return Err(deprecate_target_not_found(workflow_id));
         }
-        return deprecate_hierarchical_workflow(server, auth, caller, workflow_id, cascade, params)
-            .await;
+        return deprecate_hierarchical_workflow(
+            server,
+            viewer,
+            auth,
+            caller,
+            workflow_id,
+            cascade,
+            params,
+        )
+        .await;
     }
 
     // Deprecate the target workflow (A4: also set is_current = false).
@@ -1957,6 +1965,7 @@ fn deprecate_target_not_found(workflow_id: uuid::Uuid) -> McpError {
 /// so it needs a retirement marker and touches the shared executor.
 async fn deprecate_hierarchical_workflow(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
     workflow_id: uuid::Uuid,
@@ -1990,7 +1999,7 @@ async fn deprecate_hierarchical_workflow(
     let not_found = || deprecate_target_not_found(workflow_id);
     for &row in &targets {
         crate::tools::workflow_authority::require_workflow_authority(
-            server, &mut tx, auth, caller, row, TOOL, &not_found,
+            server, &mut tx, auth, caller, viewer, row, TOOL, &not_found,
         )
         .await?;
     }
@@ -2041,7 +2050,7 @@ async fn deprecate_hierarchical_workflow(
     for &row in &targets {
         grants.push(
             crate::tools::workflow_authority::require_workflow_authority(
-                server, &mut tx, auth, caller, row, TOOL, &not_found,
+                server, &mut tx, auth, caller, viewer, row, TOOL, &not_found,
             )
             .await?,
         );
