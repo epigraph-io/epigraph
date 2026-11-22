@@ -147,6 +147,15 @@ pub struct StoreWorkflowRequest {
     /// group.
     #[serde(default)]
     pub tenancy: Option<epigraph_ingest::workflow::WorkflowTenancy>,
+    /// Mint a new generation-0 lineage even when an existing hierarchical
+    /// workflow has a near-identical goal (default false). Without it, a goal
+    /// whose embedding is at least 0.90 cosine-similar to a live workflow's
+    /// goal under a DIFFERENT canonical_name, in exactly the tenancy this
+    /// store would use, stores nothing and answers with the head of that
+    /// workflow's lineage, `matched_existing: true`, its `similarity` and a
+    /// `hint` (backlog 51d599a9; the rule MCP `store_workflow` applies).
+    #[serde(default)]
+    pub force_new: Option<bool>,
 }
 
 #[cfg(feature = "db")]
@@ -317,7 +326,11 @@ fn slugify_goal(s: &str) -> String {
 /// `tenancy` declares a group or, explicitly, public (see
 /// [`IngestWorkflowRequest`]). Each step becomes a first-class claim.
 /// Idempotent on `(slugify(goal), generation=0)`: a re-store writes nothing,
-/// and emits no event.
+/// and emits no event. A REWORDED goal that matches a live workflow in the
+/// tenancy this store would use stores nothing either, and answers with that
+/// workflow's lineage head and `matched_existing: true`, unless `force_new`
+/// (backlog 51d599a9; the rule is MCP `store_workflow`'s,
+/// `epigraph_ingest_executor::matching_workflow_conn`).
 #[cfg(feature = "db")]
 pub async fn store_workflow(
     ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
@@ -349,6 +362,61 @@ pub async fn store_workflow(
         epigraph_ingest_executor::require_caller_writes_group(&viewer, caller, group)
             .map_err(workflow_ingest_error)?;
     }
+
+    // Embed the goal ONCE, best-effort (a query vector: the embedding
+    // service, whichever provider it is). It decides whether this goal is a
+    // rewording of a workflow already in the tenancy this store would use
+    // (backlog 51d599a9, the rule MCP `store_workflow` applies:
+    // `epigraph_ingest_executor::matching_workflow_conn`), and the same vector
+    // is stored as a new row's goal embedding below when the provider may
+    // store. Without a service, or when it fails, nothing is matched, as
+    // before.
+    let goal_vec = match state.embedding_service() {
+        Some(embedder) => match embedder.generate(&request.goal).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(error = ?e, "store_workflow goal embedding failed; not matching");
+                None
+            }
+        },
+        None => None,
+    };
+    if !request.force_new.unwrap_or(false) {
+        if let (Some(qvec), Some(caller)) = (goal_vec.as_deref(), viewer.principal()) {
+            let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows").await?;
+            let found = epigraph_ingest_executor::matching_workflow_conn(
+                &mut tx,
+                &viewer,
+                caller,
+                declared,
+                &canonical_name,
+                qvec,
+            )
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("store_workflow: could not match the goal: {e}"),
+            })?;
+            tx.rollback().await.map_err(|e| ApiError::InternalError {
+                message: format!("store_workflow: could not end the match read: {e}"),
+            })?;
+            if let Some(hit) = found {
+                // Nothing was stored, so nothing is announced: no event.
+                return Ok(Json(serde_json::json!({
+                    "workflow_id": hit.id,
+                    "canonical_name": hit.canonical_name,
+                    "goal": hit.goal,
+                    "generation": hit.generation,
+                    "step_count": 0,
+                    "claims_ingested": 0,
+                    "already_ingested": false,
+                    "matched_existing": true,
+                    "similarity": hit.similarity,
+                    "hint": hit.hint("POST /api/v1/workflows"),
+                })));
+            }
+        }
+    }
+
     let prereqs = request.prerequisites.unwrap_or_default();
     let tags = request.tags.unwrap_or_default();
     let confidence = request.confidence.unwrap_or(0.8).clamp(0.0, 1.0);
@@ -459,8 +527,14 @@ pub async fn store_workflow(
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
         // only on a row this call's insert CREATED: an existing row (one the
         // walk was admitted under) keeps the goal embedding of its own goal.
+        // The vector computed for the match above is the same service's, so
+        // it is reused; it is generated here only when that one failed.
         if result.row_created {
-            match embedder.generate(&request.goal).await {
+            let qvec = match goal_vec {
+                Some(v) => Ok(v),
+                None => embedder.generate(&request.goal).await,
+            };
+            match qvec {
                 Ok(qvec) => {
                     store_workflow_goal_embedding(&state, &viewer, "workflows", wf_id, &qvec).await;
                 }
@@ -487,6 +561,7 @@ pub async fn store_workflow(
         "step_count": request.steps.len(),
         "claims_ingested": result.claims_ingested,
         "already_ingested": result.already_ingested,
+        "matched_existing": false,
     });
     if !caller_reads_row {
         omit_workflow_id(&mut event);
