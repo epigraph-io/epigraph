@@ -26,19 +26,29 @@ pub struct RevokeRequest {
 /// `application/x-www-form-urlencoded`; JSON is also accepted because deployed
 /// clients send it. The same split as `token.rs::parse_token_request`, kept
 /// separate because that one is `db`-only and this endpoint is not.
+///
+/// A body that does not parse, including one without the REQUIRED `token`
+/// parameter, is refused with RFC 7009 section 2.2.1's error response: RFC
+/// 6749 section 5.2's `{"error":"invalid_request","error_description":..}`
+/// (400), the code a standards-following client keys on.
 fn parse_revoke_request(headers: &HeaderMap, body: &[u8]) -> Result<RevokeRequest, ApiError> {
     let ct = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if ct.starts_with("application/json") {
-        serde_json::from_slice(body).map_err(|e| ApiError::BadRequest {
-            message: format!("invalid JSON revocation request: {e}"),
-        })
+        serde_json::from_slice(body).map_err(|e| invalid_request(format!("invalid JSON: {e}")))
     } else {
-        serde_urlencoded::from_bytes(body).map_err(|e| ApiError::BadRequest {
-            message: format!("invalid form-encoded revocation request: {e}"),
-        })
+        serde_urlencoded::from_bytes(body)
+            .map_err(|e| invalid_request(format!("invalid form-encoded body: {e}")))
+    }
+}
+
+/// RFC 6749 section 5.2 `invalid_request` for a revocation request.
+fn invalid_request(detail: String) -> ApiError {
+    ApiError::OAuthGrantError {
+        error: "invalid_request",
+        description: format!("malformed revocation request ({detail})"),
     }
 }
 

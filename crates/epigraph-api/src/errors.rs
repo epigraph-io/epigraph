@@ -301,8 +301,10 @@ pub enum ApiError {
     /// `400` with an RFC 6749 §5.2 token-endpoint error body,
     /// `{"error": <code>, "error_description": <text>}`, for a client that
     /// must act on the code: the elevate grant's device-flow-style polling
-    /// (`authorization_pending`, then `invalid_grant`). The other grants keep
-    /// their historical `BadRequest` shape.
+    /// (`authorization_pending`, then `invalid_grant`), the run-token and
+    /// token-exchange grants, the refresh grant's `invalid_scope`, and
+    /// `POST /oauth/revoke`'s `invalid_request` (RFC 7009 §2.2.1). Other
+    /// token-endpoint refusals keep their historical `BadRequest` shape.
     #[error("{error}: {description}")]
     OAuthGrantError {
         error: &'static str,
