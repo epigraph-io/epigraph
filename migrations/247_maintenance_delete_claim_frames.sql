@@ -18,10 +18,13 @@
 -- WHY A GRANT, NOT A DEFINER. Every SECURITY DEFINER in this schema is owned
 -- by `epigraph_maintenance` itself, and a definer runs with its owner's
 -- privileges: a maintenance-owned "unbind the recorded frames" function would
--- fail the same way. A narrow definer would need a new owner role holding the
--- DELETE (as 161 did for `epigraph_identity_attestor`), which managed
--- Postgres must provision out of band, for no real narrowing (next
--- paragraph). Leaving the binding instead is not a reversal: a `binary_truth`
+-- fail the same way. Restricting who may CALL a definer (161's pattern: a
+-- narrow caller role with EXECUTE on a maintenance-owned definer) does not
+-- help, because the caller here is the maintenance role itself and the
+-- definer's owner would still lack the DELETE. A narrow definer would need a
+-- different OWNER role holding the DELETE, which managed Postgres must
+-- provision out of band, for little narrowing (next paragraph). Leaving the
+-- binding instead is not a reversal: a `binary_truth`
 -- binding at a non-zero index, copied when both claims share an owner group,
 -- would keep the canonical reading FALSE on a frame it holds no input on.
 --
@@ -30,11 +33,25 @@
 -- already rewrite every binding (070's UPDATE on `claim_frames`, pinned by the
 -- test above, covers `frame_id` and `hypothesis_index`), insert new ones, and
 -- delete a whole frame (158), which empties that frame's `claim_frames` rows
--- through the ON DELETE CASCADE. Deleting a binding row is therefore not new
--- authority over what a claim is bound to. It deletes no frame and no BBA, so
--- it is independent of the open question of whether frame deletion (158)
--- should need stronger credentials than this role: revoking 158 would leave
--- this grant correct.
+-- through the ON DELETE CASCADE. While 158 stands, deleting a binding row is
+-- therefore not new authority over what a claim is bound to. That argument
+-- leans on 158: if frame deletion is ever taken from this role (the open
+-- question of whether it should need stronger credentials), UPDATE can only
+-- re-bind a claim, and this grant becomes the role's one way to remove a
+-- binding from any claim. The grant deletes no frame and no BBA, so it stays
+-- correct for the un-mark either way; whoever revokes 158 should weigh this
+-- grant in the same decision.
+--
+-- OTHER CONSUMER. `scripts/migrate_provenance_bba.py --rollback` connects
+-- through `maintenance_dsn()` and deletes the `claim_frames` rows its run
+-- created, so it failed the same way on a NOSUPERUSER maintenance login and
+-- works after this grant.
+--
+-- DEPLOY CHECK. The grant is skipped when `epigraph_maintenance` does not
+-- exist yet (as in 158). A deployment that creates the role after migrating
+-- must check, and grant by hand if false:
+--   SELECT has_table_privilege('epigraph_maintenance',
+--                              'public.claim_frames', 'DELETE');
 --
 -- ROW SECURITY is unchanged. 115's RESTRICTIVE delete policy on
 -- `claim_frames` still applies, and a maintenance session passes it through
