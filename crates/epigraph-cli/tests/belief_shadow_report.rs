@@ -793,6 +793,65 @@ async fn the_sheaf_shadow_reads_the_folds_and_strict_drops_compound_ended_edges(
     );
 }
 
+/// The candidate's sheaf edges skip a retired endpoint, as the served
+/// readers do (backlog 829de1e2). `s -supports-> t` between two current
+/// atoms is the live control; `s -supports-> r` ends on `r`, valued by the
+/// single writer and THEN retired (`is_current = false`), so only the
+/// retirement keeps its edge out. With `r` listed in the scope, the served
+/// cohomology as the sheaf tool computes it reads one edge; the like-for-like
+/// served set and both candidate modes must read the same one edge. Over
+/// every current claim (`Scope::All`, which lists no retired claim), the
+/// retired edge is no pair outside the scope either: it is not a pair.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_sheaf_shadow_skips_an_edge_with_a_retired_endpoint(pool: PgPool) {
+    let author = agent(&pool).await;
+    let s = claim(&pool, author, "s").await;
+    let t = claim(&pool, author, "t").await;
+    let r = claim(&pool, author, "r retired").await;
+    support(&pool, s, 0.9).await;
+    support(&pool, t, 0.2).await;
+    refute(&pool, t, 0.6).await;
+    refute(&pool, r, 0.8).await;
+    edge(&pool, s, t, "supports").await;
+    edge(&pool, s, r, "supports").await;
+    let (_scoped, maint) = fixture::bypass(&pool).await;
+    single_writer(&pool, &maint, &[s, t, r]).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(r)
+        .execute(&pool)
+        .await
+        .expect("retire r");
+
+    let public = fixture::public_viewer(&pool).await;
+    let (listed, _) = report(&pool, &public, &maint, &opts(Scope::Ids(vec![s, t, r]))).await;
+    let sh = &listed.sheaf;
+    assert_eq!(
+        sh.served_as_tool.edge_count, 1,
+        "calibration: the sheaf tool's reader skips the retired endpoint: {sh:?}"
+    );
+    assert_eq!(
+        (
+            sh.served.edge_count,
+            sh.progressive.edge_count,
+            sh.strict.edge_count,
+            sh.atom_atom_edges,
+            sh.coverage_denominator,
+        ),
+        (1, 1, 1, 1, 1),
+        "829de1e2: only s -> t is a sheaf edge; s -> r ends on a retired claim: {sh:?}"
+    );
+    assert_eq!(sh.pairs_outside_scope, 0, "every listed end is in scope");
+
+    let (all, _) = report(&pool, &public, &maint, &opts(Scope::All)).await;
+    assert_eq!(
+        (all.sheaf.served.edge_count, all.sheaf.pairs_outside_scope),
+        (1, 0),
+        "829de1e2: over every current claim, s -> r is neither evaluated nor a pair \
+         outside the scope: {:?}",
+        all.sheaf
+    );
+}
+
 /// The conflict set (per-claim K at least .3): today from the stored rows'
 /// `conflict_k`, under strict from each atom's fold K, with compounds out.
 ///

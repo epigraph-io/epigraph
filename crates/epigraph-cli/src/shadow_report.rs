@@ -1486,6 +1486,11 @@ struct SheafEdge {
 /// whose endpoint gains a value only under the candidate must be read too.
 /// Whether each mode can evaluate an edge is decided from the endpoints'
 /// values, per mode.
+///
+/// Both endpoints must be current (`is_current`), as in
+/// `SheafRepository::get_epistemic_edge_pairs`: a retired claim takes no
+/// part in the sheaf, so an edge left on one (supersession keeps it) is not
+/// a sheaf edge on either side of the comparison (backlog 829de1e2).
 async fn sheaf_edges(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
@@ -1502,6 +1507,7 @@ async fn sheaf_edges(
               WHERE e.source_type = 'claim' AND e.target_type = 'claim' \
                 AND e.relationship IN ({SHEAF_RELATIONSHIPS}) \
                 AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                AND src.is_current AND tgt.is_current \
                 AND {moves_belief} \
                 /* {{EDGE_VISIBILITY:e}} */ /* {{VISIBILITY:src}} */ /* {{VISIBILITY:tgt}} */",
             moves_belief = epigraph_db::EDGE_MOVES_BELIEF_SQL,
