@@ -709,3 +709,98 @@ async fn a_maintenance_session_cannot_unretire_or_repoint_a_link(pool: PgPool) {
     }
     assert_eq!(footprint(&pool, agent).await, before);
 }
+
+/// Migration 257's role block, the `(a)-(c)` DO block that creates and checks
+/// the retirer role and re-owns the verb, read from the migration file.
+fn role_block_257() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../migrations/257_operator_link_retire_owner_role.sql");
+    let sql = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let marker = "-- (a)-(c) THE ROLE, THE OWNER, THE COLUMN GRANT";
+    let at = sql.find(marker).expect("257's role block marker");
+    let rest = &sql[at..];
+    let start = rest.find("DO $$").expect("257's role block DO");
+    rest[start..].to_string()
+}
+
+/// Re-runs 257's role block inside ONE transaction that is always rolled
+/// back, after `setup` (role DDL in the same transaction). Roles are
+/// cluster-wide: committing an offending role would make 257 refuse to apply
+/// in every database migrating beside this test. `Err` is the block's error.
+async fn role_block_after(pool: &PgPool, setup: &[String]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await.expect("begin");
+    for stmt in setup {
+        sqlx::query(stmt)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("`{stmt}`: {e}"));
+    }
+    let out = sqlx::raw_sql(&role_block_257())
+        .execute(&mut *tx)
+        .await
+        .map(|_| ());
+    tx.rollback().await.expect("rollback: nothing is committed");
+    out
+}
+
+/// T69 review of migration 257: the retirer role's isolation check refuses a
+/// non-superuser that holds the role WITH ADMIN OPTION only (on PostgreSQL 16
+/// that confers neither USAGE nor SET, but its holder can GRANT the role to
+/// itself and then run as it), and a non-superuser CREATEROLE login (which
+/// can administer roles). Each is 55000 naming the offender, and the block
+/// changes nothing. CONTROL: the same block, re-run on a clean catalog,
+/// applies (so a refusal is the check, not a mis-read block).
+///
+/// Verified to fail: 257's check restored to the USAGE / SET predicate with
+/// no ADMIN OPTION or CREATEROLE arm -> both re-runs apply cleanly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_257_role_block_refuses_a_retirer_that_is_not_isolated(pool: PgPool) {
+    role_block_after(&pool, &[])
+        .await
+        .expect("CONTROL: 257's role block re-applies on a clean catalog");
+
+    let pg16: bool =
+        sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 160000")
+            .fetch_one(&pool)
+            .await
+            .expect("server version");
+    let suffix = Uuid::new_v4().simple().to_string();
+    let admin_only = format!("t69_admin_only_{suffix}");
+    let creator = format!("t69_createrole_{suffix}");
+    let grant = if pg16 {
+        format!(
+            "GRANT epigraph_operator_link_retirer TO {admin_only} \
+             WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+        )
+    } else {
+        format!("GRANT epigraph_operator_link_retirer TO {admin_only} WITH ADMIN OPTION")
+    };
+    let cases = [
+        (
+            "an ADMIN-only holder",
+            vec![format!("CREATE ROLE {admin_only} NOLOGIN NOINHERIT"), grant],
+            admin_only.clone(),
+        ),
+        (
+            "a CREATEROLE login",
+            vec![format!("CREATE ROLE {creator} LOGIN CREATEROLE")],
+            creator.clone(),
+        ),
+    ];
+    for (what, setup, offender) in cases {
+        let err = role_block_after(&pool, &setup)
+            .await
+            .expect_err(&format!("257's role block refuses {what}"));
+        assert_eq!(sqlstate(&err).as_deref(), Some("55000"), "{what}: {err}");
+        assert!(
+            err.to_string().contains(&offender),
+            "{what}: the refusal names {offender}: {err}"
+        );
+    }
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_roles WHERE rolname LIKE $1")
+        .bind(format!("t69_%_{suffix}"))
+        .fetch_one(&pool)
+        .await
+        .expect("roles left");
+    assert_eq!(left, 0, "no test role was committed");
+}

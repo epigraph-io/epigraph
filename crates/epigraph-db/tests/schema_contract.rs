@@ -4066,7 +4066,9 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
     );
 
     // 257's owner role: NOLOGIN, no elevated attribute, a member of the
-    // maintenance role only, and nobody else (no non-superuser) can act as it.
+    // maintenance role only, and nobody else (no non-superuser) can act as it
+    // or make itself able to: no MEMBER in any form (an ADMIN-only grant
+    // included), no ADMIN OPTION holder, and no CREATEROLE login.
     let (login, elevated, memberships, actors): (bool, bool, Vec<String>, Vec<String>) =
         sqlx::query_as(
             "SELECT r.rolcanlogin, \
@@ -4077,8 +4079,12 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
                            WHERE m.member = r.oid ORDER BY 1), \
                     ARRAY(SELECT o.rolname::text FROM pg_roles o \
                            WHERE o.oid <> r.oid AND NOT o.rolsuper \
-                             AND (pg_has_role(o.oid, r.oid, 'USAGE') \
-                                  OR pg_has_role(o.oid, r.oid, 'MEMBER')) ORDER BY 1) \
+                             AND (pg_has_role(o.oid, r.oid, 'MEMBER') \
+                                  OR o.rolcreaterole \
+                                  OR EXISTS (SELECT 1 FROM pg_auth_members a \
+                                              WHERE a.roleid = r.oid AND a.member = o.oid \
+                                                AND a.admin_option)) \
+                           ORDER BY 1) \
                FROM pg_roles r WHERE r.rolname = 'epigraph_operator_link_retirer'",
         )
         .fetch_one(&pool)

@@ -2398,6 +2398,68 @@ async fn verify_dedicated_definer_owners(pool: &PgPool) -> anyhow::Result<usize>
     Ok(failures)
 }
 
+/// The role migration 257 re-owns the operator-link retire verb to.
+const OPERATOR_LINK_RETIRER_ROLE: &str = "epigraph_operator_link_retirer";
+
+/// Every way a non-superuser can act as `$1` (a role oid), or make itself
+/// able to: migration 257's isolation check, the same predicate. `MEMBER`
+/// counts any membership, direct or indirect, whatever its INHERIT / SET /
+/// ADMIN options (on PostgreSQL 16 an ADMIN-only grant confers neither USAGE
+/// nor SET, but its holder can grant the role to itself); an ADMIN OPTION row
+/// is named on its own; and a CREATEROLE login can administer roles. One
+/// text per fault.
+const RETIRER_ISOLATION_FAULTS_SQL: &str = "\
+    SELECT r.rolname::text || ' is a member of the role' \
+      FROM pg_roles r \
+     WHERE r.oid <> $1 AND NOT r.rolsuper AND pg_has_role(r.oid, $1, 'MEMBER') \
+    UNION ALL \
+    SELECT r.rolname::text || ' holds ADMIN OPTION on the role' \
+      FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member \
+     WHERE m.roleid = $1 AND m.admin_option AND NOT r.rolsuper \
+    UNION ALL \
+    SELECT r.rolname::text || ' is CREATEROLE' \
+      FROM pg_roles r \
+     WHERE r.rolcreaterole AND NOT r.rolsuper AND r.oid <> $1 \
+    ORDER BY 1";
+
+/// Migration 257's role isolation, re-checked against the LIVE catalog (backlog
+/// 9cec11f7): only the retire verb may run as
+/// [`OPERATOR_LINK_RETIRER_ROLE`], which alone holds UPDATE (retired) on
+/// `operator_links`. 257 refuses to apply over a role that is not isolated,
+/// but a grant made after it (a hand `GRANT ... WITH ADMIN OPTION`, a new
+/// CREATEROLE login) would silently reopen the direct, unserialised retire
+/// with a forgeable audit; this reports it. Returns the number of failing
+/// checks (one per fault). On a `&mut PgConnection` so a test can stage a
+/// grant in a transaction it never commits (roles are cluster-wide).
+async fn verify_operator_link_retirer_isolation(
+    conn: &mut sqlx::PgConnection,
+) -> anyhow::Result<usize> {
+    let role: Option<sqlx::postgres::types::Oid> =
+        sqlx::query_scalar("SELECT oid FROM pg_roles WHERE rolname = $1")
+            .bind(OPERATOR_LINK_RETIRER_ROLE)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(role) = role else {
+        // Before 257, or a cluster where it could not create the role:
+        // `verify_dedicated_definer_owners` reports the latter.
+        return Ok(0);
+    };
+    let faults: Vec<String> = sqlx::query_scalar(RETIRER_ISOLATION_FAULTS_SQL)
+        .bind(role)
+        .fetch_all(&mut *conn)
+        .await?;
+    for fault in &faults {
+        eprintln!(
+            "FAIL: '{OPERATOR_LINK_RETIRER_ROLE}' (migration 257) is not isolated: {fault}. Only \
+             the operator-link retire verb may run as that role, which alone holds UPDATE (retired) on \
+             operator_links; a non-superuser that can act as it, or grant it to itself, can \
+             retire a link directly, unserialised and with a forgeable audit. Revoke the grant \
+             or the attribute."
+        );
+    }
+    Ok(faults.len())
+}
+
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
 /// actually EXISTS on this database.
 ///
@@ -3613,6 +3675,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
 
     failures += verify_definer_ownership(pool).await?;
     failures += verify_dedicated_definer_owners(pool).await?;
+    failures += verify_operator_link_retirer_isolation(&mut *pool.acquire().await?).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
     failures += verify_role_holder_write_check_coverage(pool).await?;
@@ -4555,6 +4618,88 @@ mod definer_register_tests {
                 .expect("check"),
             1,
             "a verb left with epigraph_maintenance is reported"
+        );
+    }
+
+    /// Migration 257's role isolation, re-checked by `verify` after the
+    /// migration (T69 review): a non-superuser granted the retirer role WITH
+    /// ADMIN OPTION only (no INHERIT, no SET: on PostgreSQL 16 it can still
+    /// grant the role to itself), and a non-superuser CREATEROLE login, are
+    /// each reported. The offending roles live in ONE transaction that is
+    /// rolled back: roles are cluster-wide, and a committed one would make
+    /// 257 refuse to apply in every database migrating beside this test.
+    /// CONTROL: at head, and in the clean transaction, it passes.
+    ///
+    /// Verified to fail: the check's MEMBER / ADMIN OPTION arms removed (the
+    /// old USAGE / SET predicate) -> the ADMIN-only holder is not reported;
+    /// the CREATEROLE arm removed -> the CREATEROLE login is not reported.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_retirer_role_that_is_not_isolated(pool: sqlx::PgPool) {
+        let mut conn = pool.acquire().await.expect("acquire");
+        assert_eq!(
+            super::verify_operator_link_retirer_isolation(&mut conn)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        let pg16: bool =
+            sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 160000")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("server version");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let admin_only = format!("t69_retirer_admin_{suffix}");
+        let creator = format!("t69_retirer_createrole_{suffix}");
+
+        let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+        sqlx::query(&format!("CREATE ROLE {admin_only} NOLOGIN NOINHERIT"))
+            .execute(&mut *tx)
+            .await
+            .expect("create the admin-only role");
+        let grant = if pg16 {
+            format!(
+                "GRANT epigraph_operator_link_retirer TO {admin_only} \
+                 WITH ADMIN TRUE, INHERIT FALSE, SET FALSE"
+            )
+        } else {
+            format!("GRANT epigraph_operator_link_retirer TO {admin_only} WITH ADMIN OPTION")
+        };
+        sqlx::query(&grant)
+            .execute(&mut *tx)
+            .await
+            .expect("grant the retirer role with ADMIN OPTION only");
+        let admin_faults = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check with the ADMIN-only grant");
+        sqlx::query(&format!(
+            "REVOKE epigraph_operator_link_retirer FROM {admin_only}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .expect("revoke it again");
+        let clean = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check after the revoke");
+        sqlx::query(&format!("CREATE ROLE {creator} NOLOGIN CREATEROLE"))
+            .execute(&mut *tx)
+            .await
+            .expect("create a CREATEROLE role");
+        let creator_faults = super::verify_operator_link_retirer_isolation(&mut tx)
+            .await
+            .expect("check with the CREATEROLE role");
+        tx.rollback()
+            .await
+            .expect("rollback: the roles are never committed");
+
+        assert!(
+            admin_faults >= 1,
+            "an ADMIN-only holder of the retirer role is reported"
+        );
+        assert_eq!(clean, 0, "CONTROL: with the grant revoked it passes");
+        assert_eq!(
+            creator_faults, 1,
+            "a non-superuser CREATEROLE login is reported"
         );
     }
 

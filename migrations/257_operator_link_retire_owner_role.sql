@@ -35,9 +35,13 @@
 --     `epigraph_definer_bypass()` still holds and every grant and policy the
 --     verb used still applies), and no other role may act as it. Created as
 --     060/161 create theirs (guarded; a role that already exists is CHECKED,
---     not trusted: any elevated attribute, LOGIN, another membership, or a
---     non-superuser role that can SET ROLE to it or inherit it raises 55000
---     and nothing is changed).
+--     not trusted: any elevated attribute, LOGIN, another membership, a
+--     non-superuser that is a MEMBER of it in any form (INHERIT, SET or an
+--     ADMIN-only grant, which lets its holder grant the role to itself) or
+--     holds ADMIN OPTION on it, or any non-superuser CREATEROLE role, raises
+--     55000 and nothing is changed). `tenancy_backfill verify` runs the same
+--     isolation check at any later time, so a grant added after 257 is
+--     reported.
 -- (b) The verb is re-owned to that role. EXECUTE stays the maintenance
 --     role's alone (re-granted: `ALTER ... OWNER` moves the old owner's ACL
 --     entry to the new owner).
@@ -77,8 +81,8 @@
 --     application role (176, GRM02's note), and every maintenance-path
 --     writer of such a row takes 107's advisory lock, as the verb does.
 --
--- If this file cannot create the role, grant it the maintenance role or
--- re-own the verb (a migrating login that is not a superuser), it says so
+-- If the migrating login is not a superuser, or this file cannot create the
+-- role, grant it the maintenance role or re-own the verb, it says so
 -- with a NOTICE and leaves 191's grants in place: the verb keeps working and
 -- the guard's new arms stay off (they key on the verb's owner being the new
 -- role). `tenancy_backfill verify` reports that state as a FAILURE. Provision
@@ -372,14 +376,21 @@ DECLARE
     c_verb   constant text := 'public.epigraph_retire_operator_link(uuid, text, boolean)';
     v_role   oid;
     v_faults text[];
-    -- PostgreSQL 16 split membership into SET / USAGE (INHERIT) / ADMIN, as
-    -- 161's attestor check: only SET and USAGE let a role act as this one.
-    v_set    text := CASE WHEN current_setting('server_version_num')::integer >= 160000
-                          THEN 'SET' ELSE 'MEMBER' END;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         RAISE NOTICE '257: epigraph_maintenance does not exist; the retire verb keeps 191''s '
                      'owner and grants (257 is inert until the role is provisioned)';
+        RETURN;
+    END IF;
+    -- Only a superuser can create the role, grant it and re-own the verb to
+    -- it. A non-superuser migrating login (a managed cluster's CREATEROLE
+    -- login, say) would also trip the CREATEROLE fault below on itself, so it
+    -- takes the NOTICE path first, before writing anything.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = current_user AND rolsuper) THEN
+        RAISE NOTICE '257: the migrating login % is not a superuser; the retire verb keeps '
+                     '191''s owner and grants. Provision epigraph_operator_link_retirer '
+                     '(NOLOGIN, a member of epigraph_maintenance only) and re-run this block '
+                     'as a superuser.', current_user;
         RETURN;
     END IF;
 
@@ -415,11 +426,28 @@ BEGIN
           FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid
          WHERE m.member = v_role AND r.rolname <> 'epigraph_maintenance'
          ORDER BY 1);
+    -- No non-superuser may act as the role, or make itself able to. MEMBER is
+    -- any membership, direct or indirect, whatever its INHERIT / SET / ADMIN
+    -- options: on PostgreSQL 16 an ADMIN-only grant confers neither USAGE nor
+    -- SET, but its holder can GRANT the role to itself and then act as it.
+    -- An ADMIN OPTION row is named on its own as well. A CREATEROLE login can
+    -- administer roles (any non-superuser role before 16; on 16 the roles it
+    -- created or holds ADMIN on), so none may exist beside this control.
     v_faults := v_faults || ARRAY(
-        SELECT r.rolname || ' can act as ' || c_role
+        SELECT r.rolname || ' is a member of ' || c_role
           FROM pg_roles r
          WHERE r.oid <> v_role AND NOT r.rolsuper
-           AND (pg_has_role(r.oid, v_role, 'USAGE') OR pg_has_role(r.oid, v_role, v_set))
+           AND pg_has_role(r.oid, v_role, 'MEMBER')
+         ORDER BY 1);
+    v_faults := v_faults || ARRAY(
+        SELECT r.rolname || ' holds ADMIN OPTION on ' || c_role
+          FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.member
+         WHERE m.roleid = v_role AND m.admin_option AND NOT r.rolsuper
+         ORDER BY 1);
+    v_faults := v_faults || ARRAY(
+        SELECT r.rolname || ' is CREATEROLE (it can grant itself ' || c_role || ')'
+          FROM pg_roles r
+         WHERE r.rolcreaterole AND NOT r.rolsuper AND r.oid <> v_role
          ORDER BY 1);
     IF cardinality(v_faults) > 0 THEN
         RAISE EXCEPTION '257: % exists but is not isolated: %', c_role, v_faults
