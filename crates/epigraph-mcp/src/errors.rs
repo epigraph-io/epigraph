@@ -221,7 +221,7 @@ fn log_designed_refusal(e: &dyn std::any::Any, text: &str) {
 
 /// Whether a database message opens with a schema refusal code: two to five
 /// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
-fn coded(message: &str) -> bool {
+pub(crate) fn coded(message: &str) -> bool {
     let b = message.as_bytes();
     let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
     (2..=5).contains(&caps)
@@ -454,6 +454,38 @@ pub fn executor_caller_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boundaries of the refusal-code grammar (two to five ASCII capitals,
+    /// exactly two digits, a colon, at the very start) that `internal_error`
+    /// relays a database refusal by and the supersede mapper splits `42501`
+    /// on (one predicate since backlog 86a26e69; the mapper had a private
+    /// byte-for-byte copy).
+    #[test]
+    fn coded_admits_exactly_the_code_grammar() {
+        for msg in [
+            "CX03: the act",
+            "OPL01: unbound",
+            "ABCDE12: five capitals",
+            "AB12:",
+        ] {
+            assert!(coded(msg), "{msg:?} is coded");
+        }
+        for msg in [
+            "A12: one capital",
+            "ABCDEF12: six capitals",
+            "FA4: one digit",
+            "FA123: three digits",
+            "FA04 no colon",
+            "FA04",
+            " CX03: leading space",
+            "cx03: lower case",
+            "new row violates row-level security policy for table \"claims\"",
+            "permission denied for function epigraph_record_cascade_deferral",
+            "",
+        ] {
+            assert!(!coded(msg), "{msg:?} is not coded");
+        }
+    }
 
     /// A caller-caused rejection must be INVALID_PARAMS and must carry the
     /// repo's reason text through, and everything else must stay

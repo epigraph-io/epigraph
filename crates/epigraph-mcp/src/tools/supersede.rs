@@ -161,7 +161,7 @@ pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError
         return denial;
     }
     if let Some(message) = database_42501(&e) {
-        if !opens_with_refusal_code(&message) {
+        if !crate::errors::coded(&message) {
             tracing::warn!(
                 target: "tenancy.scoped_write",
                 tool = "supersede_claim",
@@ -243,19 +243,6 @@ fn caller_denial(message: String) -> McpError {
         message: std::borrow::Cow::from(message),
         data: None,
     }
-}
-
-/// Whether a database message opens with a schema refusal code (two to five
-/// ASCII capitals, two digits, a colon: `FA04: ...`), the convention the
-/// migrations' designed refusals follow.
-fn opens_with_refusal_code(message: &str) -> bool {
-    let b = message.as_bytes();
-    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
-    (2..=5).contains(&caps)
-        && b.len() > caps + 2
-        && b[caps].is_ascii_digit()
-        && b[caps + 1].is_ascii_digit()
-        && b[caps + 2] == b':'
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -846,7 +833,6 @@ pub(crate) async fn unmark_duplicate_expecting(
 
 #[cfg(test)]
 mod tests {
-    use super::opens_with_refusal_code;
     use super::unmark_refusal;
     use epigraph_db::RefusalKind;
     use epigraph_engine::admin_cascade::UnmarkRefusal;
@@ -878,38 +864,5 @@ mod tests {
         ));
         assert_eq!(failed.code, ErrorCode::INTERNAL_ERROR, "{failed:?}");
         assert!(!failed.message.contains("lock timeout"), "{failed:?}");
-    }
-
-    /// The boundaries of the refusal-code grammar the supersede mapper splits
-    /// `42501` on (two to five ASCII capitals, exactly two digits, a colon, at
-    /// the very start), which is `errors::coded`'s grammar byte for byte.
-    #[test]
-    fn opens_with_refusal_code_admits_exactly_the_code_grammar() {
-        for coded in [
-            "CX03: the act",
-            "OPL01: unbound",
-            "ABCDE12: five capitals",
-            "AB12:",
-        ] {
-            assert!(opens_with_refusal_code(coded), "{coded:?} is coded");
-        }
-        for uncoded in [
-            "A12: one capital",
-            "ABCDEF12: six capitals",
-            "FA4: one digit",
-            "FA123: three digits",
-            "FA04 no colon",
-            "FA04",
-            " CX03: leading space",
-            "cx03: lower case",
-            "new row violates row-level security policy for table \"claims\"",
-            "permission denied for function epigraph_record_cascade_deferral",
-            "",
-        ] {
-            assert!(
-                !opens_with_refusal_code(uncoded),
-                "{uncoded:?} is not coded"
-            );
-        }
     }
 }
