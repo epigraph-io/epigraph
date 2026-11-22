@@ -32,6 +32,10 @@
 //!   group claims); that frame owns the cache instead and refolds it from the
 //!   admissible input (backlog 8d720490 (1): the owner rule ranks a frame
 //!   with an admissible input first);
+//!   On the application role a NON-owner's recompute takes that move too
+//!   (migration 243, backlog 0296077b), and on every path the move drops
+//!   the verdict on the hidden fold: the classifier is binary-frame only, so
+//!   `claim_validity`'s fold carries none;
 //! * a widening act (publicize, share) keeps the recorded owner instead
 //!   (`cache_owner_frame_keeping_recorded`), and falls back to that rule only
 //!   when the claim records none;
@@ -482,8 +486,10 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
     .expect("recompute while every source is public");
     let before = cache(&pool, claim).await;
     assert!(
-        before.0.is_some() && before.5 == Some(w.binary),
-        "PREMISE: binary_truth owns a filled cache ({before:?})"
+        before.0.is_some()
+            && before.5 == Some(w.binary)
+            && before.6.as_deref() == Some("supported"),
+        "PREMISE: binary_truth owns a filled cache with a verdict on that fold ({before:?})"
     );
     hide(&pool, hidden_ev, w.group, w.member).await;
 
@@ -540,6 +546,74 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
          refresh on the frame the cache then records"
     );
     assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
+    assert_eq!(
+        cache(&pool, claim).await.6,
+        None,
+        "the verdict on the hidden fold (`supported`) must not survive the move: \
+         claim_validity's fold carries no verdict"
+    );
+}
+
+/// The PRIVILEGED twin of `an_admissible_input_on_another_frame_takes_the_cache`,
+/// and what makes the one-time deploy recompute sufficient: the maintenance
+/// `recompute_beliefs` moves the cache to `claim_validity` on the owner's
+/// statement (no migration-243 arm runs there), and must not leave the
+/// `binary_truth` verdict on the hidden fold behind. The classifier is defined
+/// on the binary frame only, so before this the label was never rewritten
+/// once the cache recorded another frame, and `get_claim` went on serving it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_beliefs_drops_the_hidden_folds_verdict_when_the_cache_moves(pool: PgPool) {
+    let w = world(&pool, "r80-verdict-moves").await;
+    let validity =
+        resolve_claim_validity_frame(&mut pool.acquire().await.expect("acquire"), &w.public)
+            .await
+            .expect("claim_validity");
+    let claim = fixture::seed_public_claim(&pool, w.author, "r80 verdict follows the move").await;
+    let open_ev = fixture::seed_evidence(&pool, claim, "observation").await;
+    store(&pool, claim, validity, w.author, open_ev, 0.7).await;
+    let hidden_ev = fixture::seed_evidence(&pool, claim, "document").await;
+    store(&pool, claim, w.binary, w.member, hidden_ev, 0.9).await;
+    recompute_claim_cached_belief(
+        &mut pool.acquire().await.expect("acquire"),
+        &w.public,
+        claim,
+    )
+    .await
+    .expect("recompute while every source is public");
+    let before = cache(&pool, claim).await;
+    assert!(
+        before.5 == Some(w.binary) && before.6.as_deref() == Some("supported"),
+        "PREMISE: binary_truth owns the cache, with its verdict ({before:?})"
+    );
+    hide(&pool, hidden_ev, w.group, w.member).await;
+
+    let server = server(&pool, fixture::scoped_pool(&pool).await);
+    let report = recompute_beliefs(&pool, &server, claim).await;
+    assert_eq!(report["errors"], serde_json::json!([]), "{report}");
+    assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
+    assert_eq!(
+        cache(&pool, claim).await.6,
+        None,
+        "recompute_beliefs moved the cache to claim_validity but kept the verdict on the \
+         hidden binary_truth fold"
+    );
+    let got = json_of(
+        &tools::claims::get_claim(
+            &server,
+            &w.author_viewer,
+            GetClaimParams {
+                claim_id: claim.to_string(),
+                frame_id: None,
+                perspective_id: None,
+            },
+        )
+        .await
+        .expect("get_claim"),
+    );
+    assert!(
+        got["classification"].is_null(),
+        "get_claim served a verdict derived from evidence the reader cannot read: {got}"
+    );
 }
 
 /// The cache owner frame of `claim` as `viewer` resolves it on the

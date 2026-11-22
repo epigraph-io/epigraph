@@ -1544,6 +1544,12 @@ impl MassFunctionRepository {
     /// The owner's statement ignores it (unchanged); a non-owner's verdict is
     /// written only when that frame is the one the claim's cache carries.
     ///
+    /// `None` clears the verdict (`classification = NULL`). The classifier is
+    /// defined on the canonical binary frame only, so a cache written on any
+    /// other frame carries no verdict: a label left from an earlier
+    /// `binary_truth` fold would go on describing that fold, which may be a
+    /// fold of evidence since narrowed (backlog 0296077b).
+    ///
     /// # A non-owner on a public claim (migration 114)
     ///
     /// These cache columns live on the CLAIM row, which a non-owner cannot
@@ -1561,7 +1567,7 @@ impl MassFunctionRepository {
     pub async fn update_claim_classification<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         claim_id: Uuid,
-        classification: &str,
+        classification: Option<&str>,
         belief_frame_id: Uuid,
     ) -> Result<(), DbError> {
         let sql = format!(
