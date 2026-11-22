@@ -69,11 +69,14 @@ async fn key_of(pool: &PgPool, content: &str, agent: Uuid) -> i32 {
         .expect("key")
 }
 
-/// `(pid, key as objid, granted)` of every dedup-lock row in `pg_locks`.
+/// `(pid, key as objid, granted)` of every dedup-lock row in `pg_locks` for
+/// THIS test database (`pg_locks` is cluster-wide, and other tests' databases
+/// share the cluster).
 async fn dedup_locks(pool: &PgPool) -> Vec<(i32, i64, bool)> {
     sqlx::query_as(
         "SELECT pid, objid::bigint, granted FROM pg_locks \
           WHERE locktype = 'advisory' AND objsubid = 2 \
+            AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
             AND classid::bigint = (hashtext('epigraph.claim_dedup')::bigint & 4294967295)",
     )
     .fetch_all(pool)
