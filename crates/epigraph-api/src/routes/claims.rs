@@ -701,7 +701,8 @@ fn validate_privacy_fields(req: &CreateClaimRequest) -> Result<&str, ApiError> {
 ///
 /// For encrypted claims (privacy_tier == "fully_private"):
 /// - group_id, encrypted_content, and encryption_epoch are required
-/// - Agent must be a member of the specified group
+/// - Agent must be a live writer or admin of the specified group (a reader is
+///   refused 403)
 /// - encryption_epoch must match the group's current epoch
 /// - Claim + encryption metadata are written atomically in a transaction
 #[cfg(feature = "db")]
@@ -827,17 +828,34 @@ pub(crate) async fn create_claim_core(
         // Prefer agent_id, fall back to client_id (sub) for human clients
         let caller_agent_id = ctx.agent_id.unwrap_or(ctx.client_id);
 
-        // Verify caller is a member of the group
-        let is_member =
-            GroupMembershipRepository::is_member(&state.db_pool, group_id, caller_agent_id)
+        // Verify the caller is a live member of the group that may WRITE into
+        // it. The role is the caller's strongest LIVE one, from
+        // `epigraph_live_memberships` (backlog f712db53): a member derived from
+        // a role binding counts, a lapsed row does not. A `reader` (explicit
+        // or derived) is refused here with a 403: it is not in the viewer's
+        // writable set, so the stamped insert below would only be refused by
+        // row security, which surfaced as a 500.
+        let live_role =
+            GroupMembershipRepository::get_member_role(&state.db_pool, group_id, caller_agent_id)
                 .await
                 .map_err(|e| ApiError::DatabaseError {
                     message: format!("Failed to check group membership: {e}"),
                 })?;
-        if !is_member {
-            return Err(ApiError::Forbidden {
-                reason: "Agent is not a member of the specified group".to_string(),
-            });
+        match live_role.as_deref() {
+            None => {
+                return Err(ApiError::Forbidden {
+                    reason: "Agent is not a member of the specified group".to_string(),
+                });
+            }
+            Some("admin" | "writer") => {}
+            Some(role) => {
+                return Err(ApiError::Forbidden {
+                    reason: format!(
+                        "Agent's role in the specified group is {role}; sealing a claim into \
+                         it needs writer or admin"
+                    ),
+                });
+            }
         }
 
         // Verify the claim is sealed under the group's CURRENT epoch, which is

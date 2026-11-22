@@ -1295,7 +1295,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed_conn",
             "GroupKeyEpochRepository::get_current_epoch",
-            "GroupMembershipRepository::is_member",
+            "GroupMembershipRepository::get_member_role",
             "Viewer::resolve",
             "db_pool.acquire",
             "provenance::record_provenance",
