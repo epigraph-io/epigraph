@@ -1382,6 +1382,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "record_edge_holds_conn",
+        "WRITE (INSERT) of `privatization_audit` rows recording the declared edges (migration \
+         260) a batch's re-meet kept off their endpoints' meet. Same table and argument as \
+         `record_item_audit_conn`: the audit trail is append-only and maintenance-only, and the \
+         rows written come from `recompute_boundary_meet_conn`'s own result, not from a caller.",
+    ),
+    (
+        "privatization.rs",
         "restore_plan_workflows_conn",
         "WRITE of `workflows` tenancy back to the pre-image the plan's own `item.apply` audit \
          rows recorded, plus an `item.revert` audit row each. Only rows still carrying the \

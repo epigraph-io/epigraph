@@ -606,6 +606,33 @@ pub struct WorkflowMove {
     pub before_owner_group_id: Uuid,
 }
 
+/// What [`PrivatizationRepository::recompute_boundary_meet_conn`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundaryMeet {
+    /// Edges whose `(visibility, owner_group_id, co_owner_group_id)` the
+    /// statement changed.
+    pub updated: u64,
+    /// Edges with a recorded declaration (migration 260) that the statement
+    /// kept OFF their endpoints' meet, in edge-id order. Classified from the
+    /// computed meet, not from what changed, so a re-run reports them again.
+    pub held: Vec<HeldEdge>,
+}
+
+/// One declared edge the re-meet did not let its endpoints' meet re-own or
+/// widen ([`BoundaryMeet::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldEdge {
+    /// The edge.
+    pub edge_id: Uuid,
+    /// The visibility the meet alone would have given it.
+    pub meet_visibility: String,
+    /// `true` when the declaration and the meet together name more groups
+    /// than one owner plus one co-owner can express: the edge then stays on
+    /// its declaration, which is NOT narrowed to its endpoints (an operator
+    /// decision; recorded as `edge.hold.unmet`).
+    pub unmet: bool,
+}
+
 /// A state transition [`PrivatizationRepository::transition_plan_conn`] performs.
 ///
 /// An enum rather than four functions, so the guard conditions that make each
@@ -2872,7 +2899,9 @@ impl PrivatizationRepository {
         // an edge's meet, and no trigger re-meets an edge when only its
         // workflow row changes. So the moved rows' own edges (`variant_of`,
         // `AUTHORED`, `executes` onto a claim the plan leaves public) are
-        // re-met here, on this transaction.
+        // re-met here, on this transaction. (A DECLARED edge keeps its owner
+        // and visibility, migration 260; the batch's own re-meet over these
+        // rows reports it for the plan's audit trail.)
         let moved: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
         Self::recompute_boundary_meet_conn(conn, &moved).await?;
         Ok(moves)
@@ -2995,8 +3024,12 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })?;
         // Migration 219: the claims went back first, and their re-meet still
         // read these rows as private, so every edge on a restored row is re-met
-        // now that the row is back (widening allowed, as for the claims').
-        Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        // now that the row is back (widening allowed, as for the claims'; a
+        // DECLARED edge goes back on its declaration, migration 260, and is
+        // recorded in the plan's audit trail).
+        let meet = Self::recompute_boundary_meet_conn(conn, &restored).await?;
+        Self::record_edge_holds_conn(conn, plan_id, actor_agent_id, correlation_id, &meet.held)
+            .await?;
         Ok(restored.len() as u64)
     }
 
@@ -3141,9 +3174,31 @@ impl PrivatizationRepository {
     /// tuples exactly. `writer_group_id` is read ONLY here: a re-point never
     /// recomputes an owner from it.
     ///
-    /// NOT fixed here: an edge DECLARED `('group', H)` between two public
-    /// claims widens on revert, as before (the declaration is not recorded).
-    /// It blocks re-enabling the privatization lifecycle, not this change.
+    /// # A DECLARED edge is never re-owned and never widened (migration 260)
+    ///
+    /// An edge whose tenancy its author declared (`('group', H)` between two
+    /// public endpoints, kept by 072's no-widening arm; recorded in
+    /// `edges.declared_owner_group_id` / `declared_co_owner_group_id`) is not
+    /// derived, so it does not take the meet. Its owner and visibility stay
+    /// the declaration's, `('group', H)`:
+    ///
+    /// * meet `public` (a revert, or an endpoint this plan never moved): the
+    ///   declared tuple exactly, co-owner included. A revert therefore gives
+    ///   back what the author declared, not the world's edge;
+    /// * meet `group`: the INTERSECTION of the declaration and the meet, so
+    ///   the edge is readable only by a reader of both, i.e. narrowed, never
+    ///   re-owned. When the groups involved (declared owner, declared
+    ///   co-owner, meet owner, meet co-owner) are at most two, that is owner
+    ///   H with the other group as co-owner. When they are more, no tuple
+    ///   expresses it; the edge is HELD on its declaration (not narrowed to
+    ///   its endpoints) and reported `unmet` for an operator to decide.
+    ///
+    /// The apply direction needs this too: the claims UPDATE's propagation
+    /// trigger has already re-met the edge (re-owning it to the target)
+    /// before this runs on the same transaction, and this statement puts the
+    /// declaration back. Every declared edge kept off the meet is returned in
+    /// [`BoundaryMeet::held`]; the callers that hold a plan record them in its
+    /// audit trail ([`Self::record_edge_holds_conn`]).
     ///
     /// # Errors
     ///
@@ -3151,14 +3206,17 @@ impl PrivatizationRepository {
     pub async fn recompute_boundary_meet_conn(
         conn: &mut PgConnection,
         entity_ids: &[Uuid],
-    ) -> Result<u64, DbError> {
+    ) -> Result<BoundaryMeet, DbError> {
         if entity_ids.is_empty() {
-            return Ok(0);
+            return Ok(BoundaryMeet::default());
         }
-        sqlx::query(
-            r#"
+        let (updated, held_ids, held_meet, held_unmet): (i64, Vec<Uuid>, Vec<String>, Vec<bool>) =
+            sqlx::query_as(
+                r#"
             WITH ep AS (
               SELECT e.id,
+                     e.declared_owner_group_id AS dg,
+                     e.declared_co_owner_group_id AS dco,
                      COALESCE(s.v, 'public')::text AS sv,
                      COALESCE(s.g, '00000000-0000-0000-0000-000000000000'::uuid) AS sg,
                      COALESCE(t.v, 'public')::text AS tv,
@@ -3173,7 +3231,7 @@ impl PrivatizationRepository {
                WHERE e.source_id = ANY($1) OR e.target_id = ANY($1)
                ORDER BY e.id
             ), meet AS (
-              SELECT ep.id,
+              SELECT ep.id, ep.dg, ep.dco,
                      (CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
                            THEN 'public' ELSE 'group' END)::varchar(16) AS v,
                      CASE WHEN ep.sv = 'public' AND ep.tv = 'public'
@@ -3184,17 +3242,115 @@ impl PrivatizationRepository {
                      CASE WHEN ep.sv = 'group' AND ep.tv = 'group' AND ep.sg <> ep.tg
                                THEN ep.tg ELSE NULL END AS co
                 FROM ep
+            ), decided AS (
+              -- A derived edge (no declaration) takes the meet. A declared one
+              -- keeps ('group', declared owner) and takes as co-owner the one
+              -- other group the declaration and the meet name, if there is
+              -- exactly one; more than one is not expressible: it keeps its
+              -- declared co-owner and is `unmet`.
+              SELECT m.id, m.dg,
+                     m.v AS mv, m.g AS mg, m.co AS mco,
+                     CASE WHEN m.dg IS NULL THEN m.v
+                          ELSE 'group'::varchar(16) END AS v,
+                     COALESCE(m.dg, m.g) AS g,
+                     CASE WHEN m.dg IS NULL THEN m.co
+                          WHEN cardinality(x.others) = 0 THEN NULL
+                          WHEN cardinality(x.others) = 1 THEN x.others[1]
+                          ELSE m.dco END AS co,
+                     (m.dg IS NOT NULL AND cardinality(x.others) > 1) AS unmet
+                FROM meet m
+                CROSS JOIN LATERAL (
+                  SELECT COALESCE(array_agg(DISTINCT u.o)
+                                    FILTER (WHERE u.o IS NOT NULL AND u.o <> m.dg),
+                                  '{}'::uuid[]) AS others
+                    FROM unnest(CASE WHEN m.v = 'group' THEN ARRAY[m.dco, m.g, m.co]
+                                     ELSE ARRAY[m.dco] END) AS u(o)
+                ) x
+            ), upd AS (
+              UPDATE public.edges e
+                 SET visibility = d.v, owner_group_id = d.g, co_owner_group_id = d.co
+                FROM decided d
+               WHERE d.id = e.id
+                 AND d.g IS NOT NULL
+                 AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
+                     IS DISTINCT FROM (d.v, d.g, d.co)
+              RETURNING e.id
+            ), held AS (
+              SELECT d.id, d.mv::text AS mv, d.unmet
+                FROM decided d
+               WHERE d.dg IS NOT NULL
+                 AND (d.v, d.g, d.co) IS DISTINCT FROM (d.mv, d.mg, d.mco)
             )
-            UPDATE public.edges e
-               SET visibility = m.v, owner_group_id = m.g, co_owner_group_id = m.co
-              FROM meet m
-             WHERE m.id = e.id
-               AND m.g IS NOT NULL
-               AND (e.visibility, e.owner_group_id, e.co_owner_group_id)
-                   IS DISTINCT FROM (m.v, m.g, m.co)
+            SELECT (SELECT count(*) FROM upd),
+                   ARRAY(SELECT h.id FROM held h ORDER BY h.id),
+                   ARRAY(SELECT h.mv FROM held h ORDER BY h.id),
+                   ARRAY(SELECT h.unmet FROM held h ORDER BY h.id)
+            "#,
+            )
+            .bind(entity_ids)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|source| DbError::QueryFailed { source })?;
+        let held = held_ids
+            .into_iter()
+            .zip(held_meet)
+            .zip(held_unmet)
+            .map(|((edge_id, meet_visibility), unmet)| HeldEdge {
+                edge_id,
+                meet_visibility,
+                unmet,
+            })
+            .collect();
+        Ok(BoundaryMeet {
+            updated: u64::try_from(updated).unwrap_or(0),
+            held,
+        })
+    }
+
+    /// Record, in a plan's audit trail, the declared edges a re-meet kept off
+    /// their endpoints' meet ([`Self::recompute_boundary_meet_conn`]): one
+    /// `privatization_audit` row each, `kind = 'edge'`, action `edge.hold`
+    /// (owner and visibility kept, narrowed to the intersection or put back
+    /// on the declaration) or `edge.hold.unmet` (held on its declaration, NOT
+    /// narrowed to its endpoints: an operator decision). `before_visibility`
+    /// is what the meet alone would have written, `after_visibility` what the
+    /// edge keeps (`group`). The owner columns are left NULL: an entity row is
+    /// readable by the target group's admins (083), who need not read the
+    /// declaring group's edge. Written on the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`DbError`] for a query fault.
+    pub async fn record_edge_holds_conn(
+        conn: &mut PgConnection,
+        plan_id: Uuid,
+        actor_agent_id: Uuid,
+        correlation_id: Option<&str>,
+        held: &[HeldEdge],
+    ) -> Result<u64, DbError> {
+        if held.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<Uuid> = held.iter().map(|h| h.edge_id).collect();
+        let meets: Vec<String> = held.iter().map(|h| h.meet_visibility.clone()).collect();
+        let unmet: Vec<bool> = held.iter().map(|h| h.unmet).collect();
+        sqlx::query(
+            r#"
+            INSERT INTO public.privatization_audit
+                   (plan_id, actor_agent_id, action, kind, entity_id,
+                    before_visibility, after_visibility, correlation_id)
+            SELECT $1, $2,
+                   CASE WHEN h.unmet THEN 'edge.hold.unmet' ELSE 'edge.hold' END,
+                   'edge', h.id, h.mv, 'group', $6
+              FROM unnest($3::uuid[], $4::text[], $5::bool[]) AS h(id, mv, unmet)
             "#,
         )
-        .bind(entity_ids)
+        .bind(plan_id)
+        .bind(actor_agent_id)
+        .bind(&ids)
+        .bind(&meets)
+        .bind(&unmet)
+        .bind(correlation_id)
         .execute(&mut *conn)
         .await
         .map(|r| r.rows_affected())

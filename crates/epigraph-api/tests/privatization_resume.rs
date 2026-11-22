@@ -312,7 +312,8 @@ async fn re_running_a_committed_batch_is_a_no_op(pool: PgPool) {
         .len();
     let edges = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &moved)
         .await
-        .expect("re-run the meet");
+        .expect("re-run the meet")
+        .updated;
     tx.commit().await.expect("commit");
 
     assert_eq!(

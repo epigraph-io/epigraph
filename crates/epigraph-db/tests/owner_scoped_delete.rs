@@ -1941,7 +1941,8 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         steps.push(("restrict", moved.len() as u64));
         let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
             .await
-            .expect("recompute_boundary_meet_conn (apply)");
+            .expect("recompute_boundary_meet_conn (apply)")
+            .updated;
         steps.push(("meet after restrict", n));
         let n = PrivatizationRepository::restore_claims_conn(&mut tx, plan, &[c1], p_group)
             .await
@@ -1949,7 +1950,8 @@ async fn a_non_superuser_maintenance_member_reowns_privatizes_and_restores_exact
         steps.push(("restore", n));
         let n = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &[c1])
             .await
-            .expect("recompute_boundary_meet_conn (revert)");
+            .expect("recompute_boundary_meet_conn (revert)")
+            .updated;
         steps.push(("meet after restore", n));
 
         tx.commit().await.expect("commit");

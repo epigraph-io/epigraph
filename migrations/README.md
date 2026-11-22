@@ -3403,6 +3403,29 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **260**: public `edge_declared_tenancy` (backlog 969f01f6). Adds
+  `edges.declared_owner_group_id` and `edges.declared_co_owner_group_id` (nullable, no
+  default, no foreign key) and the definer trigger `edges_tenancy_declared`
+  (`epigraph_edges_record_declaration()`, 172's search-path form, owned by
+  `epigraph_maintenance`), BEFORE INSERT OR UPDATE OF source_id, target_id, firing right after
+  `edges_tenancy`: a `group` row whose endpoints are both public (the tuple 072's no-widening
+  arm kept) records its (owner, co-owner) as the declaration; every other INSERT records none,
+  whatever the caller bound; a re-point keeps a recorded declaration. Records the existing
+  declarations once (every `group` edge whose endpoints are both public now; edges with a
+  dangling endpoint are skipped and counted in a NOTICE). `edges_owner_immutable` also watches
+  the two columns (a non-privileged change is 42501). `epigraph_edges_tenancy` and
+  `epigraph_propagate_tenancy` are NOT re-stated. The privatization re-meet
+  (`PrivatizationRepository::recompute_boundary_meet_conn`) reads the record: a declared edge
+  keeps owner and visibility, narrowed to the intersection with its meet (co-owner) when that
+  is expressible, otherwise held on its declaration; a revert restores the declaration exactly;
+  each such edge is recorded in the plan's audit trail (`kind = 'edge'`, `edge.hold` /
+  `edge.hold.unmet`). Pinned by `epigraph-db/tests/privatization_declared_edges.rs` (record,
+  forgery, immutability, apply/revert of claim and workflow edges with app-role reads, the
+  inexpressible hold, the backfill, the undo) and
+  `epigraph-api/tests/privatization_declared_edges.rs` (the apply and revert jobs). Undo:
+  `docs/runbooks/260-undo.sql`. **Deploy order:** migrate BEFORE rolling out the 260 binary
+  (its re-meet reads the new columns); undo only after rolling it back. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

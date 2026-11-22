@@ -802,8 +802,9 @@ async fn an_outsiders_challenge_is_not_dragged_into_the_target(pool: PgPool) {
     assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
 }
 
-/// See `PrivatizationRepository::recompute_boundary_meet_conn` ("an edge DECLARED
-/// ('group', H) between two public claims widens on revert"). An edge DECLARED `('group', target)` between two public claims
+/// The privatization re-meet (`PrivatizationRepository::recompute_boundary_meet_conn`)
+/// once widened such an edge on revert; since migration 260 it keeps a recorded
+/// declaration too. An edge DECLARED `('group', target)` between two public claims
 /// keeps exactly that tuple through apply AND reverse. A reverse that recomputed
 /// the edge from its (both public again) endpoints would make it PUBLIC.
 #[sqlx::test(migrations = "../../migrations")]
