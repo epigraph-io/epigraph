@@ -426,7 +426,8 @@ pub struct RecallWithContextParams {
     ///
     /// SHRINKS the page rather than back-filling: with `rerank=false` the
     /// candidate pool is exactly `limit`, so there is nothing below to promote.
-    /// Same contract as `min_truth` / `exclude_contested`.
+    /// Same contract as `exclude_contested`. (`min_truth` differs: it runs
+    /// before the cut to `limit` and back-fills from the retrieved pool.)
     ///
     /// Hits whose distance cannot be MEASURED are always KEPT — a paragraph
     /// with no vector in the searched column is not known to be near anything.
@@ -1989,8 +1990,9 @@ async fn recall_with_context_core(
         }
 
         // Post-filter after ranking/enrichment — a page may come back short
-        // rather than back-fill with worse-ranked material (same precedent as
-        // `min_truth`).
+        // rather than back-fill with worse-ranked material. (`min_truth` no
+        // longer sets that precedent here: it runs before the cut and
+        // back-fills, backlog d830c073.)
         if params.exclude_contested {
             results.retain(|h| !h.is_contested);
         }
