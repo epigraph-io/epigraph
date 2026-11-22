@@ -88,6 +88,14 @@ pub struct CreateAgentRequest {
     /// Arbitrary JSONB properties (methodology, affiliation metadata, etc.)
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    /// What `public_key` is: `ed25519` (the default, a real signature
+    /// verifier) or `seed-derived`, a key derived from a PUBLIC seed (an
+    /// author's name, a DOI) whose private half anyone can compute. A
+    /// `seed-derived` agent only NAMES someone: it is stored so that no
+    /// verifier accepts its key (migration 230, backlog 57943a39), and it gets
+    /// no OAuth client. Declaring it on an existing key changes nothing.
+    #[serde(default)]
+    pub key_kind: Option<String>,
 }
 
 /// Agent response structure
@@ -207,6 +215,20 @@ pub async fn create_agent(
         });
     }
 
+    let seed_derived = match request.key_kind.as_deref() {
+        None | Some("ed25519") => false,
+        Some(k) if k == epigraph_db::KEY_KIND_SEED_DERIVED => true,
+        Some(other) => {
+            return Err(ApiError::ValidationError {
+                field: "key_kind".to_string(),
+                reason: format!(
+                    "unknown key_kind {other:?}: expected \"ed25519\" (the default) or \
+                     \"seed-derived\""
+                ),
+            });
+        }
+    };
+
     let mut agent = Agent::new(public_key, request.display_name);
     if let Some(labels) = request.labels {
         agent.labels = labels;
@@ -223,14 +245,17 @@ pub async fn create_agent(
     // here for forward-compatibility but not persisted until core model is extended.
     let _ = request.properties; // acknowledged but unused until core model supports it
     let (created_agent, was_created) =
-        AgentRepository::create_or_get(&state.db_pool, &agent).await?;
+        AgentRepository::create_or_get_declaring(&state.db_pool, &agent, seed_derived).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
     // Auto-provision an OAuth client only for a *newly created* agent (and only
     // when the caller is authenticated). On a find-hit the client already
     // exists from the original registration; re-creating it would hit the
     // `oauth_clients` unique constraint on `client_id` and warn-spam the log.
-    if was_created {
+    //
+    // Never for a `seed-derived` key: its private half is public, so an
+    // active client for it is a credential anyone can use (backlog 57943a39).
+    if was_created && !seed_derived {
         if let Some(axum::Extension(auth)) = &auth_ctx {
             let client_id_str = hex::encode(public_key);
             let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");

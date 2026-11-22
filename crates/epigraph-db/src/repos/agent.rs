@@ -504,6 +504,46 @@ impl AgentRepository {
         }
     }
 
+    /// [`Self::create_or_get`], except that a NEW row is stored with
+    /// `key_kind =` [`KEY_KIND_SEED_DERIVED`] when `seed_derived`
+    /// ([`Self::create_seed_derived_conn`]): the caller declares that the key
+    /// is derived from a public seed and so is NOT a signature verifier
+    /// (backlog 57943a39). `false` is exactly [`Self::create_or_get`].
+    ///
+    /// A find-hit returns the existing row UNCHANGED, whatever its kind: the
+    /// application role may not update `key_kind` (migration 118), and a
+    /// caller's declaration must not demote, or promote, a row someone else
+    /// registered. Re-marking an existing row is an operator task.
+    ///
+    /// # Errors
+    /// As [`Self::create_or_get`].
+    pub async fn create_or_get_declaring(
+        pool: &PgPool,
+        agent: &Agent,
+        seed_derived: bool,
+    ) -> Result<(Agent, bool), DbError> {
+        if !seed_derived {
+            return Self::create_or_get(pool, agent).await;
+        }
+        if let Some(existing) = Self::get_by_public_key(pool, &agent.public_key).await? {
+            return Ok((existing, false));
+        }
+        let mut conn = pool.acquire().await?;
+        match Self::create_seed_derived_conn(&mut conn, agent).await {
+            Ok(created) => Ok((created, true)),
+            Err(DbError::DuplicateKey { .. }) => {
+                // Lost a concurrent registration race: re-find.
+                match Self::get_by_public_key(&mut *conn, &agent.public_key).await? {
+                    Some(existing) => Ok((existing, false)),
+                    None => Err(DbError::InvalidData {
+                        reason: "agent disappeared after DuplicateKey".to_string(),
+                    }),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get an agent by ID
     ///
     /// # Tenancy: takes an executor, and deliberately takes no `Viewer`
