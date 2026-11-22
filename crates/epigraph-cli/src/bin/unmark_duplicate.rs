@@ -30,11 +30,15 @@
 //!
 //! Every target is checked first, read-only, before anything is written: the
 //! claim is a marked duplicate, of the expected canonical, still carrying the
-//! expected identity edge, and has a current canonical to be restored against
+//! expected identity edge (and, named or not, an in-force identity edge to
+//! its canonical), has a current canonical to be restored against
 //! (`ClaimRepository::unmark_chain_conn`; a canonical superseded or
 //! consolidated since is followed to its current replacement, operator ruling
-//! R-11). A canonical that is itself still a marked duplicate is admissible
-//! only when the same run un-marks it first. If any target is refused, the
+//! R-11), and has something the act can reverse the mark from: a revert
+//! record, an open cascade, or a backfilled legacy identity edge
+//! (`admin_cascade::predict_no_record`, the act's `NoRecord` refusal). A
+//! canonical that is itself still a marked duplicate is admissible only when
+//! the same run un-marks it first. If any target is refused, the
 //! report lists why and nothing is written. The act reads the chain again
 //! when it commits (it must, for a canonical this run un-marks first), so the
 //! `--apply` report's `current_canonical_id` is the canonical it was restored
@@ -172,8 +176,10 @@ fn targets(cli: &Cli) -> anyhow::Result<Vec<Target>> {
 
 /// The read-only check of one target, in `unmark_gate`'s order (the MCP
 /// tool's): the claim, the expected canonical, the expected identity edge,
-/// then a current canonical to restore it against, which a canonical this run
-/// un-marks earlier does not need yet.
+/// the in-force identity edge the act retracts, then a current canonical to
+/// restore it against (which a canonical this run un-marks earlier does not
+/// need yet), then a record to reverse the mark from (the act's `NoRecord`
+/// refusal, `admin_cascade::predict_no_record`).
 async fn check(
     conn: &mut sqlx::PgConnection,
     viewer: &Viewer,
@@ -244,39 +250,70 @@ async fn check(
             );
         }
     }
+    // The identity edge the act retracts, in EVERY arm: a canonical this run
+    // un-marks first changes nothing about whether the duplicate's own mark
+    // is still there to un-mark.
+    let (identity_edge, legacy_backfill) =
+        match ClaimRepository::unmark_identity_edge_conn(&mut *conn, viewer, dup, canonical)
+            .await
+            .with_context(|| format!("read claim {dup}'s identity edge"))?
+        {
+            Ok(found) => found,
+            Err(why) => {
+                return refuse(
+                    report,
+                    Some(canonical),
+                    content,
+                    format!("claim {dup} {why}"),
+                )
+            }
+        };
+    report["identity_edge"] = serde_json::json!(identity_edge);
+    if legacy_backfill {
+        report["legacy_mark"] = serde_json::json!(true);
+    }
     if undone_first.contains(&canonical) {
         // Its canonical is un-marked earlier in this run: the chain is read
         // again by the act, once that canonical is current.
         report["chain"] = serde_json::Value::Null;
-        report["admissible"] = serde_json::json!(true);
-        return Ok(Checked {
-            canonical: Some(canonical),
-            content,
-            report,
-            admissible: true,
-        });
-    }
-    match ClaimRepository::unmark_chain_conn(&mut *conn, viewer, dup, canonical)
-        .await
-        .with_context(|| format!("read claim {dup}'s canonical chain"))?
-    {
-        Ok(chain) => {
-            report["chain"] = serde_json::json!(chain);
-            report["admissible"] = serde_json::json!(true);
-            Ok(Checked {
-                canonical: Some(canonical),
-                content,
-                report,
-                admissible: true,
-            })
+    } else {
+        match ClaimRepository::unmark_chain_conn(&mut *conn, viewer, dup, canonical)
+            .await
+            .with_context(|| format!("read claim {dup}'s canonical chain"))?
+        {
+            Ok(chain) => report["chain"] = serde_json::json!(chain),
+            Err(why) => {
+                return refuse(
+                    report,
+                    Some(canonical),
+                    content,
+                    format!("claim {dup} {why}"),
+                )
+            }
         }
-        Err(why) => refuse(
+    }
+    // What the act reverses the mark from: refused at apply when there is
+    // nothing (no revert record, no open cascade, not a backfilled legacy
+    // mark), so refused here, before any target of the run is written.
+    if let Some(refusal) =
+        admin_cascade::predict_no_record(&mut *conn, dup, identity_edge, legacy_backfill)
+            .await
+            .with_context(|| format!("read claim {dup}'s dedup records"))?
+    {
+        return refuse(
             report,
             Some(canonical),
             content,
-            format!("claim {dup} {why}"),
-        ),
+            format!("claim {dup}: {refusal}"),
+        );
     }
+    report["admissible"] = serde_json::json!(true);
+    Ok(Checked {
+        canonical: Some(canonical),
+        content,
+        report,
+        admissible: true,
+    })
 }
 
 /// Re-embed a claim made current again, best-effort: `Ok(true)` stored,

@@ -9912,6 +9912,53 @@ impl ClaimRepository {
         canonical_chain(conn, viewer, canonical, ChainLock::None).await
     }
 
+    /// The dedup identity edge an un-mark of `dup`, marked a duplicate of
+    /// `canonical`, would retract, read through `viewer` without locking:
+    /// `Ok((edge, legacy_backfill))` with the edge the act selects (the newest
+    /// in-force one to `canonical`) and whether the legacy backfill wrote it,
+    /// or `Err` with the act's own reason when there is none (a legacy
+    /// `fuzzy_dedup_claims` mark says whether the backfill can still write
+    /// it). A preflight that predicts the un-mark reads it to find the mark's
+    /// revert record, which is keyed by this edge.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a failed query.
+    pub async fn unmark_identity_edge_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        dup: Uuid,
+        canonical: Uuid,
+    ) -> Result<Result<(Uuid, bool), String>, DbError> {
+        // The act's own selection (`unmark_duplicate_act_authorized_conn`),
+        // without its `FOR UPDATE`: keep the two in step.
+        let sql = viewer.splice(
+            "SELECT e.id, \
+                    COALESCE(e.properties->$4->>'tool' = $5 \
+                             AND e.properties->$4->>'run_tag' = $6, false) \
+               FROM edges e \
+              WHERE e.source_id = $1 AND e.source_type = 'claim' \
+                AND e.target_id = $2 AND e.target_type = 'claim' \
+                AND e.relationship = $3 AND e.valid_to IS NULL AND e.properties ? $4 \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.created_at DESC, e.id DESC LIMIT 1",
+            7,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, bool)>(&sql)
+            .bind(dup)
+            .bind(canonical)
+            .bind(DUPLICATE_IDENTITY_RELATIONSHIP)
+            .bind(DUPLICATE_IDENTITY_PROPERTY)
+            .bind(LEGACY_FUZZY_DEDUP_TOOL)
+            .bind(LEGACY_IDENTITY_BACKFILL_RUN_TAG);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        match q.fetch_optional(&mut *conn).await? {
+            Some(found) => Ok(Ok(found)),
+            None => Ok(Err(no_identity_edge_refusal(conn, viewer, dup).await?)),
+        }
+    }
+
     /// Whether THIS session may un-mark `dup` from `canonical`: a privileged
     /// writer may; otherwise it writes the duplicate, and it writes the
     /// canonical or the canonical is public (the dedup act's FA04 attach rule,

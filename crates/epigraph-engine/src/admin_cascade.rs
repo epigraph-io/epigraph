@@ -1139,6 +1139,46 @@ pub async fn apply_unmark_authorized(
     ))
 }
 
+/// Whether [`apply_unmark`] would refuse `dup_id` as
+/// [`UnmarkRefusal::NoRecord`], read-only: `Some(NoRecord)` when its mark
+/// (identity edge `identity_edge`, `legacy_backfill` when the legacy backfill
+/// wrote it, as [`ClaimRepository::unmark_identity_edge_conn`] reads them) has
+/// no revert record, no open dedup cascade, and is not a backfilled legacy
+/// mark; `None` when the un-mark has something to reverse it from. The same
+/// three reads and the same rule as [`apply_unmark_authorized`], so a
+/// preflight (the `unmark_duplicate` CLI's dry run) predicts the act's
+/// refusal instead of reporting the mark admissible and refusing at apply,
+/// after earlier marks of the same run have committed.
+///
+/// Maintenance connection only (the audit reads are unfiltered).
+///
+/// # Errors
+/// `DbError::QueryFailed` on a failed read, or a revert record without a
+/// readable applied row id ([`audit::dedup_revert_record`]).
+pub async fn predict_no_record(
+    conn: &mut sqlx::PgConnection,
+    dup_id: Uuid,
+    identity_edge: Uuid,
+    legacy_backfill: bool,
+) -> Result<Option<UnmarkRefusal>, DbError> {
+    if legacy_backfill {
+        return Ok(None);
+    }
+    if audit::dedup_revert_record(&mut *conn, dup_id, identity_edge)
+        .await?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    if !audit::open_dedup_cascades(&mut *conn, dup_id)
+        .await?
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    Ok(Some(UnmarkRefusal::NoRecord))
+}
+
 /// The consolidation cascade: migrate the retired sources' live edges onto
 /// the merged claim and retract the redundant copies
 /// ([`ClaimRepository::migrate_consolidated_edges_conn`], with its audit row,
