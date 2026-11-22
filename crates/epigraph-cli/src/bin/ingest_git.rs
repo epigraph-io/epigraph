@@ -6105,9 +6105,16 @@ crates/epigraph-core/src/domain/mod.rs",
     #[test]
     fn labels_are_covered_by_the_packet_signature() {
         // Changing a label after signing invalidates the signature, which is
-        // why `labelled_and_signed` signs last.
+        // why `labelled_and_signed` signs last. The packet must verify BEFORE
+        // the change, so the negative below shows the labels are covered and
+        // not merely that the signature never verifies (an all-zero
+        // placeholder would pass the negative alone).
         let signer = test_keys().author("sig@example.com");
         let mut packet = build_packet(&signing_fixture_commit(), &signer, Uuid::new_v4(), None);
+        assert!(
+            server_accepts(&packet, &signer),
+            "the freshly built packet must verify"
+        );
         packet.claim.labels = vec!["node:commit".to_string()];
         assert!(!server_accepts(&packet, &signer));
     }
