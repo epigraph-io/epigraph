@@ -2474,7 +2474,7 @@ pub struct IngestDocumentParams {
     pub file_path: String,
     /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written (not even the papers row), so retrying is safe."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
@@ -2506,7 +2506,7 @@ pub struct IngestDocumentInlineParams {
     pub extraction: epigraph_ingest::document::schema::DocumentExtraction,
     /// Opt-in synchronous mode. `None`/`false` keeps the queued contract.
     #[schemars(
-        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written but (possibly) the empty papers row, so retrying is safe."
+        description = "Optional, default false. When true the call WAITS for the all-or-nothing walk and returns its result (claims_ingested, claims_skipped_dedup, relationships_created, ...) or its error, instead of {status: 'queued'} over a background task whose failure reaches only the server log. Prefer true for a single document: a failed walk is then reported to you, and nothing was written (not even the papers row), so retrying is safe."
     )]
     #[serde(default)]
     pub wait: Option<bool>,
