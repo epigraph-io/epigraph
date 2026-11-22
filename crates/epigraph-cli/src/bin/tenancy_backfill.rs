@@ -2322,13 +2322,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
-    // 239 (backlog 54018ca1), agent-key rotation: since 239 the ONLY way an
-    // application session records an agent key (239 revokes its INSERT on
-    // `agent_keys`). Under an APP-owned body it fails CLOSED with 42501
-    // (every HTTP rotation answers 403, nothing written, loud); under the
-    // migration runner's superuser it keeps working with more authority than
-    // intended (083's case). `agent_keys` has no row security, so a
-    // non-member owner changes nothing else.
+    // 239 (backlog 54018ca1), agent-key rotation: retires a key and records
+    // its successor in one call, executed by maintenance sessions only (239
+    // revokes the application role's INSERT on `agent_keys` and grants it no
+    // EXECUTE here). Under an APP-owned body it would run with the
+    // application role's rights and fail CLOSED with 42501 on the INSERT
+    // (nothing written, loud); under the migration runner's superuser it
+    // keeps working with more authority than intended (083's case).
+    // `agent_keys` has no row security, so a non-member owner changes nothing
+    // else.
     ("epigraph_agent_key_rotate", 239),
 ];
 

@@ -503,18 +503,19 @@ impl AgentKeyRepository {
     /// 239's `epigraph_agent_key_rotate`). The agent and type come from the
     /// old row, never from the caller.
     ///
-    /// The definer admits the old key's own agent (the executor's stamped
-    /// principal), an admin, or a maintenance session (`AK03`, 42501
-    /// otherwise), and moves a `signing` or `identity-legacy` key only on a
-    /// maintenance session (`AK02`, 42501). On the application role
-    /// `executor` must be stamped with the caller's viewer.
+    /// Only `epigraph_maintenance` executes the definer: on the application
+    /// role the call is refused 42501 (permission denied for the function)
+    /// before its body runs. Inside, it admits the old key's own agent (the
+    /// executor's stamped principal), an admin, or a maintenance session
+    /// (`AK03`, 42501 otherwise), and moves a `signing` or `identity-legacy`
+    /// key only on a maintenance session (`AK02`, 42501).
     ///
     /// Returns `None` when no key `old_key_id` exists.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` on a refusal (`AK02`, `AK03`: 42501),
-    /// an old key that is no longer active (`AK01`: 22023) or any other
-    /// database error.
+    /// Returns `DbError::QueryFailed` on a refusal (no EXECUTE, `AK02`,
+    /// `AK03`: 42501), an old key that is no longer active (`AK01`: 22023) or
+    /// any other database error.
     #[instrument(skip(executor, new_public_key))]
     pub async fn rotate<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,

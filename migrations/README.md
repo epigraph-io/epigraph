@@ -3414,19 +3414,25 @@ restart.
   pg_temp`) with one new gate for every key type: a privileged session, the key's own
   agent (`epigraph_principal_id()`), or an admin (armed: elevated; unarmed: live instance
   admin), else `AK03` / 42501; (c) adds `epigraph_agent_key_rotate(old key, new public
-  key)`, SECURITY DEFINER owned by `epigraph_maintenance`, EXECUTE to `epigraph_app` and
-  `epigraph_maintenance`: under the same AK02 and AK03 gates it retires the active old key
+  key)`, SECURITY DEFINER owned by `epigraph_maintenance`, EXECUTE to `epigraph_maintenance`
+  ONLY (an application grant would admit no legitimate call, since the one caller rotates a
+  `signing` key, and would let a DSN holder that stamps itself as the victim record a key
+  through the definer): under the same AK02 and AK03 gates it retires the active old key
   (closing its window) and inserts the new 32-byte key with the old row's agent and type,
   valid from where the old window closed, in one statement (`AK01` for a key no longer
   active, `AK04` for a wrong-length key). The HTTP rotate and revoke routes now run on a
-  transaction stamped with the caller's viewer, and rotation is the one definer call. The
-  AK03 gate reads the session principal GUC, which a holder of the application DSN can set
-  itself; the INSERT revoke and the AK02 gates do not depend on it. The database cannot see
+  transaction stamped with the caller's viewer, and rotation is the one definer call; on the
+  application role the rotation is refused 42501 (no EXECUTE), as AK02 refused it before.
+  The status definer's AK03 gate reads the session principal GUC, which a holder of the
+  application DSN can set itself (so it can still retire or revoke a victim's non-attested
+  key); the INSERT revoke and the AK02 gates do not depend on it. The database cannot see
   `claims:admin`: an unarmed admin token whose principal is not a live instance admin is now
   refused AK03 at the database. Pinned by `epigraph-db/tests/agent_keys_app_role_writes.rs`
   (insert refused for every type; another agent and an unstamped session refused, the agent,
-  an unarmed instance admin and a maintenance session admitted, an armed non-elevated admin
-  refused; the rotation's refusals and its atomic success; the route's repository calls on
+  an unarmed instance admin, an armed elevated custodian and a maintenance session admitted,
+  an armed non-elevated admin refused; no application EXECUTE on the rotation definer, and,
+  under a test-local grant standing in for a future grantee, its refusals, its admin arms
+  and its atomic success; the route's repository calls on
   an application-role `ScopedPool`; the undo, run twice). The insert, status and rotation
   tests were measured red on the series without 239; removing the REVOKE or forcing either
   caller gate open each fails at least one of them. Also pinned by

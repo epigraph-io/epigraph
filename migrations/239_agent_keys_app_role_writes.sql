@@ -55,8 +55,15 @@
 --   c. NEW `epigraph_agent_key_rotate(p_old_key uuid, p_new_public_key bytea)`
 --      RETURNS SETOF `agent_keys` (the new row; no row when the old key does
 --      not exist). SECURITY DEFINER, owner `epigraph_maintenance`, EXECUTE
---      revoked from PUBLIC and granted to `epigraph_app` and
---      `epigraph_maintenance`. In one statement it locks the old key, applies
+--      revoked from PUBLIC and granted to `epigraph_maintenance` ONLY. The
+--      application role does not execute it: the one application caller,
+--      the HTTP rotation, rotates the agent's `signing` key, which the AK02
+--      gate refuses to an application session anyway, so a grant would admit
+--      no legitimate call; and since the AK03 gate reads a GUC an application
+--      session sets itself, a grant would hand a DSN holder a way to record a
+--      chosen key for any agent holding an active non-attested key, re-opening
+--      in a definer the INSERT that (a) revokes. The AK03 gate stays, for any
+--      future grantee. In one statement it locks the old key, applies
 --      the same AK02 and AK03 gates, refuses (`AK01`, 22023) a key that is no
 --      longer `active`, retires it (`rotated`, `valid_until = LEAST(
 --      valid_until, now())`, as 163) and inserts the new key `active` with
@@ -66,7 +73,10 @@
 --      follow-up 118's header names. The new key must be 32 bytes (Ed25519;
 --      `AK04`, 22023). The HTTP rotation calls it instead of the status
 --      definer plus a direct INSERT, so a failure between the two no longer
---      leaves an agent with its old key retired and no new one.
+--      leaves an agent with its old key retired and no new one. On the
+--      application role that call is refused 42501 (no EXECUTE) before the
+--      body runs, so HTTP rotation is a maintenance-session act, as the
+--      attested `signing` type already made it.
 --
 -- ===================================================================
 -- 2. WHAT IT DOES NOT CLOSE
@@ -74,15 +84,18 @@
 --
 -- `epigraph.principal_id` is a session GUC any session on the application DSN
 -- may SET (199's note; docs/tenancy.md). Against a DSN holder:
---   * the INSERT revoke holds outright, and so do the AK02 gates (they read
---     the session login, not the GUC);
---   * the AK03 gate holds only under the stamping convention: a DSN holder
---     that stamps itself as the victim passes it. What it closes is the
---     request path: every HTTP caller is stamped from its verified token, and
---     an unstamped connection can no longer move any key.
+--   * the INSERT revoke holds outright (the application role executes no
+--     definer that inserts a key), and so do the AK02 gates (they read the
+--     session login, not the GUC);
+--   * the status definer's AK03 gate holds only under the stamping
+--     convention: a DSN holder that stamps itself as the victim passes it and
+--     can retire or revoke the victim's NON-attested keys (it can add none).
+--     What the gate closes is the request path: every HTTP caller is stamped
+--     from its verified token, and an unstamped connection can no longer move
+--     any key.
 -- The attested types stay a maintenance act, as 161 ruled: the HTTP rotation
--- of a `signing` key on an application session is refused AK02 before and
--- after this file.
+-- of a `signing` key on an application session was refused AK02 before this
+-- file and is refused 42501 (no EXECUTE on the rotation definer) after it.
 --
 -- The admin arm is the database's, not the token's: the database cannot see
 -- an OAuth scope. While the switch is unarmed, a `claims:admin` caller whose
@@ -231,8 +244,8 @@ BEGIN
                 'TO epigraph_maintenance';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_agent_key_rotate(uuid, bytea) '
-                'TO epigraph_app';
+        -- No EXECUTE on the rotation definer for the application role
+        -- (section 1c): it would re-open the INSERT revoked here.
         EXECUTE 'REVOKE INSERT ON public.agent_keys FROM epigraph_app';
     END IF;
 END $$;
