@@ -26,6 +26,7 @@ fn run(args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
         .args(args)
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .env_remove("EPIGRAPH_MCP_AGENT_KEY")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")

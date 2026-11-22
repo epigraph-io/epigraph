@@ -2023,7 +2023,18 @@ mod signer_selection_tests {
             .status()
             .expect("run mkfifo");
         assert!(status.success(), "mkfifo failed");
-        let err = read_signing_key_file(&fifo, my_uid()).expect_err("fifo");
+        // On a worker thread with a deadline, so a lost `O_NONBLOCK` fails
+        // this test instead of hanging the run (the blocked thread is
+        // abandoned; the test binary still exits).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let uid = my_uid();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_signing_key_file(&fifo, uid));
+        });
+        let err = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a writerless FIFO blocked: the key file must be opened O_NONBLOCK")
+            .expect_err("fifo");
         assert!(err.contains("not a regular file"), "{err}");
     }
 
