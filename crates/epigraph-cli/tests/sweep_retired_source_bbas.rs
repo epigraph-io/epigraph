@@ -17,7 +17,13 @@
 //!   compare-and-set; a cache or key written since the sweep is left alone;
 //!   a dry-run undo writes nothing; a second undo finds everything as
 //!   recorded and writes nothing. An undo that cannot re-insert a row exits 1
-//!   and keeps its report (the rows it did re-insert are committed).
+//!   and keeps its report (the rows it did re-insert are committed). An undo
+//!   that restores only caches writes its own audit row. A holder deleted
+//!   since the sweep lands in `missing`; a different row under a deleted
+//!   row's id is left alone (`superseded_since_sweep`).
+//! * A holder backed on another frame (`kept_other_frame`) keeps its cache;
+//!   a re-folded holder ends equal to an untouched twin backed by the same
+//!   supporter (an oracle independent of the measurement).
 //! * Every guard refuses with nothing written, for the apply AND the undo: no
 //!   configured maintenance DSN, an unprivileged login (the dry run too), a
 //!   missing agent, an empty reason, a held replay lock, an existing output
@@ -212,6 +218,9 @@ struct World {
     /// RETIRED claim: not measured, so never deleted.
     stray_row: Uuid,
     bystander: Uuid,
+    /// Supported by the same current supporter as `refuted`, over the same
+    /// path, and by nothing else: what `refuted`'s re-fold must equal.
+    twin: Uuid,
 }
 
 async fn believed(pool: &PgPool, agent: Uuid, tag: &str, bel: f64, pl: f64) -> Uuid {
@@ -378,6 +387,10 @@ async fn world(pool: &PgPool) -> World {
     let bystander = fixture::seed_public_claim(pool, agent, "k10r bystander").await;
     wire(pool, &public, agent, s2, bystander, "supports").await;
 
+    // The control: `refuted`'s supporter alone, never touched by a sweep.
+    let twin = fixture::seed_public_claim(pool, agent, "k10r twin").await;
+    wire(pool, &public, agent, supporter, twin, "supports").await;
+
     World {
         _scoped: scoped,
         agent,
@@ -390,6 +403,7 @@ async fn world(pool: &PgPool) -> World {
         kept_row,
         stray_row,
         bystander,
+        twin,
     }
 }
 
@@ -1711,6 +1725,19 @@ async fn applied(dir: &TempDir, l: &Logins, agent: &str) -> (PathBuf, serde_json
     (snap, snapshot)
 }
 
+/// The id of the row the sweep deleted from `holder`.
+fn deleted_row_of(snapshot: &serde_json::Value, holder: Uuid) -> Uuid {
+    snapshot["deleted"]
+        .as_array()
+        .expect("deleted")
+        .iter()
+        .find(|d| d["holder_id"] == holder.to_string())
+        .and_then(|d| d["id"].as_str())
+        .unwrap_or_else(|| panic!("a deleted row of {holder}: {snapshot}"))
+        .parse()
+        .unwrap()
+}
+
 /// An undo whose rows came back but whose cache step failed is re-run: the
 /// re-run re-inserts no row and restores only the caches. It writes its own
 /// `k10_retro.sweep_undone` row (who, why, which apply, what it restored),
@@ -1835,5 +1862,240 @@ async fn an_undo_that_restores_only_caches_writes_an_audit_row(pool: PgPool) {
     )
     .await;
     assert_eq!(agentless, 2, "both undo rows are agent-less");
+    l.drop(&pool).await;
+}
+
+/// A holder whose ONLY binary-frame row the sweep deletes but which keeps a
+/// row on another frame: measured `kept_other_frame`, swept, and its cache
+/// left exactly as it was (the cached scalars are frame-agnostic, so the
+/// other frame's value stands).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_holder_backed_on_another_frame_keeps_its_cache_through_the_sweep(pool: PgPool) {
+    let w = world(&pool).await;
+    let source = believed(&pool, w.agent, "k10r other-frame source", 0.9, 0.95).await;
+    let holder = fixture::seed_public_claim(&pool, w.agent, "k10r other-frame holder").await;
+    wire(&pool, &w.public, w.agent, source, holder, "refutes").await;
+    let other: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("k10r-other-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("another frame");
+    MassFunctionRepository::store_with_perspective(
+        &pool,
+        holder,
+        other,
+        Some(w.agent),
+        None,
+        &serde_json::json!({"0": 0.3, "0,1": 0.7}),
+        None,
+        Some("k10r"),
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("a row on another frame");
+    retire(&pool, source).await;
+    let held = cache(&pool, holder).await;
+    assert!(held.0.is_some(), "PREMISE: the holder holds a cache");
+
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (k0, report) = measure(&dir, "k0.json", &l);
+    assert_eq!(
+        claim(&report, holder)["outcome"],
+        "kept_other_frame",
+        "PREMISE: {report}"
+    );
+    let planned = selected(&pool).await;
+    assert_eq!(planned.len(), 4, "PREMISE: the world's 3 and the holder's");
+    let swept: Uuid =
+        sqlx::query_scalar("SELECT id FROM mass_functions WHERE claim_id = $1 AND id = ANY($2)")
+            .bind(holder)
+            .bind(&planned)
+            .fetch_one(&pool)
+            .await
+            .expect("the holder's planned row");
+
+    let snap = dir.path("snap.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, &agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    assert!(!exists(&pool, swept).await, "the holder's row was swept");
+    assert_eq!(
+        cache(&pool, holder).await,
+        held,
+        "a holder backed on another frame lost its cache"
+    );
+    l.drop(&pool).await;
+}
+
+/// A holder deleted since the sweep: its row cannot come back (nothing to
+/// hold it), lands in the undo's `missing` bucket, and the undo still exits
+/// 0 with the other rows restored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undo_reports_a_holder_deleted_since_the_sweep_as_missing(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (snap, snapshot) = applied(&dir, &l, &agent).await;
+    let gone = deleted_row_of(&snapshot, w.lonely);
+    sqlx::query("DELETE FROM claims WHERE id = $1")
+        .bind(w.lonely)
+        .execute(&pool)
+        .await
+        .expect("delete the holder since the sweep");
+
+    let report = dir.path("undo.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_to(&snap, &report, &agent, "k10r missing undo")),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    let out = read_report(&report);
+    assert_eq!(
+        id_list(&out["rows"]["missing"]),
+        vec![gone.to_string()],
+        "{out}"
+    );
+    for bucket in ["failed", "superseded_since_sweep", "already_restored"] {
+        assert_eq!(
+            out["rows"][bucket].as_array().map(Vec::len),
+            Some(0),
+            "rows.{bucket}: {out}"
+        );
+    }
+    assert_eq!(
+        out["rows"]["restored"].as_array().map(Vec::len),
+        Some(2),
+        "{out}"
+    );
+    assert!(!exists(&pool, gone).await);
+    assert_eq!(
+        id_list(&out["caches_held_back"]),
+        vec![w.lonely.to_string()],
+        "{out}"
+    );
+    l.drop(&pool).await;
+}
+
+/// A row written since the sweep under a deleted row's ID (another claim,
+/// another key): the deleted row is not re-inserted, the undo reports it
+/// `superseded_since_sweep`, and the newer row is untouched.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undo_leaves_a_different_row_holding_a_deleted_rows_id_alone(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let (snap, snapshot) = applied(&dir, &l, &agent).await;
+    let taken = deleted_row_of(&snapshot, w.refuted);
+    let elsewhere = fixture::seed_public_claim(&pool, w.agent, "k10r id taker").await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("k10r-taker-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("a frame");
+    sqlx::query(
+        "INSERT INTO mass_functions (id, claim_id, frame_id, masses) \
+         VALUES ($1, $2, $3, '{\"0,1\": 1.0}'::jsonb)",
+    )
+    .bind(taken)
+    .bind(elsewhere)
+    .bind(frame)
+    .execute(&pool)
+    .await
+    .expect("a different row under the deleted row's id");
+    let image = |pool: PgPool| async move {
+        sqlx::query_scalar::<_, String>(
+            "SELECT to_jsonb(m.*)::text FROM mass_functions m WHERE id = $1",
+        )
+        .bind(taken)
+        .fetch_one(&pool)
+        .await
+        .expect("the newer row")
+    };
+    let newer = image(pool.clone()).await;
+    let refuted_cache = cache(&pool, w.refuted).await;
+
+    let report = dir.path("undo.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_to(&snap, &report, &agent, "k10r id-taken undo")),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    let out = read_report(&report);
+    assert_eq!(
+        id_list(&out["rows"]["superseded_since_sweep"]),
+        vec![taken.to_string()],
+        "{out}"
+    );
+    for bucket in ["failed", "missing", "already_restored"] {
+        assert_eq!(
+            out["rows"][bucket].as_array().map(Vec::len),
+            Some(0),
+            "rows.{bucket}: {out}"
+        );
+    }
+    assert_eq!(
+        image(pool.clone()).await,
+        newer,
+        "the row that took the id was changed"
+    );
+    assert_eq!(
+        id_list(&out["caches_held_back"]),
+        vec![w.refuted.to_string()],
+        "{out}"
+    );
+    assert_eq!(cache(&pool, w.refuted).await, refuted_cache);
+    l.drop(&pool).await;
+}
+
+/// The re-fold is COMPUTED: after the sweep, `refuted` (its retired refuter's
+/// row gone, its supporter's left) holds exactly what `twin` holds, a claim
+/// the same supporter backs over the same path and no sweep touches. The
+/// main test's oracle is the measurement, which shares the fold with the
+/// sweep; this one does not depend on the measurement at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_refold_equals_an_untouched_twin_backed_by_the_same_supporter(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let twin = cache(&pool, w.twin).await;
+    let before = cache(&pool, w.refuted).await;
+    assert!(
+        twin.0.is_some() && twin.1.is_some() && twin.2.is_some(),
+        "PREMISE: the twin holds a cache: {twin:?}"
+    );
+    assert!(
+        !close(before.0, twin.0),
+        "PREMISE: the refuter moves `refuted` away from the twin: {before:?} vs {twin:?}"
+    );
+    applied(&dir, &l, &agent).await;
+    let (b, pl, p) = cache(&pool, w.refuted).await;
+    assert!(
+        close(b, twin.0) && close(pl, twin.1) && close(p, twin.2),
+        "the re-fold ({b:?}, {pl:?}, {p:?}) is not the twin's {twin:?} (it was {before:?})"
+    );
+    assert_eq!(cache(&pool, w.twin).await, twin, "the twin moved");
     l.drop(&pool).await;
 }
