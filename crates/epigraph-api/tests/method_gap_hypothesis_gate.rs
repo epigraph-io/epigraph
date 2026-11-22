@@ -19,9 +19,10 @@
 //!
 //! Both pools of the `AppState` are `epigraph_app` (no BYPASSRLS, `claims` row
 //! security FORCEd), as in production. Fixtures are seeded on the superuser
-//! `#[sqlx::test]` pool. Every arm carries a calibration call by the
-//! hypothesis's owner that must answer 200 and echo the id, so a 404 cannot
-//! come from a broken fixture.
+//! `#[sqlx::test]` pool. The hidden-hypothesis arm carries a calibration call
+//! by the hypothesis's owner that must answer 200 and echo the id, so a 404
+//! cannot come from a broken fixture; the public-hypothesis arm expects 200
+//! outright.
 
 use axum::{
     body::Body,
@@ -137,4 +138,31 @@ async fn a_hidden_hypothesis_is_the_missing_hypothesis_404(pool: PgPool) {
         missing_body.replace(&missing.to_string(), "<id>"),
         "a hidden hypothesis answers exactly as a missing one"
     );
+}
+
+/// The gate asks for READ access, not write: a stranger analysing a public
+/// hypothesis another group owns gets the answer. A gate that asked for write
+/// access would refuse it (403), and the hidden-hypothesis arm above cannot
+/// tell the two apart, since a private hypothesis is refused either way and
+/// the owner may do both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_hypothesis_of_another_group_is_analysed_for_a_reader(pool: PgPool) {
+    let (owner, _) = viewer_fixture::seed_agent_with_group(&pool, "b627-owner").await;
+    let (stranger, _) = viewer_fixture::seed_agent_with_group(&pool, "b627-stranger").await;
+    let hypothesis = viewer_fixture::seed_public_claim(
+        &pool,
+        owner,
+        &format!("b6273fb9 public hypothesis {}", Uuid::new_v4()),
+    )
+    .await;
+    let app = app_role_router(&pool).await;
+
+    let (status, body) = gaps(app, stranger, &uri(hypothesis)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a reader of a public hypothesis it cannot write analyses it: {body}"
+    );
+    let v: Value = serde_json::from_str(&body).expect("JSON");
+    assert_eq!(v["hypothesis_id"], hypothesis.to_string(), "{body}");
 }
