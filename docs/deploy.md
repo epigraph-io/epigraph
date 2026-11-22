@@ -509,7 +509,7 @@ For the others, anything else is off.
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | unset | The passkey relying party. Both unset → passkeys off, and the ceremonies answer 503. A partial or malformed configuration → exit 1. The RP id is effectively permanent: a passkey registered under one never asserts under another. |
 | `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to: `packed` and `tpm` attestation by a listed model. Both or neither; required unless `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` is set. |
-| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox on a device with a locked bootloader and a Verified boot; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
 | `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` | unset | A local copy of Google's attestation status list (the JSON at `https://android.googleapis.com/attestation/status`), refreshed by an operator job; the API never fetches it. REQUIRED with `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (either without the other → exit 1, as is a file that is unreadable or not a status list). Re-read at every Android enrollment and anchor use; a listed certificate anywhere in the chain refuses, and a file older than 48 hours (by modification time) refuses every Android enrollment and anchor. Section 10, as above. |
 | `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` | off | On: a person's LATER passkey, enrolled on a confirmed `passkey.register` act, may carry no attestation (a synced passkey, e.g. a password manager's), when the act was confirmed by one of that person's live passkeys that is hardware-attested under the CURRENT configuration, as is every passkey that authorized it. A first passkey is always attested. Served on an armed database. Needs migration 200. Section 10, as above. |
 | `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding, and with either setting above (exit 1). |
@@ -3007,6 +3007,21 @@ when all of these hold:
     Software, and they are refused.
   - The pinned library refuses StrongBox (level 2) outright, so a
     StrongBox-only key cannot register until the library parses it.
+- the device's boot was trusted when the key was made. The KeyDescription's
+  `rootOfTrust` must be in the hardware-enforced list with `deviceLocked`
+  true and `verifiedBootState` Verified (0). A TEE attests whatever the
+  device booted, so a key from a device with an unlocked bootloader, or
+  whose boot chain did not verify, is still TEE-level while the software
+  that asked for its user verification is not the vendor's. Refused:
+  - an unlocked bootloader;
+  - SelfSigned (1): a bootloader locked to its owner's own key, as a custom
+    ROM such as GrapheneOS installs. There is no setting to admit it;
+  - Unverified (2) and Failed (3);
+  - no `rootOfTrust`, or one only in the software-enforced list.
+
+  This is checked at enrollment and at every anchor and lineage use, so an
+  Android passkey enrolled before this check from such a device stops
+  anchoring (it still elevates);
 - only the leaf carries a KeyDescription. A chain with a second one, which
   would be an attacker's certificate extending a genuine chain, is refused;
 - no certificate of the chain, the root included, is on the attestation
@@ -3187,8 +3202,8 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     credential against today's roots, never the columns its registration
     wrote:
     - `packed`/`tpm`: an allowlist root that still admits its model;
-    - `android-key`: an Android root, plus the TEE/StrongBox rule and the
-      status list above.
+    - `android-key`: an Android root, plus the TEE/StrongBox and boot-state
+      rules and the status list above.
 
     The row's recorded format, AAGUID and backup-eligible flag must also
     agree with that credential. The anchor's certificate validity periods are
@@ -3243,8 +3258,8 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     trusted under the configuration the API runs now: self attestation, a
     model not on the allowlist, a root that is not configured, or an Android
     key that fails the Android rules (a software-level key, `purpose` or
-    `origin` only software-enforced, a KeyDescription outside the leaf, a
-    backup-eligible credential) or has a certificate on a CURRENT status
+    `origin` only software-enforced, an unlocked or unverified boot, a
+    KeyDescription outside the leaf, a backup-eligible credential) or has a certificate on a CURRENT status
     list. Such an attestation is dropped, as a browser drops it when asked
     for none, and logged at INFO. The passkey holds only through its anchor:
     it never anchors a further one, and it is revoked with its anchor.

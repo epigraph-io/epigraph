@@ -334,6 +334,87 @@ async fn a_key_description_outside_the_leaf_is_refused() {
 }
 
 // =====================================================================
+// f6087c6e: the device's boot state (RootOfTrust)
+// =====================================================================
+
+/// An Android key is hardware only on a device whose bootloader is locked
+/// and whose boot verified against its vendor's key: the KeyDescription's
+/// `rootOfTrust`, read from the TEE-enforced list. A key from an unlocked
+/// device, from a device locked to its owner's own key (SelfSigned), from
+/// an Unverified or Failed boot, with no root of trust, or with one only in
+/// the software-enforced list is refused at registration, and the same key
+/// recorded where nothing checks it (the software policy) anchors nothing
+/// once the Android root is configured. CALIBRATION: the default key
+/// (locked, Verified) registers and anchors.
+/// Mutations: the root-of-trust gate removed from `android::hardware_rules`
+/// -> every case registers and anchors; the gate reading the software list
+/// -> the calibration is refused; SelfSigned accepted -> that case
+/// registers and anchors.
+#[tokio::test]
+async fn an_android_key_from_an_unlocked_or_unverified_device_neither_registers_nor_anchors() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), true);
+    let (mut auth, good) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let good = good.expect("CALIBRATION: a locked, verified device's key registers");
+    let anchor = confirmed_anchor(&rp, &mut auth, &good, Uuid::new_v4()).await;
+    assert_eq!(rp.check_anchor(&anchor), Ok(()), "CALIBRATION: it anchors");
+
+    let soft = software();
+    for (label, root_of_trust, in_software_list, expected) in [
+        (
+            "unlocked bootloader",
+            Some((false, 0)),
+            false,
+            "bootloader is unlocked",
+        ),
+        (
+            "locked to its owner's key (SelfSigned)",
+            Some((true, 1)),
+            false,
+            "verified boot state 1",
+        ),
+        (
+            "Unverified boot",
+            Some((true, 2)),
+            false,
+            "verified boot state 2",
+        ),
+        (
+            "Failed boot",
+            Some((true, 3)),
+            false,
+            "verified boot state 3",
+        ),
+        ("no root of trust", None, false, "root of trust"),
+        (
+            "root of trust software-enforced",
+            Some((true, 0)),
+            true,
+            "root of trust",
+        ),
+    ] {
+        let opts = AndroidKeyOpts {
+            root_of_trust,
+            root_of_trust_in_software_list: in_software_list,
+            ..AndroidKeyOpts::default()
+        };
+        let (_, reg) = android_registration(&rp, &google, &opts).await;
+        let why = policy_refusal(reg);
+        assert!(why.contains(expected), "{label}: {why}");
+
+        let (mut auth, reg) = android_registration(&soft, &google, &opts).await;
+        let reg = reg.unwrap_or_else(|e| panic!("{label}: the software policy records it: {e}"));
+        assert_eq!(reg.attestation_format, "android-key", "{label}");
+        let anchor = confirmed_anchor(&rp, &mut auth, &reg, Uuid::new_v4()).await;
+        assert_eq!(
+            rp.check_anchor(&anchor),
+            Err(AnchorRefusal::AnchorNotAttested),
+            "{label}"
+        );
+    }
+}
+
+// =====================================================================
 // P779-2: the attestation status list, local, fail closed
 // =====================================================================
 

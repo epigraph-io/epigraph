@@ -930,6 +930,8 @@ impl Passkeys {
     /// * `android-key`: chains to an Android key root, its KeyDescription
     ///   (the leaf's, and only the leaf's) places the attestation and the key
     ///   in a TEE or StrongBox with `purpose` and `origin` hardware-enforced,
+    ///   on a device whose bootloader was locked and whose boot was Verified
+    ///   (its hardware-enforced `rootOfTrust`, [`android::hardware_rules`]),
     ///   and no certificate of the chain, root included, is on the status list
     ///   (which must be no older than
     ///   [`android::ANDROID_KEY_STATUS_MAX_AGE`]);

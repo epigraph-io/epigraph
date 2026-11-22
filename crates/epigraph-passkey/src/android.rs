@@ -10,6 +10,14 @@
 //!   The 0.5.5 parser refuses level 2 outright (`InvalidTag`), so a StrongBox
 //!   key cannot register through it today; this crate admits level 2 so that
 //!   a library that parses it needs no change here.
+//! * the device's boot state. A TEE attests whatever the device booted, so a
+//!   key generated on a device with an unlocked bootloader or a boot chain
+//!   that did not verify is still TEE-level, while the software that asked
+//!   for its user verification is not the vendor's. This crate requires the
+//!   KeyDescription's `rootOfTrust` [704] in the HARDWARE-enforced list with
+//!   `deviceLocked` TRUE and `verifiedBootState` Verified (0); a device
+//!   locked to its owner's own key (SelfSigned, 1: a custom ROM) is refused
+//!   as well ([`hardware_rules`]).
 //! * where the KeyDescription sits. Only the first occurrence counts, and it
 //!   must be the leaf's: a chain in which any other certificate also carries
 //!   one is refused (Google's guidance: a later occurrence may be an
@@ -34,7 +42,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
-use x509_parser::der_parser::ber::BerObjectContent;
+use x509_parser::der_parser::ber::{parse_ber_bool, BerObjectContent};
 use x509_parser::der_parser::der::{
     parse_der, parse_der_container, parse_der_enum, parse_der_integer, parse_der_octetstring,
     Header, Tag,
@@ -114,6 +122,9 @@ const LEVEL_STRONGBOX: u32 = 2;
 const ORIGIN_GENERATED: u32 = 0;
 /// `purpose` SIGN.
 const PURPOSE_SIGN: u32 = 2;
+/// `verifiedBootState` Verified: the whole boot chain verified against the
+/// vendor's key.
+const BOOT_VERIFIED: u32 = 0;
 
 /// A serial number's big-endian bytes as a status list keys it: lowercase
 /// hex, no leading zeros (`"0"` for zero).
@@ -258,6 +269,17 @@ impl StatusList {
     }
 }
 
+/// A KeyDescription's `rootOfTrust` [704], as far as this crate reads it:
+/// the state of the device's boot when the key was generated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootOfTrust {
+    /// `deviceLocked`: the bootloader is locked.
+    pub device_locked: bool,
+    /// `verifiedBootState`: Verified (0), SelfSigned (1), Unverified (2),
+    /// Failed (3).
+    pub verified_boot_state: u32,
+}
+
 /// One of a KeyDescription's authorization lists, as far as this crate reads
 /// it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -268,6 +290,34 @@ pub struct AuthorizationList {
     pub origin: Option<u32>,
     /// `purpose` [1], every member of the set.
     pub purposes: Vec<u32>,
+    /// `rootOfTrust` [704].
+    pub root_of_trust: Option<RootOfTrust>,
+}
+
+/// `RootOfTrust ::= SEQUENCE { verifiedBootKey OCTET STRING, deviceLocked
+/// BOOLEAN, verifiedBootState ENUMERATED, verifiedBootHash OCTET STRING
+/// (version 3 and later) }`. `deviceLocked` is read as BER (any non-zero
+/// octet is TRUE): a Keymaster that encodes TRUE as 0x01 rather than DER's
+/// 0xFF states the same thing, and it is the certificate's signature, not
+/// its encoding, that makes it trustworthy.
+fn root_of_trust(i: &[u8]) -> BerResult<'_, RootOfTrust> {
+    parse_der_container(|i: &[u8], hdr: Header| {
+        if hdr.tag() != Tag::Sequence {
+            return Err(x509_parser::nom::Err::Error(BerError::BerTypeError));
+        }
+        let (i, _verified_boot_key) = parse_der_octetstring(i)?;
+        let (i, device_locked) = parse_ber_bool(i)?;
+        let (i, verified_boot_state) = parse_der_enum(i)?;
+        // verifiedBootHash (version 3 and later) and anything a later
+        // version appends are not read.
+        Ok((
+            i,
+            RootOfTrust {
+                device_locked: device_locked.as_bool()?,
+                verified_boot_state: verified_boot_state.as_u32()?,
+            },
+        ))
+    })(i)
 }
 
 /// A KeyDescription (Android Keystore attestation schema), as far as this
@@ -296,6 +346,12 @@ fn authorization_list(i: &[u8]) -> BerResult<'_, AuthorizationList> {
             i = rest;
             match obj.tag() {
                 Tag(600) => list.all_applications = true,
+                Tag(704) => {
+                    if let BerObjectContent::Unknown(o) = obj.content {
+                        let (_, rot) = root_of_trust(o.data)?;
+                        list.root_of_trust = Some(rot);
+                    }
+                }
                 Tag(702) => {
                     if let BerObjectContent::Unknown(o) = obj.content {
                         let (_, v) = parse_der_integer(o.data)?;
@@ -399,8 +455,11 @@ pub fn inspect_chain(chain: &[Vec<u8>]) -> Result<(Vec<Vec<u8>>, KeyDescription)
 
 /// The hardware rules of a KeyDescription: the attestation and the key in a
 /// TEE or StrongBox, the key's `purpose` (SIGN) and `origin` (GENERATED)
-/// enforced by that hardware, and the key scoped to the relying party (no
-/// `allApplications`).
+/// enforced by that hardware, the key scoped to the relying party (no
+/// `allApplications`), and the device's boot as the hardware saw it
+/// (`rootOfTrust` in the hardware-enforced list): bootloader locked, boot
+/// chain Verified. A `rootOfTrust` only in the software-enforced list, or in
+/// neither, is refused.
 ///
 /// # Errors
 /// Which rule it breaks.
@@ -424,7 +483,23 @@ pub fn hardware_rules(kd: &KeyDescription) -> Result<(), String> {
                 .into(),
         );
     }
-    Ok(())
+    match &hw.root_of_trust {
+        None => Err(
+            "the key's root of trust (bootloader lock and verified boot state) is not in the \
+             hardware-enforced list"
+                .into(),
+        ),
+        Some(rot) if !rot.device_locked => {
+            Err("the key was generated on a device whose bootloader is unlocked".into())
+        }
+        Some(rot) if rot.verified_boot_state != BOOT_VERIFIED => Err(format!(
+            "the key was generated on a device whose boot was not verified against its \
+             vendor's key (verified boot state {}: 0 Verified required; 1 SelfSigned, \
+             2 Unverified, 3 Failed)",
+            rot.verified_boot_state
+        )),
+        Some(_) => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -521,7 +596,15 @@ mod tests {
                 all_applications: false,
                 origin: hw_origin,
                 purposes: hw_purposes,
+                root_of_trust: Some(rot(true, 0)),
             },
+        }
+    }
+
+    fn rot(device_locked: bool, verified_boot_state: u32) -> RootOfTrust {
+        RootOfTrust {
+            device_locked,
+            verified_boot_state,
         }
     }
 
@@ -545,5 +628,121 @@ mod tests {
         let mut everywhere = kd(1, Some(0), vec![2]);
         everywhere.software_enforced.all_applications = true;
         assert!(hardware_rules(&everywhere).is_err());
+    }
+
+    /// The device's boot (f6087c6e): a locked bootloader and a Verified boot
+    /// chain, read from the HARDWARE-enforced list, pass; an unlocked
+    /// bootloader, each boot state but Verified (SelfSigned, Unverified,
+    /// Failed, and an unknown one), a missing root of trust, and one only in
+    /// the software-enforced list do not. Mutations: the root-of-trust gate
+    /// removed from `hardware_rules` -> every refused case passes; the gate
+    /// reading `software_enforced` -> the software-only case passes and the
+    /// genuine one is refused; `verified_boot_state <= 1` (SelfSigned
+    /// accepted) -> the SelfSigned case passes; `device_locked` not read ->
+    /// the unlocked case passes.
+    #[test]
+    fn the_root_of_trust_rules() {
+        assert_eq!(hardware_rules(&kd(1, Some(0), vec![2])), Ok(()));
+        let with = |locked: bool, state: u32| {
+            let mut k = kd(1, Some(0), vec![2]);
+            k.hardware_enforced.root_of_trust = Some(rot(locked, state));
+            hardware_rules(&k)
+        };
+        assert_eq!(with(true, 0), Ok(()));
+        let unlocked = with(false, 0).unwrap_err();
+        assert!(unlocked.contains("bootloader is unlocked"), "{unlocked}");
+        for state in [1, 2, 3, 4] {
+            let why = with(true, state).unwrap_err();
+            assert!(why.contains("verified boot state"), "{state}: {why}");
+        }
+        assert!(with(false, 2).is_err());
+        let mut absent = kd(1, Some(0), vec![2]);
+        absent.hardware_enforced.root_of_trust = None;
+        let why = hardware_rules(&absent).unwrap_err();
+        assert!(why.contains("root of trust"), "{why}");
+        let mut software_only = absent.clone();
+        software_only.software_enforced.root_of_trust = Some(rot(true, 0));
+        assert!(hardware_rules(&software_only).is_err());
+    }
+
+    /// One DER TLV, its length in the short form below 128 bytes and the
+    /// one-octet long form (`0x81`) up to 255.
+    fn tlv(tag: &[u8], content: &[u8]) -> Vec<u8> {
+        let mut out = tag.to_vec();
+        let len = u8::try_from(content.len()).unwrap();
+        if len >= 0x80 {
+            out.push(0x81);
+        }
+        out.push(len);
+        out.extend_from_slice(content);
+        out
+    }
+
+    /// A KeyDescription whose TEE-enforced list holds `purpose` SIGN,
+    /// `origin` GENERATED and, when given, `rootOfTrust` [704] (high tag
+    /// number form `BF 85 40`) with the `deviceLocked` octet `locked` and the
+    /// `verifiedBootState` `state`.
+    fn encoded(root_of_trust: Option<(u8, u8)>) -> Vec<u8> {
+        let mut tee = [
+            tlv(&[0xA1], &tlv(&[0x31], &tlv(&[0x02], &[0x02]))),
+            tlv(&[0xBF, 0x85, 0x3E], &tlv(&[0x02], &[0x00])),
+        ]
+        .concat();
+        if let Some((locked, state)) = root_of_trust {
+            let rot = tlv(
+                &[0x30],
+                &[
+                    tlv(&[0x04], &[0xAB; 32]),
+                    tlv(&[0x01], &[locked]),
+                    tlv(&[0x0A], &[state]),
+                    tlv(&[0x04], &[0xCD; 32]),
+                ]
+                .concat(),
+            );
+            tee.extend(tlv(&[0xBF, 0x85, 0x40], &rot));
+        }
+        tlv(
+            &[0x30],
+            &[
+                tlv(&[0x02], &[0x03]),
+                tlv(&[0x0A], &[0x01]),
+                tlv(&[0x02], &[0x04]),
+                tlv(&[0x0A], &[0x01]),
+                tlv(&[0x04], &[0x11; 32]),
+                tlv(&[0x04], &[]),
+                tlv(&[0x30], &[]),
+                tlv(&[0x30], &tee),
+            ]
+            .concat(),
+        )
+    }
+
+    /// `rootOfTrust` [704] is read from the TEE-enforced list: `deviceLocked`
+    /// as BER (0xFF and 0x01 are both TRUE, 0x00 FALSE) and
+    /// `verifiedBootState`; a list without it has none. Mutations: the
+    /// [704] arm removed from `authorization_list` -> `root_of_trust` is
+    /// always `None`; `deviceLocked` read with the DER parser -> the 0x01
+    /// case does not parse.
+    #[test]
+    fn the_root_of_trust_is_read_from_the_key_description() {
+        let read = |r| parse_key_description(&encoded(r)).unwrap();
+        let kd = read(Some((0xFF, 0)));
+        assert_eq!(kd.hardware_enforced.root_of_trust, Some(rot(true, 0)));
+        assert_eq!(kd.software_enforced.root_of_trust, None);
+        assert_eq!(hardware_rules(&kd), Ok(()));
+        assert_eq!(
+            read(Some((0x01, 0))).hardware_enforced.root_of_trust,
+            Some(rot(true, 0))
+        );
+        let unlocked = read(Some((0x00, 1)));
+        assert_eq!(
+            unlocked.hardware_enforced.root_of_trust,
+            Some(rot(false, 1))
+        );
+        assert!(hardware_rules(&unlocked).is_err());
+        let absent = read(None);
+        assert_eq!(absent.hardware_enforced.root_of_trust, None);
+        assert_eq!(absent.hardware_enforced.purposes, vec![2]);
+        assert!(hardware_rules(&absent).is_err());
     }
 }
