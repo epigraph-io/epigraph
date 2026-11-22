@@ -281,7 +281,10 @@ async fn input_is_normalised_as_the_mcp_twin_normalises_it(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("stored name");
-    assert_eq!(stored, "Synthetic Parity Team\t", "PREMISE: btrim strips spaces only");
+    assert_eq!(
+        stored, "Synthetic Parity Team\t",
+        "PREMISE: btrim strips spaces only"
+    );
     assert_eq!(body["display_name"], stored, "the echo is the stored name");
 
     let (status, body) = post(

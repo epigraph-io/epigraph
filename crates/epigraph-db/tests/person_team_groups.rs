@@ -700,10 +700,7 @@ async fn an_operator_made_team_group_takes_no_invitation(pool: PgPool) {
     invite(&pool, h, own, b, "admin")
         .await
         .expect("a Person-made group takes invitations");
-    assert!(my_groups(&pool, h)
-        .await
-        .iter()
-        .any(|g| g.0 == own && g.2));
+    assert!(my_groups(&pool, h).await.iter().any(|g| g.0 == own && g.2));
 }
 
 /// 164's guards still refuse every direct application write to a verb-made

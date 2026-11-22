@@ -420,7 +420,10 @@ async fn input_is_normalised_as_the_rest_twin_normalises_it(pool: PgPool) {
         stored, "Synthetic Parity Team\t",
         "PREMISE: btrim strips spaces only"
     );
-    assert_eq!(created["display_name"], stored, "the echo is the stored name");
+    assert_eq!(
+        created["display_name"], stored,
+        "the echo is the stored name"
+    );
 
     let invited = json_of(
         mcp.invite(a, group, b, Some(" writer "))
