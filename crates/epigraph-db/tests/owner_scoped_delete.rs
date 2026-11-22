@@ -993,20 +993,25 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
 
     // The application role, pooled or on a connection: refused, nothing written.
     let app = fixture::downgraded_pool(&pool, "epigraph_app").await;
+    // A repo-authored refusal of the session's authority (backlog 05f56dde:
+    // `DbError::Refused`, which a transport answers as a refusal; a
+    // `sqlx::Error::Protocol` was redacted as a server fault).
+    let authority = |r: &Result<_, epigraph_db::DbError>| {
+        matches!(
+            r,
+            Err(epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            }) if message.contains("privileged")
+        )
+    };
     let whole = MatchCandidateRepo::new(app).retire(cand.id, None).await;
     assert!(
-        whole
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("privileged")),
+        authority(&whole),
         "retirement is not the application role's: {whole:?}"
     );
     let by_app = retire(pool.clone(), "epigraph_app", Some("promoted")).await;
-    assert!(
-        by_app
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("privileged")),
-        "{by_app:?}"
-    );
+    assert!(authority(&by_app), "{by_app:?}");
     assert_eq!(status(pool.clone()).await, "promoted");
     assert!(edge_in_force(pool.clone()).await);
     assert!(exists(&pool, "mass_functions", bba).await);
@@ -1015,10 +1020,14 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
     // nothing changed.
     let moved_on = retire(pool.clone(), "epigraph_maintenance", Some("pending")).await;
     assert!(
-        moved_on
-            .as_ref()
-            .is_err_and(|e| e.to_string().contains("decided again")),
-        "{moved_on:?}"
+        matches!(
+            &moved_on,
+            Err(epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::State,
+                message,
+            }) if message.contains("decided again")
+        ),
+        "a state refusal: {moved_on:?}"
     );
     assert_eq!(status(pool.clone()).await, "promoted");
     assert!(edge_in_force(pool.clone()).await);
