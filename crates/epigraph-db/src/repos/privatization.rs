@@ -613,13 +613,14 @@ pub struct BoundaryMeet {
     /// statement changed.
     pub updated: u64,
     /// Edges with a recorded declaration (migration 260) that the statement
-    /// kept OFF their endpoints' meet, in edge-id order. Classified from the
-    /// computed meet, not from what changed, so a re-run reports them again.
+    /// kept OFF their endpoints' meet, or could not keep on their declaration
+    /// (`unmet`), in edge-id order. Classified from the computed meet, not
+    /// from what changed, so a re-run reports them again.
     pub held: Vec<HeldEdge>,
 }
 
-/// One declared edge the re-meet did not let its endpoints' meet re-own or
-/// widen ([`BoundaryMeet::held`]).
+/// One declared edge the re-meet treated as declared, not derived
+/// ([`BoundaryMeet::held`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeldEdge {
     /// The edge.
@@ -627,9 +628,13 @@ pub struct HeldEdge {
     /// The visibility the meet alone would have given it.
     pub meet_visibility: String,
     /// `true` when the declaration and the meet together name more groups
-    /// than one owner plus one co-owner can express: the edge then stays on
-    /// its declaration, which is NOT narrowed to its endpoints (an operator
-    /// decision; recorded as `edge.hold.unmet`).
+    /// than one owner plus one co-owner can express. The endpoints' meet
+    /// wins (the edge is never readable by a session that cannot read both
+    /// endpoints), keeping the declared owner where the meet allows, so the
+    /// declaration is only partly honoured; recorded as `edge.unmet` for an
+    /// operator. Reachable only in a stacked state (a second plan, or a
+    /// sibling path that already re-tenanted an endpoint): one plan has one
+    /// target group, so its meet next to a declaration names at most it.
     pub unmet: bool,
 }
 
@@ -2899,9 +2904,9 @@ impl PrivatizationRepository {
         // an edge's meet, and no trigger re-meets an edge when only its
         // workflow row changes. So the moved rows' own edges (`variant_of`,
         // `AUTHORED`, `executes` onto a claim the plan leaves public) are
-        // re-met here, on this transaction. (A DECLARED edge keeps its owner
-        // and visibility, migration 260; the batch's own re-meet over these
-        // rows reports it for the plan's audit trail.)
+        // re-met here, on this transaction. (A DECLARED edge is narrowed to its
+        // declaration and its meet, migration 260; the batch's own re-meet
+        // over these rows reports it for the plan's audit trail.)
         let moved: Vec<Uuid> = moves.iter().map(|m| m.workflow_id).collect();
         Self::recompute_boundary_meet_conn(conn, &moved).await?;
         Ok(moves)
@@ -3174,24 +3179,33 @@ impl PrivatizationRepository {
     /// tuples exactly. `writer_group_id` is read ONLY here: a re-point never
     /// recomputes an owner from it.
     ///
-    /// # A DECLARED edge is never re-owned and never widened (migration 260)
+    /// # A DECLARED edge (migration 260)
     ///
     /// An edge whose tenancy its author declared (`('group', H)` between two
     /// public endpoints, kept by 072's no-widening arm; recorded in
     /// `edges.declared_owner_group_id` / `declared_co_owner_group_id`) is not
-    /// derived, so it does not take the meet. Its owner and visibility stay
-    /// the declaration's, `('group', H)`:
+    /// derived, so it does not simply take the meet. Two bounds, in order:
+    /// the edge is NEVER readable by a session that cannot read its
+    /// endpoints' meet (an edge naming a private node discloses it), and,
+    /// within that, it is readable only by a reader of its declaration:
     ///
     /// * meet `public` (a revert, or an endpoint this plan never moved): the
     ///   declared tuple exactly, co-owner included. A revert therefore gives
     ///   back what the author declared, not the world's edge;
     /// * meet `group`: the INTERSECTION of the declaration and the meet, so
-    ///   the edge is readable only by a reader of both, i.e. narrowed, never
-    ///   re-owned. When the groups involved (declared owner, declared
-    ///   co-owner, meet owner, meet co-owner) are at most two, that is owner
-    ///   H with the other group as co-owner. When they are more, no tuple
-    ///   expresses it; the edge is HELD on its declaration (not narrowed to
-    ///   its endpoints) and reported `unmet` for an operator to decide.
+    ///   the edge is readable only by a reader of both. When the groups
+    ///   involved (declared owner, declared co-owner, meet owner, meet
+    ///   co-owner) are at most two, that is owner H with the other group as
+    ///   co-owner: owner and visibility unchanged, narrowed only.
+    /// * more groups (`unmet`): no tuple expresses the intersection. The
+    ///   meet wins: a one-group meet G gives `(H, co G)` (owner kept, the
+    ///   declared co-owner dropped); a two-group meet gives the meet itself,
+    ///   with H as owner when it is one of the two. Reported `unmet` for an
+    ///   operator; the record survives, so a later revert restores the
+    ///   declaration. One plan has one target group, so a single restrict
+    ///   and its revert never reach a two-group meet next to a declaration;
+    ///   only a stacked state (a second plan, or a sibling path that already
+    ///   re-tenanted an endpoint) does.
     ///
     /// The apply direction needs this too: the claims UPDATE's propagation
     /// trigger has already re-met the edge (re-owning it to the target)
@@ -3246,17 +3260,25 @@ impl PrivatizationRepository {
               -- A derived edge (no declaration) takes the meet. A declared one
               -- keeps ('group', declared owner) and takes as co-owner the one
               -- other group the declaration and the meet name, if there is
-              -- exactly one; more than one is not expressible: it keeps its
-              -- declared co-owner and is `unmet`.
+              -- exactly one (the intersection). More than one is `unmet` and
+              -- the MEET bounds it (readers of the tuple are a subset of the
+              -- meet's only when the tuple names every group the meet names):
+              -- a one-group meet G gives (declared owner, co G); a two-group
+              -- meet gives the meet, the declared owner first when it is one
+              -- of the two.
               SELECT m.id, m.dg,
                      m.v AS mv, m.g AS mg, m.co AS mco,
                      CASE WHEN m.dg IS NULL THEN m.v
                           ELSE 'group'::varchar(16) END AS v,
-                     COALESCE(m.dg, m.g) AS g,
+                     CASE WHEN m.dg IS NULL THEN m.g
+                          WHEN cardinality(x.others) <= 1 THEN m.dg
+                          WHEN m.co IS NULL OR m.dg = m.co THEN m.dg
+                          ELSE m.g END AS g,
                      CASE WHEN m.dg IS NULL THEN m.co
                           WHEN cardinality(x.others) = 0 THEN NULL
                           WHEN cardinality(x.others) = 1 THEN x.others[1]
-                          ELSE m.dco END AS co,
+                          WHEN m.co IS NULL OR m.dg = m.co THEN m.g
+                          ELSE m.co END AS co,
                      (m.dg IS NOT NULL AND cardinality(x.others) > 1) AS unmet
                 FROM meet m
                 CROSS JOIN LATERAL (
@@ -3279,7 +3301,8 @@ impl PrivatizationRepository {
               SELECT d.id, d.mv::text AS mv, d.unmet
                 FROM decided d
                WHERE d.dg IS NOT NULL
-                 AND (d.v, d.g, d.co) IS DISTINCT FROM (d.mv, d.mg, d.mco)
+                 AND (d.unmet
+                      OR (d.v, d.g, d.co) IS DISTINCT FROM (d.mv, d.mg, d.mco))
             )
             SELECT (SELECT count(*) FROM upd),
                    ARRAY(SELECT h.id FROM held h ORDER BY h.id),
@@ -3311,10 +3334,11 @@ impl PrivatizationRepository {
     /// their endpoints' meet ([`Self::recompute_boundary_meet_conn`]): one
     /// `privatization_audit` row each, `kind = 'edge'`, action `edge.hold`
     /// (owner and visibility kept, narrowed to the intersection or put back
-    /// on the declaration) or `edge.hold.unmet` (held on its declaration, NOT
-    /// narrowed to its endpoints: an operator decision). `before_visibility`
-    /// is what the meet alone would have written, `after_visibility` what the
-    /// edge keeps (`group`). The owner columns are left NULL: an entity row is
+    /// on the declaration) or `edge.unmet` (the declaration and the meet name
+    /// more groups than one tuple expresses; the edge took the meet, keeping
+    /// the declared owner where the meet allows: an operator decision).
+    /// `before_visibility` is what the meet alone would have written,
+    /// `after_visibility` what the edge has (`group`). The owner columns are left NULL: an entity row is
     /// readable by the target group's admins (083), who need not read the
     /// declaring group's edge. Written on the caller's transaction.
     ///
@@ -3340,7 +3364,7 @@ impl PrivatizationRepository {
                    (plan_id, actor_agent_id, action, kind, entity_id,
                     before_visibility, after_visibility, correlation_id)
             SELECT $1, $2,
-                   CASE WHEN h.unmet THEN 'edge.hold.unmet' ELSE 'edge.hold' END,
+                   CASE WHEN h.unmet THEN 'edge.unmet' ELSE 'edge.hold' END,
                    'edge', h.id, h.mv, 'group', $6
               FROM unnest($3::uuid[], $4::text[], $5::bool[]) AS h(id, mv, unmet)
             "#,

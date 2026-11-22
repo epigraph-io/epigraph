@@ -12,10 +12,12 @@
 //! * revert recomputed it from its public endpoints and WIDENED it to public;
 //! * a moved workflow's edges (219) went the same way.
 //!
-//! After 260 the edge keeps owner H and visibility `group` throughout: on
-//! apply it is narrowed to the intersection (co-owner G), on revert it is put
-//! back on its exact declaration, and a meet that cannot be expressed next
-//! to the declaration HOLDS the declaration and reports it.
+//! After 260 the edge keeps owner H and visibility `group` through a single
+//! restrict and its revert: on apply it is narrowed to the intersection
+//! (co-owner G), on revert it is put back on its exact declaration. It is
+//! never readable by a session that cannot read its endpoints' meet: a meet
+//! that cannot be expressed next to the declaration (a co-owned declaration,
+//! or stacked plans) is bounded by the meet and reported `unmet`.
 //!
 //! Every edge here is written, and every read is made, on the application
 //! role (`epigraph_app`) with a stamped session, so the real row policies and
@@ -430,12 +432,16 @@ async fn a_declared_claim_edge_is_narrowed_on_apply_and_restored_exactly_on_reve
     );
 }
 
-/// A declared co-owned edge whose apply adds a THIRD group cannot be
-/// expressed in one owner plus one co-owner. It is held on its declaration
-/// (owner, visibility and co-owner unchanged) and reported `unmet`; the
-/// revert leaves it exactly as declared.
+/// A declared co-owned edge `(H, co K)` whose apply adds a THIRD group G
+/// cannot be expressed in one owner plus one co-owner. The endpoints' meet
+/// bounds it: it becomes `(H, co G)` (owner and visibility kept, K dropped),
+/// so a session that cannot read G (A is now private to G) never reads it,
+/// and it is reported `unmet`. The revert puts back exactly `(H, co K)`.
+///
+/// Before the fix the edge was HELD on `(H, co K)`: a reader of H and K who
+/// is not in G read an edge naming a claim private to G.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_meet_inexpressible_next_to_the_declaration_holds_it_and_reports_unmet(pool: PgPool) {
+async fn a_meet_inexpressible_next_to_the_declaration_is_bounded_by_the_meet(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
     let (_h_agent, h) = fixture::seed_agent_with_group(&pool, "declarer-h").await;
     let (_k_agent, k) = fixture::seed_agent_with_group(&pool, "co-owner-k").await;
@@ -454,18 +460,132 @@ async fn a_meet_inexpressible_next_to_the_declaration_holds_it_and_reports_unmet
     .fetch_one(&pool)
     .await
     .expect("a co-owned declaration");
+    assert_eq!(declaration(&pool, edge).await, (Some(h), Some(k)));
+    assert!(
+        reads(&pool, &[h, k], edge).await,
+        "CALIBRATION: a reader of H and K reads the declared edge"
+    );
 
     let applied = restrict(&pool, &[a], g).await;
+    assert!(
+        !reads(&pool, &[h, k], edge).await,
+        "a reader of H and K who cannot read G must not read an edge naming G's private claim"
+    );
+    for (who, groups) in [("H", vec![h]), ("K", vec![k]), ("G", vec![g])] {
+        assert!(
+            !reads(&pool, &groups, edge).await,
+            "a reader of {who} alone must not read the edge"
+        );
+    }
     assert_eq!(
         tuple(&pool, edge).await,
-        t(h, "group", Some(k)),
-        "held on its declaration: neither re-owned to G nor stripped of K"
+        t(h, "group", Some(g)),
+        "bounded by the meet, keeping the declared owner: (H, co G)"
     );
+    assert!(reads(&pool, &[h, g], edge).await);
     assert_eq!(held(&applied), vec![(edge, "group".to_string(), true)]);
 
     let reverted = unrestrict(&pool, &[a]).await;
-    assert_eq!(tuple(&pool, edge).await, t(h, "group", Some(k)));
+    assert_eq!(
+        tuple(&pool, edge).await,
+        t(h, "group", Some(k)),
+        "the revert restores the declaration exactly"
+    );
+    assert_eq!(declaration(&pool, edge).await, (Some(h), Some(k)));
     assert_eq!(held(&reverted), vec![(edge, "public".to_string(), false)]);
+}
+
+/// Two stacked plans: a declared `('group', H)` edge A -> B; plan 1 moves A
+/// into G (the edge narrows to `(H, co G)`), plan 2 moves B into G2. The meet
+/// is now `(G, co G2)`, which cannot sit next to H in one tuple: the meet
+/// wins, so a session reading only H (or H and G) reads nothing of an edge
+/// whose endpoints are private to G and G2. Reverting plan 2 and then plan 1
+/// walks it back to EXACTLY its declaration.
+///
+/// Before the fix plan 2 wrote `('group', H)`: an H-only reader read an edge
+/// between a claim private to G and one private to G2.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_stacked_plans_never_let_the_declaration_outread_the_meet(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, h) = fixture::seed_agent_with_group(&pool, "writer-h").await;
+    let (_g_agent, g) = fixture::seed_agent_with_group(&pool, "target-g").await;
+    let (_g2_agent, g2) = fixture::seed_agent_with_group(&pool, "target-g2").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A, plan 1").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B, plan 2").await;
+    let edge = declare(&pool, w, h, (a, "claim"), (b, "claim")).await;
+
+    let plan1 = restrict(&pool, &[a], g).await;
+    assert_eq!(tuple(&pool, edge).await, t(h, "group", Some(g)));
+    assert_eq!(held(&plan1), vec![(edge, "group".to_string(), false)]);
+
+    let plan2 = restrict(&pool, &[b], g2).await;
+    for (who, groups) in [("H", vec![h]), ("H+G", vec![h, g]), ("H+G2", vec![h, g2])] {
+        assert!(
+            !reads(&pool, &groups, edge).await,
+            "a reader of {who} cannot read both endpoints and must not read the edge"
+        );
+    }
+    assert!(
+        reads(&pool, &[g, g2], edge).await,
+        "the meet's readers read it (the declaration is reported unmet, not enforced)"
+    );
+    assert_eq!(tuple(&pool, edge).await, t(g, "group", Some(g2)));
+    assert_eq!(held(&plan2), vec![(edge, "group".to_string(), true)]);
+    assert_eq!(declaration(&pool, edge).await, (Some(h), None));
+
+    // Revert plan 2, then plan 1.
+    let back2 = unrestrict(&pool, &[b]).await;
+    assert_eq!(tuple(&pool, edge).await, t(h, "group", Some(g)));
+    assert_eq!(held(&back2), vec![(edge, "group".to_string(), false)]);
+    let back1 = unrestrict(&pool, &[a]).await;
+    assert_eq!(
+        tuple(&pool, edge).await,
+        t(h, "group", None),
+        "both reverts walk the edge back to exactly its declaration"
+    );
+    assert_eq!(readers(&pool, h, g, edge).await, [false, true, false, true]);
+    assert_eq!(held(&back1), vec![(edge, "public".to_string(), false)]);
+}
+
+/// A declared edge re-tenanted OUTSIDE the privatization re-meet (a claim
+/// UPDATE whose propagation trigger re-owns the edge to `('group', G)`; the
+/// recorded declaration H stays) and then re-met by a plan moving its other
+/// endpoint into G2: the stale record must not be written back over the
+/// meet. No H-only reader reads it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_declaration_re_owned_by_a_sibling_path_is_still_bounded_by_the_meet(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
+    let (w, h) = fixture::seed_agent_with_group(&pool, "writer-h").await;
+    let (_g_agent, g) = fixture::seed_agent_with_group(&pool, "group-g").await;
+    let (_g2_agent, g2) = fixture::seed_agent_with_group(&pool, "target-g2").await;
+    let a = fixture::seed_public_claim(&pool, author, "public A").await;
+    let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    let edge = declare(&pool, w, h, (a, "claim"), (b, "claim")).await;
+
+    // The sibling path: A re-tenanted with no privatization re-meet.
+    let mut tx = pool.begin().await.expect("begin");
+    PrivatizationRepository::restrict_claims_conn(&mut tx, &[a], g)
+        .await
+        .expect("restrict A without a re-meet");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        tuple(&pool, edge).await,
+        t(g, "group", None),
+        "CALIBRATION: the propagation trigger re-owned the declared edge to G"
+    );
+    assert!(
+        !reads(&pool, &[h], edge).await,
+        "CALIBRATION: H-only reads nothing"
+    );
+
+    let meet = restrict(&pool, &[b], g2).await;
+    assert!(
+        !reads(&pool, &[h], edge).await,
+        "the stale declaration must not widen the edge to an H-only reader"
+    );
+    assert!(!reads(&pool, &[h, g], edge).await);
+    assert_eq!(tuple(&pool, edge).await, t(g, "group", Some(g2)));
+    assert_eq!(held(&meet), vec![(edge, "group".to_string(), true)]);
 }
 
 /// A declared edge onto a WORKFLOW (219's endpoint): the plan's move into G

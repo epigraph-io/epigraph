@@ -3417,12 +3417,14 @@ restart.
   the two columns (a non-privileged change is 42501). `epigraph_edges_tenancy` and
   `epigraph_propagate_tenancy` are NOT re-stated. The privatization re-meet
   (`PrivatizationRepository::recompute_boundary_meet_conn`) reads the record: a declared edge
-  keeps owner and visibility, narrowed to the intersection with its meet (co-owner) when that
-  is expressible, otherwise held on its declaration; a revert restores the declaration exactly;
-  each such edge is recorded in the plan's audit trail (`kind = 'edge'`, `edge.hold` /
-  `edge.hold.unmet`). Pinned by `epigraph-db/tests/privatization_declared_edges.rs` (record,
-  forgery, immutability, apply/revert of claim and workflow edges with app-role reads, the
-  inexpressible hold, the backfill, the undo) and
+  is never readable outside its endpoints' meet; it keeps owner and visibility, narrowed to
+  the intersection with its meet (co-owner) when that is expressible, otherwise (stacked
+  states only) it takes the meet, keeping the declared owner where the meet allows; a revert
+  restores the declaration exactly; each such edge is recorded in the plan's audit trail
+  (`kind = 'edge'`, `edge.hold` / `edge.unmet`). Pinned by
+  `epigraph-db/tests/privatization_declared_edges.rs` (record, forgery, immutability, re-point,
+  apply/revert of claim and workflow edges with app-role reads, the inexpressible and stacked
+  cases bounded by the meet, the backfill, the undo) and
   `epigraph-api/tests/privatization_declared_edges.rs` (the apply and revert jobs). Undo:
   `docs/runbooks/260-undo.sql`. **Deploy order:** migrate BEFORE rolling out the 260 binary
   (its re-meet reads the new columns; on an unmigrated database it fails with 42703, moot while

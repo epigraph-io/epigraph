@@ -54,12 +54,17 @@
 --      (42501), as for the owner columns and the author record.
 --
 -- The privatization re-meet (`PrivatizationRepository::
--- recompute_boundary_meet_conn`) reads the columns: an edge with a recorded
--- declaration is never re-owned and never widened. Its owner and visibility
--- stay the declaration's; when the meet is `group`, the edge is narrowed to
--- the intersection of the declaration and the meet (the meet's group as
--- co-owner) when that is expressible in one owner plus one co-owner, and is
--- otherwise HELD on its declaration and recorded in the plan's audit trail.
+-- recompute_boundary_meet_conn`) reads the columns. A declared edge is never
+-- readable by a session that cannot read its endpoints' meet, and, where one
+-- owner plus one co-owner can say so, never by one that cannot read its
+-- declaration either: when the meet is `public` it goes back on its exact
+-- declaration (a revert no longer widens it); when the meet is `group` it is
+-- narrowed to the intersection of the declaration and the meet (owner = the
+-- declared owner, co-owner = the meet's group). When the declaration and the
+-- meet name more groups than that (only a stacked state: a second plan, or a
+-- sibling path that already re-tenanted an endpoint), the meet wins, the
+-- declared owner kept where the meet allows, and the edge is reported
+-- `unmet` in the plan's audit trail for an operator.
 --
 -- NOT changed: the propagation trigger (a claim's re-tenanting outside the
 -- privatization re-meet still re-owns a declared edge to the meet), 206's
@@ -115,8 +120,9 @@ COMMENT ON COLUMN public.edges.declared_owner_group_id IS
     'an explicit group declaration that 072''s no-widening arm kept on an edge between two '
     'public endpoints. NULL when the edge''s tenancy is derived (the meet). Set only by '
     'epigraph_edges_record_declaration(); immutable to a non-privileged session '
-    '(edges_owner_immutable). Read by the privatization re-meet, which never re-owns or '
-    'widens a declared edge.';
+    '(edges_owner_immutable). Read by the privatization re-meet, which keeps a declared '
+    'edge within both its declaration and its endpoints'' meet where one tuple can say so, '
+    'and within the meet always.';
 COMMENT ON COLUMN public.edges.declared_co_owner_group_id IS
     'Migration 260: the co-owner of the edge''s declared tuple (NULL when the declaration '
     'named none, and whenever declared_owner_group_id is NULL).';
