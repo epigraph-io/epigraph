@@ -1679,6 +1679,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "operator_actor_for_act",
+        "`operator_actor` (the same definer read, same reason) preceded by migration 107's link \
+         advisory lock in shared mode, so an act that grants authority on the answer is \
+         serialised against a link retire (backlog 9a5bc055). The lock is a function call, not a \
+         table read; nothing here is viewer-filtered.",
+    ),
+    (
+        "agent.rs",
         "operator_of_author",
         "READ through migration 107's `epigraph_operator_of_author` SECURITY DEFINER function; \
          same reason as `operator_actor`. It returns only (operator agent id, operator personal \
