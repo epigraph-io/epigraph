@@ -161,13 +161,17 @@
 //! world-owned rows that SHOULD have moved and reports the platform corpus.
 //!
 //! `--entity <name>` runs one arm alone (e.g. `recall_events` without the
-//! claims walk). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! claims walk). `--entity registry-edges` re-meets every edge with a
+//! non-public frame, context, perspective or community endpoint (migration
+//! 258; see [`registry_edge_remeet`]); its `--dry-run` lists what it would
+//! re-meet, by relationship and transition. `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
 //! once the budget is spent and exits 3 ("partial, re-run to resume"); the
 //! cursor of every committed batch is already persisted.
 //!
 //! Usage:
 //!     epigraph-tenancy-backfill run --legacy-owner operator|platform [--batch-size 5000]
-//!         [--dry-run] [--entity claims|communities|perspectives|recall-events|harvester-fragments]
+//!         [--dry-run]
+//!         [--entity claims|communities|perspectives|recall-events|harvester-fragments|registry-edges]
 //!         [--max-runtime 2h]
 //!     epigraph-tenancy-backfill verify [--legacy-owner operator|platform]
 //!
@@ -406,6 +410,9 @@ enum Entity {
     Perspectives,
     RecallEvents,
     HarvesterFragments,
+    /// Re-meet every edge with a non-public frame, context, perspective or
+    /// community endpoint (migration 258).
+    RegistryEdges,
 }
 
 /// `90m`, `2h`, `3600s`, or bare seconds.
@@ -597,6 +604,9 @@ async fn run(
                 );
             }
         }
+        if wants(Entity::RegistryEdges) {
+            remeet_registry_edges(pool, true).await?;
+        }
         return Ok(RunEnd::Complete);
     }
 
@@ -648,6 +658,9 @@ async fn run(
     }
     if wants(Entity::HarvesterFragments) {
         backfill_harvester_fragments(pool).await?;
+    }
+    if wants(Entity::RegistryEdges) {
+        remeet_registry_edges(pool, false).await?;
     }
     if let Some(e) = entity {
         println!(
@@ -1194,10 +1207,9 @@ fn fragment_restampable() -> String {
 /// * **The 17 claim-derived tables and `edges`** are stamped by 070 arms (c)
 ///   and (d). Their residual should already be zero; this records the measured
 ///   count rather than asserting it.
-/// * **`frames` and `contexts` carry no owner column of any kind** — verified
-///   against `information_schema`: `frames` has `parent_frame_id`, `contexts`
-///   has none. There is nothing to derive an owner from, so they stay
-///   `('public', world)`.
+/// * **`frames` and `contexts`** carry tenancy columns (migration 062) but no
+///   author to derive an owner from, and every writer declares them
+///   instance-wide, so they stay `('public', world)`.
 /// * **`perspectives`** has an `owner_agent_id`, and **`communities`** a
 ///   projected group of its own, but every writer of either declares the row
 ///   instance-wide on purpose (module doc), so their world-owned rows are a
@@ -1211,10 +1223,11 @@ fn fragment_restampable() -> String {
 /// world-owned row that is `visibility = 'public'` is explicitly permitted, and
 /// that is exactly what these rows are. It also matches 070 arm (b), which
 /// stamps `('public', world)` for an edge between two public endpoints.
-/// Re-stamp every WORLD-OWNED edge that touches a non-public claim or evidence
-/// endpoint (the rows `verify`'s edge check fails on) to the meet of its
-/// endpoints, exactly as 070 arm (d) computes it (migration 122 section 8's
-/// set-based form, same CASE expressions and guards). Returns the rows changed.
+/// Re-stamp every WORLD-OWNED edge that touches a non-public endpoint (the
+/// rows `verify`'s edge checks fail on) to the meet of its endpoints, exactly
+/// as 070 arm (d) computes it (migration 122 section 8's set-based form, same
+/// CASE expressions and guards; every endpoint type 258's cascade reads from
+/// its own row, [`MET_ENDPOINTS`]). Returns the rows changed.
 ///
 /// Arm (d) repairs such an edge only when a claim UPDATE touches one of its
 /// endpoints. Under `--legacy-owner operator` every world-owned claim moves, so
@@ -1224,7 +1237,7 @@ fn fragment_restampable() -> String {
 /// with no command to fix it (review C4). Run in both modes: it touches only
 /// rows `verify` fails on.
 async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Result<u64> {
-    Ok(sqlx::query(
+    Ok(sqlx::query(&format!(
         "UPDATE edges e
             SET owner_group_id    = m.g,
                 visibility        = m.v,
@@ -1243,20 +1256,8 @@ async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Res
                               THEN t.g
                          ELSE NULL END AS co
                FROM edges e2
-               LEFT JOIN claims   sc ON e2.source_type = 'claim'    AND sc.id = e2.source_id
-               LEFT JOIN evidence se ON e2.source_type = 'evidence' AND se.id = e2.source_id
-               LEFT JOIN claims   tc ON e2.target_type = 'claim'    AND tc.id = e2.target_id
-               LEFT JOIN evidence te ON e2.target_type = 'evidence' AND te.id = e2.target_id
-               CROSS JOIN LATERAL (
-                 SELECT COALESCE(sc.owner_group_id, se.owner_group_id,
-                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
-                        COALESCE(sc.visibility, se.visibility,
-                                 'public'::character varying(16)) AS v) s
-               CROSS JOIN LATERAL (
-                 SELECT COALESCE(tc.owner_group_id, te.owner_group_id,
-                                 '00000000-0000-0000-0000-000000000000'::uuid) AS g,
-                        COALESCE(tc.visibility, te.visibility,
-                                 'public'::character varying(16)) AS v) t
+               {s_side}
+               {t_side}
               WHERE e2.owner_group_id = $1
                 AND (s.v <> 'public' OR t.v <> 'public')
            ) m
@@ -1266,11 +1267,205 @@ async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Res
             AND NOT (e.visibility = 'group' AND m.v = 'public')
             AND (e.owner_group_id, e.visibility, e.co_owner_group_id)
                 IS DISTINCT FROM (m.g, m.v, m.co)",
-    )
+        s_side = endpoint_side_sql("source", "s"),
+        t_side = endpoint_side_sql("target", "t"),
+    ))
     .bind(WORLD)
     .execute(pool)
     .await?
     .rows_affected())
+}
+
+// =============================================================================
+// registry edges (migration 258)
+// =============================================================================
+
+/// The four instance-wide registries as edge-endpoint types: (entity type,
+/// table). Migration 258 meets each with its OWN row (`owner_group_id`,
+/// `visibility`, migration 062) in `epigraph_node_tenancy` and in the claim
+/// cascade; before it they counted as `('public', world)`.
+const REGISTRY_ENDPOINTS: &[(&str, &str)] = &[
+    ("frame", "frames"),
+    ("context", "contexts"),
+    ("perspective", "perspectives"),
+    ("community", "communities"),
+];
+
+/// Every endpoint type the meet reads from its own row at head (258's
+/// `epigraph_propagate_tenancy`): (entity type, table, join-alias stem). Any
+/// other type (agent, paper, task, trace) contributes `('public', world)`.
+const MET_ENDPOINTS: &[(&str, &str, &str)] = &[
+    ("claim", "claims", "c"),
+    ("evidence", "evidence", "e"),
+    ("workflow", "workflows", "w"),
+    ("frame", "frames", "f"),
+    ("context", "contexts", "x"),
+    ("perspective", "perspectives", "p"),
+    ("community", "communities", "m"),
+];
+
+/// One side of edge alias `e2`, as 258's propagation reads it: a LEFT JOIN per
+/// [`MET_ENDPOINTS`] type (aliases `<side letter><stem>`) and a `CROSS JOIN
+/// LATERAL` named `side_alias` with that endpoint's `(g, v)`.
+fn endpoint_side_sql(column: &str, side_alias: &str) -> String {
+    let joins: String = MET_ENDPOINTS
+        .iter()
+        .map(|(ty, table, stem)| {
+            format!(
+                " LEFT JOIN public.{table} {side_alias}{stem} \
+                   ON e2.{column}_type = '{ty}' AND {side_alias}{stem}.id = e2.{column}_id"
+            )
+        })
+        .collect();
+    let col = |c: &str| {
+        MET_ENDPOINTS
+            .iter()
+            .map(|(_, _, stem)| format!("{side_alias}{stem}.{c}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{joins} CROSS JOIN LATERAL (\
+           SELECT COALESCE({g}, '00000000-0000-0000-0000-000000000000'::uuid) AS g, \
+                  COALESCE({v}, 'public'::character varying(16)) AS v) {side_alias}",
+        g = col("owner_group_id"),
+        v = col("visibility"),
+    )
+}
+
+/// The label of an edge [`registry_edge_remeet`] cannot re-meet: its current
+/// tuple names a group outside the meet, and the two together need three
+/// groups, more than an edge can carry.
+const REGISTRY_EDGE_HELD: &str = "held: needs three groups";
+
+/// The re-meet of every edge with a NON-PUBLIC frame, context, perspective or
+/// community endpoint (migration 258 section 4's statement, read from the
+/// endpoints' own rows rather than through `epigraph_node_tenancy`, which is
+/// revoked from PUBLIC): `apply` writes it, otherwise it only counts. Returns
+/// `(relationship, transition, count)` rows; a transition of
+/// [`REGISTRY_EDGE_HELD`] is never written.
+///
+/// The rule is the cascade's meet (072, 120), never widening: an edge is
+/// written only when the meet is `group`. One addition, which only a ONE-TIME
+/// repair needs: an edge that is already group-private keeps every group it
+/// requires. A legacy edge DECLARED `('group', G)` between a public claim and a
+/// frame private to H met to `('group', H)` alone would hand G's edge to H's
+/// members; it is met to `(H, co-owner G)` instead (readable only by a member
+/// of both). When the meet and the current tuple need more than two groups the
+/// edge is held and reported.
+///
+/// A registry row re-tenanted AFTER 258 does not re-meet its edges by itself
+/// (there is no trigger on the four tables); this is the repair, and `verify`
+/// fails while it has anything to write.
+async fn registry_edge_remeet(
+    pool: &PgPool,
+    apply: bool,
+) -> anyhow::Result<Vec<(String, String, i64)>> {
+    let reg_edges = REGISTRY_ENDPOINTS
+        .iter()
+        .flat_map(|(ty, table)| {
+            ["source", "target"].into_iter().map(move |side| {
+                format!(
+                    "SELECT x.id FROM public.edges x JOIN public.{table} r \
+                       ON x.{side}_type = '{ty}' AND x.{side}_id = r.id \
+                      WHERE r.visibility <> 'public'"
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" UNION ");
+    let sql = format!(
+        "WITH reg_edges AS ({reg_edges}), \
+         m AS ( \
+           SELECT e2.id, e2.relationship, \
+                  e2.owner_group_id AS old_g, e2.visibility AS old_v, \
+                  e2.co_owner_group_id AS old_co, \
+                  CASE WHEN s.v = 'public' AND t.v = 'public' \
+                            THEN '00000000-0000-0000-0000-000000000000'::uuid \
+                       WHEN s.v = 'public' THEN t.g \
+                       WHEN t.v = 'public' THEN s.g \
+                       ELSE s.g END AS g, \
+                  CASE WHEN s.v = 'public' AND t.v = 'public' \
+                            THEN 'public'::character varying(16) \
+                       ELSE 'group'::character varying(16) END AS v, \
+                  CASE WHEN s.v = 'group' AND t.v = 'group' AND s.g <> t.g \
+                            THEN t.g ELSE NULL END AS co \
+             FROM reg_edges k JOIN public.edges e2 ON e2.id = k.id \
+             {s_side} {t_side} \
+         ), \
+         n AS ( \
+           SELECT m.*, \
+                  ARRAY(SELECT DISTINCT x FROM unnest(ARRAY[ \
+                          m.co, \
+                          CASE WHEN m.old_v = 'group' THEN m.old_g END, \
+                          CASE WHEN m.old_v = 'group' THEN m.old_co END]) x \
+                         WHERE x IS NOT NULL AND x <> m.g) AS others \
+             FROM m WHERE m.v = 'group' \
+         ), \
+         d AS ( \
+           SELECT n.id, n.relationship, n.g, n.v, n.others[1] AS co, \
+                  cardinality(n.others) > 1 AS held, \
+                  CASE WHEN n.old_v = 'public' THEN 'public to group' \
+                       WHEN n.others[1] IS NOT NULL AND n.old_co IS NULL THEN 'group to co-owned' \
+                       WHEN n.old_g IS DISTINCT FROM n.g THEN 'group to another group' \
+                       ELSE 'co-owner changed' END AS transition \
+             FROM n \
+            WHERE (n.old_g, n.old_v, n.old_co) IS DISTINCT FROM (n.g, n.v, n.others[1]) \
+         ) {tail}",
+        s_side = endpoint_side_sql("source", "s"),
+        t_side = endpoint_side_sql("target", "t"),
+        tail = if apply {
+            format!(
+                ", upd AS ( \
+                   UPDATE public.edges e \
+                      SET owner_group_id = d.g, visibility = d.v, co_owner_group_id = d.co \
+                     FROM d WHERE e.id = d.id AND NOT d.held \
+                   RETURNING d.relationship, d.transition) \
+                 SELECT relationship, transition, count(*)::bigint FROM upd GROUP BY 1, 2 \
+                 UNION ALL \
+                 SELECT relationship, '{REGISTRY_EDGE_HELD}', count(*)::bigint FROM d \
+                  WHERE d.held GROUP BY 1 \
+                 ORDER BY 1, 2"
+            )
+        } else {
+            format!(
+                "SELECT relationship, \
+                        CASE WHEN held THEN '{REGISTRY_EDGE_HELD}' ELSE transition END, \
+                        count(*)::bigint \
+                   FROM d GROUP BY 1, 2 ORDER BY 1, 2"
+            )
+        },
+    );
+    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+}
+
+/// `(re-met or to re-meet, held)` totals of [`registry_edge_remeet`]'s rows.
+fn registry_edge_totals(rows: &[(String, String, i64)]) -> (i64, i64) {
+    rows.iter().fold((0, 0), |(n, h), (_, t, c)| {
+        if t == REGISTRY_EDGE_HELD {
+            (n, h + c)
+        } else {
+            (n + c, h)
+        }
+    })
+}
+
+/// `run --entity registry-edges` (and the same step of a full run): re-meet,
+/// or with `dry_run` count, every edge [`registry_edge_remeet`] covers, and
+/// print one line per relationship and transition.
+async fn remeet_registry_edges(pool: &PgPool, dry_run: bool) -> anyhow::Result<()> {
+    let rows = registry_edge_remeet(pool, !dry_run).await?;
+    let (n, held) = registry_edge_totals(&rows);
+    let verb = if dry_run { "would re-meet" } else { "re-met" };
+    println!(
+        "{}registry-edges: {verb} {n} edge(s) with a non-public frame, context, perspective or \
+         community endpoint; {held} held (their meet and current tuple need three groups).",
+        if dry_run { "dry-run: " } else { "run: " }
+    );
+    for (relationship, transition, count) in &rows {
+        println!("  {relationship}\t{transition}\t{count}");
+    }
+    Ok(())
 }
 
 async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()> {
@@ -3707,6 +3902,36 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
              `UPDATE edges SET source_id = source_id WHERE co_owner_group_id IS NULL;` \
              — PostgreSQL fires `UPDATE OF source_id` on column MENTION, not on \
              value change, so arm (b) re-runs and stamps the meet."
+        );
+    }
+
+    // The THIRD edge shape (migration 258): an edge with a non-public frame,
+    // context, perspective or community endpoint that is not on its
+    // endpoints' meet. Before 258 the oracle met those endpoints as public,
+    // so such an edge could be world-owned (readable by anyone, naming the
+    // private registry row) or owned by its other endpoint's group alone;
+    // 258's section 4 re-met every one, but a registry row re-tenanted after
+    // it does not re-meet its edges by itself. Read from the endpoints' own
+    // rows, as above, never through `epigraph_node_tenancy`.
+    let registry_rows = registry_edge_remeet(pool, false).await?;
+    let (registry_stale, registry_held) = registry_edge_totals(&registry_rows);
+    if registry_stale > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_stale} edge(s) with a non-public frame, context, perspective or \
+             community endpoint are not on their endpoints' meet (migration 258), so a reader \
+             outside the registry row's group can read an edge naming it. Remediation: \
+             `epigraph-tenancy-backfill run --legacy-owner <decision> --entity registry-edges \
+             --dry-run`, then the same without `--dry-run`."
+        );
+    }
+    if registry_held > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_held} edge(s) with a non-public frame, context, perspective or \
+             community endpoint need three groups (their meet plus the groups their current \
+             tuple requires), more than an edge can carry; `--entity registry-edges` holds \
+             them. An operator decides each one (delete it, or re-declare an endpoint)."
         );
     }
 

@@ -1905,3 +1905,218 @@ async fn strict_verify_lists_world_owned_provenance_rows_by_their_key(pool: PgPo
         "verify FAILS on world-owned rows; stderr:\n{stderr}"
     );
 }
+
+// ===========================================================================
+// Registry edges — migration 258 (backlog a07c25c0)
+// ===========================================================================
+
+/// [`run_backfill`], returning `(exit_code, stdout, stderr)`.
+async fn run_backfill_out(pool: &PgPool, args: &[&str]) -> (i32, String, String) {
+    let url = fixture::database_url_for(pool).await;
+    let out = Command::new(BIN)
+        .args(args)
+        .env("DATABASE_URL", &url)
+        .env("MAINTENANCE_DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn epigraph-tenancy-backfill");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A frame private to `group` (a legacy re-stamp or a group writer's direct
+/// write; no first-party writer produces one).
+async fn seed_private_frame(pool: &PgPool, group: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
+         VALUES ($1, ARRAY['a','b'], $2, 'group') RETURNING id",
+    )
+    .bind(format!("private-frame-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("seed a group-private frame")
+}
+
+async fn seed_typed_edge(pool: &PgPool, s: (Uuid, &str), t: (Uuid, &str)) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, 'relates_to') RETURNING id",
+    )
+    .bind(s.0)
+    .bind(s.1)
+    .bind(t.0)
+    .bind(t.1)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+async fn edge_tuple(pool: &PgPool, id: Uuid) -> (String, Uuid, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read edge tenancy")
+}
+
+/// Since migration 258 an edge's meet reads a frame, context, perspective or
+/// community endpoint from its own row. An edge stamped while the oracle met
+/// such a row as public (or left behind when the row was re-tenanted later) is
+/// off its meet: world-owned while naming a private frame, or owned by its
+/// claim's group alone. Neither of the two older edge checks sees it (they
+/// read claims and evidence only). `verify` FAILS on it, the dry run of
+/// `--entity registry-edges` lists it without writing, the arm re-meets it,
+/// and `verify` passes. An edge that would need three groups is held and
+/// keeps `verify` failing.
+///
+/// Verified to fail with the `.rs` changes stashed: `--entity registry-edges`
+/// is not a valid value (exit 2) and `verify` exits 0 on the stale edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_flags_a_registry_edge_off_its_meet_and_the_registry_arm_repairs_it(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-g").await;
+    let (agent_h, group_h) = fixture::seed_agent_with_group(&pool, "registry-h").await;
+    let (_, group_k) = fixture::seed_agent_with_group(&pool, "registry-k").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let theirs = fixture::seed_group_claim(&pool, agent_h, group_h, "H's private claim").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+
+    let e_world = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    let e_cross = seed_typed_edge(&pool, (frame, "frame"), (theirs, "claim")).await;
+    let e_held = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    assert_eq!(
+        edge_tuple(&pool, e_world).await,
+        ("group".to_string(), group_g, None),
+        "CALIBRATION: 258's trigger meets the frame with its own row"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_cross).await,
+        ("group".to_string(), group_g, Some(group_h)),
+        "CALIBRATION: a frame of G onto H's claim is co-owned"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "CALIBRATION: the corpus is clean; stderr:\n{stderr}"
+    );
+
+    // The pre-258 stamps, written without touching the endpoint columns.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e_world)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the world-owned stamp");
+    force_edge_tenancy(&pool, e_cross, group_h, None).await;
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must FAIL on the stale registry edges; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("2 edge(s) with a non-public frame")
+            && stderr.contains("--entity registry-edges"),
+        "the failure counts them and names the remediation; stderr:\n{stderr}"
+    );
+
+    let before = (
+        edge_tuple(&pool, e_world).await,
+        edge_tuple(&pool, e_cross).await,
+    );
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        stdout.contains("would re-meet 2 edge(s)") && stdout.contains("0 held"),
+        "the dry run reports the edges it would re-tenant; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("relates_to\tpublic to group\t1")
+            && stdout.contains("relates_to\tgroup to co-owned\t1"),
+        "by relationship and transition; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        (
+            edge_tuple(&pool, e_world).await,
+            edge_tuple(&pool, e_cross).await
+        ),
+        "the dry run writes nothing"
+    );
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stdout.contains("re-met 2 edge(s)"), "stdout:\n{stdout}");
+    assert_eq!(
+        edge_tuple(&pool, e_world).await,
+        ("group".to_string(), group_g, None),
+        "the world-owned edge goes to the frame's group"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_cross).await,
+        ("group".to_string(), group_g, Some(group_h)),
+        "the claim-only edge becomes co-owned"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "verify clears once they are re-met; stderr:\n{stderr}"
+    );
+
+    // An edge declared co-owned by H and K onto G's frame needs three groups:
+    // held, never written, and `verify` fails on it.
+    force_edge_tenancy(&pool, e_held, group_h, Some(group_k)).await;
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        stdout.contains("re-met 0 edge(s)") && stdout.contains("1 held"),
+        "stdout:\n{stdout}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_held).await,
+        ("group".to_string(), group_h, Some(group_k)),
+        "a held edge is left as it is"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(stderr.contains("need three groups"), "stderr:\n{stderr}");
+}
