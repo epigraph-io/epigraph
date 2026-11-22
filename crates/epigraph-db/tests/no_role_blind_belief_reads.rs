@@ -182,6 +182,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_belief_bounds", Tag::Todo { pr: "PR-R3", why: "range list on c.belief / c.plausibility; SPEC §7.2 floor row or omitted" }),
     ("crates/epigraph-db/src/repos/claim.rs", "list_by_labels", Tag::Todo { pr: "unassigned", why: "query_claims_by_label min-truth gate on truth_value; no plan row converts it" }),
     ("crates/epigraph-db/src/repos/claim.rs", "rag_hybrid_context", Tag::Todo { pr: "unassigned", why: "RAG context ranked and gated on truth_value; no plan row converts it" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "retire_for_workflow_deprecation", Tag::Writer("one UPDATE retires a workflow claim and records its own prior truth_value in properties for a later revival (backlog 1767f2ae); it serves no belief")),
     ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility; SPEC §7.2" }),

@@ -453,7 +453,7 @@ pub async fn store_workflow(
             &viewer,
             embedder.as_ref(),
             "workflows",
-            &result.inserted,
+            &result.claims_to_embed(),
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
@@ -2522,7 +2522,7 @@ pub async fn ingest_workflow(
             &viewer,
             embedder.as_ref(),
             "workflows/ingest",
-            &result.inserted,
+            &result.claims_to_embed(),
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,

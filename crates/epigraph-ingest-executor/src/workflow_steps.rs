@@ -1,7 +1,8 @@
 //! Step manipulation primitives for hierarchical workflows.
 //!
 //! - [`add_step`] appends or middle-inserts a step claim under an existing
-//!   workflow. Idempotent on `(canonical_name, step_text)`.
+//!   workflow. Idempotent on `(canonical_name, step_text)`; a reused text a
+//!   workflow deprecation retired is revived.
 //! - [`delete_step`] soft-deletes a step lineage by setting the head claim's
 //!   `truth_value` to 0.05.
 //!
@@ -52,9 +53,11 @@ pub struct AddStepResult {
     /// re-add); the existing position/lineage_id are returned and the chain
     /// is not rewired.
     pub already_present: bool,
-    /// Content of the step claim if this call inserted a new row;
-    /// `None` if the step was already present (idempotent re-add). The
-    /// caller embeds when `Some(_)`; see CLAUDE.md "Embedding policy".
+    /// Content of the step claim when this call put it into the plan: a new
+    /// row, or an existing one (a reused text, revived if a workflow
+    /// deprecation had retired it). `None` if the step was already present
+    /// (idempotent re-add). The caller embeds when `Some(_)`; see CLAUDE.md
+    /// "Embedding policy".
     pub inserted_content: Option<String>,
     /// `true` only when THIS call's INSERT created the step claim row. `false`
     /// for an idempotent re-add, and also when the step was spliced into the
@@ -600,6 +603,23 @@ pub async fn add_step(
     .await?
     .rows_affected()
         == 1;
+
+    // The claim already existed (its id is content-addressed per workflow
+    // name): its own `step_lineage_id` is the step's, not the fresh one the
+    // INSERT did not write, and a claim a workflow deprecation retired is
+    // revived, so the plan does not execute a retired, unembedded step
+    // (backlog 1767f2ae). The caller embeds `inserted_content` either way.
+    let step_lineage = if claim_created {
+        step_lineage
+    } else {
+        crate::workflow::revive_deprecation_retired(&mut *conn, step_claim_id).await?;
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT step_lineage_id FROM claims WHERE id = $1")
+            .bind(step_claim_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten()
+            .unwrap_or(step_lineage)
+    };
 
     let executes_properties = match plan_index {
         Some(k) => serde_json::json!({"level": 2, "plan_index": k}),

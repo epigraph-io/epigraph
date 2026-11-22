@@ -273,6 +273,13 @@ pub struct WorkflowIngestExecutionResult {
     /// is_current=true → has-embedding invariant; see CLAUDE.md
     /// "Embedding policy".
     pub inserted: Vec<(Uuid, String)>,
+    /// (claim_id, content) for every planned claim this run REUSED that a
+    /// hierarchical workflow's deprecation had retired, and that this run
+    /// revived (current again, its truth value back; backlog 1767f2ae). Its
+    /// vectors were nulled at retirement, so callers embed these too: see
+    /// [`Self::claims_to_embed`]. Not authored by this call, so not in
+    /// [`Self::inserted`].
+    pub revived: Vec<(Uuid, String)>,
     /// Newly inserted plan edges (claim→claim relationships from
     /// `IngestPlan::edges`). Callers fire `auto_wire_edge_if_epistemic` on
     /// each so epistemic edges materialize their factor BBA on the target.
@@ -304,6 +311,51 @@ pub struct WorkflowIngestExecutionResult {
     /// storing a goal embedding, announcing `workflow.created`) is keyed on
     /// it, never on a read made before the walk.
     pub row_created: bool,
+}
+
+impl WorkflowIngestExecutionResult {
+    /// Every claim this run left current without a vector: the ones it
+    /// [`inserted`](Self::inserted) and the ones it [`revived`](Self::revived).
+    /// What a caller embeds post-commit (CLAUDE.md "Embedding policy").
+    #[must_use]
+    pub fn claims_to_embed(&self) -> Vec<(Uuid, String)> {
+        self.inserted
+            .iter()
+            .chain(&self.revived)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Revive `claim_id` if a hierarchical workflow's deprecation retired it
+/// (`ClaimRepository::revive_workflow_deprecation_retired`), for a walk or an
+/// `add_step` that reuses the claim. `true` when this call revived it.
+///
+/// Best-effort and isolated in a SAVEPOINT: the claim may belong to a group
+/// the session does not write, where `claims_tenancy`'s `WITH CHECK` refuses
+/// the UPDATE (42501). That refusal must not abort the caller's transaction:
+/// the claim is then reused as it is, which is what every walk did before.
+pub(crate) async fn revive_deprecation_retired(
+    conn: &mut sqlx::PgConnection,
+    claim_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let mut savepoint = sqlx::Connection::begin(&mut *conn).await?;
+    match ClaimRepository::revive_workflow_deprecation_retired(&mut *savepoint, claim_id).await {
+        Ok(revived) => {
+            savepoint.commit().await?;
+            Ok(revived)
+        }
+        Err(e) => {
+            savepoint.rollback().await?;
+            tracing::warn!(
+                claim_id = %claim_id,
+                error = %e,
+                "a reused claim a workflow deprecation retired could not be revived on this \
+                 session; it is reused as it is (not current, no vector)"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// A planned claim a declared-tenancy ingest reused rather than created, whose
@@ -1102,6 +1154,22 @@ async fn execute_plan(
         }
     }
 
+    // ── 5c. Revive reused claims a workflow deprecation retired ─────────
+    //
+    // A claim's id depends only on its text and the `canonical_name`, so a
+    // new generation that keeps a deprecated generation's text reuses the
+    // retired row. Only a deprecation's MARKED retirement is undone; an
+    // `evolve_step` supersede is not (backlog 1767f2ae).
+    let mut revived: Vec<(Uuid, String)> = Vec::new();
+    for planned in &plan.claims {
+        if reused_ids.contains(&planned.id)
+            && !revived.iter().any(|(id, _)| *id == planned.id)
+            && revive_deprecation_retired(&mut *conn, planned.id).await?
+        {
+            revived.push((planned.id, planned.content.clone()));
+        }
+    }
+
     // ── 6. workflow —executes→ claim edges ──────────────────────────────
     //
     // `plan_index` IS LOAD-BEARING AND IT IS NEW. Every reader that maps a
@@ -1231,6 +1299,7 @@ async fn execute_plan(
         relationship_edges_created: relationships_created,
         already_ingested: false,
         inserted,
+        revived,
         inserted_edges,
         author_id: Some(author_id),
         reused_items,
@@ -1297,6 +1366,7 @@ async fn already_ingested_result(
         relationship_edges_created: 0,
         already_ingested: true,
         inserted: Vec::new(),
+        revived: Vec::new(),
         inserted_edges: Vec::new(),
         author_id: None,
         reused_items,
