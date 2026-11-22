@@ -282,3 +282,46 @@ async fn a_method_vector_is_stored_only_from_the_owning_provider(pool: PgPool) {
         assert_eq!(embedded, stores, "{provider:?}: methods.embedding");
     }
 }
+
+/// `POST /api/v1/workflows/steps` embeds the step it adds (backlog 1767f2ae:
+/// a step it reuses and revives from a workflow deprecation has no vector
+/// either). The route used to store no vector at all; its MCP twin embeds.
+/// The step lands in `claims.embedding`, so only the owning provider stores.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_added_step_is_embedded_only_from_the_owning_provider(pool: PgPool) {
+    let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "add-step-gate").await;
+    for (provider, stores) in ARMS {
+        let router = router(&pool, provider).await;
+        let goal = format!("add step gate {provider:?} {}", Uuid::new_v4());
+        let (status, stored) = post(
+            &router,
+            "/api/v1/workflows",
+            agent,
+            &json!({ "goal": goal, "steps": ["gate step one"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "store_workflow: {stored}");
+        let (status, out) = post(
+            &router,
+            "/api/v1/workflows/steps",
+            agent,
+            &json!({
+                "canonical_name": stored["canonical_name"],
+                "step_text": "gate step two",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{provider:?}: {out}");
+        let step = Uuid::parse_str(out["step_claim_id"].as_str().expect("step_claim_id"))
+            .expect("uuid");
+        let (current, embedded): (bool, bool) = sqlx::query_as(
+            "SELECT is_current, embedding IS NOT NULL FROM claims WHERE id = $1",
+        )
+        .bind(step)
+        .fetch_one(&pool)
+        .await
+        .expect("step claim");
+        assert!(current, "{provider:?}: the added step is current");
+        assert_eq!(embedded, stores, "{provider:?}: the added step's claims.embedding");
+    }
+}

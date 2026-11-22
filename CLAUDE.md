@@ -270,7 +270,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
 - **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
-- **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
+- **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`

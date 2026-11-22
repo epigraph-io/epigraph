@@ -3885,6 +3885,24 @@ pub async fn add_step(
         message: format!("add_step: could not commit: {e}"),
     })?;
 
+    // Post-commit, best-effort, on the caller's stamp (CLAUDE.md "Embedding
+    // policy"), as the MCP twin does: the step this call put into the plan,
+    // new or revived from a workflow deprecation (backlog 1767f2ae), is a
+    // current claim with no vector.
+    if let (Some(content), Some(embedder)) = (
+        r.inserted_content.clone(),
+        state.storing_embedding_service(),
+    ) {
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows/steps",
+            &[(r.step_claim_id, content)],
+        )
+        .await;
+    }
+
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,
         "step_claim_id": r.step_claim_id,
