@@ -389,3 +389,53 @@ async fn a_hex_word_after_an_id_falls_back_to_the_shorter_prefix(pool: PgPool) {
         serde_json::json!(["b43fa110", "b43fa111-face"])
     );
 }
+
+const HIDDEN_WORD: &str = "b43fa121-face-4000-8000-000000000021";
+const HIDDEN_SIBLING: &str = "b43fa121-0000-4000-8000-000000000022";
+const ABSENT_SIBLING: &str = "b43fa122-0000-4000-8000-000000000023";
+const HIDDEN_LINTED: &str = "b43a0a01-0000-4000-8000-000000000024";
+const ABSENT_LINTED: &str = "b43a0a02-0000-4000-8000-000000000025";
+
+/// Backlog `5120795e`, visibility: a longer prefix that names only a claim
+/// the caller cannot read falls back exactly as if that claim were absent,
+/// so the fallback reveals nothing about hidden claims. Its member still
+/// resolves the citation at full precision.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_longer_match_falls_back_like_an_absent_one(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "t43ids-hidden").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "t43ids-hidden-stranger").await;
+    let hidden = claim_with_id(&pool, HIDDEN_WORD, member, "a private face claim").await;
+    stamp_group_private(&pool, hidden, group).await;
+    let sibling = claim_with_id(&pool, HIDDEN_SIBLING, member, "a public sibling").await;
+    claim_with_id(&pool, ABSENT_SIBLING, member, "a public sibling").await;
+    let with_hidden = claim_with_id(&pool, HIDDEN_LINTED, member, "Cites b43fa121-face.").await;
+    let with_absent = claim_with_id(&pool, ABSENT_LINTED, member, "Cites b43fa122-face.").await;
+
+    let doc = lint(&server, &pool, member, with_hidden).await;
+    assert_eq!(status_of(&doc, "b43fa121-face"), "unwired", "{doc}");
+    assert_eq!(
+        doc["citations"][0]["matches"],
+        serde_json::json!([hidden.to_string()])
+    );
+
+    let hidden_doc = lint(&server, &pool, stranger, with_hidden).await;
+    assert_eq!(
+        hidden_doc["citations"][0]["matches"],
+        serde_json::json!([sibling.to_string()]),
+        "{hidden_doc}"
+    );
+    assert!(!hidden_doc.to_string().contains(HIDDEN_WORD));
+    let absent_doc = lint(&server, &pool, stranger, with_absent).await;
+    let mask = |doc: &Value, head: &str, linted: &str, sibling: &str| {
+        doc.to_string()
+            .replace(linted, "<linted>")
+            .replace(sibling, "<sibling>")
+            .replace(head, "<head>")
+    };
+    assert_eq!(
+        mask(&hidden_doc, "b43fa121", HIDDEN_LINTED, HIDDEN_SIBLING),
+        mask(&absent_doc, "b43fa122", ABSENT_LINTED, ABSENT_SIBLING),
+        "hidden and absent must be indistinguishable"
+    );
+}
