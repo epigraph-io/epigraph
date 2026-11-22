@@ -2322,6 +2322,22 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 238 (backlog b5f6883b), 074's sealed-claim widening guard, re-stated as
+    // a definer trigger body. Fails OPEN and QUIETLY under a non-member owner:
+    // its only read is of the FORCEd `claim_encryption`, which 077's policy
+    // then filters exactly as the updating session's own read would, so a
+    // sealed claim whose ciphertext group the owner cannot see reads as
+    // unsealed and is made public with no error. The owner is the control.
+    // NOT version-gated, unlike the other entries here: the presence gate in
+    // `applicable_definer_functions` skips only a MISSING function, and 074
+    // has installed this name (as an INVOKER body) since long before 238, so
+    // the entry is always checked and `238` only names the migration in a
+    // NOTE. On a database between 074 and 237 whose migration runner is
+    // neither a superuser nor a member of `epigraph_maintenance`, `verify`
+    // from a 238-aware binary therefore reports 074's invoker body as a
+    // FAIL although its owner does not matter yet; apply 238 and re-run. The
+    // same caveat `DEFINER_FUNCTIONS` records for its 070 bodies.
+    ("epigraph_claims_block_widening", 238),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
