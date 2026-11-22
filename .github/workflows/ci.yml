@@ -631,6 +631,20 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
           df -ih / ; df -h /
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Self-test the SQLite dependency-graph check
+        # Throwaway workspaces outside the checkout: a postgres-only sqlx
+        # passes, a non-member crate enabling sqlx's `sqlite` feature (as a
+        # normal or a dev dependency) fails, and a graph without the control
+        # crate fails as vacuous. Proves the next step can still go red.
+        run: .github/scripts/test-sqlite-never-compiled.sh
+      - name: SQLite is never compiled (resolved dependency graph)
+        # The blocking ratchet behind the RUSTSEC-2026-0459 ignore in
+        # .cargo/audit.toml. crates/epigraph-auth/tests/sqlite_never_compiled.rs
+        # scans workspace manifests and Cargo.lock, which cannot show a crate
+        # outside the workspace enabling sqlx/sqlite in its own manifest;
+        # `cargo tree` over the feature-resolved graph can. It needs the
+        # registry, hence a step here (network) rather than a test.
+        run: .github/scripts/sqlite-never-compiled.sh
       - name: Clippy
         # --all-targets is load-bearing, not cosmetic. Without it cargo lints
         # only lib+bin targets, so `tests/`, `examples/` and `benches/` are
