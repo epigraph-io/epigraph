@@ -454,11 +454,12 @@ fn model_readable(
 /// table carries its own `(owner_group_id, visibility)`: entity type -> table.
 ///
 /// `epigraph_node_tenancy` (070) answers `('public', world)` for every type but
-/// claim, evidence and (since migration 219) workflow, so the trigger's meet
+/// claim, evidence, (since migration 219) workflow and (since migration 246)
+/// paper, so the trigger's meet
 /// treats such a node as public even when the row itself is group-private (a
 /// frame, context, perspective or community, migration 062; a reasoning trace,
 /// which follows its claim; a workflow, migration 183, until 219). A workflow
-/// stays in this map: reading its own row agrees with the oracle. Read from the schema,
+/// or a paper stays in this map: reading its own row agrees with the oracle. Read from the schema,
 /// not from `entity_types.tenancy_tier` (which still says `derived` for
 /// `workflow`), so a type that gains tenancy columns later is covered.
 pub type NodeTypes = BTreeMap<String, String>;

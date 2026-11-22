@@ -1699,6 +1699,11 @@ async fn seed_node(pool: &PgPool, ty: &str, owner: Uuid, visibility: &str) -> Uu
             "INSERT INTO communities (id, name, owner_group_id, visibility) \
              VALUES ($1, $2, $3, $4)"
         }
+        // Migration 246: a paper row carries its ingest's tenancy.
+        "paper" => {
+            "INSERT INTO papers (id, doi, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
         other => panic!("no seeder for node type {other}"),
     };
     sqlx::query(sql)
@@ -1828,6 +1833,7 @@ fn row_table(ty: &str) -> &'static str {
         "context" => "contexts",
         "perspective" => "perspectives",
         "community" => "communities",
+        "paper" => "papers",
         other => panic!("no table for {other}"),
     }
 }
@@ -1855,6 +1861,13 @@ async fn a_perspective_edge_takes_the_exact_meet(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_community_edge_takes_the_exact_meet(pool: PgPool) {
     a_source_node_edge_is_co_owned_and_reported(pool, "community", true).await;
+}
+
+/// A group paper (migration 246) asserting the moving claim: the paper is the
+/// edge's source end, as an ingest's `asserts` edge is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_edge_takes_the_exact_meet(pool: PgPool) {
+    a_source_node_edge_is_co_owned_and_reported(pool, "paper", true).await;
 }
 
 /// A reasoning trace is an entity type with its own tenancy that FOLLOWS its
@@ -2148,7 +2161,8 @@ async fn the_node_types_are_every_tenanted_entity_type(pool: PgPool) {
     assert!(
         r.stdout.lines().any(|l| l.starts_with(
             "NODE-TYPES\tcommunity=communities,context=contexts,frame=frames,\
-             perspective=perspectives,trace=reasoning_traces,workflow=workflows\t"
+             paper=papers,perspective=perspectives,trace=reasoning_traces,\
+             workflow=workflows\t"
         )),
         "{}",
         r.show()

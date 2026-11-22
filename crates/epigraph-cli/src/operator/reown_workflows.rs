@@ -1521,8 +1521,10 @@ async fn classify_narrowing(
         // The cascade re-meets every edge with a narrowing CLAIM endpoint,
         // reading a workflow endpoint as its own row (migration 219; the
         // batch writes the `workflows` rows before the claims, so a moving
-        // one is already in the TO state), an agent or paper endpoint as
-        // ('public', world), and evidence as the cascade just left it. Any
+        // one is already in the TO state), a paper endpoint as its own row
+        // (migration 246; `e.*_state` is read through `epigraph_node_tenancy`),
+        // an agent endpoint as ('public', world), and evidence as the cascade
+        // just left it. Any
         // other edge with a changing endpoint is this tool's to narrow, to the
         // meet of its endpoints' tuples (a workflow's own), unless it is
         // already narrower.
