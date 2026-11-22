@@ -2644,18 +2644,18 @@ pub struct LinkHierarchicalParams {
     pub target_claim_id: String,
 
     #[schemars(
-        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). None of them moves belief."
+        description = "Structural relationship type. Claim to claim: decomposes_to, section_follows, continues_argument. Workflow references: executes (workflow -> claim: the workflow runs that step claim; use it to repair a dropped executes edge), invokes (workflow -> workflow, or step claim -> workflow: a sub-workflow reference; optional at_step; cycles refused), depends_on (workflow -> workflow: a prerequisite; cycles refused). Agent attribution: asserts (agent -> claim: the agent asserts the claim; written only by that agent or the human operating it through a live binding). None of them moves belief."
     )]
     pub relationship: String,
 
     #[schemars(
-        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim). A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
+        description = "Entity type of the source, validated against the entity_types registry. Default \"claim\". executes, invokes and depends_on take \"workflow\" here (invokes also \"claim\", for a step claim); asserts takes \"agent\". A workflow source requires authority over that workflow, as add_step does (its submitter, the submitter's operator or delegate, or a writer of its owner group), and a step-claim source of invokes requires it over every workflow executing that step; a refusal writes nothing."
     )]
     #[serde(default)]
     pub source_type: Option<String>,
 
     #[schemars(
-        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes takes \"claim\"."
+        description = "Entity type of the target, validated against the entity_types registry. Default \"claim\". invokes and depends_on take \"workflow\" here; executes and asserts take \"claim\"."
     )]
     #[serde(default)]
     pub target_type: Option<String>,
