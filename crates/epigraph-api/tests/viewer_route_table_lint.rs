@@ -560,7 +560,16 @@ const AUTH_OPTIONAL_PROVENANCE_SITES: &[(&str, usize)] = &[
 /// safe, because this register is an exact set and a new entry reddens the
 /// build; but a NEW row must be read for an authorization call the classifier
 /// does not recognise before it is accepted as benign.
-const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[("agents.rs", 1)];
+///
+/// # Empty since backlog 2f87eb08
+///
+/// The `create_agent` row was REMOVED, not zeroed (the PR-10 rule): that
+/// handler no longer provisions an OAuth client merely because a principal is
+/// present. It provisions one only on an explicit `login: true` request, using
+/// the `auth` its unconditional `let Some(..) = &auth_ctx else { 401 }` binds,
+/// so the optional block is gone. The register stays, empty, so a new
+/// auth-conditional write reddens the build.
+const AUTH_OPTIONAL_WRITE_SITES: &[(&str, usize)] = &[];
 
 /// `UPDATE`/`DELETE` statements against a tenancy-scoped table, issued from a
 /// route handler.

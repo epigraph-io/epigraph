@@ -88,6 +88,14 @@ pub struct CreateAgentRequest {
     /// Arbitrary JSONB properties (methodology, affiliation metadata, etc.)
     #[serde(default)]
     pub properties: Option<serde_json::Value>,
+    /// Ask for an OAuth login for the new agent (backlog 2f87eb08). Default
+    /// `false`: registering an agent records an identity and provisions NO
+    /// client. With `true`, the new agent gets an `agent` client whose
+    /// `client_id` is its public key: ACTIVE with the agent provision scopes
+    /// when the caller holds `claims:admin`, otherwise PENDING with none
+    /// granted, as `/oauth/register`'s agent arm registers it.
+    #[serde(default)]
+    pub login: bool,
 }
 
 /// Agent response structure
@@ -162,8 +170,9 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
     ValidationService::parse_public_key(hex_key)
 }
 
-/// Standard harvester-level scopes for auto-provisioned agent OAuth clients.
-/// These allow the agent to read/write claims, edges, and evidence.
+/// Standard harvester-level scopes for an agent OAuth client provisioned on an
+/// explicit login request. These allow the agent to read/write claims, edges,
+/// and evidence.
 ///
 /// Re-exported from `epigraph_core::canonical_scopes` (identical contents) so
 /// this is no longer one of three divergent private grant lists. It is
@@ -176,8 +185,15 @@ const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PRO
 /// POST /agents
 ///
 /// Creates a new agent with the given public key and optional display name.
-/// When called by an authenticated user (OAuth2 bearer token), also auto-provisions
-/// an `oauth_clients` row so the new agent can authenticate via client_credentials.
+///
+/// Registering an agent is an IDENTITY act and provisions no login (backlog
+/// 2f87eb08). It used to give every new agent an ACTIVE `agent` client with
+/// `claims:write`, treating the caller's `agents:write` as the approval, so any
+/// `agents:write` holder (a bulk ingester registering one agent per author)
+/// minted a live login for every key it registered. Now a client is created
+/// only when the request sets `login: true`, and it is ACTIVE only when the
+/// caller also holds `claims:admin`; otherwise it is PENDING with no scope
+/// granted, awaiting the same approval as a `/oauth/register` agent client.
 #[cfg(feature = "db")]
 pub async fn create_agent(
     State(state): State<AppState>,
@@ -191,6 +207,7 @@ pub async fn create_agent(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
+    let login = request.login;
 
     let public_key = parse_public_key(&request.public_key)?;
     // Migration 148: the legacy public-constant key of a system role names a
@@ -226,58 +243,61 @@ pub async fn create_agent(
         AgentRepository::create_or_get(&state.db_pool, &agent).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
-    // Auto-provision an OAuth client only for a *newly created* agent (and only
-    // when the caller is authenticated). On a find-hit the client already
-    // exists from the original registration; re-creating it would hit the
-    // `oauth_clients` unique constraint on `client_id` and warn-spam the log.
-    if was_created {
-        if let Some(axum::Extension(auth)) = &auth_ctx {
-            let client_id_str = hex::encode(public_key);
-            let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
-            let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
+    // A login is provisioned only on an explicit request (backlog 2f87eb08),
+    // and only for a *newly created* agent: on a find-hit the agent already
+    // exists, and re-creating its client would hit the `oauth_clients` unique
+    // constraint on `client_id`.
+    if was_created && login {
+        let client_id_str = hex::encode(public_key);
+        let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
+        let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();
 
-            // This path passes a REAL agent_id at creation time, so it is not
-            // part of the "oauth_clients.agent_id is never populated" bug that
-            // `AgentRepository::ensure_for_client` fixes for the other three
-            // creation paths (`oauth/register.rs`, external provisioning,
-            // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
-            // created here — it early-returns on the existing link.
-            //
-            // Do NOT "unify" the two: this one has a real Ed25519 agent whose
-            // public_key IS a signature verifier (key_kind='ed25519'), whereas
-            // ensure_for_client materialises a `derived` placeholder for a
-            // keyless OAuth principal. Collapsing them would either lose the
-            // real key or mark it derived.
-            //
-            // status="active" here, while /oauth/register's agent arm now
-            // registers "pending", is a deliberate asymmetry, not an oversight:
-            // reaching this line requires an authenticated caller holding
-            // `agents:write` (checked above) — which IS the admin approval that
-            // the anonymous registration endpoint lacks.
-            if let Err(e) = OAuthClientRepository::create(
-                &state.db_pool,
-                &client_id_str,
-                None, // no client_secret_hash for agent clients
-                client_name,
-                "agent",
-                &scopes, // allowed_scopes
-                &scopes, // granted_scopes (auto-approved for agents)
-                "active",
-                Some(new_agent_id),   // agent_id
-                Some(auth.client_id), // owner_id = the creating user/service
-                None,                 // legal_entity_name
-                None,                 // legal_contact_email
-                None, // redirect_uris: agents use Ed25519 assertion auth, no redirect
-            )
-            .await
-            {
-                // Log but don't fail agent creation — the agent row already exists
-                tracing::warn!(
-                    agent_id = %new_agent_id,
-                    error = %e,
-                    "Failed to auto-provision OAuth client for new agent"
-                );
-            }
+        // `agents:write` is NOT the approval of a login: it is held by bulk
+        // ingesters that register an agent per author, for identities that
+        // never asked to log in. Only `claims:admin` approves one here; any
+        // other caller gets a PENDING client with nothing granted, exactly
+        // what `/oauth/register`'s agent arm writes, for an admin to approve.
+        let (status, granted): (&str, Vec<String>) = if auth.has_scope("claims:admin") {
+            ("active", scopes.clone())
+        } else {
+            ("pending", Vec::new())
+        };
+
+        // This path passes a REAL agent_id at creation time, so it is not
+        // part of the "oauth_clients.agent_id is never populated" bug that
+        // `AgentRepository::ensure_for_client` fixes for the other three
+        // creation paths (`oauth/register.rs`, external provisioning,
+        // `bootstrap_clients`). `ensure_for_client` is a no-op for a client
+        // created here — it early-returns on the existing link.
+        //
+        // Do NOT "unify" the two: this one has a real Ed25519 agent whose
+        // public_key IS a signature verifier (key_kind='ed25519'), whereas
+        // ensure_for_client materialises a `derived` placeholder for a
+        // keyless OAuth principal. Collapsing them would either lose the
+        // real key or mark it derived.
+        if let Err(e) = OAuthClientRepository::create(
+            &state.db_pool,
+            &client_id_str,
+            None, // no client_secret_hash for agent clients
+            client_name,
+            "agent",
+            &scopes,  // allowed_scopes: what an approval may grant
+            &granted, // granted_scopes: all of them for an admin, else none
+            status,
+            Some(new_agent_id),   // agent_id
+            Some(auth.client_id), // owner_id = the creating user/service
+            None,                 // legal_entity_name
+            None,                 // legal_contact_email
+            None,                 // redirect_uris: agents use Ed25519 assertion auth, no redirect
+        )
+        .await
+        {
+            // Log but don't fail agent creation — the agent row already exists
+            tracing::warn!(
+                agent_id = %new_agent_id,
+                error = %e,
+                "Failed to provision the requested OAuth client for new agent"
+            );
         }
     }
 
