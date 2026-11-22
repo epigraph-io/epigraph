@@ -16,7 +16,7 @@
 // Path stub functions are consumed by #[utoipa::path] for spec generation only
 #![allow(dead_code)]
 
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
 use utoipa::openapi::{self};
 use utoipa::{Modify, OpenApi};
 
@@ -190,11 +190,21 @@ use workflow_schema_stubs::{
 )]
 pub struct ApiDoc;
 
-/// Security scheme modifier for Ed25519 signature authentication
+/// Security scheme modifier for Ed25519 signature authentication.
+///
+/// Also sets the document's DEFAULT security requirement to that scheme: the
+/// router serves every documented operation behind its bearer layer except
+/// the anonymous ones, which say so with an explicit `security(())` (an empty
+/// requirement). An operation with no `security(...)` of its own therefore
+/// inherits "authentication required" rather than advertising "none".
 struct SecurityAddon;
 
 impl Modify for SecurityAddon {
     fn modify(&self, openapi: &mut openapi::OpenApi) {
+        openapi.security = Some(vec![SecurityRequirement::new(
+            "ed25519_signature",
+            Vec::<String>::new(),
+        )]);
         if let Some(components) = openapi.components.as_mut() {
             components.add_security_scheme(
                 "ed25519_signature",
@@ -242,7 +252,10 @@ pub struct ErrorResponse {
     tag = "health",
     responses(
         (status = 200, description = "Service is healthy", body = HealthResponse),
-    )
+    ),
+    // Anonymous (the public router): an explicit empty requirement, so the
+    // document's default does not claim a signature here.
+    security(())
 )]
 async fn health_check() {}
 
@@ -288,7 +301,9 @@ async fn submit_packet() {}
     responses(
         (status = 200, description = "High-truth claims matching the query", body = RagContextResponse),
         (status = 400, description = "Invalid query parameters", body = ErrorResponse),
-    )
+        (status = 401, description = "Missing or invalid Bearer token"),
+    ),
+    security(("ed25519_signature" = []))
 )]
 async fn rag_context() {}
 
@@ -297,13 +312,12 @@ async fn rag_context() {}
 /// Returns comprehensive system health and operational metrics
 /// from all major subsystems. Requires the `claims:admin` scope.
 ///
-/// The `security(...)` block this path does not carry is a deliberate and
-/// separate matter: five of this document's paths lack one, and adding it to
-/// exactly the path that changed would make the inconsistency look like a rule.
-/// The response set below is not in that category — without the 401/403 arms a
-/// generated client is told 200 is the only outcome of a route that refuses
-/// every non-admin token, which is a false contract rather than an incomplete
-/// one.
+/// Without the 401/403 arms below a generated client is told 200 is the only
+/// outcome of a route that refuses every non-admin token, which is a false
+/// contract rather than an incomplete one. Its `security(...)` names the
+/// signature scheme like every authenticated operation in this document (the
+/// test `every_documented_operation_declares_its_authentication` holds them to
+/// the router).
 #[utoipa::path(
     get,
     path = "/api/v1/admin/stats",
@@ -312,7 +326,8 @@ async fn rag_context() {}
         (status = 200, description = "System statistics snapshot", body = SystemStats),
         (status = 401, description = "Missing or invalid Bearer token"),
         (status = 403, description = "Token does not carry the `claims:admin` scope"),
-    )
+    ),
+    security(("ed25519_signature" = []))
 )]
 async fn system_stats() {}
 
@@ -356,8 +371,10 @@ async fn submit_challenge() {}
     ),
     responses(
         (status = 200, description = "List of challenges", body = Vec<ChallengeResponse>),
+        (status = 401, description = "Missing or invalid Bearer token"),
         (status = 404, description = "Claim not found", body = ErrorResponse),
-    )
+    ),
+    security(("ed25519_signature" = []))
 )]
 async fn list_challenges() {}
 
@@ -448,7 +465,8 @@ async fn unmark_duplicate_doc() {}
         (status = 401),
         (status = 403),
         (status = 404),
-    )
+    ),
+    security(("ed25519_signature" = []))
 )]
 async fn get_claim_doc() {}
 
@@ -672,6 +690,93 @@ mod tests {
         let spec = openapi_spec();
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("ed25519_signature"));
+    }
+
+    /// The path literals `routes/mod.rs` registers on its anonymous `public`
+    /// router chains (both `create_router` variants), read from the source as
+    /// `tests/public_router_allowlist.rs` reads it: axum spelling (`:id`).
+    fn anonymous_router_paths() -> std::collections::BTreeSet<String> {
+        let src = include_str!("routes/mod.rs");
+        let mut out = std::collections::BTreeSet::new();
+        let mut rest = src;
+        while let Some(i) = rest.find("let public = Router::new()") {
+            let chunk = &rest[i..];
+            let end = chunk.find(";\n").expect("the public chain ends");
+            let mut body = &chunk[..end];
+            while let Some(j) = body.find(".route(") {
+                body = &body[j + ".route(".len()..];
+                if let Some(lit) = body.trim_start().strip_prefix('"') {
+                    let k = lit.find('"').expect("closing quote");
+                    out.insert(lit[..k].to_string());
+                }
+            }
+            rest = &chunk[end..];
+        }
+        out
+    }
+
+    /// `/api/v1/claims/{id}` -> `/api/v1/claims/:id`.
+    fn axum_path(openapi_path: &str) -> String {
+        openapi_path
+            .split('/')
+            .map(
+                |seg| match seg.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+                    Some(name) => format!(":{name}"),
+                    None => seg.to_string(),
+                },
+            )
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Backlog d1e573ae (2): every documented operation states its
+    /// authentication. One the router serves anonymously declares it (an
+    /// empty requirement, `{}`); every other one requires `ed25519_signature`,
+    /// on the operation or through the document's default, and admits no
+    /// anonymous alternative. Before the fix four read operations carried no
+    /// `security` and the document no default, so the schema advertised them
+    /// as needing nothing while the router answered them 401.
+    #[test]
+    fn every_documented_operation_declares_its_authentication() {
+        let anonymous = anonymous_router_paths();
+        assert!(
+            anonymous.contains("/health") && anonymous.contains("/api/v1/openapi.json"),
+            "the source parse of the public router found {anonymous:?}"
+        );
+        let doc = serde_json::to_value(openapi_spec()).unwrap();
+        let default = doc.get("security").cloned();
+        let paths = doc["paths"].as_object().expect("paths");
+        let mut checked = 0;
+        for (path, item) in paths {
+            for (method, op) in item.as_object().expect("path item") {
+                if !matches!(method.as_str(), "get" | "post" | "put" | "patch" | "delete") {
+                    continue;
+                }
+                checked += 1;
+                let effective = op.get("security").cloned().or_else(|| default.clone());
+                let reqs: Vec<serde_json::Value> = effective
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let allows_anonymous = reqs
+                    .iter()
+                    .any(|r| r.as_object().is_some_and(serde_json::Map::is_empty));
+                let names_scheme = reqs.iter().any(|r| r.get("ed25519_signature").is_some());
+                if anonymous.contains(&axum_path(path)) {
+                    assert!(
+                        allows_anonymous,
+                        "{method} {path} is on the anonymous router but its security \
+                         {reqs:?} does not say so"
+                    );
+                } else {
+                    assert!(
+                        names_scheme && !allows_anonymous,
+                        "{method} {path} requires authentication on the router but its \
+                         security is {reqs:?}"
+                    );
+                }
+            }
+        }
+        assert!(checked >= 19, "only {checked} operations checked");
     }
 
     #[test]
