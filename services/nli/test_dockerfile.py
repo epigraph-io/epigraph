@@ -12,7 +12,9 @@ They check three things:
     PyTorch CPU wheel index, at the version requirements.txt pins, before the
     rest of the requirements, and the build fails if a CUDA build of torch
     ends up in the image;
-  * a failing model pre-cache fails the build instead of being masked;
+  * the model pre-cache loads and scores the model, and each way the model
+    can fail (load error, inverted label order, wrong-direction scores)
+    fails the build instead of being masked;
   * the NLI_STUB build argument reaches the pre-cache step and skips it.
 """
 from __future__ import annotations
@@ -194,21 +196,113 @@ class TorchCpuWheelTest(unittest.TestCase):
                     self.assertIn("CUDA", res.stderr)
 
 
+# A stand-in `transformers` package for the pre-cache step. FAKE_NLI_MODE
+# picks its behaviour; FAKE_NLI_LOG records each pipeline() load and call, so
+# a test can see that the step really loaded and scored the model.
+_FAKE_TRANSFORMERS = textwrap.dedent(
+    """
+    import os
+
+    MODE = os.environ["FAKE_NLI_MODE"]
+    LOG = os.environ["FAKE_NLI_LOG"]
+
+
+    def _log(line):
+        with open(LOG, "a") as fh:
+            fh.write(line + "\\n")
+
+
+    class _Config:
+        def __init__(self, id2label):
+            self.id2label = id2label
+
+
+    class _Model:
+        def __init__(self, id2label):
+            self.config = _Config(id2label)
+
+
+    class _Pipe:
+        def __init__(self, id2label, scores):
+            self.model = _Model(id2label)
+            self._scores = scores
+
+        def __call__(self, inputs, **kwargs):
+            _log("score " + inputs["text"] + " || " + inputs["text_pair"])
+            return [[{"label": k, "score": v} for k, v in self._scores.items()]]
+
+
+    def pipeline(task, model=None, **kwargs):
+        _log("load " + task + " " + str(model))
+        if MODE == "raise":
+            raise OSError("fake: no such model " + str(model))
+        order = {0: "entailment", 1: "neutral", 2: "contradiction"}
+        if MODE == "inverted":
+            order = {0: "contradiction", 1: "neutral", 2: "entailment"}
+        scores = {"ENTAILMENT": 0.90, "NEUTRAL": 0.07, "CONTRADICTION": 0.03}
+        if MODE == "contradiction":
+            scores = {"ENTAILMENT": 0.03, "NEUTRAL": 0.07, "CONTRADICTION": 0.90}
+        return _Pipe(order, scores)
+    """
+)
+
+
 class ModelPrecacheTest(unittest.TestCase):
-    def test_a_failing_model_load_fails_the_build(self):
-        # A model that cannot load (here: a path that does not exist, offline)
-        # must stop the build with the pre-cache's own error, not ship an image
-        # without a working model.
+    """The pre-cache RUN step, with a fake `transformers` on PYTHONPATH.
+
+    Each failure mode must stop the build (exit 1, the pre-cache's own error
+    line) for its own reason, and a working model must pass, after the step
+    has actually loaded the model named by NLI_MODEL and scored a pair.
+    """
+
+    MODEL = "fake-org/fake-nli-model"
+
+    def _run_precache(self, mode: str) -> tuple[subprocess.CompletedProcess, list[str]]:
         command = _instructions()[_run_index(_is_precache)][1]
         with tempfile.TemporaryDirectory() as tmp:
-            bindir = _shim_dir(pathlib.Path(tmp))
+            tmp = pathlib.Path(tmp)
+            site = tmp / "site" / "transformers"
+            site.mkdir(parents=True)
+            (site / "__init__.py").write_text(_FAKE_TRANSFORMERS)
+            log = tmp / "fake.log"
+            log.touch()
+            bindir = _shim_dir(tmp)
             env = _clean_env(
                 PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}",
-                NLI_MODEL=str(pathlib.Path(tmp) / "no-such-model"),
+                PYTHONPATH=str(tmp / "site"),
+                NLI_MODEL=self.MODEL,
+                FAKE_NLI_MODE=mode,
+                FAKE_NLI_LOG=str(log),
             )
             res = _sh(command, cwd=HERE, env=env)
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn(PRECACHE_FAILED, res.stderr)
+            calls = log.read_text().splitlines()
+        return res, calls
+
+    def test_a_working_model_is_loaded_scored_and_passes(self):
+        res, calls = self._run_precache("ok")
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn("NLI model pre-cached", res.stdout)
+        self.assertNotIn(PRECACHE_FAILED, res.stderr)
+        self.assertEqual(calls[0], f"load text-classification {self.MODEL}")
+        self.assertEqual(len([c for c in calls if c.startswith("score ")]), 1, calls)
+
+    def test_each_model_failure_fails_the_build(self):
+        # mode -> text that names the reason in the pre-cache's error line.
+        cases = {
+            "raise": "fake: no such model",
+            "inverted": "label order",
+            "contradiction": "not entailment-dominant",
+        }
+        for mode, reason in cases.items():
+            with self.subTest(mode=mode):
+                res, calls = self._run_precache(mode)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(PRECACHE_FAILED, res.stderr)
+                self.assertIn(reason, res.stderr)
+                self.assertNotIn("NLI model pre-cached", res.stdout)
+                # The failure came from the model step itself, not from an
+                # import error before the model was ever asked for.
+                self.assertEqual(calls[0], f"load text-classification {self.MODEL}")
 
     def test_nli_stub_build_arg_reaches_the_precache_and_skips_it(self):
         instructions = _instructions()
