@@ -287,13 +287,21 @@ mod tests {
         let message = key_kind_declaration_message("seed-derived", &key);
         assert!(!message.starts_with(SIGNING_DOMAIN_V1));
         assert!(!SIGNING_DOMAIN_V1.starts_with(KEY_KIND_DECLARATION_V1));
-        assert_ne!(message.len(), HASH_SIZE, "would collide with a legacy bare digest");
+        assert_ne!(
+            message.len(),
+            HASH_SIZE,
+            "would collide with a legacy bare digest"
+        );
         let proof = s.sign(&message);
         assert!(SignatureVerifier::verify(&key, &message, &proof).unwrap());
 
         // The proof over the declaration, read as a claim signature over the
         // key bytes taken as a digest: neither rung verifies.
-        for kind in [SignedEntity::Claim, SignedEntity::Edge, SignedEntity::Evidence] {
+        for kind in [
+            SignedEntity::Claim,
+            SignedEntity::Edge,
+            SignedEntity::Evidence,
+        ] {
             assert!(
                 SignatureVerifier::verify_entity(&key, kind, &key, &proof)
                     .unwrap()

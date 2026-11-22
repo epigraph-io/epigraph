@@ -243,7 +243,10 @@ async fn a_seed_derived_declaration_needs_the_keys_own_proof(pool: PgPool) {
         ("missing", serde_json::Value::Null),
         ("malformed", serde_json::Value::from("not-hex")),
         ("short", serde_json::Value::from("00".repeat(63))),
-        ("squatter's", serde_json::Value::from(proof_by(&squatter, &key))),
+        (
+            "squatter's",
+            serde_json::Value::from(proof_by(&squatter, &key)),
+        ),
     ] {
         let (status, body) = post(
             &pool,
