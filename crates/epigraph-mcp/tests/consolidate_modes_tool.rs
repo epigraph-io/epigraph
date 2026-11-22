@@ -611,3 +611,65 @@ async fn identity_mode_without_an_admin_connection_defers_each_sources_cascade(p
         assert_eq!(identity_edges(&pool, dup, survivor).await, 1);
     }
 }
+
+/// The marks are one transaction, and a transaction carries one stamp. A
+/// `claims:admin` caller whose pairs would act under different stamps (its own
+/// for a source whose owning group it writes, this server's agent through the
+/// admin borrow for one it does not) is refused before anything is written,
+/// and told to split the call.
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_refuses_sources_that_need_different_write_identities(pool: PgPool) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(&pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let (caller, auth, viewer) =
+        common::seed_caller(&pool, &["claims:write", "claims:admin"]).await;
+    common::seed_admin_grant(&pool, &auth).await;
+    let own_group = common::personal_group_of(&pool, caller).await;
+    let survivor = seed_claim(&pool, "the caller's restated fact", 0.6).await;
+    let dup_own = seed_claim(&pool, "the caller's restated fact, again", 0.5).await;
+    let dup_foreign = seed_claim(&pool, "someone else's restatement", 0.5).await;
+    sqlx::query("UPDATE claims SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(survivor)
+        .bind(own_group)
+        .execute(&pool)
+        .await
+        .expect("make the survivor public and the caller's");
+    common::stamp_group_private(&pool, dup_own, own_group).await;
+    let stranger = common::seed_agent(&pool).await;
+    let stranger_group = common::personal_group_of(&pool, stranger).await;
+    sqlx::query("UPDATE claims SET visibility = 'public', owner_group_id = $2 WHERE id = $1")
+        .bind(dup_foreign)
+        .bind(stranger_group)
+        .execute(&pool)
+        .await
+        .expect("make the foreign duplicate public and stranger-owned");
+
+    let err = consolidate_claims(
+        &server,
+        &viewer,
+        params(
+            "identity",
+            &[survivor, dup_own, dup_foreign],
+            "",
+            Some(survivor),
+        ),
+        Some(&auth),
+    )
+    .await
+    .expect_err("pairs needing two stamps refuse the call");
+    for id in [survivor, dup_own, dup_foreign] {
+        assert_eq!(
+            standing(&pool, id).await,
+            (None, true),
+            "source {id} is untouched: {err:?}"
+        );
+    }
+    assert_eq!(identity_edges(&pool, dup_own, survivor).await, 0);
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains("Split the call"), "{err:?}");
+    assert!(err.message.contains("nothing was written"), "{err:?}");
+}
