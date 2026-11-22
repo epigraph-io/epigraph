@@ -320,6 +320,59 @@ async fn the_walk_follows_derivation_edges_only(pool: PgPool) {
     );
 }
 
+/// Upper-case `DERIVED_FROM` is NOT the derivation `derived_from`: it is the
+/// paraphrase edge, written paraphrase -> source atom (descendant -> origin),
+/// and `epigraph_core::edge::relationships` says never to fold the pair. So
+/// the walk must not take a paraphrase for an ancestor: not as an entity, and
+/// not as the depth probe's evidence of a cut. Membership is asserted (not a
+/// capped order), so the uuid order within a depth cannot make it pass.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paraphrase_is_not_an_ancestor(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-paraphrase").await;
+    let root = fixture::seed_public_claim(&pool, agent, "paraphrase root atom").await;
+    let parent = fixture::seed_public_claim(&pool, agent, "paraphrase compound parent").await;
+    let derived = fixture::seed_public_claim(&pool, agent, "paraphrase derivation source").await;
+    let probe = fixture::seed_public_claim(&pool, agent, "a paraphrase of the root").await;
+    let parent_probe = fixture::seed_public_claim(&pool, agent, "a paraphrase of the parent").await;
+    public_edge(&pool, parent, root, "decomposes_to").await;
+    public_edge(&pool, derived, root, "derived_from").await;
+    public_edge(&pool, probe, root, "DERIVED_FROM").await;
+    public_edge(&pool, parent_probe, parent, "DERIVED_FROM").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let walked =
+        epigraph_db::LineageRepository::get_ancestor_ids_probed(&pool, &viewer, root, Some(5))
+            .await
+            .expect("ancestor walk");
+    let walked: std::collections::BTreeSet<Uuid> = walked.ids.into_iter().collect();
+    assert_eq!(
+        walked,
+        [root, parent, derived].into_iter().collect(),
+        "the decomposes_to parent and the derived_from source are ancestors; \
+         the DERIVED_FROM paraphrases ({probe}, {parent_probe}) are not"
+    );
+
+    let doc = export_as(&pool, &viewer, root, 5, None).await;
+    assert_eq!(
+        entity_set(&doc),
+        claim_set(&[root, parent, derived]),
+        "{doc}"
+    );
+
+    // At max_depth 1 the only claim one layer further is the parent's
+    // paraphrase, which is not an ancestor, so nothing was cut.
+    let shallow = export_as(&pool, &viewer, root, 1, None).await;
+    assert_eq!(
+        entity_set(&shallow),
+        claim_set(&[root, parent, derived]),
+        "{shallow}"
+    );
+    assert_eq!(
+        shallow["depth_truncated"], false,
+        "a paraphrase past the depth is not a cut ancestor: {shallow}"
+    );
+}
+
 /// `truncated` reports a depth cutoff: a readable ancestor one layer past
 /// `max_depth` sets it (and `depth_truncated`); a lineage that ends exactly at
 /// `max_depth` does not.

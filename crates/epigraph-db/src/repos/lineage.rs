@@ -169,17 +169,23 @@ struct LineageEdgeRow {
 pub const LINEAGE_INCOMING: &[&str] = &["supports", "elaborates", "decomposes_to"];
 
 /// Relationships [`LineageRepository::get_ancestor_ids`] walks, each behind an
-/// INCOMING edge (`ancestor -> claim`): [`LINEAGE_INCOMING`] plus the
-/// derivation family the PROV-O export maps to `prov:wasDerivedFrom` /
-/// `prov:wasGeneratedBy` / `prov:used` (`derived_from`, its legacy spelling
-/// `derives_from`, `generated`, `uses_evidence`; all written
-/// ancestor -> descendant).
+/// INCOMING edge (`ancestor -> claim`): [`LINEAGE_INCOMING`] plus
+/// [`ANCESTOR_DERIVATION_RELATIONSHIPS`].
 ///
 /// Not walked (backlog 19d325d5): `refutes`, `contradicts`, cross-source
 /// `CORROBORATES` and every other relationship, which are not ancestry, and
 /// `supersedes`, which is written new -> old, so its INCOMING edge names a
 /// successor; the export reaches predecessors by its own one-hop outgoing
-/// expansion. Compared lower-cased, as [`LINEAGE_INCOMING`] is.
+/// expansion.
+///
+/// The two halves are matched differently. [`LINEAGE_INCOMING`] is compared
+/// lower-cased, exactly as [`LineageRepository::get_lineage`] compares it, so
+/// the two walks agree on what an ancestor is. The derivation family is
+/// matched EXACTLY: `DERIVED_FROM` is a different relationship from
+/// `derived_from` (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`
+/// says never to fold the pair), written paraphrase -> source atom, i.e.
+/// descendant -> origin, so its incoming edge names a paraphrase, not an
+/// ancestor.
 pub const ANCESTOR_ID_RELATIONSHIPS: &[&str] = &[
     "supports",
     "elaborates",
@@ -189,6 +195,14 @@ pub const ANCESTOR_ID_RELATIONSHIPS: &[&str] = &[
     "generated",
     "uses_evidence",
 ];
+
+/// The derivation family of [`ANCESTOR_ID_RELATIONSHIPS`]: what the PROV-O
+/// export maps to `prov:wasDerivedFrom` / `prov:wasGeneratedBy` / `prov:used`
+/// (`derived_from`, its legacy spelling `derives_from`, `generated`,
+/// `uses_evidence`), in the exact lower-case spelling that mapping matches.
+/// Matched case-sensitively; see [`ANCESTOR_ID_RELATIONSHIPS`].
+pub const ANCESTOR_DERIVATION_RELATIONSHIPS: &[&str] =
+    &["derived_from", "derives_from", "generated", "uses_evidence"];
 
 /// The ancestor ids of a claim and whether the walk stopped at its depth
 /// bound; see [`LineageRepository::get_ancestor_ids_probed`].
@@ -1163,7 +1177,9 @@ impl LineageRepository {
     /// ancestors first, and whether a readable ancestor lies past the bound.
     ///
     /// "Ancestor" means reached over an incoming edge whose relationship is in
-    /// [`ANCESTOR_ID_RELATIONSHIPS`] (compared lower-cased). A disputing claim
+    /// [`ANCESTOR_ID_RELATIONSHIPS`] ([`LINEAGE_INCOMING`] compared
+    /// lower-cased, [`ANCESTOR_DERIVATION_RELATIONSHIPS`] exactly, so a
+    /// `paraphrase -DERIVED_FROM-> claim` row is not walked). A disputing claim
     /// (`refutes`, `contradicts`) or a successor (`supersedes`, written
     /// new -> old) is not walked, so under a caller's node cap it can never
     /// take a slot ahead of a derivation ancestor (backlog 19d325d5).
@@ -1187,7 +1203,8 @@ impl LineageRepository {
         max_depth: Option<i32>,
     ) -> Result<AncestorIds, DbError> {
         let max_depth = max_depth.unwrap_or(100);
-        let relationships: Vec<String> = ANCESTOR_ID_RELATIONSHIPS
+        let folded: Vec<String> = LINEAGE_INCOMING.iter().map(|r| (*r).to_string()).collect();
+        let exact: Vec<String> = ANCESTOR_DERIVATION_RELATIONSHIPS
             .iter()
             .map(|r| (*r).to_string())
             .collect();
@@ -1224,7 +1241,8 @@ impl LineageRepository {
                         SELECT c.id
                         FROM unnest(w.frontier) AS l(id)
                         JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim'
-                                    AND lower(e.relationship) = ANY($3::text[])
+                                    AND (lower(e.relationship) = ANY($3::text[])
+                                         OR e.relationship = ANY($4::text[]))
                         JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
                         WHERE true
                           /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
@@ -1240,12 +1258,13 @@ impl LineageRepository {
             CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             ORDER BY u.id
             "#,
-            4,
+            5,
         );
         let mut q = sqlx::query_as::<_, IdDepthRow>(&sql)
             .bind(claim_id)
             .bind(probe_depth(max_depth))
-            .bind(&relationships);
+            .bind(&folded)
+            .bind(&exact);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }

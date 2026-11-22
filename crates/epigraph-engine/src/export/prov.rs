@@ -135,8 +135,12 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 /// [`epigraph_db::LineageRepository::get_ancestor_ids_probed`] walks incoming
 /// claim-to-claim edges whose relationship is in
 /// [`epigraph_db::ANCESTOR_ID_RELATIONSHIPS`]: the `derived_from` family this
-/// module maps, plus the lineage relationships `get_provenance` walks
-/// (`supports`, `elaborates`, `decomposes_to`). A claim that only `refutes` or
+/// module maps ([`epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS`], matched in
+/// exactly the lower-case spelling [`relationship_to_prov_predicate`] maps, so
+/// an upper-case `DERIVED_FROM` paraphrase edge, written paraphrase -> source,
+/// is not walked), plus the lineage relationships `get_provenance` walks
+/// (`supports`, `elaborates`, `decomposes_to`, compared lower-cased as there).
+/// A claim that only `refutes` or
 /// `contradicts` an ancestor, or that `supersedes` one (a successor, not an
 /// ancestor), is not walked, so it never takes a `max_nodes` slot from a
 /// derivation ancestor (backlog 19d325d5). A `supports` / `elaborates` /
@@ -442,8 +446,15 @@ mod tests {
         for r in ["derived_from", "derives_from", "generated", "uses_evidence"] {
             assert!(relationship_to_prov_predicate(r).is_some(), "{r} is mapped");
             assert!(
-                epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r),
-                "{r} is walked"
+                epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r)
+                    && epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS.contains(&r),
+                "{r} is walked, in the exactly-matched derivation family"
+            );
+        }
+        for r in epigraph_db::ANCESTOR_DERIVATION_RELATIONSHIPS {
+            assert!(
+                relationship_to_prov_predicate(r).is_some(),
+                "{r} is matched exactly, so it must be the spelling the mapping maps"
             );
         }
         for r in [
@@ -452,6 +463,7 @@ mod tests {
             "supersedes",
             "CORROBORATES",
             "corroborates",
+            "DERIVED_FROM",
         ] {
             assert!(
                 !epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r),
