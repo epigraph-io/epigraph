@@ -395,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
         report.recomputed.len()
     );
     println!("  cache cleared (no BBA backs): {}", report.unbacked.len());
+    println!("  cache left as it was:         {}", report.unchanged.len());
     if !report.errors.is_empty() {
         for e in &report.errors {
             println!("  error: {e}");

@@ -860,6 +860,15 @@ column being non-NULL and returns its row count. Regression:
 `mark_duplicate_cascade_recompute.rs::bba_free_dedup_leaves_the_survivors_derived_columns_alone`
 (verified red with the guard removed: `mass_on_empty 0.0 → NULL`, `updated_at` moved).
 
+**Addendum (backlog 541d7104).** `targets` keeps this meaning. A candidate that still holds BBAs
+but whose refold wrote nothing (no BBA on the repaired frame, a fold that admitted none with
+nothing to vacate, or a write migration 114 declined for a non-owner session) used to be absent
+from the whole report, so a caller could not tell that its cache may still fold the retired
+evidence. It is now listed in a fourth field, `unchanged`, outside `targets` (nothing was
+written). Every repair candidate that holds a BBA or a cache lands in exactly one of
+`recomputed`, `unbacked`, `unchanged` or `errors`; a BBA-free, cache-free endpoint is still absent
+from every field. Regression: `epigraph-engine/tests/cascade_report_unchanged.rs`.
+
 ### D11 — BCH-EG-K05's 1-hop bound is satisfied by construction, and separately tested
 
 `retraction_cascade` contains no recursion: `invalidate_and_rewire` is a flat `for` over one

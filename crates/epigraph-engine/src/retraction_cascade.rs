@@ -53,7 +53,8 @@
 //!
 //! Claims that still hold BBAs on some *other* frame are left alone: the cached
 //! scalars are frame-agnostic and last-writer-wins, so nulling them would
-//! discard a live cross-frame result.
+//! discard a live cross-frame result. They are reported under
+//! [`CascadeReport::unchanged`], so the caller can see the cache was kept.
 //!
 //! # Structural discipline
 //!
@@ -139,13 +140,14 @@ use crate::edge_factor::{
 #[serde(default)]
 pub struct CascadeReport {
     /// Downstream claims whose derived records the cascade actually touched
-    /// (or tried and failed to touch). A candidate that turned out to have no
-    /// derived record at all is **absent**: the union of `recomputed`,
-    /// `unbacked` and the claims named in `errors`. So is a candidate that
-    /// still has BBAs but whose refold wrote nothing: no BBAs on the repaired
-    /// frame, a fold that admitted none of them with nothing to vacate, or a
-    /// write the database declined because the session does not own the
-    /// claim's cache (migration 114). Its cache is left as it was.
+    /// (or tried and failed to touch): exactly the union of `recomputed`,
+    /// `unbacked` and the claims named in `errors`. A candidate that turned
+    /// out to have no derived record at all (no BBA and no cache) is absent
+    /// from every field. A candidate that still has BBAs but whose refold
+    /// wrote nothing is not here either: it is in [`Self::unchanged`].
+    ///
+    /// So every repair candidate that holds a BBA or a cache lands in exactly
+    /// one of `recomputed`, `unbacked`, `unchanged` or `errors`.
     pub targets: Vec<Uuid>,
     /// Stale edge-factor BBAs deleted (invalidation, not recombination).
     pub invalidated_bbas: u64,
@@ -158,6 +160,16 @@ pub struct CascadeReport {
     /// never had a cache in the first place, which would be the mirror-image
     /// lie.
     pub unbacked: Vec<Uuid>,
+    /// Repair candidates that still hold BBAs but whose refold wrote NOTHING,
+    /// so their cache is left as it was (backlog 541d7104): no BBA on the
+    /// repaired frame (the claim is backed only on another frame), a fold that
+    /// admitted none of them with nothing to vacate, or a write the database
+    /// declined because the session does not own the claim's cache (migration
+    /// 114). Listed so a caller can tell that the cache of such a claim may
+    /// still fold the retired evidence, instead of the claim silently
+    /// vanishing from the report. Not part of `targets` (nothing was written),
+    /// and disjoint from `recomputed`, `unbacked` and the claims in `errors`.
+    pub unchanged: Vec<Uuid>,
     /// Best-effort failures, already logged at `warn`. Never returned as `Err`.
     pub errors: Vec<String>,
     /// Retracted edge-keyed BBAs (migration 184) the cascade found on an edge
@@ -943,14 +955,16 @@ async fn repair_one(
 /// nothing to repair, and listing it under `targets` would assert a repair
 /// that did not happen.
 ///
-/// Nor is a candidate that keeps BBAs but whose refold wrote nothing
+/// A candidate that keeps BBAs but whose refold wrote nothing
 /// (`recompute_claim_belief_on_frame` answers `Ok(false)`, and
-/// [`mark_unbacked_if_evidence_free`] finds BBAs left): no BBAs on
-/// `frame_id`, a fold that admitted none with nothing to vacate, or a write
-/// migration 114 declined for a session that does not own the claim's cache.
-/// Its cache is left as it was. Before the recompute reported whether it
-/// wrote (backlog 8d720490 (2)), the last two were listed under `recomputed`,
-/// which claimed a write that did not happen.
+/// [`mark_unbacked_if_evidence_free`] finds BBAs left) is listed under
+/// [`CascadeReport::unchanged`], not under `targets`: no BBAs on `frame_id`, a
+/// fold that admitted none with nothing to vacate, or a write migration 114
+/// declined for a session that does not own the claim's cache. Its cache is
+/// left as it was. Before the recompute reported whether it wrote (backlog
+/// 8d720490 (2)), the last two were listed under `recomputed`, which claimed a
+/// write that did not happen; after that, until backlog 541d7104, they were
+/// absent from the report altogether.
 async fn repair_targets(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -986,6 +1000,10 @@ async fn repair_targets(
                     UnbackedOutcome::Failed => {
                         report.targets.push(target_id);
                         false
+                    }
+                    UnbackedOutcome::BbasLeft => {
+                        report.unchanged.push(target_id);
+                        true
                     }
                     UnbackedOutcome::NothingToClear => true,
                 }
@@ -1023,7 +1041,7 @@ async fn mark_unbacked_if_evidence_free(
     report: &mut CascadeReport,
 ) -> UnbackedOutcome {
     match MassFunctionRepository::get_for_claim(&mut *conn, viewer, claim_id).await {
-        Ok(rows) if !rows.is_empty() => UnbackedOutcome::NothingToClear,
+        Ok(rows) if !rows.is_empty() => UnbackedOutcome::BbasLeft,
         Ok(_) => match MassFunctionRepository::clear_claim_belief(&mut *conn, claim_id).await {
             Ok(0) => UnbackedOutcome::NothingToClear,
             Ok(_) => UnbackedOutcome::Cleared,
@@ -1040,13 +1058,18 @@ async fn mark_unbacked_if_evidence_free(
 }
 
 /// What [`mark_unbacked_if_evidence_free`] did, so the caller can distinguish
-/// "the cache was cleared", "there was no cache to clear" and "the attempt
-/// failed" — three states a `bool` would collapse into two.
+/// "the cache was cleared", "BBAs are left, so nothing was cleared", "there
+/// was no cache to clear" and "the attempt failed" — states a `bool` would
+/// collapse into two.
 enum UnbackedOutcome {
     /// A derived cache existed and is now NULL.
     Cleared,
-    /// The claim still has BBAs, or never had a derived cache at all. Nothing
-    /// was written and nothing is reported.
+    /// The claim still has BBAs (on another frame, or ones the refold did not
+    /// write from). Nothing was written; reported as
+    /// [`CascadeReport::unchanged`].
+    BbasLeft,
+    /// The claim has no BBA and never had a derived cache. Nothing was
+    /// written and nothing is reported.
     NothingToClear,
     /// The check or the clear errored; already recorded in
     /// [`CascadeReport::errors`].
