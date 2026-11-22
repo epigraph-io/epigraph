@@ -457,9 +457,7 @@ impl IntoResponse for ApiError {
             if *basic_attempted {
                 response.headers_mut().insert(
                     WWW_AUTHENTICATE,
-                    HeaderValue::from_static(
-                        "Basic realm=\"oauth\", charset=\"UTF-8\"",
-                    ),
+                    HeaderValue::from_static("Basic realm=\"oauth\", charset=\"UTF-8\""),
                 );
             }
             return response;

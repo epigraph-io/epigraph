@@ -893,7 +893,11 @@ async fn client_authentication_failures_are_rfc_invalid_client(pool: PgPool) {
 
     // Calibration: nothing above spent either chain.
     let (status, body) = post_token(&app, service_refresh(&svc_chain, &svc_id, &secret)).await;
-    assert_eq!(status, StatusCode::OK, "the service chain is intact: {body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the service chain is intact: {body}"
+    );
     let (status, body) = post_token(&app, agent_refresh(&agent_chain, &agent_id, &key)).await;
     assert_eq!(status, StatusCode::OK, "the agent chain is intact: {body}");
 }
