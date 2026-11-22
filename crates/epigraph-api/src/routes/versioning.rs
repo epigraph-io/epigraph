@@ -1025,6 +1025,31 @@ pub async fn mark_duplicate(
     }))
 }
 
+/// The answer `unmark_duplicate` gives when the administrative un-mark
+/// changed nothing ([`epigraph_engine::admin_cascade::UnmarkRefusal`]):
+///
+/// - the act's designed refusal by its kind, as any repo refusal is answered
+///   (`From<DbError>`: input 400, authority 403, state 409), its text the
+///   reason;
+/// - no record to reverse the mark from: 409, with the reason;
+/// - a failure: 500, its text in the server log only.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn unmark_refusal(e: epigraph_engine::admin_cascade::UnmarkRefusal) -> ApiError {
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+    match e {
+        UnmarkRefusal::Act { kind, message } => {
+            ApiError::from(epigraph_db::DbError::Refused { kind, message })
+        }
+        e @ UnmarkRefusal::NoRecord => ApiError::Conflict {
+            reason: e.to_string(),
+        },
+        e @ UnmarkRefusal::Failed(_) => ApiError::InternalError {
+            message: e.to_string(),
+        },
+    }
+}
+
 /// Un-mark a duplicate: reverse `POST /api/v1/claims/{id}/dedup`.
 ///
 /// POST /api/v1/claims/{id}/undedup
@@ -1216,14 +1241,7 @@ pub async fn unmark_duplicate(
         Some(&chain),
     )
     .await
-    .map_err(|e| match e {
-        epigraph_engine::admin_cascade::UnmarkRefusal::Failed(_) => ApiError::InternalError {
-            message: e.to_string(),
-        },
-        other => ApiError::Conflict {
-            reason: other.to_string(),
-        },
-    })?;
+    .map_err(unmark_refusal)?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.
@@ -1586,5 +1604,40 @@ mod nodb_stub_tests {
             challenge.contains(r#"error="invalid_token""#),
             "got: {challenge}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod unmark_refusal_tests {
+    use super::unmark_refusal;
+    use axum::response::IntoResponse;
+    use epigraph_db::RefusalKind;
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+
+    fn status(e: UnmarkRefusal) -> u16 {
+        unmark_refusal(e).into_response().status().as_u16()
+    }
+
+    /// An un-mark's act refusal is answered by its kind, as every repo refusal
+    /// is (backlog dca9ed56): an authority refusal is 403, not the 409 every
+    /// act refusal used to be; a failure is a 500 whose text stays in the log.
+    #[test]
+    fn an_unmark_refusal_is_answered_by_its_kind() {
+        let act = |kind| UnmarkRefusal::Act {
+            kind,
+            message: "unmark_duplicate: refused".into(),
+        };
+        assert_eq!(status(act(RefusalKind::Input)), 400);
+        assert_eq!(status(act(RefusalKind::Authority)), 403);
+        assert_eq!(status(act(RefusalKind::State)), 409);
+        assert_eq!(status(UnmarkRefusal::NoRecord), 409);
+        let failed = unmark_refusal(UnmarkRefusal::Failed(
+            "Query failed: canceling statement due to lock timeout".into(),
+        ));
+        assert!(
+            matches!(failed, crate::errors::ApiError::InternalError { .. }),
+            "{failed:?}"
+        );
+        assert_eq!(failed.into_response().status().as_u16(), 500);
     }
 }

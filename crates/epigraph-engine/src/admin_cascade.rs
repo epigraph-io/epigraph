@@ -903,8 +903,17 @@ pub struct UnmarkOutcome {
 /// Why an un-mark changed nothing (its transaction rolled back).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnmarkRefusal {
-    /// The act refused: not a dedup-marked duplicate, or not writable.
-    Act(String),
+    /// The act refused, by design: the claim is not a dedup-marked duplicate,
+    /// its mark is not the one the caller was checked against, or the chain
+    /// moved since. `kind` decides the transport's answer, as for any
+    /// [`epigraph_db::DbError::Refused`] (input 400, authority 403, state 409),
+    /// and `message` is text written for the caller. Only a designed refusal
+    /// is an `Act`: any other error of the act is [`Self::Failed`], so driver
+    /// text never reaches a caller as a refusal's reason (backlog dca9ed56).
+    Act {
+        kind: epigraph_db::RefusalKind,
+        message: String,
+    },
     /// No applied repair record and no open cascade for this mark, and it is
     /// not a legacy mark the operator backfill gave its identity edge: there is
     /// nothing to reverse it from.
@@ -916,7 +925,7 @@ pub enum UnmarkRefusal {
 impl std::fmt::Display for UnmarkRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Act(e) => write!(f, "{e}"),
+            Self::Act { message, .. } => f.write_str(message),
             Self::NoRecord => f.write_str(
                 "there is no record of this dedup's repair (it was repaired before revert \
                  records existed, or not through the administrative cascade), so it cannot \
@@ -924,6 +933,26 @@ impl std::fmt::Display for UnmarkRefusal {
             ),
             Self::Failed(e) => write!(f, "the un-mark failed and nothing was changed: {e}"),
         }
+    }
+}
+
+/// The un-mark's answer to an error of its act
+/// ([`ClaimRepository::unmark_duplicate_act_authorized_conn`]): a designed
+/// refusal keeps its kind and its text ([`UnmarkRefusal::Act`]); a claim that
+/// vanished since the caller read it is a state refusal; anything else (the
+/// database failing: a lock timeout, a lost connection) is
+/// [`UnmarkRefusal::Failed`], whose text the transports keep in the server log.
+fn act_refusal(e: epigraph_db::DbError) -> UnmarkRefusal {
+    match e {
+        epigraph_db::DbError::Refused { kind, message } => UnmarkRefusal::Act { kind, message },
+        // The duplicate was deleted after the caller read it: its state moved,
+        // and the text is the fixed not-found template naming an id the caller
+        // supplied.
+        e @ epigraph_db::DbError::NotFound { .. } => UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: e.to_string(),
+        },
+        other => UnmarkRefusal::Failed(other.to_string()),
     }
 }
 
@@ -1009,16 +1038,20 @@ pub async fn apply_unmark_authorized(
         authorized_chain,
     )
     .await
-    .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
+    .map_err(act_refusal)?;
     let canonical_id = unmarked.canonical;
     // The act locked the duplicate's row; the mark it found must be the one
     // the caller was authorized against (read earlier, on its own transaction).
     if canonical_id != expected_canonical {
-        return Err(UnmarkRefusal::Act(format!(
-            "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
-             {expected_canonical}, which the caller's authority was checked against; \
-             nothing was changed"
-        )));
+        // State: the mark moved since the caller was checked.
+        return Err(UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: format!(
+                "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
+                 {expected_canonical}, which the caller's authority was checked against; \
+                 nothing was changed"
+            ),
+        });
     }
     let current_canonical_id = unmarked.current_canonical();
     let failed = |e: String| UnmarkRefusal::Failed(e);
