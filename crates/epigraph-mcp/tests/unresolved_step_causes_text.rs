@@ -3,8 +3,12 @@
 //! Backlog 0f35c13b: `WorkflowRepository::plan_step_claim_ids` returns only
 //! the plan prefix whose positions the reporter can PROVE, so a step the
 //! reporter can read is also reported unresolved when its position cannot be
-//! established (it follows an ordinal the reporter cannot read, or it is an
-//! unordered step after a plan the reporter cannot read). The tool
+//! established: an ORDINAL step after a gap in the ordinals the reporter can
+//! read, or an unordered step when the reporter reads no ordinal edge (nor,
+//! for a plan written before the ordinal, a phase edge) of the plan. (An
+//! unordered step after HIDDEN TRAILING ordinals is not one of these: it is
+//! listed, on the wrong index; that resolution gap is backlog 6f634609 and
+//! is not closed here.) The tool
 //! description, the warning in the response, and the warning both transports
 //! log named only "out of range" and "not visible", which sends a reporter who
 //! CAN open the step looking for the wrong problem.
@@ -16,7 +20,8 @@
 //! Asserted against `EpiGraphMcpFull::all_tools_json()` (the schema
 //! `tools/list` hands a client), `unresolved_steps_warning` (the response
 //! warning both transports return) and `UNRESOLVED_STEPS_LOG` (the message both
-//! transports log).
+//! transports log), plus a source check that both transports' `tracing::warn!`
+//! calls log that constant rather than an inline copy of the old text.
 
 use epigraph_mcp::tools::workflow_hierarchical::{unresolved_steps_warning, UNRESOLVED_STEPS_LOG};
 
@@ -72,6 +77,41 @@ fn the_logged_warning_names_the_unprovable_position_cause() {
         assert!(
             UNRESOLVED_STEPS_LOG.contains(needle),
             "the logged warning must name {needle:?}; got: {UNRESOLVED_STEPS_LOG}"
+        );
+    }
+}
+
+/// The old two-cause log text, as each transport inlined it before the shared
+/// constant. Only `UNRESOLVED_STEPS_LOG`'s own definition may carry it.
+const INLINE_LOG_FRAGMENT: &str = "rows recorded with a NULL step_claim_id";
+
+fn source(rel: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+#[test]
+fn both_transports_log_the_shared_constant_not_an_inline_copy() {
+    // (file, how many times the old inline text may appear: the MCP tool file
+    // holds the constant's definition, the HTTP route holds none)
+    for (rel, allowed) in [
+        ("src/tools/workflow_hierarchical.rs", 1),
+        ("../epigraph-api/src/routes/workflows.rs", 0),
+    ] {
+        let src = source(rel);
+        let inline = src.matches(INLINE_LOG_FRAGMENT).count();
+        assert_eq!(
+            inline, allowed,
+            "{rel}: the unresolved-step log text must come from UNRESOLVED_STEPS_LOG, \
+             not an inline string ({inline} occurrence(s) of {INLINE_LOG_FRAGMENT:?})"
+        );
+        let uses = src
+            .matches("UNRESOLVED_STEPS_LOG")
+            .count()
+            .saturating_sub(usize::from(src.contains("pub const UNRESOLVED_STEPS_LOG")));
+        assert!(
+            uses >= 1,
+            "{rel}: the unresolved-step tracing::warn! must log UNRESOLVED_STEPS_LOG"
         );
     }
 }
