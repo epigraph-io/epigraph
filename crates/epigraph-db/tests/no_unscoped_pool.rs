@@ -579,7 +579,7 @@ const EXEMPT: &[(&str, usize, &str)] = &[
          agent's assertion (`AssertionNonceRepository::consume`), an app-callable definer keyed \
          by the verified public key and the assertion's signed nonce, run after the signature and freshness \
          verify and before anything is minted: the same pre-authentication reason. The \
-         twenty-first is `refuse_non_verifier_agent_key` (backlog 57943a39): between that \
+         twenty-first is `refuse_seed_derived_agent_key` (backlog 57943a39): between that \
          verify and the nonce record, one read of `agents.key_kind` (universally readable by \
          policy, untenanted) for the verified key, refusing a key whose private half is public \
          (`seed-derived`), before anything is minted: the same pre-authentication reason.",

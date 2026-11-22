@@ -347,3 +347,28 @@ async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
     );
     assert!(body.get("access_token").is_none(), "{body}");
 }
+
+/// The seed-derived refusal is NOT "anything but `ed25519`": a host-registered
+/// LLM identity stores its identity key as `derived` (migration 161's
+/// `epigraph_register_agent_identity`), and that key is keyed with a secret
+/// the host keeps, so its holder may authenticate with it. Catches a refusal
+/// widened to every non-`ed25519` kind, which would lock such a client out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_derived_identity_key_still_authenticates(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    sqlx::query("UPDATE agents SET key_kind = 'derived' WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("mark derived");
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a derived (host-keyed) identity key must still mint: {body}"
+    );
+}

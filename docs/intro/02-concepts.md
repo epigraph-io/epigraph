@@ -138,9 +138,10 @@ its private half, so an agent named by one must not sign. An agent row
 created for such a key is stored with `key_kind = 'seed-derived'`
 (migration 230), and no signature verifier accepts it:
 `AgentRepository::public_key_if_signer` (the packet-signature check's key
-source), `verify_claim`'s bare-key fallback, the edge-signature check and the
-OAuth agent assertion check (`client_credentials` and refresh) all require
-`key_kind = 'ed25519'` (backlog 57943a39). A client that registers such a key
+source), `verify_claim`'s bare-key fallback and the edge-signature check
+admit an agent's bare key only when `key_kind = 'ed25519'`, and the OAuth
+agent assertion check (`client_credentials` and refresh) refuses a
+`seed-derived` key (backlog 57943a39). A client that registers such a key
 through `POST /api/v1/agents` declares it with `"key_kind": "seed-derived"`,
 and the route then provisions no OAuth client for it. Rows written before
 these checks may still be stored as `ed25519`; re-marking them is an operator
