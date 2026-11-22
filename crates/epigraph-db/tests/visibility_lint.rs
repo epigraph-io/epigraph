@@ -1107,12 +1107,21 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          statement with no row to filter; the SQL is unchanged.",
     ),
     (
-        "claim_theme.rs",
+        "vector_scan.rs",
         "begin_iterative_hnsw",
-        "NO ROW READ. A private helper that opens a savepoint and sets two transaction-local \
-         pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the viewer-spliced theme \
-         read its caller runs next (backlog a507966d); it reads and writes no table, so there is \
-         nothing to filter.",
+        "NO ROW READ. A crate-private helper that opens a savepoint and sets two \
+         transaction-local pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the \
+         viewer-spliced kNN read its caller runs next (backlog a507966d); it reads and writes no \
+         table, so there is nothing to filter.",
+    ),
+    (
+        "vector_scan.rs",
+        "begin_exact_vector_scan",
+        "NO ROW READ. A crate-private helper that opens a savepoint and sets transaction-local \
+         planner knobs (`enable_indexscan` off; seqscan, bitmapscan, sort on) and a capped \
+         `statement_timeout` for the exact retry of the viewer-spliced kNN read its caller runs \
+         next (backlog 28b79b1e). Its one read is `pg_settings`, for the caller's own timeout; \
+         it reads and writes no table, so there is nothing to filter.",
     ),
     (
         "claim.rs",

@@ -105,6 +105,7 @@ pub mod system_agent;
 pub mod task;
 pub mod trace;
 pub mod triple;
+pub(crate) mod vector_scan;
 pub mod webhook;
 pub mod workflow;
 pub mod workflow_execution;

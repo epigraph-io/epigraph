@@ -2,6 +2,9 @@
 
 use crate::errors::DbError;
 use crate::repos::edge_signature::EdgeSigningKey;
+use crate::repos::vector_scan::{
+    begin_exact_vector_scan, begin_iterative_hnsw, exact_retry_or_first_pass,
+};
 use chrono::{DateTime, Utc};
 use epigraph_core::{AgentId, Claim, ClaimId, TenancyDecl, TraceId, TruthValue};
 use epigraph_crypto::ContentHasher;
@@ -456,6 +459,31 @@ pub struct SemanticFlatHit {
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// One row of [`ClaimRepository::semantic_search_flat`]'s statement: the hit,
+/// plus whether it clears `min_similarity`. The unpinned statement applies the
+/// threshold AFTER its scan's `LIMIT` (see that fn's "Exact retry"), so the
+/// verdict rides along and the rows that fail it are dropped in Rust.
+///
+/// `FromRow` is written out for `PgRow` rather than derived with
+/// `#[sqlx(flatten)]`: the derive's generic `where SemanticFlatHit:
+/// FromRow<'a, R>` bound defeats rustc's `Send` proof for the route futures
+/// that await this read.
+#[derive(Debug)]
+struct FlatRow {
+    hit: SemanticFlatHit,
+    meets_min_similarity: bool,
+}
+
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for FlatRow {
+    fn from_row(row: &'r sqlx::postgres::PgRow) -> Result<Self, sqlx::Error> {
+        use sqlx::Row;
+        Ok(Self {
+            hit: SemanticFlatHit::from_row(row)?,
+            meets_min_similarity: row.try_get("meets_min_similarity")?,
+        })
+    }
+}
+
 /// One `(properties->>'level', properties->>'source_type')` pair from
 /// [`ClaimRepository::embedding_radius_breakdown`].
 ///
@@ -644,6 +672,31 @@ pub struct HybridHit {
     pub rrf_score: f64,
     pub dense_similarity: Option<f64>,
     pub in_lexical: bool,
+}
+
+/// One row of the hybrid statement in
+/// [`ClaimRepository::search_hybrid_scoped_since_in_theme_conn`]: the page's
+/// hit columns, NULL on the single row an empty page still returns, plus the
+/// dense leg's size, which the statement reports on every row so the
+/// exact-retry decision never depends on the fused page being non-empty.
+#[derive(Debug, sqlx::FromRow)]
+struct HybridPageRow {
+    dense_count: i64,
+    claim_id: Option<Uuid>,
+    rrf_score: Option<f64>,
+    dense_similarity: Option<f64>,
+    in_lexical: Option<bool>,
+}
+
+impl HybridPageRow {
+    fn into_hit(self) -> Option<HybridHit> {
+        Some(HybridHit {
+            claim_id: self.claim_id?,
+            rrf_score: self.rrf_score?,
+            dense_similarity: self.dense_similarity,
+            in_lexical: self.in_lexical?,
+        })
+    }
 }
 
 /// Result row for [`ClaimRepository::latest_in_lineage`].
@@ -2969,9 +3022,22 @@ impl ClaimRepository {
     /// The transaction is ROLLED BACK, not committed: on a caller's own
     /// transaction `begin()` opens a savepoint, and releasing it would carry the
     /// `SET LOCAL` values into the caller's later HNSW reads. This is the same
-    /// arrangement as the hybrid recall dense leg. `hnsw.max_scan_tuples` stays
-    /// at its default (20,000), so a scope rarer than about `limit / 20,000` of
-    /// the embedded claims can still return fewer than `limit` rows.
+    /// arrangement as the hybrid recall dense leg.
+    ///
+    /// # Exact retry
+    ///
+    /// The iterative scan still stops at `hnsw.max_scan_tuples` (default
+    /// 20,000), so a scope rarer than about `limit / 20,000` of the embedded
+    /// claims, or a viewer with more hidden rows than that nearer the query
+    /// than its own, got fewer than `limit` rows (backlog 28b79b1e). An
+    /// unpinned first pass whose scan yields fewer than `LIMIT $7 + $9` rows
+    /// therefore runs once more as an exact scan, under a timeout that falls
+    /// back to the first pass (`vector_scan` module doc). `min_similarity` is
+    /// applied AFTER the scan's `LIMIT`, not inside it: rows come in distance
+    /// order, so the rows that clear it are a prefix of the scan either way
+    /// and the page is the same, but a threshold that ends the result early no
+    /// longer keeps the scan running to `max_scan_tuples` looking for rows
+    /// that cannot qualify, nor triggers the retry.
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`); prod runs 0.8.2.
     ///
@@ -3061,6 +3127,46 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        // `begin`, not `acquire`: holding an acquired `&mut PgConnection`
+        // across the awaits below makes this future fail rustc's `Send` proof
+        // ("implementation of `sqlx::Acquire` is not general enough") for the
+        // route handlers that await it. The transaction is read-only and is
+        // rolled back.
+        let mut tx = executor.begin().await?;
+        let rows = Self::semantic_search_flat_on(
+            &mut tx,
+            viewer,
+            ranking,
+            min_similarity,
+            claim_type,
+            created_after,
+            created_before,
+            agent_id,
+            limit,
+            theme_id,
+            offset,
+        )
+        .await;
+        tx.rollback().await?;
+        rows
+    }
+
+    /// [`Self::semantic_search_flat`] on an open transaction; the generic
+    /// form acquires and delegates here, so the statements exist once.
+    #[allow(clippy::too_many_arguments)]
+    async fn semantic_search_flat_on(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        ranking: FlatRanking<'_>,
+        min_similarity: f64,
+        claim_type: Option<&str>,
+        created_after: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<Uuid>,
+        limit: i64,
+        theme_id: Option<Uuid>,
+        offset: i64,
+    ) -> Result<Vec<SemanticFlatHit>, DbError> {
         let query_literal: Option<&str> = match (ranking, theme_id) {
             (FlatRanking::Query(v), _) => Some(v),
             (FlatRanking::ThemeCore, Some(_)) => None,
@@ -3085,7 +3191,6 @@ impl ClaimRepository {
                     SELECT k.id, (k.embedding <=> q.vec) AS dist
                     FROM claims k, query_vec q
                     WHERE k.embedding IS NOT NULL
-                      AND 1 - (k.embedding <=> q.vec) >= $2
                       AND ($3::text IS NULL OR $3 = ANY(k.labels))
                       AND ($4::timestamptz IS NULL OR k.created_at >= $4)
                       AND ($5::timestamptz IS NULL OR k.created_at <= $5)
@@ -3105,7 +3210,8 @@ impl ClaimRepository {
                     c.agent_id,
                     c.trace_id,
                     c.labels[1] AS claim_type,
-                    c.created_at
+                    c.created_at,
+                    (1 - n.dist >= $2) AS meets_min_similarity
                 FROM nearest n JOIN claims c ON c.id = n.id
                 WHERE c.embedding IS NOT NULL /* {VISIBILITY:c} */
                 ORDER BY n.dist, n.id
@@ -3163,7 +3269,8 @@ impl ClaimRepository {
                         c.agent_id,
                         c.trace_id,
                         c.labels[1] AS claim_type,
-                        c.created_at
+                        c.created_at,
+                        true AS meets_min_similarity
                     FROM page n JOIN claims c ON c.id = n.id
                     WHERE c.embedding IS NOT NULL /* {{VISIBILITY:c}} */
                     ORDER BY n.dist, n.id
@@ -3175,37 +3282,56 @@ impl ClaimRepository {
         // for (the interpolated theme-core fragment is not a template and
         // carries a single brace already). Every marker resolves to `$10`.
         let sql = viewer.splice(&sql, 10);
-        let mut q = sqlx::query_as::<_, SemanticFlatHit>(&sql)
-            .bind(query_literal) // $1
-            .bind(min_similarity) // $2
-            .bind(claim_type) // $3
-            .bind(created_after) // $4
-            .bind(created_before) // $5
-            .bind(agent_id) // $6
-            .bind(limit) // $7
-            .bind(theme_id) // $8
-            .bind(offset); // $9
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g); // $10
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, FlatRow>(&sql)
+                    .bind(query_literal) // $1
+                    .bind(min_similarity) // $2
+                    .bind(claim_type) // $3
+                    .bind(created_after) // $4
+                    .bind(created_before) // $5
+                    .bind(agent_id) // $6
+                    .bind(limit) // $7
+                    .bind(theme_id) // $8
+                    .bind(offset); // $9
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g); // $10
+                }
+                q
+            }};
         }
 
-        // One code path for both shapes. The pinned read needs no HNSW
-        // settings; running it in the same rolled-back transaction is harmless.
-        let mut tx = executor.begin().await?;
-        if theme_id.is_none() {
+        let rows = if theme_id.is_some() {
+            // The pinned read is exact and needs no HNSW settings.
+            build!().fetch_all(&mut *conn).await?
+        } else {
             // See "The scan is served by the HNSW index" above.
-            sqlx::query(
-                "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                        set_config('hnsw.ef_search', $1, true)",
-            )
-            .bind(flat_ef_search(limit).to_string())
-            .execute(&mut *tx)
-            .await?;
-        }
-        let rows = q.fetch_all(&mut *tx).await?;
-        tx.rollback().await?;
+            let mut tx = begin_iterative_hnsw(&mut *conn, flat_ef_search(limit)).await?;
+            let fetched = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            let rows = fetched?;
+            // See "Exact retry" above: the count is the scan's own, taken
+            // before `min_similarity` is applied, so a page the threshold
+            // shortened does not trigger it.
+            if (rows.len() as i64) < limit {
+                let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+                let retried = build!().fetch_all(&mut *tx).await;
+                tx.rollback().await?;
+                exact_retry_or_first_pass(retried, rows, "semantic_search_flat")?
+            } else {
+                rows
+            }
+        };
 
-        Ok(rows)
+        // Rows come in ascending distance, so the ones below
+        // `min_similarity` are a suffix.
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.meets_min_similarity)
+            .map(|r| r.hit)
+            .collect())
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.
@@ -4152,10 +4278,18 @@ impl ClaimRepository {
     ///
     /// The transaction is ROLLED BACK, not committed: on a caller's own
     /// transaction `begin()` opens a savepoint, and releasing it would carry
-    /// the `SET LOCAL` values into the caller's later HNSW reads.
-    /// `hnsw.max_scan_tuples` stays at its default (20,000). The 3072d column
-    /// has no ANN index, so there the settings are inert and the statement is
-    /// an exact scan.
+    /// the `SET LOCAL` values into the caller's later HNSW reads. The 3072d
+    /// column has no ANN index, so there the settings are inert and the
+    /// statement is an exact scan.
+    ///
+    /// # Exact retry
+    ///
+    /// The iterative scan still stops at `hnsw.max_scan_tuples` (default
+    /// 20,000), so a viewer with more hidden rows than that nearer the query
+    /// than its own got a short page (backlog 28b79b1e). A 1536d first pass
+    /// that returns fewer than `limit` rows is therefore run once more as an
+    /// exact scan, under a timeout that falls back to the first pass's rows
+    /// (`vector_scan` module doc).
     ///
     /// Requires pgvector >= 0.8.0 (`hnsw.iterative_scan`).
     #[allow(clippy::too_many_arguments)]
@@ -4280,31 +4414,40 @@ impl ClaimRepository {
         let vis_bind = if paper_doi_filter.is_some() { 5 } else { 4 };
         let sql = viewer.splice(&sql, vis_bind);
 
-        let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit)
-            .bind(since);
-        if let Some(doi) = paper_doi_filter {
-            // Every stored spelling of the document key (backlog 90756d26),
-            // through the normalizer the paper writers use: a bare filter
-            // finds a URL-keyed legacy paper and vice versa.
-            q = q.bind(crate::repos::paper::document_key_spellings(doi));
-        }
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit)
+                    .bind(since);
+                if let Some(doi) = paper_doi_filter {
+                    // Every stored spelling of the document key (backlog 90756d26),
+                    // through the normalizer the paper writers use: a bare filter
+                    // finds a URL-keyed legacy paper and vice versa.
+                    q = q.bind(crate::repos::paper::document_key_spellings(doi));
+                }
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
 
         // See "Iterative HNSW scan" above.
-        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(limit.clamp(40, 1000).to_string())
-        .execute(&mut *tx)
-        .await?;
-        let rows = q.fetch_all(&mut *tx).await?;
+        let mut tx = begin_iterative_hnsw(&mut *conn, limit).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
         tx.rollback().await?;
+        let rows = fetched?;
+        // See "Exact retry" above. The 3072d column has no ANN index, so its
+        // first pass was already exact.
+        if column == "embedding" && (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "search_by_embedding_since_conn");
+        }
 
         Ok(rows)
     }
@@ -4365,7 +4508,9 @@ impl ClaimRepository {
     /// order, until `LIMIT` matching rows are found) and
     /// `hnsw.ef_search = clamp(limit, 40, 1000)`, and is ROLLED BACK so the
     /// settings never reach the caller's later reads. `hnsw.max_scan_tuples`
-    /// (default 20,000) still bounds the scan.
+    /// (default 20,000) still bounds that scan, so a first pass that returns
+    /// fewer than `limit` rows is run once more as an exact scan (backlog
+    /// 28b79b1e; `vector_scan` module doc).
     ///
     /// Takes a connection rather than an executor because the settings need
     /// a transaction (a savepoint on a caller's own transaction).
@@ -4403,26 +4548,33 @@ impl ClaimRepository {
             "#,
             5,
         );
-        let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
-            .bind(query_embedding_pgvector)
-            .bind(limit)
-            .bind(tags_owned)
-            .bind(agent_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, ClaimEmbeddingHit>(&sql)
+                    .bind(query_embedding_pgvector)
+                    .bind(limit)
+                    .bind(tags_owned.clone())
+                    .bind(agent_id);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
 
         // See "Iterative HNSW scan" above.
-        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(limit.clamp(40, 1000).to_string())
-        .execute(&mut *tx)
-        .await?;
-        let rows = q.fetch_all(&mut *tx).await?;
+        let mut tx = begin_iterative_hnsw(&mut *conn, limit).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
         tx.rollback().await?;
+        let rows = fetched?;
+        if (rows.len() as i64) < limit {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, rows, "search_by_embedding_scoped");
+        }
 
         Ok(rows)
     }
@@ -4639,12 +4791,22 @@ impl ClaimRepository {
     /// `THEME_COVERAGE_PROBE_K` probe). `ROLLBACK TO SAVEPOINT` reverts them;
     /// for a read-only statement the two are otherwise equivalent.
     ///
-    /// Residual: the iterative scan still stops at `hnsw.max_scan_tuples`
-    /// (default 20,000) or at its memory budget (`hnsw.scan_mem_multiplier` x
-    /// `work_mem`), whichever comes first; neither is changed here. A scope
-    /// whose share of embedded current claims is below about
-    /// `candidate_pool / 20,000` (0.25% at a pool of 50) can still under-fill
-    /// the dense leg.
+    /// ## Exact retry of a short dense leg (backlog 28b79b1e)
+    ///
+    /// The iterative scan still stops at `hnsw.max_scan_tuples` (default
+    /// 20,000) or at its memory budget (`hnsw.scan_mem_multiplier` x
+    /// `work_mem`), whichever comes first, so a scope whose share of embedded
+    /// current claims is below about `candidate_pool / 20,000` (0.25% at a
+    /// pool of 50), or a viewer with that many hidden rows nearer the query,
+    /// under-filled the dense leg. The statement therefore reports the dense
+    /// leg's size (`dense_count`) on every row, including the one NULL row it
+    /// returns for an empty page, and a first pass whose dense leg holds fewer
+    /// than `candidate_pool` rows runs once more as an exact scan, under a
+    /// timeout that falls back to the first pass (`vector_scan` module doc).
+    /// The trigger is the dense leg's size, not the fused page's, so it does
+    /// not depend on `offset` and every page of a walk ranks the same pool.
+    /// The lexical leg is served by its GIN index through a bitmap scan, which
+    /// the exact pass leaves enabled.
     ///
     /// Requires pgvector >= 0.8.0, the release that added
     /// `hnsw.iterative_scan`; check the deployed extension version before
@@ -4751,47 +4913,69 @@ impl ClaimRepository {
                   /* {VISIBILITY:c} */
                 ORDER BY ts_rank_cd(c.content_tsv, q) DESC
                 LIMIT $3
+            ),
+            fused AS (
+                SELECT COALESCE(d.id, l.id) AS claim_id,
+                       (COALESCE(1.0/($4 + d.rank), 0)
+                        + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
+                       d.cos::float8 AS dense_similarity,
+                       (l.rank IS NOT NULL) AS in_lexical
+                FROM dense d
+                FULL OUTER JOIN lex l ON d.id = l.id
+                ORDER BY rrf_score DESC, claim_id
+                LIMIT $5 OFFSET $9
             )
-            SELECT COALESCE(d.id, l.id) AS claim_id,
-                   (COALESCE(1.0/($4 + d.rank), 0)
-                    + COALESCE(1.0/($4 + l.rank), 0))::float8 AS rrf_score,
-                   d.cos::float8 AS dense_similarity,
-                   (l.rank IS NOT NULL) AS in_lexical
-            FROM dense d
-            FULL OUTER JOIN lex l ON d.id = l.id
-            ORDER BY rrf_score DESC, claim_id
-            LIMIT $5 OFFSET $9
+            SELECT (SELECT count(*) FROM dense)::int8 AS dense_count,
+                   f.claim_id, f.rrf_score, f.dense_similarity, f.in_lexical
+            FROM (SELECT 1) one
+            LEFT JOIN fused f ON true
+            ORDER BY f.rrf_score DESC, f.claim_id
             "#,
             11,
         );
-        let mut q = sqlx::query_as::<_, HybridHit>(&sql)
-            .bind(query_embedding_pgvector) // $1
-            .bind(query_text) // $2
-            .bind(candidate_pool) // $3
-            .bind(k_rrf) // $4
-            .bind(limit) // $5
-            .bind(tags_owned) // $6
-            .bind(agent_id) // $7
-            .bind(since) // $8
-            .bind(offset) // $9
-            .bind(theme_id); // $10
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g); // $11
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query_as::<_, HybridPageRow>(&sql)
+                    .bind(query_embedding_pgvector) // $1
+                    .bind(query_text) // $2
+                    .bind(candidate_pool) // $3
+                    .bind(k_rrf) // $4
+                    .bind(limit) // $5
+                    .bind(tags_owned.clone()) // $6
+                    .bind(agent_id) // $7
+                    .bind(since) // $8
+                    .bind(offset) // $9
+                    .bind(theme_id); // $10
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g); // $11
+                }
+                q
+            }};
         }
 
         // See "The dense leg runs with pgvector's iterative HNSW scan" above.
-        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-        sqlx::query(
-            "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                    set_config('hnsw.ef_search', $1, true)",
-        )
-        .bind(hnsw_ef_search_for_pool(candidate_pool).to_string())
-        .execute(&mut *tx)
-        .await?;
-        let rows = q.fetch_all(&mut *tx).await?;
+        let mut tx =
+            begin_iterative_hnsw(&mut *conn, hnsw_ef_search_for_pool(candidate_pool)).await?;
+        let fetched = build!().fetch_all(&mut *tx).await;
         tx.rollback().await?;
+        let mut rows = fetched?;
+        // See "Exact retry of a short dense leg" above. The trigger is the
+        // dense leg's own size, which does not depend on `offset`, so every
+        // page of a walk takes the same path.
+        let dense_count = rows.first().map_or(0, |r| r.dense_count);
+        if dense_count < candidate_pool {
+            let mut tx = begin_exact_vector_scan(&mut *conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            rows = exact_retry_or_first_pass(retried, rows, "search_hybrid_scoped_since_in_theme")?;
+        }
 
-        Ok(rows)
+        Ok(rows
+            .into_iter()
+            .filter_map(HybridPageRow::into_hit)
+            .collect())
     }
 
     /// Lexical-only retrieval over current claims (`content_tsv` / GIN), ranked
