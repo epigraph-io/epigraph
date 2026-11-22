@@ -285,5 +285,12 @@ name = "tls_provider_choice"
 path = "tests/tls_provider_choice.rs"
 required-features = ["tls"]
 
+# Boots the `server` binary on its TLS path (EPIGRAPH_TLS_CERT / _KEY) against
+# a migrated database: `cargo test -p epigraph-api --features tls --test boot_tls_served`.
+[[test]]
+name = "boot_tls_served"
+path = "tests/boot_tls_served.rs"
+required-features = ["tls"]
+
 [lints]
 workspace = true
