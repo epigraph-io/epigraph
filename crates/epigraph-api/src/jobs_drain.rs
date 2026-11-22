@@ -185,6 +185,15 @@ pub struct DrainReport {
     /// had no handler in this run. Empty when none were named or none were
     /// pending.
     pub cancelled_unregistered: BTreeMap<String, i64>,
+    /// Privatization plans in `applying` or `reverting` that no pending or
+    /// running apply or revert job names, read at the end of the run
+    /// ([`PostgresJobQueue::stranded_privatization_plans`], backlog
+    /// e8c8dd03). Nothing will move them: their job ended (most often failed
+    /// by the reaper after its crash re-deliveries) and left the plan
+    /// mid-flight, its claims possibly part-moved. They are reported on EVERY
+    /// run until an operator recovers them (abort, then revert), so the run
+    /// exits [`EXIT_PLAN_STRANDED`] instead of 0. Empty when there are none.
+    pub stranded_privatization_plans: Vec<epigraph_jobs::StrandedPlan>,
 }
 
 /// The `error_message` of a pending job `drain_jobs --cancel-pending` cancelled.
@@ -196,11 +205,18 @@ pub const CANCELLED_UNREGISTERED_MESSAGE: &str =
 /// claim (and had no job failure): see [`DrainReport::exit_code`].
 pub const EXIT_PENDING_UNREGISTERED: i32 = 4;
 
+/// The exit code of a run that found a privatization plan stranded in
+/// `applying` or `reverting` (and had no job failure): see
+/// [`DrainReport::exit_code`] and [`DrainReport::stranded_privatization_plans`].
+pub const EXIT_PLAN_STRANDED: i32 = 5;
+
 impl DrainReport {
     /// The process exit code: 1 when any job failed in this run, retryable or
-    /// terminal; otherwise 4 ([`EXIT_PENDING_UNREGISTERED`]) when pending jobs
-    /// of an unregistered type are waiting; otherwise 3 when the run ran out of
-    /// time with work pending; otherwise 0 (drained, or locked).
+    /// terminal; otherwise 5 ([`EXIT_PLAN_STRANDED`]) when a privatization
+    /// plan is stranded mid-flight; otherwise 4 ([`EXIT_PENDING_UNREGISTERED`])
+    /// when pending jobs of an unregistered type are waiting; otherwise 3 when
+    /// the run ran out of time with work pending; otherwise 0 (drained, or
+    /// locked).
     ///
     /// A retryable failure is a failed run: the job is back to `pending` and
     /// the next run retries it, but an operator hears about it the first time
@@ -213,10 +229,18 @@ impl DrainReport {
     /// exited 0 while those jobs sat in the queue for ever, which reads as
     /// "drained" (backlog f5448fed). It outranks 3 for the same reason a
     /// failure does, and ranks below 1 so a job failure is never hidden.
+    ///
+    /// A stranded plan (backlog e8c8dd03) is its own code too. The run that
+    /// reaps its job already exits 1, but every later run used to exit 0
+    /// while the plan sat mid-flight with part of its claims moved, which
+    /// reads as "healthy". It outranks 4: a plan whose claims are half-moved
+    /// is the more urgent of the two, and both mean an operator must act.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if !self.failures.is_empty() {
             1
+        } else if !self.stranded_privatization_plans.is_empty() {
+            EXIT_PLAN_STRANDED
         } else if !self.pending_unregistered.is_empty() {
             EXIT_PENDING_UNREGISTERED
         } else if self.out_of_time {
@@ -381,6 +405,14 @@ pub async fn drain_cancelling(
                 });
             }
         }
+    }
+    report.stranded_privatization_plans = queue.stranded_privatization_plans().await?;
+    if !report.stranded_privatization_plans.is_empty() {
+        tracing::error!(
+            stranded_privatization_plans = ?report.stranded_privatization_plans,
+            "drain: a privatization plan is stranded in applying or reverting with no job to \
+             finish it; abort it, then revert it"
+        );
     }
     report.pending_unregistered = queue
         .count_pending_by_type_outside(&report.registered)

@@ -510,6 +510,143 @@ async fn a_one_attempt_job_past_its_crash_redeliveries_is_failed_by_the_reaper(p
     assert_eq!(report.exit_code(), 1);
 }
 
+/// Backlog e8c8dd03: a privatization apply job the reaper fails after its
+/// crash re-deliveries leaves its plan in `applying` with nothing to finish
+/// it. The run that reaps it exits 1 (a job failure), but before this every
+/// LATER run exited 0 and named nothing while the plan sat mid-flight. The
+/// drain now reads such plans at the end of every run
+/// (`stranded_privatization_plans` in the report) and exits
+/// `EXIT_PLAN_STRANDED` (5) while one exists, until the operator recovers it.
+/// The recovery step the runbook names, `POST …/abort`, clears it: the next
+/// run is clean.
+///
+/// Calibrated by the plan BEFORE its job is reaped: a pending apply job
+/// names it, so it is not stranded (a dispatch in progress is never
+/// reported).
+///
+/// Verified to fail: without the drain's stranded-plan read, the second run
+/// exits 0 and names no plan; without the query's live-job exclusion the
+/// pending-job calibration names the plan.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_plan_whose_job_the_reaper_failed_is_reported_on_every_run_until_aborted(pool: PgPool) {
+    use axum::extract::{Path, State};
+    use epigraph_api::middleware::bearer::ViewerExtractor;
+
+    let world = fx::World::seed(&pool).await;
+    let claim = viewer_fixture::seed_public_claim(&pool, world.actor, "stranded seed").await;
+    let (plan, _) = fx::create_plan(&pool, &world, &[claim]).await;
+    let correlation = fx::dispatch(&pool, &world, plan, "applying").await;
+    let job = {
+        let job = fx::apply_job(plan, world.actor, &correlation);
+        let id: Uuid = job.id.into();
+        PostgresJobQueue::new(pool.clone())
+            .enqueue(job)
+            .await
+            .expect("seed the apply job");
+        id
+    };
+
+    let scoped = maintenance_scoped(&pool).await;
+    assert_maintenance_posture(&scoped).await;
+    let (runner, queue) = runner_on(&scoped, EmbeddingProviderKind::Mock);
+
+    assert_eq!(
+        queue
+            .stranded_privatization_plans()
+            .await
+            .expect("read stranded plans"),
+        Vec::new(),
+        "CALIBRATION: a plan in applying whose apply job is still pending is a dispatch in \
+         progress, not a stranded plan"
+    );
+
+    // The apply job's handler was killed on every run: one attempt, running
+    // past the stale bound, its crash re-deliveries spent.
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', started_at = now() - interval '2 hours', \
+                retry_count = 0, max_retries = 1, redelivery_count = $2 WHERE id = $1",
+    )
+    .bind(job)
+    .bind(epigraph_jobs::MAX_CRASH_REDELIVERIES)
+    .execute(&pool)
+    .await
+    .expect("age the apply job on its last re-delivery");
+
+    let reaping = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the reaping run");
+    assert!(
+        reaping
+            .failures
+            .iter()
+            .any(|f| f.job_id == job && f.error == epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE),
+        "CALIBRATION: the reaper fails the apply job: {reaping:?}"
+    );
+    assert_eq!(reaping.exit_code(), 1, "{reaping:?}");
+    assert_eq!(
+        fx::plan_state(&pool, plan).await,
+        "applying",
+        "CALIBRATION: the reaped job leaves its plan mid-flight"
+    );
+    let expected = vec![epigraph_jobs::StrandedPlan {
+        plan_id: plan,
+        state: "applying".to_string(),
+        last_job_id: Some(job),
+        last_job_state: Some("failed".to_string()),
+        last_job_error: Some(epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE.to_string()),
+    }];
+    assert_eq!(
+        reaping.stranded_privatization_plans, expected,
+        "the reaping run names the plan its reap stranded"
+    );
+
+    // A later run reaps nothing and runs nothing; the plan is still stranded.
+    let later = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("a later run");
+    assert!(later.failures.is_empty(), "{later:?}");
+    assert_eq!(
+        later.stranded_privatization_plans, expected,
+        "a run after the reap still names the stranded plan"
+    );
+    assert_eq!(
+        later.exit_code(),
+        jobs_drain::EXIT_PLAN_STRANDED,
+        "a run that found a plan stranded mid-flight exited as healthy: {later:?}"
+    );
+    let wire = serde_json::to_value(&later).expect("the report serializes");
+    assert_eq!(
+        wire["stranded_privatization_plans"][0]["plan_id"],
+        serde_json::json!(plan),
+        "the printed report names the plan: {wire}"
+    );
+
+    // The runbook's recovery step: abort the plan.
+    let state = fx::split_state(&pool).await;
+    let axum::Json(aborted) = epigraph_api::routes::privatization::abort_plan(
+        ViewerExtractor(
+            epigraph_db::visibility::Viewer::resolve(&pool, world.actor)
+                .await
+                .expect("resolve"),
+        ),
+        State(state),
+        Some(axum::Extension(fx::auth_for(world.actor))),
+        Path(plan),
+    )
+    .await
+    .expect("the stranded plan can be aborted");
+    assert_eq!(aborted.state, "failed");
+
+    let recovered = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("the run after the abort");
+    assert!(
+        recovered.stranded_privatization_plans.is_empty(),
+        "an aborted plan is no longer reported: {recovered:?}"
+    );
+    assert_eq!(recovered.exit_code(), 0, "{recovered:?}");
+}
+
 /// The provider gate on `embedding_generation`, and why the drain filters by
 /// registered type: with a provider that may not write `claims.embedding` the
 /// handler is not registered, and a pending `embedding_generation` job at the
@@ -961,6 +1098,45 @@ fn a_failed_job_outranks_running_out_of_time_in_the_exit_code() {
         failed_and_stranded.exit_code(),
         1,
         "a job failure was hidden behind unregistered pending work"
+    );
+    let stranded_plan = || {
+        vec![epigraph_jobs::StrandedPlan {
+            plan_id: Uuid::nil(),
+            state: "applying".to_string(),
+            last_job_id: None,
+            last_job_state: None,
+            last_job_error: None,
+        }]
+    };
+    let plan_stranded = jobs_drain::DrainReport {
+        stranded_privatization_plans: stranded_plan(),
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(
+        plan_stranded.exit_code(),
+        jobs_drain::EXIT_PLAN_STRANDED,
+        "a plan stranded mid-flight exited 0"
+    );
+    let plan_stranded_unregistered_late = jobs_drain::DrainReport {
+        stranded_privatization_plans: stranded_plan(),
+        pending_unregistered: unregistered(),
+        out_of_time: true,
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(
+        plan_stranded_unregistered_late.exit_code(),
+        jobs_drain::EXIT_PLAN_STRANDED,
+        "a stranded plan was hidden behind unregistered pending work or running out of time"
+    );
+    let failed_and_plan_stranded = jobs_drain::DrainReport {
+        failures: vec![failure(true)],
+        stranded_privatization_plans: stranded_plan(),
+        ..jobs_drain::DrainReport::default()
+    };
+    assert_eq!(
+        failed_and_plan_stranded.exit_code(),
+        1,
+        "a job failure was hidden behind a stranded plan"
     );
     for terminal in [false, true] {
         let failed = jobs_drain::DrainReport {

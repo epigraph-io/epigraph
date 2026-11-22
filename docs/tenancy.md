@@ -2288,3 +2288,39 @@ things that does not amount to:
 All three are functional gaps and none is a confidentiality one — the seal nulled
 the vectors, which is the safe direction. An operator who wants full recall back
 after an unseal runs `epigraph-cli reembed`.
+
+### A plan stranded in `applying` or `reverting`
+
+The apply and revert jobs are one-attempt jobs. When the drain's reaper finds one
+still `running` after `MAX_CRASH_REDELIVERIES` (3) crash re-deliveries, it fails
+the job with `REAPED_REDELIVERIES_SPENT_MESSAGE`; a handler that fails on a
+database fault (a deadlock or a lock timeout, say) also ends its job `failed`.
+Neither writes the plan: it stays in `applying` or `reverting`, with whatever
+prefix of its batches committed. A refusal is different: the handler sets the
+plan `failed` itself.
+
+**How it is detected.** At the end of every run `drain_jobs` lists each plan in
+`applying` or `reverting` that no `pending` or `running` apply or revert job
+names, under `stranded_privatization_plans` in its JSON report (plan id, state,
+and the last job's id, state and error), logs it at ERROR, and exits **5**
+while one exists (a job failure still exits 1). It does so on every run until
+the plan is recovered, so the timer's failure alert keeps firing. The dispatch
+writes the state flip and the job in one transaction, so a dispatch in
+progress is never reported.
+
+**How to recover.** The applied prefix stays applied until reverted, and the
+order of the two steps is the one §6.5.5 gives for any stop:
+
+1. `POST /api/v1/admin/privatization/plans/:id/abort`: sets the plan `failed`
+   and writes a `plan.abort` audit row. The next drain run no longer reports it.
+2. `POST /api/v1/admin/privatization/plans/:id/revert`: un-applies exactly the
+   items marked `applied` (a revert accepts a `failed` plan). A `seal` plan with
+   a sealed item is refused until those items are unsealed.
+
+Both are privatization lifecycle routes, so they answer only on a deployment
+that attaches a maintenance pool to the API; under operator decision D9 the
+server attaches none and they answer 501. Before deploying a `drain_jobs` with
+this check, list the plans it will report (`SELECT id, state FROM
+privatization_plans WHERE state IN ('applying', 'reverting')` on the
+maintenance login, then look for a live job naming each one): every one of
+them makes every run exit 5 until it is recovered.
