@@ -3346,3 +3346,188 @@ async fn link_retired_attest_shared_signer_refuses_a_multi_id_agents_file(pool: 
             .expect("links");
     assert_eq!(links, 0, "refused before any retire call");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Writer-owned rows the trigger leaves in place (backlog fc2fe9c7)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A world-owned public claim by the retired (linked) author carrying three
+/// WRITER-OWNED rows, all public: evidence the non-linked stranger wrote and
+/// owns (migration 114), a challenge the stranger filed and owns (migration
+/// 168's outsider challenge), and evidence the LINKED actor wrote and owns.
+/// While the claim stays public the tenancy trigger leaves every one of them
+/// on its writer's group, whatever `--derived` says.
+struct WoFx {
+    fx: Fx,
+    c: Uuid,
+    ev_stranger: Uuid,
+    ch_stranger: Uuid,
+    ev_actor: Uuid,
+    ev_plain: Uuid,
+}
+
+async fn writer_owned_fixture(pool: &PgPool) -> WoFx {
+    let fx = seed(pool).await;
+    let c = claim(pool, fx.retired, WORLD, "carries writer-owned rows").await;
+    let ev_plain = evidence(pool, c, Some(fx.retired), "the author's own evidence").await;
+    let ev_stranger = evidence(pool, c, Some(fx.stranger), "the stranger's own evidence").await;
+    let ev_actor = evidence(pool, c, Some(fx.actor), "the linked actor's own evidence").await;
+    let ch_stranger: Uuid = sqlx::query_scalar(
+        "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation) \
+         VALUES ($1, $2, 'factual', 'the outsider objects') RETURNING id",
+    )
+    .bind(c)
+    .bind(fx.stranger)
+    .fetch_one(pool)
+    .await
+    .expect("seed the outsider's challenge");
+    // The shape migrations 114 and 168 give a writer's row on a public claim
+    // (the harness is privileged, so the rows inherited; set it directly).
+    // LAST, on purpose: 070's insert arm re-syncs every row of a table to its
+    // claim on each new insert for that claim.
+    for (t, id, g) in [
+        ("evidence", ev_stranger, fx.stranger_group),
+        ("evidence", ev_actor, fx.actor_group),
+        ("challenges", ch_stranger, fx.stranger_group),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE {t} SET owner_group_id = $2, visibility = 'public', writer_owned = true \
+              WHERE id = $1"
+        ))
+        .bind(id)
+        .bind(g)
+        .execute(pool)
+        .await
+        .expect("make a writer-owned row");
+    }
+    WoFx {
+        fx,
+        c,
+        ev_stranger,
+        ch_stranger,
+        ev_actor,
+        ev_plain,
+    }
+}
+
+async fn is_writer_owned(pool: &PgPool, table: &str, id: Uuid) -> bool {
+    sqlx::query_scalar(&format!("SELECT writer_owned FROM {table} WHERE id = $1"))
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{table} {id}: {e}"))
+}
+
+async fn reown_one(
+    pool: &PgPool,
+    w: &WoFx,
+    derived: &str,
+    mf: &std::path::Path,
+    apply: bool,
+) -> Run {
+    let dir = mf.parent().expect("manifest dir");
+    let ids = ids_file(dir, "wo-ids.txt", &[w.c]);
+    let op = w.fx.operator.to_string();
+    let mut args = vec![
+        "reown-claims",
+        "--claims-file",
+        ids.to_str().unwrap(),
+        "--operator",
+        &op,
+        "--derived",
+        derived,
+        "--manifest-out",
+        mf.to_str().unwrap(),
+    ];
+    if apply {
+        args.push("--apply");
+    }
+    run_op(pool, &args).await
+}
+
+async fn assert_writer_owned_rows_stayed(pool: &PgPool, w: &WoFx, r: &Run) {
+    let fx = &w.fx;
+    assert_eq!(
+        tenancy(pool, "claims", w.c).await,
+        public(fx.target),
+        "{}",
+        r.show()
+    );
+    assert_eq!(
+        tenancy(pool, "evidence", w.ev_plain).await,
+        public(fx.target),
+        "control: the author's own (not writer-owned) evidence follows the claim"
+    );
+    for (t, id, g) in [
+        ("evidence", w.ev_stranger, fx.stranger_group),
+        ("evidence", w.ev_actor, fx.actor_group),
+        ("challenges", w.ch_stranger, fx.stranger_group),
+    ] {
+        assert_eq!(
+            tenancy(pool, t, id).await,
+            public(g),
+            "{t} {id}: a writer-owned row stays its writer's\n{}",
+            r.show()
+        );
+        assert!(
+            is_writer_owned(pool, t, id).await,
+            "{t} {id} keeps its flag"
+        );
+    }
+}
+
+/// MEASUREMENT (backlog fc2fe9c7): in the default `follow-claim` mode, a claim
+/// carrying writer-owned evidence and an outsider's challenge re-owns, those
+/// rows stay on their writers' groups (the trigger's rule), the run's own
+/// plan agrees, and a reversal restores every row byte for byte.
+#[sqlx::test(migrations = "../../migrations")]
+async fn follow_claim_leaves_writer_owned_rows_and_outsider_challenges_in_place(pool: PgPool) {
+    let w = writer_owned_fixture(&pool).await;
+    let dir = scratch_dir();
+    let mf = dir.join("wo.jsonl");
+    let before = snapshot(&pool, true).await;
+    let r = reown_one(&pool, &w, "follow-claim", &mf, true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(r.stdout.contains("claims moved: 1"), "{}", r.show());
+    assert_writer_owned_rows_stayed(&pool, &w, &r).await;
+
+    let rv = reverse(&pool, &mf, true).await;
+    assert_eq!(rv.code, 0, "{}", rv.show());
+    assert_same(&before, &snapshot(&pool, true).await, "apply then reverse");
+}
+
+/// `keep-writer` too: the LINKED actor's writer-owned evidence is not in the
+/// keep set (its writer is linked) but the trigger leaves it on the actor's
+/// group all the same, and the plan must say so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn keep_writer_leaves_a_linked_writers_writer_owned_row_in_place(pool: PgPool) {
+    let w = writer_owned_fixture(&pool).await;
+    let dir = scratch_dir();
+    let r = reown_one(&pool, &w, "keep-writer", &dir.join("wo.jsonl"), true).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert_writer_owned_rows_stayed(&pool, &w, &r).await;
+}
+
+/// The dry run's census does not report a writer-owned row as moving to the
+/// operator's group: the stranger's two writer-owned rows are not SPILL, they
+/// are WRITER-OWNED, and the rolled-back batches hold their invariants.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_dry_run_census_counts_writer_owned_rows_as_staying(pool: PgPool) {
+    let w = writer_owned_fixture(&pool).await;
+    let dir = scratch_dir();
+    let r = reown_one(&pool, &w, "follow-claim", &dir.join("wo.jsonl"), false).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    for needle in [
+        "SPILL (rows written by agents NOT linked to the operator; they MOVE to the operator \
+         group in this mode): 0 row(s)",
+        "WRITER-OWNED\tchallenges\t1",
+        "WRITER-OWNED\tevidence\t2",
+        "invariants: all held in every batch",
+    ] {
+        assert!(
+            r.stdout.contains(needle),
+            "missing {needle:?}\n{}",
+            r.show()
+        );
+    }
+}

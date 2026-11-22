@@ -30,10 +30,18 @@
 //! Required, with no default, because it is a policy decision:
 //!
 //! * `follow-claim`: every derived row takes the new owner (what the trigger
-//!   does on its own).
+//!   does on its own), except a WRITER-OWNED one (below).
 //! * `keep-writer`: a derived row whose WRITER is not linked to the operator
 //!   keeps the owner it had. The trigger moves it; this module puts it back in
 //!   the same transaction.
+//!
+//! In BOTH modes a row carrying the `writer_owned` flag keeps its owner:
+//! migration 114's writer-owned evidence, BBAs and reasoning traces, and
+//! migration 168's challenge owned by the outsider who filed it. The tenancy
+//! trigger leaves such a row on its writer's group while the claim stays
+//! public, which it always does here, so the plan predicts exactly that, the
+//! census does not count it as moving (`WRITER-OWNED` lines, not `SPILL`), and
+//! the manifest records it unchanged.
 //!
 //! A table with no writer column, or a row whose writer is NULL, FOLLOWS the
 //! claim in both modes (see `tables::WRITER_COLUMNS`). Edges are not rewritten
@@ -386,6 +394,13 @@ fn expected(a: &Attached, specs: &[TableSpec], target: Uuid, keep: &BTreeSet<Row
     if keep.contains(&(a.table.clone(), a.pk.clone())) {
         return a.tenancy.clone();
     }
+    // Migrations 114 and 168: the trigger never moves a WRITER-OWNED row
+    // (writer-owned evidence, BBAs and traces; an outsider's challenge) while
+    // its claim stays public, and a re-own moves public claims only. Its
+    // writer keeps it in both `--derived` modes.
+    if a.writer_owned == Some(true) {
+        return a.tenancy.clone();
+    }
     match spec_of(specs, &a.table).kind {
         // Migration 120 (D8): a public-to-public owner change of an endpoint
         // never rewrites a public edge (propagation writes an edge only where
@@ -432,6 +447,10 @@ pub struct Spill {
     pub by_writer: BTreeMap<Uuid, usize>,
     /// Rows with no writer of record (no writer column, or NULL), per table.
     pub unattributed: BTreeMap<String, usize>,
+    /// WRITER-OWNED rows (migrations 114 and 168), per table: they stay on
+    /// their writer's group in both modes, so they are not spill whoever
+    /// wrote them.
+    pub writer_owned: BTreeMap<String, usize>,
     /// Fragments that are also the provenance of a claim not being moved.
     pub shared_fragments: usize,
     /// Per eligible claim: edges whose OTHER endpoint is a claim that is not
@@ -461,6 +480,10 @@ async fn spill(
             for c in a.claims.intersection(eligible) {
                 *s.neighbour_edges.entry(*c).or_default() += 1;
             }
+        }
+        if a.writer_owned == Some(true) {
+            *s.writer_owned.entry(a.table.clone()).or_default() += 1;
+            continue;
         }
         match a.writer {
             Some(w) => {
@@ -1118,11 +1141,18 @@ pub async fn run(
     writeln!(
         out,
         "RULE: rows with no writer of record (no writer column, or NULL) follow the claim in both \
-         --derived modes; edges are not rewritten (migration 120: a public edge keeps its owner, \
-         its writer's group or the world)"
+         --derived modes; writer-owned rows (writer_owned flag: a writer's evidence, BBA or \
+         trace, an outsider's challenge) keep their writer's owner in both modes; edges are not \
+         rewritten (migration 120: a public edge keeps its owner, its writer's group or the world)"
     )?;
     for (t, n) in &report.spill.unattributed {
         writeln!(out, "UNATTRIBUTED\t{t}\t{n}")?;
+    }
+    for (t, n) in &report.spill.writer_owned {
+        writeln!(
+            out,
+            "WRITER-OWNED\t{t}\t{n}\t(stay on their writer's group in both modes)"
+        )?;
     }
     writeln!(
         out,

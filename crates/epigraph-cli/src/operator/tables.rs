@@ -401,8 +401,8 @@ pub struct Attached {
     /// other claim endpoint.
     pub neighbours: BTreeSet<Uuid>,
     /// Migration 114's `writer_owned`, on a table that carries it; `None`
-    /// elsewhere. Read by `restrict-claims` (a narrowing clears it), ignored
-    /// by the re-own.
+    /// elsewhere. Read by `restrict-claims` (a narrowing clears it) and by the
+    /// re-own (a public-to-public move leaves the row on its writer's group).
     pub writer_owned: Option<bool>,
     /// Evidence only: `evidence_type`, `labels` and the first 80 characters of
     /// `raw_content`, for the hide selectors and their preview.
