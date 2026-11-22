@@ -276,7 +276,8 @@ pub(crate) async fn open_scoped_read<'a>(
 // from both router variants in PR-03 and is served only by the internal
 // listener that `bin/server.rs` binds (`EPIGRAPH_METRICS_ADDR`).
 use crate::middleware::{
-    bearer_auth_middleware, optional_bearer_auth_middleware, rate_limit_middleware,
+    address_rate_limit_middleware, bearer_auth_middleware, optional_bearer_auth_middleware,
+    rate_limit_middleware,
 };
 use crate::state::AppState;
 use axum::{
@@ -419,6 +420,11 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
+/// request except the liveness probes is ALSO charged to its client address,
+/// outside the bearer layers and routing, so 401s and unknown-path 404s are
+/// counted and refused before any token is read.
 ///
 /// When it carries none but carries `AppState::guest_rate_limiter` (guest
 /// reads on, no limiter configured: the operator's ruling of 2026-11-16), the
@@ -1443,15 +1449,25 @@ pub fn create_router_with_extensions(
         ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // The body limit is the outermost layer. Rate limiting is NOT layered
-    // here: each of the three routers above installs it where it can see the
-    // principal (inside the bearer layers), so a merged-router layer could
-    // only ever key on the address. Health endpoints bypass it internally.
+    // The principal rate limiter is NOT layered here: each of the three
+    // routers above installs it where it can see the principal (inside the
+    // bearer layers), so a merged-router layer could only ever key on the
+    // address. Health endpoints bypass it internally.
+    //
+    // The PER-ADDRESS limiter (backlog 20210eaa) is, on purpose, and
+    // outermost: outside the bearer layers and outside routing, so the
+    // bearer layer's per-request reads, its 401s and unknown-path 404s are
+    // all charged to the client address, and a refused request reaches none
+    // of them. A no-op unless `AppState::address_rate_limiter` is set.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            address_rate_limit_middleware,
+        ))
         .with_state(state)
 }
 
@@ -1484,6 +1500,11 @@ pub fn create_router_with_extensions(
 /// charged to its principal and an anonymous one to its client address
 /// (`middleware::rate_limit`). A request to a protected route without a valid
 /// token is refused 401 by the bearer layer before it reaches the limiter.
+///
+/// When it carries `AppState::address_rate_limiter` (backlog 20210eaa), every
+/// request except the liveness probes is ALSO charged to its client address,
+/// outside the bearer layers and routing, so 401s and unknown-path 404s are
+/// counted and refused before any token is read.
 #[cfg(not(feature = "db"))]
 pub fn create_router(state: AppState) -> Router {
     create_router_with_extensions(state, Vec::new())
@@ -1969,15 +1990,25 @@ pub fn create_router_with_extensions(
         ))
         .layer(middleware::map_response(oauth_response_headers));
 
-    // The body limit is the outermost layer. Rate limiting is NOT layered
-    // here: each of the three routers above installs it where it can see the
-    // principal (inside the bearer layers), so a merged-router layer could
-    // only ever key on the address. Health endpoints bypass it internally.
+    // The principal rate limiter is NOT layered here: each of the three
+    // routers above installs it where it can see the principal (inside the
+    // bearer layers), so a merged-router layer could only ever key on the
+    // address. Health endpoints bypass it internally.
+    //
+    // The PER-ADDRESS limiter (backlog 20210eaa) is, on purpose, and
+    // outermost: outside the bearer layers and outside routing, so the
+    // bearer layer's per-request reads, its 401s and unknown-path 404s are
+    // all charged to the client address, and a refused request reaches none
+    // of them. A no-op unless `AppState::address_rate_limiter` is set.
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(oauth)
         .layer(DefaultBodyLimit::max(state.config.max_request_size))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            address_rate_limit_middleware,
+        ))
         .with_state(state)
 }
 

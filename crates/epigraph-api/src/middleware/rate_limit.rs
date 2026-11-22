@@ -326,6 +326,59 @@ pub async fn guest_rate_limit_middleware(
     Ok(response)
 }
 
+/// The per-address limiter (backlog 20210eaa).
+///
+/// [`rate_limit_middleware`] sits INSIDE the bearer layers so it can charge
+/// a request to its principal, which leaves three things uncounted: the
+/// bearer layer's own per-request work (token verification, the revocation
+/// lookup and the admin-scope and delegation reads), the requests it refuses
+/// 401, and requests to a path no route matches (404). This middleware is
+/// layered on the whole merged router, outside all of that
+/// (`routes::create_router`), and charges EVERY request to its client
+/// address ([`client_ip`]: the TCP peer, or behind a trusted proxy the
+/// right-most untrusted `X-Forwarded-For` hop) before any of it runs. A
+/// refused request is answered 429 having cost one bucket lookup.
+///
+/// It writes no `X-RateLimit-*` headers: it runs last on the way out, so it
+/// would overwrite the principal limiter's, which describe the bucket a
+/// client can do something about.
+///
+/// Exempt: the liveness probes, matched exactly (`/health` and anything
+/// under `/health/`, `/readiness`, `/liveness`), not by prefix as
+/// [`should_bypass_rate_limit`] does, so `/healthXYZ` is a counted 404. CORS
+/// preflights are NOT exempt: this process answers no CORS (it is the
+/// reverse proxy's), so an `OPTIONS` request is one more request.
+///
+/// Active only when the state carries [`AppState::address_rate_limiter`]
+/// (`EPIGRAPH_RATE_LIMIT_ADDRESS_RPM`).
+pub async fn address_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, RateLimitResponse> {
+    let Some(rate_limiter) = state.address_rate_limiter.clone() else {
+        return Ok(next.run(request).await);
+    };
+    if is_liveness_probe(request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
+    let agent_id = client_ip(&request, rate_limiter.trusted_proxies())
+        .map(ip_to_agent_id)
+        .unwrap_or_else(|| fallback_key(request.uri().path()));
+    refuse_if_limited(&state, &rate_limiter, agent_id, request.uri().path())?;
+    Ok(next.run(request).await)
+}
+
+/// Whether `path` is one of [`BYPASS_ROUTES`] exactly, or under one of them
+/// (`/health/ready`), as opposed to merely starting with its text
+/// (`/healthXYZ`).
+fn is_liveness_probe(path: &str) -> bool {
+    BYPASS_ROUTES.iter().any(|route| {
+        path.strip_prefix(route)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
 /// The bucket of a request no key could be read for. Reachable only for a
 /// router served WITHOUT connect info, which `bin/server.rs` never does; it is
 /// one shared bucket, so it is logged.
@@ -475,6 +528,22 @@ mod tests {
             "/metrics-not-really",
             &Method::GET
         ));
+    }
+
+    #[test]
+    fn the_address_limiter_exempts_the_probes_exactly() {
+        for exempt in ["/health", "/health/ready", "/readiness", "/liveness"] {
+            assert!(is_liveness_probe(exempt), "{exempt}");
+        }
+        for counted in [
+            "/healthXYZ",
+            "/health-check",
+            "/readinessjunk",
+            "/",
+            "/api/v1/claims",
+        ] {
+            assert!(!is_liveness_probe(counted), "{counted}");
+        }
     }
 
     #[test]

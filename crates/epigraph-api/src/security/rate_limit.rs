@@ -284,6 +284,13 @@ pub const RATE_LIMIT_GLOBAL_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_GLOBAL_RPM";
 /// The reverse proxies whose `X-Forwarded-For` is believed ([`TrustedProxies`]).
 /// Read only to key an installed limiter; it never turns one on.
 pub const TRUSTED_PROXIES_ENV: &str = "EPIGRAPH_TRUSTED_PROXIES";
+/// Requests per minute per client address, counted OUTSIDE authentication
+/// and routing (backlog 20210eaa): every request from one address, a 401, an
+/// unknown-path 404 and an authenticated request alike, is charged to the
+/// address before the bearer layer reads anything. Unset: no per-address
+/// limiter. It is independent of [`RATE_LIMIT_RPM_ENV`] (setting one does not
+/// turn the other on), and [`RATE_LIMIT_ENV`]`=off` turns it off too.
+pub const RATE_LIMIT_ADDRESS_RPM_ENV: &str = "EPIGRAPH_RATE_LIMIT_ADDRESS_RPM";
 /// [`RATE_LIMIT_RPM_ENV`]'s value when rate limiting is on but no per-bucket
 /// limit was given (`EPIGRAPH_RATE_LIMIT=on`, or only a global limit): 10
 /// requests a second sustained, with a burst of a full minute's worth.
@@ -318,6 +325,10 @@ pub struct RateLimitSettings {
     /// Whose `X-Forwarded-For` is believed. Unset means loopback only (a
     /// reverse proxy on this host); `none` trusts no proxy.
     pub trusted_proxies: TrustedProxies,
+    /// Requests per minute per client address for the per-address limiter
+    /// ([`RATE_LIMIT_ADDRESS_RPM_ENV`]), if configured. [`Self::parse`]
+    /// leaves it `None`; [`Self::with_address_rpm`] sets it.
+    pub per_address_rpm: Option<u32>,
 }
 
 impl RateLimitSettings {
@@ -379,7 +390,21 @@ impl RateLimitSettings {
             per_key_rpm,
             global_rpm,
             trusted_proxies,
+            per_address_rpm: None,
         })
+    }
+
+    /// Add the per-address limit, [`RATE_LIMIT_ADDRESS_RPM_ENV`]'s raw value
+    /// (`None` or blank = unset). A value that is not a positive whole number
+    /// is an error, for the same reason as [`Self::parse`]'s.
+    pub fn with_address_rpm(mut self, raw: Option<&str>) -> Result<Self, String> {
+        self.per_address_rpm = match blank_is_unset(raw) {
+            None => None,
+            Some(v) => Some(v.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                format!("{RATE_LIMIT_ADDRESS_RPM_ENV}={v:?} is not a positive whole number")
+            })?),
+        };
+        Ok(self)
     }
 
     /// Read and parse the variables from the process environment.
@@ -390,6 +415,29 @@ impl RateLimitSettings {
             var(RATE_LIMIT_RPM_ENV).as_deref(),
             var(RATE_LIMIT_GLOBAL_RPM_ENV).as_deref(),
             var(TRUSTED_PROXIES_ENV).as_deref(),
+        )?
+        .with_address_rpm(var(RATE_LIMIT_ADDRESS_RPM_ENV).as_deref())
+    }
+
+    /// The per-address limiter (backlog 20210eaa), or `None` when
+    /// [`Self::per_address_rpm`] is unset or [`RATE_LIMIT_ENV`] is `off`.
+    ///
+    /// One bucket per client address ([`TrustedProxies`] decides which
+    /// `X-Forwarded-For` hop that is, as for the principal limiter), no
+    /// global bucket. It is a backstop under the principal limiter, not a
+    /// replacement: every principal behind one address shares this bucket,
+    /// so size it for the busiest address, not for one client.
+    #[must_use]
+    pub fn build_address(&self) -> Option<AgentRateLimiter> {
+        let rpm = self.per_address_rpm.filter(|_| !self.switched_off)?;
+        Some(
+            AgentRateLimiter::new(RateLimitConfig {
+                default_rpm: rpm,
+                global_rpm: u32::MAX,
+                replenish_interval_secs: 1,
+                enable_global_limit: false,
+            })
+            .with_trusted_proxies(self.trusted_proxies.clone()),
         )
     }
 
@@ -432,6 +480,7 @@ impl RateLimitSettings {
             per_key_rpm: DEFAULT_RATE_LIMIT_RPM,
             global_rpm: None,
             trusted_proxies: self.trusted_proxies.clone(),
+            per_address_rpm: None,
         })
     }
 }
@@ -1283,6 +1332,67 @@ mod tests {
                 RateLimitSettings::parse(None, rpm, global, proxies).is_err(),
                 "{rpm:?} {global:?} {proxies:?} must refuse"
             );
+        }
+    }
+
+    /// 20210eaa: the per-address limiter is opt-in through its own variable,
+    /// does not turn the principal limiter on (nor the reverse), is turned off
+    /// by an explicit `EPIGRAPH_RATE_LIMIT=off`, and keys through the same
+    /// trusted proxies.
+    #[test]
+    fn the_address_limit_is_its_own_opt_in() {
+        let unset = RateLimitSettings::parse(None, None, None, None)
+            .unwrap()
+            .with_address_rpm(None)
+            .unwrap();
+        assert!(unset.build_address().is_none(), "unset: no address limiter");
+        let blank = unset.clone().with_address_rpm(Some(" ")).unwrap();
+        assert!(blank.build_address().is_none(), "blank is unset");
+
+        let only = RateLimitSettings::parse(None, None, None, Some("192.0.2.0/24"))
+            .unwrap()
+            .with_address_rpm(Some("900"))
+            .unwrap();
+        assert!(
+            only.build().is_none(),
+            "the address limit does not turn the principal limiter on"
+        );
+        let limiter = only.build_address().expect("address limiter");
+        assert_eq!(limiter.config().default_rpm, 900);
+        assert!(!limiter.config().enable_global_limit);
+        assert!(limiter
+            .trusted_proxies()
+            .contains("192.0.2.9".parse().unwrap()));
+        assert!(
+            only.guest_default().is_some(),
+            "the address limit does not count as a configured limiter for the guest default"
+        );
+
+        let principal = RateLimitSettings::parse(None, Some("30"), None, None)
+            .unwrap()
+            .with_address_rpm(None)
+            .unwrap();
+        assert!(principal.build().is_some());
+        assert!(
+            principal.build_address().is_none(),
+            "the principal limit does not turn the address limiter on"
+        );
+
+        let off = RateLimitSettings::parse(Some("off"), None, None, None)
+            .unwrap()
+            .with_address_rpm(Some("900"))
+            .unwrap();
+        assert!(
+            off.build_address().is_none(),
+            "EPIGRAPH_RATE_LIMIT=off wins"
+        );
+
+        for bad in ["0", "-1", "ten", "1.5"] {
+            let err = RateLimitSettings::parse(None, None, None, None)
+                .unwrap()
+                .with_address_rpm(Some(bad))
+                .expect_err("a malformed address limit refuses");
+            assert!(err.contains(RATE_LIMIT_ADDRESS_RPM_ENV), "{err}");
         }
     }
 

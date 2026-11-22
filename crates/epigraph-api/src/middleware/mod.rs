@@ -20,7 +20,7 @@ pub use auth::{
 // Re-export rate limiting middleware
 #[cfg(feature = "db")]
 pub use rate_limit::guest_rate_limit_middleware;
-pub use rate_limit::{rate_limit_middleware, RateLimitResponse};
+pub use rate_limit::{address_rate_limit_middleware, rate_limit_middleware, RateLimitResponse};
 
 // Re-export OAuth2 middleware
 pub use bearer::{bearer_auth_middleware, optional_bearer_auth_middleware, AuthContext};

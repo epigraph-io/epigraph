@@ -289,3 +289,150 @@ async fn authenticated_requests_are_charged_to_their_principal() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The per-address limiter (backlog 20210eaa)
+// ---------------------------------------------------------------------------
+
+/// One request through `router` from `peer`, optionally with a bearer token;
+/// the status and the `X-RateLimit-Limit` header.
+async fn from_peer(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    peer: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, Option<String>) {
+    let peer: SocketAddr = peer.parse().expect("peer address");
+    let mut req = Request::builder().method(method).uri(uri);
+    if let Some(token) = bearer {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    let mut req = req.body(Body::empty()).unwrap();
+    req.extensions_mut().insert(ConnectInfo(peer));
+    let response = router.clone().oneshot(req).await.unwrap();
+    let limit = response
+        .headers()
+        .get("X-RateLimit-Limit")
+        .map(|v| v.to_str().unwrap().to_string());
+    (response.status(), limit)
+}
+
+/// The per-address limiter counts what the principal limiter cannot see: a
+/// request the bearer layer refuses 401 and a request no route matches
+/// (404). Each address gets `LIMIT` of them, then 429, before the bearer
+/// layer runs (a junk token is answered 429, not 401). The liveness probe is
+/// exempt by exact path, so `/healthXYZ` is counted. And the principal
+/// limiter's `X-RateLimit-Limit` survives the outer layer.
+///
+/// Fails on the parent commit (no per-address limiter: every 401 and 404 is
+/// answered as such), and with the layer moved inside the protected router's
+/// bearer layer (the 401s never become 429).
+#[tokio::test]
+async fn the_address_limiter_counts_401s_and_unknown_paths_before_authentication() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default()).with_address_rate_limiter(limiter()),
+    );
+
+    // A junk bearer on a protected route: refused 401 by the bearer layer.
+    let a = "203.0.113.60:1000";
+    for i in 0..LIMIT {
+        assert_eq!(
+            from_peer(&router, "POST", "/api/v1/claims", a, Some("junk"))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "CALIBRATION: junk bearer {i} is refused by the bearer layer"
+        );
+    }
+    assert_eq!(
+        from_peer(&router, "POST", "/api/v1/claims", a, Some("junk"))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the address has spent its bucket on 401s: refused before the bearer layer"
+    );
+    assert_eq!(
+        from_peer(&router, "GET", "/health", a, None).await.0,
+        StatusCode::OK,
+        "the liveness probe is exempt"
+    );
+
+    // Unknown paths, including one that merely starts with `/health`.
+    let b = "203.0.113.61:1000";
+    for (i, path) in ["/no/such/route", "/healthXYZ", "/api/v1/nothing-here"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            from_peer(&router, "GET", path, b, None).await.0,
+            StatusCode::NOT_FOUND,
+            "CALIBRATION: unknown path {i} ({path}) is a 404"
+        );
+    }
+    assert_eq!(
+        from_peer(&router, "GET", "/no/such/route", b, None).await.0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the address has spent its bucket on 404s"
+    );
+
+    // A third address is untouched by the first two.
+    assert_eq!(
+        from_peer(&router, "GET", "/no/such/route", "203.0.113.62:1000", None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// With both limiters on, the outer per-address limiter leaves the principal
+/// limiter's `X-RateLimit-Limit` alone, and refuses first when its own
+/// bucket is the smaller.
+#[tokio::test]
+async fn the_address_limiter_keeps_the_principal_limiters_headers() {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+        .expect("lazy pool");
+    let principal = AgentRateLimiter::new(RateLimitConfig {
+        default_rpm: 50,
+        global_rpm: 1_000_000,
+        replenish_interval_secs: 60,
+        enable_global_limit: false,
+    });
+    let router = create_router(
+        AppState::with_db(pool, ApiConfig::default())
+            .with_rate_limiter(principal)
+            .with_address_rate_limiter(limiter()),
+    );
+    let peer = "203.0.113.70:1000";
+    for _ in 0..LIMIT {
+        assert_eq!(
+            from_peer(
+                &router,
+                "GET",
+                "/.well-known/oauth-authorization-server",
+                peer,
+                None
+            )
+            .await,
+            (StatusCode::OK, Some("50".to_string())),
+            "the header is the principal limiter's (50), not the address limiter's"
+        );
+    }
+    assert_eq!(
+        from_peer(
+            &router,
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            peer,
+            None
+        )
+        .await
+        .0,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the address bucket ({LIMIT}) is spent before the principal one (50)"
+    );
+}

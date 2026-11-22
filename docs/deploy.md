@@ -334,6 +334,22 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `security_events.agent_id` references `agents`, so a refusal keyed on a
   client address (or on an agentless token's client) is not persisted and
   logs `Failed to persist security event` instead.
+- **Per-address rate limiting** (`EPIGRAPH_RATE_LIMIT_ADDRESS_RPM`, off
+  unless set) closes the gap the limiter above leaves: it sits inside the
+  bearer layer, so the bearer layer's own work (token verification and the
+  revocation, admin-scope and delegation reads), the 401s it answers and
+  requests to unknown paths (404) are never counted by it. With this variable
+  set, EVERY request except `/health`, `/readiness` and `/liveness` (matched
+  exactly) is first charged to its client address (keyed as above, through
+  `EPIGRAPH_TRUSTED_PROXIES`), outside authentication and routing, and
+  refused 429 past the limit before any token is read. It writes no
+  `X-RateLimit-*` headers, does not turn the principal limiter on (nor does
+  that limiter turn it on), and `EPIGRAPH_RATE_LIMIT=off` turns it off too.
+  Every principal behind one address shares its bucket, so size it for the
+  busiest address you serve (an agent host, the reverse proxy when
+  `EPIGRAPH_TRUSTED_PROXIES` does not name it), well above
+  `EPIGRAPH_RATE_LIMIT_RPM`. The boot log says `per-address rate limiter ON`
+  or `OFF`.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
@@ -500,6 +516,7 @@ For the others, anything else is off.
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
 | `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` | unset (no per-address limit) | Requests a minute per client address, counted before authentication and routing, so 401s and unknown-path 404s are limited too (Step 8, "Per-address rate limiting"). Independent of `EPIGRAPH_RATE_LIMIT_RPM`; `EPIGRAPH_RATE_LIMIT=off` turns it off. Not a positive whole number → exit 1. |
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |

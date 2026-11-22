@@ -179,6 +179,26 @@ async fn main() {
         );
     }
     let rate_limiter = rate_limit.build();
+    // The per-address limiter (backlog 20210eaa), outside authentication and
+    // routing; opt-in through EPIGRAPH_RATE_LIMIT_ADDRESS_RPM, independent of
+    // the principal limiter, off under EPIGRAPH_RATE_LIMIT=off.
+    let address_rate_limiter = rate_limit.build_address();
+    match (&address_rate_limiter, rate_limit.per_address_rpm) {
+        (Some(_), Some(rpm)) => tracing::info!(
+            per_address_rpm = rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "per-address rate limiter ON: every request but the liveness probes, 401s and \
+             unknown paths included, is charged to its client address before authentication"
+        ),
+        (None, Some(_)) => tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT_ADDRESS_RPM is set but EPIGRAPH_RATE_LIMIT=off: the \
+             per-address rate limiter is OFF"
+        ),
+        _ => tracing::info!(
+            "per-address rate limiter OFF (EPIGRAPH_RATE_LIMIT_ADDRESS_RPM unset): 401s and \
+             unknown-path 404s are not rate limited by this process"
+        ),
+    }
 
     // Guest reads (backlog `1deb9dbf`), read here, next to the rate limit,
     // because they decide whether the guest routes get a limiter of their own
@@ -733,6 +753,11 @@ async fn main() {
     // And the guest reads' default limiter, when it applies (see above).
     let state = match guest_rate_limiter {
         Some(limiter) => state.with_guest_rate_limiter(limiter),
+        None => state,
+    };
+    // And the per-address limiter, when configured (see above).
+    let state = match address_rate_limiter {
+        Some(limiter) => state.with_address_rate_limiter(limiter),
         None => state,
     };
 
