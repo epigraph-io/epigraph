@@ -50,6 +50,18 @@
 //! lands unrecorded. Unchanged claims are not recorded; `claims.updated_at` is
 //! not part of the record. See `epigraph_cli::recompute_claim_belief`.
 //!
+//! Mode check (backlog a7ab715d, 1ea4f6bf): before a WRITING run, and before
+//! it opens the database, the run reads the API's `/health` → `belief_modes`
+//! (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`) and refuses (exit 3) when any mode
+//! differs from this process's, or when they cannot be read
+//! (`epigraph_cli::belief_mode_check`, as `recompute_betp` and
+//! `backfill_factors` do). It also refuses (exit 3) a writing run under any
+//! `EPIGRAPH_ATOM_FOLD` other than `legacy`, whatever the server says: the
+//! owner-frame recompute this binary calls implements only the legacy fold.
+//! `--dry-run` writes nothing and is exempt. Exit 3 is also the wave-file STOP
+//! below; the two are told apart by stderr (a mode refusal names
+//! `belief_modes` or `atom_fold` and writes nothing).
+//!
 //! Concurrency is `--concurrency` (default 8). Each task is one DB round-trip
 //! to fetch BBAs + one round-trip to write the recomputed belief. On a local
 //! Postgres ~10–20 claims/sec per worker is typical. 15 000 claims at 8
@@ -63,6 +75,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::recompute_claim_belief::{recompute_claim_recorded, ClaimRecomputeError};
 
 #[derive(Parser, Debug)]
@@ -98,13 +111,19 @@ struct Cli {
     /// The wave name every record carries. Default `recompute_claim_belief`.
     #[arg(long, requires = "snapshot")]
     wave: Option<String>,
+    /// Proceed with a writing run although this process's belief modes differ
+    /// from the API's `/health` report (or cannot be read). For tests and a
+    /// deliberate, recorded override only.
+    #[arg(long, hide = true)]
+    allow_mode_skew: bool,
 }
 
 /// The wave name a `--snapshot` run records when `--wave` is not given.
 const DEFAULT_WAVE: &str = "recompute_claim_belief";
 
 /// Exit code of a run stopped because a wave-file record could not be
-/// written (claims after it were not attempted).
+/// written (claims after it were not attempted). The same number as
+/// `belief_mode_check::MODE_CHECK_REFUSED_EXIT`; stderr tells them apart.
 const EXIT_SNAPSHOT_FAILED: i32 = 3;
 
 #[tokio::main]
@@ -115,6 +134,18 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    // Before the database: a writing run must show its belief modes match the
+    // API's (SPEC §10.2), and, since the owner-frame recompute folds only the
+    // legacy way, must run under the legacy atom fold. A dry run writes
+    // nothing and is exempt.
+    let intent = if cli.dry_run {
+        RunIntent::WritesNothing
+    } else {
+        RunIntent::Writes
+    };
+    enforce_or_exit("recompute_claim_belief", intent, cli.allow_mode_skew).await;
+    enforce_build_fold_or_exit("recompute_claim_belief", intent);
 
     // CLI maintenance bin: the operator is the authority and the work is
     // corpus-wide. See `epigraph_cli::MaintenancePool` for why that earns a

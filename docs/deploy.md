@@ -1084,6 +1084,15 @@ viewer the maintenance session owns.
   * A dropped or panicking claim mid-transaction is rolled back, so the file
     never misses a committed write. At worst it holds a record of a write
     that never committed, which a restore reports as `already_restored`.
+* **A writing `recompute_claim_belief` run checks the belief modes first**
+  (backlog a7ab715d), as `recompute_betp` and `backfill_factors` do. Before
+  it opens the database it reads the API's `/health` → `belief_modes`
+  (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`, else `http://127.0.0.1:8080`) and
+  exits 3, writing nothing, when any mode differs from its own or cannot be
+  read. It also exits 3 under any `EPIGRAPH_ATOM_FOLD` other than `legacy`:
+  the owner-frame recompute it calls folds only the legacy way. Run it from
+  the API's environment, with the API reachable. `--dry-run` is exempt.
+  Exit 3 is also the wave-file STOP above; stderr says which.
 
 ### The Python scripts
 

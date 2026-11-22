@@ -36,6 +36,7 @@ const RECOMPUTE_BETP: &str = env!("CARGO_BIN_EXE_recompute_betp");
 const BACKFILL_FACTORS: &str = env!("CARGO_BIN_EXE_backfill_factors");
 const DECOMPOSE_CLAIMS: &str = env!("CARGO_BIN_EXE_decompose_claims");
 const RESTORE_EDGE_FACTORS: &str = env!("CARGO_BIN_EXE_restore_edge_factors");
+const RECOMPUTE_CLAIM_BELIEF: &str = env!("CARGO_BIN_EXE_recompute_claim_belief");
 
 /// The modes a server with no belief flag set reports (SPEC §10.2 defaults).
 fn legacy_modes() -> serde_json::Value {
@@ -888,6 +889,192 @@ fn a_refusal_names_this_process_s_unrecognised_flag_value() {
             r.stderr
         );
     }
+}
+
+// ── recompute_claim_belief (backlog a7ab715d, 1ea4f6bf) ─────────────────────
+//
+// The per-claim owner-frame recompute writes the shared claim cache with the
+// legacy fold, so a writing run refuses on mode skew (as `recompute_betp`)
+// and under any fold other than legacy (as `backfill_factors`). The seeded
+// hub's cached BetP is the 0.5 sentinel; its owner frame's two BBAs combine to
+// > .9, so a run that writes moves it.
+
+/// The argv of a writing `recompute_claim_belief` run over `claims`, plus
+/// `extra`. The id list is written to a fresh scratch directory, which is
+/// returned so the caller can remove it.
+fn claim_belief_args(claims: &[Uuid], extra: &[&str]) -> (std::path::PathBuf, Vec<String>) {
+    let dir = std::env::temp_dir().join(format!("belief-mode-rcb-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let list = dir.join("ids.txt");
+    let body: String = claims.iter().map(|id| format!("{id}\n")).collect();
+    std::fs::write(&list, body).expect("write the id list");
+    let mut args = vec![
+        "--input".to_string(),
+        list.to_str().expect("utf-8").to_string(),
+    ];
+    args.extend(extra.iter().map(|a| (*a).to_string()));
+    (dir, args)
+}
+
+fn as_strs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_claim_belief_refuses_a_writing_run_on_mode_skew(pool: PgPool) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    // The server is the one ahead: this process runs `legacy`, so the build's
+    // own fold refusal cannot fire and only the skew check can refuse.
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let (dir, args) = claim_belief_args(&[hub], &[]);
+
+    let r = run(
+        RECOMPUTE_CLAIM_BELIEF,
+        &as_strs(&args),
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_refused_for_atom_fold(&r, "recompute_claim_belief");
+    assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Control for the refusals: the same run with matching (legacy) modes
+/// rewrites the sentinel, so "writes nothing" above is the check's doing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_claim_belief_with_matching_modes_rewrites_the_same_claim(pool: PgPool) {
+    let hub = seed_stale_hub(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let (dir, args) = claim_belief_args(&[hub], &[]);
+
+    let r = run(
+        RECOMPUTE_CLAIM_BELIEF,
+        &as_strs(&args),
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_eq!(
+        r.code,
+        Some(0),
+        "matching modes must not refuse\nstdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let after = cached_betp(&pool, hub)
+        .await
+        .expect("a cache after the run");
+    assert!(
+        (after - 0.5).abs() > 0.05,
+        "a real run must rewrite the stale sentinel; got {after}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The owner-frame recompute folds only the legacy way, so a writing run
+/// under another fold refuses even when the server agrees.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_claim_belief_refuses_a_writing_run_under_a_fold_this_build_cannot_write(
+    pool: PgPool,
+) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(modes_with_atom_fold("aef")));
+    let (dir, args) = claim_belief_args(&[hub], &[]);
+
+    let r = run(
+        RECOMPUTE_CLAIM_BELIEF,
+        &as_strs(&args),
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef"),
+        ],
+    );
+
+    assert_eq!(
+        r.code, REFUSED,
+        "recompute_claim_belief: must exit 3\nstdout: {}\nstderr: {}",
+        r.stdout, r.stderr
+    );
+    assert!(
+        r.stderr.contains("writes only the legacy fold"),
+        "stderr: {}",
+        r.stderr
+    );
+    assert_eq!(cached_betp(&pool, hub).await, Some(0.5), "the sentinel");
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--dry-run` writes nothing, so it is exempt: a skewed environment
+/// proceeds, and the API is never contacted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_claim_belief_dry_run_is_exempt_and_never_contacts_the_api(pool: PgPool) {
+    let hub = seed_stale_hub(&pool).await;
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let (api, hits) = fixture_health_counted(health_with(legacy_modes()));
+    let (dir, args) = claim_belief_args(&[hub], &["--dry-run"]);
+
+    let r = run(
+        RECOMPUTE_CLAIM_BELIEF,
+        &as_strs(&args),
+        &[
+            ("DATABASE_URL", &db),
+            ("EPIGRAPH_API_URL", &api),
+            ("EPIGRAPH_ATOM_FOLD", "aef_standalone"),
+        ],
+    );
+
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(r.stdout.contains("DRY-RUN"), "stdout: {}", r.stdout);
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a dry run must not contact the API"
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a dry run writes nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The check runs before the database is opened: with no `DATABASE_URL` at
+/// all, a skewed writing run is refused by the mode check, not by the pool.
+#[test]
+fn recompute_claim_belief_refuses_on_mode_skew_before_touching_the_database() {
+    let api = fixture_health(health_with(modes_with_atom_fold("aef_standalone")));
+    let (dir, args) = claim_belief_args(&[Uuid::new_v4()], &[]);
+
+    let r = run(
+        RECOMPUTE_CLAIM_BELIEF,
+        &as_strs(&args),
+        &[("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_refused_for_atom_fold(&r, "recompute_claim_belief (no database)");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── backfill_factors targeted rewire (R-177(4) class E) ────────────────────

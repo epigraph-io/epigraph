@@ -60,14 +60,32 @@ impl Run {
     }
 }
 
-/// Run `bin` with only `DATABASE_URL` (plus `PATH`), from `cwd`.
+/// The operator flags every `recompute_claim_belief` invocation here carries
+/// beyond the ones a test is about. These tests are about the wave file, not
+/// the pre-run mode check (`belief_mode_check_bins.rs` covers that for this
+/// bin), so the check is overridden, against an API address that refuses at
+/// once (see [`OPERATOR_ENV`]).
+const OPERATOR_FLAGS: &[&str] = &["--allow-mode-skew"];
+
+/// The environment beside `DATABASE_URL`: an API base nothing listens on, so
+/// the overridden mode check never reaches a real server on the test host.
+const OPERATOR_ENV: &[(&str, &str)] = &[("EPIGRAPH_API_URL", "http://127.0.0.1:1")];
+
+/// Run `bin` with only `DATABASE_URL` (plus `PATH` and [`OPERATOR_ENV`]),
+/// from `cwd`. When the command runs `recompute_claim_belief` (directly, or
+/// as the last program a wrapper `exec`s), [`OPERATOR_FLAGS`] are appended.
 fn run(bin: &str, cwd: &Path, db: &str, args: &[&str]) -> Run {
+    let mut argv: Vec<&str> = args.to_vec();
+    if bin == RECOMPUTE || args.contains(&RECOMPUTE) {
+        argv.extend_from_slice(OPERATOR_FLAGS);
+    }
     let out = Command::new(bin)
         .env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "warn")
         .env("DATABASE_URL", db)
-        .args(args)
+        .envs(OPERATOR_ENV.iter().copied())
+        .args(&argv)
         .current_dir(cwd)
         .output()
         .expect("run the binary");
@@ -710,7 +728,9 @@ async fn a_writer_mid_transaction_when_the_run_reaches_the_claim_is_the_recorded
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("RUST_LOG", "warn")
         .env("DATABASE_URL", &db)
+        .envs(OPERATOR_ENV.iter().copied())
         .args(["--input", s(&list), "--snapshot", s(&wave)])
+        .args(OPERATOR_FLAGS)
         .current_dir(&dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -23,8 +23,9 @@
 //! `--help` and exists for tests and for a deliberate, recorded operator
 //! override; a wave run never needs it.
 //!
-//! Wave bins wired today: `recompute_betp`, `backfill_factors`, and
-//! `decompose_claims` in its two retarget writing modes. A wave bin added
+//! Wave bins wired today: `recompute_betp`, `backfill_factors`,
+//! `recompute_claim_belief`, and `decompose_claims` in its two retarget
+//! writing modes. A wave bin added
 //! later (`attribute_atoms`, `rekey_self_assertions`) calls [`enforce`] the
 //! same way.
 
