@@ -2322,6 +2322,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 260 (backlog 969f01f6), the `edges_tenancy_declared` trigger body that
+    // records an edge's declared tenancy. It reads each endpoint through
+    // `epigraph_node_tenancy`, which is revoked from PUBLIC: under an
+    // APP-owned (non-member) body every INSERT of a `group` edge errors 42501
+    // with nothing written (loud, fail CLOSED); a re-point only carries the
+    // row's record and reads nothing. Under the migration runner's superuser
+    // it keeps working with more authority than intended (083's case), which
+    // only this check reports.
+    ("epigraph_edges_record_declaration", 260),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
