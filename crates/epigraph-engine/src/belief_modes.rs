@@ -18,6 +18,7 @@
 //!
 //! The modes are reported by:
 //!
+//! - the job runner (`drain_jobs`), which journals it at boot;
 //! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)

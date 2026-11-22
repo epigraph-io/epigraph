@@ -37,6 +37,10 @@
 //! jobs `cancelled` (`cancelled_unregistered` in the report) before draining.
 //! It refuses, exit 1 with no write, a type this run has a handler for.
 //!
+//! At start, before any refusal, the run journals its belief modes and any
+//! belief-mode flag value it did not recognise (SPEC §10.2), as the API
+//! server does.
+//!
 //! Usage: `drain_jobs [--max-runtime <DURATION>] [--cancel-pending <TYPE>]...`,
 //! where DURATION is seconds or a number with `s`, `m`/`min` or `h`. `DATABASE_URL` and
 //! `MAINTENANCE_DATABASE_URL` come from the environment (the unit's 0600
@@ -118,6 +122,20 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    // Belief modes (SPEC §10.2, backlog a7ab715d): read once, here, and
+    // journalled before anything can stop the run, as the API server does at
+    // boot, so the journal shows the modes every job of this run ran under.
+    // No job acts on a belief-mode flag yet; the first one that does would
+    // otherwise run in a mode nobody can see.
+    tracing::info!(
+        belief_modes = %epigraph_engine::belief_modes::current().summary(),
+        "belief modes read at startup"
+    );
+    // A typo runs the flag's default; named here so it shows in the journal.
+    for flag in epigraph_engine::belief_modes::unrecognised() {
+        tracing::warn!("belief-mode flag ignored: {flag}");
+    }
 
     let Args {
         max_runtime,
