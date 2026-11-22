@@ -284,9 +284,9 @@ async fn the_definers_type_list_is_prunable_event_types(pool: PgPool) {
     assert_eq!(db, rust);
 }
 
-/// `docs/runbooks/250-undo.sql` restores the posture before 250 for section 1
-/// (the maintenance role's UPDATE and DELETE on `events`, no definer), and
-/// can be run twice.
+/// `docs/runbooks/250-undo.sql` restores the posture before 250 (the
+/// maintenance role's UPDATE and DELETE on `events`, no prune definer, no
+/// `claim.assessed` guard), and can be run twice.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_250_undo_restores_the_maintenance_grants(pool: PgPool) {
     let undo = std::fs::read_to_string(concat!(
@@ -300,18 +300,23 @@ async fn the_250_undo_restores_the_maintenance_grants(pool: PgPool) {
             .await
             .unwrap_or_else(|e| panic!("apply the undo (run {run}): {e}"));
     }
-    let state: (bool, bool, bool, bool) = sqlx::query_as(
+    let state: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
         "SELECT has_table_privilege('epigraph_maintenance', 'public.events', 'DELETE'), \
                 has_table_privilege('epigraph_maintenance', 'public.events', 'UPDATE'), \
                 to_regprocedure('public.epigraph_prune_telemetry_events(integer)') IS NULL, \
-                to_regprocedure('public.epigraph_prunable_event_types()') IS NULL",
+                to_regprocedure('public.epigraph_prunable_event_types()') IS NULL, \
+                to_regprocedure('public.epigraph_events_assessment_guard()') IS NULL, \
+                NOT EXISTS (SELECT 1 FROM pg_trigger \
+                             WHERE tgrelid = 'public.events'::regclass \
+                               AND tgname = 'events_assessment_guard')",
     )
     .fetch_one(&pool)
     .await
     .expect("catalog");
     assert_eq!(
         state,
-        (true, true, true, true),
-        "(maintenance DELETE, maintenance UPDATE, prune definer gone, type list gone)"
+        (true, true, true, true, true, true),
+        "(maintenance DELETE, maintenance UPDATE, prune definer gone, type list gone, \
+         assessment guard function gone, its trigger gone)"
     );
 }

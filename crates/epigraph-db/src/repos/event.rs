@@ -51,6 +51,13 @@ impl EventRepository {
     /// the server's own account of a write: a caller-filed `claim.assessed`
     /// would otherwise become "the previous record" of a slot and re-attribute
     /// the next overwrite to whoever filed it.
+    ///
+    /// The database enforces `claim.assessed` too (migration 250's
+    /// `events_assessment_guard`): outside a maintenance session it admits the
+    /// row only when it records a `mass_functions` row written for the named
+    /// claim, frame and owner in the same transaction, with `actor_id` equal
+    /// to `assessed_by`, and refuses every other spelling. A new reserved type
+    /// needs its own database guard; this list does not create one.
     pub const RESERVED_EVENT_TYPES: &'static [&'static str] = &[Self::ASSESSMENT_EVENT_TYPE];
 
     /// Whether a caller-supplied `event_type` names a reserved type.

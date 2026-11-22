@@ -38,12 +38,17 @@ use uuid::Uuid;
 /// The type is reserved (`EventRepository::RESERVED_EVENT_TYPES`): both
 /// caller-typed publish paths, `POST /api/v1/events` and the MCP
 /// `publish_event` tool, refuse it, so through the API only this route's
-/// slot transaction writes it. That holds at the API, not in the database:
-/// a direct database login with INSERT on `events` can still write a row of
-/// this type, so the record is the server's account of a write, not a
-/// cryptographic proof of authorship. Before the reservation the REST path
-/// accepted this type, so a row of it older than the reservation may have
-/// been filed by a caller rather than by this route.
+/// slot transaction writes it. The database holds the same line (migration
+/// 250's `events_assessment_guard`): outside a maintenance session a row of
+/// this type is admitted only when it records a slot row written for its
+/// claim, frame and owner in the SAME transaction, with `actor_id` equal to
+/// `assessed_by`. That is why the record is written inside `slot_tx` (and
+/// must stay outside any savepoint there). It binds the record to a write,
+/// not to an identity: a session that may write the slot row can still name
+/// a false `assessed_by` for its own write, so the record is the server's
+/// account of a write, not a cryptographic proof of authorship. Before the
+/// reservation the REST path accepted this type, so a row of it older than
+/// the reservation may have been filed by a caller rather than by this route.
 pub const ASSESSMENT_EVENT_TYPE: &str = epigraph_db::EventRepository::ASSESSMENT_EVENT_TYPE;
 
 // =============================================================================

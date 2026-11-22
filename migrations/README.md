@@ -3404,7 +3404,7 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
-- **250**: public `events_telemetry_prune_definer`.
+- **250**: public `events_write_guards` (two guards on the provenance record).
   **Section 1** (backlog 062d7767): the maintenance role prunes `events` only
   through the SECURITY DEFINER `epigraph_prune_telemetry_events(retention_days)`,
   which deletes rows whose `event_type` is exactly one of
@@ -3437,6 +3437,42 @@ restart.
   the job exits non-zero having deleted nothing from `events` (no data loss).
   Before migrating, measure who owns `public.events` and whether that role is
   a member of `epigraph_maintenance` (the migration refuses if so).
+  **Section 2** (backlog a278f16d): `claim.assessed` is reserved in the
+  database, not only at the REST and MCP publish surfaces. The BEFORE INSERT
+  OR UPDATE row trigger `events_assessment_guard` (WHEN the lower-cased type
+  contains `claim.assessed`) runs the maintenance-owned definer
+  `epigraph_events_assessment_guard()` (172's path, EXECUTE revoked from
+  PUBLIC): a maintenance or superuser session (`epigraph_bypass()`) is
+  admitted; any other session is refused 42501 for a padded or re-cased
+  spelling, and for the exact type unless the payload's `mass_function_id`,
+  `claim_id`, `frame_id`, `owner_agent_id` name a `mass_functions` row written
+  IN THIS TRANSACTION (`xmin`, top-level) for that claim, frame and
+  `source_agent_id`, and `actor_id = assessed_by`. That is the assess route's
+  own shape (slot upsert and record in one transaction), so no binary change
+  is needed; it closes the forgery of a record naming another writer's slot
+  row. A validating trigger rather than a route-called definer: a definer the
+  application role calls with its own payload would admit the same forgery.
+  Residual: a session that may write the slot row can still name a false
+  `assessed_by` for its own write. Pinned by
+  `epigraph-db/tests/assessment_event_reservation.rs` (forgeries, spellings
+  and malformed ids refused on a stamped `epigraph_app` session, the route's
+  shape admitted and each binding field mutated, a row from an earlier
+  transaction refused, maintenance admitted) and
+  `epigraph-api/tests/assess_writer_recorded.rs` (the route, unchanged).
+  **Deploy order for section 2:** none. **Operator data repair (not done by
+  the migration):** rows of the type written before 250 are unchecked; after
+  migrating, classify them with
+  `SELECT e.id, e.created_at, e.actor_id, CASE WHEN mf.id IS NULL THEN
+  'no_slot_row' WHEN mf.claim_id::text IS DISTINCT FROM e.payload->>'claim_id'
+  OR mf.frame_id::text IS DISTINCT FROM e.payload->>'frame_id' OR
+  mf.source_agent_id::text IS DISTINCT FROM e.payload->>'owner_agent_id' THEN
+  'fields_mismatch' WHEN e.actor_id::text IS DISTINCT FROM
+  e.payload->>'assessed_by' THEN 'actor_not_assessed_by' ELSE 'consistent' END
+  FROM events e LEFT JOIN mass_functions mf ON mf.id::text =
+  e.payload->>'mass_function_id' WHERE lower(btrim(e.event_type)) =
+  'claim.assessed' AND e.created_at < (SELECT installed_on FROM
+  _sqlx_migrations WHERE version = 250)` (on the owner DSN; `consistent` is
+  necessary, not sufficient, for a genuine record).
 
 ## `-- no-transaction` migrations
 

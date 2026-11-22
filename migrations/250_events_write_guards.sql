@@ -1,6 +1,10 @@
--- Migration 250: `events` guards. The maintenance role prunes telemetry only
--- through a type-restricted definer and loses its table-wide DELETE and UPDATE
--- on `events` (section 1, backlog 062d7767).
+-- Migration 250: two `events` write guards, both on the provenance record.
+--   1. The maintenance role prunes telemetry only through a type-restricted
+--      definer and loses its table-wide DELETE and UPDATE on `events`
+--      (backlog 062d7767).
+--   2. A `claim.assessed` row is refused unless it records a slot write made
+--      in the same transaction, or comes from a maintenance session (backlog
+--      a278f16d).
 --
 -- ===================================================================
 -- 1. TELEMETRY-ONLY PRUNE (backlog 062d7767)
@@ -86,7 +90,68 @@
 -- `events` (its `recall_events` prune runs first and is unaffected); no data
 -- is lost either way.
 --
--- UNDO: docs/runbooks/250-undo.sql.
+-- ===================================================================
+-- 2. `claim.assessed` IS RESERVED IN THE DATABASE (backlog a278f16d)
+-- ===================================================================
+--
+-- WHY. `claim.assessed` is the assess route's durable writer record
+-- (`POST /api/v1/claims/:id/assess`): the writer of masses a later call
+-- replaces is read as the `actor_id` of the previous record with the same
+-- `mass_function_id`. `EventRepository::RESERVED_EVENT_TYPES` refused the type
+-- on the two caller-typed publish surfaces (REST `POST /api/v1/events`, MCP
+-- `publish_event`), but nothing in the database did, so any session holding an
+-- application DSN (agent containers hold one) could INSERT a record naming a
+-- real slot row's `mass_function_id` and be credited, by that rule, as the
+-- writer of its masses.
+--
+-- WHAT IT DOES. A BEFORE INSERT OR UPDATE row trigger on `events`,
+-- `events_assessment_guard`, runs `epigraph_events_assessment_guard()` for
+-- any row whose lower-cased type contains `claim.assessed` (the trigger's
+-- WHEN clause, so every other event pays nothing beyond that test). The body:
+--   * admits a row whose type, trimmed and lower-cased, is not exactly
+--     `claim.assessed` (e.g. `claim.assessed.v2` is another type);
+--   * admits any session `epigraph_bypass()` admits (maintenance logins, the
+--     migration / superuser DSN): repair and backfill stay possible;
+--   * refuses (42501) any spelling other than the exact `claim.assessed`
+--     (padded or re-cased), as the API layer does;
+--   * otherwise requires the payload to name, as uuids, `mass_function_id`,
+--     `claim_id`, `frame_id`, `owner_agent_id` and `assessed_by`, the row's
+--     `actor_id` to equal `assessed_by`, and a `mass_functions` row with that
+--     id, claim, frame and `source_agent_id = owner_agent_id` whose `xmin` is
+--     THIS transaction: the slot write the record describes must have been
+--     made in the same transaction, which is exactly what the assess route
+--     does (slot upsert and record in one `slot_tx`; the upsert's
+--     ON CONFLICT DO UPDATE writes a new row version, so a replacement counts).
+--     Anything else is refused with 42501, never 22P02.
+--
+-- WHY A VALIDATING TRIGGER, NOT A DEFINER THE ROUTE CALLS. The fix sketch
+-- named "the assess path's definer". A definer the application role may call
+-- with a caller-built payload would admit the same forgery the table did; what
+-- closes it is the binding to the slot row written in the same transaction,
+-- and a trigger enforces that on every path, the shipped route included. It
+-- also needs no binary change: the shipped route already writes the record
+-- this way, so the migration may be applied before or after the binary.
+--
+-- THE BODY. SECURITY DEFINER owned by `epigraph_maintenance` on 172's path
+-- (`pg_catalog, pg_temp`, every public name qualified), so its read of
+-- `mass_functions` is not filtered by row security (`epigraph_definer_bypass()`
+-- admits the owner), and `epigraph_bypass()` still reads `session_user`, the
+-- caller. EXECUTE revoked from PUBLIC (a trigger function is not checked at
+-- fire time). The `xmin` comparison is against the top-level transaction id,
+-- so the slot write must not be inside a SAVEPOINT; the route takes none.
+--
+-- RESIDUAL. A session that can write the slot row itself (row security admits
+-- the owner's writers) can still record a false `assessed_by` for its own
+-- write: the database binds the record to a write, not to an identity it
+-- cannot authenticate (the tenancy GUCs are session-settable). Rows written
+-- before this migration are not checked: a `claim.assessed` row older than the
+-- reservation may have been filed by a caller. Classifying them is an
+-- operator data-repair step (README entry for 250 has the query); this file
+-- changes no row.
+--
+-- DEPLOY ORDER for section 2: none against the binaries.
+--
+-- UNDO: docs/runbooks/250-undo.sql (both sections).
 -- Checked before claiming: slot 250 was assigned to this batch; no origin
 -- branch carries a `250`.
 
@@ -148,3 +213,82 @@ BEGIN
         EXECUTE 'REVOKE DELETE, UPDATE, TRUNCATE ON public.events FROM epigraph_maintenance';
     END IF;
 END $$;
+
+-- ===================================================================
+-- Section 2: the `claim.assessed` guard.
+-- ===================================================================
+
+CREATE OR REPLACE FUNCTION public.epigraph_events_assessment_guard()
+RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+DECLARE
+    c_uuid constant text :=
+        '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$';
+    c_keys constant text[] :=
+        ARRAY['mass_function_id', 'claim_id', 'frame_id', 'owner_agent_id', 'assessed_by'];
+    k text;
+    v_mf uuid;
+    v_by uuid;
+    v_found boolean;
+BEGIN
+    IF pg_catalog.lower(pg_catalog.regexp_replace(NEW.event_type,
+                                                  '^[[:space:]]+|[[:space:]]+$', '', 'g'))
+       IS DISTINCT FROM 'claim.assessed' THEN
+        RETURN NEW;
+    END IF;
+    IF public.epigraph_bypass() THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.event_type <> 'claim.assessed' THEN
+        RAISE EXCEPTION 'event type % is a spelling of the reserved claim.assessed', NEW.event_type
+            USING ERRCODE = '42501';
+    END IF;
+    IF pg_catalog.jsonb_typeof(NEW.payload) IS DISTINCT FROM 'object' THEN
+        RAISE EXCEPTION 'claim.assessed is reserved for the assess path: no payload object'
+            USING ERRCODE = '42501';
+    END IF;
+    FOREACH k IN ARRAY c_keys LOOP
+        IF NOT COALESCE((NEW.payload ->> k) ~ c_uuid, false) THEN
+            RAISE EXCEPTION 'claim.assessed is reserved for the assess path: payload % is not a uuid', k
+                USING ERRCODE = '42501';
+        END IF;
+    END LOOP;
+    v_mf := (NEW.payload ->> 'mass_function_id')::uuid;
+    v_by := (NEW.payload ->> 'assessed_by')::uuid;
+    IF NEW.actor_id IS DISTINCT FROM v_by THEN
+        RAISE EXCEPTION 'claim.assessed is reserved for the assess path: actor_id is not assessed_by'
+            USING ERRCODE = '42501';
+    END IF;
+    SELECT EXISTS (
+        SELECT 1 FROM public.mass_functions mf
+         WHERE mf.id = v_mf
+           AND mf.claim_id = (NEW.payload ->> 'claim_id')::uuid
+           AND mf.frame_id = (NEW.payload ->> 'frame_id')::uuid
+           AND mf.source_agent_id = (NEW.payload ->> 'owner_agent_id')::uuid
+           AND mf.xmin::text
+               = (pg_catalog.pg_current_xact_id()::text::numeric % 4294967296)::text
+    ) INTO v_found;
+    IF NOT v_found THEN
+        RAISE EXCEPTION 'claim.assessed is reserved for the assess path: mass function % was not '
+                        'written for this claim, frame and owner in this transaction', v_mf
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END $$;
+
+REVOKE EXECUTE ON FUNCTION public.epigraph_events_assessment_guard() FROM PUBLIC;
+
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_events_assessment_guard() '
+                'OWNER TO epigraph_maintenance';
+    END IF;
+END $$;
+
+DROP TRIGGER IF EXISTS events_assessment_guard ON public.events;
+CREATE TRIGGER events_assessment_guard
+    BEFORE INSERT OR UPDATE ON public.events
+    FOR EACH ROW
+    WHEN (pg_catalog.strpos(pg_catalog.lower(NEW.event_type), 'claim.assessed') > 0)
+    EXECUTE FUNCTION public.epigraph_events_assessment_guard();
