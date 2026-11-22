@@ -2016,7 +2016,9 @@ async fn recall_with_context_core(
     // nothing at all WITH it — switching on a de-duplication filter deleted
     // the good hit. `min_truth` now runs before the cut (backlog d830c073),
     // but `exclude_contested` still has that shape, and so would any later
-    // post-filter (as did the missing-paper drop, removed in drain U082).
+    // post-filter (as did the missing-paper drop, removed in drain U082). The
+    // test now pins the ordering through `exclude_contested`: a contested
+    // near-duplicate ranked first must not evict the clean one.
     //
     // Running last makes the rule "a hit may only be suppressed by a hit that
     // is itself being returned", and makes this surface agree with
