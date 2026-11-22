@@ -548,6 +548,10 @@ pub struct AndroidKeyOpts {
     /// `rootOfTrust` in the SOFTWARE-enforced list instead of the
     /// TEE-enforced one.
     pub root_of_trust_in_software_list: bool,
+    /// A `[704]` that is not a RootOfTrust (an INTEGER where the SEQUENCE
+    /// belongs), in place of `root_of_trust`: a KeyDescription this crate's
+    /// parser refuses and the library's (which skips the tag) accepts.
+    pub root_of_trust_malformed: bool,
 }
 
 impl Default for AndroidKeyOpts {
@@ -563,6 +567,7 @@ impl Default for AndroidKeyOpts {
             leaf_validity: None,
             root_of_trust: Some((true, 0)),
             root_of_trust_in_software_list: false,
+            root_of_trust_malformed: false,
         }
     }
 }
@@ -588,20 +593,25 @@ fn android_key_description(challenge: &[u8], opts: &AndroidKeyOpts) -> Vec<u8> {
     // [704] EXPLICIT RootOfTrust: 704 = 5 * 128 + 64. SEQUENCE {
     // verifiedBootKey OCTET STRING, deviceLocked BOOLEAN, verifiedBootState
     // ENUMERATED, verifiedBootHash OCTET STRING }.
-    let root_of_trust = opts.root_of_trust.map(|(locked, state)| {
-        der(
-            &[0xBF, 0x85, 0x40],
-            &der(
-                &[0x30],
-                &[
-                    der(&[0x04], &[0x5A; 32]),
-                    der(&[0x01], &[if locked { 0xFF } else { 0x00 }]),
-                    der(&[0x0A], &[state]),
-                    der(&[0x04], &[0xA5; 32]),
-                ]
-                .concat(),
-            ),
-        )
+    let malformed = opts
+        .root_of_trust_malformed
+        .then(|| der(&[0xBF, 0x85, 0x40], &der(&[0x02], &[0x01])));
+    let root_of_trust = malformed.or_else(|| {
+        opts.root_of_trust.map(|(locked, state)| {
+            der(
+                &[0xBF, 0x85, 0x40],
+                &der(
+                    &[0x30],
+                    &[
+                        der(&[0x04], &[0x5A; 32]),
+                        der(&[0x01], &[if locked { 0xFF } else { 0x00 }]),
+                        der(&[0x0A], &[state]),
+                        der(&[0x04], &[0xA5; 32]),
+                    ]
+                    .concat(),
+                ),
+            )
+        })
     });
     let (mut software, mut tee) = if opts.in_software_list {
         (enforced, Vec::new())

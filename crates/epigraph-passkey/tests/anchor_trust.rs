@@ -846,6 +846,77 @@ async fn the_assertion_recheck_is_about_standing_only() {
     );
 }
 
+/// An enrolled Android passkey's assertions are not held to its
+/// KeyDescription: a stored chain whose leaf says the bootloader was
+/// unlocked, or whose `rootOfTrust` does not parse at all (as a chain
+/// enrolled before this crate read the field might), anchors nothing but is
+/// in good standing under a fresh list that does not list it, and refused
+/// under one that does (its serials are still read).
+/// Mutations: `android_key_serials` reading serials through
+/// `android::inspect_chain` (which parses the KeyDescription) -> the
+/// unparseable case is refused under the empty list; `hardware_rules` run
+/// at assertion -> both cases are.
+#[tokio::test]
+async fn an_enrolled_android_passkey_asserts_whatever_its_key_description_says() {
+    let google = TestAttestation::new("Android");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(None, Some(&google), Some(status.clone()), false);
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let revoked_leaf = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let reg = rp
+        .finish_registration(
+            &google.android_key_with(&auth, &created, true, &revoked_leaf),
+            &state,
+        )
+        .expect("CALIBRATION: registers");
+    let spliced = [
+        (
+            "unparseable root of trust",
+            AndroidKeyOpts {
+                root_of_trust_malformed: true,
+                ..revoked_leaf.clone()
+            },
+        ),
+        (
+            "unlocked bootloader",
+            AndroidKeyOpts {
+                root_of_trust: Some((false, 0)),
+                ..revoked_leaf.clone()
+            },
+        ),
+    ]
+    .map(|(label, opts)| {
+        let stored = with_stored_chain(&reg, &google.android_chain_der(&auth, &created, &opts));
+        assert!(
+            rp.hardware_attested(&stored.passkey, "android-key", Uuid::nil(), false)
+                .is_err(),
+            "CALIBRATION {label}: it anchors nothing"
+        );
+        (label, stored)
+    });
+    for (label, stored) in &spliced {
+        assert_eq!(
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format),
+            Ok(()),
+            "{label}"
+        );
+    }
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    for (label, stored) in &spliced {
+        assert_eq!(
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format)
+                .map_err(|r| r.code()),
+            Err("attestation_not_in_good_standing"),
+            "{label}: its leaf is listed"
+        );
+    }
+}
+
 // =====================================================================
 // P779-3: an anchor is re-verified against the CURRENT configuration
 // =====================================================================

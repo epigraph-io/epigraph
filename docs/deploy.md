@@ -3021,7 +3021,9 @@ when all of these hold:
 
   This is checked at enrollment and at every anchor and lineage use, so an
   Android passkey enrolled before this check from such a device stops
-  anchoring (it still elevates);
+  anchoring, and so does every later passkey whose lineage holds it (a
+  security key enrolled on an act that phone confirmed, for example). It
+  still elevates: assertions re-check only the status list;
 - only the leaf carries a KeyDescription. A chain with a second one, which
   would be an attacker's certificate extending a genuine chain, is refused;
 - no certificate of the chain, the root included, is on the attestation

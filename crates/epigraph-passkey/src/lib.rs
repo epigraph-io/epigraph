@@ -1304,12 +1304,24 @@ impl Passkeys {
                 ))
             })?
             .ok_or_else(|| untrusted("it carries no certificate chain".into()))?;
-        let der = chain
+        // Each certificate's serial, and nothing else: the KeyDescription is
+        // NOT parsed here, so a parser or rule added after a passkey enrolled
+        // cannot stop it asserting (registration enforced them).
+        let mut serials = chain
             .iter()
-            .map(|c| c.to_der())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| untrusted(format!("a certificate does not encode: {e}")))?;
-        let (mut serials, _) = android::inspect_chain(&der).map_err(untrusted)?;
+            .enumerate()
+            .map(|(index, c)| {
+                let der = c
+                    .to_der()
+                    .map_err(|e| untrusted(format!("a certificate does not encode: {e}")))?;
+                let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| {
+                    untrusted(format!(
+                        "attestation certificate {index} does not parse: {e}"
+                    ))
+                })?;
+                Ok(cert.raw_serial().to_vec())
+            })
+            .collect::<Result<Vec<_>, StandingRefusal>>()?;
         let root = ca
             .ca()
             .to_der()
