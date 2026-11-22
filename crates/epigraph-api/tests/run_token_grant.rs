@@ -768,7 +768,8 @@ async fn a_model_outside_the_allowlist_is_refused(pool: PgPool) {
 }
 
 /// The model list is checked against the ATTESTED registration (migration
-/// 161's `agent_prompt_snapshots`, written only by the attestor's definer),
+/// 161's `agent_prompt_snapshots`, written only by the attestor's definer or
+/// a maintenance session),
 /// never against `agents.properties`, which the application role may rewrite
 /// on the agent's own row. An identity registered under a model outside the
 /// list stays refused after it rewrites its display model to a listed one, and
@@ -841,6 +842,68 @@ async fn the_attested_model_decides_a_mint_not_the_display_property(pool: PgPool
         "a listed registration whose display model was rewritten",
         &mint(&st, &request(&client_id, &key, json!({}))).await,
     );
+}
+
+/// A delegator with NO live delegation over an identity learns nothing of
+/// that identity's registration: whether it was attested, and whether its
+/// attested model is listed, never changes the answer. The model checks run
+/// only after the delegation check, so an unattested identity, one attested
+/// under an excluded model and one attested under a listed model are all
+/// refused `delegation_not_live`, with byte-identical response bodies.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_caller_without_a_delegation_learns_nothing_of_an_identitys_registration(pool: PgPool) {
+    let (_d, client_id, key) = world(&pool, "run-token-oracle").await;
+    let st = app_state(&pool, RunTokens::On, &[MODEL]).await;
+    token_of(
+        "CALIBRATION: the delegator mints for its own principal",
+        &mint(&st, &request(&client_id, &key, json!({}))).await,
+    );
+
+    // Three identities the delegator holds no delegation over.
+    let (unattested, _) = delegation::agent_with_group(&pool, "run-token-oracle-unattested").await;
+    let unattested_key = display_model(&pool, unattested, MODEL).await;
+    let (excluded, _) = delegation::agent_with_group(&pool, "run-token-oracle-excluded").await;
+    let excluded_key = identify(&pool, excluded, EXCLUDED_MODEL).await;
+    let (listed, _) = delegation::agent_with_group(&pool, "run-token-oracle-listed").await;
+    let listed_key = identify(&pool, listed, MODEL).await;
+
+    let mut bodies = Vec::new();
+    for (n, (what, agent, k)) in [
+        ("an unattested identity", unattested, &unattested_key),
+        (
+            "an identity attested under an excluded model",
+            excluded,
+            &excluded_key,
+        ),
+        (
+            "an identity attested under a listed model",
+            listed,
+            &listed_key,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let answer = mint(&st, &request(&client_id, k, json!({}))).await;
+        refused_because(
+            &pool,
+            n + 1,
+            what,
+            &answer,
+            "invalid_grant",
+            "delegation_not_live",
+            Some(agent),
+        )
+        .await;
+        bodies.push((what, answer.1));
+    }
+    for (what, body) in &bodies[1..] {
+        assert_eq!(
+            body, &bodies[0].1,
+            "{what} must be answered exactly as {}",
+            bodies[0].0
+        );
+    }
 }
 
 /// A malformed request is `invalid_request`: a run label over 64 characters,

@@ -984,17 +984,21 @@ It is refused (`invalid_request`, `invalid_client`, `invalid_grant` or
 * the delegator client authenticates and has an agent (never created here);
 * an agent has the identity key (never created here: the host registers an
   identity and links it before it runs it);
-* the agent has an ATTESTED registration (migration 161's
-  `agent_prompt_snapshots`, written only by the host attestor's definer; else
-  `no_attested_model`), and the model it was registered under is listed in
-  `EPIGRAPH_RUN_TOKEN_MODELS` (comma or whitespace separated; EMPTY refuses
-  every mint). The model is read through migration 199's
-  `epigraph_agent_prompt_snapshot_at`, never from `agents.properties ->>
-  'llm_model'`, which is display state the application role may rewrite on
-  the agent's own row. This narrows which identities the grant serves; it is
-  not authority;
+* `EPIGRAPH_RUN_TOKEN_MODELS` lists at least one model (comma or whitespace
+  separated; EMPTY refuses every mint, `no_model_allowed`);
 * `AgentRepository::delegated_principal_pool` answers `Some`, the same
-  question every request then repeats.
+  question every request then repeats;
+* the agent has an ATTESTED registration (migration 161's
+  `agent_prompt_snapshots`, written only by the host attestor's definer or a
+  maintenance session, never by the application role; else
+  `no_attested_model`), and the model it was registered under is listed in
+  `EPIGRAPH_RUN_TOKEN_MODELS` (else `model_not_allowed`). The model is read
+  through migration 199's `epigraph_agent_prompt_snapshot_at`, never from
+  `agents.properties ->> 'llm_model'`, which is display state the
+  application role may rewrite on the agent's own row. This narrows which
+  identities the grant serves; it is not authority. It is checked after the
+  delegation, so a caller with no live delegation over an identity is
+  answered `delegation_not_live` and learns nothing of its registration.
 
 Every mint writes one `security_events` row `oauth_run_token_minted` (the
 principal as `agent_id`; details: delegator, delegator client, operator,

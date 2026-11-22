@@ -52,7 +52,8 @@ pub const RUN_TOKEN_MODELS_ENV: &str = "EPIGRAPH_RUN_TOKEN_MODELS";
 
 /// The LLM models a run token may be minted for, matched against the model
 /// the agent's identity was ATTESTED under (migration 161's
-/// `agent_prompt_snapshots`, written only by the host attestor; read by
+/// `agent_prompt_snapshots`, written only by the host attestor's definer or
+/// a maintenance session, never by the application role; read by
 /// `AgentRepository::run_token_principal_pool`), never against
 /// `agents.properties ->> 'llm_model'`, which the application role may
 /// rewrite on the agent's own row. An agent with no attested registration is
@@ -378,24 +379,6 @@ async fn decide(
             format!("{RUN_TOKEN_MODELS_ENV} lists no model on this server"),
         )));
     }
-    // The ATTESTED model (see `RunTokenModels`); display properties are
-    // never consulted.
-    let Some(model) = model else {
-        return Ok(Err(refusal(
-            "invalid_grant",
-            "no_attested_model",
-            "the agent has no attested identity registration: the host registers an identity \
-             through the attestor before it runs it",
-        )));
-    };
-    if !state.run_token_models.contains(&model) {
-        return Ok(Err(refusal(
-            "invalid_grant",
-            "model_not_allowed",
-            format!("the agent's model is not in {RUN_TOKEN_MODELS_ENV}"),
-        )));
-    }
-
     // THE authority check, the one every request will repeat.
     let live =
         AgentRepository::delegated_principal_pool(pool, state.run_tokens, delegator, principal)
@@ -412,6 +395,28 @@ async fn decide(
              hold an acting (not retired) link to that operator",
         )));
     };
+
+    // The ATTESTED model (see `RunTokenModels`); display properties are
+    // never consulted. Checked only AFTER the delegation, so a caller with no
+    // live delegation over the identity is told `delegation_not_live` whatever
+    // the identity's registration is: neither whether it was attested nor
+    // whether its model is listed reaches it (migration 199 keeps the
+    // attested model behind the prompt-history gate).
+    let Some(model) = model else {
+        return Ok(Err(refusal(
+            "invalid_grant",
+            "no_attested_model",
+            "the agent has no attested identity registration: the host registers an identity \
+             through the attestor before it runs it",
+        )));
+    };
+    if !state.run_token_models.contains(&model) {
+        return Ok(Err(refusal(
+            "invalid_grant",
+            "model_not_allowed",
+            format!("the agent's model is not in {RUN_TOKEN_MODELS_ENV}"),
+        )));
+    }
 
     // Scopes: asked-for (or all granted) ∩ granted ∩ the delegated ceiling,
     // then the mint chokepoint. The ceiling holds no admin-only scope, so the
