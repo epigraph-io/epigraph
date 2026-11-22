@@ -2454,7 +2454,8 @@ async fn verify_operator_link_retirer_isolation(
              the operator-link retire verb may run as that role, which alone holds UPDATE (retired) on \
              operator_links; a non-superuser that can act as it, or grant it to itself, can \
              retire a link directly, unserialised and with a forgeable audit. Revoke the grant \
-             or the attribute."
+             or the attribute. A cluster with no superuser (a managed service whose admin login \
+             is CREATEROLE) cannot hold this control: see docs/deploy.md, migration 257."
         );
     }
     Ok(faults.len())

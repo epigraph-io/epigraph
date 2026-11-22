@@ -3431,7 +3431,11 @@ restart.
   `schema_contract.rs::migration_191_retire_operator_link_is_owned_and_granted` and
   `operator_link_retire_owner_undo.rs`. Undo: `docs/runbooks/257-undo.sql`. **Deploy order:**
   none against other migrations; apply as a superuser, on a cluster with no non-superuser
-  CREATEROLE role (257 refuses otherwise). **Applied to throwaway databases
+  CREATEROLE role (257 refuses otherwise). A cluster with no superuser (a managed service
+  whose admin login is CREATEROLE) is an unsupported configuration for this control: 257
+  takes the NOTICE path, and a hand-provisioned role fails `verify`'s isolation check
+  because that admin login is CREATEROLE (and, on PG 16, holds ADMIN on a role it
+  creates). **Applied to throwaway databases
   only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

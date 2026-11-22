@@ -390,7 +390,8 @@ BEGIN
         RAISE NOTICE '257: the migrating login % is not a superuser; the retire verb keeps '
                      '191''s owner and grants. Provision epigraph_operator_link_retirer '
                      '(NOLOGIN, a member of epigraph_maintenance only) and re-run this block '
-                     'as a superuser.', current_user;
+                     'as a superuser. A cluster with no superuser cannot hold this control '
+                     '(docs/deploy.md, migration 257).', current_user;
         RETURN;
     END IF;
 
