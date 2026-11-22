@@ -731,8 +731,16 @@ const TOOLS: Surface = Surface {
         "admin_session_or_deferral(",
         "supersede_session_or_deferral(",
     ],
-    marker_spend: spends_viewer,
+    marker_spend: call_spends_viewer,
 };
+
+/// The per-call marker spend: the statement's live SQL (comments removed) puts
+/// `visibility = 'public'` in predicate position. See
+/// [`viewer_calls::predicate_spend`].
+fn call_spends_viewer(region: &str) -> bool {
+    let (_, live_sql) = spend_views(region);
+    viewer_calls::predicate_spend(&live_sql)
+}
 
 /// Every database call in a viewer-holding tool fn that does not spend the
 /// fn's viewer, as measured and reviewed on **2026-11-22** (backlog ada8ee55):
@@ -2159,6 +2167,48 @@ pub async fn cascade_after_gate(server: &EpiGraphMcpFull, viewer: &Viewer, id: U
         ],
         "the session `admin_session_or_deferral` returns is a connection, so the \
          cascade run on it without the viewer is reported"
+    );
+}
+
+/// The per-call marker counts `visibility = 'public'` only as a filter. In a
+/// projection it hides no row; on another receiver `.splice(` is not this
+/// fn's viewer.
+#[test]
+fn the_per_call_marker_counts_only_a_filtering_predicate() {
+    let src = r##"
+pub async fn projected(server: &EpiGraphMcpFull, viewer: &Viewer, id: Uuid) -> R {
+    let _ = viewer;
+    let row: (String, bool) = sqlx::query_as(
+        "SELECT c.content, c.visibility = 'public' FROM claims c WHERE c.id = $1",
+    )
+    .bind(id)
+    .fetch_one(&server.pool)
+    .await?;
+    Ok(row)
+}
+
+pub async fn filtered(server: &EpiGraphMcpFull, viewer: &Viewer, id: Uuid) -> R {
+    let row: (String,) = sqlx::query_as(
+        "SELECT c.content FROM claims c WHERE c.id = $1 \
+         AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3))",
+    )
+    .bind(id)
+    .bind(viewer.is_bypass())
+    .fetch_one(&server.pool)
+    .await?;
+    Ok(row)
+}
+"##;
+    let m = tool_unviewed(src);
+    assert_eq!(
+        tool_labels(&m, "projected"),
+        vec!["sqlx::query_as(SELECT).fetch_one"],
+        "a raw-pool content read whose only marker is a projected column is unviewed"
+    );
+    assert_eq!(
+        tool_labels(&m, "filtered"),
+        Vec::<String>::new(),
+        "the marker in predicate position is a spend"
     );
 }
 

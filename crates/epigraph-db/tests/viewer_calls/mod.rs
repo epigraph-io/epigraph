@@ -19,9 +19,13 @@
 //! * **The spend rule is the repo and tool layers', not the routes'.** A call is
 //!   viewed when it hands the viewer on as a whole value (the bare identifier, or
 //!   [`HANDOFF_METHODS`]: a clone, a scoped copy, or a rendered or spliced
-//!   predicate), or when its statement text carries a live spend marker
-//!   (`marker_spend`, each lint's own `spends_viewer`: `.splice(` in code,
-//!   `visibility = 'public'` in live SQL). `group_bind()` and `writable_bind()`
+//!   predicate), or when its statement text carries the live SQL marker
+//!   `visibility = 'public'` IN PREDICATE POSITION ([`predicate_spend`], after
+//!   `AND` / `OR` / `WHERE` / `ON`; not in a projection, an `ORDER BY` or a
+//!   `CASE WHEN`). Stricter than each lint's fn-level `spends_viewer`, which
+//!   also counts `.splice(` on any receiver and the marker anywhere: per call,
+//!   a splice counts only on one of the fn's own viewers (a handoff).
+//!   `group_bind()` and `writable_bind()`
 //!   are NOT a spend here, as they are not in either lint's fn-level check:
 //!   binding an array proves a parameter was supplied, not that the SQL reads
 //!   it. A three-bind statement is viewed by its SQL text, which is in the
@@ -70,8 +74,11 @@ pub struct Surface {
     /// Extra connection constructors, beyond [`CONNECTION_CTORS`], whose `let`
     /// binding is a connection (`admin_cascade_session(`).
     pub conn_ctors: &'static [&'static str],
-    /// The lint's own marker-spend predicate, run on the RAW text of a call's
-    /// region.
+    /// The per-call marker-spend predicate, run on the RAW text of a call's
+    /// region: the lint's `spend_views` (to drop comments) followed by
+    /// [`predicate_spend`]. Not the lint's fn-level `spends_viewer`, which
+    /// also counts `.splice(` on any receiver and the SQL marker in any
+    /// position.
     pub marker_spend: fn(&str) -> bool,
 }
 
@@ -960,6 +967,69 @@ fn hands_on_viewer(region: &str, viewers: &[String]) -> bool {
             HANDOFF_METHODS.contains(&ident_at(s, m_at))
         })
     })
+}
+
+/// The SQL-text spend marker, matched only where it filters rows.
+pub const PREDICATE_MARKER: &str = "visibility = 'public'";
+
+/// Does `live_sql` (a statement's text with its comments removed, as each
+/// lint's `spend_views` returns it) carry [`PREDICATE_MARKER`] as a FILTER: in
+/// predicate position, right after `AND`, `OR`, `WHERE` or `ON` (skipping an
+/// opening parenthesis, line breaks and the column's table alias, `c.` or a
+/// `{mf}.` placeholder)?
+///
+/// The per-call check reads this instead of the fn-level `spends_viewer`,
+/// which counts the marker anywhere in the text. In one call's statement the
+/// marker can sit in a projection (`SELECT c.content, c.visibility = 'public'
+/// FROM claims c WHERE c.id = $1`), an `ORDER BY` or a `CASE WHEN`, none of
+/// which hides a row, and a column named `profile_visibility` is not the
+/// marker at all.
+pub fn predicate_spend(live_sql: &str) -> bool {
+    // `\n`, `\t`, `\r` escapes and line-continuation backslashes are line
+    // breaks in the statement; read them as whitespace.
+    let mut t = live_sql.as_bytes().to_vec();
+    let mut i = 0;
+    while i < t.len() {
+        if t[i] == b'\\' {
+            t[i] = b' ';
+            if i + 1 < t.len() && matches!(t[i + 1], b'n' | b't' | b'r') {
+                t[i + 1] = b' ';
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    let mut from = 0;
+    while let Some(p) = find(&t, PREDICATE_MARKER.as_bytes(), from) {
+        from = p + 1;
+        if p > 0 && is_ident(t[p - 1]) {
+            // `profile_visibility = 'public'`: another column.
+            continue;
+        }
+        let mut k = p;
+        // The table alias: `c.`, `c2.`, `{mf}.`.
+        if k > 0 && t[k - 1] == b'.' {
+            k -= 1;
+            while k > 0 && (is_ident(t[k - 1]) || t[k - 1] == b'{' || t[k - 1] == b'}') {
+                k -= 1;
+            }
+        }
+        while k > 0 && (t[k - 1].is_ascii_whitespace() || t[k - 1] == b'(') {
+            k -= 1;
+        }
+        let end = k;
+        while k > 0 && is_ident(t[k - 1]) {
+            k -= 1;
+        }
+        let word = std::str::from_utf8(&t[k..end]).expect("ASCII keyword");
+        if ["AND", "OR", "WHERE", "ON"]
+            .iter()
+            .any(|kw| word.eq_ignore_ascii_case(kw))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// The path written immediately before the `(` at `open` (a `!` of a macro

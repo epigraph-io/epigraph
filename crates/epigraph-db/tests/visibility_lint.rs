@@ -4661,8 +4661,16 @@ const REPOS: Surface = Surface {
     state_db_methods: &[],
     viewer_ctors: &["Viewer::resolve("],
     conn_ctors: &[],
-    marker_spend: spends_viewer,
+    marker_spend: call_spends_viewer,
 };
+
+/// The per-call marker spend: the statement's live SQL (comments removed) puts
+/// `visibility = 'public'` in predicate position. See
+/// [`viewer_calls::predicate_spend`].
+fn call_spends_viewer(region: &str) -> bool {
+    let (_, live_sql) = spend_views(region);
+    viewer_calls::predicate_spend(&live_sql)
+}
 
 /// Every database call in a viewer-taking repo fn that does not spend the
 /// fn's viewer, as measured and reviewed on **2026-11-22** (backlog ada8ee55):
@@ -4695,12 +4703,36 @@ const REPOS: Surface = Surface {
 /// No entry reads content into a response without the viewer: the review
 /// found nothing to fix. Do not add an entry to make the build pass.
 const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
-    // untenanted: `disclosed_roles` (the role-assignment definer) and the operator humans'
-    // `agents` display names, for agents whose card the viewed statement admitted.
+    // untenanted: `agents` has no tenancy columns (`agents_identity` is USING (true)). The
+    // profile details (`profile_visibility`, ORCID, ROR, properties) are gated IN the
+    // statement by `may_see_details`, computed from the viewer's principal, groups and
+    // bypass binds: a hidden detail never leaves the database. That gate sits in a
+    // projection, not a filter, so the per-call marker (rightly) does not count it.
+    (
+        "agent.rs",
+        "get_public_profile",
+        &["sqlx::query_as(SELECT).fetch_optional"],
+    ),
+    // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
+    // viewer's principal, groups and bypass binds, as in `get_public_profile`),
+    // `disclosed_roles` (the role-assignment definer) and the operator humans' `agents`
+    // display names, for the carded agents.
     (
         "agent_lookup.rs",
         "cards_inner",
-        &["Self::disclosed_roles", "sqlx::query_as(SELECT).fetch_all"],
+        &[
+            "Self::disclosed_roles",
+            "sqlx::query_as(SELECT).fetch_all",
+            "sqlx::query_as(SELECT).fetch_all",
+        ],
+    ),
+    // untenanted: ranks `agents` by name, returning only the public identity columns (id,
+    // display name, created_at); the ORCID / ROR tiers match only where `details_ok`
+    // (viewer's principal, groups and bypass binds) admits the agent's details.
+    (
+        "agent_lookup.rs",
+        "match_ranked",
+        &["sqlx::query_as(WITH).fetch_all"],
     ),
     // untenanted: `atlas_layout_regions` and the region bundle rows; each is kept only where
     // `visible_themes` (spliced) admits a theme.
@@ -5244,4 +5276,93 @@ pub async fn helpers_and_transactions(pool: &PgPool, viewer: &Viewer, id: Uuid) 
          drop, a logging macro and the result of a statement bound `let mut` are not \
          calls"
     );
+}
+
+/// The per-call marker counts `visibility = 'public'` only where it filters
+/// rows (after `AND`, `OR`, `WHERE` or `ON`), and `.splice(` only on one of the
+/// fn's own viewers. The fn-level check counts both anywhere, which is right
+/// for "does this fn spend its viewer at all" and wrong for one statement.
+#[test]
+fn the_per_call_marker_counts_only_a_filtering_predicate() {
+    let src = r##"
+pub async fn projected(conn: &mut PgConnection, viewer: &Viewer, id: Uuid) -> R {
+    let _ = viewer;
+    sqlx::query_as("SELECT c.content, c.visibility = 'public' FROM claims c WHERE c.id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+}
+
+pub async fn ordered(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT c.content FROM claims c ORDER BY c.visibility = 'public' DESC")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn case_when(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT CASE WHEN c.visibility = 'public' THEN c.content END FROM claims c")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn another_column(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT a.bio FROM agents a WHERE a.profile_visibility = 'public'")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn spliced_by_another(conn: &mut PgConnection, viewer: &Viewer, ctx: &Ctx) -> R {
+    let _ = viewer;
+    let sql = ctx.viewer.splice("SELECT content FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    sqlx::query_scalar(&sql).fetch_all(&mut *conn).await
+}
+
+pub async fn filtered(conn: &mut PgConnection, viewer: &Viewer, id: Uuid) -> R {
+    let _ = viewer;
+    sqlx::query_scalar(
+        "SELECT c.content FROM claims c WHERE c.id = $1 \
+         AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3))",
+    )
+    .fetch_one(&mut *conn)
+    .await
+}
+
+pub async fn continued(conn: &mut PgConnection, viewer: &Viewer, mf: &str) -> R {
+    let _ = viewer;
+    let sql = format!(
+        "SELECT {mf}.content FROM claims {mf} WHERE {mf}.id = $1 AND \
+         ({mf}.visibility = 'public' OR {mf}.owner_group_id = ANY($2))"
+    );
+    sqlx::query_scalar(&sql).fetch_one(&mut *conn).await
+}
+
+pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let sql = viewer.splice("SELECT content FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    sqlx::query_scalar(&sql).fetch_all(&mut *conn).await
+}
+"##;
+    let m = repo_unviewed(src);
+    for (f, label) in [
+        ("projected", "sqlx::query_as(SELECT).fetch_one"),
+        ("ordered", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("case_when", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("another_column", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("spliced_by_another", "sqlx::query_scalar(SELECT).fetch_all"),
+    ] {
+        assert_eq!(
+            repo_labels(&m, f),
+            vec![label],
+            "{f}: the marker is not a filter on this fn's viewer, so the read is unviewed"
+        );
+    }
+    for f in ["filtered", "continued", "spliced"] {
+        assert_eq!(
+            repo_labels(&m, f),
+            Vec::<String>::new(),
+            "{f}: a filtering predicate, or a splice on the fn's own viewer, is a spend"
+        );
+    }
 }
