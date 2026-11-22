@@ -214,7 +214,9 @@ if want propagate; then
   q "INSERT INTO factors (factor_type, variable_ids, potential) VALUES ('evidential_support', ARRAY['$P1','$P2']::uuid[], '{\"strength\":0.9}')" >/dev/null
   bp() {  # $1 case, $2 token, $3 claim to watch
     local before; before="$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
-    req POST "/api/v1/bp/propagate" "$2" '{"apply_updates":true,"mode":"scalar"}'
+    # A request names its scope (backlog b02347c6): the two owner claims, one
+    # factor hop, which reaches every factor this probe inserts.
+    req POST "/api/v1/bp/propagate" "$2" "{\"apply_updates\":true,\"mode\":\"scalar\",\"claim_ids\":[\"$P1\",\"$P2\"],\"max_hops\":1}"
     line "$1" "applied=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('applied'), 'written', d.get('applied_count'), 'skipped', d.get('skipped_not_visible'), 'compounds', d.get('skipped_compounds'))" "$BODY" 2>/dev/null) listed=$(python3 -c "import json,sys; print(len(json.load(open(sys.argv[1])).get('updated_beliefs') or []))" "$BODY" 2>/dev/null) betp=$before->$(q "SELECT round(pignistic_prob::numeric,4) FROM claims WHERE id='$3'")"
   }
   bp owner/own-factor "$T_OWNER" "$P2"

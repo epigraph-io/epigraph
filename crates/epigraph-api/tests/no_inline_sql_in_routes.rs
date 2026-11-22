@@ -98,7 +98,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
-    ("computation.rs", 9),
+    ("computation.rs", 8),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
@@ -137,7 +137,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 94 on staging batch 4 by backlog batch B37 (#895): its route
 /// reads moved into the repo layer (`search.rs` 4 -> 3; `conflicts.rs`,
 /// `embeddings.rs`, `political.rs` and `workflows.rs` reached zero).
-const HIGH_WATER: usize = 91;
+/// Lowered to 90 by backlog triage T52 (backlog b02347c6): `/bp/propagate`'s
+/// factor load moved into `FactorRepository::load_bp_scope`
+/// (`computation.rs` 9 -> 8).
+const HIGH_WATER: usize = 90;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

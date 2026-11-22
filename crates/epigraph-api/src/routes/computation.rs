@@ -101,7 +101,17 @@ pub struct ReconcileRequest {
 #[cfg(feature = "db")]
 #[derive(Debug, Deserialize)]
 pub struct PropagateRequest {
+    /// Only factors on this frame. With no `claim_ids`, the whole frame is
+    /// the scope.
     pub frame_id: Option<Uuid>,
+    /// The claims whose factor-graph neighbourhood is run (backlog
+    /// b02347c6): the factors that name one of them, then those that name a
+    /// variable of those, out to `max_hops`. At most [`BP_MAX_SCOPE_CLAIMS`].
+    /// A request names this, `frame_id`, or both.
+    pub claim_ids: Option<Vec<Uuid>>,
+    /// Factor hops from `claim_ids`, 1 to [`BP_MAX_HOPS`]; default
+    /// [`BP_DEFAULT_HOPS`]. Only with `claim_ids`.
+    pub max_hops: Option<usize>,
     pub max_iterations: Option<usize>,
     pub convergence_threshold: Option<f64>,
     pub damping: Option<f64>,
@@ -927,6 +937,94 @@ fn bp_config_from_request(
     })
 }
 
+/// The most claims a `POST /api/v1/bp/propagate` scope may name.
+#[cfg(feature = "db")]
+pub const BP_MAX_SCOPE_CLAIMS: usize = 1_000;
+
+/// The factor hops a claim scope is expanded by when `max_hops` is absent.
+#[cfg(feature = "db")]
+pub const BP_DEFAULT_HOPS: usize = 2;
+
+/// The most factor hops a claim scope may ask for.
+#[cfg(feature = "db")]
+pub const BP_MAX_HOPS: usize = 4;
+
+/// The most factors one BP run loads. A scope that reaches more is refused
+/// (400) rather than run on a truncated graph: narrow the claim set, lower
+/// `max_hops`, or add a `frame_id`.
+#[cfg(feature = "db")]
+pub const BP_MAX_FACTORS: usize = 10_000;
+
+/// The factor-graph scope a [`PropagateRequest`] names (backlog b02347c6).
+///
+/// A run used to load every BP-readable factor when `frame_id` was absent,
+/// so its cost grew with the corpus, not with the request. A request must
+/// now name `claim_ids` (expanded `max_hops` factor hops, default
+/// [`BP_DEFAULT_HOPS`]) or a `frame_id`, or both.
+///
+/// # Errors
+/// `ApiError::ValidationError` (400) on `claim_ids` when neither is named,
+/// when `claim_ids` is empty or longer than [`BP_MAX_SCOPE_CLAIMS`]; on
+/// `max_hops` when it is 0, above [`BP_MAX_HOPS`], or given without
+/// `claim_ids`.
+#[cfg(feature = "db")]
+fn bp_scope_from_request(
+    request: &PropagateRequest,
+) -> Result<epigraph_db::repos::factor::BpFactorScope<'_>, ApiError> {
+    let refuse = |field: &str, reason: String| ApiError::ValidationError {
+        field: field.to_string(),
+        reason,
+    };
+    let claim_ids = request.claim_ids.as_deref();
+    match claim_ids {
+        None if request.frame_id.is_none() => {
+            return Err(refuse(
+                "claim_ids",
+                "Name the claims to run BP around (claim_ids) or a frame (frame_id); \
+                 a run over the whole factor graph is not served"
+                    .to_string(),
+            ))
+        }
+        Some([]) => {
+            return Err(refuse(
+                "claim_ids",
+                "Must name at least one claim".to_string(),
+            ))
+        }
+        Some(ids) if ids.len() > BP_MAX_SCOPE_CLAIMS => {
+            return Err(refuse(
+                "claim_ids",
+                format!(
+                    "Must name at most {BP_MAX_SCOPE_CLAIMS} claims (got {})",
+                    ids.len()
+                ),
+            ))
+        }
+        _ => {}
+    }
+    let max_hops = match (request.max_hops, claim_ids) {
+        (Some(_), None) => {
+            return Err(refuse(
+                "max_hops",
+                "Bounds a claim_ids scope; this request names none".to_string(),
+            ))
+        }
+        (Some(h), Some(_)) if h == 0 || h > BP_MAX_HOPS => {
+            return Err(refuse(
+                "max_hops",
+                format!("Must be in [1, {BP_MAX_HOPS}] (got {h})"),
+            ))
+        }
+        (Some(h), Some(_)) => h,
+        (None, _) => BP_DEFAULT_HOPS,
+    };
+    Ok(epigraph_db::repos::factor::BpFactorScope {
+        frame_id: request.frame_id,
+        claim_ids,
+        max_hops,
+    })
+}
+
 /// Run a BP engine on the blocking pool, off the async runtime's workers
 /// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
 /// sweeps of the factor graph.
@@ -948,6 +1046,12 @@ where
 /// `max_iterations` is capped at [`BP_MAX_ITERATIONS`] and
 /// `convergence_threshold` / `damping` must lie in `[0, 1]`; anything else is
 /// a 400 before any factor is loaded.
+///
+/// The run's factor graph is the scope the request names (backlog
+/// b02347c6): `claim_ids` expanded `max_hops` factor hops, a `frame_id`, or
+/// both ([`bp_scope_from_request`]). A request that names neither is a 400,
+/// as is a scope that reaches more than [`BP_MAX_FACTORS`] factors. An apply
+/// writes from that neighbourhood's run only.
 ///
 /// BP apply is retired: `apply_updates: true` answers 409 and writes nothing
 /// unless the server runs with `EPIGRAPH_BP_APPLY=on` ([`crate::state::BpApply`]).
@@ -972,6 +1076,7 @@ pub async fn propagate_beliefs(
     Json(request): Json<PropagateRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let config = bp_config_from_request(&request)?;
+    let scope = bp_scope_from_request(&request)?;
     let apply = request.apply_updates.unwrap_or(false);
     if apply {
         crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
@@ -991,9 +1096,10 @@ pub async fn propagate_beliefs(
         });
     }
 
-    // Load factors from DB. This is the one loader that feeds the BP engines
-    // (`run_cdst_bp`, `run_bp`; interval mode runs the scalar track here), so
-    // the `decomposes_to` exclusion (SPEC §6.2, D3) is applied here, once.
+    // Load the factors in the request's scope (backlog b02347c6). This is the
+    // one loader that feeds the BP engines (`run_cdst_bp`, `run_bp`; interval
+    // mode runs the scalar track here), so the `decomposes_to` exclusion
+    // (SPEC §6.2, D3) is applied here, once, at every hop of the expansion.
     //
     // On the caller's viewer-stamped connection, not the raw pool: the
     // exclusion's legacy arm matches a factor to its `decomposes_to` edge by
@@ -1012,21 +1118,32 @@ pub async fn propagate_beliefs(
             message: "Failed to acquire a scoped connection".to_string(),
         }
     })?;
-    let factors: Vec<FactorRow> = sqlx::query_as(&format!(
-        "SELECT f.id, f.factor_type, f.variable_ids, f.potential, f.description \
-         FROM factors f \
-         WHERE ($1::uuid IS NULL OR f.frame_id = $1) \
-           AND {} \
-         ORDER BY f.created_at",
-        epigraph_db::repos::factor::bp_readable_factor_sql()
-    ))
-    .bind(request.frame_id)
-    .fetch_all(&mut *read)
+    let loaded = epigraph_db::repos::factor::FactorRepository::load_bp_scope(
+        &mut read,
+        &scope,
+        BP_MAX_FACTORS,
+    )
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to load factors: {e}"),
     })?;
     crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+    let factors = match loaded {
+        epigraph_db::repos::factor::BpScopeLoad::Loaded(rows) => rows,
+        epigraph_db::repos::factor::BpScopeLoad::OverCap { cap } => {
+            return Err(ApiError::ValidationError {
+                field: if scope.claim_ids.is_some() {
+                    "claim_ids".to_string()
+                } else {
+                    "frame_id".to_string()
+                },
+                reason: format!(
+                    "The scope reaches more than {cap} factors; narrow claim_ids, lower \
+                     max_hops or add a frame_id"
+                ),
+            });
+        }
+    };
 
     if factors.is_empty() {
         return Ok(Json(serde_json::json!({
@@ -1477,18 +1594,6 @@ pub async fn belief_at_time(
 }
 
 // ── Internal types ──
-
-#[cfg(feature = "db")]
-#[derive(sqlx::FromRow)]
-struct FactorRow {
-    #[allow(dead_code)]
-    id: Uuid,
-    factor_type: String,
-    variable_ids: Vec<Uuid>,
-    potential: serde_json::Value,
-    #[allow(dead_code)]
-    description: Option<String>,
-}
 
 // `EvidenceAtRow` was deleted with the inline evidence read in
 // `belief_at_time`; its replacement is `epigraph_db::EvidenceAtTimeRow`, whose

@@ -385,7 +385,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "computation.rs",
         "propagate_beliefs",
         &[
-            "sqlx::query_as(SELECT).fetch_all",
+            "FactorRepository::load_bp_scope",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
         ],

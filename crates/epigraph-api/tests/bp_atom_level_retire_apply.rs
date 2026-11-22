@@ -224,8 +224,8 @@ async fn propagate_with_scopes(
     scopes: &[&str],
 ) -> Result<Value, StatusCode> {
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve viewer");
-    let request: PropagateRequest =
-        serde_json::from_value(request).expect("a well-formed propagate request");
+    let request: PropagateRequest = serde_json::from_value(whole_graph_scope(pool, request).await)
+        .expect("a well-formed propagate request");
     match propagate_beliefs(
         ViewerExtractor(viewer),
         bearer(agent, scopes),
@@ -237,6 +237,23 @@ async fn propagate_with_scopes(
         Ok(Json(body)) => Ok(body),
         Err(e) => Err(e.into_response().status()),
     }
+}
+
+/// `request`, scoped to every claim any factor names when it names no scope
+/// of its own. A request must name a claim set or a frame (backlog
+/// b02347c6); these tests are about what the loader EXCLUDES, so they keep
+/// running over the whole factor graph, one hop from every variable in it.
+async fn whole_graph_scope(pool: &PgPool, mut request: Value) -> Value {
+    if request.get("frame_id").is_none() && request.get("claim_ids").is_none() {
+        let every: Vec<Uuid> =
+            sqlx::query_scalar("SELECT DISTINCT unnest(variable_ids) FROM factors")
+                .fetch_all(pool)
+                .await
+                .expect("every claim a factor names");
+        request["claim_ids"] = json!(every);
+        request["max_hops"] = json!(1);
+    }
+    request
 }
 
 /// A read-only run over every factor (no frame filter: the trigger's factors
@@ -1017,8 +1034,7 @@ async fn bp_apply_skips_a_compound_whose_only_child_is_hidden(pool: PgPool) {
             .execute(&pool)
             .await
             .expect("clear the factor graph");
-        let (agent, group) =
-            seed_agent_with_group(&pool, &format!("bp-hidden-child-{mode}")).await;
+        let (agent, group) = seed_agent_with_group(&pool, &format!("bp-hidden-child-{mode}")).await;
         let (stranger, other) =
             seed_agent_with_group(&pool, &format!("bp-hidden-child-other-{mode}")).await;
         let frame = binary_frame(&pool).await;
@@ -1047,12 +1063,11 @@ async fn bp_apply_skips_a_compound_whose_only_child_is_hidden(pool: PgPool) {
                 "CALIBRATION: the caller's stamped session cannot see the decomposition"
             );
         }
-        let structural: bool =
-            sqlx::query_scalar("SELECT public.epigraph_claim_is_compound($1)")
-                .bind(k)
-                .fetch_one(&state.db_pool)
-                .await
-                .expect("the migration 193 definer, on the app role");
+        let structural: bool = sqlx::query_scalar("SELECT public.epigraph_claim_is_compound($1)")
+            .bind(k)
+            .fetch_one(&state.db_pool)
+            .await
+            .expect("the migration 193 definer, on the app role");
         assert!(
             structural,
             "CALIBRATION: with definer rights k is a compound"

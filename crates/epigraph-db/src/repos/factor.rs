@@ -124,6 +124,61 @@ pub struct BpMessageRow {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The factor graph a BP request asks for (backlog b02347c6): a frame, a
+/// claim set expanded through the factor graph, or both. `claim_ids: None`
+/// is the frame scope alone (every BP-readable factor of `frame_id`, or of
+/// every frame when that is `None` too, which the HTTP route refuses).
+#[derive(Debug, Clone, Copy)]
+pub struct BpFactorScope<'a> {
+    /// Only factors on this frame.
+    pub frame_id: Option<Uuid>,
+    /// The seed claims; `None` for a frame-only scope.
+    pub claim_ids: Option<&'a [Uuid]>,
+    /// Factor hops from the seeds: 1 loads the factors that name a seed, 2
+    /// also those that name a variable of those, and so on. Ignored without
+    /// `claim_ids`.
+    pub max_hops: usize,
+}
+
+/// What [`FactorRepository::load_bp_scope`] found.
+#[derive(Debug)]
+pub enum BpScopeLoad {
+    /// Every factor in scope, in `created_at` order.
+    Loaded(Vec<FactorRow>),
+    /// The scope reaches more than `cap` factors. Nothing is returned: a
+    /// truncated factor graph would answer a different question with a 200.
+    OverCap { cap: usize },
+}
+
+/// The columns [`FactorRow`] is read from, over a `factors` row aliased `f`.
+const FACTOR_ROW_COLUMNS: &str = "f.id, f.factor_type, f.variable_ids, f.potential,      f.description, f.frame_id, f.properties, f.created_at";
+
+type FactorRowTuple = (
+    Uuid,
+    String,
+    Vec<Uuid>,
+    JsonValue,
+    Option<String>,
+    Option<Uuid>,
+    JsonValue,
+    chrono::DateTime<chrono::Utc>,
+);
+
+fn factor_row(t: FactorRowTuple) -> FactorRow {
+    let (id, factor_type, variable_ids, potential, description, frame_id, properties, created_at) =
+        t;
+    FactorRow {
+        id,
+        factor_type,
+        variable_ids,
+        potential,
+        description,
+        frame_id,
+        properties,
+        created_at,
+    }
+}
+
 pub struct FactorRepository;
 
 impl FactorRepository {
@@ -309,6 +364,90 @@ impl FactorRepository {
                 },
             )
             .collect())
+    }
+
+    /// The BP-readable factors ([`bp_readable_factor_sql`]) in `scope`, for
+    /// `POST /api/v1/bp/propagate` (backlog b02347c6). At most `cap` rows:
+    /// one more is [`BpScopeLoad::OverCap`], never a silent truncation.
+    ///
+    /// A claim scope is expanded hop by hop over `factors.variable_ids`
+    /// (`&&`, served by the GIN index `idx_factors_variables`), applying the
+    /// frame filter and the BP-readable predicate at EVERY hop, so the
+    /// expansion never walks through a factor BP would not read (a
+    /// `decomposes_to` echo, SPEC §6.2 D3). Each hop asks only for the rows
+    /// it can still afford (`cap + 1 - loaded`).
+    ///
+    /// Run it on the caller's stamped connection: the predicate's legacy arm
+    /// reads `edges`, which row security filters (see
+    /// [`bp_readable_factor_sql`]).
+    ///
+    /// # Errors
+    /// `DbError` when a statement fails.
+    pub async fn load_bp_scope(
+        conn: &mut sqlx::PgConnection,
+        scope: &BpFactorScope<'_>,
+        cap: usize,
+    ) -> Result<BpScopeLoad, crate::DbError> {
+        let limit = |loaded: usize| i64::try_from(cap + 1 - loaded).unwrap_or(i64::MAX);
+        let mut rows: Vec<FactorRow> = Vec::new();
+        match scope.claim_ids {
+            None => {
+                let found: Vec<FactorRowTuple> = sqlx::query_as(&format!(
+                    "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
+                      WHERE ($1::uuid IS NULL OR f.frame_id = $1) AND {} \
+                      ORDER BY f.created_at, f.id LIMIT $2",
+                    bp_readable_factor_sql()
+                ))
+                .bind(scope.frame_id)
+                .bind(limit(0))
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(crate::DbError::from)?;
+                rows.extend(found.into_iter().map(factor_row));
+            }
+            Some(seeds) => {
+                let mut seen_vars: std::collections::HashSet<Uuid> =
+                    seeds.iter().copied().collect();
+                let mut frontier: Vec<Uuid> = seen_vars.iter().copied().collect();
+                let mut loaded_ids: Vec<Uuid> = Vec::new();
+                for _ in 0..scope.max_hops {
+                    if frontier.is_empty() || rows.len() > cap {
+                        break;
+                    }
+                    let found: Vec<FactorRowTuple> = sqlx::query_as(&format!(
+                        "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
+                          WHERE f.variable_ids && $1::uuid[] \
+                            AND NOT (f.id = ANY($2::uuid[])) \
+                            AND ($3::uuid IS NULL OR f.frame_id = $3) AND {} \
+                          ORDER BY f.created_at, f.id LIMIT $4",
+                        bp_readable_factor_sql()
+                    ))
+                    .bind(&frontier)
+                    .bind(&loaded_ids)
+                    .bind(scope.frame_id)
+                    .bind(limit(rows.len()))
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(crate::DbError::from)?;
+                    frontier = Vec::new();
+                    for t in found {
+                        let row = factor_row(t);
+                        for v in &row.variable_ids {
+                            if seen_vars.insert(*v) {
+                                frontier.push(*v);
+                            }
+                        }
+                        loaded_ids.push(row.id);
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+        if rows.len() > cap {
+            return Ok(BpScopeLoad::OverCap { cap });
+        }
+        rows.sort_by(|a, b| (a.created_at, a.id).cmp(&(b.created_at, b.id)));
+        Ok(BpScopeLoad::Loaded(rows))
     }
 
     /// Upsert a BP message (factor↔variable, one direction).
