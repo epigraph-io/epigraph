@@ -55,9 +55,12 @@
 -- lookup stay in the repository, between the two calls, unchanged.
 --
 -- The counter arithmetic is `HierarchicalOutcomeCounters::after_report`'s:
--- a counter that is missing, or is not a JSON integer that fits an i64,
--- counts as 0; `avg_variance` that is not a JSON number counts as 0; a
--- `metadata` that is not a JSON object becomes `{}` first. `variance` must be
+-- a counter that is missing, is not a JSON integer that fits an i64, or is
+-- negative counts as 0, and a counter saturates at the i64 maximum;
+-- `avg_variance` that is not a JSON number in [0, 1] counts as 0; a
+-- `metadata` that is not a JSON object becomes `{}` first. So no stored shape
+-- makes a report fail (a stored `use_count` of -1 would otherwise divide by
+-- zero, on every later report too). `variance` must be
 -- in [0, 1] (the fraction of the report's step rows marked deviated) and is
 -- refused otherwise (22023), so a direct caller cannot poison the mean.
 --
@@ -216,26 +219,28 @@ BEGIN
         v_meta := '{}'::jsonb;
     END IF;
 
-    -- A counter is a JSON integer that fits an i64 (serde's `as_i64`), else 0.
+    -- A counter is a non-negative JSON integer that fits an i64 (serde's
+    -- `as_i64`, then `>= 0`), else 0; it saturates at the i64 maximum.
     v_use := CASE WHEN pg_catalog.jsonb_typeof(v_meta -> 'use_count') = 'number'
-                       AND (v_meta ->> 'use_count') ~ '^-?[0-9]{1,19}$'
-                       AND (v_meta ->> 'use_count')::numeric
-                           BETWEEN -9223372036854775808 AND 9223372036854775807
-                  THEN (v_meta ->> 'use_count')::bigint ELSE 0 END + 1;
+                       AND (v_meta ->> 'use_count') ~ '^[0-9]{1,19}$'
+                       AND (v_meta ->> 'use_count')::numeric <= 9223372036854775807
+                  THEN (v_meta ->> 'use_count')::bigint ELSE 0 END;
     v_success := CASE WHEN pg_catalog.jsonb_typeof(v_meta -> 'success_count') = 'number'
-                           AND (v_meta ->> 'success_count') ~ '^-?[0-9]{1,19}$'
-                           AND (v_meta ->> 'success_count')::numeric
-                               BETWEEN -9223372036854775808 AND 9223372036854775807
-                      THEN (v_meta ->> 'success_count')::bigint ELSE 0 END
-                 + CASE WHEN p_success THEN 1 ELSE 0 END;
+                           AND (v_meta ->> 'success_count') ~ '^[0-9]{1,19}$'
+                           AND (v_meta ->> 'success_count')::numeric <= 9223372036854775807
+                      THEN (v_meta ->> 'success_count')::bigint ELSE 0 END;
     v_failure := CASE WHEN pg_catalog.jsonb_typeof(v_meta -> 'failure_count') = 'number'
-                           AND (v_meta ->> 'failure_count') ~ '^-?[0-9]{1,19}$'
-                           AND (v_meta ->> 'failure_count')::numeric
-                               BETWEEN -9223372036854775808 AND 9223372036854775807
-                      THEN (v_meta ->> 'failure_count')::bigint ELSE 0 END
-                 + CASE WHEN p_success THEN 0 ELSE 1 END;
-    -- `avg_variance`: any JSON number (serde's `as_f64`), else 0.
+                           AND (v_meta ->> 'failure_count') ~ '^[0-9]{1,19}$'
+                           AND (v_meta ->> 'failure_count')::numeric <= 9223372036854775807
+                      THEN (v_meta ->> 'failure_count')::bigint ELSE 0 END;
+    IF v_use < 9223372036854775807 THEN v_use := v_use + 1; END IF;
+    IF p_success AND v_success < 9223372036854775807 THEN v_success := v_success + 1; END IF;
+    IF NOT p_success AND v_failure < 9223372036854775807 THEN v_failure := v_failure + 1; END IF;
+    -- `avg_variance`: a JSON number in [0, 1] (every running mean of variances
+    -- in [0, 1] is), else 0. Compared as numeric first, so a stored number
+    -- beyond the float8 range is never cast.
     v_prev_avg := CASE WHEN pg_catalog.jsonb_typeof(v_meta -> 'avg_variance') = 'number'
+                            AND (v_meta ->> 'avg_variance')::numeric BETWEEN 0 AND 1
                        THEN (v_meta ->> 'avg_variance')::double precision ELSE 0 END;
     v_avg := (v_prev_avg * (v_use - 1)::double precision + p_variance)
              / v_use::double precision;

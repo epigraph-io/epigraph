@@ -158,7 +158,9 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
 /// moves the counters through that definer); [`Self::after_report`] and
 /// [`Self::write_into`] are the rule it follows, and
 /// `epigraph-db/tests/workflows_update_owner_scope.rs` pins the two equal on
-/// every stored shape the rule treats specially. Change both together.
+/// the stored shapes the rule treats specially (missing, non-integer,
+/// negative and saturated counters, a non-numeric or out-of-range mean).
+/// Change both together.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalOutcomeCounters {
     pub use_count: i64,
@@ -170,26 +172,33 @@ pub struct HierarchicalOutcomeCounters {
 
 impl HierarchicalOutcomeCounters {
     /// The counters after one more report on a row whose metadata is
-    /// `metadata`: a missing or non-numeric counter counts as zero.
+    /// `metadata`. A counter that is missing, is not a JSON integer that fits
+    /// an i64, or is negative counts as zero, and a counter saturates at
+    /// `i64::MAX` instead of overflowing. A stored `avg_variance` that is not
+    /// a JSON number in `[0, 1]` (every running mean of variances in `[0, 1]`
+    /// is) counts as zero. So no stored shape makes a report fail, or makes
+    /// every later report on the row fail.
     #[must_use]
     pub fn after_report(metadata: &serde_json::Value, success: bool, variance: f64) -> Self {
         let int = |k: &str| {
             metadata
                 .get(k)
                 .and_then(serde_json::Value::as_i64)
+                .filter(|n| *n >= 0)
                 .unwrap_or(0)
         };
-        let use_count = int("use_count") + 1;
+        let use_count = int("use_count").saturating_add(1);
         let prev_avg_var = metadata
             .get("avg_variance")
             .and_then(serde_json::Value::as_f64)
+            .filter(|v| (0.0..=1.0).contains(v))
             .unwrap_or(0.0);
         #[allow(clippy::cast_precision_loss)]
         let avg_variance = (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64;
         Self {
             use_count,
-            success_count: int("success_count") + i64::from(success),
-            failure_count: int("failure_count") + i64::from(!success),
+            success_count: int("success_count").saturating_add(i64::from(success)),
+            failure_count: int("failure_count").saturating_add(i64::from(!success)),
             avg_variance,
         }
     }

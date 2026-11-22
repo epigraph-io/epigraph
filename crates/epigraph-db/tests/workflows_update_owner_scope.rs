@@ -243,10 +243,12 @@ async fn a_reader_moves_only_the_four_counters(pool: PgPool) {
     assert_eq!(lock(&w, &w.member, w.private).await, Ok(true));
 }
 
-/// The definer's arithmetic is `after_report`'s on every stored shape the
-/// Rust rule treats specially: a non-object `metadata`, a counter that is a
-/// string, a float, out of i64 range or negative, and an `avg_variance` that
-/// is not a number.
+/// The definer's arithmetic is `after_report`'s on the stored shapes the
+/// rule treats specially: a non-object `metadata`, a counter that is a
+/// string, a float, out of i64 range, negative (-1 divided by zero before the
+/// rule refused negatives) or at the i64 maximum (it overflowed), and an
+/// `avg_variance` that is not a number or is outside [0, 1] (1e308 overflowed
+/// the multiply).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_counters_follow_after_report_on_odd_stored_shapes(pool: PgPool) {
     let w = world(&pool).await;
@@ -263,6 +265,11 @@ async fn the_counters_follow_after_report_on_odd_stored_shapes(pool: PgPool) {
         r#"{"use_count": -2, "success_count": -1, "avg_variance": 0.5}"#,
         r#"{"use_count": 1e2, "success_count": 40, "failure_count": 60, "avg_variance": 0.125}"#,
         r#"{"use_count": 7, "success_count": 3, "failure_count": 4, "avg_variance": 0.3, "k": [1]}"#,
+        r#"{"use_count": -1, "avg_variance": 0.5}"#,
+        r#"{"use_count": 9223372036854775807, "success_count": 9223372036854775807, "failure_count": 9223372036854775807, "avg_variance": 0.25}"#,
+        r#"{"use_count": 3, "avg_variance": 1e308}"#,
+        r#"{"use_count": 3, "avg_variance": -0.5}"#,
+        r#"{"use_count": 3, "avg_variance": 1.5}"#,
     ];
     for (i, shape) in shapes.iter().enumerate() {
         for (success, variance) in [(true, 0.0), (false, 1.0), (true, 1.0 / 3.0)] {
@@ -307,6 +314,23 @@ async fn the_counters_follow_after_report_on_odd_stored_shapes(pool: PgPool) {
             }
         }
     }
+
+    // A stored mean beyond the float8 range (serde cannot even read it back,
+    // so it is outside the parity loop): counted as 0, never cast.
+    sqlx::query(
+        "UPDATE workflows SET metadata = '{\"use_count\": 1, \"avg_variance\": 1e400}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(w.public)
+    .execute(&pool)
+    .await
+    .expect("seed the shape");
+    let got = record(&w, &w.stranger, w.public, true, 0.5)
+        .await
+        .expect("a mean beyond float8 counts as 0");
+    let c = counters(&got);
+    assert_eq!(c.use_count, 2);
+    assert!((c.avg_variance - 0.25).abs() < 1e-12, "{c:?}");
 }
 
 /// A row the session cannot read is not locked (`false`) and its counters
