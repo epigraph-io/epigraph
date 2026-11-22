@@ -63,33 +63,51 @@
 --
 -- THE GAP. Arm (d) (`epigraph_propagate_tenancy`, last re-stated in 218)
 -- re-stamps every fragment a changed claim cites. 218 added one guard: when
--- the changed claims' winner is public, a fragment another group-private claim
--- still cites is left. Nothing holds a fragment on a group-to-group move: a
+-- the changed claims' winner is public, a group fragment another group claim
+-- still cites is left. Nothing held a fragment on a group-to-group move: a
 -- share took a fragment the moved claim cites into the team even when a claim
 -- that stays in the home group also cites it, and 215's source rule then saw
--- the source's fragments "agree" and moved the source too. Nor did publicize
--- hold a group fragment whose other citer is public. The spec's table (4.6,
--- `harvester_fragments`) says such a fragment is HELD in its current tenancy
--- (`shared-fragment`), for share and publicize alike.
+-- the source's fragments "agree" and moved the source too. The spec's table
+-- (4.6, `harvester_fragments`) says such a fragment is HELD in its current
+-- tenancy (`shared-fragment`).
 --
--- THE FIX. Before the claims UPDATE each act collects the fragments that a
--- moving claim cites AND a claim outside the moving set (current or not, any
--- tenancy) also cites, locks them, and records their pair. After the UPDATE
--- (arm (d) has run) and the edge re-meet, it puts each back on that pair; 173's
--- trigger carries the fragment's audit reports back with it. 215's source
--- rule then runs on the post-hold fragments, so a source with a held fragment
--- and a moved one disagrees and is held (`harvester_sources_held`). The audit
--- row counts the held fragments (`harvester_fragments_held`).
+-- THE FIX, SHARE. Before the claims UPDATE the act collects the fragments
+-- that a moving claim cites AND a claim outside the moving set also cites
+-- whose pair is not already the target team's (`('group', p_group_id)`),
+-- locks them, and records their pair. After the UPDATE (arm (d) has run) and
+-- the edge re-meet, it puts each back on that pair; 173's trigger carries the
+-- fragment's audit reports back with it. 215's source rule then runs on the
+-- post-hold fragments, so a source with a held fragment and a moved one
+-- disagrees and is held (`harvester_sources_held`). The audit row counts the
+-- fragments actually put back (`harvester_fragments_held`).
+--
+-- The other citer may be current or not: the act reaches a superseded claim
+-- as it does a current one, and a superseded claim's readers still read what
+-- it cites. A co-citer already in the team does NOT hold the fragment: the
+-- move takes nothing from its audience. So two claims that cite one fragment,
+-- shared in two calls, end with the fragment (and, once its fragments agree,
+-- the source) in the team; holding on ANY other citer stranded them in the
+-- home group for good, with no app path to move them.
+--
+-- THE FIX, PUBLICIZE. Publicize does not re-own a fragment, it only widens
+-- it, and 218's guard already keeps a group fragment that another group
+-- claim still cites. That is publicize's hold; 242 adds no second one. A
+-- fragment whose other citers are all public goes public with the moved
+-- claim (holding it would leave it narrower than every claim that cites it,
+-- and stranded once the last group citer is publicized). The audit row now
+-- reports 218's hold: `harvester_fragments_held` counts the moved claims'
+-- fragments that are still `group` after the UPDATE.
 --
 -- 218's arm (d) is NOT changed: `restrict-claims` and `regroup-claims` rely
 -- on it moving a fragment with a moved claim and put a kept node back
 -- themselves (218's header, "Moving A to another group also moves a fragment
--- B cites with it; 218 keeps that"). The hold lives in the two app acts, as
+-- B cites with it; 218 keeps that"). Share's hold lives in the app act, as
 -- the tools' does in the tools.
 --
--- A held fragment can be narrower than every claim that cites it (publicize
--- when every other citer is public). That costs availability, never
--- disclosure, and is the spec's rule.
+-- RESIDUAL. The hold set is read before the claims UPDATE and provenance
+-- rows are not locked, so a harvester write that commits a new citer of a
+-- fragment between that read and the UPDATE is not seen. The window is one
+-- statement wide and harvester writes are privileged.
 --
 -- ===================================================================
 -- 3. PRECONDITION, OWNER, GRANTS
@@ -164,9 +182,6 @@ DECLARE
     v_moved bigint := 0;
     v_human uuid;
     v_operated boolean;
-    v_hold_ids uuid[];
-    v_hold_own uuid[];
-    v_hold_vis text[];
     v_frags_held bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
@@ -263,23 +278,6 @@ BEGIN
       JOIN public.evidence_visibility_pins vp ON vp.evidence_id = ev.id
      WHERE ev.claim_id = ANY(v_todo);
 
-    -- Section 2: the fragments a moved claim cites that a claim NOT moving
-    -- also cites, locked, with the pair each has now (before arm (d) runs).
-    SELECT array_agg(f.id ORDER BY f.id) INTO v_hold_ids
-      FROM public.harvester_fragments f
-     WHERE EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
-                    WHERE p.fragment_id = f.id AND p.claim_id = ANY(v_todo))
-       AND EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
-                    WHERE p.fragment_id = f.id AND NOT (p.claim_id = ANY(v_todo)));
-    IF v_hold_ids IS NOT NULL THEN
-        PERFORM 1 FROM public.harvester_fragments f
-          WHERE f.id = ANY(v_hold_ids) ORDER BY f.id FOR NO KEY UPDATE;
-        SELECT array_agg(f.id ORDER BY f.id), array_agg(f.owner_group_id ORDER BY f.id),
-               array_agg(f.visibility::text ORDER BY f.id)
-          INTO v_hold_ids, v_hold_own, v_hold_vis
-          FROM public.harvester_fragments f WHERE f.id = ANY(v_hold_ids);
-    END IF;
-
     PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);  -- see 206's header
     -- THE widening statement, and the only one the GUC is armed around.
     PERFORM set_config('epigraph.allow_declassify', 'yes', true);
@@ -345,17 +343,15 @@ BEGIN
           FROM upd;
     END IF;
 
-    -- Section 2: arm (d) moved every fragment of a moved claim; a held one
-    -- goes back to the pair it had (its audit reports follow it, 173), and
-    -- the source rule below then sees the post-hold fragments.
-    IF v_hold_ids IS NOT NULL THEN
-        UPDATE public.harvester_fragments f
-           SET owner_group_id = h.g, visibility = h.v
-          FROM unnest(v_hold_ids, v_hold_own, v_hold_vis) AS h(id, g, v)
-         WHERE f.id = h.id
-           AND (f.owner_group_id, f.visibility::text) IS DISTINCT FROM (h.g, h.v);
-        v_frags_held := cardinality(v_hold_ids);
-    END IF;
+    -- Section 2: arm (d) made public every fragment of a moved claim except
+    -- one a group claim still cites (218's guard), which keeps its pair. That
+    -- is publicize's hold; count it for the audit row. Every moved claim is
+    -- public now, so a fragment of one that is still `group` was held.
+    SELECT count(*) INTO v_frags_held
+      FROM public.harvester_fragments f
+     WHERE f.visibility::text = 'group'
+       AND EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
+                    WHERE p.fragment_id = f.id AND p.claim_id = ANY(v_todo));
 
     -- 215 section 2: a source whose fragments now agree takes their pair.
     WITH touched AS (
@@ -534,14 +530,19 @@ BEGIN
              CASE WHEN m.sv = 'group' AND m.tv = 'group' AND m.sg <> m.tg
                        THEN m.tg ELSE NULL END);
 
-    -- Section 2: the fragments a moved claim cites that a claim NOT moving
-    -- also cites, locked, with the pair each has now (before arm (d) runs).
+    -- Section 2: the fragments a moved claim cites that a claim NOT moving,
+    -- and not already the target team's, also cites; locked, with the pair
+    -- each has now (before arm (d) runs). A co-citer already in the team
+    -- takes nothing from anyone when the fragment joins it.
     SELECT array_agg(f.id ORDER BY f.id) INTO v_hold_ids
       FROM public.harvester_fragments f
      WHERE EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
                     WHERE p.fragment_id = f.id AND p.claim_id = ANY(v_cls_ids))
        AND EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
-                    WHERE p.fragment_id = f.id AND NOT (p.claim_id = ANY(v_cls_ids)));
+                     JOIN public.claims c2 ON c2.id = p.claim_id
+                    WHERE p.fragment_id = f.id AND NOT (p.claim_id = ANY(v_cls_ids))
+                      AND (c2.visibility::text, c2.owner_group_id)
+                          IS DISTINCT FROM ('group', p_group_id));
     IF v_hold_ids IS NOT NULL THEN
         PERFORM 1 FROM public.harvester_fragments f
           WHERE f.id = ANY(v_hold_ids) ORDER BY f.id FOR NO KEY UPDATE;
@@ -603,7 +604,8 @@ BEGIN
           FROM unnest(v_hold_ids, v_hold_own, v_hold_vis) AS h(id, g, v)
          WHERE f.id = h.id
            AND (f.owner_group_id, f.visibility::text) IS DISTINCT FROM (h.g, h.v);
-        v_frags_held := cardinality(v_hold_ids);
+        -- Only the fragments arm (d) actually moved, and this put back.
+        GET DIAGNOSTICS v_frags_held = ROW_COUNT;
     END IF;
 
     -- 215 section 2: a source whose fragments now agree takes their pair.

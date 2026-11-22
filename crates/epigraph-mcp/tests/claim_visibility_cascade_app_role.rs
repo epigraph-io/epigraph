@@ -36,11 +36,14 @@
 //!   and even when its human's team is the target; its human makes the same
 //!   call and succeeds. (Before 242 the agent's session also failed the
 //!   refold check when only its human wrote the team; 242 refuses it first.)
-//! * backlog fc33ef1a (migration 242): a harvester fragment that a moved claim
-//!   cites and a claim that does NOT move also cites is held where it was, its
-//!   audit report with it, and counted (`harvester_fragments_held`). For
-//!   publicize the pinned shape is a PUBLIC other citer (218's arm (d) guard
-//!   already holds a fragment with another group-private citer).
+//! * backlog fc33ef1a (migration 242): on share, a harvester fragment that a
+//!   moved claim cites and a claim that does NOT move (and is not already in
+//!   the team) also cites is held where it was, its audit report with it, and
+//!   counted (`harvester_fragments_held`); co-citing claims shared in two
+//!   calls end with the fragment in the team. On publicize, 218's arm (d)
+//!   guard is the hold (a group co-citer), now counted in the audit row; a
+//!   fragment whose other citer is public goes public, and co-citing claims
+//!   publicized in two calls end with it public.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -614,48 +617,162 @@ async fn share_holds_a_fragment_a_claim_that_stays_also_cites(pool: PgPool) {
     assert_eq!(events[0]["harvester_sources_moved"], 0, "{events:?}");
 }
 
-/// Backlog fc33ef1a, publicize: a fragment the publicized claim cites and a
-/// claim that is NOT publicized also cites is held in its group. The other
-/// citer is PUBLIC here: with a group-private other citer, 218's arm (d) guard
-/// already keeps the fragment, so that shape proves nothing about this file.
+/// Backlog fc33ef1a, share, the other half of the hold: a co-citer that is
+/// ALREADY in the target team does not hold the fragment. Two claims that
+/// cite one fragment, shared into the same team in two calls: after the
+/// second call every citer is the team's, so the fragment and its source are
+/// too, and a teammate reads them. A hold on "any other citer" stranded the
+/// fragment and source in the home group for good (the first review of 242).
 #[sqlx::test(migrations = "../../migrations")]
-async fn publicize_holds_a_fragment_a_claim_not_publicized_also_cites(pool: PgPool) {
+async fn sharing_co_citing_claims_in_two_calls_does_not_strand_their_fragment(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "seq-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "seq-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let a = write(&pool, &s, alice, "first harvested finding", "private", None).await;
+    let b = write(
+        &pool,
+        &s,
+        alice,
+        "second harvested finding",
+        "private",
+        None,
+    )
+    .await;
+    let (source, f) = harvested(&pool, a).await;
+    cite(&pool, b, f).await;
+
+    share(&pool, &s, alice, &[a], t).await.expect("share a");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", f).await,
+        group(home),
+        "held while b stays home"
+    );
+    share(&pool, &s, alice, &[b], t).await.expect("share b");
+
+    assert_eq!(tenancy(&pool, "claims", a).await, group(t), "PREMISE");
+    assert_eq!(tenancy(&pool, "claims", b).await, group(t), "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", f).await,
+        group(t),
+        "every citer is the team's now, so the fragment is too"
+    );
+    assert_eq!(tenancy(&pool, "harvester_sources", source).await, group(t));
+    assert!(reads_row(&pool, &s, bob, "harvester_fragments", f).await);
+    assert!(reads_row(&pool, &s, bob, "harvester_sources", source).await);
+    let events = audit(&pool, "claim.shared_with_team").await;
+    let mut held: Vec<i64> = events
+        .iter()
+        .map(|e| e["harvester_fragments_held"].as_i64().expect("count"))
+        .collect();
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        vec![0, 1],
+        "one call held it, the other not: {events:?}"
+    );
+}
+
+/// Backlog fc33ef1a, publicize: a fragment the publicized claim cites and a
+/// group-private claim that is NOT publicized also cites stays in its group
+/// (218's arm (d) guard), and 242 reports it held in the audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_reports_a_fragment_a_group_claim_still_cites_as_held(pool: PgPool) {
     let s = app_role(&pool).await;
     let t = team(&pool, "team").await;
     let (eve, _) = fixture::seed_agent_with_group(&pool, "hold-admin").await;
     let (carol, _) = fixture::seed_agent_with_group(&pool, "hold-stranger").await;
     add_member(&pool, t, eve, "admin").await;
     let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
-    let other = write(&pool, &s, carol, "an already public claim", "public", None).await;
+    let stays = write(&pool, &s, eve, "team note not published", "team", Some(t)).await;
     let (source, shared) = harvested(&pool, c).await;
-    cite(&pool, other, shared).await;
-    let report = audit_report(&pool, shared).await;
-    assert_eq!(
-        tenancy(&pool, "harvester_fragments", shared).await,
-        group(t),
-        "PREMISE"
-    );
+    cite(&pool, stays, shared).await;
+    let own = fragment_of(&pool, source, c).await;
 
     publicize(&pool, &s, eve, &[c]).await.expect("publicized");
 
     assert_eq!(tenancy(&pool, "claims", c).await.0, "public", "PREMISE");
     assert_eq!(
+        tenancy(&pool, "harvester_fragments", own).await.0,
+        "public",
+        "a fragment only the publicized claim cites goes public"
+    );
+    assert_eq!(
         tenancy(&pool, "harvester_fragments", shared).await,
         group(t),
-        "a fragment a claim that did not move also cites is held"
+        "a fragment a group claim still cites is held"
     );
     assert!(!reads_row(&pool, &s, carol, "harvester_fragments", shared).await);
     assert_eq!(
-        tenancy(&pool, "harvester_audit_reports", report).await,
-        group(t)
-    );
-    assert_eq!(
         tenancy(&pool, "harvester_sources", source).await,
         group(t),
-        "the source's one fragment was held, so the source stays"
+        "the source's fragments disagree, so it stays"
     );
     let events = audit(&pool, "claim.publicized").await;
     assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_held"], 1, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize, the other half: a fragment whose other citer
+/// is already PUBLIC is not held. Publicize widens visibility and never
+/// changes the fragment's owner, so nothing is taken from the other citer's
+/// audience; holding it would leave a fragment narrower than every claim
+/// that cites it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_does_not_hold_a_fragment_whose_other_citer_is_public(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "pub-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "pub-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let other = write(&pool, &s, carol, "an already public claim", "public", None).await;
+    let (source, shared) = harvested(&pool, c).await;
+    cite(&pool, other, shared).await;
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await.0,
+        "public"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await.0,
+        "public"
+    );
+    assert!(reads_row(&pool, &s, carol, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 0, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize: two team claims that cite one fragment,
+/// publicized in two calls. The first call holds it (the second claim is
+/// still the team's); after the second, every citer is public and so are the
+/// fragment and its source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicizing_co_citing_claims_in_two_calls_does_not_strand_their_fragment(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "seq-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "seq-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let a = write(&pool, &s, eve, "first team finding", "team", Some(t)).await;
+    let b = write(&pool, &s, eve, "second team finding", "team", Some(t)).await;
+    let (source, f) = harvested(&pool, a).await;
+    cite(&pool, b, f).await;
+
+    publicize(&pool, &s, eve, &[a]).await.expect("publicize a");
+    assert_eq!(tenancy(&pool, "harvester_fragments", f).await, group(t));
+    publicize(&pool, &s, eve, &[b]).await.expect("publicize b");
+
+    assert_eq!(tenancy(&pool, "harvester_fragments", f).await.0, "public");
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await.0,
+        "public"
+    );
+    assert!(reads_row(&pool, &s, carol, "harvester_fragments", f).await);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

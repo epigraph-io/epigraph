@@ -3415,13 +3415,19 @@ restart.
   acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole
   human gate: an agent with no operator link and no client allowance (for example a
   role-attached agent that has neither) is still judged by its own memberships.
-  (2) A harvester fragment that a moved claim cites and a claim outside the call also cites is
-  held on its pair (its audit reports with it, 173), counted in the audit row as
-  `harvester_fragments_held`; 215's source rule then runs on the post-hold fragments. 218's
-  arm (d) is unchanged. Audit rows carry `migration` 242. Pinned by
+  (2) Share holds a harvester fragment that a moved claim cites and a claim outside the call
+  also cites, unless that claim is already in the target team: the fragment keeps its pair
+  (its audit reports with it, 173) and 215's source rule then runs on the post-hold
+  fragments. A co-citer already in the team does not hold it, so co-citing claims shared in
+  separate calls end with the fragment and source in the team. Publicize adds no hold of its
+  own (218's arm (d) guard already keeps a group fragment another group claim cites; a
+  fragment whose other citers are all public goes public). Both audit rows count the held
+  fragments as `harvester_fragments_held`. 218's arm (d) is unchanged. Audit rows carry
+  `migration` 242. Pinned by
   `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs` (the operated agent with its own
-  writer / admin membership, a retired link, the human's control call; the share and the
-  publicize hold, publicize with a PUBLIC other citer) and
+  writer / admin membership, a retired link, the human's control call; the share hold, the
+  share and publicize of co-citing claims in two calls, publicize with a group and with a
+  PUBLIC other citer) and
   `epigraph-db/tests/share_publicize_operated_fragment_undo.rs` (the undo, run twice; the md5
   precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
   was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a
