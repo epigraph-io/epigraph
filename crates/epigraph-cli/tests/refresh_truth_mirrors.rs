@@ -1436,6 +1436,157 @@ async fn a_claim_superseded_after_the_refresh_is_restored_and_reported_not_curre
     assert_eq!(again.already_restored, vec![retired, live]);
 }
 
+// ── (22) the binary: argument refusals write nothing ───────────────────────
+
+/// A refreshable mirror `a`, its wave file, and its state before the run.
+struct Refusal {
+    url: String,
+    dir: PathBuf,
+    a: Uuid,
+    wave_file: PathBuf,
+    t: f64,
+    v: (i64, DateTime<Utc>),
+}
+
+async fn refusal_fixture(pool: &PgPool) -> Refusal {
+    let url = fixture::database_url_for(pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(pool).await;
+    let a = mirror_claim(pool, author, 0.731_37).await;
+    let records = wave(pool, &[a], "L1").await;
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+    let t = truth_of(pool, a).await;
+    let v = row_version(pool, a).await;
+    Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_an_existing_record_and_leaves_no_report(pool: PgPool) {
+    let Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    } = refusal_fixture(&pool).await;
+    let w = wave_file.to_str().unwrap();
+    // An existing --record: refused before the database, the record kept
+    // as it was, and no report left behind.
+    let existing = dir.join("EXISTING-RECORD.jsonl");
+    std::fs::write(&existing, b"an operator's earlier record\n").unwrap();
+    let report = dir.join("existing.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--record",
+            existing.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(!o.status.success(), "an existing record was accepted");
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"an operator's earlier record\n"
+    );
+    assert!(!report.exists(), "a refused run left its report behind");
+    assert_untouched(&pool, a, t, v, "existing record").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_a_record_without_apply(pool: PgPool) {
+    let Refusal {
+        url,
+        dir,
+        a,
+        wave_file,
+        t,
+        v,
+    } = refusal_fixture(&pool).await;
+    let w = wave_file.to_str().unwrap();
+    // --record without --apply: a usage error, never an apply.
+    let record = dir.join("NO-APPLY-RECORD.jsonl");
+    let report = dir.join("no-apply.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "--record without --apply");
+    assert!(!record.exists() && !report.exists());
+    assert_untouched(&pool, a, t, v, "--record without --apply").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_refuses_include_round_with_restore(pool: PgPool) {
+    let Refusal {
+        url, dir, a, t, v, ..
+    } = refusal_fixture(&pool).await;
+    // --include-round with --restore: a usage error, nothing restored.
+    // The record would restore `a` to 0.4 if the run went ahead.
+    let restore_record = dir.join("RESTORE-RECORD.jsonl");
+    let mut rec = Vec::new();
+    write_truth_record(
+        &mut rec,
+        &TruthRecord {
+            claim_id: a,
+            truth_before: 0.4,
+            truth_written: t,
+            cache_old: 0.4,
+            cache_new: t,
+            waves: vec!["L1".into()],
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+    std::fs::write(&restore_record, rec).unwrap();
+    let report = dir.join("restore-round.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            restore_record.to_str().unwrap(),
+            "--include-round",
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(2), "--include-round with --restore");
+    assert!(!report.exists());
+    assert_untouched(&pool, a, t, v, "--include-round with --restore").await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ── (23) a run that stops still writes its (partial) report ────────────────
 
 /// A test-only trigger that refuses any `truth_value` write to `id` (an

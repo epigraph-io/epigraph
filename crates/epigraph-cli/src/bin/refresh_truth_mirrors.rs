@@ -39,7 +39,8 @@
 //! served.
 //!
 //! Output files are never overwritten (they are created new, before the
-//! database is touched). A run that stops on an error still writes its report,
+//! database is touched; a run refused because one exists leaves no file of
+//! its own behind). A run that stops on an error still writes its report,
 //! marked `"partial": true` with the error, holding the outcomes of every
 //! batch that committed (for an apply, exactly the writes in the record
 //! file). A writing run (`--apply`, or `--restore` without
@@ -133,6 +134,26 @@ fn create_new(path: &Path) -> anyhow::Result<BufWriter<File>> {
     Ok(BufWriter::new(f))
 }
 
+/// Create every output new, in order; if one cannot be created, remove the
+/// ones this call already created (they are empty) and fail, so a refused run
+/// leaves no file behind.
+fn create_all_new(paths: &[&Path]) -> anyhow::Result<Vec<BufWriter<File>>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        match create_new(p) {
+            Ok(w) => out.push(w),
+            Err(e) => {
+                drop(out);
+                for created in &paths[..i] {
+                    let _ = std::fs::remove_file(created);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Mark a report complete, or partial with the error that stopped the run.
 fn mark_outcome(v: &mut serde_json::Value, err: Option<&anyhow::Error>) {
     v["partial"] = serde_json::Value::Bool(err.is_some());
@@ -168,11 +189,25 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .report
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--report is required"))?;
-    let report_w = create_new(&report_path)?;
-    let mut record_w = match &cli.record {
-        Some(p) => Some(create_new(p)?),
-        None => None,
+    // The record exists only for an apply (clap also refuses `--record`
+    // without `--apply`); the write path is chosen on `--apply` below, never
+    // on the record's presence.
+    let record_path = if cli.apply {
+        Some(
+            cli.record
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--apply requires --record"))?,
+        )
+    } else {
+        None
     };
+    let mut outputs: Vec<&Path> = vec![report_path.as_path()];
+    if let Some(p) = &record_path {
+        outputs.push(p);
+    }
+    let mut writers = create_all_new(&outputs)?.into_iter();
+    let report_w = writers.next().expect("the report writer");
+    let mut record_w = writers.next();
 
     let maint = epigraph_cli::MaintenancePool::connect(BIN)
         .await
@@ -190,29 +225,31 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     };
 
     let mut report = MirrorReport::default();
-    let result = if let Some(w) = record_w.as_mut() {
-        apply_into(
-            maint.pool(),
-            viewer,
-            &candidates,
-            &opts,
-            &mut report,
-            |rec| {
-                write_truth_record(w, rec)?;
-                w.flush()?;
-                w.get_ref().sync_data()?;
-                Ok(())
-            },
-        )
-        .await
-    } else {
-        match dry_run(maint.pool(), viewer, &candidates, &opts).await {
+    let result = match (cli.apply, record_w.as_mut()) {
+        (true, Some(w)) => {
+            apply_into(
+                maint.pool(),
+                viewer,
+                &candidates,
+                &opts,
+                &mut report,
+                |rec| {
+                    write_truth_record(w, rec)?;
+                    w.flush()?;
+                    w.get_ref().sync_data()?;
+                    Ok(())
+                },
+            )
+            .await
+        }
+        (true, None) => Err(anyhow::anyhow!("--apply without a record file")),
+        (false, _) => match dry_run(maint.pool(), viewer, &candidates, &opts).await {
             Ok(r) => {
                 report = r;
                 Ok(())
             }
             Err(e) => Err(e),
-        }
+        },
     };
 
     let dry = !cli.apply;
