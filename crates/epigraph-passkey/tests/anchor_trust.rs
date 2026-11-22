@@ -344,22 +344,49 @@ async fn a_key_description_outside_the_leaf_is_refused() {
 /// an Unverified or Failed boot, with no root of trust, or with one only in
 /// the software-enforced list is refused at registration, and the same key
 /// recorded where nothing checks it (the software policy) anchors nothing
-/// once the Android root is configured. CALIBRATION: the default key
-/// (locked, Verified) registers and anchors.
+/// once the Android root is configured, neither directly nor from the
+/// LINEAGE of an otherwise good anchor. CALIBRATION: the default key
+/// (locked, Verified) registers and anchors, and the same default key
+/// recorded under the software policy anchors and passes on a lineage.
 /// Mutations: the root-of-trust gate removed from `android::hardware_rules`
 /// -> every case registers and anchors; the gate reading the software list
 /// -> the calibration is refused; SelfSigned accepted -> that case
-/// registers and anchors.
+/// registers and anchors; the lineage loop skipped in `check_anchor` ->
+/// every lineage case anchors.
 #[tokio::test]
 async fn an_android_key_from_an_unlocked_or_unverified_device_neither_registers_nor_anchors() {
     let google = TestAttestation::new("Android");
     let rp = attested(None, Some(&google), true);
     let (mut auth, good) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
     let good = good.expect("CALIBRATION: a locked, verified device's key registers");
-    let anchor = confirmed_anchor(&rp, &mut auth, &good, Uuid::new_v4()).await;
-    assert_eq!(rp.check_anchor(&anchor), Ok(()), "CALIBRATION: it anchors");
+    let good_anchor = confirmed_anchor(&rp, &mut auth, &good, Uuid::new_v4()).await;
+    assert_eq!(
+        rp.check_anchor(&good_anchor),
+        Ok(()),
+        "CALIBRATION: it anchors"
+    );
 
+    // CALIBRATION, like for like with the refused cases below: a locked,
+    // Verified key recorded under the software policy anchors directly and
+    // passes as a lineage ancestor of the good anchor.
     let soft = software();
+    let (mut soft_auth, soft_good) =
+        android_registration(&soft, &google, &AndroidKeyOpts::default()).await;
+    let soft_good = soft_good.expect("the software policy records it");
+    let anchor = confirmed_anchor(&rp, &mut soft_auth, &soft_good, Uuid::new_v4()).await;
+    assert_eq!(
+        rp.check_anchor(&anchor),
+        Ok(()),
+        "CALIBRATION: a software-recorded good key anchors"
+    );
+    let mut via_good = good_anchor.clone();
+    via_good.anchor_lineage = vec![lineage_entry(&soft_good)];
+    assert_eq!(
+        rp.check_anchor(&via_good),
+        Ok(()),
+        "CALIBRATION: a software-recorded good key passes on the lineage"
+    );
+
     for (label, root_of_trust, in_software_list, expected) in [
         (
             "unlocked bootloader",
@@ -410,6 +437,15 @@ async fn an_android_key_from_an_unlocked_or_unverified_device_neither_registers_
             rp.check_anchor(&anchor),
             Err(AnchorRefusal::AnchorNotAttested),
             "{label}"
+        );
+
+        // On the lineage of a good anchor, it withdraws that anchor too.
+        let mut via = good_anchor.clone();
+        via.anchor_lineage = vec![lineage_entry(&reg)];
+        assert_eq!(
+            rp.check_anchor(&via),
+            Err(AnchorRefusal::LineageNotAttested),
+            "{label}: on the lineage"
         );
     }
 }
