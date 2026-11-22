@@ -792,7 +792,9 @@ async fn an_android_chain_attests_only_the_key_it_certifies() {
 /// every planted row anchored. Mutations: the statement check in
 /// `hardware_trust_but_android` removed -> every case anchors; its key and
 /// credential id comparisons removed -> (iii) anchors; its attestation
-/// comparison removed -> (iv) anchors.
+/// comparison removed -> (iv) anchors; its key comparison alone removed ->
+/// (v) is hardware; its credential id comparison alone removed -> (vi) is
+/// hardware.
 #[tokio::test]
 async fn a_planted_row_with_a_genuine_chain_beside_its_own_key_anchors_nothing() {
     let vendor = TestAttestation::new("Allowlisted");
@@ -895,6 +897,53 @@ async fn a_planted_row_with_a_genuine_chain_beside_its_own_key_anchors_nothing()
             Err(AnchorRefusal::AnchorNotAttested),
             "{label}: as an anchor"
         );
+        assert!(
+            rp.hardware_attested(&row.passkey, "packed", MODEL, false)
+                .is_err(),
+            "{label}: as hardware"
+        );
+        let mut on_lineage = anchor.clone();
+        on_lineage.anchor_lineage = vec![lineage_entry(&row)];
+        assert_eq!(
+            rp.check_anchor(&on_lineage),
+            Err(AnchorRefusal::LineageNotAttested),
+            "{label}: on a lineage"
+        );
+    }
+
+    // The statement's comparisons one at a time: the genuine row's statement
+    // and chain beside a credential that differs from the genuine one in ONE
+    // field, so each comparison is the only one that can refuse it:
+    // (v) the planter's key under the genuine credential id (the statement
+    //     attests that id, so only the key comparison tells them apart);
+    // (vi) the genuine key under the planter's credential id (only the
+    //     credential id comparison tells them apart).
+    // Not asserted as anchors: no authenticator holds the key under that id.
+    let with_cred_id = |mut row: RegisteredPasskey, from: &RegisteredPasskey| {
+        row.passkey["cred"]["cred_id"] = from.passkey["cred"]["cred_id"].clone();
+        row.credential_id = from.credential_id.clone();
+        row
+    };
+    let genuine_rebuilt = planted(&genuine, beside(&genuine));
+    rp.hardware_attested(&genuine_rebuilt.passkey, "packed", MODEL, false)
+        .expect("CALIBRATION: the genuine row, rebuilt field by field, is hardware");
+    let mut on_lineage = anchor.clone();
+    on_lineage.anchor_lineage = vec![lineage_entry(&genuine_rebuilt)];
+    assert_eq!(
+        rp.check_anchor(&on_lineage),
+        Ok(()),
+        "CALIBRATION: the genuine row, rebuilt field by field, counts on a lineage"
+    );
+    for (label, row) in [
+        (
+            "(v) its own key under the genuine credential id",
+            with_cred_id(planted(&own_none, beside(&genuine)), &genuine),
+        ),
+        (
+            "(vi) the genuine key under its own credential id",
+            with_cred_id(planted(&genuine, beside(&genuine)), &own_none),
+        ),
+    ] {
         assert!(
             rp.hardware_attested(&row.passkey, "packed", MODEL, false)
                 .is_err(),
