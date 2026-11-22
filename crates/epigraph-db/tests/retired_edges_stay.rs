@@ -303,8 +303,8 @@ async fn targets(pool: &PgPool, ids: &[Uuid]) -> Vec<(Uuid, bool)> {
 /// a third agent's `asserts`, and a claim-sourced edge carrying the reserved
 /// act marker with tool value `act_tool` (SPEC §5.2 rule 2 is keyed on the
 /// marker, not on the source; it is harness-written here: the generic edge
-/// writers that run the reserved-property refusal reject the marker, though
-/// MCP `link_epistemic` / `link_hierarchical` do not run it yet).
+/// writers, HTTP and MCP, run the reserved-property refusal and reject the
+/// marker).
 ///
 /// Then the boundary, edges every replacement act still moves: `control` is
 /// a third claim's `supports` (it proves the migration ran), and

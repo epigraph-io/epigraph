@@ -1138,8 +1138,14 @@ pub const SUPERSEDE_ACT_TOOLS: &[&str] = &[
 /// the act's `AUTHORED` edge apart (the operator arming census, and the edge
 /// migration that leaves it on the claim it records): `tool` alone is an
 /// ordinary property any edge writer can spell, so only the act writes this
-/// key and every application surface that writes edge `properties` (create,
-/// patch and the staged promote, HTTP and MCP) refuses a body that carries it.
+/// key. These surfaces, which write caller-supplied edge `properties`, refuse
+/// a body that carries it ([`reserved_edge_property_refusal`]): over HTTP
+/// `POST /api/v1/edges`, `POST /api/v1/edges/hierarchical`,
+/// `POST /api/v1/claims/:id/relate`, `PATCH /api/v1/edges/:id` and the staged
+/// promote; over MCP `link_epistemic`, `link_hierarchical` and `patch_edge`
+/// (the link tools and the hierarchical and relate routes since backlog
+/// 3676c459). No database guard refuses it, so a new writer of caller
+/// `properties` must call the refusal.
 pub const SUPERSEDE_ACT_PROPERTY: &str = "supersede_act";
 
 /// The refusal text for a body carrying [`SUPERSEDE_ACT_PROPERTY`].

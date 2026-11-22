@@ -710,6 +710,52 @@ impl WorkflowRepository {
         .await
     }
 
+    /// Whether `claim_id` is shaped as a workflow STEP, as `viewer` reads it:
+    /// a claim at plan level 2 (the non-throwing form of the level predicate
+    /// the plan-order readers apply to `executes` targets) that carries a
+    /// `step_lineage_id`. Only the workflow writers set that column (the
+    /// ingest executor for level-2 and level-3 plan claims, `add_step`,
+    /// `evolve_step`), so it tells a step from a level-2 document paragraph or
+    /// a claim whose `properties.level` a caller set. It checks SHAPE, not
+    /// provenance: `evolve_step` (`revises`, level 2) on a caller's own claim
+    /// that no workflow executes needs no workflow authority and back-fills a
+    /// lineage onto it, so a caller can make its own claim step-shaped. That
+    /// grants nothing new: the `executes` adopter already needs authority over
+    /// the workflow and could write the same step with `add_step`.
+    ///
+    /// Exists for MCP `link_hierarchical`'s `executes` gate (backlog
+    /// 298317a7): outside the plan's own lineage it adopts only a step-shaped
+    /// target, because the plan readers and the outcome reports take every
+    /// level-2 `executes` target as a step, and `evolve_step` and a step-claim
+    /// `invokes` gate on the workflows executing a step's lineage.
+    ///
+    /// Run it on the caller's STAMPED transaction (the spliced predicate and
+    /// the row security then agree). A claim the viewer cannot read is not
+    /// step-shaped to it.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the query fails.
+    pub async fn is_step_shaped(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM claims c \
+               WHERE c.id = $1 AND c.step_lineage_id IS NOT NULL \
+                 AND btrim(c.properties->>'level') ~ '^[+]?0*2$' \
+                 /* {VISIBILITY:c} */ \
+             )",
+            2,
+        );
+        let mut q = sqlx::query_scalar::<_, bool>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_one(&mut *conn).await?)
+    }
+
     /// Every workflow that executes the step lineage of `claim_id`, read
     /// UNFILTERED: the set [`Self::workflows_executing_step_lineage`] returns
     /// to a session that reads every row (same lineage, same edges, retracted
