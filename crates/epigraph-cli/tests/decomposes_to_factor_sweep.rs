@@ -660,6 +660,51 @@ async fn the_binary_exports_then_deletes_on_the_maintenance_login(pool: PgPool) 
         r.stdout
     );
 
+    // A manifest of the wrong run is refused before any file or connection:
+    // --expect takes only a dry run's (the reviewed set), --restore only an
+    // apply's (the rows that run deleted).
+    let wrong = dir.path("wrong.jsonl");
+    let wrong_s = wrong.to_string_lossy().into_owned();
+    let r = run_bin(
+        &dir.0,
+        &[
+            "--manifest-out",
+            &wrong_s,
+            "--apply",
+            "--expect",
+            &applied_s,
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stderr, r.stdout);
+    assert!(
+        r.stderr
+            .contains("--expect needs a manifest with mode `dry_run`, this one has mode `apply`"),
+        "{}",
+        r.stderr
+    );
+    assert!(!wrong.exists(), "the refused apply leaves no manifest");
+    let r = run_bin(
+        &dir.0,
+        &["--restore", &dry_s, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stderr, r.stdout);
+    assert!(
+        r.stderr
+            .contains("--restore needs a manifest with mode `apply`, this one has mode `dry_run`"),
+        "{}",
+        r.stderr
+    );
+    let still_gone: i64 = sqlx::query_scalar("SELECT count(*) FROM factors WHERE id = ANY($1)")
+        .bind(vec![w.legacy, w.keyed])
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(still_gone, 0, "a refused restore inserts nothing");
+
     // Restore from the apply's manifest (dry, then for real).
     let r = run_bin(
         &dir.0,

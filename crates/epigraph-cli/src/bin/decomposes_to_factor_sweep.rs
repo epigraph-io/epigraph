@@ -11,7 +11,8 @@
 //!
 //!     decomposes_to_factor_sweep --manifest-out <apply.jsonl> --apply --expect <manifest.jsonl>
 //!         In one transaction, under an advisory lock: selects the set and
-//!         refuses unless it equals the reviewed dry run's (<manifest.jsonl>)
+//!         refuses unless it equals the reviewed dry run's (<manifest.jsonl>,
+//!         which must be a dry run's manifest)
 //!         exactly; writes and syncs <apply.jsonl>, deletes exactly those
 //!         rows, re-measures (no such row may remain), commits. <apply.jsonl>
 //!         is the restore record.
@@ -19,9 +20,12 @@
 //!     decomposes_to_factor_sweep --remaining
 //!         Prints the number of such rows left (the DONE measurement: 0).
 //!
-//!     decomposes_to_factor_sweep --restore <manifest.jsonl> [--apply]
-//!         Re-inserts the manifest's rows, ON CONFLICT DO NOTHING. Without
-//!         `--apply` it inserts and rolls back.
+//!     decomposes_to_factor_sweep --restore <apply.jsonl> [--apply]
+//!         Re-inserts the rows an apply deleted (only an apply's manifest is
+//!         taken), ON CONFLICT DO NOTHING. Without `--apply` it inserts and
+//!         rolls back. A restore re-opens the residual the sweep closed (a
+//!         caller who cannot see a decomposition reads its legacy factor
+//!         again) until the next sweep.
 //!
 //! The sweep for rows minted later is the same dry run and apply again.
 //!
@@ -69,7 +73,8 @@ struct Cli {
     /// selection is exactly its rows.
     #[arg(long, requires = "apply", conflicts_with_all = ["restore", "remaining"])]
     expect: Option<PathBuf>,
-    /// Re-insert the rows of this manifest.
+    /// Re-insert the rows of this apply's manifest. This re-opens the
+    /// residual the sweep closed until the next sweep.
     #[arg(long, conflicts_with = "remaining")]
     restore: Option<PathBuf>,
     /// Print how many decomposes_to factors remain, and exit.
@@ -151,6 +156,28 @@ fn create_new(path: &Path) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Read a manifest and require the run that wrote it: `--expect` takes a dry
+/// run's (the set the operator reviewed), `--restore` an apply's (the rows
+/// that run deleted). Checked before any file is created or any connection.
+fn read_manifest_of_mode(
+    path: &Path,
+    want: &str,
+    flag: &str,
+) -> Result<Vec<sweep::ManifestRow>, String> {
+    let (header, rows) = sweep::read_manifest(BufReader::new(
+        File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
+    ))
+    .map_err(|e| format!("{}: {e}", path.display()))?;
+    if header.mode != want {
+        return Err(format!(
+            "{}: {flag} needs a manifest with mode `{want}`, this one has mode `{}`",
+            path.display(),
+            header.mode
+        ));
+    }
+    Ok(rows)
+}
+
 async fn connect() -> Result<epigraph_cli::MaintenancePool, String> {
     let maint = epigraph_cli::MaintenancePool::connect("decomposes_to_factor_sweep")
         .await
@@ -184,10 +211,7 @@ async fn export(cli: &Cli, out: &Path, expect: Option<&Path>) -> Result<(), Fail
     let expected: Option<Vec<uuid::Uuid>> = match expect {
         None => None,
         Some(path) => {
-            let (_, rows) = sweep::read_manifest(BufReader::new(
-                File::open(path).map_err(|e| format!("{}: {e}", path.display()))?,
-            ))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+            let rows = read_manifest_of_mode(path, "dry_run", "--expect")?;
             Some(rows.into_iter().map(|r| r.id).collect())
         }
     };
@@ -236,10 +260,7 @@ async fn export(cli: &Cli, out: &Path, expect: Option<&Path>) -> Result<(), Fail
 }
 
 async fn restore(manifest: &Path, apply: bool) -> Result<(), Failure> {
-    let (_, rows) = sweep::read_manifest(BufReader::new(
-        File::open(manifest).map_err(|e| format!("{}: {e}", manifest.display()))?,
-    ))
-    .map_err(|e| format!("{}: {e}", manifest.display()))?;
+    let rows = read_manifest_of_mode(manifest, "apply", "--restore")?;
     let maint = connect().await?;
     let mut session = session(&maint).await?;
     let (conn, _) = session.split();
