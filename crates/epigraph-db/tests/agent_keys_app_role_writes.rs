@@ -223,11 +223,12 @@ async fn a_status_change_needs_the_keys_agent_or_an_admin(pool: PgPool) {
             &format!("another agent moved the key to {status}"),
         );
         assert!(msg.contains("AK03"), "{msg}");
-        assert_refused(
+        let msg = assert_refused(
             set_status_as(&pool, "epigraph_app", None, key, status).await,
             INSUFFICIENT_PRIVILEGE,
             &format!("an unstamped application session moved the key to {status}"),
         );
+        assert!(msg.contains("AK03"), "{msg}");
     }
     assert_eq!(
         key_state(&pool, key).await,
@@ -253,11 +254,12 @@ async fn a_status_change_needs_the_keys_agent_or_an_admin(pool: PgPool) {
     .await
     .expect("arm the admin-scope switch");
     let k3 = seed_key(&pool, owner, "encryption").await;
-    assert_refused(
+    let msg = assert_refused(
         set_status_as(&pool, "epigraph_app", Some(admin), k3, "revoked").await,
         INSUFFICIENT_PRIVILEGE,
         "armed: a standing instance admin without an elevation moved another agent's key",
     );
+    assert!(msg.contains("AK03"), "{msg}");
     set_status_as(&pool, "epigraph_app", Some(owner), k3, "revoked")
         .await
         .expect("armed: the key's own agent still revokes it");
@@ -287,11 +289,12 @@ async fn the_rotation_definer_rotates_only_for_the_keys_agent(pool: PgPool) {
         "another agent rotated the key",
     );
     assert!(msg.contains("AK03"), "{msg}");
-    assert_refused(
+    let msg = assert_refused(
         rotate_as(&pool, "epigraph_app", None, key, &new_key).await,
         INSUFFICIENT_PRIVILEGE,
         "an unstamped application session rotated the key",
     );
+    assert!(msg.contains("AK03"), "{msg}");
     assert_refused(
         rotate_as(&pool, "epigraph_app", Some(owner), key, &[7u8; 31]).await,
         INVALID_PARAMETER,

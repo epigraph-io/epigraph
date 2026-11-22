@@ -3427,8 +3427,10 @@ restart.
   (insert refused for every type; another agent and an unstamped session refused, the agent,
   an unarmed instance admin and a maintenance session admitted, an armed non-elevated admin
   refused; the rotation's refusals and its atomic success; the route's repository calls on
-  an application-role `ScopedPool`; the undo, run twice), all red on the series without 239,
-  and by `app_role_table_lockdown.rs` (`agent_keys` joins `NO_WRITE`). Undo:
+  an application-role `ScopedPool`; the undo, run twice). The insert, status and rotation
+  tests were measured red on the series without 239; removing the REVOKE or forcing either
+  caller gate open each fails at least one of them. Also pinned by
+  `app_role_table_lockdown.rs` (`agent_keys` joins `NO_WRITE`). Undo:
   `docs/runbooks/239-undo.sql`. Slot 239 was assigned by the 2026-11-22 backlog triage;
   checked before claiming: no origin branch carries a `239`. **Deploy order:** migrate
   before rolling out the 239 binary (its rotation calls the new definer). A pre-239 binary

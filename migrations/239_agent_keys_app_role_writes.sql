@@ -13,8 +13,9 @@
 -- agent can be used as that principal". 161 (section 7a) then closed the two
 -- ATTESTED key types, `signing` and `identity-legacy`, with a guard trigger
 -- and a session test in the status definer; 162 and 163 re-stated the definer
--- and re-granted it. Through 238 nothing else changed. So a session on the
--- application DSN (which agent containers hold) could still:
+-- and re-granted it. Measured on main through migration 235, nothing else
+-- changed. So a session on the application DSN (which agent containers hold)
+-- could still:
 --   * INSERT a key of any other `key_type` for any agent;
 --   * rotate or revoke any agent's key of any other type through the status
 --     definer, whoever it was stamped as, or unstamped.
