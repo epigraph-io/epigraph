@@ -1118,6 +1118,29 @@ grep -rlE 'postgres(ql)?://[a-z_]+:[a-z_]+@' scripts/
 creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
 `DATABASE_URL`) explicitly when you run a script.
 
+**A read-only login for the theme scripts needs two grants.** Every theme
+label path (`label_themes_llm.py`, including `--dry-run`, `cluster_claims.py`,
+`evidential_clustering.py`, `refine_clusters.py`,
+`seed_themes_from_textbooks.py`) filters its label samples through
+`scripts/theme_lib.py::not_intake_owned`, which reads the bug-report intake's
+two tables: `bug_report_intake_settings` (migration 207) and
+`bug_report_intake_marks` (migration 265). The maintenance role already holds
+SELECT on both. A login outside it (a read-only role you created for dry runs,
+outside the migration series) fails such a query with 42501, and the run stops
+(fail-closed: it never samples without the exclusion). Grant it both, on the
+migration (superuser) DSN:
+
+```sql
+GRANT SELECT ON public.bug_report_intake_settings TO <readonly_login>;
+GRANT SELECT ON public.bug_report_intake_marks TO <readonly_login>;  -- 265 and later
+```
+
+Grant nothing else on `bug_report_intake_marks`, and never grant it to
+`epigraph_app`: it records which agent filed which report, which the
+application role is deliberately not given (265). Below migration 265 the
+second statement fails with 42P01; run the first alone. The theme scripts of a
+build that includes 265 need the database migrated to 265 first.
+
 ## 6. Session settings and connection poolers
 
 ### `EPIGRAPH_SESSION_GUC_MODE`
