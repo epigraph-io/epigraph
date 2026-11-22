@@ -84,8 +84,9 @@
 -- (`pg_catalog, public, pg_temp`), the candidate predicate, the target group,
 -- idempotence and the bounded batch are 120's. The one `security_events` row
 -- per call that changed anything (`edges.legacy_signer_reown`) now also
--- carries `auto_excluded_signers` (how many signers the lookup excluded) and
--- `migration` 253.
+-- carries `auto_excluded_signers` (how many signers the lookup excluded),
+-- `auto_excluded` (WHICH signers, per arm, so an operator can tell a server
+-- from a wrongly excluded author) and `migration` 253.
 --
 -- ===================================================================
 -- 5. PRECONDITION, OWNER, GRANTS
@@ -123,8 +124,8 @@ END $$;
 
 -- -------------------------------------------------------------------
 -- 120's body; delta = the per-arm lookups and their union `v_auto`
--- (section 2), its exclusion, and the audit row's `auto_excluded_signers`
--- and `migration`.
+-- (section 2), its exclusion, and the audit row's `auto_excluded_signers`,
+-- `auto_excluded` and `migration`.
 -- -------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.epigraph_reown_legacy_edges_to_signer(
     p_limit integer, p_exclude_signers uuid[])
@@ -144,7 +145,8 @@ BEGIN
             'key (an empty array only when there is none); nothing was re-owned'
             USING ERRCODE = '22004';
     END IF;
-    -- 253: the server signers, looked up (header section 2), arm by arm.
+    -- 253: the server signers, looked up (header section 2), arm by arm so
+    -- the audit row can name them.
     -- (a) the API's registered edge signer.
     SELECT COALESCE(array_agg(a.id ORDER BY a.id), '{}'::uuid[]) INTO v_named
       FROM public.agents a
@@ -218,6 +220,11 @@ BEGIN
                 jsonb_build_object('rows', v_n, 'limit', p_limit,
                                    'excluded_signers', cardinality(p_exclude_signers),
                                    'auto_excluded_signers', cardinality(v_auto),
+                                   'auto_excluded', jsonb_build_object(
+                                       'api_signer_name', to_jsonb(v_named),
+                                       'signed_anothers_claim', to_jsonb(v_claim),
+                                       'signed_anothers_edge', to_jsonb(v_edge),
+                                       'signing_key_no_claim', to_jsonb(v_key)),
                                    'migration', 253));
     END IF;
     RETURN v_n;

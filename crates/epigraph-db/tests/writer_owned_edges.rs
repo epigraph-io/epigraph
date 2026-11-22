@@ -1343,8 +1343,8 @@ async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
 ///
 /// The control, `genuine`, signs its own claim and its own stamped edge, and
 /// its legacy edge IS re-owned, so the exclusions are not vacuous. A run with
-/// an EMPTY list and one with a PARTIAL list each leave the three server
-/// edges world-owned.
+/// an EMPTY list and one with a PARTIAL list each leave the four server
+/// edges world-owned, and the audit row names each excluded signer by arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: PgPool) {
     let (author, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -1462,17 +1462,28 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
             "{why} is never followed"
         );
     }
-    let auto: Vec<i64> = sqlx::query_scalar(
-        "SELECT (details->>'auto_excluded_signers')::bigint FROM security_events \
+    let audit: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events \
           WHERE event_type = 'edges.legacy_signer_reown'",
     )
     .fetch_all(&pool)
     .await
     .expect("events");
+    assert_eq!(audit.len(), 1, "only the first run changed anything");
     assert_eq!(
-        auto,
-        vec![4],
-        "one event, counting the four server signers the function excluded itself"
+        audit[0]["auto_excluded_signers"],
+        serde_json::json!(4),
+        "the event counts the four server signers the function excluded itself"
+    );
+    assert_eq!(
+        audit[0]["auto_excluded"],
+        serde_json::json!({
+            "api_signer_name": [api_named],
+            "signed_anothers_claim": [mcp],
+            "signed_anothers_edge": [api_unnamed],
+            "signing_key_no_claim": [api_keyed],
+        }),
+        "the event names each excluded signer under the arm that excluded it"
     );
 }
 
