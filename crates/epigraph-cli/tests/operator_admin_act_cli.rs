@@ -442,13 +442,19 @@ async fn cascade_deferrals(
 /// act with `confirmation = 'passkey'`. The confirmed-act arm owes the same
 /// cascade as the assignment arm (SPEC section 3.1): the refused runs leave no
 /// `supersede` cascade deferral, the confirmed run leaves exactly one, naming
-/// the custodian and the predecessor, and the act record links it.
+/// the custodian and the predecessor, and the act record links it. A run on
+/// the confirmed act with ANOTHER custodian's assignment passes the verb's
+/// early check and is refused inside `record_custodial_act_on_act` (CUS04),
+/// after the deferral was written: it leaves no successor, no deferral, no
+/// record, and the act unspent.
 ///
 /// Verified to fail: the verb recording without the act (the six-parameter
 /// recorder) -> the confirmed run is refused ELV10; the verb hashing the
 /// content trimmed -> the confirmed run is refused (the flags are not the
 /// act's); the cascade deferral recorded in the assignment arm only -> the
-/// confirmed run leaves no deferral.
+/// confirmed run leaves no deferral; the act's transaction committed right
+/// after the cascade deferral (backlog f630031a) -> the run refused CUS04
+/// inside `record_custodial_act_on_act` leaves its successor and deferral.
 #[sqlx::test(migrations = "../../migrations")]
 async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
     let (c, a) = custodian_with_passkey(&pool, "custodian", 1).await;
@@ -522,6 +528,52 @@ async fn custodial_supersede_executes_its_confirmed_act(pool: PgPool) {
         vec![],
         "a refusal before the write records no deferral"
     );
+
+    // Backlog f630031a: a refusal raised INSIDE `record_custodial_act_on_act`,
+    // after the act's transaction has written the successor and the cascade
+    // deferral. The act's args name no assignment, so the verb's early check
+    // passes this run (the act is the act); the database refuses another
+    // custodian's assignment (CUS04) in the record, and the whole transaction
+    // rolls back: no successor, no deferral (a committed one would have the
+    // replay migrate edges for a supersede that never happened), no record,
+    // and the act unspent.
+    let (other, _) = fixture::seed_human_operator(&pool, "another custodian").await;
+    let others = fixture::make_custodian(&pool, other).await.to_string();
+    let mut wrong = args_for("0.7", Some(&act_s));
+    let at = wrong
+        .iter()
+        .position(|a| a == "--assignment")
+        .expect("an --assignment flag")
+        + 1;
+    wrong[at] = others;
+    let refused = run(wrong).await;
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(refused.stderr.contains("CUS04"), "{}", refused.show());
+    assert!(is_current(&pool, claim).await, "the supersede rolled back");
+    let successors: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE supersedes = $1")
+        .bind(claim)
+        .fetch_one(&pool)
+        .await
+        .expect("successors");
+    assert_eq!(
+        successors, 0,
+        "the refused record took its successor with it"
+    );
+    assert_eq!(
+        cascade_deferrals(&pool).await,
+        vec![],
+        "a refusal inside the record rolls its cascade deferral back with it"
+    );
+    let records: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details->>'target' = $1",
+    )
+    .bind(claims.as_str())
+    .fetch_one(&pool)
+    .await
+    .expect("custodial act records");
+    assert_eq!(records, 0, "no act was recorded");
+    assert!(!consumed(&pool, act).await, "the act is not spent");
 
     let done = run(args_for("0.7", Some(&act_s))).await;
     assert_eq!(done.code, 0, "{}", done.show());
