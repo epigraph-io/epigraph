@@ -501,9 +501,9 @@ async fn writer_scope_catalog(
 
 /// `docs/runbooks/256-undo.sql` restores 166's body byte for byte (owner,
 /// volatility, grants and search path kept), and a second run changes
-/// nothing. On the restored body the defect is back: a REPEATABLE READ
-/// holder whose assignment is ended mid-transaction WRITES (the measurement
-/// that 256 is what refuses it). Over a foreign body both 256 and its undo
+/// nothing. On the restored body the defect is back: a REPEATABLE READ or
+/// SERIALIZABLE holder whose assignment, or whose group's binding, is ended
+/// mid-transaction WRITES (the measurement that 256 is what refuses it). Over a foreign body both 256 and its undo
 /// refuse 55000 and leave it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_256_undo_restores_166s_writer_scope(pool: PgPool) {
@@ -530,17 +530,25 @@ async fn the_256_undo_restores_166s_writer_scope(pool: PgPool) {
 
     define_role(&pool).await;
     arm(&pool).await;
-    let h = holder(&pool, "Undo").await;
-    write_across_an_end(
-        &pool,
-        h.human,
-        RR,
-        None,
-        Ending::Assignment(h.assignment),
-        h.group,
-    )
-    .await
-    .expect("on 166's body the REPEATABLE READ holder writes after its end (the defect)");
+    // Every case the first test refuses, measured on 166's body: each lands.
+    for (n, isolation) in [RR, SER].into_iter().enumerate() {
+        for end_binding in [false, true] {
+            let h = holder(&pool, &format!("Undo {n} {end_binding}")).await;
+            let ending = if end_binding {
+                Ending::Binding(h.binding)
+            } else {
+                Ending::Assignment(h.assignment)
+            };
+            write_across_an_end(&pool, h.human, isolation, None, ending, h.group)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "on 166's body the {isolation} holder writes after {ending:?} ended \
+                         (the defect): {e}"
+                    )
+                });
+        }
+    }
 
     // 256 re-applies over 166's body and refuses a foreign one, as does the
     // undo (which opens its own transaction: end it on the same connection).
