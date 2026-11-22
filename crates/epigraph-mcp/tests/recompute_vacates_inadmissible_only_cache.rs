@@ -490,10 +490,8 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
     // The member can read the hidden evidence and the author cannot; the
     // owner rule's admissibility is the fold's, which answers the same for
     // both on the application role. Neither owns this public claim (the
-    // fixture's claim is not in either's group), and migration 114 lets a
-    // non-owner refresh the cache only on the frame it already carries, so
-    // the re-pointing recompute runs where the bulk recomputers run: on the
-    // privileged connection.
+    // fixture's claim is not in either's group), so their writes reach
+    // migration 114's non-owner definer.
     let scoped = app_role(&pool).await;
     for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
         assert_eq!(
@@ -504,12 +502,14 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
         );
     }
 
-    // KNOWN RESIDUAL (request path, until a privileged recompute runs): the
-    // same recompute by a NON-OWNER on the application role folds
-    // `claim_validity`, and migration 114 declines that write because the
-    // recorded frame is `binary_truth`. The cache keeps the hidden-evidence
-    // fold, and the recompute must say it wrote nothing (backlog 8d720490
-    // (2): it used to answer true here).
+    // The request path, with no privileged recompute (backlog 0296077b): a
+    // NON-OWNER's recompute on the application role folds `claim_validity`,
+    // and migration 243 lets the definer take that write, because the
+    // recorded frame, `binary_truth`, holds no input any reader of the claim
+    // may read and `claim_validity` is the frame the owner rule elects. Before
+    // 243 the definer declined it and the cache kept the hidden-evidence fold
+    // until a maintenance recompute ran. The second writer then refreshes the
+    // fold on the frame the cache now records.
     for (who, viewer) in [("member", &w.member_viewer), ("author", &w.author_viewer)] {
         let mut tx = scoped.begin_as(viewer).await.expect("stamped app session");
         let wrote = recompute_claim_cached_belief(&mut tx, viewer, claim)
@@ -517,24 +517,28 @@ async fn an_admissible_input_on_another_frame_takes_the_cache(pool: PgPool) {
             .expect("non-owner recompute on the application role");
         tx.commit().await.expect("commit");
         assert!(
-            !wrote,
-            "a declined non-owner write by the {who} must not report the cache as written"
+            wrote,
+            "the {who}'s non-owner recompute must write the owner-rule frame's fold over \
+             the hidden-evidence cache"
         );
-        let unchanged = cache(&pool, claim).await;
-        assert!(
-            unchanged.5 == Some(w.binary) && near(unchanged.0, before.0.unwrap_or(f64::NAN)),
-            "RESIDUAL: the {who}'s declined write leaves the binary_truth cache as it was; \
-             it is {unchanged:?} (before {before:?})"
-        );
+        assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
     }
-
-    recompute_claim_cached_belief(
-        &mut pool.acquire().await.expect("acquire"),
-        &w.public,
-        claim,
+    let repoints: Vec<Option<Uuid>> = sqlx::query_scalar(
+        "SELECT agent_id FROM security_events \
+          WHERE event_type = 'claims.foreign_aggregate_write' \
+            AND details->>'action' = 'belief_cache_repoint' \
+            AND details->>'claim_id' = $1::text",
     )
+    .bind(claim)
+    .fetch_all(&pool)
     .await
-    .expect("recompute after the evidence is hidden");
+    .expect("read the re-point audit");
+    assert_eq!(
+        repoints,
+        vec![Some(w.member)],
+        "the member's write is the one audited re-point (migration 243); the author's is a \
+         refresh on the frame the cache then records"
+    );
     assert_holds_fold_of(&pool, &w.public, claim, validity, &before).await;
 }
 

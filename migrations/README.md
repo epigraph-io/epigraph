@@ -3403,6 +3403,23 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **243**: `foreign_cache_repoint_off_inadmissible_frame` (backlog 0296077b). Re-states 114's
+  `epigraph_foreign_belief_cache` (an md5 precondition refuses to apply over any other body;
+  path stays 190's `pg_catalog, public, pg_temp`, owner and grants unchanged) with ONE new
+  arm: a non-owner's write may re-point a public claim's cache off the frame it records (R)
+  to frame P when, read with definer rights, the claim is not a compound, R holds no
+  cache-admissible combine input, and P is `binary_truth` with an admissible input or
+  `claim_validity` with one while `binary_truth` has none (the frame the cache-owner rule
+  elects). Before it, after evidence on a public claim was narrowed, a request-path
+  recompute by anyone but the owner was declined and every reader kept being served a fold
+  of the hidden evidence until a privileged recompute ran. The re-point is audited as
+  `claims.foreign_aggregate_write` with `action = 'belief_cache_repoint'`. Every other
+  re-point is still a no-op, as in 114. The three owner-rule predicates are inlined
+  verbatim; `epigraph-db/tests/foreign_cache_repoint.rs` pins the arm, each refusal
+  (mutation-tested), that verbatim copy, and the undo. Undo: `docs/runbooks/243-undo.sql`.
+  **Deploy order:** none required (no binary change). Claims that already hold a fold of
+  narrowed evidence are cleared at their next recompute on any session; a one-time
+  `recompute_beliefs` on the maintenance DSN clears them all at once.
 
 ## `-- no-transaction` migrations
 
