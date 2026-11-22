@@ -4,7 +4,8 @@
 //! Before: both endpoints were claims and not caller-controllable, so a
 //! dropped `workflow -executes-> claim` edge could not be repaired from MCP,
 //! and no tool wrote a workflow-to-workflow reference (`invokes`,
-//! `depends_on`). These drive `do_link_hierarchical` on the stdio path
+//! `depends_on`). These drive `do_link_hierarchical` on the stdio path, and
+//! (backlog 298317a7) on the authenticated-HTTP path with a caller's token,
 //! against workflows stored through `store_workflow`, the same rows a live
 //! plan reads.
 
@@ -700,5 +701,112 @@ async fn executes_refuses_an_own_claim_that_is_not_a_step(pool: PgPool) {
         .await
         .unwrap_or_else(|e| panic!("CONTROL: the level-{level} edge is repaired: {e:?}"));
         assert_eq!(in_force(&pool, workflow, node, "executes").await, 1);
+    }
+}
+
+/// `store_workflow` as an HTTP caller: the caller is the new lineage's
+/// submitter, public in the caller's own group.
+async fn store_as(
+    server: &epigraph_mcp::EpiGraphMcpFull,
+    auth: &epigraph_auth::AuthContext,
+    steps: &[&str],
+) -> Uuid {
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(server, Some(auth))
+        .await
+        .expect("HTTP viewer");
+    let stored = epigraph_mcp::tools::workflows::store_workflow(
+        server,
+        &viewer,
+        StoreWorkflowParams {
+            tenancy: Some(public_tenancy_for(&viewer)),
+            goal: format!("http workflow reference probe {}", Uuid::new_v4()),
+            steps: steps.iter().map(|s| (*s).to_string()).collect(),
+            prerequisites: None,
+            expected_outcome: None,
+            confidence: None,
+            tags: None,
+            force_new: None,
+        },
+        Some(auth),
+    )
+    .await
+    .expect("store_workflow over HTTP");
+    parse_uuid_field(&first_text(&stored), "workflow_id")
+}
+
+/// Backlog 298317a7 (part 2): the typed workflow references over the
+/// AUTHENTICATED-HTTP path (an `AuthContext`, the caller's own viewer), where
+/// the write identity and the workflow authority are the token's agent, not
+/// this server's. The caller repairs its own plan's dropped `executes` edge
+/// and gives its own workflow a prerequisite; the same caller is refused on a
+/// workflow this server's agent submitted (as the source of `executes` and of
+/// `depends_on`), with nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_http_caller_writes_references_from_its_own_workflow_only(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (caller, auth, _) = seed_caller(&pool, &["claims:write"]).await;
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&server, Some(&auth))
+        .await
+        .expect("HTTP viewer");
+    let mine = store_as(&server, &auth, &["my http step"]).await;
+    let theirs = store(&server, &["the server's step"]).await;
+
+    let (dropped, step) = step_claim(&pool, mine, "my http step").await;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(dropped)
+        .execute(&pool)
+        .await
+        .expect("drop my executes edge");
+    let repaired = do_link_hierarchical(
+        &server,
+        &viewer,
+        link(mine, "workflow", step, "claim", "executes"),
+        Some(&auth),
+    )
+    .await
+    .expect("the submitter repairs its own plan over HTTP");
+    assert_eq!(first_text(&repaired)["created"], serde_json::json!(true));
+    assert_eq!(in_force(&pool, mine, step, "executes").await, 1);
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(mine, "workflow", theirs, "workflow", "depends_on"),
+        Some(&auth),
+    )
+    .await
+    .expect("the submitter gives its own workflow a prerequisite over HTTP");
+    assert_eq!(in_force(&pool, mine, theirs, "depends_on").await, 1);
+
+    let (dropped, their_step) = step_claim(&pool, theirs, "the server's step").await;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(dropped)
+        .execute(&pool)
+        .await
+        .expect("drop the server's executes edge");
+    for (relationship, target, target_type) in [
+        ("executes", their_step, "claim"),
+        ("depends_on", mine, "workflow"),
+    ] {
+        let err = do_link_hierarchical(
+            &server,
+            &viewer,
+            link(theirs, "workflow", target, target_type, relationship),
+            Some(&auth),
+        )
+        .await
+        .expect_err(&format!(
+            "{relationship}: the HTTP caller has no authority over the server's workflow"
+        ));
+        assert!(
+            err.message.contains(&format!("caller agent {caller}"))
+                && err.message.contains("Nothing was written"),
+            "{relationship}: the refusal names the HTTP caller: {}",
+            err.message
+        );
+        assert_eq!(
+            in_force(&pool, theirs, target, relationship).await,
+            0,
+            "{relationship}: nothing written"
+        );
     }
 }
