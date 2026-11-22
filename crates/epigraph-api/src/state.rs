@@ -551,6 +551,29 @@ pub const BP_MAX_CONCURRENT_DEFAULT: usize = 2;
 #[cfg(feature = "db")]
 pub const BP_MAX_CONCURRENT_ENV: &str = "EPIGRAPH_BP_MAX_CONCURRENT";
 
+/// Parse a [`BP_MAX_CONCURRENT_ENV`] value: `Some(limit)` for a
+/// non-negative integer the runtime's semaphore can hold, `None` for
+/// anything else. A value above `tokio::sync::Semaphore::MAX_PERMITS`
+/// parses as a `usize` but would panic `Semaphore::new` at boot, so it is
+/// refused here like any other bad value and the caller uses the default.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn parse_bp_max_concurrent(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit <= tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// The semaphore behind [`AppState::bp_runs`] for `limit` concurrent runs,
+/// clamped to `tokio::sync::Semaphore::MAX_PERMITS` so no limit panics.
+#[cfg(feature = "db")]
+fn bp_runs_semaphore(limit: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        limit.min(tokio::sync::Semaphore::MAX_PERMITS),
+    ))
+}
+
 /// The environment variable that switches the guest reads on:
 /// `EPIGRAPH_GUEST_READS`.
 pub const GUEST_READS_ENV: &str = "EPIGRAPH_GUEST_READS";
@@ -595,6 +618,42 @@ impl GuestReads {
         raw.map(str::trim).is_some_and(|v| {
             !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
         })
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_max_concurrent_tests {
+    use super::{bp_runs_semaphore, parse_bp_max_concurrent};
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn a_limit_the_semaphore_can_hold_parses() {
+        assert_eq!(parse_bp_max_concurrent("0"), Some(0));
+        assert_eq!(parse_bp_max_concurrent(" 2 "), Some(2));
+        let max = Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(parse_bp_max_concurrent(&max), Some(Semaphore::MAX_PERMITS));
+    }
+
+    /// A value above the semaphore's limit is a valid `usize`, so a bare
+    /// `parse::<usize>()` accepted it and `Semaphore::new` panicked at boot
+    /// instead of the documented "warn and use the default".
+    #[test]
+    fn a_limit_above_the_semaphore_maximum_is_refused_not_a_boot_panic() {
+        let over = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert_eq!(parse_bp_max_concurrent(&over), None, "{over}");
+        assert_eq!(parse_bp_max_concurrent(&usize::MAX.to_string()), None);
+        for bad in ["", "-1", "two", "2.0"] {
+            assert_eq!(parse_bp_max_concurrent(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `with_bp_max_concurrent` is public: a caller that skips the parser
+    /// gets the semaphore's maximum, not a panic.
+    #[test]
+    fn the_semaphore_clamps_an_oversized_limit() {
+        let sem = bp_runs_semaphore(usize::MAX);
+        assert_eq!(sem.available_permits(), Semaphore::MAX_PERMITS);
+        assert_eq!(bp_runs_semaphore(2).available_permits(), 2);
     }
 }
 
@@ -1468,7 +1527,7 @@ impl AppState {
     #[cfg(feature = "db")]
     #[must_use]
     pub fn with_bp_max_concurrent(mut self, limit: usize) -> Self {
-        self.bp_runs = Arc::new(tokio::sync::Semaphore::new(limit));
+        self.bp_runs = bp_runs_semaphore(limit);
         self
     }
 
