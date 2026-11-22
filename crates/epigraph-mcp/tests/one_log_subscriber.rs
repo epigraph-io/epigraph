@@ -13,12 +13,22 @@
 use std::path::{Path, PathBuf};
 
 /// What building or installing a subscriber needs. A file that only emits
-/// events (`tracing::info!`) names none of these.
+/// events (`tracing::info!`) names none of these. Besides the
+/// `tracing_subscriber` crate: each way `tracing` itself installs a
+/// dispatcher (globally, for a scope, for a closure, or for one future), the
+/// `Dispatch` constructors those take, and a subscriber crate that does not
+/// go through `tracing_subscriber` by name (`console_subscriber::init()`).
 const SUBSCRIBER_MARKERS: &[&str] = &[
     "tracing_subscriber",
     "set_global_default",
     "subscriber::set_default",
     "subscriber::with_default",
+    "dispatcher::set_default",
+    "dispatcher::with_default",
+    "with_subscriber",
+    "Dispatch::new",
+    "Dispatch::from",
+    "console_subscriber",
 ];
 
 /// The one file allowed to: it builds the capped subscriber.
