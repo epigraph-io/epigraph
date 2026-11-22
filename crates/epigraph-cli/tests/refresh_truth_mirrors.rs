@@ -700,7 +700,8 @@ async fn two_chained_waves_refresh_to_the_last_and_a_broken_chain_is_left_untouc
         old_chained.to_bits(),
         "old = first.before"
     );
-    assert_eq!(r.waves, vec!["E-pass-1".to_string(), "L1".to_string()]);
+    // Chain order (L1 ran first), not name order.
+    assert_eq!(r.waves, vec!["L1".to_string(), "E-pass-1".to_string()]);
     assert_eq!(report.bucket_of(broken), Some(Bucket::BrokenChain));
     assert_untouched(&pool, broken, tb, vb, "broken chain").await;
 }

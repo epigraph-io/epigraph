@@ -205,7 +205,9 @@ pub struct Candidate {
     pub written: CacheColumns,
     /// The records do not chain: another writer landed between two waves.
     pub broken_chain: bool,
-    /// The names of the waves that wrote it, sorted.
+    /// The names of the waves that wrote it, each once, in chain order: by
+    /// record `at`, file order among equal `at` (as `plan_restore` chains
+    /// them), so the first is the wave whose `before` is [`Self::old`].
     pub waves: Vec<String>,
 }
 
@@ -214,10 +216,24 @@ pub struct Candidate {
 /// does) into one candidate per claim, in first-seen order.
 #[must_use]
 pub fn plan_candidates(records: &[WaveRecord]) -> Vec<Candidate> {
-    let mut waves: HashMap<Uuid, BTreeSet<String>> = HashMap::new();
+    let mut by_claim: HashMap<Uuid, Vec<&WaveRecord>> = HashMap::new();
     for r in records {
-        waves.entry(r.claim_id).or_default().insert(r.wave.clone());
+        by_claim.entry(r.claim_id).or_default().push(r);
     }
+    let mut waves: HashMap<Uuid, Vec<String>> = by_claim
+        .into_iter()
+        .map(|(id, mut group)| {
+            // Stable: records with equal `at` keep their file order.
+            group.sort_by_key(|r| r.at);
+            let mut seen = BTreeSet::new();
+            let names = group
+                .into_iter()
+                .filter(|r| seen.insert(r.wave.as_str()))
+                .map(|r| r.wave.clone())
+                .collect();
+            (id, names)
+        })
+        .collect();
     plan_restore(records, None)
         .entries
         .into_iter()
@@ -227,10 +243,7 @@ pub fn plan_candidates(records: &[WaveRecord]) -> Vec<Candidate> {
             new: e.written.pignistic_prob,
             written: e.written,
             broken_chain: e.partial,
-            waves: waves
-                .remove(&e.claim_id)
-                .map(|s| s.into_iter().collect())
-                .unwrap_or_default(),
+            waves: waves.remove(&e.claim_id).unwrap_or_default(),
         })
         .collect()
 }
@@ -918,6 +931,33 @@ mod tests {
         assert_eq!(classify(&c, Some(&s), true), Bucket::Refresh, "control");
         s.role = Some(ClaimRole::Procedural);
         assert_eq!(classify(&c, Some(&s), true), Bucket::Procedural);
+    }
+
+    #[test]
+    fn a_candidates_waves_are_in_chain_order_not_name_order() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now();
+        let rec = |wave: &str, secs: i64, before: f64, written: f64| WaveRecord {
+            claim_id: id,
+            before: cache(before),
+            written: cache(written),
+            wave: wave.to_string(),
+            at: t0 + chrono::Duration::seconds(secs),
+        };
+        // File order is neither chain order nor name order; "Z-first" ran
+        // first, then "A-second", then "M-third" (and "Z-first" again: named
+        // once, where it first appears).
+        let records = vec![
+            rec("M-third", 20, 0.62, 0.63),
+            rec("Z-first", 0, 0.60, 0.61),
+            rec("A-second", 10, 0.61, 0.62),
+            rec("Z-first", 30, 0.63, 0.64),
+        ];
+        let c = &plan_candidates(&records)[0];
+        assert!(!c.broken_chain, "the records chain");
+        assert_eq!(c.old, Some(0.60));
+        assert_eq!(c.new, Some(0.64));
+        assert_eq!(c.waves, vec!["Z-first", "A-second", "M-third"]);
     }
 
     #[test]
