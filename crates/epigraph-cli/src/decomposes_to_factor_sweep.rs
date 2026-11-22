@@ -169,26 +169,42 @@ pub struct RestoreReport {
 
 /// The selection: every factor `bp_readable_factor_sql` hides, with the
 /// manifest's columns. `{lock}` is `FOR UPDATE OF f` on apply.
+///
+/// The `parallel_unfactored_edges` count is computed once, set-wise, in the
+/// `parallel` CTE: its "no factor keyed to the edge" test is a `NOT EXISTS`
+/// in a join's WHERE, so the planner runs it as one anti-join over
+/// `factors` (no index covers `properties->>'source_edge_id'`). Written as a
+/// per-row scalar subquery it would rescan `factors` once per parallel edge,
+/// under the apply's row locks. The outer selection and its lock are the
+/// predicate alone.
 fn select_sql(lock: &str) -> String {
     format!(
         "-- VISIBILITY-EXEMPT: maintenance read; the decomposes_to sweep runs on the privileged connection.
+         WITH parallel AS MATERIALIZED (
+             SELECT f.id AS factor_id, count(*) AS n
+               FROM factors f
+               JOIN edges e
+                 ON cardinality(f.variable_ids) = 2
+                AND ( (e.source_id = f.variable_ids[1] AND e.target_id = f.variable_ids[2])
+                   OR (e.source_id = f.variable_ids[2] AND e.target_id = f.variable_ids[1]) )
+              CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
+              WHERE NOT ({pred})
+                AND e.source_type = 'claim' AND e.target_type = 'claim'
+                AND lower(e.relationship) <> 'decomposes_to'
+                AND ft.factor_type = f.factor_type
+                AND {in_force}
+                AND NOT EXISTS (SELECT 1 FROM factors g
+                                 WHERE g.properties->>'source_edge_id' = e.id::text)
+              GROUP BY f.id
+         )
          SELECT f.id,
                 CASE WHEN lower(COALESCE(f.properties->>'relationship', '')) = 'decomposes_to'
                      THEN 'keyed' ELSE 'legacy' END,
                 (SELECT count(*) FROM bp_messages m WHERE m.factor_id = f.id),
-                (SELECT count(*) FROM edges e
-                   CROSS JOIN LATERAL edge_to_factor_type(e.relationship) ft
-                  WHERE e.source_type = 'claim' AND e.target_type = 'claim'
-                    AND lower(e.relationship) <> 'decomposes_to'
-                    AND ft.factor_type = f.factor_type
-                    AND cardinality(f.variable_ids) = 2
-                    AND ( (e.source_id = f.variable_ids[1] AND e.target_id = f.variable_ids[2])
-                       OR (e.source_id = f.variable_ids[2] AND e.target_id = f.variable_ids[1]) )
-                    AND {in_force}
-                    AND NOT EXISTS (SELECT 1 FROM factors g
-                                     WHERE g.properties->>'source_edge_id' = e.id::text)),
+                COALESCE(p.n, 0),
                 to_jsonb(f)::text
            FROM factors f
+           LEFT JOIN parallel p ON p.factor_id = f.id
           WHERE NOT ({pred})
           ORDER BY f.id
           {lock}",

@@ -134,6 +134,16 @@ async fn world(pool: &PgPool) -> World {
         parallel_rows, 0,
         "calibration: the keyed row holds the slot the parallel edge would use"
     );
+    // A second parallel edge (the other direction) that DOES have a factor
+    // keyed to it: not a factorless edge, so not counted.
+    let parallel2 = edge(pool, k, a2, "supports").await;
+    factor(
+        pool,
+        "evidential_support",
+        &sorted(k, a2),
+        json!({"source_edge_id": parallel2}),
+    )
+    .await;
 
     // Keep: the trigger's ordinary keyed factor of a supports edge.
     let sup = edge(pool, s, t, "supports").await;
@@ -315,7 +325,8 @@ async fn a_stranger_reads_no_decomposition_factor_after_the_sweep(pool: PgPool) 
     let keyed_row = rows.iter().find(|r| r.id == w.keyed).expect("keyed row");
     assert_eq!(
         keyed_row.parallel_unfactored_edges, 1,
-        "the supports edge whose slot the keyed row holds is counted"
+        "the supports edge whose slot the keyed row holds is counted, and the parallel edge \
+         with a factor keyed to it is not"
     );
     assert_eq!(
         rows.iter()
