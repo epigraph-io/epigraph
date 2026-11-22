@@ -23,7 +23,7 @@ use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
     LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StoredPasskey,
-    ACT_NONCE_LEN,
+    ACT_NONCE_LEN, STATEMENT_KEY,
 };
 use support::{
     android_status, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
@@ -163,18 +163,42 @@ fn lineage_entry_at(reg: &RegisteredPasskey, confirmed_at: SystemTime) -> Lineag
 
 /// `reg` with its STORED attestation chain replaced by `chain` (DER, leaf
 /// first), as the library serializes one (`/cred/attestation/data/Basic`,
-/// base64url). Its key and every column are unchanged.
+/// base64url), and so is the `x5c` of its stored attestation statement
+/// ([`STATEMENT_KEY`]): the row the same registration would have stored had
+/// the authenticator held that chain. Every `chain` here re-issues the
+/// original leaf's key, and a statement's signature covers the
+/// authenticator and client data, not `x5c`, so the statement still
+/// verifies. Its key and every column are unchanged.
 fn with_stored_chain(reg: &RegisteredPasskey, chain: &[Vec<u8>]) -> RegisteredPasskey {
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let mut passkey = reg.passkey.clone();
     passkey["cred"]["attestation"]["data"]["Basic"] = chain
         .iter()
-        .map(|der| {
-            serde_json::Value::from(base64::Engine::encode(
-                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                der,
-            ))
-        })
+        .map(|der| serde_json::Value::from(base64::Engine::encode(&b64, der)))
         .collect();
+    if let Some(object) =
+        passkey.pointer_mut(&format!("/{STATEMENT_KEY}/response/attestationObject"))
+    {
+        let raw = object.as_str().expect("base64url").trim_end_matches('=');
+        let bytes = base64::Engine::decode(&b64, raw).expect("an attestation object");
+        let mut cbor: ciborium::Value = ciborium::from_reader(bytes.as_slice()).expect("cbor");
+        let x5c = ciborium::Value::Array(
+            chain
+                .iter()
+                .map(|der| ciborium::Value::Bytes(der.clone()))
+                .collect(),
+        );
+        let replaced = cbor
+            .as_map_mut()
+            .and_then(|m| m.iter_mut().find(|(k, _)| k.as_text() == Some("attStmt")))
+            .and_then(|(_, stmt)| stmt.as_map_mut())
+            .and_then(|m| m.iter_mut().find(|(k, _)| k.as_text() == Some("x5c")))
+            .map(|(_, v)| *v = x5c);
+        assert!(replaced.is_some(), "the stored statement carries an x5c");
+        let mut out = Vec::new();
+        ciborium::into_writer(&cbor, &mut out).expect("cbor");
+        *object = serde_json::Value::from(base64::Engine::encode(&b64, &out));
+    }
     RegisteredPasskey {
         passkey,
         ..reg.clone()
@@ -741,6 +765,149 @@ async fn an_android_chain_attests_only_the_key_it_certifies() {
         why.contains("does not attest this credential's key"),
         "{why}"
     );
+}
+
+// =====================================================================
+// bccf27a1: a packed / tpm chain vouches only for the key it attested
+// =====================================================================
+
+/// A row PLANTED through 124's completion function, which any holder of the
+/// request DSN with a live enrollment id can call with values of its
+/// choosing: the planter's own software key, device-bound, recorded `packed`
+/// with an allowlisted model's AAGUID and a GENUINE chain copied from another
+/// passkey's row (a model's chain is public). Its key asserts, its columns
+/// agree with its credential, and its chain verifies to today's root, so only
+/// the attestation statement tells it apart. It anchors nothing, and counts
+/// as hardware nowhere (directly, or as an ancestor on a lineage), whatever
+/// it stores beside its credential:
+/// (i) nothing (as every row was stored before statements were kept);
+/// (ii) its own `none` registration's statement;
+/// (iii) everything the genuine passkey's row stores beside its credential
+///     (its statement, a valid one, over the GENUINE key);
+/// (iv) a valid statement over its OWN key by a chain from a root nobody
+///     configured, the stored chain still the genuine one.
+/// CALIBRATION: the genuine passkey anchors, is hardware, and counts on a
+/// lineage; the planted rows' keys assert.
+/// Red line: on the code before the statement was stored and re-verified,
+/// every planted row anchored. Mutations: the statement check in
+/// `hardware_trust_but_android` removed -> every case anchors; its key and
+/// credential id comparisons removed -> (iii) anchors; its attestation
+/// comparison removed -> (iv) anchors.
+#[tokio::test]
+async fn a_planted_row_with_a_genuine_chain_beside_its_own_key_anchors_nothing() {
+    let vendor = TestAttestation::new("Allowlisted");
+    let nobody = TestAttestation::new("Nobody");
+    let rp = attested(Some((&vendor, &[MODEL])), None, true);
+    let soft = software();
+    let person = Uuid::new_v4();
+
+    // The genuine, allowlisted hardware passkey whose chain is copied.
+    let (options, state) = rp.start_registration(person, "op", "Op").unwrap();
+    let mut genuine_key = SoftAuthenticator::new(MODEL).hardware();
+    let created = genuine_key
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let genuine = rp
+        .finish_registration(&vendor.rewrap(&created), &state)
+        .expect("CALIBRATION: the genuine key registers");
+    let anchor = confirmed_anchor(&rp, &mut genuine_key, &genuine, person).await;
+    assert_eq!(rp.check_anchor(&anchor), Ok(()), "CALIBRATION: it anchors");
+    rp.hardware_attested(&genuine.passkey, "packed", MODEL, false)
+        .expect("CALIBRATION: it is hardware");
+    let mut genuine_lineage = anchor.clone();
+    genuine_lineage.anchor_lineage = vec![lineage_entry(&genuine)];
+    assert_eq!(
+        rp.check_anchor(&genuine_lineage),
+        Ok(()),
+        "CALIBRATION: it counts on a lineage"
+    );
+
+    // The planter's software key: one registration, finished as `none` and
+    // as a `packed` one under a root nobody configured (the software policy
+    // records either).
+    let (options, state) = soft.start_registration(person, "op", "Op").unwrap();
+    let mut planter = SoftAuthenticator::new(MODEL).hardware();
+    let created = planter
+        .register(ORIGIN, options, ClientUv::AsRequested)
+        .await;
+    let own_none = soft
+        .finish_registration(&created, &state)
+        .expect("a device-bound none passkey");
+    let own_nobody = soft
+        .finish_registration(&nobody.rewrap(&created), &state)
+        .expect("a self-made chain, recorded by the software policy");
+    assert_eq!(own_none.credential_id, own_nobody.credential_id);
+    assert_eq!(
+        own_none.passkey["cred"]["cred"],
+        own_nobody.passkey["cred"]["cred"]
+    );
+
+    let beside = |reg: &RegisteredPasskey| -> serde_json::Map<String, serde_json::Value> {
+        reg.passkey
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| k.as_str() != "cred")
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    // `base`'s key and credential id, the genuine chain, the columns of an
+    // attested hardware passkey, and `stored` beside the credential.
+    let planted = |base: &RegisteredPasskey,
+                   stored: serde_json::Map<String, serde_json::Value>|
+     -> RegisteredPasskey {
+        let mut cred = base.passkey["cred"].clone();
+        cred["attestation"] = genuine.passkey["cred"]["attestation"].clone();
+        cred["attestation_format"] = "packed".into();
+        assert_eq!(cred["backup_eligible"], false, "a device-bound key");
+        let mut passkey = serde_json::Value::Object(stored);
+        passkey["cred"] = cred;
+        RegisteredPasskey {
+            credential_id: base.credential_id.clone(),
+            passkey,
+            aaguid: MODEL,
+            attestation_format: "packed".into(),
+            user_verified: true,
+            backup_eligible: false,
+        }
+    };
+    for (label, row) in [
+        (
+            "(i) nothing beside the credential",
+            planted(&own_none, serde_json::Map::new()),
+        ),
+        (
+            "(ii) its own none registration's statement",
+            planted(&own_none, beside(&own_none)),
+        ),
+        (
+            "(iii) the genuine row's statement",
+            planted(&own_none, beside(&genuine)),
+        ),
+        (
+            "(iv) its own statement under an unconfigured root",
+            planted(&own_nobody, beside(&own_nobody)),
+        ),
+    ] {
+        let as_anchor = confirmed_anchor(&rp, &mut planter, &row, person).await;
+        assert_eq!(
+            rp.check_anchor(&as_anchor),
+            Err(AnchorRefusal::AnchorNotAttested),
+            "{label}: as an anchor"
+        );
+        assert!(
+            rp.hardware_attested(&row.passkey, "packed", MODEL, false)
+                .is_err(),
+            "{label}: as hardware"
+        );
+        let mut on_lineage = anchor.clone();
+        on_lineage.anchor_lineage = vec![lineage_entry(&row)];
+        assert_eq!(
+            rp.check_anchor(&on_lineage),
+            Err(AnchorRefusal::LineageNotAttested),
+            "{label}: on a lineage"
+        );
+    }
 }
 
 // =====================================================================
