@@ -1141,6 +1141,40 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // receive the viewer (`AppState::store_claim_embedding_as` /
     // `store_evidence_embedding_as`, backlog 1e2315a9), so they left this list.
     ("submit.rs", "submit_packet", &["validate_packet"]),
+    // write / read: team_groups.rs (migration 263). Each handler spends its
+    // viewer on `write_as` (`read_as` for the list) and calls one 263 definer
+    // on that stamped transaction through `PersonTeamGroupRepository`; the
+    // definer reads the caller from the stamp and decides who may (a Person
+    // signed in as themselves, a live admin, the invitee), so no call here
+    // takes the viewer as an argument.
+    (
+        "team_groups.rs",
+        "accept_invitation",
+        &["PersonTeamGroupRepository::accept_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "create_team_group",
+        &["PersonTeamGroupRepository::create_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "decline_invitation",
+        &["PersonTeamGroupRepository::decline_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "invite_to_group",
+        &["PersonTeamGroupRepository::invite_conn"],
+    ),
+    (
+        "team_groups.rs",
+        "my_groups",
+        &[
+            "PersonTeamGroupRepository::my_groups_conn",
+            "PersonTeamGroupRepository::my_invitations_conn",
+        ],
+    ),
     // gated (`write_target_of`) then write.
     (
         "versioning.rs",

@@ -1980,6 +1980,56 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          of a write the caller just made on the same transaction.",
     ),
     (
+        "person_team_group.rs",
+        "accept_conn",
+        "WRITE through migration 263's principal-bound app-callable definer \
+         `epigraph_accept_group_invitation` on the invitee's STAMPED connection: the definer \
+         reads the caller from the stamp, finds the invitation only when it names that caller \
+         (anyone else is told it does not exist), and answers only the new membership's id, \
+         its group and role; the viewer is spent on the stamp.",
+    ),
+    (
+        "person_team_group.rs",
+        "create_conn",
+        "WRITE through migration 263's principal-bound app-callable definer \
+         `epigraph_person_create_team_group` on the creator's STAMPED connection: the creator \
+         and admin are read from the stamp, never an argument, and only the new group's id is \
+         answered; the viewer is spent on the stamp.",
+    ),
+    (
+        "person_team_group.rs",
+        "decline_conn",
+        "WRITE through migration 263's principal-bound app-callable definer \
+         `epigraph_decline_group_invitation` on the invitee's STAMPED connection: it acts only \
+         on an invitation that names the stamped caller (anyone else is told it does not \
+         exist) and answers only its group id; the viewer is spent on the stamp.",
+    ),
+    (
+        "person_team_group.rs",
+        "invite_conn",
+        "WRITE through migration 263's principal-bound app-callable definer \
+         `epigraph_invite_to_team_group` on the inviter's STAMPED connection: the definer \
+         admits only a live admin of the named group (a non-member is told it does not exist), \
+         writes a pending invitation and no membership, and answers only the invitation's id; \
+         the viewer is spent on the stamp.",
+    ),
+    (
+        "person_team_group.rs",
+        "my_groups_conn",
+        "READ through migration 263's principal-bound app-callable definer \
+         `epigraph_my_groups` on the caller's STAMPED connection: only the stamped principal's \
+         own live memberships (`epigraph_live_memberships` of the stamp, no caller-supplied id) \
+         with each group's name, kind and status; the viewer is spent on the stamp.",
+    ),
+    (
+        "person_team_group.rs",
+        "my_invitations_conn",
+        "READ through migration 263's principal-bound app-callable definer \
+         `epigraph_my_group_invitations` on the caller's STAMPED connection: only the pending \
+         invitations that name the stamped principal (no caller-supplied id), with each group's \
+         name; the viewer is spent on the stamp.",
+    ),
+    (
         "perspective.rs",
         "set_source_reliability_conn",
         "WRITE of one caller-named `perspectives` row's `properties.source_reliability` on the \
