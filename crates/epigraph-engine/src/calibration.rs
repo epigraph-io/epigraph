@@ -352,6 +352,50 @@ impl CalibrationConfig {
         Self::problems(Self::cached(), Self::cached_source())
     }
 
+    /// Evidence-type keys the calibration compiled into this binary resolves to
+    /// a calibrated weight but `cfg` does not, when `cfg` came from a
+    /// `CALIBRATION_PATH` file (backlog 88791b82). An operator's override file
+    /// is a full copy taken at some point in time, so an alias added to the
+    /// workspace file later (`dataset`, `figure`) is missing from it and every
+    /// row stored under that tag weighs at the 0.5 unknown-type fallback.
+    ///
+    /// Empty for the compiled-in calibration. A warning, not a
+    /// [`Self::problems`] entry: those make the targeted `backfill_factors`
+    /// rewire and the R-173 guard refuse, and an override may leave a key out
+    /// on purpose.
+    #[must_use]
+    pub fn override_gaps(cfg: &Self, source: &CalibrationSource) -> Vec<String> {
+        if !matches!(source, CalibrationSource::Path(_)) {
+            return Vec::new();
+        }
+        let shipped = Self::embedded();
+        let mut keys: Vec<&String> = shipped
+            .evidence_type_weights
+            .keys()
+            .chain(shipped.evidence_type_aliases.keys())
+            .filter(|k| shipped.evidence_type_weight_present(k))
+            .filter(|k| !cfg.evidence_type_weight_present(k))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "{source} does not resolve evidence type(s) {keys:?} that the calibration \
+             compiled into this binary does; rows stored under them weigh at the 0.5 \
+             unknown-type fallback (add the missing [evidence_type_aliases] / \
+             [evidence_type_weights] lines to the override)"
+        )]
+    }
+
+    /// [`Self::override_gaps`] for the process-wide calibration, for the
+    /// binaries to log at WARN at boot.
+    #[must_use]
+    pub fn startup_warnings() -> Vec<String> {
+        Self::override_gaps(Self::cached(), Self::cached_source())
+    }
+
     /// Resolve a methodology string to its `(base_support, base_against, base_ignorance)` profile.
     ///
     /// Resolution order:
@@ -890,6 +934,52 @@ mod tests {
             }
         );
         assert!(CalibrationConfig::problems(&cfg, &src).is_empty());
+    }
+
+    /// An override file taken before an alias was added to the workspace file
+    /// (backlog 88791b82: `figure`) is named at boot with the missing key; the
+    /// compiled-in calibration and a current copy report nothing.
+    #[test]
+    fn an_override_missing_a_shipped_alias_is_warned_about() {
+        let path = PathBuf::from("/etc/epigraph/calibration.toml");
+        let mut stale = CalibrationConfig::embedded();
+        assert!(stale.evidence_type_aliases.remove("figure").is_some());
+        let warnings =
+            CalibrationConfig::override_gaps(&stale, &CalibrationSource::Path(path.clone()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"figure\"")
+                && warnings[0].contains("/etc/epigraph/calibration.toml")
+                && !warnings[0].contains("\"dataset\""),
+            "{}",
+            warnings[0]
+        );
+        // Not a problem: the guards that refuse on problems are unaffected.
+        assert!(
+            CalibrationConfig::problems(&stale, &CalibrationSource::Path(path.clone())).is_empty()
+        );
+
+        // A canonical weight key missing from the override is a gap too.
+        let mut no_weight = CalibrationConfig::embedded();
+        assert!(no_weight
+            .evidence_type_weights
+            .remove("testimonial")
+            .is_some());
+        let warnings =
+            CalibrationConfig::override_gaps(&no_weight, &CalibrationSource::Path(path.clone()));
+        assert!(
+            warnings.len() == 1
+                && warnings[0].contains("\"testimonial\"")
+                && warnings[0].contains("\"testimony\""),
+            "{warnings:?}"
+        );
+
+        let (current, src) = CalibrationConfig::resolve(Some(calibration_path()));
+        assert!(CalibrationConfig::override_gaps(&current, &src).is_empty());
+        let embedded = CalibrationSource::Embedded {
+            failed_override: None,
+        };
+        assert!(CalibrationConfig::override_gaps(&stale, &embedded).is_empty());
     }
 
     /// An explicit calibration whose vocabulary is empty is the one way left
