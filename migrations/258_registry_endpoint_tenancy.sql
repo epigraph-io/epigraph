@@ -58,9 +58,11 @@
 --      edge takes the meet only when the meet is `group`, never widens, and is
 --      written only when its (owner, visibility, co-owner) triple differs. An
 --      edge that is already group-private also keeps every group it requires
---      (section 4 says why); one that would then need three groups is held.
---      Counts by relationship and transition, and the held count, are RAISEd
---      as a NOTICE: they are the measurement of what this changed.
+--      (section 4 says why); one that would then need three groups is held,
+--      and one whose other endpoint no longer exists is skipped (a write
+--      would trip `edges_validate_refs` and abort the migration). Counts by
+--      relationship and transition, and the held and skipped counts, are
+--      RAISEd as a NOTICE: they are the measurement of what this changed.
 --
 -- NOT changed:
 --   * re-tenanting a registry row does not, by itself, re-meet its edges
@@ -81,7 +83,8 @@
 -- an RLS-filtered re-meet would see no private registry row and re-meet
 -- nothing). No binary depends on it. Run the `epigraph-tenancy-backfill`
 -- built with it AFTER the migration: its `verify` now fails on an edge with a
--- non-public registry endpoint that is off its meet, or held (section 4). New edges written after
+-- non-public registry endpoint that is off its meet, held or skipped as
+-- dangling (section 4). New edges written after
 -- 258 from a public claim to a group-private registry row are ('group',
 -- that row's group), so the writer must write that group (fail-closed).
 --
@@ -422,8 +425,15 @@ END $$;
 -- `epigraph-tenancy-backfill verify` fails on it, for an operator to decide.
 -- `epigraph-tenancy-backfill run --entity registry-edges` applies the same
 -- rule later.
+--
+-- An edge whose other endpoint no longer exists (a deleted agent, task,
+-- claim, ...) is SKIPPED and counted, never written: an UPDATE of `edges`
+-- fires `edges_validate_refs` on every row it writes, and one dangling
+-- endpoint would abort this migration and the api's boot with it (175's
+-- header; 260 skips the same way). `epigraph-tenancy-backfill verify` fails on
+-- such an edge, for an operator to repair or delete.
 DO $$
-DECLARE v_summary text; v_total bigint; v_held bigint;
+DECLARE v_summary text; v_total bigint; v_held bigint; v_dangling bigint;
 BEGIN
     WITH reg_edges AS (
         SELECT x.id FROM public.edges x
@@ -459,6 +469,7 @@ BEGIN
          WHERE r.visibility <> 'public'
     ), m AS (
         SELECT e2.id, e2.relationship,
+               e2.source_id, e2.source_type, e2.target_id, e2.target_type,
                e2.visibility AS old_v, e2.owner_group_id AS old_g,
                e2.co_owner_group_id AS old_co,
                CASE WHEN s.v = 'public' AND t.v = 'public'
@@ -490,6 +501,8 @@ BEGIN
     ), d AS (
         SELECT n.id, n.relationship, n.g, n.v, n.others[1] AS co,
                cardinality(n.others) > 1 AS held,
+               (public.validate_edge_reference(n.source_id, n.source_type)
+                AND public.validate_edge_reference(n.target_id, n.target_type)) AS refs_ok,
                CASE WHEN n.old_v = 'public' THEN 'public to group'
                     WHEN n.others[1] IS NOT NULL AND n.old_co IS NULL THEN 'group to co-owned'
                     WHEN n.old_g IS DISTINCT FROM n.g THEN 'group to another group'
@@ -504,6 +517,7 @@ BEGIN
           FROM d
          WHERE e.id = d.id
            AND NOT d.held
+           AND d.refs_ok
         RETURNING d.relationship, d.transition
     ), counts AS (
         SELECT relationship, transition, count(*) AS n FROM upd GROUP BY 1, 2
@@ -511,9 +525,11 @@ BEGIN
     SELECT COALESCE((SELECT sum(n) FROM counts), 0),
            COALESCE((SELECT string_agg(format('%s %s: %s', relationship, transition, n), '; '
                                        ORDER BY relationship, transition) FROM counts), 'none'),
-           (SELECT count(*) FROM d WHERE d.held)
-      INTO v_total, v_summary, v_held;
+           (SELECT count(*) FROM d WHERE d.held AND d.refs_ok),
+           (SELECT count(*) FROM d WHERE NOT d.refs_ok)
+      INTO v_total, v_summary, v_held, v_dangling;
     RAISE NOTICE '258: re-met % edge(s) with a non-public frame, context, perspective or '
-                 'community endpoint (%); % held (they need three groups, see '
-                 '`epigraph-tenancy-backfill verify`)', v_total, v_summary, v_held;
+                 'community endpoint (%); % held (they need three groups); % skipped with a '
+                 'dangling endpoint (see `epigraph-tenancy-backfill verify`)',
+                 v_total, v_summary, v_held, v_dangling;
 END $$;

@@ -21,17 +21,23 @@
 //! * the one-time re-meet (258 section 4) narrows an edge stamped before 258,
 //!   keeps the group a legacy declaration required (co-owned), holds an edge
 //!   that would need three groups, leaves public registry rows' edges alone,
-//!   and is idempotent.
+//!   and is idempotent;
+//! * the one-time re-meet skips an edge whose other endpoint no longer exists
+//!   (instead of aborting on `edges_validate_refs`) and still narrows the rest.
 //!
 //! Verified to fail (mutations of 258, each applied alone):
 //! * the `perspective` arm removed from `epigraph_node_tenancy` -> the
 //!   perspective app-role test, the oracle test, the narrowing test and the
 //!   re-meet test fail;
 //! * the target-side `communities` LEFT JOIN of `epigraph_propagate_tenancy`
-//!   disabled -> only the narrowing test fails (community, node is target).
+//!   disabled -> only the narrowing test fails (community, node is target);
+//! * the `refs_ok` guard removed from section 4 -> the dangling-endpoint test
+//!   fails (the re-run aborts on the reference check).
 //!
-//! With 258 reduced to an empty section 4 (the tree before 258) every test
-//! here fails: the edges are public.
+//! With 258 replaced by an empty stub (the tree before 258) every test here
+//! fails: the edges are public, and section 4 is absent. Emptying section 4
+//! alone is NOT enough to fail the app-role tests: the function arms still
+//! stamp new edges correctly.
 
 mod viewer_fixture;
 
@@ -493,4 +499,100 @@ async fn the_one_time_re_meet_narrows_stale_edges_onto_private_registry_rows(poo
         .await
         .expect("re-run 258's section 4 again");
     assert_eq!(before, snapshot().await, "the re-meet is idempotent");
+}
+
+/// An edge between a group-private registry row and an endpoint that no
+/// longer exists, written with `edges_validate_refs` disabled (harness
+/// superuser), standing in for a row whose other endpoint was deleted after
+/// the edge was written.
+async fn dangling_edge(pool: &PgPool, registry: (Uuid, &str)) -> Uuid {
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("ALTER TABLE edges DISABLE TRIGGER edges_validate_refs")
+        .execute(&mut *tx)
+        .await
+        .expect("disable edges_validate_refs");
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, 'agent', 'relates_to') RETURNING id",
+    )
+    .bind(registry.0)
+    .bind(registry.1)
+    .bind(Uuid::new_v4())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert a dangling edge");
+    sqlx::query("ALTER TABLE edges ENABLE TRIGGER edges_validate_refs")
+        .execute(&mut *tx)
+        .await
+        .expect("re-enable edges_validate_refs");
+    tx.commit().await.expect("commit");
+    id
+}
+
+/// Section 4 skips (and counts) an edge whose other endpoint no longer
+/// exists instead of aborting: an UPDATE of `edges` fires
+/// `edges_validate_refs` on every row it writes, so one dangling row would
+/// fail the migration and the api's boot with it. The re-meet of every other
+/// stale edge in the same run still lands.
+///
+/// Verified to fail without the `refs_ok` guard in section 4: the re-run
+/// raises the reference error and this test panics at "re-run 258's section 4".
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_one_time_re_meet_skips_an_edge_with_a_dangling_endpoint(pool: PgPool) {
+    let (agent, g) = fixture::seed_agent_with_group(&pool, "registry-dangling").await;
+    let claim = fixture::seed_public_claim(&pool, agent, "a public claim").await;
+
+    let mut dangling = Vec::new();
+    let mut stale = Vec::new();
+    for (ty, _) in TYPES {
+        let private = registry_row(&pool, ty, g, "group").await;
+        dangling.push((ty, dangling_edge(&pool, (private, ty)).await));
+        stale.push((ty, edge(&pool, (claim, "claim"), (private, ty)).await));
+    }
+    let ids: Vec<Uuid> = dangling
+        .iter()
+        .chain(stale.iter())
+        .map(|(_, e)| *e)
+        .collect();
+    // The pre-258 stamp (the registry row counted as public). Written with
+    // edges_validate_refs off too: the dangling rows would trip it.
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("ALTER TABLE edges DISABLE TRIGGER edges_validate_refs")
+        .execute(&mut *tx)
+        .await
+        .expect("disable edges_validate_refs");
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = ANY($1)",
+    )
+    .bind(&ids)
+    .bind(WORLD)
+    .execute(&mut *tx)
+    .await
+    .expect("restore the pre-258 public edges");
+    sqlx::query("ALTER TABLE edges ENABLE TRIGGER edges_validate_refs")
+        .execute(&mut *tx)
+        .await
+        .expect("re-enable edges_validate_refs");
+    tx.commit().await.expect("commit");
+
+    sqlx::raw_sql(section_4())
+        .execute(&pool)
+        .await
+        .expect("re-run 258's section 4");
+
+    for (ty, e) in &dangling {
+        assert_eq!(
+            edge_tenancy(&pool, *e).await,
+            public_world(),
+            "a {ty} edge with a dangling endpoint is skipped, not written"
+        );
+    }
+    for (ty, e) in &stale {
+        assert_eq!(
+            edge_tenancy(&pool, *e).await,
+            group(g),
+            "the other stale {ty} edge in the same run is still narrowed"
+        );
+    }
 }

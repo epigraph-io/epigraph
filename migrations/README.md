@@ -3411,8 +3411,10 @@ restart.
   in either body changes; CREATE OR REPLACE keeps owner and ACL, and the owner is
   re-set). Re-meets, once, every edge with a non-public registry endpoint (group meet
   only, never widening; an already-private edge keeps every group it requires, so a
-  legacy declaration becomes co-owned; an edge that would need three groups is held)
-  and RAISEs a NOTICE with the counts. So an edge from a public claim onto a
+  legacy declaration becomes co-owned; an edge that would need three groups is held;
+  an edge whose other endpoint no longer exists is skipped, since writing it would
+  trip `edges_validate_refs` and abort the migration) and RAISEs a NOTICE with the
+  counts. So an edge from a public claim onto a
   group-private registry row is that row's group's, and one onto another group's
   claim is co-owned. Not changed: re-tenanting a registry row does not re-meet its
   edges by itself (no trigger on the four tables, as on `workflows`);
