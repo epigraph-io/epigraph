@@ -67,6 +67,7 @@ const NOTHING_WRITTEN: &str = "Nothing was written";
 // The production-shaped API
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Api {
     router: axum::Router,
 }
@@ -921,4 +922,131 @@ async fn a_claim_no_workflow_executes_is_unaffected(pool: PgPool) {
     }
     assert!(evolve_rows(&pool, CALLER_WRITE).await.is_empty());
     assert!(evolve_rows(&pool, ADMIN_WRITE).await.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// An `executes` edge in flight (backlog bf2e9aa6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether a backend of this test's database is waiting on an advisory lock,
+/// polled until one is or `task` finishes (deadline 30 s).
+async fn evolve_waits_on_the_lineage_lock<T>(
+    pool: &PgPool,
+    task: &tokio::task::JoinHandle<T>,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() \
+                AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            return true;
+        }
+        if task.is_finished() {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// An `executes` edge into the step's lineage that a writer has inserted but
+/// not yet committed is gated by a concurrent evolve (backlog bf2e9aa6).
+///
+/// The curator submitted workflow A and may evolve A's step; another agent's
+/// workflow B is being attached to that step by a writer (the repository's
+/// own `executes` writer, the one the ingest uses) whose transaction is still
+/// open. The evolve must wait for that writer (its lineage lock) and then,
+/// with B in the set, refuse the curator, who holds no authority over B, with
+/// nothing written.
+///
+/// VERIFIED TO FAIL before the fix: the gate read its set with no lock, did
+/// not see B's uncommitted edge, never waited, and the evolve answered 200.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_executes_edge_in_flight_is_gated_by_a_concurrent_evolve(pool: PgPool) {
+    let (curator, curator_g) = fixture::seed_agent_with_group(&pool, "evolve-race-curator").await;
+    let (other, other_g) = fixture::seed_agent_with_group(&pool, "evolve-race-other").await;
+    let api = Api::prod_shaped(&pool).await;
+    let wf_a = api
+        .ingest(
+            &token(curator),
+            &public_in(extraction("acme-evolve-race-a", 2), curator_g),
+        )
+        .await;
+    let wf_b = api
+        .ingest(
+            &token(other),
+            &public_in(extraction("acme-evolve-race-b", 2), other_g),
+        )
+        .await;
+    let (step, _) = first_step(&pool, wf_a).await;
+
+    // The writer: B executes A's step, inserted and not yet committed.
+    let mut writer = pool.begin().await.expect("the writer's transaction");
+    let (_, created) =
+        epigraph_db::EdgeRepository::create_if_absent_including_retracted_signed_conn(
+            &mut writer,
+            None,
+            wf_b,
+            "workflow",
+            step,
+            "claim",
+            "executes",
+            Some(json!({"level": 2, "plan_index": 7})),
+            None,
+            None,
+        )
+        .await
+        .expect("the writer inserts B's executes edge");
+    assert!(created, "the edge is new");
+
+    let content = "the curator's revision while an executes edge is in flight";
+    let evolver = api.clone();
+    let curator_token = token(curator);
+    let task = tokio::spawn(async move {
+        evolver
+            .evolve(&curator_token, step, content, "revises")
+            .await
+    });
+    let waited = evolve_waits_on_the_lineage_lock(&pool, &task).await;
+    writer.commit().await.expect("the writer commits");
+    let (status, body) = task.await.expect("the evolve task");
+    let text = body.to_string();
+    assert!(
+        waited,
+        "the evolve did not wait for the in-flight executes edge (answered {status}: {text})"
+    );
+    assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+    assert!(
+        text.contains(GATE_TEXT) && text.contains(NOTHING_WRITTEN),
+        "the workflow gate refuses: {text}"
+    );
+    assert!(
+        text.contains(&wf_b.to_string()),
+        "the refusal names workflow B, attached while the evolve waited: {text}"
+    );
+    assert_eq!(claims_with_content(&pool, content).await, 0, "no claim");
+    assert!(is_current(&pool, step).await, "the parent is not retired");
+    assert!(
+        evolve_rows(&pool, CALLER_WRITE).await.is_empty(),
+        "no caller_write row"
+    );
+
+    // CALIBRATION: once the curator is B's submitter too, the same evolve is
+    // admitted, so the refusal above was the gate's over B and nothing else.
+    set_submitter(&pool, wf_b, Some(curator)).await;
+    let (status, body) = api
+        .evolve(
+            &token(curator),
+            step,
+            "the curator's revision of both",
+            "revises",
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

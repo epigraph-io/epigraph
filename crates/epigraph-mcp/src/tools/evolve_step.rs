@@ -184,7 +184,7 @@ pub async fn evolve_step(
         let mut tx =
             crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
         let grants =
-            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
+            require_lineage_authority_locked(server, &mut tx, auth, identity, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
             Some(edge_key),
@@ -250,7 +250,7 @@ pub async fn evolve_step(
         // ScopedPool is not a way around it.
         let mut tx = server.pool.begin().await.map_err(internal_error)?;
         let grants =
-            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
+            require_lineage_authority_locked(server, &mut tx, auth, identity, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
             Some(edge_key),
@@ -287,6 +287,40 @@ pub async fn evolve_step(
         cascade,
         belief_cascade,
     })
+}
+
+/// [`require_lineage_authority`] serialized against every concurrent
+/// `executes` edge into the parent's lineage (backlog bf2e9aa6), on the act's
+/// own transaction: AUTHORITY, THEN THE LOCK, THEN AUTHORITY AGAIN, as
+/// `deprecate_workflow` orders it (the REST twin is the same three steps in
+/// `routes/workflows.rs::evolve_step`).
+///
+/// 1. The unlocked pass refuses a caller with no authority before it takes,
+///    or queues for, any lock.
+/// 2. `WorkflowRepository::lock_step_lineage_for_evolve` locks the parent's
+///    row and takes its lineage's advisory lock, which every writer of an
+///    `executes` edge holds in share mode until it commits. Read before that
+///    lock, the set could miss an edge in flight, and the evolve would change
+///    what that workflow runs without authority over it.
+/// 3. The set is re-read under the lock and authority decided again; only
+///    these grants admit the act and drive [`record_lineage_writes`].
+async fn require_lineage_authority_locked(
+    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
+    auth: Option<&epigraph_auth::AuthContext>,
+    caller: WriteIdentity,
+    parent: Uuid,
+) -> Result<Vec<(Uuid, WorkflowGrant)>, McpError> {
+    require_lineage_authority(server, &mut *conn, auth, caller, parent).await?;
+    epigraph_db::WorkflowRepository::lock_step_lineage_for_evolve(&mut *conn, parent)
+        .await
+        .map_err(|e| {
+            crate::errors::internal_error_logged(
+                "evolve_step: could not lock the step's lineage",
+                e,
+            )
+        })?;
+    require_lineage_authority(server, &mut *conn, auth, caller, parent).await
 }
 
 /// Lineage-wide authority: refuse the caller unless it has workflow authority

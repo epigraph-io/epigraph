@@ -1187,12 +1187,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &["BehavioralExecutionRepository::create"],
     ),
     // write on a transaction stamped with the caller's viewer, after the
-    // database's lineage-authority check for the caller.
+    // database's lineage-authority check for the caller. The lineage lock
+    // (backlog bf2e9aa6) locks the parent's row and takes an advisory lock on
+    // the same stamped transaction; it returns nothing to the caller.
     (
         "workflows.rs",
         "evolve_step",
         &[
             "ClaimRepository::evolve_step_conn",
+            "WorkflowRepository::lock_step_lineage_for_evolve",
             "record_api_lineage_writes",
             "versioning::admin_session_or_deferral",
         ],

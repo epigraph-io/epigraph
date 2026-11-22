@@ -267,6 +267,27 @@ pub struct ClaimLinkRow {
     pub relationship: String,
 }
 
+/// Before an `executes` edge onto a claim is inserted, take that claim's step
+/// lineage lock in SHARE mode (`WorkflowRepository::lock_step_lineage_shared`,
+/// backlog bf2e9aa6), held to the end of the writer's transaction, so the
+/// edge serializes against an `evolve_step` of the lineage, whose authority
+/// gate must see it. Any other edge takes no lock. On a connection only: a
+/// transaction-scoped lock taken on a pool executor would end with its own
+/// statement, so [`EdgeRepository::create`] on a pool takes none (no
+/// `executes` writer uses that form; every one writes on its transaction).
+async fn lock_executes_target(
+    conn: &mut sqlx::PgConnection,
+    relationship: &str,
+    target_type: &str,
+    target_id: Uuid,
+) -> Result<(), DbError> {
+    if target_type == "claim" && canonical_relationship(relationship) == "executes" {
+        crate::repos::workflow::WorkflowRepository::lock_step_lineage_shared(conn, target_id)
+            .await?;
+    }
+    Ok(())
+}
+
 impl EdgeRepository {
     /// Create a new edge relationship
     ///
@@ -394,6 +415,7 @@ impl EdgeRepository {
         valid_from: Option<chrono::DateTime<chrono::Utc>>,
         valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Uuid, DbError> {
+        lock_executes_target(&mut *conn, relationship, target_type, target_id).await?;
         let Some(key) = key else {
             return Self::create(
                 &mut *conn,
@@ -807,6 +829,7 @@ impl EdgeRepository {
     ) -> Result<(EdgeRow, bool), DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
+        lock_executes_target(&mut tx, relationship, target_type, target_id).await?;
 
         // VISIBILITY-EXEMPT (both spellings): dedup probe inside a WRITE path
         // (`create_or_get`). It must see an existing edge regardless of who is

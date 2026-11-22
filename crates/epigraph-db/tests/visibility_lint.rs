@@ -2062,6 +2062,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `step_lineage_executors`. Returns workflow ids only, never content.",
     ),
     (
+        "edge.rs",
+        "lock_executes_target",
+        "WRITE-PATH LOCK (backlog bf2e9aa6), private to the edge writers: before an `executes` \
+         edge onto a claim is inserted, `WorkflowRepository::lock_step_lineage_shared` on the \
+         writer's own transaction. Reads nothing back and returns nothing.",
+    ),
+    (
+        "workflow.rs",
+        "lock_step_lineage_for_evolve",
+        "WRITE-PATH LOCK (backlog bf2e9aa6), not a disclosure: the evolve's own `FOR UPDATE` of \
+         the parent it is about to evolve, on the caller-stamped write transaction (the same row \
+         lock `ClaimRepository::evolve_step_conn` takes), then the lineage's advisory lock. It \
+         returns only whether the row was found; the lineage key never leaves the function. \
+         Row security on that connection still bounds the row it can lock.",
+    ),
+    (
+        "workflow.rs",
+        "lock_step_lineage_shared",
+        "WRITE-PATH LOCK (backlog bf2e9aa6), not a disclosure: an `executes` writer's share-mode \
+         advisory lock on the target claim's step lineage, taken on the writer's own \
+         transaction before its INSERT. It reads the target's `step_lineage_id` only to key the \
+         lock, under that connection's row security, and returns nothing.",
+    ),
+    (
         "workflow.rs",
         "step_lineage_executors",
         "AUTHORITY READ through migration 219's definer \

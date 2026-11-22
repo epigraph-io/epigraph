@@ -1889,6 +1889,22 @@ pub async fn evolve_step(
     // Workflow authority over every workflow executing the parent's
     // step lineage, checked for the SAME principal the step is authored as,
     // on the act's own transaction and before it, so a refusal writes nothing.
+    //
+    // AUTHORITY, THEN THE LOCK, THEN AUTHORITY AGAIN (backlog bf2e9aa6), as
+    // `deprecate_workflow` orders it. The first pass refuses a caller with no
+    // authority before it takes or queues for any lock. The lock (the parent's
+    // row, then its lineage's advisory lock, which every `executes` writer
+    // takes in share mode) serializes the evolve against an `executes` edge
+    // into the lineage that is in flight: the set read before it could miss
+    // such an edge, and the evolve would then change what that workflow runs
+    // without authority over it. Only the second pass's grants, decided with
+    // the set re-read under the lock, admit the act and drive its records.
+    require_api_lineage_authority(&mut tx, &auth, &viewer, agent, parent_id).await?;
+    epigraph_db::WorkflowRepository::lock_step_lineage_for_evolve(&mut tx, parent_id)
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("evolve_step: could not lock the step's lineage: {e}"),
+        })?;
     let grants = require_api_lineage_authority(&mut tx, &auth, &viewer, agent, parent_id).await?;
     // The step edge is attested at INSERT with the API's own key (backlog
     // dae795f8), `None` when this API has none configured.
@@ -3380,8 +3396,11 @@ async fn require_api_workflow_authority(
 ///
 /// `caller` must be the principal the step is authored as (the viewer's), so
 /// the identity checked is the identity that writes. Run on the act's own
-/// transaction, before the act. Returns each workflow with its grant, for
-/// [`record_api_lineage_writes`].
+/// transaction, before the act, and AGAIN after
+/// `WorkflowRepository::lock_step_lineage_for_evolve` (backlog bf2e9aa6): only
+/// that second read sees every `executes` edge into the lineage, because each
+/// writer of one holds the lineage lock in share mode until it commits.
+/// Returns each workflow with its grant, for [`record_api_lineage_writes`].
 ///
 /// # A workflow the caller cannot see
 ///
