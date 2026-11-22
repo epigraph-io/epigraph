@@ -3927,8 +3927,22 @@ async fn migration_179_attached_arm_survives_at_head(pool: PgPool) {
         "JOIN public.agent_succession s",
         "ON s.child_agent_id = l.agent_id",
         "AND dr.inherited_from IS NULL",
-        "AND dr.detached_at IS NULL",
+        "AND (dr.detached_at IS NULL",
         "AND dd.detached_at IS NOT NULL",
+        // 249: an earlier instant's answer is not changed by a later record.
+        // Each row, detach and succession counts from when it was recorded,
+        // and at the present (`p_at >= now()`) every record the snapshot
+        // sees counts. Losing a time test lets a later detach, succession or
+        // dated-back attach rewrite who held the group at a past instant (the
+        // roster's `--at`); losing the present clause lets a live gate admit
+        // an identity whose detach committed after its transaction began.
+        "AND (ra.created_at <= p_at OR p_at >= now())",
+        "OR (p_at < ra.detached_at AND p_at < now()))",
+        "OR (p_at < hop.detached_at",
+        "WHERE (s.attested_at <= p_at",
+        "AND (dr.created_at <= p_at",
+        "OR (p_at < dr.detached_at",
+        "AND (dd.detached_at <= p_at",
     ] {
         assert!(
             body.contains(fragment),

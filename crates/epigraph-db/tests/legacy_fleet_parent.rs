@@ -1974,6 +1974,143 @@ async fn the_195_undo_restores_the_catalog_below_195(pool: PgPool) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Migration 249 (the derivation answers a past instant from what was recorded
+// by then) re-states 195's derivation: its precondition and its undo
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The md5 of `prosrc` 249 leaves for the derivation (the deploy gate's
+/// value). A later re-statement starts from this body.
+const DERIVATION_249_MD5: &str = "58caa9ae65e89485b4fac1bb26959fdd";
+
+/// 249 re-states the derivation whole, so it first checks it is 195's. Over
+/// another body (195's plus one comment line, standing in for a re-statement
+/// applied out of order) it refuses 55000 naming the derivation and applies
+/// nothing. POSITIVE CONTROL: with 195's exact body back, it applies, and the
+/// body it leaves has the md5 the deploy gate measures and reads when each
+/// record was made.
+#[sqlx::test(migrations = false)]
+async fn migration_249_refuses_to_restate_a_body_it_was_not_written_from(pool: PgPool) {
+    migrate(&pool, &up_to_below(249))
+        .await
+        .expect("migrate below 249");
+    let derivation = derivation_src(&pool).await;
+    assert_eq!(
+        body_md5(&pool, DERIVATION_SIG).await,
+        DERIVATION_195_MD5,
+        "CALIBRATION: below 249 the derivation is 195's"
+    );
+
+    set_derivation_src(
+        &pool,
+        &format!("{derivation}-- an out-of-order re-statement\n"),
+    )
+    .await;
+    let err = migrate(&pool, &up_to_below(250))
+        .await
+        .expect_err("249 refuses a derivation it was not written from");
+    assert!(
+        err.contains("55000") && err.contains("epigraph_role_derived_memberships"),
+        "the refusal names the derivation: {err}"
+    );
+    assert!(!applied(&pool, 249).await, "a refused 249 is not recorded");
+    assert!(
+        derivation_src(&pool)
+            .await
+            .ends_with("-- an out-of-order re-statement\n"),
+        "a refused 249 changes nothing"
+    );
+    set_derivation_src(&pool, &derivation).await;
+
+    migrate(&pool, &up_to_below(250))
+        .await
+        .expect("over 195's exact body, 249 applies");
+    assert_eq!(
+        body_md5(&pool, DERIVATION_SIG).await,
+        DERIVATION_249_MD5,
+        "249's body of the derivation"
+    );
+    let after = derivation_src(&pool).await;
+    for fragment in [
+        "WHERE (s.attested_at <= p_at",
+        "AND (ra.created_at <= p_at OR p_at >= now())",
+        "AND (dd.detached_at <= p_at",
+    ] {
+        assert!(after.contains(fragment), "249 reads {fragment:?}");
+    }
+}
+
+/// `docs/runbooks/249-undo.sql`, applied twice to a database migrated through
+/// 249, returns the catalog to exactly what it was below 249 (195's
+/// derivation, owner and ACL). Over a body a LATER migration re-stated, it
+/// refuses 55000 and changes nothing.
+#[sqlx::test(migrations = false)]
+async fn the_249_undo_restores_the_catalog_below_249(pool: PgPool) {
+    migrate(&pool, &up_to_below(249)).await.expect("below 249");
+    let before = catalog(&pool).await;
+    migrate(&pool, &up_to_below(250))
+        .await
+        .expect("through 249");
+    let through_249 = catalog(&pool).await;
+    assert_ne!(through_249, before, "CALIBRATION: 249 changed the catalog");
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/249-undo.sql"),
+    )
+    .expect("249-undo.sql");
+
+    let derivation_249 = derivation_src(&pool).await;
+    set_derivation_src(&pool, &format!("{derivation_249}-- a later re-statement\n")).await;
+    let refused = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+        // The undo's own BEGIN is left aborted on this connection.
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .expect("ROLLBACK");
+        r.expect_err("the undo refuses a body it does not know")
+    };
+    assert!(
+        refused.to_string().contains("249-undo")
+            && refused
+                .to_string()
+                .contains("epigraph_role_derived_memberships"),
+        "the refusal names the undo and the derivation: {refused}"
+    );
+    assert!(
+        derivation_src(&pool)
+            .await
+            .ends_with("-- a later re-statement\n"),
+        "a refused undo changes nothing"
+    );
+    set_derivation_src(&pool, &derivation_249).await;
+    assert_eq!(
+        catalog(&pool).await,
+        through_249,
+        "CALIBRATION: back to 249's catalog"
+    );
+
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the undo applies (run {run}): {e}"));
+    }
+    assert_eq!(
+        body_md5(&pool, DERIVATION_SIG).await,
+        DERIVATION_195_MD5,
+        "the undo restores 195's body byte for byte"
+    );
+    let after = catalog(&pool).await;
+    let left: Vec<&String> = after.difference(&before).collect();
+    let lost: Vec<&String> = before.difference(&after).collect();
+    assert!(
+        left.is_empty() && lost.is_empty(),
+        "the undo does not restore the catalog below 249.\nleft: {left:#?}\nlost: {lost:#?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // The registration's role-attachment copy (166's step 5b) never copies a
 // grant back onto the identity it came from (180)
 // ─────────────────────────────────────────────────────────────────────────────
