@@ -3506,6 +3506,30 @@ restart.
   s.event_type IN ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM
   operator_links l WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway
   databases only, NOT to any deployed database.**
+- **243**: `foreign_cache_repoint_off_inadmissible_frame` (backlog 0296077b). Re-states 114's
+  `epigraph_foreign_belief_cache` (an md5 precondition refuses to apply over any other body;
+  path stays 190's `pg_catalog, public, pg_temp`, owner and grants unchanged) with ONE new
+  arm: a non-owner's write may re-point a public claim's cache off the frame it records (R)
+  to frame P when, read with definer rights, the claim is not a compound, R holds no
+  cache-admissible combine input, and P is `binary_truth` with an admissible input or
+  `claim_validity` with one while `binary_truth` has none (the frame the cache-owner rule
+  elects). Before it, after evidence on a public claim was narrowed, a request-path
+  recompute by anyone but the owner was declined and every reader kept being served a fold
+  of the hidden evidence until a privileged recompute ran. An accepted re-point also clears
+  `claims.classification` (the verdict on the hidden fold; the engine computes no verdict
+  off `binary_truth`, so nothing would overwrite it), and is audited as
+  `claims.foreign_aggregate_write` with `action = 'belief_cache_repoint'`, the cleared
+  classification in its before/after. Every other re-point is still a no-op, as in 114. The
+  three owner-rule predicates are inlined verbatim; `epigraph-db/tests/foreign_cache_repoint.rs`
+  pins the arm, the verdict clear, each refusal (mutation-tested), that verbatim copy, and
+  the undo. Undo: `docs/runbooks/243-undo.sql`. Shipped with an engine change in the same PR:
+  `edge_factor::recompute_combined_belief` now clears `classification` whenever it writes
+  the cache on a frame with no verdict, so an owner or maintenance recompute also drops a
+  stale label. **Deploy order:** migration and binary in either order. **Recommended after
+  both:** a one-time `recompute_beliefs` on the maintenance DSN, run by the NEW binary (the
+  old one leaves the stale verdict). Claims that already hold a fold of narrowed evidence
+  are otherwise cleared only at their next owner-rule recompute on a stamped or maintenance
+  session; nothing runs at the narrowing act itself.
 
 ## `-- no-transaction` migrations
 
