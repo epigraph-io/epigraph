@@ -1831,10 +1831,15 @@ impl AgentRepository {
     ///   insert into that group) and then waits on the advisory lock would
     ///   deadlock with it.
     ///
-    /// It does NOT serialise a writer-membership revoke made through the
-    /// roster verbs (they take no link lock). Such a revoke also ends the
-    /// acting link. Nor does it serialise a direct maintenance `UPDATE` of
-    /// `operator_links.retired`, which 191 leaves unserialised.
+    /// The team-group roster verbs (164, 235) take the same lock exclusively
+    /// before they add, remove or re-role a member, so a writer-membership
+    /// revoke made through them is serialised like a retire. Such a revoke
+    /// also ends the acting link (`epigraph_operator_actor` joins the live
+    /// writer row). It does NOT serialise a revoke that UPDATEs
+    /// `group_memberships` directly, without a verb (for example
+    /// `GroupMembershipRepository::remove_member` or
+    /// `revoke_member_unless_last_admin`), nor a direct maintenance `UPDATE`
+    /// of `operator_links.retired`, which 191 leaves unserialised.
     ///
     /// # Errors
     /// As [`Self::operator_actor`]; the lock statement's failure is
