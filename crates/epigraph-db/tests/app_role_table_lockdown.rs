@@ -156,6 +156,11 @@ const CLOSED: &[&str] = &[
 /// table-level one.
 const NO_WRITE: &[&str] = &[
     "agent_capabilities",
+    // Migration 239: written only by the identity registration, the
+    // maintenance-owned rotation and status definers, and maintenance
+    // sessions; the application role holds SELECT only (118 took UPDATE and
+    // DELETE, 239 INSERT).
+    "agent_keys",
     // Migration 149: written only through maintenance definers; the
     // application role holds SELECT only.
     "author_binding_clients",
@@ -1546,15 +1551,19 @@ async fn the_mint_path_links_a_client_on_the_app_role(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_agent_key_never_leaves_revoked(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "w11-key").await;
-    let app = app_pool(&pool, 2).await;
+    // Stamped as the key's own agent: since 239 the status definer moves a
+    // key only for its agent or an admin
+    // (`agent_keys_app_role_writes.rs::a_status_change_needs_the_keys_agent_or_an_admin`).
+    let app = app_pool_as(&pool, agent).await;
     let now = chrono::Utc::now();
     let pk: Vec<u8> = Uuid::new_v4().as_bytes().repeat(2);
     // An `encryption` key: since 161 a `signing` or `identity-legacy` key is
     // attested state the application role can neither store nor move
     // (`agent_identity_lineage.rs::an_application_session_can_neither_bind_nor_move_an_attested_key`).
-    // The transitions pinned here are 118's, for every key type.
+    // The transitions pinned here are 118's, for every key type. Seeded on
+    // the harness connection: since 239 the application role inserts no key.
     let key = AgentKeyRepository::store(
-        &app,
+        &pool,
         Uuid::new_v4(),
         epigraph_core::AgentId::from_uuid(agent),
         &pk,
@@ -1565,7 +1574,7 @@ async fn an_agent_key_never_leaves_revoked(pool: PgPool) {
         now,
     )
     .await
-    .expect("store on the application role");
+    .expect("store on the harness connection");
     let rotated = AgentKeyRepository::update_status(&app, key.id, "rotated", None, None)
         .await
         .expect("active -> rotated");

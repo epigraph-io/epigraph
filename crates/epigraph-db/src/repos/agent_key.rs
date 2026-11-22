@@ -197,6 +197,10 @@ pub struct AgentKeyRepository;
 impl AgentKeyRepository {
     /// Store a new agent key.
     ///
+    /// A direct INSERT. Since migration 239 the application role holds no
+    /// INSERT on `agent_keys`, so this runs only on a privileged connection;
+    /// the request path records a key through [`Self::rotate`].
+    ///
     /// # Errors
     /// Returns `DbError::DuplicateKey` if a key with the same ID already exists.
     /// Returns `DbError::QueryFailed` for other database errors.
@@ -337,8 +341,11 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, key_id: Uuid) -> Result<Option<AgentKeyRow>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        key_id: Uuid,
+    ) -> Result<Option<AgentKeyRow>, DbError> {
         let row = sqlx::query!(
             r#"
             SELECT
@@ -349,7 +356,7 @@ impl AgentKeyRepository {
             "#,
             key_id
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| AgentKeyRow {
@@ -379,9 +386,9 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_active_key(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_active_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         agent_id: AgentId,
         key_type: &str,
     ) -> Result<Option<AgentKeyRow>, DbError> {
@@ -397,7 +404,7 @@ impl AgentKeyRepository {
         )
         .bind(agent_uuid)
         .bind(key_type)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row)
@@ -447,14 +454,22 @@ impl AgentKeyRepository {
 
     /// Update a key's status (and optional revocation fields).
     ///
-    /// Used for key rotation (status → 'rotated') and revocation (status → 'revoked').
+    /// Used for revocation (status → 'revoked'); rotation goes through
+    /// [`Self::rotate`], which also records the new key.
+    ///
+    /// Since migration 239 the definer moves a key only for the key's own
+    /// agent (the executor's stamped principal), an admin, or a maintenance
+    /// session, so on the application role `executor` must be a connection
+    /// stamped with the caller's viewer (`ScopedPool::begin_as`); an
+    /// unstamped one is refused `AK03` (42501) for every key.
     ///
     /// # Errors
     /// Returns `DbError::NotFound` if no key with the given ID exists.
-    /// Returns `DbError::QueryFailed` for other database errors.
-    #[instrument(skip(pool))]
-    pub async fn update_status(
-        pool: &PgPool,
+    /// Returns `DbError::QueryFailed` for other database errors, a `42501`
+    /// refusal (`AK02`, `AK03`) and an illegal transition (`AK01`) included.
+    #[instrument(skip(executor))]
+    pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         key_id: Uuid,
         status: &str,
         revocation_reason: Option<&str>,
@@ -473,13 +488,48 @@ impl AgentKeyRepository {
         .bind(status)
         .bind(revocation_reason)
         .bind(revoked_by)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         row.ok_or_else(|| DbError::NotFound {
             entity: "AgentKey".to_string(),
             id: key_id,
         })
+    }
+
+    /// Rotate one key: retire `old_key_id` (`rotated`, its window closed) and
+    /// record `new_public_key` as the active key of the SAME agent and type,
+    /// valid from where the old window closed, in one statement (migration
+    /// 239's `epigraph_agent_key_rotate`). The agent and type come from the
+    /// old row, never from the caller.
+    ///
+    /// The definer admits the old key's own agent (the executor's stamped
+    /// principal), an admin, or a maintenance session (`AK03`, 42501
+    /// otherwise), and moves a `signing` or `identity-legacy` key only on a
+    /// maintenance session (`AK02`, 42501). On the application role
+    /// `executor` must be stamped with the caller's viewer.
+    ///
+    /// Returns `None` when no key `old_key_id` exists.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` on a refusal (`AK02`, `AK03`: 42501),
+    /// an old key that is no longer active (`AK01`: 22023) or any other
+    /// database error.
+    #[instrument(skip(executor, new_public_key))]
+    pub async fn rotate<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        old_key_id: Uuid,
+        new_public_key: &[u8; 32],
+    ) -> Result<Option<AgentKeyRow>, DbError> {
+        Ok(sqlx::query_as::<_, AgentKeyRow>(
+            "SELECT id, agent_id, public_key, key_type, status, valid_from, valid_until, \
+                    revocation_reason, revoked_by, created_at \
+             FROM public.epigraph_agent_key_rotate($1, $2)",
+        )
+        .bind(old_key_id)
+        .bind(new_public_key.as_slice())
+        .fetch_optional(executor)
+        .await?)
     }
 
     /// Full update of a key row.
