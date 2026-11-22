@@ -1862,6 +1862,9 @@ async fn main_inner() -> anyhow::Result<i32> {
             };
             // The act and the successor's embedding run on one maintenance
             // session: the embedding is stored through its bypass viewer.
+            // The verb's plain connection is returned first, so the session
+            // is the only one this verb holds (the pool allows two).
+            drop(conn);
             let mut session = db
                 .session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
                 .await?;
