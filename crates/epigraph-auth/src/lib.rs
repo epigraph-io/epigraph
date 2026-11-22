@@ -24,9 +24,31 @@
 //! the kernel's), so a forwarded token replayed at the kernel acts as no one.
 //! An extension validates its own with
 //! [`JwtConfig::validate_token_for_audience`].
+//!
+//! ## Signing keys
+//!
+//! An extension must be able to VERIFY kernel tokens without being able to
+//! MINT them. With one shared HMAC secret (HS256, [`JwtConfig::from_secret`])
+//! that is impossible: whoever verifies can sign any kernel token. So the
+//! kernel signs EdDSA with an Ed25519 key only it holds
+//! ([`JWT_SIGNING_KEY_VAR`], [`JwtConfig::from_ed25519_seed`]), publishes the
+//! public half as a JWK Set ([`JwtConfig::jwks`], served at
+//! `/.well-known/jwks.json`), and an extension verifies with
+//! [`JwtConfig::verifier_from_jwks`], which cannot mint. HS256 stays as the
+//! unset-key default and, beside a signing key, as an accept-only migration
+//! window ([`JwtConfig::with_hs256_accept`]) the operator closes by removing
+//! the shared secret everywhere.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{
+    AlgorithmParameters, CommonParameters, EllipticCurve, Jwk, JwkSet, KeyAlgorithm,
+    OctetKeyPairParameters, OctetKeyPairType, PublicKeyUse, ThumbprintHash,
+};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,6 +58,11 @@ pub mod claim_act;
 /// Single source of truth — every consumer must reference this const, not a
 /// copy of the literal.
 pub const DEV_JWT_SECRET: &[u8] = b"epigraph-dev-secret-change-in-production!!";
+
+/// The environment variable holding the kernel's Ed25519 JWT signing key
+/// (64 hex characters, the 32-byte seed). Set, the kernel signs every token
+/// EdDSA and `EPIGRAPH_JWT_SECRET` becomes only the HS256 accept window.
+pub const JWT_SIGNING_KEY_VAR: &str = "EPIGRAPH_JWT_SIGNING_KEY";
 
 /// Minimum acceptable HMAC secret length, in bytes.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -298,19 +325,339 @@ pub struct ElevationRef {
     pub family_id: Uuid,
 }
 
-pub struct JwtConfig {
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+/// RFC 8410 PKCS#8 v1 prefix of an Ed25519 private key: `OneAsymmetricKey`
+/// with algorithm `id-Ed25519` (1.3.101.112) wrapping a 32-byte
+/// `CurvePrivateKey`. The 32-byte seed follows. `EncodingKey::from_ed_der`
+/// takes exactly this encoding.
+const ED25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+/// Parse the kernel's Ed25519 JWT signing key: 64 hex characters (the 32-byte
+/// seed), the same format as the kernel's other Ed25519 keys. The error never
+/// echoes the value.
+pub fn parse_ed25519_seed(hex_seed: &str) -> Result<[u8; 32], String> {
+    let bytes =
+        hex::decode(hex_seed.trim()).map_err(|_| format!("{JWT_SIGNING_KEY_VAR} is not hex"))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        format!(
+            "{JWT_SIGNING_KEY_VAR} is {} bytes; an Ed25519 seed is 32 (64 hex characters)",
+            bytes.len()
+        )
+    })
 }
 
-impl JwtConfig {
-    pub fn from_secret(secret: &[u8]) -> Self {
+/// The kernel's boot check for its JWT keys. Pure, so every arm is testable
+/// without a process.
+///
+/// * A set [`JWT_SIGNING_KEY_VAR`] must parse ([`parse_ed25519_seed`]),
+///   whatever `allow_insecure` says: a typo must refuse boot, never fall back
+///   to signing with the shared secret.
+/// * A set `EPIGRAPH_JWT_SECRET` must pass [`assert_production_secret`]
+///   (unless `allow_insecure`), whether it signs (no signing key) or is only
+///   the HS256 accept window (signing key set).
+/// * Neither set: refused unless `allow_insecure` (the dev fallback).
+pub fn check_kernel_jwt_keys(
+    signing_key: Option<&str>,
+    secret: Option<&str>,
+    allow_insecure: bool,
+) -> Result<(), String> {
+    let signing_key = signing_key.map(str::trim).filter(|s| !s.is_empty());
+    let secret = secret.filter(|s| !s.is_empty());
+    if let Some(key) = signing_key {
+        parse_ed25519_seed(key)?;
+    }
+    if allow_insecure {
+        return Ok(());
+    }
+    match (signing_key, secret) {
+        (_, Some(secret)) => assert_production_secret(secret.as_bytes()),
+        (Some(_), None) => Ok(()),
+        (None, None) => assert_production_secret(b""),
+    }
+}
+
+/// How a [`JwtConfig`] signs, if it signs at all.
+enum Signer {
+    /// The legacy shared HMAC secret. Anyone who can VERIFY can also sign,
+    /// which is why an extension must never be handed this config.
+    Hs256(EncodingKey),
+    /// The kernel's Ed25519 key. Every token carries `kid`.
+    EdDsa { key: EncodingKey, kid: String },
+    /// A verify-only config ([`JwtConfig::verifier_from_jwks`]): every mint
+    /// refuses.
+    None,
+}
+
+/// One Ed25519 public key a [`JwtConfig`] verifies with.
+struct EdVerifyingKey {
+    /// RFC 7638 thumbprint of the key's JWK: the `kid` its tokens carry.
+    kid: String,
+    /// base64url of the 32-byte public key (the JWK `x`).
+    x: String,
+    key: DecodingKey,
+}
+
+impl EdVerifyingKey {
+    fn from_public(public: &[u8; 32]) -> Self {
+        let x = URL_SAFE_NO_PAD.encode(public);
+        let kid = Self::jwk_for(&x, None).thumbprint(ThumbprintHash::SHA256);
         Self {
-            encoding_key: EncodingKey::from_secret(secret),
-            decoding_key: DecodingKey::from_secret(secret),
+            kid,
+            x,
+            key: DecodingKey::from_ed_der(public),
         }
     }
 
+    fn jwk_for(x: &str, kid: Option<&str>) -> Jwk {
+        Jwk {
+            common: CommonParameters {
+                public_key_use: Some(PublicKeyUse::Signature),
+                key_algorithm: Some(KeyAlgorithm::EdDSA),
+                key_id: kid.map(str::to_string),
+                ..CommonParameters::default()
+            },
+            algorithm: AlgorithmParameters::OctetKeyPair(OctetKeyPairParameters {
+                key_type: OctetKeyPairType::OctetKeyPair,
+                curve: EllipticCurve::Ed25519,
+                x: x.to_string(),
+            }),
+        }
+    }
+
+    fn jwk(&self) -> Jwk {
+        Self::jwk_for(&self.x, Some(&self.kid))
+    }
+}
+
+/// The kernel's token keys.
+///
+/// * [`Self::from_secret`]: HS256 with one shared secret, signing and
+///   verifying (the legacy and dev configuration, unchanged).
+/// * [`Self::from_ed25519_seed`]: the kernel signs EdDSA with its private key
+///   and publishes the public half ([`Self::jwks`], served at
+///   `/.well-known/jwks.json`). [`Self::with_hs256_accept`] keeps accepting
+///   HS256 tokens from the shared secret during a migration window; it never
+///   signs with it.
+/// * [`Self::verifier_from_jwks`]: a resource server that is NOT the kernel
+///   (a federation extension) verifies by public key and cannot mint any
+///   token, kernel or extension audience.
+///
+/// Every verification goes through one dispatcher that pins the algorithm to
+/// the key that verifies it: an EdDSA token needs a `kid` this config holds,
+/// an HS256 token needs the accept window, and nothing else verifies. So an
+/// HS256 token MACed with a public key's bytes (algorithm confusion) is
+/// refused like any other HS256 token outside the window.
+pub struct JwtConfig {
+    signer: Signer,
+    hs256: Option<DecodingKey>,
+    ed25519: Vec<EdVerifyingKey>,
+}
+
+impl JwtConfig {
+    /// HS256 with one shared secret, signing and verifying.
+    pub fn from_secret(secret: &[u8]) -> Self {
+        Self {
+            signer: Signer::Hs256(EncodingKey::from_secret(secret)),
+            hs256: Some(DecodingKey::from_secret(secret)),
+            ed25519: Vec::new(),
+        }
+    }
+
+    /// The kernel signing EdDSA with the Ed25519 key whose 32-byte seed this
+    /// is, and verifying only its own tokens (add the legacy window with
+    /// [`Self::with_hs256_accept`]).
+    pub fn from_ed25519_seed(seed: &[u8; 32]) -> Self {
+        let public = ed25519_dalek::SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_bytes();
+        let verifying = EdVerifyingKey::from_public(&public);
+        let mut pkcs8 = Vec::with_capacity(48);
+        pkcs8.extend_from_slice(&ED25519_PKCS8_PREFIX);
+        pkcs8.extend_from_slice(seed);
+        Self {
+            signer: Signer::EdDsa {
+                key: EncodingKey::from_ed_der(&pkcs8),
+                kid: verifying.kid.clone(),
+            },
+            hs256: None,
+            ed25519: vec![verifying],
+        }
+    }
+
+    /// A verify-only config from a JWK Set (the kernel's
+    /// `/.well-known/jwks.json`). Every key must be an Ed25519 (`OKP`) key;
+    /// any other key, or an empty set, is refused rather than skipped. The
+    /// `kid` is recomputed from the key, so a published `kid` that does not
+    /// match its key is refused too. [`Self::issue_access_token`] and
+    /// [`Self::exchange_token`] refuse on this config.
+    ///
+    /// # Errors
+    /// A description of the first key or document problem.
+    pub fn verifier_from_jwks(jwks: &str) -> Result<Self, String> {
+        let set: JwkSet =
+            serde_json::from_str(jwks).map_err(|e| format!("JWKS is not a JWK Set: {e}"))?;
+        if set.keys.is_empty() {
+            return Err("JWKS holds no keys".to_string());
+        }
+        let mut ed25519 = Vec::with_capacity(set.keys.len());
+        for jwk in &set.keys {
+            let AlgorithmParameters::OctetKeyPair(params) = &jwk.algorithm else {
+                return Err("JWKS holds a key that is not an Ed25519 (OKP) key".to_string());
+            };
+            if params.curve != EllipticCurve::Ed25519 {
+                return Err("JWKS holds an OKP key whose curve is not Ed25519".to_string());
+            }
+            if !matches!(jwk.common.key_algorithm, None | Some(KeyAlgorithm::EdDSA)) {
+                return Err("JWKS holds an Ed25519 key whose alg is not EdDSA".to_string());
+            }
+            let public = URL_SAFE_NO_PAD
+                .decode(&params.x)
+                .ok()
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .ok_or_else(|| "JWKS holds an Ed25519 key whose x is not 32 bytes".to_string())?;
+            ed25519_dalek::VerifyingKey::from_bytes(&public)
+                .map_err(|_| "JWKS holds an invalid Ed25519 public key".to_string())?;
+            let key = EdVerifyingKey::from_public(&public);
+            if let Some(kid) = jwk.common.key_id.as_deref() {
+                if kid != key.kid {
+                    return Err(format!(
+                        "JWKS key `{kid}` is not its key's RFC 7638 thumbprint"
+                    ));
+                }
+            }
+            if !ed25519.iter().any(|k: &EdVerifyingKey| k.kid == key.kid) {
+                ed25519.push(key);
+            }
+        }
+        Ok(Self {
+            signer: Signer::None,
+            hs256: None,
+            ed25519,
+        })
+    }
+
+    /// Also ACCEPT HS256 tokens MACed with `secret`: the migration window
+    /// while tokens minted before the switch to EdDSA are still live. Never
+    /// signs with it. Close the window by dropping the secret, because while
+    /// it is open anyone holding the secret can still mint a token this
+    /// config admits.
+    #[must_use]
+    pub fn with_hs256_accept(mut self, secret: &[u8]) -> Self {
+        self.hs256 = Some(DecodingKey::from_secret(secret));
+        self
+    }
+
+    /// The kernel's config from its environment values: with a signing key,
+    /// EdDSA (and the HS256 accept window only if `secret` is set); without
+    /// one, HS256 from `secret`, or [`DEV_JWT_SECRET`] when that is unset too
+    /// (the dev fallback; production refuses it at boot,
+    /// [`check_kernel_jwt_keys`]). The dev literal is NEVER the accept window
+    /// of a config that signs EdDSA.
+    ///
+    /// # Errors
+    /// The signing key does not parse ([`parse_ed25519_seed`]).
+    pub fn from_kernel_env(
+        signing_key: Option<&str>,
+        secret: Option<&str>,
+    ) -> Result<Self, String> {
+        let secret = secret.filter(|s| !s.is_empty());
+        match signing_key.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(key) => {
+                let cfg = Self::from_ed25519_seed(&parse_ed25519_seed(key)?);
+                Ok(match secret {
+                    Some(secret) => cfg.with_hs256_accept(secret.as_bytes()),
+                    None => cfg,
+                })
+            }
+            None => Ok(Self::from_secret(
+                secret.map_or(DEV_JWT_SECRET, str::as_bytes),
+            )),
+        }
+    }
+
+    /// The algorithm this config mints with, `None` for a verify-only one.
+    #[must_use]
+    pub fn signing_algorithm(&self) -> Option<Algorithm> {
+        match self.signer {
+            Signer::Hs256(_) => Some(Algorithm::HS256),
+            Signer::EdDsa { .. } => Some(Algorithm::EdDSA),
+            Signer::None => None,
+        }
+    }
+
+    /// Whether this config admits HS256 tokens (the shared-secret window).
+    #[must_use]
+    pub fn accepts_hs256(&self) -> bool {
+        self.hs256.is_some()
+    }
+
+    /// The public keys this config verifies EdDSA tokens with, as the JWK Set
+    /// `/.well-known/jwks.json` serves. Empty for an HS256-only config: a
+    /// shared secret is never published.
+    #[must_use]
+    pub fn jwks(&self) -> JwkSet {
+        JwkSet {
+            keys: self.ed25519.iter().map(EdVerifyingKey::jwk).collect(),
+        }
+    }
+
+    /// THE SIGNING CHOKEPOINT: every token this config mints.
+    fn sign(&self, claims: &EpiGraphClaims) -> Result<String, jsonwebtoken::errors::Error> {
+        match &self.signer {
+            Signer::Hs256(key) => encode(&Header::new(Algorithm::HS256), claims, key),
+            Signer::EdDsa { key, kid } => {
+                let mut header = Header::new(Algorithm::EdDSA);
+                header.kid = Some(kid.clone());
+                encode(&header, claims, key)
+            }
+            Signer::None => Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into()),
+        }
+    }
+
+    /// THE VERIFICATION CHOKEPOINT: issuer, `aud` = `audience`, signature by a
+    /// key this config holds for the token's algorithm, and `exp` with no
+    /// leeway unless `check_exp` is false (revocation only).
+    fn verify(
+        &self,
+        token: &str,
+        audience: &str,
+        check_exp: bool,
+    ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
+        use jsonwebtoken::errors::ErrorKind;
+        let header = decode_header(token)?;
+        let key = match header.alg {
+            Algorithm::EdDSA => {
+                let kid = header.kid.as_deref().ok_or(ErrorKind::InvalidSignature)?;
+                &self
+                    .ed25519
+                    .iter()
+                    .find(|k| k.kid == kid)
+                    .ok_or(ErrorKind::InvalidSignature)?
+                    .key
+            }
+            Algorithm::HS256 => self.hs256.as_ref().ok_or(ErrorKind::InvalidAlgorithm)?,
+            _ => return Err(ErrorKind::InvalidAlgorithm.into()),
+        };
+        let mut validation = Validation::new(header.alg);
+        validation.set_issuer(&[KERNEL_ISSUER]);
+        validation.set_audience(&[audience]);
+        if check_exp {
+            validation.leeway = 0;
+        } else {
+            // `exp` must still be present (`required_spec_claims`); only its
+            // comparison with this host's clock is skipped.
+            validation.validate_exp = false;
+        }
+        let data = decode::<EpiGraphClaims>(token, key, &validation)?;
+        Ok(data.claims)
+    }
+
+    /// Mint a kernel-audience access token.
+    ///
+    /// # Errors
+    /// Signing fails; a verify-only config ([`Self::verifier_from_jwks`])
+    /// always refuses (`InvalidKeyFormat`).
     #[allow(
         clippy::too_many_arguments,
         reason = "the binding is the one options struct; folding the client's own \
@@ -352,7 +699,7 @@ impl JwtConfig {
             elv: binding.elevation_id,
             dlg: binding.delegated_by,
         };
-        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)?;
+        let token = self.sign(&claims)?;
         Ok((token, jti))
     }
 
@@ -375,12 +722,7 @@ impl JwtConfig {
         token: &str,
         audience: &str,
     ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&[KERNEL_ISSUER]);
-        validation.set_audience(&[audience]);
-        validation.leeway = 0;
-        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
-        Ok(data.claims)
+        self.verify(token, audience, true)
     }
 
     /// RFC 8693 token exchange, the pure half: validate `subject_token` as a
@@ -473,7 +815,8 @@ impl JwtConfig {
             elv: None,
             dlg: None,
         };
-        let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding_key)
+        let token = self
+            .sign(&claims)
             .map_err(|e| ExchangeRefusal::InvalidRequest(format!("signing failed: {e}")))?;
         Ok(ExchangedToken {
             token,
@@ -495,14 +838,7 @@ impl JwtConfig {
         &self,
         token: &str,
     ) -> Result<EpiGraphClaims, jsonwebtoken::errors::Error> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.set_issuer(&[KERNEL_ISSUER]);
-        validation.set_audience(&[KERNEL_AUDIENCE]);
-        // `exp` must still be present (`required_spec_claims`); only its
-        // comparison with this host's clock is skipped.
-        validation.validate_exp = false;
-        let data = decode::<EpiGraphClaims>(token, &self.decoding_key, &validation)?;
-        Ok(data.claims)
+        self.verify(token, KERNEL_AUDIENCE, false)
     }
 }
 
@@ -904,8 +1240,7 @@ mod tests {
                 aud: aud.to_string(),
                 ..base.clone()
             };
-            let token =
-                encode(&Header::new(Algorithm::HS256), &altered, &cfg.encoding_key).unwrap();
+            let token = cfg.sign(&altered).unwrap();
             assert!(
                 cfg.verify_for_revocation(&token).is_err(),
                 "iss {iss:?} / aud {aud:?} is refused"
@@ -969,7 +1304,7 @@ mod tests {
         validation.set_issuer(&["epigraph"]);
         validation.set_audience(&["epigraph-api"]);
         let keys = |token: &str| -> std::collections::HashMap<String, serde::de::IgnoredAny> {
-            decode(token, &cfg.decoding_key, &validation)
+            decode(token, cfg.hs256.as_ref().unwrap(), &validation)
                 .expect("payload keys")
                 .claims
         };
@@ -989,8 +1324,9 @@ mod tests {
         assert_eq!(ctx.delegated_by, Some(delegator));
         assert_eq!(ctx.agent_id, Some(agent));
 
-        let old = decode::<PreDelegationClaims>(&delegated, &cfg.decoding_key, &validation)
-            .expect("a binary that predates `dlg` must still decode a delegated token");
+        let old =
+            decode::<PreDelegationClaims>(&delegated, cfg.hs256.as_ref().unwrap(), &validation)
+                .expect("a binary that predates `dlg` must still decode a delegated token");
         assert_eq!(
             old.claims.agent_id,
             Some(agent),
@@ -1332,5 +1668,359 @@ mod tests {
         assert!(cfg
             .exchange_token(&good, "other-ext", &allowed(), None)
             .is_ok());
+    }
+}
+
+/// Backlog 7b834860: an extension that verifies kernel tokens must not be able
+/// to mint them. Each negative test names the mutation it catches.
+#[cfg(test)]
+mod asymmetric_signing_tests {
+    use super::*;
+    use jsonwebtoken::errors::ErrorKind;
+
+    /// RFC 8037 appendix A.1: the Ed25519 private key `d`.
+    const RFC8037_SEED_HEX: &str =
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    /// The shared HMAC secret an extension held before this change.
+    const SHARED: &[u8] = b"the-shared-hmac-secret-of-32-bytes!!";
+
+    fn seed(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn mint(cfg: &JwtConfig, ttl: Duration) -> Result<String, jsonwebtoken::errors::Error> {
+        cfg.issue_access_token(
+            Uuid::new_v4(),
+            vec!["claims:read".to_string(), "claims:write".to_string()],
+            "agent",
+            None,
+            Some(Uuid::new_v4()),
+            ttl,
+            AccessTokenBinding::NONE,
+        )
+        .map(|(token, _)| token)
+    }
+
+    fn claims_now() -> EpiGraphClaims {
+        let now = Utc::now().timestamp();
+        EpiGraphClaims {
+            sub: Uuid::new_v4(),
+            iss: KERNEL_ISSUER.to_string(),
+            aud: KERNEL_AUDIENCE.to_string(),
+            exp: now + 300,
+            iat: now,
+            nbf: now,
+            jti: Uuid::new_v4(),
+            scopes: vec!["claims:admin".to_string()],
+            client_type: "service".to_string(),
+            owner_id: None,
+            agent_id: None,
+            fam: None,
+            elv: None,
+            dlg: None,
+        }
+    }
+
+    fn jwks_json(cfg: &JwtConfig) -> String {
+        serde_json::to_string(&cfg.jwks()).unwrap()
+    }
+
+    /// Known answer (RFC 8037 A.2 and A.3): the published `x` and the `kid`
+    /// derived from the RFC's private key are the RFC's. Proves the PKCS#8
+    /// wrapping and the public-key derivation, not just self-consistency.
+    #[test]
+    fn the_published_key_and_kid_match_rfc_8037() {
+        let cfg = JwtConfig::from_ed25519_seed(&parse_ed25519_seed(RFC8037_SEED_HEX).unwrap());
+        let doc: serde_json::Value = serde_json::to_value(cfg.jwks()).unwrap();
+        let key = &doc["keys"][0];
+        assert_eq!(key["kty"], "OKP");
+        assert_eq!(key["crv"], "Ed25519");
+        assert_eq!(key["alg"], "EdDSA");
+        assert_eq!(key["use"], "sig");
+        assert_eq!(key["x"], "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo");
+        assert_eq!(key["kid"], "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k");
+        assert_eq!(doc["keys"].as_array().unwrap().len(), 1);
+        // The token it mints names that key and verifies.
+        let token = mint(&cfg, Duration::minutes(5)).unwrap();
+        let header = decode_header(&token).unwrap();
+        assert_eq!(header.alg, Algorithm::EdDSA);
+        assert_eq!(
+            header.kid.as_deref(),
+            Some("kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k")
+        );
+        assert!(cfg.validate_token(&token).is_ok());
+    }
+
+    /// THE DEFECT: an extension holding what it needs to verify kernel tokens
+    /// could mint any of them. With the kernel's JWKS it verifies a kernel
+    /// token and the exchanged token the gateway forwards, and refuses to
+    /// mint either (no kernel token, no extension token). The JWKS carries no
+    /// private material. Mutation caught: a verify-only config that can sign
+    /// (`Signer::None` encoding with any key).
+    #[test]
+    fn an_extension_verifies_kernel_tokens_by_public_key_and_cannot_mint_one() {
+        let kernel = JwtConfig::from_ed25519_seed(&seed(7));
+        let published = jwks_json(&kernel);
+        for private_field in ["\"d\"", "\"k\"", "\"p\"", "\"q\""] {
+            assert!(
+                !published.contains(private_field),
+                "JWKS leaks {private_field}"
+            );
+        }
+        let extension = JwtConfig::verifier_from_jwks(&published).unwrap();
+        assert_eq!(extension.signing_algorithm(), None);
+        assert!(!extension.accepts_hs256());
+
+        let kernel_token = mint(&kernel, Duration::minutes(5)).unwrap();
+        assert!(extension.validate_token(&kernel_token).is_ok());
+        let exchanged = kernel
+            .exchange_token(
+                &kernel_token,
+                "episcience",
+                &["episcience".to_string()],
+                None,
+            )
+            .unwrap();
+        let claims = extension
+            .validate_token_for_audience(&exchanged.token, "episcience")
+            .expect("the extension verifies the token the gateway forwards");
+        assert_eq!(claims.sub, exchanged.subject.sub);
+
+        let refused = mint(&extension, Duration::minutes(5)).unwrap_err();
+        assert_eq!(refused.kind(), &ErrorKind::InvalidKeyFormat);
+        assert!(extension.sign(&claims_now()).is_err());
+        assert!(matches!(
+            extension.exchange_token(
+                &kernel_token,
+                "episcience",
+                &["episcience".to_string()],
+                None
+            ),
+            Err(ExchangeRefusal::InvalidRequest(_))
+        ));
+    }
+
+    /// With a signing key and NO accept window, an HS256 token is refused
+    /// whoever MACed it: the old shared secret, or the committed dev literal
+    /// (the kernel's dev fallback must never become the window). Calibration:
+    /// the same forged token IS admitted while the window holds the secret,
+    /// and a token the kernel mints in the window is still EdDSA. Mutations
+    /// caught: HS256 verified without a configured window (e.g. falling back
+    /// to `DEV_JWT_SECRET`), and `from_kernel_env` opening the window with
+    /// the dev literal when the secret is unset.
+    #[test]
+    fn an_eddsa_kernel_admits_no_hs256_token_outside_the_window() {
+        let key_hex = hex::encode(seed(9));
+        let forged_with = |secret: &[u8]| {
+            let mut claims = claims_now();
+            claims.scopes = vec!["claims:admin".to_string(), "claims:write".to_string()];
+            encode(
+                &Header::new(Algorithm::HS256),
+                &claims,
+                &EncodingKey::from_secret(secret),
+            )
+            .unwrap()
+        };
+        let closed = JwtConfig::from_kernel_env(Some(&key_hex), None).unwrap();
+        assert!(!closed.accepts_hs256());
+        for secret in [SHARED, DEV_JWT_SECRET] {
+            let err = closed.validate_token(&forged_with(secret)).unwrap_err();
+            assert_eq!(err.kind(), &ErrorKind::InvalidAlgorithm);
+            assert!(closed.verify_for_revocation(&forged_with(secret)).is_err());
+        }
+        let empty_secret = JwtConfig::from_kernel_env(Some(&key_hex), Some("")).unwrap();
+        assert!(empty_secret.validate_token(&forged_with(b"")).is_err());
+
+        let window =
+            JwtConfig::from_kernel_env(Some(&key_hex), Some(std::str::from_utf8(SHARED).unwrap()))
+                .unwrap();
+        assert!(window.accepts_hs256());
+        assert!(window.validate_token(&forged_with(SHARED)).is_ok());
+        assert!(window.validate_token(&forged_with(DEV_JWT_SECRET)).is_err());
+        let minted = mint(&window, Duration::minutes(5)).unwrap();
+        assert_eq!(decode_header(&minted).unwrap().alg, Algorithm::EdDSA);
+        assert_eq!(window.signing_algorithm(), Some(Algorithm::EdDSA));
+        // Closing the window is dropping the secret: the same kernel key still
+        // verifies everything it minted.
+        assert!(closed.validate_token(&minted).is_ok());
+    }
+
+    /// Algorithm confusion: an HS256 token MACed with the PUBLIC key (its raw
+    /// bytes, or the published `x` string) is refused by the extension and by
+    /// a kernel whose window holds a different secret. Mutation caught: the
+    /// HS256 arm verifying with a key derived from a configured Ed25519 key.
+    #[test]
+    fn an_hs256_token_macd_with_the_public_key_is_refused() {
+        let kernel = JwtConfig::from_ed25519_seed(&seed(3)).with_hs256_accept(SHARED);
+        let extension = JwtConfig::verifier_from_jwks(&jwks_json(&kernel)).unwrap();
+        let x = kernel.ed25519[0].x.clone();
+        let raw = URL_SAFE_NO_PAD.decode(&x).unwrap();
+        for mac_key in [raw.as_slice(), x.as_bytes()] {
+            let token = encode(
+                &Header::new(Algorithm::HS256),
+                &claims_now(),
+                &EncodingKey::from_secret(mac_key),
+            )
+            .unwrap();
+            assert!(extension.validate_token(&token).is_err());
+            assert!(kernel.validate_token(&token).is_err());
+        }
+        // Nor does any algorithm outside the two the kernel uses verify.
+        let hs512 = encode(
+            &Header::new(Algorithm::HS512),
+            &claims_now(),
+            &EncodingKey::from_secret(SHARED),
+        )
+        .unwrap();
+        assert_eq!(
+            kernel.validate_token(&hs512).unwrap_err().kind(),
+            &ErrorKind::InvalidAlgorithm
+        );
+    }
+
+    /// An EdDSA token verifies only under the `kid` it names, and only if this
+    /// config holds that `kid`: a token from another Ed25519 key is refused,
+    /// and so is a genuine token whose `kid` was stripped or swapped.
+    /// Mutation caught: the `kid` lookup replaced by "the first key".
+    #[test]
+    fn an_eddsa_token_needs_a_kid_this_config_holds() {
+        let kernel = JwtConfig::from_ed25519_seed(&seed(1));
+        let other = JwtConfig::from_ed25519_seed(&seed(2));
+        let extension = JwtConfig::verifier_from_jwks(&jwks_json(&kernel)).unwrap();
+        let foreign = mint(&other, Duration::minutes(5)).unwrap();
+        assert!(kernel.validate_token(&foreign).is_err());
+        assert!(extension.validate_token(&foreign).is_err());
+
+        let Signer::EdDsa { key, .. } = &kernel.signer else {
+            panic!("an Ed25519 kernel signs EdDSA");
+        };
+        let claims = claims_now();
+        let no_kid = encode(&Header::new(Algorithm::EdDSA), &claims, key).unwrap();
+        let mut swapped = Header::new(Algorithm::EdDSA);
+        swapped.kid = Some(other.ed25519[0].kid.clone());
+        let swapped = encode(&swapped, &claims, key).unwrap();
+        for token in [&no_kid, &swapped] {
+            for cfg in [&kernel, &extension] {
+                assert_eq!(
+                    cfg.validate_token(token).unwrap_err().kind(),
+                    &ErrorKind::InvalidSignature
+                );
+            }
+        }
+        // CONTROL: the same claims under the right kid verify.
+        assert!(extension
+            .validate_token(&kernel.sign(&claims).unwrap())
+            .is_ok());
+    }
+
+    /// Revocation verifies an EdDSA token past its expiry (else EdDSA tokens
+    /// are unrevocable) and still refuses another key's. Mutation caught:
+    /// `verify_for_revocation` left pinned to HS256.
+    #[test]
+    fn revocation_verifies_an_expired_eddsa_token_and_refuses_a_foreign_one() {
+        let kernel = JwtConfig::from_ed25519_seed(&seed(5));
+        let expired = mint(&kernel, Duration::hours(-2)).unwrap();
+        assert_eq!(
+            kernel.validate_token(&expired).unwrap_err().kind(),
+            &ErrorKind::ExpiredSignature
+        );
+        assert!(kernel.verify_for_revocation(&expired).is_ok());
+        let foreign = mint(&JwtConfig::from_ed25519_seed(&seed(6)), Duration::hours(-2)).unwrap();
+        assert!(kernel.verify_for_revocation(&foreign).is_err());
+    }
+
+    /// A JWKS is all Ed25519 or refused: a symmetric (`oct`) key beside a
+    /// good one, an empty set, a `kid` that is not its key's thumbprint, a
+    /// short `x`, or a non-EdDSA `alg` refuses the whole document. Mutation
+    /// caught: skipping a non-Ed25519 key instead of refusing.
+    #[test]
+    fn verifier_from_jwks_refuses_anything_but_ed25519_keys() {
+        let kernel = JwtConfig::from_ed25519_seed(&seed(4));
+        let good: serde_json::Value = serde_json::to_value(kernel.jwks()).unwrap();
+        let good_key = good["keys"][0].clone();
+        let with = |key: serde_json::Value| {
+            serde_json::json!({ "keys": [key, good_key.clone()] }).to_string()
+        };
+        let mut wrong_kid = good_key.clone();
+        wrong_kid["kid"] = serde_json::json!("not-the-thumbprint");
+        let mut short_x = good_key.clone();
+        short_x["x"] = serde_json::json!("AAAA");
+        let mut wrong_alg = good_key.clone();
+        wrong_alg["alg"] = serde_json::json!("ES256");
+        for bad in [
+            with(serde_json::json!({ "kty": "oct", "k": "c2VjcmV0" })),
+            r#"{"keys":[]}"#.to_string(),
+            "not json".to_string(),
+            with(wrong_kid),
+            with(short_x),
+            with(wrong_alg),
+        ] {
+            assert!(
+                JwtConfig::verifier_from_jwks(&bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        // CONTROL: the good key alone, and without a `kid`, are accepted.
+        assert!(JwtConfig::verifier_from_jwks(&good.to_string()).is_ok());
+        let mut kidless = good_key.clone();
+        kidless.as_object_mut().unwrap().remove("kid");
+        let extension =
+            JwtConfig::verifier_from_jwks(&serde_json::json!({ "keys": [kidless] }).to_string())
+                .unwrap();
+        assert!(extension
+            .validate_token(&mint(&kernel, Duration::minutes(5)).unwrap())
+            .is_ok());
+    }
+
+    /// With no signing key the kernel is exactly the HS256 kernel it was: the
+    /// secret (or the dev literal when unset) signs, tokens carry no `kid`,
+    /// a peer still on `from_secret` verifies them, and nothing is published.
+    #[test]
+    fn with_no_signing_key_the_kernel_is_unchanged() {
+        let secret = std::str::from_utf8(SHARED).unwrap();
+        for (env_secret, peer_secret) in [(Some(secret), SHARED), (None, DEV_JWT_SECRET)] {
+            for key in [None, Some(""), Some("  ")] {
+                let cfg = JwtConfig::from_kernel_env(key, env_secret).unwrap();
+                assert_eq!(cfg.signing_algorithm(), Some(Algorithm::HS256));
+                assert!(cfg.jwks().keys.is_empty());
+                let token = mint(&cfg, Duration::minutes(5)).unwrap();
+                let header = decode_header(&token).unwrap();
+                assert_eq!(header.alg, Algorithm::HS256);
+                assert_eq!(header.kid, None);
+                assert!(JwtConfig::from_secret(peer_secret)
+                    .validate_token(&token)
+                    .is_ok());
+            }
+        }
+    }
+
+    /// The boot check: a malformed signing key refuses boot even under the
+    /// insecure opt-out (never a silent fall back to HS256 signing), without
+    /// echoing the key; a key alone is a production configuration; a set
+    /// secret is still held to the production bar while it is the window.
+    #[test]
+    fn the_kernel_boot_check_covers_every_arm() {
+        let key = hex::encode(seed(8));
+        let real = "r".repeat(MIN_SECRET_LEN);
+        let dev = std::str::from_utf8(DEV_JWT_SECRET).unwrap();
+        let typo = format!("{}zz", &key[..62]);
+        for allow_insecure in [false, true] {
+            let err = check_kernel_jwt_keys(Some(&typo), Some(&real), allow_insecure).unwrap_err();
+            assert!(
+                !err.contains(&typo[..20]),
+                "the error echoes the key: {err}"
+            );
+            assert!(check_kernel_jwt_keys(Some(&key[..62]), None, allow_insecure).is_err());
+            assert!(JwtConfig::from_kernel_env(Some(&typo), Some(&real)).is_err());
+        }
+        assert!(check_kernel_jwt_keys(Some(&key), None, false).is_ok());
+        assert!(check_kernel_jwt_keys(Some(&key), Some(&real), false).is_ok());
+        assert!(check_kernel_jwt_keys(Some(&key), Some(dev), false).is_err());
+        assert!(check_kernel_jwt_keys(Some(&key), Some(dev), true).is_ok());
+        assert!(check_kernel_jwt_keys(None, Some(&real), false).is_ok());
+        assert!(check_kernel_jwt_keys(None, Some(dev), false).is_err());
+        assert!(check_kernel_jwt_keys(None, None, false).is_err());
+        assert!(check_kernel_jwt_keys(Some(""), Some(""), false).is_err());
+        assert!(check_kernel_jwt_keys(None, None, true).is_ok());
     }
 }
