@@ -4957,8 +4957,11 @@ impl ClaimRepository {
     /// than `candidate_pool` rows runs once more as an exact scan, under a
     /// timeout that falls back to the first pass (`vector_scan` module doc).
     /// The trigger is the dense leg's size, not the fused page's, so it does
-    /// not depend on `offset` and every page of a walk ranks the same pool.
-    /// The lexical leg is served by its GIN index through a bitmap scan, which
+    /// not depend on `offset` and every page of a walk ranks the same pool,
+    /// with one timing-dependent exception: the retry runs under a timeout,
+    /// so if it finishes for one page of a walk and times out for another
+    /// (load), those two pages rank different dense pools and a row can be
+    /// skipped or repeated across them. The lexical leg is served by its GIN index through a bitmap scan, which
     /// the exact pass leaves enabled.
     ///
     /// Requires pgvector >= 0.8.0, the release that added

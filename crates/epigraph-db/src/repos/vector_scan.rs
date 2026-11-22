@@ -29,6 +29,19 @@
 //! retry that times out returns the first pass's rows, i.e. exactly what the
 //! read returned before this fallback existed.
 //!
+//! # What the retry still discloses
+//!
+//! The retry closes the short page, not the side channel behind it. A
+//! restricted viewer now gets a full page, but a page that needed the exact
+//! pass takes measurably longer than one the iterative pass filled, and the
+//! iterative pass falls short only when about `hnsw.max_scan_tuples`
+//! unreadable rows (or fewer readable rows than `LIMIT` in total) lie nearer
+//! the query. So the latency of a read still hints that hidden rows sit near
+//! a query, for any query the caller chooses; and a retry that times out
+//! returns the short page, which hints the same. The API's key cursor is
+//! authenticated so that a caller cannot also aim this at a distance band of
+//! its choice by forging the boundary.
+//!
 //! Both passes run in a transaction (a savepoint on a caller's own
 //! transaction) that the caller ROLLS BACK, never commits: a released savepoint
 //! would carry the `SET LOCAL` values into the caller's later reads.
@@ -119,7 +132,11 @@ pub(crate) async fn begin_exact_vector_scan(
 /// The result of an exact retry, given the first pass's result `first`.
 ///
 /// A retry cancelled by `statement_timeout` (SQLSTATE 57014) yields `first`,
-/// logged at WARN under `read`; any other error propagates. Call it AFTER the
+/// logged at WARN under `read`; any other error propagates. 57014 is also
+/// what an operator's `pg_cancel_backend` raises, and that is treated the
+/// same way: the read degrades to exactly what it returned before the retry
+/// existed, with the WARN as the record. Telling the two apart would mean
+/// matching the error's message text, which `lc_messages` localises. Call it AFTER the
 /// retry's transaction has been rolled back, so the savepoint the timeout
 /// aborted is gone and the connection is usable again.
 pub(crate) fn exact_retry_or_first_pass<R>(
