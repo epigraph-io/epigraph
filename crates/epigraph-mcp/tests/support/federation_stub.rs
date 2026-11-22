@@ -14,7 +14,10 @@
 //! - `alive = false`: every HTTP request gets `503`, as if the process were
 //!   gone (new dials fail, and so does a request on an existing session);
 //! - `hang_list = true`: `tools/list` never answers;
-//! - a request whose bearer is [`REJECTED_BEARER`] gets `401`.
+//! - a request whose bearer is [`REJECTED_BEARER`] gets `401`;
+//! - `calls`: every `tools/call` the stub received, with its arguments and
+//!   the bearer it came with ([`RecordedCall`]), so a test can assert what
+//!   reached the downstream, and that nothing did.
 //!
 //! [`spawn_legacy_stub`] serves the same stub speaking ONLY protocol
 //! `2025-03-26`, as episcience-mcp does: its results carry no SEP-2322
@@ -23,8 +26,8 @@
 //!
 //! Tool behaviour is keyed by name: [`HANG_TOOL`] never answers,
 //! [`FAIL_TOOL`] answers with [`fail_error`], [`INTERNAL_FAIL_TOOL`] with
-//! [`internal_fail_error`], and any other name echoes
-//! `stub handled `<name>``.
+//! [`internal_fail_error`], [`ECHO_TOOL`] answers with its arguments as
+//! JSON text, and any other name echoes `stub handled `<name>``.
 #![allow(dead_code)]
 
 use std::borrow::Cow;
@@ -48,6 +51,9 @@ pub const HANG_TOOL: &str = "hang_forever";
 pub const FAIL_TOOL: &str = "always_fails";
 /// A tool whose `tools/call` answers with [`internal_fail_error`].
 pub const INTERNAL_FAIL_TOOL: &str = "fails_internally";
+/// A tool whose `tools/call` answers with its own arguments, serialized as
+/// JSON in one text block.
+pub const ECHO_TOOL: &str = "echo_arguments";
 /// A bearer the stub answers with `401`, at `initialize` as on every request.
 pub const REJECTED_BEARER: &str = "a-token-this-downstream-refuses";
 
@@ -74,14 +80,28 @@ pub fn internal_fail_error() -> ErrorData {
     )
 }
 
+/// One `tools/call` as the stub received it.
+#[derive(Debug, Clone)]
+pub struct RecordedCall {
+    pub name: String,
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    /// The `Authorization` header value it came with, `Bearer ` stripped.
+    pub bearer: Option<String>,
+}
+
 /// What the test controls. See the module doc.
 pub struct StubControl {
     pub tools: Mutex<Vec<String>>,
     pub alive: AtomicBool,
     pub hang_list: AtomicBool,
+    pub calls: Mutex<Vec<RecordedCall>>,
 }
 
 impl StubControl {
+    /// Every `tools/call` received so far, in order.
+    pub fn calls(&self) -> Vec<RecordedCall> {
+        self.calls.lock().unwrap().clone()
+    }
     pub fn set_tools(&self, names: &[&str]) {
         *self.tools.lock().unwrap() = names.iter().map(|n| (*n).to_string()).collect();
     }
@@ -142,8 +162,20 @@ impl ServerHandler for ControlledStub {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let bearer = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|parts| parts.headers.get(axum::http::header::AUTHORIZATION))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        self.control.calls.lock().unwrap().push(RecordedCall {
+            name: request.name.to_string(),
+            arguments: request.arguments.clone(),
+            bearer,
+        });
         match request.name.as_ref() {
             HANG_TOOL => {
                 std::future::pending::<()>().await;
@@ -151,6 +183,10 @@ impl ServerHandler for ControlledStub {
             }
             FAIL_TOOL => Err(fail_error()),
             INTERNAL_FAIL_TOOL => Err(internal_fail_error()),
+            ECHO_TOOL => Ok(CallToolResult::success(vec![ContentBlock::text(
+                serde_json::Value::Object(request.arguments.unwrap_or_default()).to_string(),
+            )])
+            .into()),
             other => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "stub handled `{other}`"
             ))])
@@ -220,6 +256,7 @@ fn serve_controlled_stub(
         tools: Mutex::new(tools.iter().map(|n| (*n).to_string()).collect()),
         alive: AtomicBool::new(true),
         hang_list: AtomicBool::new(false),
+        calls: Mutex::new(Vec::new()),
     });
 
     let for_service = control.clone();
