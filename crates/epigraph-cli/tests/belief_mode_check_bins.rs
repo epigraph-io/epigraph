@@ -911,6 +911,12 @@ fn claim_belief_args(claims: &[Uuid], extra: &[&str]) -> (std::path::PathBuf, Ve
     let mut args = vec![
         "--input".to_string(),
         list.to_str().expect("utf-8").to_string(),
+        // The disk gate a writing run must name (backlog 1ea4f6bf).
+        "--disk-path".to_string(),
+        dir.to_str().expect("utf-8").to_string(),
+        "--min-free-gb".to_string(),
+        "0".to_string(),
+        "--no-backup-check".to_string(),
     ];
     args.extend(extra.iter().map(|a| (*a).to_string()));
     (dir, args)

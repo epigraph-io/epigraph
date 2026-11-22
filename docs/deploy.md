@@ -1093,6 +1093,22 @@ viewer the maintenance session owns.
   the owner-frame recompute it calls folds only the legacy way. Run it from
   the API's environment, with the API reachable. `--dry-run` is exempt.
   Exit 3 is also the wave-file STOP above; stderr says which.
+* **A writing `recompute_claim_belief` run passes a disk gate before every
+  batch** (backlog 1ea4f6bf; `recompute_betp`'s `DiskGate`). It needs
+  `--disk-path <path on the database's data volume>` and
+  `--disk-check-cmd <backup and archive health check>`, or an explicit
+  `--no-backup-check`; clap refuses a writing run without them (exit 2).
+  The id list is worked in batches of `--batch-size` (default 1000). Before
+  each batch, the volume's free space less the batch's projected writes
+  (`--projected-bytes-per-claim`, default 65536: WAL and archive, plus the
+  wave file's records when it is on that volume) must stay at or above
+  `--min-free-gb` (default 20), and the check command must exit 0. A failure
+  stops the run before that batch writes (exit 4, `STOPPED by the disk
+  gate`); what committed before it is recorded, so the wave file restores
+  it. The wave file's own volume is not gated: a record that does not fit
+  already rolls its claim back and stops the run (exit 3). The projection
+  default is `recompute_betp`'s provisional figure; measure it for this
+  binary before relying on a tight headroom.
 
 ### The Python scripts
 
