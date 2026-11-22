@@ -3432,23 +3432,23 @@ restart.
   precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
   was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a
   binary without the new refusal text answers the generic "refused". Operated agents that
-  share or publicize today start being refused. Before migrating, measure (plain tables, no
-  definer; link and membership state is read NOW, not as of each act; the client-allowance
-  arm is not counted): shares by an agent with a live operator link that is itself a member
-  of the target team, `SELECT count(*) FROM security_events s WHERE s.event_type =
+  share or publicize today start being refused. Before migrating, measure (on a role that
+  may execute `epigraph_live_memberships`, so role-derived memberships, 165, count; link and
+  membership state is read NOW, not as of each act; the client-allowance arm is not
+  counted): shares by an agent with a live operator link that is itself a member of the
+  target team, `SELECT count(*) FROM security_events s WHERE s.event_type =
   'claim.shared_with_team' AND EXISTS (SELECT 1 FROM operator_links l WHERE l.agent_id =
-  s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM group_memberships m WHERE
-  m.agent_id = s.agent_id AND m.group_id = (s.details->>'to_group_id')::uuid AND m.revoked_at
-  IS NULL)`; publicizes by such an agent that is itself an admin of an owning group,
-  `SELECT count(*) FROM security_events s WHERE s.event_type = 'claim.publicized' AND EXISTS
-  (SELECT 1 FROM operator_links l WHERE l.agent_id = s.agent_id AND NOT l.retired) AND EXISTS
-  (SELECT 1 FROM group_memberships m JOIN jsonb_array_elements_text(s.details->
-  'owner_group_ids') g(id) ON m.group_id = g.id::uuid WHERE m.agent_id = s.agent_id AND
-  m.role = 'admin' AND m.revoked_at IS NULL)`; and every act 242 would now refuse, `SELECT
-  s.event_type, count(*) FROM security_events s WHERE s.event_type IN
-  ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM operator_links l
-  WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway databases only, NOT to
-  any deployed database.**
+  s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM epigraph_live_memberships(s.agent_id)
+  m WHERE m.group_id = (s.details->>'to_group_id')::uuid)`; publicizes by such an agent that
+  is itself an admin of an owning group, `SELECT count(*) FROM security_events s WHERE
+  s.event_type = 'claim.publicized' AND EXISTS (SELECT 1 FROM operator_links l WHERE
+  l.agent_id = s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM
+  epigraph_live_memberships(s.agent_id) m JOIN jsonb_array_elements_text(s.details->
+  'owner_group_ids') g(id) ON m.group_id = g.id::uuid WHERE m.role = 'admin')`; and every act
+  242 would now refuse, `SELECT s.event_type, count(*) FROM security_events s WHERE
+  s.event_type IN ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM
+  operator_links l WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

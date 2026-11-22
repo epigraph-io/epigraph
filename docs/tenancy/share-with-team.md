@@ -444,9 +444,9 @@ The roles:
 
 | act | rule (this spec) | today (206) |
 |---|---|---|
-| share private → team | a **human** (R1) who is a live admin of the home group (in practice, the human whose personal group it is) and who writes the target by **own** membership (`via = 'own'`) | author **or** home admin; the target is any team in `epigraph_writable_teams(caller)`, including `via = 'operator'`. **An operated agent passes today.** |
+| share private → team | a **human** (R1) who is a live admin of the home group (in practice, the human whose personal group it is) and who writes the target by **own** membership (`via = 'own'`) | author **or** home admin; the target is any team in `epigraph_writable_teams(caller)`, including `via = 'operator'`. An operated agent passed until migration 242, which refuses it (`refused_not_human`) and takes the target by `via = 'own'` only; the author arm remains. |
 | move A → B | a **human** (R1) with its own live admin membership of A and writer membership of B; refused when `readers_losing > 0` (R2) | not app-callable |
-| publicize | a **human** (R1) with its own live admin membership of the owning group (D-V2) | D-V2 without the human test |
+| publicize | a **human** (R1) with its own live admin membership of the owning group (D-V2) | D-V2; since migration 242 an operated agent is refused (`refused_not_human`), an unlinked agent is not yet |
 | undo a publicize | inside the window (R3): a **human** live admin of the owning group; refused if anyone outside the owning group has built on it (R8). After the window, or when refused: maintenance only. | none |
 | undo a share or move | inside the window (R7): a **human** live admin of the source group (home, or team A); refused if anyone outside that group has built on it (R8). After the window, or when refused: maintenance only (`reown-reverse`), which keeps attached claims in the team (R4). | none |
 
@@ -467,6 +467,11 @@ The roles:
 
   D-V3 is untouched for **writes**: an operated agent still writes into its human's teams. R1
   removes it only from the acts that move existing work.
+
+* **Migration 242 lands part of R1** (backlog ecd842bf): both acts refuse an operated agent
+  (`epigraph_human_of(caller, false)` is another agent) with `refused_not_human`, and share
+  takes the target by `via = 'own'` only. The author arm and the gate for an agent that belongs
+  to no human remain P1's.
 
 ### 4.3 All or nothing
 
