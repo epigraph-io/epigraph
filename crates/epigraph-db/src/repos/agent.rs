@@ -271,10 +271,12 @@ pub struct AgentPublicProfile {
 /// Ed25519 SECRET, so anyone who knows the seed holds the private key. Such a
 /// key names the agent and is NOT a signature verifier:
 /// [`AgentRepository::public_key_if_signer`] returns `None` for it, as for
-/// the OAuth placeholder `derived`. NOT YET enforced by the verifiers that
-/// read `agents.public_key` directly: `verify_claim`'s bare-key fallback, the
-/// edge-signature check and the OAuth assertion check. Insert these rows with
-/// [`AgentRepository::create_seed_derived_conn`].
+/// the OAuth placeholder `derived`, and so do the verifiers that read the
+/// bare key directly (backlog 57943a39): `verify_claim`'s bare-key fallback
+/// ([`AgentRepository::key_kind_of_public_key`]), the edge-signature check
+/// and the OAuth agent assertion check. Insert these rows with
+/// [`AgentRepository::create_seed_derived_conn`] (over HTTP, `POST /agents`
+/// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
 /// Repository for Agent operations
