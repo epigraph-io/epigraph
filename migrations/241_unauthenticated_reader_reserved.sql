@@ -41,11 +41,13 @@
 --     creator; the listener now only LOOKS the row up.
 --   * `group_memberships_refuse_unauthenticated_reader` (BEFORE INSERT OR
 --     UPDATE): a membership row of the reader agent may never be LIVE:
---     an INSERT of a live row (any role, any group, any epoch) and an UPDATE
---     that revives a revoked one are refused (42501, `RDR02`). Revoking a
+--     an INSERT of a live row (any role, any group, any epoch), an UPDATE
+--     that revives a revoked one, and an UPDATE that moves any live row's
+--     `agent_id` onto the reader are refused (42501, `RDR02`). Revoking a
 --     legacy live row stays open, and so does every other UPDATE of a row that
---     is already live (e.g. `GroupKeyEpochRepository::rotate_conn`'s epoch
---     and key-share writes), so a group holding such a row is not wedged.
+--     is already live and keeps its agent (e.g.
+--     `GroupKeyEpochRepository::rotate_conn`'s epoch and key-share writes), so
+--     a group holding such a row is not wedged.
 --
 -- NEITHER TRIGGER HAS AN ESCAPE HATCH. 109's guards let
 -- `epigraph_bypass()` / `epigraph_definer_bypass()` through; these do not.
@@ -57,7 +59,7 @@
 --
 -- Both triggers identify the reader by its KEY (`agents.public_key`), not by
 -- an id, so the rule follows the row whatever id it was created with.
--- `agents` is readable by every role (077's `agents_read USING (true)`), so
+-- `agents` is readable by every role (077's `agents_identity ... USING (true)`), so
 -- the INVOKER trigger's lookup sees the row on every connection.
 --
 -- ===================================================================
@@ -139,11 +141,14 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp AS $$
 BEGIN
     -- The WHEN clause admits only a row that is live after the statement. An
-    -- UPDATE of a row that was ALREADY live (a legacy row: an epoch rotation,
-    -- a role change) passes; only an INSERT or a revival is judged. Nested,
-    -- so OLD is read on UPDATE only.
+    -- UPDATE of a row that was ALREADY live and stays the SAME agent's (a
+    -- legacy row: an epoch rotation, a role change) passes; an INSERT, a
+    -- revival, and an UPDATE that moves a live row onto another agent (which
+    -- 109's identity guard lets through on a maintenance session) are judged.
+    -- Nested, so OLD is read on UPDATE only.
     IF TG_OP = 'UPDATE' THEN
-        IF OLD.revoked_at IS NULL THEN
+        IF OLD.revoked_at IS NULL
+           AND OLD.agent_id IS NOT DISTINCT FROM NEW.agent_id THEN
             RETURN NEW;
         END IF;
     END IF;

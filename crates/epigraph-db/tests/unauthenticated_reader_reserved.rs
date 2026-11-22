@@ -13,9 +13,10 @@
 //!   reader to that group, in any role, through the repository call
 //!   `POST /api/v1/groups/:id/members` makes, while the same session adds
 //!   another agent (calibration: the refusal is 241's, not RLS or a grant);
-//! * no other role or path gives it a live row either: a superuser INSERT, and
+//! * no other role or path gives it a live row either: a superuser INSERT,
 //!   077's personal-group definer (a definer frame, which 109's guards let
-//!   through);
+//!   through), and a superuser UPDATE moving a live row's `agent_id` onto it
+//!   (which 109's identity guard lets through);
 //! * the key is the reserved row's alone: an `epigraph_app` INSERT, a
 //!   superuser INSERT and a key UPDATE of another row are refused with 241's
 //!   own error (RDR01, never the unique constraint's 23505), while another key
@@ -26,9 +27,11 @@
 //! * `docs/runbooks/241-undo.sql` removes the refusal, twice over.
 //!
 //! Verified to fail: with 241 reduced to its row INSERT (no triggers), all
-//! five fail on their refusal assertions (the key test on 23505 instead of
-//! RDR01); with a `epigraph_definer_bypass()` exemption added to the
-//! membership trigger, the definer probe and the revival refusal fail.
+//! five original tests fail on their refusal assertions (the key test on 23505
+//! instead of RDR01); with a `epigraph_definer_bypass()` exemption added to
+//! the membership trigger, the definer probe and the revival refusal fail;
+//! with the UPDATE early return keyed on `OLD.revoked_at` alone (no
+//! `agent_id` check), the identity-move test fails.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -237,6 +240,51 @@ async fn no_role_and_no_definer_gives_the_reader_a_live_membership(pool: PgPool)
     .await
     .expect("a revoked row grants nothing and is admitted");
     assert_eq!(live_memberships(&pool, reader).await, 0);
+}
+
+/// No escape through an identity move either. 109's
+/// `group_memberships_identity_immutable` lets a maintenance session (here a
+/// superuser, `epigraph_bypass()`) change a live row's `agent_id`; moving a
+/// live row ONTO the reader is refused, while the same move onto another
+/// agent passes (calibration: 109 admits the move, so the refusal is 241's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_update_cannot_move_a_live_membership_onto_the_reader(pool: PgPool) {
+    let reader = reader_id(&pool).await.expect("241 creates the reader row");
+    let (_, group) = fixture::seed_agent_with_group(&pool, "rdr-move").await;
+    let first = plain_agent(&pool).await;
+    let second = plain_agent(&pool).await;
+    let membership: Uuid = sqlx::query_scalar(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader') RETURNING id",
+    )
+    .bind(group)
+    .bind(first)
+    .fetch_one(&pool)
+    .await
+    .expect("a live membership of an ordinary agent");
+
+    // CALIBRATION: the maintenance session moves the live row to another agent.
+    sqlx::query("UPDATE group_memberships SET agent_id = $2 WHERE id = $1")
+        .bind(membership)
+        .bind(second)
+        .execute(&pool)
+        .await
+        .expect("CALIBRATION: 109 admits a maintenance identity move");
+    assert_eq!(live_memberships(&pool, second).await, 1);
+
+    let err = sqlx::query("UPDATE group_memberships SET agent_id = $2 WHERE id = $1")
+        .bind(membership)
+        .bind(reader)
+        .execute(&pool)
+        .await
+        .expect_err("a live row must not be moved onto the reader");
+    assert_refused(&err, "RDR02");
+    assert_eq!(live_memberships(&pool, reader).await, 0);
+    assert_eq!(
+        live_memberships(&pool, second).await,
+        1,
+        "the refused move leaves the row where it was"
+    );
 }
 
 /// 14a38166's DONE: the key is reserved. The refusal is 241's own (RDR01),
