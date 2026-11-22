@@ -340,8 +340,11 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_by_id(pool: &PgPool, key_id: Uuid) -> Result<Option<AgentKeyRow>, DbError> {
+    #[instrument(skip(executor))]
+    pub async fn get_by_id<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        key_id: Uuid,
+    ) -> Result<Option<AgentKeyRow>, DbError> {
         let row = sqlx::query!(
             r#"
             SELECT
@@ -352,7 +355,7 @@ impl AgentKeyRepository {
             "#,
             key_id
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row.map(|r| AgentKeyRow {
@@ -382,9 +385,9 @@ impl AgentKeyRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_active_key(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_active_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         agent_id: AgentId,
         key_type: &str,
     ) -> Result<Option<AgentKeyRow>, DbError> {
@@ -400,7 +403,7 @@ impl AgentKeyRepository {
         )
         .bind(agent_uuid)
         .bind(key_type)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
 
         Ok(row)

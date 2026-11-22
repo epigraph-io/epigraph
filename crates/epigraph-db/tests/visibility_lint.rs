@@ -3193,6 +3193,21 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          the key handlers run it on the transaction that also writes the admin audit row.",
     ),
     (
+        "agent_key.rs",
+        "get_by_id",
+        "READ of one `agent_keys` row by id. `agent_keys` has no row security and no owner \
+         group: a public key is identity data, not tenant content (`GET \
+         /api/v1/agents/:id/keys` lists them to any `agents:read` holder). Generic only so \
+         the revoke handler reads the key on the viewer-stamped transaction that changes it.",
+    ),
+    (
+        "agent_key.rs",
+        "get_active_key",
+        "READ of an agent's one active key of a type. `agent_keys` has no row security and \
+         no owner group (identity data, not tenant content). Generic only so the rotate \
+         handler reads the key on the viewer-stamped transaction that retires it.",
+    ),
+    (
         "derivation_scope.rs",
         "cache_admissible",
         "READ that answers, for BBA rows the caller already read, which may enter THEIR \
