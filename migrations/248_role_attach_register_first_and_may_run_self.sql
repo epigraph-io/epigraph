@@ -54,7 +54,12 @@
 -- Only the verb checks: a direct maintenance INSERT into `role_agents` meets
 -- 166's guards alone, as before (the custodial path), and the registration's
 -- own succession copy and the lineage follow attach registered successors
--- only.
+-- only. An identity the host will never register (not a host identity) has
+-- no register-first remedy; attaching it is that custodial INSERT's job, not
+-- the verb's. The verdict is taken at attach time: if another binding let
+-- the attach through and is removed before the first registration, that
+-- registration still sees only the attachment and aborts AID09 (detach,
+-- register, re-attach).
 --
 -- (b) `epigraph_role_agent_may_run(agent)` answers in full, as before, a
 -- PRIVILEGED session (`epigraph_bypass()`: a maintenance member or a
@@ -65,12 +70,16 @@
 -- agent, or unstamped, it is refused `42501` and gets no row.
 -- `AgentRepository::role_agent_may_run` (epigraph-mcp's boot check) stamps
 -- the agent it asks about, transaction-local, on the connection it asks on.
--- LIMIT: the principal is a session setting, and a holder of the
--- application DSN can set it to any agent before asking. So this binds the
--- question to the caller's DECLARED principal, as 198's own-assignment read
--- does: it closes enumeration by code that stamps the principal it serves,
--- not by a session that forges its own stamp (the limit every check keyed on
--- the session's stamp shares).
+-- LIMIT (this NARROWS 1afdc93d, it does not close it): the principal is a
+-- session setting, and a holder of the application DSN can set it before
+-- asking. Re-stamping is not limited to one agent per ask: a single
+-- statement can set the stamp per row (set_config is an ordinary function)
+-- and so still enumerate the whole roster. This binds the question to the
+-- caller's DECLARED principal, as 198's own-assignment read does: it stops
+-- enumeration by code that stamps the principal it serves honestly (the
+-- API, an unmodified epigraph-mcp), not by a session that forges its own
+-- stamp (the limit every check keyed on the session's stamp shares). It
+-- discloses nothing 166 did not.
 --
 -- ===================================================================
 -- 3. RE-STATEMENTS
@@ -86,14 +95,25 @@
 --
 -- `docs/runbooks/248-undo.sql` re-states both 166 bodies verbatim. No
 -- binary needs rolling back first: the repository's stamped ask works on
--- both bodies.
+-- both bodies. The reverse does not hold: rolling `epigraph-mcp-full` back
+-- to a build without this file's repository change, while this file is
+-- applied, makes every boot on an application login refuse (below); run the
+-- undo FIRST, then roll the binary back.
 --
 -- DEPLOY ORDER: `epigraph-mcp-full` built with this file's repository change
--- FIRST (or together), then this file. An older epigraph-mcp asks may_run
--- unstamped; on an application login it is then refused `42501` and refuses
--- to boot ("could not ask whether agent ... may run"). The new binary works
--- on a database below this file (166's body ignores the stamp). The host
--- asks on the attestor login and is unaffected.
+-- FIRST (or together), then this file. That means EVERY copy that connects
+-- on an application login: the server's, and the binary the host mounts
+-- into its agent containers (each container's epigraph-mcp asks may_run at
+-- start). An older epigraph-mcp asks may_run unstamped; on an application
+-- login it is then refused `42501` and refuses to boot ("could not ask
+-- whether agent ... may run"). The new binary works on a database below
+-- this file (166's body ignores the stamp).
+-- The host asks on its attestor login, which this file exempts by ROLE
+-- MEMBERSHIP only. Check before migrating that the login the host asks on
+-- is a member: SELECT pg_has_role('<host attestor login>',
+-- 'epigraph_identity_attestor', 'MEMBER') must be true. A login holding only
+-- a direct EXECUTE grant on the function would be refused 42501 about every
+-- identity it starts.
 
 SET LOCAL lock_timeout = '3s';
 

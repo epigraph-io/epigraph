@@ -17,7 +17,10 @@
 -- a NEW migration, never a re-run of 248.
 --
 -- No binary needs rolling back first: the repository's stamped ask works on
--- both bodies.
+-- both bodies. The reverse order matters: to roll `epigraph-mcp-full` back
+-- to a build without 248's repository change, run this undo FIRST; an older
+-- binary asks may_run unstamped, and under 248's body every boot on an
+-- application login is refused 42501.
 -- ===================================================================
 
 BEGIN;

@@ -3416,14 +3416,22 @@ restart.
   `epigraph_identity_attestor` login about any agent, and any other session only about
   its own stamped principal (`42501` otherwise), so an application session can no longer
   enumerate the role roster; `AgentRepository::role_agent_may_run` stamps the agent it
-  asks about, transaction-local. The stamp is a session setting, so a session that forges
-  its own principal still learns about that one agent per ask. Pinned by
+  asks about, transaction-local. This NARROWS 1afdc93d, it does not close it: the stamp is
+  a session setting, and a session holding the application DSN can re-stamp per row inside
+  one statement and still enumerate the whole roster; it stops enumeration only by code
+  that stamps its own principal honestly (166 disclosed no less). Pinned by
   `epigraph-db/tests/role_attached_agents.rs`
   (`attaching_an_identity_the_host_has_not_registered_is_refused`, replacing the pinned
   AID09 case, and `may_run_answers_an_app_session_only_about_its_own_principal`). Undo:
   `docs/runbooks/248-undo.sql`. **Deploy order:** `epigraph-mcp-full` built with this
-  file's repository change first (or together): an older binary asks unstamped and
-  refuses to boot after the migration. The host asks on the attestor login.
+  file's repository change first (or together), for every copy on an application login,
+  including the binary the host mounts into agent containers: an older binary asks
+  unstamped and refuses to boot after the migration. Rolling that binary back after 248
+  needs `248-undo.sql` first. The host asks on its attestor login, exempt by membership
+  only: check `pg_has_role('<host attestor login>', 'epigraph_identity_attestor',
+  'MEMBER')` before migrating. The attach refusal is decided at attach time: a binding
+  that let the attach through and is removed before the first registration still leaves
+  that registration to abort `AID09`.
 
 ## `-- no-transaction` migrations
 
