@@ -60,9 +60,11 @@
 --     time: a copy holder that registers in a second folder later loses the
 --     group at past instants too (179's "a successor that once ran
 --     elsewhere does not count again");
---   * the operator link (`epigraph_operator_actor`) and the client allowance
---     (`epigraph_allowlisted_operator`) are read as they stand now, not at
---     `p_at`;
+--   * the operator link (`epigraph_operator_actor`), the client allowance
+--     (`epigraph_allowlisted_operator`) and the group's status
+--     (`groups.status = 'active'`) are read as they stand now, not at `p_at`:
+--     suspending or deprovisioning a group later empties the answer (and the
+--     roster's `--at`) for every earlier instant;
 --   * a timestamp is its writer's transaction start, not its commit: a
 --     record dated at or before T that commits after T changes the answer
 --     for T once it commits, as it always did;

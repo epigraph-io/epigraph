@@ -1607,9 +1607,12 @@ successions attested by T, so a later revert or detach does not change the
 answer for T (the roster's `--at` reads that answer). From the moment a
 detach is made it is sticky, as above. An instant at or after the asking
 transaction's start is the present: every record the transaction can see
-counts, so a live check never misses a detach already committed. The folder
-test still reads every snapshot at any time, and the operator link is read
-as it stands now, so those two can still change a past answer.
+counts, so a live check never misses a detach already committed. Four
+inputs are still read as they stand now, not at T, so they can still change
+a past answer: the folder test (every snapshot, at any time), the operator
+link, the client allowance, and the group's status (suspending or
+deprovisioning a group later empties the answer, and the roster's `--at`,
+for every earlier instant).
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor

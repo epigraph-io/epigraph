@@ -3416,14 +3416,16 @@ restart.
   `idx_role_agents_agent_role (agent_id, role)`: the time-aware read of the row asked about
   cannot use 166's partial index, and without it every call paid a JIT compile (0.55 to
   0.8 s measured; 3 to 4 ms with it). Limits kept: the folder test still reads snapshots at
-  any time, and the operator link and client allowance are read as they stand now. An md5
+  any time, and the operator link, the client allowance and the group's status are read as
+  they stand now (suspending a group later empties every earlier instant's answer). An md5
   precondition refuses (`55000`, nothing changed) over any body but 195's
   (`1c5c6925547d6aa0d0a54e718ce6bd47`); a later re-statement starts from 249's
   (`58caa9ae65e89485b4fac1bb26959fdd`). Signature, owner, ACL and `search_path` unchanged;
   no grant. Pinned by `epigraph-db/tests/group_role_membership.rs` (the 249 section: one
-  test per kind of record, each failing on 195's body or on its conjunct reverted alone; the
-  present-instant test; the planner-estimate test that fails without the index; and two
-  pins of the cross-folder limits of 195, part 1 of the item),
+  test per kind of record, each failing on 195's body or on its conjunct reverted alone; one
+  present-instant test per site that reads a record's time, each failing with that site's
+  present clause reverted alone; the planner-estimate test that fails without the index; and
+  two pins of the cross-folder limits of 195, part 1 of the item),
   `schema_contract.rs::migration_179_attached_arm_survives_at_head` (249's fragments) and
   `legacy_fleet_parent.rs` (`migration_249_refuses_to_restate_a_body_it_was_not_written_from`,
   `the_249_undo_restores_the_catalog_below_249`). Undo: `docs/runbooks/249-undo.sql`
