@@ -14,6 +14,17 @@
 //!   --agent-key <base64-encoded-32-byte-secret>
 //! ```
 //!
+//! # Licence gate (backlog 1a462cc1)
+//!
+//! A claim's `supporting_text` (and a figure's image and caption) is
+//! publisher text. It is shipped verbatim only when `source.licence` permits
+//! retention (`epigraph_ingest::common::licence::passage_retention_permitted`,
+//! the same allowlist as the document-ingest path). Under any other licence,
+//! or none, the passage evidence carries the citation, a locator (page and
+//! section) and the passage's BLAKE3 hash instead, and figures are not
+//! attached; the run prints what it withheld. `--allow-verbatim` is the
+//! operator override for a source the operator has the right to republish.
+//!
 //! # Input Format
 //!
 //! ```json
@@ -22,7 +33,8 @@
 //!     "doi": "10.1000/example",
 //!     "title": "Example Paper",
 //!     "authors": ["Author One"],
-//!     "journal": "Nature"
+//!     "journal": "Nature",
+//!     "licence": "CC-BY-4.0"
 //!   },
 //!   "claims": [
 //!     {
@@ -41,6 +53,7 @@
 //! ```
 
 use epigraph_crypto::{AgentSigner, ContentHasher, SignedEntity};
+use epigraph_ingest::common::licence::passage_retention_permitted;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -59,6 +72,9 @@ struct Args {
     agent_key: String,
     /// Dry run mode - validate and show packets without submitting
     dry_run: bool,
+    /// Ship verbatim passages and figures whatever `source.licence` says
+    /// (operator override of the licence gate)
+    allow_verbatim: bool,
 }
 
 impl Args {
@@ -69,6 +85,7 @@ impl Args {
         let mut endpoint = "http://localhost:8080".to_string();
         let mut agent_key = "generate".to_string();
         let mut dry_run = false;
+        let mut allow_verbatim = false;
 
         let mut i = 1;
         while i < args.len() {
@@ -96,6 +113,9 @@ impl Args {
                 "--dry-run" | "-n" => {
                     dry_run = true;
                 }
+                "--allow-verbatim" => {
+                    allow_verbatim = true;
+                }
                 "--help" | "-h" => {
                     return Err(USAGE.to_string());
                 }
@@ -113,6 +133,7 @@ impl Args {
             endpoint,
             agent_key,
             dry_run,
+            allow_verbatim,
         })
     }
 }
@@ -125,6 +146,8 @@ Options:
   -e, --endpoint <URL>     API endpoint [default: http://localhost:8080]
   -k, --agent-key <KEY>    Base64-encoded 32-byte agent key, or 'generate' [default: generate]
   -n, --dry-run            Validate and show packets without submitting
+      --allow-verbatim     Ship supporting passages and figures verbatim even when
+                           source.licence does not permit retention (operator override)
   -h, --help               Show this help message";
 
 /// Maximum allowed input file size (100 MB). Prevents OOM from malicious or
@@ -157,6 +180,11 @@ struct LiteratureSource {
     authors: Vec<AuthorEntry>,
     #[allow(dead_code)]
     journal: Option<String>,
+    /// The source's licence (an SPDX id such as `CC-BY-4.0`). Decides whether
+    /// supporting passages and figures may be shipped verbatim; absent means
+    /// unknown, which withholds them.
+    #[serde(default)]
+    licence: Option<String>,
 }
 
 /// Author entry — backward-compatible with plain strings or enriched objects
@@ -430,17 +458,80 @@ async fn register_agent(
 // PACKET BUILDER
 // =============================================================================
 
+/// Whether this run may ship the source's passages and figures verbatim: the
+/// source's licence permits retention, or the operator passed
+/// `--allow-verbatim`.
+fn verbatim_permitted(source: &LiteratureSource, allow_verbatim: bool) -> bool {
+    allow_verbatim || passage_retention_permitted(source.licence.as_deref())
+}
+
+/// The `raw_content` of a claim's passage evidence. Verbatim
+/// `supporting_text` when `verbatim` holds; otherwise the citation, a locator
+/// a reader holding the paper can follow, and the passage's BLAKE3 hash, worded
+/// like the document-ingest writer's body (`literature_evidence_body`).
+fn passage_evidence_body(
+    source: &LiteratureSource,
+    claim: &ExtractedClaim,
+    verbatim: bool,
+) -> String {
+    if verbatim {
+        return claim.supporting_text.clone();
+    }
+    let mut locator = claim
+        .page
+        .map_or_else(|| "full document".to_string(), |p| format!("page {p}"));
+    if let Some(section) = &claim.section {
+        locator.push_str(&format!(", section {section:?}"));
+    }
+    let passage_hash = hex::encode(ContentHasher::hash(claim.supporting_text.as_bytes()));
+    let licence = source.licence.as_deref().map_or_else(
+        || "licence unknown".to_string(),
+        |l| format!("licence: {l}"),
+    );
+    format!(
+        "Source: {} (DOI: {}). Locator: {locator}. Passage BLAKE3: {passage_hash}. \
+         Passage not retained ({licence}).",
+        source.title, source.doi
+    )
+}
+
+/// What the licence gate kept out of a run's packets, for the operator log:
+/// `None` when nothing was withheld.
+fn withheld_summary(extraction: &LiteratureExtraction, allow_verbatim: bool) -> Option<String> {
+    if verbatim_permitted(&extraction.source, allow_verbatim) {
+        return None;
+    }
+    let figures = extraction
+        .figures
+        .iter()
+        .filter(|f| f.image_base64.is_some())
+        .count();
+    Some(format!(
+        "Licence gate ({}): withheld {} supporting passage(s) (stored as locator + BLAKE3 \
+         hash) and {figures} figure(s). Pass --allow-verbatim only for a source you may \
+         republish.",
+        extraction
+            .source
+            .licence
+            .as_deref()
+            .unwrap_or("licence unknown"),
+        extraction.claims.len(),
+    ))
+}
+
 fn build_packets(
     extraction: &LiteratureExtraction,
     signer: &AgentSigner,
     agent_id: Uuid,
+    allow_verbatim: bool,
 ) -> Vec<EpistemicPacket> {
+    let verbatim = verbatim_permitted(&extraction.source, allow_verbatim);
     extraction
         .claims
         .iter()
         .map(|claim| {
-            // Build literature text evidence
-            let raw_content = claim.supporting_text.clone();
+            // Build literature text evidence (licence-gated, backlog 1a462cc1)
+            let raw_content = passage_evidence_body(&extraction.source, claim, verbatim);
             let content_hash = ContentHasher::hash(raw_content.as_bytes());
             let content_hash_hex = hex::encode(content_hash);
 
@@ -465,7 +556,9 @@ fn build_packets(
             // Find figures near this claim's page and create Figure evidence.
             // Uses ±2 page proximity: main text figures are often on adjacent pages.
             // Cap at 3 figures per claim to avoid bloating packets.
-            if let Some(claim_page) = claim.page {
+            // A figure's image and caption are publisher content too: under a
+            // licence that does not permit retention none is attached.
+            if let (true, Some(claim_page)) = (verbatim, claim.page) {
                 let mut fig_count = 0u32;
                 for fig in &extraction.figures {
                     if fig_count >= 3 {
@@ -701,8 +794,20 @@ async fn main() {
     };
 
     // Build packets
-    let packets = build_packets(&extraction, &signer, agent_id);
+    let packets = build_packets(&extraction, &signer, agent_id, args.allow_verbatim);
     println!("Built {} epistemic packets", packets.len());
+    match withheld_summary(&extraction, args.allow_verbatim) {
+        Some(summary) => eprintln!("{summary}"),
+        None if args.allow_verbatim
+            && !passage_retention_permitted(extraction.source.licence.as_deref()) =>
+        {
+            eprintln!(
+                "Licence gate overridden by --allow-verbatim ({}): passages and figures ship verbatim.",
+                extraction.source.licence.as_deref().unwrap_or("licence unknown")
+            );
+        }
+        None => {}
+    }
 
     if args.dry_run {
         println!("\n--- DRY RUN MODE ---");
@@ -1191,7 +1296,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert_eq!(packets.len(), 2, "Should produce one packet per claim");
 
@@ -1217,7 +1322,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // Evidence should have a valid hex-encoded signature
         let sig_hex = packets[0].evidence[0].signature.as_ref().unwrap();
@@ -1252,7 +1357,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert!(
             packets[0]
@@ -1302,7 +1407,7 @@ mod tests {
 
         let extraction: LiteratureExtraction = serde_json::from_str(json).unwrap();
         let signer = AgentSigner::generate();
-        let packets = build_packets(&extraction, &signer, Uuid::new_v4());
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), false);
 
         assert!(packets.is_empty());
     }
@@ -1334,7 +1439,8 @@ mod tests {
             "source": {
                 "doi": "10.1000/fig-test",
                 "title": "Paper With Figures",
-                "authors": ["Test Author"]
+                "authors": ["Test Author"],
+                "licence": "CC-BY-4.0"
             },
             "claims": [
                 {
@@ -1415,7 +1521,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // First claim is on page 10, figure 2a is also on page 10
         assert_eq!(
@@ -1475,7 +1581,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // Verify figure evidence hash matches raw_content
         let fig_evidence = &packets[0].evidence[1]; // Figure evidence on page 10
@@ -1630,7 +1736,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         assert_eq!(packets.len(), 2);
         // First claim has methodology "instrumental" from enriched JSON
@@ -1647,7 +1753,7 @@ mod tests {
         let signer = AgentSigner::generate();
         let agent_id = Uuid::new_v4();
 
-        let packets = build_packets(&extraction, &signer, agent_id);
+        let packets = build_packets(&extraction, &signer, agent_id, false);
 
         // All claims should default to "extraction" methodology
         for packet in &packets {
@@ -1714,5 +1820,127 @@ mod tests {
         assert!(extraction.source.authors[0].affiliations().is_empty());
         assert_eq!(extraction.source.authors[1].name(), "Detailed, A.");
         assert_eq!(extraction.source.authors[1].affiliations(), &["MIT"]);
+    }
+
+    // =========================================================================
+    // LICENCE GATE (backlog 1a462cc1)
+    // =========================================================================
+
+    /// One claim near one figure, under `licence` (omitted when `None`).
+    fn licensed_extraction(licence: Option<&str>) -> LiteratureExtraction {
+        let mut json = serde_json::json!({
+            "source": {
+                "doi": "10.9999/t88-licence",
+                "title": "Licence Gate Paper",
+                "authors": ["Gate, L."]
+            },
+            "claims": [{
+                "statement": "The film conducts above 40 K",
+                "page": 7,
+                "section": "Results",
+                "confidence": 0.8,
+                "supporting_text": LICENSED_PASSAGE
+            }],
+            "figures": [{
+                "page": 7,
+                "figure_id": "fig3",
+                "caption": "Figure 3. Publisher caption text.",
+                "image_base64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+            }]
+        });
+        if let Some(l) = licence {
+            json["source"]["licence"] = serde_json::json!(l);
+        }
+        serde_json::from_value(json).expect("fixture parses")
+    }
+
+    const LICENSED_PASSAGE: &str =
+        "Publisher prose the evidence table must not republish verbatim, word for word";
+
+    /// The withheld shape: no passage, no figure image or caption, a body
+    /// whose stored hash is its own digest, and the passage's BLAKE3.
+    fn assert_withheld(packets: &[EpistemicPacket], why: &str) {
+        assert_eq!(packets.len(), 1);
+        let p = &packets[0];
+        let passage_hash = hex::encode(ContentHasher::hash(LICENSED_PASSAGE.as_bytes()));
+        for ev in &p.evidence {
+            let raw = ev.raw_content.as_deref().unwrap_or("");
+            assert!(
+                !raw.contains(LICENSED_PASSAGE),
+                "verbatim passage shipped ({why}): {raw}"
+            );
+            assert!(
+                !matches!(ev.evidence_type, EvidenceTypeSubmission::Figure { .. }),
+                "publisher figure shipped ({why})"
+            );
+            assert_eq!(
+                ev.content_hash,
+                hex::encode(ContentHasher::hash(raw.as_bytes())),
+                "content_hash must be the digest of the body the server checks"
+            );
+        }
+        let body = p.evidence[0].raw_content.as_deref().unwrap();
+        assert!(
+            body.contains(&format!("Passage BLAKE3: {passage_hash}.")),
+            "the passage hash pins the withheld text: {body}"
+        );
+        assert!(
+            body.contains("page 7"),
+            "a locator a reader can follow: {body}"
+        );
+        assert!(body.contains("Passage not retained"), "{body}");
+    }
+
+    #[test]
+    fn non_open_licence_input_emits_no_verbatim_passage() {
+        let signer = AgentSigner::generate();
+        let packets = build_packets(
+            &licensed_extraction(Some("CC-BY-NC-4.0")),
+            &signer,
+            Uuid::new_v4(),
+            false,
+        );
+        assert_withheld(&packets, "CC-BY-NC-4.0");
+    }
+
+    #[test]
+    fn unknown_licence_input_emits_no_verbatim_passage() {
+        let signer = AgentSigner::generate();
+        let packets = build_packets(&licensed_extraction(None), &signer, Uuid::new_v4(), false);
+        assert_withheld(&packets, "no licence");
+        assert!(
+            withheld_summary(&licensed_extraction(None), false).is_some_and(|s| s
+                .contains("withheld 1 supporting passage(s)")
+                && s.contains("1 figure(s)"))
+        );
+    }
+
+    #[test]
+    fn open_licence_ships_passage_and_figure_verbatim() {
+        let signer = AgentSigner::generate();
+        let extraction = licensed_extraction(Some("CC-BY-4.0"));
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), false);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
+        assert!(packets[0]
+            .evidence
+            .iter()
+            .any(|e| matches!(e.evidence_type, EvidenceTypeSubmission::Figure { .. })));
+        assert_eq!(withheld_summary(&extraction, false), None);
+    }
+
+    #[test]
+    fn allow_verbatim_overrides_a_restrictive_licence() {
+        let signer = AgentSigner::generate();
+        let extraction = licensed_extraction(Some("All rights reserved"));
+        let packets = build_packets(&extraction, &signer, Uuid::new_v4(), true);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
+        assert_eq!(packets[0].evidence.len(), 2, "passage + figure");
+        assert_eq!(withheld_summary(&extraction, true), None);
     }
 }
