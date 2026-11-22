@@ -772,6 +772,202 @@ async fn the_260_backfill_records_the_existing_declarations_only(pool: PgPool) {
     );
 }
 
+/// Migration 258's `epigraph_node_tenancy` (its section 1, byte for byte, on
+/// `origin/fix/triage-t70`): the four registries are met with their own row.
+/// Applied here only while this tree's migrations do not carry 258 itself;
+/// once they do, `up_to(259)` installs the real one.
+const ORACLE_258: &str = r#"
+CREATE OR REPLACE FUNCTION public.epigraph_node_tenancy(p_id uuid, p_type text)
+RETURNS TABLE (g uuid, v character varying(16))
+LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
+BEGIN
+    IF p_type = 'claim' THEN
+        RETURN QUERY SELECT c.owner_group_id, c.visibility FROM public.claims c WHERE c.id = p_id;
+    ELSIF p_type = 'evidence' THEN
+        RETURN QUERY SELECT e.owner_group_id, e.visibility FROM public.evidence e WHERE e.id = p_id;
+    ELSIF p_type = 'workflow' THEN
+        -- 219: a plan's row carries its tenancy since 183.
+        RETURN QUERY SELECT w.owner_group_id, w.visibility FROM public.workflows w WHERE w.id = p_id;
+    ELSIF p_type = 'frame' THEN
+        -- 258: the four registries carry their tenancy since 062.
+        RETURN QUERY SELECT f.owner_group_id, f.visibility FROM public.frames f WHERE f.id = p_id;
+    ELSIF p_type = 'context' THEN
+        RETURN QUERY SELECT x.owner_group_id, x.visibility FROM public.contexts x WHERE x.id = p_id;
+    ELSIF p_type = 'perspective' THEN
+        RETURN QUERY SELECT p.owner_group_id, p.visibility FROM public.perspectives p WHERE p.id = p_id;
+    ELSIF p_type = 'community' THEN
+        RETURN QUERY SELECT m.owner_group_id, m.visibility FROM public.communities m WHERE m.id = p_id;
+    END IF;
+    -- An edge pointing at an agent/paper/task has no tenancy of its own,
+    -- so it contributes 'public' to the meet and never BLOCKS privatization.
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT '00000000-0000-0000-0000-000000000000'::uuid,
+                            'public'::character varying(16);
+    END IF;
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_node_tenancy(uuid, text) FROM PUBLIC;
+"#;
+
+const REGISTRY_TYPES: [&str; 4] = ["frame", "context", "perspective", "community"];
+
+/// A registry row of entity type `ty` (harness superuser: a legacy re-stamp
+/// or a group writer's direct write, the only sources of a private one).
+async fn registry_row(pool: &PgPool, ty: &str, owner: Uuid, visibility: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let sql = match ty {
+        "frame" => {
+            "INSERT INTO frames (id, name, hypotheses, owner_group_id, visibility) \
+             VALUES ($1, $2, ARRAY['a','b'], $3, $4)"
+        }
+        "context" => {
+            "INSERT INTO contexts (id, name, context_type, owner_group_id, visibility) \
+             VALUES ($1, $2, 'domain', $3, $4)"
+        }
+        "perspective" => {
+            "INSERT INTO perspectives (id, name, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
+        "community" => {
+            "INSERT INTO communities (id, name, owner_group_id, visibility) \
+             VALUES ($1, $2, $3, $4)"
+        }
+        other => panic!("no seeder for {other}"),
+    };
+    sqlx::query(sql)
+        .bind(id)
+        .bind(format!("{ty}-{id}"))
+        .bind(owner)
+        .bind(visibility)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("seed {ty}: {e}"));
+    id
+}
+
+/// An edge from claim `a` stamped `('group', h)` (harness superuser).
+async fn group_edge(pool: &PgPool, a: Uuid, target: (Uuid, &str), h: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            visibility, owner_group_id) \
+         VALUES ($1, 'claim', $2, $3, 'supports', 'group', $4) RETURNING id",
+    )
+    .bind(a)
+    .bind(target.0)
+    .bind(target.1)
+    .bind(h)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("seed an edge onto a {}: {e}", target.1))
+}
+
+/// The seed both oracle states are measured on: from a public claim, one
+/// `('group', H)` edge onto each registry type's H-private row, plus the
+/// controls: onto a public claim, a public frame and an agent (all public in
+/// every oracle, so each is a declaration).
+struct RegistrySeed {
+    h: Uuid,
+    private_registry: Vec<(&'static str, Uuid)>,
+    controls: Vec<(&'static str, Uuid)>,
+}
+
+async fn seed_registry_endpoints(pool: &PgPool) -> RegistrySeed {
+    let (author, h) = fixture::seed_agent_with_group(pool, "author").await;
+    let a = fixture::seed_public_claim(pool, author, "public A").await;
+    let b = fixture::seed_public_claim(pool, author, "public B").await;
+    let mut private_registry = Vec::new();
+    for ty in REGISTRY_TYPES {
+        let row = registry_row(pool, ty, h, "group").await;
+        private_registry.push((ty, group_edge(pool, a, (row, ty), h).await));
+    }
+    let public_frame = registry_row(pool, "frame", WORLD, "public").await;
+    let controls = vec![
+        ("claim", group_edge(pool, a, (b, "claim"), h).await),
+        (
+            "public frame",
+            group_edge(pool, a, (public_frame, "frame"), h).await,
+        ),
+        ("agent", group_edge(pool, a, (author, "agent"), h).await),
+    ];
+    RegistrySeed {
+        h,
+        private_registry,
+        controls,
+    }
+}
+
+async fn assert_controls_declared(pool: &PgPool, seed: &RegistrySeed) {
+    for (what, edge) in &seed.controls {
+        assert_eq!(
+            declaration(pool, *edge).await,
+            (Some(seed.h), None),
+            "CALIBRATION: a ('group', H) edge onto a public {what} is a declaration, \
+             and is recorded (not skipped as dangling)"
+        );
+    }
+}
+
+/// Once 258 meets a frame, context, perspective or community endpoint with
+/// its own row, a `('group', H)` edge from a public claim onto one private to
+/// H is DERIVED (the meet), not declared: 260's backfill must ask the same
+/// oracle as its trigger and record nothing, or the edge keeps H as a
+/// declaration forever (a revert or a publicized registry row would then put
+/// it back on H instead of re-meeting it).
+#[sqlx::test(migrations = false)]
+async fn the_260_backfill_never_records_a_private_registry_endpoint_edge(pool: PgPool) {
+    migrate(&pool, &up_to(259)).await;
+    if !MIGRATOR.migrations.iter().any(|m| m.version == 258) {
+        sqlx::raw_sql(ORACLE_258)
+            .execute(&pool)
+            .await
+            .expect("install 258's epigraph_node_tenancy");
+    }
+    let seed = seed_registry_endpoints(&pool).await;
+    for (ty, edge) in &seed.private_registry {
+        assert_eq!(
+            tuple(&pool, *edge).await,
+            t(seed.h, "group", None),
+            "CALIBRATION: the {ty} edge is ('group', H), the meet 258 stamps"
+        );
+    }
+    migrate(&pool, &MIGRATOR).await;
+    for (ty, edge) in &seed.private_registry {
+        assert_eq!(
+            declaration(&pool, *edge).await,
+            (None, None),
+            "an edge ('group', H) because its {ty} endpoint is private to H is derived, \
+             never a declaration"
+        );
+    }
+    assert_controls_declared(&pool, &seed).await;
+}
+
+/// Below 258 the oracle meets every registry row as public, so the same
+/// edges ARE declarations (the trigger records them too until 258 applies):
+/// the backfill follows the oracle that is installed, not the registries'
+/// own `visibility` columns. 260 is applied by hand on a database below 258.
+#[sqlx::test(migrations = false)]
+async fn below_258_the_260_backfill_follows_the_oracle_that_is_installed(pool: PgPool) {
+    migrate(&pool, &up_to(257)).await;
+    let seed = seed_registry_endpoints(&pool).await;
+    let m260 = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../migrations/260_edge_declared_tenancy.sql"),
+    )
+    .expect("migration 260");
+    sqlx::raw_sql(&m260)
+        .execute(&pool)
+        .await
+        .expect("apply 260 below 258");
+    for (ty, edge) in &seed.private_registry {
+        assert_eq!(
+            declaration(&pool, *edge).await,
+            (Some(seed.h), None),
+            "below 258 the oracle calls the {ty} row public: the edge is a declaration"
+        );
+    }
+    assert_controls_declared(&pool, &seed).await;
+}
+
 async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
     let rows: Vec<String> = sqlx::query_scalar(
         "SELECT 'col edges.' || a.attname || ' ' || format_type(a.atttypid, a.atttypmod) \

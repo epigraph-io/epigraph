@@ -85,10 +85,24 @@
 -- Export `(id, declared_owner_group_id, declared_co_owner_group_id)` of the
 -- non-NULL rows first if the declarations may be wanted again.
 --
+-- ORDER WITH #1022 (258, registry endpoint tenancy): merge after #1022; it
+-- is safe either way. Section 3 and the trigger both ask whichever
+-- `epigraph_node_tenancy` is installed. In numeric order (258 first) an edge
+-- that is ('group', H) because its frame, context, perspective or community
+-- endpoint is private to H is derived, and records no declaration. If 260
+-- lands first, such a pre-existing edge is recorded as declared (the pre-258
+-- oracle calls the registry row public, as the trigger itself would until
+-- 258 applies), and 258, applied below the 260 head, never clears it; a
+-- declaration still never lets an edge out-read its endpoints' meet. Measure
+-- that exposure before choosing: the rows of `frames`, `contexts`,
+-- `perspectives` and `communities` with `visibility <> 'public'`.
+--
 -- LOCKS. The ADD COLUMN is catalog-only but takes ACCESS EXCLUSIVE on
 -- `edges`, and section 3's backfill runs in the same transaction, so every
 -- read and write of `edges` waits for the scan of the `group` edges (a
--- set-based join, no per-row function call). Apply in a maintenance window;
+-- set-based join; the tenancy oracle is called once per distinct endpoint
+-- that is not a claim, evidence row or workflow, never per edge). Apply in a
+-- maintenance window;
 -- measure `SELECT count(*) FROM edges WHERE visibility = 'group'` first. A
 -- lock-timeout failure means re-run, never force.
 
@@ -174,30 +188,57 @@ END $$;
 -- ===================================================================
 -- 3. THE EXISTING DECLARATIONS
 -- ===================================================================
--- Before the guard below watches the columns. Set-based: each endpoint's
--- tenancy is read by a LEFT JOIN on the three tables `epigraph_node_tenancy`
--- reads (claim, evidence, workflow; any other type, or a missing row, is
--- public), 219's shape, instead of two function calls per group edge: the
--- ADD COLUMN above holds ACCESS EXCLUSIVE on `edges` until commit. Only rows
--- whose endpoints exist are written (`edges_validate_refs` fires on every
--- UPDATE and would abort the migration on a dangling one); the count of
+-- Before the guard below watches the columns. "Both endpoints public" is
+-- decided by the SAME oracle the trigger above reads,
+-- `epigraph_node_tenancy`, so the backfill records exactly what the trigger
+-- would record for each row. It is set-based: the ADD COLUMN above holds
+-- ACCESS EXCLUSIVE on `edges` until commit, and two plpgsql calls per group
+-- edge would hold it for millions of calls.
+--   * a `claim`, `evidence` or `workflow` endpoint (almost every edge) is read
+--     by a LEFT JOIN on its table, 219's shape: these are the oracle's own
+--     arms (the row's visibility, NOT NULL since 062/183; a missing row is
+--     public), unchanged by every re-statement of it (070, 219, 258);
+--   * ANY OTHER endpoint type asks the oracle itself, once per DISTINCT
+--     (id, type) among the candidate edges (`other_node`, MATERIALIZED, then
+--     hash-joined). Which other types it meets with their own row depends on
+--     the oracle installed: below 258 every other type is public; from 258 a
+--     group-private frame, context, perspective or community is not. An
+--     inline join on those registries' `visibility` would disagree with a
+--     pre-258 oracle, and one that treated them as public would record a
+--     DERIVED edge (('group', H) because its registry endpoint is private to
+--     H) as a declaration, permanently.
+-- Only rows whose endpoints exist are written (`edges_validate_refs` fires on
+-- every UPDATE and would abort the migration on a dangling one); the count of
 -- skipped rows is reported.
 DO $$
 DECLARE v_marked bigint; v_dangling bigint;
 BEGIN
-    WITH both_public AS (
+    WITH grp AS NOT MATERIALIZED (
         SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type
           FROM public.edges e
-          LEFT JOIN public.claims    sc ON e.source_type = 'claim'    AND sc.id = e.source_id
-          LEFT JOIN public.evidence  se ON e.source_type = 'evidence' AND se.id = e.source_id
-          LEFT JOIN public.workflows sw ON e.source_type = 'workflow' AND sw.id = e.source_id
-          LEFT JOIN public.claims    tc ON e.target_type = 'claim'    AND tc.id = e.target_id
-          LEFT JOIN public.evidence  te ON e.target_type = 'evidence' AND te.id = e.target_id
-          LEFT JOIN public.workflows tw ON e.target_type = 'workflow' AND tw.id = e.target_id
          WHERE e.visibility = 'group'
            AND e.declared_owner_group_id IS NULL
-           AND COALESCE(sc.visibility, se.visibility, sw.visibility, 'public') = 'public'
-           AND COALESCE(tc.visibility, te.visibility, tw.visibility, 'public') = 'public'
+    ), other_node AS MATERIALIZED (
+        SELECT k.id, k.type, n.v
+          FROM (SELECT DISTINCT x.id, x.type
+                  FROM grp g
+                 CROSS JOIN LATERAL (VALUES (g.source_id, g.source_type),
+                                            (g.target_id, g.target_type)) x (id, type)
+                 WHERE x.type NOT IN ('claim', 'evidence', 'workflow')) k
+          CROSS JOIN LATERAL public.epigraph_node_tenancy(k.id, k.type) n
+    ), both_public AS (
+        SELECT g.id, g.source_id, g.source_type, g.target_id, g.target_type
+          FROM grp g
+          LEFT JOIN public.claims    sc ON g.source_type = 'claim'    AND sc.id = g.source_id
+          LEFT JOIN public.evidence  se ON g.source_type = 'evidence' AND se.id = g.source_id
+          LEFT JOIN public.workflows sw ON g.source_type = 'workflow' AND sw.id = g.source_id
+          LEFT JOIN other_node       so ON so.type = g.source_type    AND so.id = g.source_id
+          LEFT JOIN public.claims    tc ON g.target_type = 'claim'    AND tc.id = g.target_id
+          LEFT JOIN public.evidence  te ON g.target_type = 'evidence' AND te.id = g.target_id
+          LEFT JOIN public.workflows tw ON g.target_type = 'workflow' AND tw.id = g.target_id
+          LEFT JOIN other_node       tn ON tn.type = g.target_type    AND tn.id = g.target_id
+         WHERE COALESCE(sc.visibility, se.visibility, sw.visibility, so.v, 'public') = 'public'
+           AND COALESCE(tc.visibility, te.visibility, tw.visibility, tn.v, 'public') = 'public'
     ), cand AS (
         SELECT b.id,
                (public.validate_edge_reference(b.source_id, b.source_type)
