@@ -118,6 +118,9 @@
 //! * `group-member add|remove|set-role` — change its roster: an operated agent
 //!   is a member only where its operator writes, the last live admin stays,
 //!   and a removal is a revoke. Each act audited (`group.member_*`).
+//!   `add --role writer` and `remove` also reach a PERSONAL group for one
+//!   member only: the client-allowlisted agent of the group's owner
+//!   (migration 235, SR-3 GAP-4); the row lapses with the allowance.
 //!
 //! And an OAuth cleanup (backlog d3cdd376; see [`dcr_sweep`]):
 //!

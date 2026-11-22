@@ -3387,6 +3387,22 @@ restart.
   "no team", so a binary ahead of the migration reads exactly as before. Undo:
   `docs/runbooks/234-undo.sql`. **Deploy order:** none required; migrate first for the new
   reads to take effect.
+- **235**: `personal_group_allowlisted_writer` (security ruling SR-3, gap GAP-4; backlog
+  e694b36e). Re-states 164's `epigraph_team_group_add_member` and
+  `epigraph_team_group_remove_member` and 165's `epigraph_live_memberships` (an md5
+  precondition refuses to apply over any other body). `group-member add` admits ONE
+  personal-group member: a `writer` that is the client-allowlisted agent (149,
+  `epigraph_author_binding = 'client_allowlist'`) whose live human is the group's owner, on
+  the maintenance DSN; every other personal-group add is still `GRP05`. `remove` revokes such
+  a row (allowance live or revoked); `set-role` is unchanged. The viewer's group set
+  (`epigraph_live_memberships`) counts a personal-group row of an agent that has an allowance
+  row naming the owner only while that agent's live human is the owner, so the row lapses
+  with the allowance (it also reaches a pre-existing row of that shape). Audit rows carry
+  `arm` and `kind`. Owner and grants unchanged. Pinned by
+  `epigraph-db/tests/personal_group_allowlisted_writer.rs` (each refusal mutation-tested,
+  the RLS write on an armed database, the run-token delegation, the undo) and
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
+  `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
 
 ## `-- no-transaction` migrations
 
