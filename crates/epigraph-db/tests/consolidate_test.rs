@@ -871,3 +871,94 @@ async fn identity_mode_is_refused_by_the_merge_act_and_writes_nothing(pool: PgPo
             .unwrap();
     assert_eq!(current, 2, "no source retired");
 }
+
+/// The refusal kind of `err`, or `None` for anything that is not a
+/// repo-authored refusal.
+fn refusal_kind(err: &epigraph_db::DbError) -> Option<epigraph_db::RefusalKind> {
+    match err {
+        epigraph_db::DbError::Refused { kind, .. } => Some(*kind),
+        _ => None,
+    }
+}
+
+/// Every refusal the merge act authors carries the kind the transports answer
+/// it by (backlog dca9ed56 part 3): the request's own shape is `Input` (HTTP
+/// 400), a source the graph has already retired is `State` (HTTP 409). Each
+/// kind was set only by classification at its site; nothing triggered them.
+/// A missing source is `NotFound`, never a `Refused` of any kind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_merge_refusal_carries_its_kind(pool: PgPool) {
+    use epigraph_db::RefusalKind::{Input, State};
+    let agent = seed_agent(&pool).await;
+    let a = seed_claim(&pool, agent, "kind a", &[]).await;
+    let b = seed_claim(&pool, agent, "kind b", &[]).await;
+    let merge = |ids: Vec<Uuid>, content: &'static str| {
+        let pool = pool.clone();
+        async move {
+            ClaimRepository::consolidate(
+                &pool,
+                &ids,
+                content,
+                0.8,
+                ConsolidateMode::Merge,
+                "kinds",
+                agent,
+            )
+            .await
+            .expect_err("refused")
+        }
+    };
+
+    let too_many: Vec<Uuid> = (0..21).map(|_| Uuid::new_v4()).collect();
+    for (what, err) in [
+        ("one source", merge(vec![a], "x").await),
+        ("21 sources", merge(too_many, "x").await),
+        ("a source named twice", merge(vec![a, a], "x").await),
+        ("blank merged content", merge(vec![a, b], "   ").await),
+    ] {
+        assert_eq!(refusal_kind(&err), Some(Input), "{what}: {err:?}");
+    }
+
+    // A source retired before this merge (here by a first merge).
+    let c = seed_claim(&pool, agent, "kind c", &[]).await;
+    let d = seed_claim(&pool, agent, "kind d", &[]).await;
+    ClaimRepository::consolidate(
+        &pool,
+        &[a, c],
+        "kind first merge",
+        0.8,
+        ConsolidateMode::Merge,
+        "first",
+        agent,
+    )
+    .await
+    .expect("first merge");
+    let err = merge(vec![a, d], "kind second merge").await;
+    assert_eq!(refusal_kind(&err), Some(State), "a retired source: {err:?}");
+    assert!(format!("{err}").contains("not current"), "{err}");
+
+    // A current source that already names a predecessor (a revision
+    // successor): a merge would overwrite its lineage.
+    let older = seed_claim(&pool, agent, "kind older revision", &[]).await;
+    let newer = seed_claim(&pool, agent, "kind newer revision", &[]).await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(older)
+        .execute(&pool)
+        .await
+        .expect("retire the older revision");
+    sqlx::query("UPDATE claims SET supersedes = $1 WHERE id = $2")
+        .bind(older)
+        .bind(newer)
+        .execute(&pool)
+        .await
+        .expect("make newer its successor");
+    let err = merge(vec![newer, d], "kind merge over a successor").await;
+    assert_eq!(refusal_kind(&err), Some(State), "a successor: {err:?}");
+    assert!(format!("{err}").contains("already superseded"), "{err}");
+
+    let err = merge(vec![d, Uuid::new_v4()], "kind merge of a ghost").await;
+    assert!(
+        matches!(err, epigraph_db::DbError::NotFound { .. }),
+        "a missing source is not found, not a refusal: {err:?}"
+    );
+}
