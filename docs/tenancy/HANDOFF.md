@@ -213,6 +213,7 @@ anything added in 0.8.1–0.8.6 without confirming prod's patch version.
   This is exactly the failure class the plan's §12 summary names — *"a derived
   table nobody listed keeps the plaintext public after privatization"*. The
   registry CATCHES it; it does not CLOSE it. All twelve `tenancy_exempt` rows
+  (eleven since migration 240 covered `behavioral_executions`)
   carry `reviewed_by = 'PENDING'`, which is honest — nothing in PR-05 could
   cause a review — but it means the registry's "named reviewer" property is
   currently unmet for every row. `tenancy_coverage.rs::
