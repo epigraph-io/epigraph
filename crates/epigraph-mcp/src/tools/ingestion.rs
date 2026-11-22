@@ -800,12 +800,13 @@ fn is_cc_jurisdiction_port(port: &str) -> bool {
 /// hash of the passage; the passage text itself only when the source's
 /// licence permits retention ([`passage_retention_permitted`]).
 ///
-/// For a Tier-1 extraction (one carrying `source_text` and byte spans) a
-/// reader who holds the source re-derives the quote from the locator's span
-/// and checks it against the hash. For a Tier-2 extraction the locator names
-/// the extractor's section/paragraph path and section title only, and the
-/// hash covers the extracted text, which need not match the source byte for
-/// byte; there the hash pins what was extracted, not a reproducible span.
+/// When the locator carries a byte span (a Tier-1 extraction, or a passage
+/// the planner found verbatim in `source_text`), a reader who holds the source
+/// re-derives the quote from it and checks it against the hash. Otherwise the
+/// locator ends in `source_verifiable: false` (a Tier-2 extraction with no
+/// `source_text`, or a passage that does not occur in it), and the hash pins
+/// what was extracted, not a reproducible span (backlog c083c1c9; see
+/// `epigraph_ingest::document::builder::passage_locator`).
 ///
 /// This removes the passage from the evidence row only. A level-2 paragraph
 /// claim's own `content` is still the paragraph text (see

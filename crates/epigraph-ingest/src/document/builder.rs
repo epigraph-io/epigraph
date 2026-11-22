@@ -175,16 +175,52 @@ fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
     })
 }
 
-/// The [`PlannedClaim::supporting_locator`] of a section or paragraph node:
-/// its extraction path, the section title a reader can find in the source,
-/// and the byte span into `source_text` when the extractor supplied one.
-/// Only a Tier-1 extraction has that span; a Tier-2 locator indexes the
-/// extractor's output, not the source document.
+/// The suffix a [`PlannedClaim::supporting_locator`] carries when no byte span
+/// into the source reproduces the passage (backlog c083c1c9): a Tier-2
+/// extraction with no `source_text`, or a passage the extractor rewrote so it
+/// occurs nowhere in `source_text`. A reader of a withheld passage then knows
+/// the stored hash pins what was extracted, not a quote they can re-derive.
+pub const NOT_SOURCE_VERIFIABLE: &str = "source_verifiable: false";
+
+/// Where `passage` sits in the extraction's `source_text`: the span the
+/// extractor supplied when there is one, else the first byte-exact occurrence
+/// of `passage` in `source_text`. `None` when there is no `source_text` (Tier
+/// 2) or the passage does not occur in it verbatim. A found span always
+/// satisfies `source_text[start..end] == passage`, so a reader who holds the
+/// source re-derives exactly the bytes the evidence hash covers.
 #[must_use]
-pub fn passage_locator(path: &str, section_title: &str, span: Option<&ByteSpan>) -> String {
-    let mut locator = format!("{path} ({section_title:?})");
-    if let Some(span) = span {
-        locator.push_str(&format!(", bytes {}..{}", span.start, span.end));
+pub fn locate_passage(
+    extraction: &DocumentExtraction,
+    passage: &str,
+    supplied: Option<&ByteSpan>,
+) -> Option<ByteSpan> {
+    if let Some(span) = supplied {
+        return Some(span.clone());
+    }
+    let source = extraction.source_text.as_deref()?;
+    if passage.is_empty() {
+        return None;
+    }
+    source.find(passage).map(|start| ByteSpan {
+        start,
+        end: start + passage.len(),
+    })
+}
+
+/// The [`PlannedClaim::supporting_locator`] of a thesis, section or paragraph
+/// node: its extraction path, the section title a reader can find in the
+/// source (none for the thesis), and then EITHER the byte span into
+/// `source_text` ([`locate_passage`]) OR the [`NOT_SOURCE_VERIFIABLE`] flag.
+/// Every locator a document plan writes ends in exactly one of the two.
+#[must_use]
+pub fn passage_locator(path: &str, section_title: Option<&str>, span: Option<&ByteSpan>) -> String {
+    let mut locator = match section_title {
+        Some(title) => format!("{path} ({title:?})"),
+        None => path.to_string(),
+    };
+    match span {
+        Some(span) => locator.push_str(&format!(", bytes {}..{}", span.start, span.end)),
+        None => locator.push_str(&format!(", {NOT_SOURCE_VERIFIABLE}")),
     }
     locator
 }
@@ -239,7 +275,11 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             evidence_type: None,
             axis: None,
             supporting_text: None,
-            supporting_locator: Some("thesis".to_string()),
+            supporting_locator: Some(passage_locator(
+                "thesis",
+                None,
+                locate_passage(extraction, thesis_text, None).as_ref(),
+            )),
             enrichment: serde_json::json!({}),
         });
         Some(id)
@@ -276,7 +316,11 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             // axis on them would have nothing to place.
             axis: None,
             supporting_text: None,
-            supporting_locator: Some(passage_locator(&section_path, &section.title, None)),
+            supporting_locator: Some(passage_locator(
+                &section_path,
+                Some(&section.title),
+                locate_passage(extraction, &section.title, None).as_ref(),
+            )),
             enrichment: serde_json::json!({}),
         });
 
@@ -288,7 +332,11 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
 
         for (pi, paragraph) in section.paragraphs.iter().enumerate() {
             let para_path = format!("{section_path}.paragraphs[{pi}]");
-            let para_locator = passage_locator(&para_path, &section.title, paragraph.span.as_ref());
+            let para_locator = passage_locator(
+                &para_path,
+                Some(&section.title),
+                locate_passage(extraction, &paragraph.text, paragraph.span.as_ref()).as_ref(),
+            );
             let para_hash = content_hash(&paragraph.text);
             let para_seed = format!("{doc_title}\u{1f}{para_path}");
             let para_id = compound_claim_id(&para_hash, &para_seed);
@@ -530,5 +578,155 @@ mod source_type_guard {
              written before backlog 6178a205 share the stamp but store the PLAIN hash, so \
              listing the stamp here would excuse a tampered legacy workflow phase/step body"
         );
+    }
+}
+
+/// Backlog c083c1c9: every passage locator a document plan writes either
+/// carries a byte span into the source that reproduces the hashed passage, or
+/// says explicitly that it is not source-verifiable. Before the fix a Tier-2
+/// extraction (no `source_text`) got a span-less locator with no flag, and a
+/// span-less paragraph in an extraction that DID carry `source_text` was never
+/// located in it.
+#[cfg(test)]
+mod passage_locator_tests {
+    use super::build_ingest_plan;
+    use crate::common::plan::PlannedClaim;
+    use crate::document::schema::DocumentExtraction;
+
+    const FLAG: &str = ", source_verifiable: false";
+    const THESIS: &str = "Locators either reproduce or admit they cannot";
+    const PARA: &str = "The measured value was 4.2 under the stated conditions.";
+
+    fn extraction(
+        source_text: Option<&str>,
+        para_span: Option<(usize, usize)>,
+    ) -> DocumentExtraction {
+        let mut paragraph = serde_json::json!({
+            "text": PARA,
+            "atoms": ["The measured value was 4.2"],
+            "generality": [1],
+            "confidence": 0.8
+        });
+        if let Some((start, end)) = para_span {
+            paragraph["span"] = serde_json::json!({"start": start, "end": end});
+        }
+        let mut json = serde_json::json!({
+            "source": {"title": "Locator Paper", "source_type": "Paper", "authors": []},
+            "thesis": THESIS,
+            "thesis_derivation": "TopDown",
+            "sections": [{"title": "Results", "paragraphs": [paragraph]}],
+            "relationships": []
+        });
+        if let Some(src) = source_text {
+            json["source_text"] = serde_json::json!(src);
+        }
+        serde_json::from_value(json).expect("fixture parses")
+    }
+
+    /// The passage the evidence writer hashes for this claim
+    /// (`literature_evidence_body`: `supporting_text`, else `content`).
+    fn passage(c: &PlannedClaim) -> &str {
+        c.supporting_text.as_deref().unwrap_or(&c.content)
+    }
+
+    /// `(start, end)` parsed from a locator's `, bytes a..b` suffix.
+    fn span_of(locator: &str) -> Option<(usize, usize)> {
+        let (_, tail) = locator.rsplit_once(", bytes ")?;
+        let (a, b) = tail.split_once("..")?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    }
+
+    /// The invariant: a span that reproduces the passage from `source`, or the
+    /// explicit flag. Never neither, never both.
+    fn assert_every_locator_verifiable_or_flagged(claims: &[PlannedClaim], source: Option<&str>) {
+        for c in claims {
+            let loc = c
+                .supporting_locator
+                .as_deref()
+                .expect("document claims carry a locator");
+            match (span_of(loc), loc.ends_with(FLAG)) {
+                (Some((a, b)), false) => {
+                    if let Some(src) = source {
+                        assert_eq!(
+                            src.get(a..b),
+                            Some(passage(c)),
+                            "span must reproduce the hashed passage: {loc}"
+                        );
+                    }
+                }
+                (None, true) => {}
+                other => panic!("locator neither spanned nor flagged ({other:?}): {loc}"),
+            }
+        }
+    }
+
+    #[test]
+    fn tier2_locators_are_flagged_not_source_verifiable() {
+        let plan = build_ingest_plan(&extraction(None, None));
+        assert_eq!(plan.claims.len(), 4, "thesis, section, paragraph, atom");
+        for c in &plan.claims {
+            let loc = c.supporting_locator.as_deref().unwrap();
+            assert!(
+                loc.ends_with(FLAG),
+                "Tier-2 locator must carry the flag: {loc}"
+            );
+        }
+        assert_every_locator_verifiable_or_flagged(&plan.claims, None);
+    }
+
+    #[test]
+    fn spanless_passages_found_in_source_text_get_a_byte_span() {
+        let src = format!("Header noise. {THESIS}\n\nResults\n\nPreamble. {PARA} Trailing.");
+        let plan = build_ingest_plan(&extraction(Some(&src), None));
+        let para_start = src.find(PARA).unwrap();
+        for c in plan.claims.iter().filter(|c| c.level >= 2) {
+            let loc = c.supporting_locator.as_deref().unwrap();
+            assert_eq!(
+                span_of(loc),
+                Some((para_start, para_start + PARA.len())),
+                "paragraph/atom locator: {loc}"
+            );
+        }
+        let thesis = plan.claims.iter().find(|c| c.level == 0).unwrap();
+        let t0 = src.find(THESIS).unwrap();
+        assert_eq!(
+            span_of(thesis.supporting_locator.as_deref().unwrap()),
+            Some((t0, t0 + THESIS.len()))
+        );
+        assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
+    }
+
+    #[test]
+    fn passages_missing_from_source_text_are_flagged() {
+        // The extractor paraphrased: neither the paragraph nor the thesis nor
+        // the section title occurs in the source bytes.
+        let src = "Something else entirely, with no shared sentence.";
+        let plan = build_ingest_plan(&extraction(Some(src), None));
+        for c in &plan.claims {
+            let loc = c.supporting_locator.as_deref().unwrap();
+            assert!(
+                loc.ends_with(FLAG),
+                "unlocatable passage must be flagged: {loc}"
+            );
+            assert!(span_of(loc).is_none(), "no invented span: {loc}");
+        }
+    }
+
+    #[test]
+    fn an_extractor_supplied_span_is_kept() {
+        let src = format!("xx{PARA}yy");
+        let plan = build_ingest_plan(&extraction(Some(&src), Some((2, 2 + PARA.len()))));
+        let para = plan.claims.iter().find(|c| c.level == 2).unwrap();
+        assert_eq!(
+            para.supporting_locator.as_deref(),
+            Some(
+                format!(
+                    r#"sections[0].paragraphs[0] ("Results"), bytes 2..{}"#,
+                    2 + PARA.len()
+                )
+                .as_str()
+            )
+        );
+        assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
     }
 }

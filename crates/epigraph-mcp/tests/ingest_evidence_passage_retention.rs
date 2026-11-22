@@ -140,6 +140,14 @@ async fn document_ingest_drops_passage_when_licence_unknown(pool: PgPool) {
         );
     }
     assert_citation_locator_hash(&rows, 2);
+    // Backlog c083c1c9: the fixture carries no `source_text`, so the thesis and
+    // section rows (no extractor span) say their hash is not checkable against
+    // the source instead of presenting a bare locator.
+    let flagged = rows
+        .iter()
+        .filter(|(b, _)| b.contains(", source_verifiable: false. Passage BLAKE3: "))
+        .count();
+    assert_eq!(flagged, 2, "thesis and section rows are flagged: {rows:#?}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
