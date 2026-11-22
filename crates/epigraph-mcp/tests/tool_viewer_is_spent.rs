@@ -55,10 +55,11 @@ use std::path::{Path, PathBuf};
 /// names the function, which is the point: an exemption appearing on a READ
 /// path is almost always a leak being annotated instead of fixed.
 const EXPECTED_EXEMPTIONS: &[(&str, &str)] = &[
-    // `papers` (bibliographic records, no `owner_group_id`) and `claim_themes`
-    // (plan §2.4's registered `tenancy_exempt` table). Both reasons are written
-    // at the site. The `claim_themes` one explicitly records that §2.4's stated
-    // control — viewer-scoped clustering — is NOT delivered by PR-09.
+    // `claim_themes` (plan §2.4's registered `tenancy_exempt` table); the
+    // reason is written at the site, and explicitly records that §2.4's stated
+    // control — viewer-scoped clustering — is NOT delivered by PR-09. (`papers`
+    // left this site's exemption with migration 246: its count now carries the
+    // viewer predicate.)
     ("recall.rs", "compute_corpus_scope"),
     // (`workflow_hierarchical.rs::do_report_hierarchical_outcome_as` left this
     // set with backlog c34a0643: its `workflows` counter read-modify-write

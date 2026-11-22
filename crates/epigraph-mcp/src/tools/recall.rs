@@ -207,11 +207,12 @@ impl CentroidPopulationCache {
 
 /// Corpus cardinality reported alongside every `recall_with_context` response.
 ///
-/// PR-09: three of the four counts are viewer-scoped. `papers` and
-/// `claim_themes` are NOT in migration 062's `tier_a` array and have no
-/// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
-/// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
-/// control. Both are annotated in the SQL rather than left silent.
+/// PR-09: the claim counts are viewer-scoped, and since migration 246 the
+/// paper count is too (`papers` carries `owner_group_id`). `claim_themes` is
+/// NOT in migration 062's `tier_a` array and has no `owner_group_id`, so there
+/// is nothing to filter on: it is the table plan §2.4 registers as
+/// `tenancy_exempt`, with theme clustering as its control, and is annotated in
+/// the SQL rather than left silent.
 async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     viewer: &epigraph_db::visibility::Viewer,
@@ -228,13 +229,16 @@ async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
              WHERE (c2.properties->>'level')::int = 2
                AND ($1::bool OR c2.visibility = 'public'
                     OR c2.owner_group_id = ANY($2::uuid[]))) AS paragraph_total,
-          -- VISIBILITY-EXEMPT: `papers` is not in migration 062's tier_a array
-          -- and carries no owner_group_id. A bibliographic-record count, not
-          -- claim content.
-          (SELECT COUNT(*) FROM papers) AS paper_total,
+          -- `papers` carries owner_group_id since migration 246 (a team's or
+          -- agent's private ingest writes a group row): filtered like the
+          -- claim counts above, on top of the row security that admits the
+          -- same rows to this stamped read.
+          (SELECT COUNT(*) FROM papers p
+             WHERE ($1::bool OR p.visibility = 'public'
+                    OR p.owner_group_id = ANY($2::uuid[]))) AS paper_total,
           -- VISIBILITY-EXEMPT: `claim_themes` is the table plan §2.4 registers
-          -- as tenancy_exempt; it has no owner_group_id either, so no predicate
-          -- can be written here.
+          -- as tenancy_exempt; it has no owner_group_id, so no predicate can
+          -- be written here.
           --
           -- §2.4's stated control for that residual is viewer-scoped
           -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls

@@ -388,11 +388,13 @@ pub async fn create_paper(
 /// ([`PaperListing`]) as the caller may read them; each ingest names its
 /// agent, that agent's human and, for a caller the prompt-history gate admits,
 /// the model it ran ([`PaperIngestView`]). Every read, the registry rows
-/// included (`papers` has no row security: it is keyed on the document), runs
-/// on the caller's one stamped connection, so the page is one snapshot under
-/// `SessionGucMode::Transaction`. The full list is ordered `created_at DESC,
-/// id DESC`, so `offset` paging is stable across papers registered in the
-/// same instant.
+/// included, runs on the caller's one stamped connection, so the page is one
+/// snapshot under `SessionGucMode::Transaction`. Since migration 246 a
+/// `papers` row carries the tenancy of the ingest that wrote it: the registry
+/// statements carry the viewer's predicate as well as the row security that
+/// admits the same rows, so a non-member's list and count omit a group's
+/// private copy. The full list is ordered `created_at DESC, id DESC`, so
+/// `offset` paging is stable across papers registered in the same instant.
 #[cfg(feature = "db")]
 pub async fn list_papers(
     State(state): State<AppState>,
@@ -422,45 +424,62 @@ pub async fn list_papers(
         let spellings = epigraph_db::repos::paper::document_key_spellings(doi);
         let rows = sqlx::query(
             "SELECT id, doi, title, journal, created_at FROM papers \
-             WHERE doi = ANY($1) ORDER BY array_position($1, doi) LIMIT $2 OFFSET $3",
+             WHERE doi = ANY($1) \
+               AND ($4::bool OR visibility = 'public' OR owner_group_id = ANY($5::uuid[])) \
+             ORDER BY array_position($1, doi) LIMIT $2 OFFSET $3",
         )
         .bind(&spellings)
         .bind(limit)
         .bind(offset)
+        .bind(viewer.bypass_bind())
+        .bind(viewer.group_bind().unwrap_or(&[]))
         .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
         })?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = ANY($1)")
-            .bind(&spellings)
-            .fetch_one(&mut *read)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to count papers: {e}"),
-            })?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM papers WHERE doi = ANY($1) \
+               AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))",
+        )
+        .bind(&spellings)
+        .bind(viewer.bypass_bind())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .fetch_one(&mut *read)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to count papers: {e}"),
+        })?;
         (rows, total)
     } else {
         // Full list
         let rows = sqlx::query(
             "SELECT id, doi, title, journal, created_at FROM papers \
+             WHERE ($3::bool OR visibility = 'public' OR owner_group_id = ANY($4::uuid[])) \
              ORDER BY created_at DESC, id DESC LIMIT $1 OFFSET $2",
         )
         .bind(limit)
         .bind(offset)
+        .bind(viewer.bypass_bind())
+        .bind(viewer.group_bind().unwrap_or(&[]))
         .fetch_all(&mut *read)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to query papers: {e}"),
         })?;
 
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM papers")
-            .fetch_one(&mut *read)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to count papers: {e}"),
-            })?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM papers \
+             WHERE ($1::bool OR visibility = 'public' OR owner_group_id = ANY($2::uuid[]))",
+        )
+        .bind(viewer.bypass_bind())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .fetch_one(&mut *read)
+        .await
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to count papers: {e}"),
+        })?;
         (rows, total)
     };
 

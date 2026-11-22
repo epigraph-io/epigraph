@@ -869,22 +869,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
-    // stamped: the `papers` rows and their count, read on the caller's stamped
-    // connection. Since migration 246 `papers` carries the tenancy of the
-    // ingest that wrote it, under FORCEd row security, so that connection
-    // admits only the rows the viewer may read (public, or a group in its read
-    // set). Every claim-derived field (authors, claim count, ingests) is read
-    // by `paper_listings` on the same connection, with the viewer.
-    (
-        "papers.rs",
-        "list_papers",
-        &[
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
-        ],
-    ),
+    // (`papers.rs::list_papers` left this list with backlog 34864fb5's review:
+    // its four `papers` statements now bind the viewer's predicate as well as
+    // running on the caller's stamped connection.)
     // stamped write (migration 246): the caller's home group (a definer
     // answer on the pool, as every claim-writing handler resolves it), then
     // the public paper row written and read back on the caller's stamped
