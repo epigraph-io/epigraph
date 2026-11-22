@@ -315,3 +315,77 @@ async fn a_hidden_edge_between_readable_claims_is_not_wiring(pool: PgPool) {
     );
     assert_eq!(doc["unwired"], serde_json::json!(["b41ed9e1"]));
 }
+
+const WORD_HEAD: &str = "b43fa110-0000-4000-8000-000000000011";
+const WORD_REAL: &str = "b43fa111-face-4000-8000-000000000012";
+const WORD_SIBLING: &str = "b43fa111-0000-4000-8000-000000000013";
+const DIGIT_SIBLING: &str = "b43fa112-1111-4000-8000-000000000014";
+const WORD_LINTED: &str = "b43a0a00-0000-4000-8000-000000000010";
+
+/// Backlog `5120795e`: a hex WORD after an id (`b43fa110-face`) is parsed as
+/// a uuid group. When that longer prefix names no readable claim, the lint
+/// falls back past trailing all-letter groups to the shorter prefix and
+/// reports the citation resolved there, keeping the written form. A longer
+/// prefix that does resolve wins; a group with a digit, and a full uuid, are
+/// never dropped, so they cannot be re-pointed at a sibling claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hex_word_after_an_id_falls_back_to_the_shorter_prefix(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (member, _) = fixture::seed_agent_with_group(&pool, "t43ids").await;
+    let head = claim_with_id(&pool, WORD_HEAD, member, "the head-only citation").await;
+    let real = claim_with_id(&pool, WORD_REAL, member, "a claim whose 2nd group is face").await;
+    claim_with_id(
+        &pool,
+        WORD_SIBLING,
+        member,
+        "its sibling under the same head",
+    )
+    .await;
+    claim_with_id(&pool, DIGIT_SIBLING, member, "a sibling of a digit group").await;
+    let linted = claim_with_id(
+        &pool,
+        WORD_LINTED,
+        member,
+        "Follows b43fa110-face; again b43fa110. Builds on b43fa111-face. \
+         Not b43fa112-0ca4, nor b43fa110-aaaa-bbbb-cccc-dddddddddddd.",
+    )
+    .await;
+
+    let doc = lint(&server, &pool, member, linted).await;
+    let cites = doc["citations"].as_array().expect("citations");
+    let tokens: Vec<&str> = cites.iter().map(|c| c["token"].as_str().unwrap()).collect();
+    assert_eq!(
+        tokens,
+        vec![
+            "b43fa110",
+            "b43fa111-face",
+            "b43fa112-0ca4",
+            "b43fa110-aaaa-bbbb-cccc-dddddddddddd"
+        ],
+        "`b43fa110-face` resolves at `b43fa110` and is not cited twice: {doc}"
+    );
+    assert_eq!(status_of(&doc, "b43fa110"), "unwired", "{doc}");
+    assert_eq!(
+        cites[0]["cited_as"], "b43fa110-face",
+        "the written form kept"
+    );
+    assert_eq!(cites[0]["matches"], serde_json::json!([head.to_string()]));
+
+    // The longer prefix resolves, so it wins: one match, not the ambiguous
+    // pair under the head, and no fallback is reported.
+    assert_eq!(status_of(&doc, "b43fa111-face"), "unwired");
+    assert_eq!(cites[1]["matches"], serde_json::json!([real.to_string()]));
+    assert!(cites[1].get("cited_as").is_none(), "{doc}");
+
+    // A digit group and a full uuid never fall back, though their heads
+    // name readable claims.
+    assert_eq!(status_of(&doc, "b43fa112-0ca4"), "unresolved");
+    assert_eq!(
+        status_of(&doc, "b43fa110-aaaa-bbbb-cccc-dddddddddddd"),
+        "unresolved"
+    );
+    assert_eq!(
+        doc["unwired"],
+        serde_json::json!(["b43fa110", "b43fa111-face"])
+    );
+}

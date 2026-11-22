@@ -10,7 +10,7 @@
 //! caller cannot read is not a match, so a prefix naming only hidden claims
 //! reads exactly like one naming nothing; a hidden edge is not wiring.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use rmcp::model::*;
 use serde::Serialize;
@@ -29,7 +29,8 @@ const MAX_MATCH_LIMIT: i64 = 50;
 /// readable matches than this is ambiguous whatever they are.
 const LINT_MATCHES_PER_TOKEN: i64 = 10;
 /// Distinct cited tokens the lint examines, first appearance first. Bounds
-/// the statements one call issues; `tokens_truncated` says when it bit.
+/// the statements one call issues (at most four prefix lookups per token, see
+/// [`lint_prefixes`]); `tokens_truncated` says when it bit.
 const MAX_LINT_TOKENS: usize = 100;
 
 fn success_json(value: &impl Serialize) -> Result<CallToolResult, McpError> {
@@ -108,8 +109,9 @@ pub async fn resolve_claim_id_prefix(
 /// a content hash) is not a citation.
 ///
 /// A hyphenated 4-letter hex WORD after an id (`30d8b667-face`) is read as a
-/// group and narrows the prefix; a citation written that way can come back
-/// `unresolved`. Partial groups (`30d8b667-0c`) are never kept.
+/// group and narrows the prefix here; the lint falls back past it when the
+/// longer prefix names no readable claim (see [`lint_prefixes`]). Partial
+/// groups (`30d8b667-0c`) are never kept.
 #[must_use]
 pub fn cited_id_tokens(text: &str) -> Vec<String> {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
@@ -137,9 +139,42 @@ pub fn cited_id_tokens(text: &str) -> Vec<String> {
     out
 }
 
+/// The prefixes the lint looks a cited token up at, longest first: the token
+/// itself, then, while its last group is a 4-letter hex WORD (only `a`-`f`,
+/// as in `face`, `beef`, `cafe`), the token without that group. The first
+/// that names a readable claim is the citation's precision, so
+/// `30d8b667-face` in prose resolves at `30d8b667` unless a claim really
+/// starts `30d8b667-face`.
+///
+/// Only all-letter 4-hex groups are dropped. A group with a digit
+/// (`30d8b667-0ca4`) and a full uuid (its last group is 12 hex) are what the
+/// author wrote as an id; falling back past them could re-point the citation
+/// at a sibling claim under the same head, so they resolve at full precision
+/// or not at all.
+#[must_use]
+pub fn lint_prefixes(token: &str) -> Vec<String> {
+    let mut groups: Vec<&str> = token.split('-').collect();
+    let mut out = vec![token.to_string()];
+    while groups.len() > 1 {
+        let last = groups[groups.len() - 1];
+        if last.len() != 4 || !last.chars().all(|c| matches!(c, 'a'..='f' | 'A'..='F')) {
+            break;
+        }
+        groups.pop();
+        out.push(groups.join("-"));
+    }
+    out
+}
+
 #[derive(Debug, Serialize)]
 struct Citation {
+    /// The prefix the citation resolved at; the token as written when it
+    /// resolved at none.
     token: String,
+    /// The token as written, present only when the lint fell back to a
+    /// shorter prefix ([`lint_prefixes`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cited_as: Option<String>,
     /// `wired`: a readable claim it names shares an edge with this claim.
     /// `unwired`: it names exactly one readable claim and no edge joins them.
     /// `ambiguous`: it names several readable claims and none is wired.
@@ -174,19 +209,39 @@ pub async fn lint_claim_id_citations(
     let tokens_truncated = tokens.len() > MAX_LINT_TOKENS;
     tokens.truncate(MAX_LINT_TOKENS);
 
-    let mut matches: HashMap<String, Vec<Uuid>> = HashMap::new();
+    // (token resolved at, token as written, readable matches), deduplicated
+    // on the resolved token: `30d8b667-face` falling back to `30d8b667` is
+    // the same citation as a later bare `30d8b667`.
+    let mut resolved: Vec<(String, String, Vec<Uuid>)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut all: Vec<Uuid> = Vec::new();
-    for tok in &tokens {
-        let Some((lo, hi)) = id_prefix_bounds(tok) else {
+    for written in tokens {
+        let mut at = written.clone();
+        let mut ids: Vec<Uuid> = Vec::new();
+        for prefix in lint_prefixes(&written) {
+            let Some((lo, hi)) = id_prefix_bounds(&prefix) else {
+                break;
+            };
+            let rows = ClaimIdPrefixRepository::matches(
+                &mut *read,
+                viewer,
+                lo,
+                hi,
+                LINT_MATCHES_PER_TOKEN,
+            )
+            .await
+            .map_err(internal_error)?;
+            if !rows.is_empty() {
+                at = prefix;
+                ids = rows.into_iter().map(|r| r.id).collect();
+                break;
+            }
+        }
+        if !seen.insert(at.clone()) {
             continue;
-        };
-        let rows =
-            ClaimIdPrefixRepository::matches(&mut *read, viewer, lo, hi, LINT_MATCHES_PER_TOKEN)
-                .await
-                .map_err(internal_error)?;
-        let ids: Vec<Uuid> = rows.into_iter().map(|r| r.id).collect();
+        }
         all.extend(ids.iter().copied().filter(|m| *m != id));
-        matches.insert(tok.clone(), ids);
+        resolved.push((at, written, ids));
     }
     all.sort_unstable();
     all.dedup();
@@ -197,10 +252,9 @@ pub async fn lint_claim_id_citations(
         .collect();
     read.commit().await.map_err(internal_error)?;
 
-    let citations: Vec<Citation> = tokens
+    let citations: Vec<Citation> = resolved
         .into_iter()
-        .map(|token| {
-            let ids = matches.remove(&token).unwrap_or_default();
+        .map(|(token, written, ids)| {
             let others: Vec<Uuid> = ids.iter().copied().filter(|m| *m != id).collect();
             let status = if ids.is_empty() {
                 "unresolved"
@@ -214,6 +268,7 @@ pub async fn lint_claim_id_citations(
                 "ambiguous"
             };
             Citation {
+                cited_as: (written != token).then_some(written),
                 token,
                 status,
                 matches: ids,
@@ -274,6 +329,37 @@ mod tests {
         assert_eq!(
             cited_id_tokens("1a2b3c4d-0ca4-4b7f-aa85-000000000001-old"),
             vec!["1a2b3c4d-0ca4-4b7f-aa85-000000000001"]
+        );
+    }
+
+    #[test]
+    fn the_lint_falls_back_only_past_trailing_hex_words() {
+        // Backlog `5120795e`: `30d8b667-face` must also be looked up as
+        // `30d8b667`, longest first.
+        assert_eq!(
+            lint_prefixes("30d8b667-face"),
+            vec!["30d8b667-face", "30d8b667"]
+        );
+        assert_eq!(
+            lint_prefixes("30d8b667-cafe-babe"),
+            vec!["30d8b667-cafe-babe", "30d8b667-cafe", "30d8b667"]
+        );
+        // The fallback stops at a group with a digit...
+        assert_eq!(
+            lint_prefixes("30d8b667-0ca4-beef"),
+            vec!["30d8b667-0ca4-beef", "30d8b667-0ca4"]
+        );
+        assert_eq!(lint_prefixes("30d8b667-0ca4"), vec!["30d8b667-0ca4"]);
+        // ...never drops the head, even an all-letter one...
+        assert_eq!(lint_prefixes("abcdefab"), vec!["abcdefab"]);
+        assert_eq!(
+            lint_prefixes("abcdefab-face"),
+            vec!["abcdefab-face", "abcdefab"]
+        );
+        // ...and never shortens a full uuid.
+        assert_eq!(
+            lint_prefixes("30d8b667-aaaa-bbbb-cccc-dddddddddddd"),
+            vec!["30d8b667-aaaa-bbbb-cccc-dddddddddddd"]
         );
     }
 
