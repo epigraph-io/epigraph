@@ -138,9 +138,11 @@ async fn a_writer_keyed_before_a_backfill_still_serializes_with_the_next_evolve(
     let epool = pool.clone();
     let mut evolve2 = tokio::spawn(async move {
         let mut c = epool.begin().await.unwrap();
-        assert!(WorkflowRepository::lock_step_lineage_for_evolve(&mut c, head)
-            .await
-            .unwrap());
+        assert!(
+            WorkflowRepository::lock_step_lineage_for_evolve(&mut c, head)
+                .await
+                .unwrap()
+        );
         let set = WorkflowRepository::workflows_executing_step_lineage(&mut c, head)
             .await
             .unwrap();
