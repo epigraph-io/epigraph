@@ -30,13 +30,17 @@
 //! * `--undo <snapshot>` re-inserts each deleted row from its stored image
 //!   where its id and key are still free, then restores the caches of the
 //!   holders whose every row came back by compare-and-set (a cache written
-//!   since the sweep is reported and left alone). `--dry-run` runs every
+//!   since the sweep is reported and left alone), and writes one
+//!   `k10_retro.sweep_undone` audit row: with the rows when it re-inserts
+//!   any, otherwise after the caches when it restores only caches (the re-run
+//!   of an undo whose cache step failed). `--dry-run` runs every
 //!   statement and rolls back. The outcomes go to `--report` (default
 //!   `<snapshot>.undo-<UTC stamp>[-dry-run].json`, created new), which is
 //!   kept once the rows' transaction has ended, whatever follows. Exit 1 when
-//!   a row could not be re-inserted or the cache step failed (the report then
-//!   names the rows' errors, or carries `caches_error`); the rows it did
-//!   re-insert stay committed.
+//!   a row could not be re-inserted, the cache step failed, or the audit row
+//!   of a caches-only undo could not be written (the report then names the
+//!   rows' errors, or carries `caches_error` or `caches_audit_error`); the
+//!   rows and caches it did restore stay committed.
 //!
 //! # Authority
 //!
@@ -63,8 +67,8 @@ use uuid::Uuid;
 use epigraph_cli::belief_cache::{plan_restore, restore_wave_with, RestoreOptions, RestoreReport};
 use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::k10_retro::{
-    apply, compare_to_measurement, dry_run, expected_block, read_snapshot, restore_rows, Operator,
-    BIN, DEFAULT_TOP,
+    apply, audit_cache_undo, cache_undo_needs_audit, compare_to_measurement, dry_run,
+    expected_block, read_snapshot, restore_rows, Operator, BIN, DEFAULT_TOP,
 };
 
 #[derive(Parser, Debug)]
@@ -332,6 +336,18 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         .await
         .err()
         .map(|e| format!("{e:#}"));
+        // An undo that re-inserted no row wrote no audit row with them; if it
+        // restored any cache, record it now (also after a failed later batch:
+        // the earlier batches are committed).
+        let (cache_audit, cache_audit_error) =
+            if cache_undo_needs_audit(cli.dry_run, &rows, &caches) {
+                match audit_cache_undo(&mut *conn, &op, snap.audit_event_id, &rows, &caches).await {
+                    Ok(id) => (Some(id), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            } else {
+                (None, None)
+            };
         let mut cache_buckets = serde_json::Map::new();
         for (name, ids) in caches.buckets() {
             cache_buckets.insert(name.to_string(), serde_json::json!(ids));
@@ -346,6 +362,8 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
                 "caches": cache_buckets,
                 "caches_held_back": held_back,
                 "caches_error": cache_error,
+                "caches_audit_event_id": cache_audit,
+                "caches_audit_error": cache_audit_error,
             }),
         )
         .with_context(|| format!("write {}", out_path.display()))?;
@@ -366,6 +384,12 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         }
         println!("caches held back (a row not back): {}", held_back.len());
         println!("report: {}", out_path.display());
+        if let Some(e) = cache_audit_error {
+            bail!(
+                "write the audit row of an undo that restored only caches: {e}; the caches it \
+                 restored stay restored, and the report names them"
+            );
+        }
         if let Some(e) = cache_error {
             bail!(
                 "restore the holders' caches: {e}; the rows' outcomes and every cache batch \

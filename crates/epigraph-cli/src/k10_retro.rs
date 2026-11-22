@@ -45,6 +45,9 @@
 //! compare-and-set from the snapshot's wave records
 //! (`belief_cache::restore_wave`), only for holders whose every row came
 //! back. Last in, first out: rows before caches. Nothing is re-derived.
+//! An undo that writes records one `k10_retro.sweep_undone` audit row: with
+//! its rows when it re-inserts any, otherwise after its cache step when that
+//! restores a cache.
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statements on
@@ -669,7 +672,9 @@ SELECT EXISTS (SELECT 1 FROM mass_functions m WHERE m.id = r.id AND to_jsonb(m.*
 /// first) from its image, in ONE transaction on `conn`, each in its own
 /// savepoint so one failure is reported alone. With `dry_run` the whole
 /// transaction is rolled back. A non-dry run that restored anything appends
-/// one audit row in the same transaction.
+/// one audit row in the same transaction. An undo that re-inserts no row but
+/// then restores caches is recorded after its cache step instead
+/// ([`cache_undo_needs_audit`], [`audit_cache_undo`]).
 ///
 /// # Errors
 /// A database error outside a row's savepoint (the transaction, the probe,
@@ -746,6 +751,66 @@ pub async fn restore_rows(
     }
     tx.commit().await?;
     Ok(report)
+}
+
+/// Whether an undo must write its audit row AFTER its cache step: a writing
+/// run whose rows' transaction re-inserted no row (so [`restore_rows`] wrote
+/// no audit row) but whose cache step restored at least one holder's cache.
+/// That is the undo an operator re-runs when an earlier undo committed the
+/// rows and then failed at the caches: without this row the caches it puts
+/// back would carry no record of who reverted them, or why.
+///
+/// An undo that re-inserted rows already has its row (written with them), and
+/// an undo that wrote nothing at all needs none.
+#[must_use]
+pub fn cache_undo_needs_audit(
+    dry_run: bool,
+    rows: &RowRestoreReport,
+    caches: &crate::belief_cache::RestoreReport,
+) -> bool {
+    !dry_run
+        && rows.restored.is_empty()
+        && (!caches.restored.is_empty() || !caches.restored_partial.is_empty())
+}
+
+/// The audit row of an undo that restored only caches (see
+/// [`cache_undo_needs_audit`]): the same event type and fields as
+/// [`restore_rows`]' row, plus every cache bucket. Written on `conn` (the
+/// maintenance connection) after the cache batches have committed, so it is
+/// not atomic with them: a failure here leaves the caches restored and is
+/// reported by the caller.
+///
+/// # Errors
+/// The audit row's write.
+pub async fn audit_cache_undo(
+    conn: &mut sqlx::PgConnection,
+    operator: &Operator,
+    snapshot_audit: Option<Uuid>,
+    rows: &RowRestoreReport,
+    caches: &crate::belief_cache::RestoreReport,
+) -> anyhow::Result<Uuid> {
+    let mut cache_buckets = serde_json::Map::new();
+    for (name, ids) in caches.buckets() {
+        cache_buckets.insert(name.to_string(), serde_json::json!(ids));
+    }
+    audit(
+        conn,
+        EVENT_UNDONE,
+        serde_json::json!({
+            "tool": BIN,
+            "acting_agent": operator.acting_agent,
+            "reason": operator.reason,
+            "undoes": snapshot_audit,
+            "caches_only": true,
+            "rows_restored": rows.restored,
+            "rows_already_restored": rows.already_restored,
+            "rows_superseded_since_sweep": rows.superseded_since_sweep,
+            "rows_missing": rows.missing,
+            "rows_failed": rows.failed.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            "caches": cache_buckets,
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -956,6 +1021,47 @@ mod tests {
             ..RowRestoreReport::default()
         };
         assert_eq!(report.holders_whole(&deleted), HashSet::from([a, b]));
+    }
+
+    #[test]
+    fn only_a_writing_undo_that_restored_caches_and_no_row_audits_after_the_caches() {
+        use crate::belief_cache::RestoreReport;
+        let id = Uuid::new_v4();
+        let no_rows = RowRestoreReport {
+            already_restored: vec![id],
+            ..RowRestoreReport::default()
+        };
+        let rows_back = RowRestoreReport {
+            restored: vec![id],
+            ..RowRestoreReport::default()
+        };
+        let restored = RestoreReport {
+            restored: vec![id],
+            ..RestoreReport::default()
+        };
+        let partial = RestoreReport {
+            restored_partial: vec![id],
+            ..RestoreReport::default()
+        };
+        let found = RestoreReport {
+            already_restored: vec![id],
+            superseded_since_wave: vec![Uuid::new_v4()],
+            ..RestoreReport::default()
+        };
+        assert!(cache_undo_needs_audit(false, &no_rows, &restored));
+        assert!(cache_undo_needs_audit(false, &no_rows, &partial));
+        assert!(
+            !cache_undo_needs_audit(true, &no_rows, &restored),
+            "a dry run writes nothing"
+        );
+        assert!(
+            !cache_undo_needs_audit(false, &rows_back, &restored),
+            "the rows' audit row already records this undo"
+        );
+        assert!(
+            !cache_undo_needs_audit(false, &no_rows, &found),
+            "an undo that wrote nothing records nothing"
+        );
     }
 
     #[test]

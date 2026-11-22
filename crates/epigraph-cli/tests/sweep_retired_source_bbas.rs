@@ -1671,3 +1671,169 @@ async fn an_undo_that_cannot_reinsert_a_row_exits_1_and_keeps_its_report(pool: P
     );
     l.drop(&pool).await;
 }
+
+/// A writing undo of `snap` with its report at `report`.
+fn undo_to(snap: &Path, report: &Path, agent: &str, reason: &str) -> Vec<String> {
+    let mut a = undo_args(snap, Some(agent), Some(reason), true);
+    a.extend(["--report".to_string(), report.to_str().unwrap().to_string()]);
+    a
+}
+
+fn read_report(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("the undo report")).expect("JSON")
+}
+
+fn id_list(v: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = v
+        .as_array()
+        .unwrap_or_else(|| panic!("an array: {v}"))
+        .iter()
+        .map(|x| x.as_str().expect("an id").to_string())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Apply the world's sweep and return the snapshot's path and JSON.
+async fn applied(dir: &TempDir, l: &Logins, agent: &str) -> (PathBuf, serde_json::Value) {
+    let (k0, _) = measure(dir, "k0.json", l);
+    let snap = dir.path("snap.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &apply_args(&k0, &snap, agent),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "PREMISE: the apply: {r}");
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&snap).expect("the snapshot")).unwrap();
+    (snap, snapshot)
+}
+
+/// An undo whose rows came back but whose cache step failed is re-run: the
+/// re-run re-inserts no row and restores only the caches. It writes its own
+/// `k10_retro.sweep_undone` row (who, why, which apply, what it restored),
+/// as the row-restoring undo does (backlog 4da0af53 (1)).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_undo_that_restores_only_caches_writes_an_audit_row(pool: PgPool) {
+    let w = world(&pool).await;
+    let l = Logins::new(&pool).await;
+    let dir = TempDir::new();
+    let agent = w.owner.to_string();
+    let start = footprint(&pool).await;
+    let (snap, snapshot) = applied(&dir, &l, &agent).await;
+    let undone_rows =
+        "SELECT count(*) FROM security_events WHERE event_type = 'k10_retro.sweep_undone'";
+
+    // The first undo: every row comes back (and is audited with them), then
+    // every cache write raises.
+    install_fault(
+        &pool,
+        "k10r_fault_cache_restore",
+        "BEFORE UPDATE",
+        "claims",
+        "IF NEW.belief IS DISTINCT FROM OLD.belief \
+            OR NEW.plausibility IS DISTINCT FROM OLD.plausibility THEN \
+         RAISE EXCEPTION 'k10r injected cache restore fault'; END IF; RETURN NEW;",
+    )
+    .await;
+    let first = dir.path("undo-1.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_to(&snap, &first, &agent, "k10r first undo")),
+        &l.app,
+        Some(&l.maint),
+    );
+    drop_fault(&pool, "k10r_fault_cache_restore", "claims").await;
+    assert_eq!(r.code, Some(1), "PREMISE: the cache step fails: {r}");
+    let out = read_report(&first);
+    assert_eq!(
+        out["rows"]["restored"].as_array().map(Vec::len),
+        Some(3),
+        "PREMISE: every row came back: {out}"
+    );
+    assert!(
+        out["caches_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("k10r injected cache restore fault")),
+        "PREMISE: the cache step failed on the fault: {out}"
+    );
+    assert_eq!(
+        count(&pool, undone_rows).await,
+        1,
+        "PREMISE: the rows' audit row"
+    );
+
+    // The re-run: no row to re-insert, every cache to restore.
+    let second = dir.path("undo-2.json");
+    let r = run(
+        SWEEP,
+        &dir.0,
+        &owned(&undo_to(&snap, &second, &agent, "k10r caches-only undo")),
+        &l.app,
+        Some(&l.maint),
+    );
+    assert!(r.ok(), "{r}");
+    let out = read_report(&second);
+    assert_eq!(
+        out["rows"]["already_restored"].as_array().map(Vec::len),
+        Some(3),
+        "PREMISE: no row is re-inserted: {out}"
+    );
+    let holders = {
+        let mut h = vec![
+            w.refuted.to_string(),
+            w.lonely.to_string(),
+            w.private_holder.to_string(),
+        ];
+        h.sort();
+        h
+    };
+    assert_eq!(
+        id_list(&out["caches"]["restored"]),
+        holders,
+        "PREMISE: the caches are restored: {out}"
+    );
+    let (rows, caches, _) = footprint(&pool).await;
+    assert_eq!((rows, caches), (start.0, start.1), "the undo is not exact");
+
+    assert_eq!(
+        count(&pool, undone_rows).await,
+        2,
+        "an undo that restored only caches wrote no audit row"
+    );
+    let details: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'k10_retro.sweep_undone' \
+          AND details->>'reason' = 'k10r caches-only undo'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the caches-only undo's audit row");
+    assert_eq!(details["acting_agent"], agent, "{details}");
+    assert_eq!(details["undoes"], snapshot["audit_event_id"], "{details}");
+    assert_eq!(details["caches_only"], true, "{details}");
+    assert_eq!(
+        id_list(&details["caches"]["restored"]),
+        holders,
+        "{details}"
+    );
+    assert_eq!(
+        details["rows_already_restored"].as_array().map(Vec::len),
+        Some(3),
+        "{details}"
+    );
+    assert!(
+        out["caches_audit_event_id"].is_string(),
+        "the report names the audit row: {out}"
+    );
+    let agentless = count(
+        &pool,
+        "SELECT count(*) FROM security_events WHERE event_type = 'k10_retro.sweep_undone' \
+          AND agent_id IS NULL",
+    )
+    .await;
+    assert_eq!(agentless, 2, "both undo rows are agent-less");
+    l.drop(&pool).await;
+}
