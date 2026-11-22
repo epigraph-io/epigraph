@@ -3398,9 +3398,12 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   anchored path: revoke their live passkeys (`revoke-passkey`), enroll their
   hardware key again through the bootstrap (`passkey-enroll` without
   `--act`), and enroll further passkeys on acts that key confirms. With the
-  anchored setting off, nothing changes. The statement is re-verified for
-  the configured origin, so changing the origin (even under the same rp id)
-  stops `packed`/`tpm` anchors the same way.
+  anchored setting off, nothing changes. The statement is re-verified under
+  the CURRENT relying-party configuration, so changing the origin (even
+  under the same rp id) stops `packed`/`tpm` anchors the same way, and so
+  can a `webauthn-rs` upgrade that narrows its default algorithm list or
+  tightens its registration checks: re-run the anchor tests
+  (`cargo test -p epigraph-passkey --test anchor_trust`) on such an upgrade.
 
 **The accepted cost.** Once a synced passkey is registered, an elevation (and
 every admin-act confirmation) is only as strong as the password-manager
