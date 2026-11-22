@@ -70,14 +70,18 @@
 //! Apply, dry run and reverse alike: the batch's claims `FOR UPDATE`, then
 //! `SHARE ROW EXCLUSIVE` on `edges`, `harvester_fragments` and the derived
 //! tables with no key to claims (`tables::batch_lock_tables`, printed as
-//! `LOCKED-PER-BATCH`), as `regroup-claims` does. Without the first two, an
-//! edge or fragment INSERT on a moving claim that its trigger stamped from the
-//! claim's PUBLIC tuple before the batch committed would land public on a
-//! claim the batch just restricted, outside every check. With them, such an
-//! insert either commits before the batch reads its rows (and is narrowed with
-//! them) or waits until the batch commits (and is stamped from the narrowed
-//! claim). Cost: every edge and fragment write on the instance waits while a
-//! batch runs, dry runs included; keep batches short.
+//! `LOCKED-PER-BATCH`), as `regroup-claims` does. Without the `edges` lock,
+//! an edge INSERT on a moving claim that its trigger stamped from the claim's
+//! PUBLIC tuple before the batch committed would land public on a claim the
+//! batch just restricted, outside every check (an edge has no foreign key to
+//! `claims`, so nothing else makes it wait). With it, such an insert either
+//! commits before the batch reads its rows (and is narrowed with them) or
+//! waits until the batch commits (and is stamped from the narrowed claim).
+//! The `harvester_fragments` lock is defence in depth: a fragment is stamped
+//! through a `harvester_claim_provenance` insert, whose foreign key to
+//! `claims` already serialises against the batch's `FOR UPDATE`
+//! (`tables::batch_lock_tables`). Cost: every edge and fragment write on the
+//! instance waits while a batch runs, dry runs included; keep batches short.
 //!
 //! # The manifest records every row's full prior tenancy
 //!

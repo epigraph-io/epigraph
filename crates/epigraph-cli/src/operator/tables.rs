@@ -776,16 +776,27 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
 /// EXCLUSIVE` on for its duration: the derived tables with no key to claims
 /// ([`unkeyed_tables`]), plus `edges` and `harvester_fragments`.
 ///
-/// Why the last two: a concurrent INSERT of an edge (or fragment) on a moving
-/// claim is stamped by its trigger from the claim as that statement reads it,
-/// so one that read the claim before the batch's commit would land on the
-/// pre-move tuple after the commit, outside every check (for a restriction: a
-/// PUBLIC edge or fragment on a claim that is now group-private). The lock
-/// makes such an INSERT either commit before the batch reads its rows (the
-/// batch then sees and moves it) or wait until the batch commits (its trigger,
-/// which reads the claim with a fresh snapshot, then sees the move). Cost: a
-/// batch, dry runs included, blocks every edge and fragment write on the
-/// instance while it runs; keep batches short.
+/// Why `edges`: a concurrent edge INSERT on a moving claim is stamped by its
+/// trigger from the claim as that statement reads it, and an edge has no
+/// foreign key to `claims` (its endpoints are polymorphic), so nothing makes
+/// it wait for the batch's `FOR UPDATE` on the claim. One that read the claim
+/// before the batch's commit would land on the pre-move tuple after the
+/// commit, outside every check (for a restriction: a PUBLIC edge on a claim
+/// that is now group-private). The lock makes such an INSERT either commit
+/// before the batch reads its rows (the batch then sees and moves it) or wait
+/// until the batch commits (its trigger, which reads the claim with a fresh
+/// snapshot, then sees the move).
+///
+/// `harvester_fragments` is defence in depth, not a second closed gap: a
+/// fragment takes its tenancy from the AFTER INSERT statement trigger on
+/// `harvester_claim_provenance` (migration 089, ranked by 218), and that
+/// insert's foreign key to `claims` already takes `KEY SHARE` on the claim,
+/// which waits for the batch's `FOR UPDATE` (or makes the batch wait). The
+/// lock keeps any other fragment writer that reads a claim's tenancy without
+/// that key serialised too. Only the edge race is exercised by a test.
+///
+/// Cost: a batch, dry runs included, blocks every edge and fragment write on
+/// the instance while it runs; keep batches short.
 ///
 /// `reown-claims` does not use this list: it moves public claims to another
 /// public owner, and a public edge's tuple does not depend on its endpoints'

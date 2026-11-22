@@ -2068,6 +2068,11 @@ async fn a_concurrent_edge_insert_on_a_restricted_claim_is_waited_for_and_narrow
         .and_then(|rest| rest.split('\t').next())
         .map(|list| list.split(',').collect())
         .unwrap_or_default();
+    // Only the edge race is exercised above. `harvester_fragments` is pinned
+    // by the printed list alone: its lock is defence in depth, since a
+    // fragment's stamp comes through a `harvester_claim_provenance` insert
+    // whose foreign key to `claims` already waits on the batch's row lock
+    // (`tables::batch_lock_tables`).
     for t in ["edges", "harvester_fragments"] {
         assert!(
             locked.contains(&t),

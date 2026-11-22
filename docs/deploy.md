@@ -2570,12 +2570,14 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   other edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
 - **Locks**: each batch, dry runs and reversal included, holds `SHARE ROW
   EXCLUSIVE` on `edges`, `harvester_fragments` and the derived tables with no
-  key to claims (`LOCKED-PER-BATCH`), as `regroup-claims` does. An edge or
-  fragment inserted on a claim being restricted therefore either lands before
-  the batch reads its rows (and is narrowed with them) or is stamped after
-  the move; it can no longer commit public on a restricted claim. Every write
-  to those tables on the instance waits for the batch; keep `--batch-size`
-  small on a busy instance.
+  key to claims (`LOCKED-PER-BATCH`), as `regroup-claims` does. An edge
+  inserted on a claim being restricted therefore either lands before the
+  batch reads its rows (and is narrowed with them) or is stamped after the
+  move; it can no longer commit public on a restricted claim. (A fragment was
+  already safe: it is stamped through a `harvester_claim_provenance` insert,
+  whose foreign key to `claims` waits on the batch's row lock; its table lock
+  is defence in depth.) Every write to those tables on the instance waits for
+  the batch; keep `--batch-size` small on a busy instance.
 - **Not covered (outside the reversal contract)**: `claims.updated_at`. Its
   trigger (migration 001, unconditional `BEFORE UPDATE`) stamps `now()` on the
   apply and again on the reverse, so a reversal does not restore it, and both
