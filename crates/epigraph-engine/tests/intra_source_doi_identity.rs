@@ -126,3 +126,18 @@ async fn a_document_keyed_on_its_uri_still_matches_itself(pool: PgPool) {
     let elsewhere = citing_source(&pool, author, "https://example.org/reports/other.pdf").await;
     assert!(!is_intra(&pool, elsewhere, target).await);
 }
+
+/// Two equal placeholders name no document. The exact join read a paper whose
+/// stored doi is the placeholder `unknown` and evidence citing `unknown` as
+/// one source, so the edge took the intra-source discount; the shared key
+/// reads neither as a document, so the edge is cross-source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn equal_placeholders_are_not_one_source(pool: PgPool) {
+    let author = agent(&pool).await;
+    let target = asserted_target(&pool, author, "unknown").await;
+    let source = citing_source(&pool, author, "unknown").await;
+    assert!(
+        !is_intra(&pool, source, target).await,
+        "a paper and evidence that both say `unknown` are not the same document"
+    );
+}
