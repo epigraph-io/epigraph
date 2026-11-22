@@ -461,3 +461,82 @@ async fn colliding_mass_keys_are_refused_and_nothing_is_stored(
     .await;
     assert_eq!(ok["write_outcome"], "inserted", "{ok}");
 }
+
+fn assert_beta(got: (f64, f64), want: (f64, f64), what: &str) {
+    assert!(
+        (got.0 - want.0).abs() < 1e-12 && (got.1 - want.1).abs() < 1e-12,
+        "{what}: want Beta{want:?}, got Beta{got:?}"
+    );
+}
+
+/// Backlog 1ce62137: a REST evidence write on a claim with no frame link links
+/// it at hypothesis_index 0 (what every belief read resolves a missing index
+/// to), so the write moves the claim's Beta track and the next write records a
+/// divergence row. No `claim_frames` row is seeded here.
+///
+/// At origin/main the route linked the claim with a NULL index, which
+/// `beta_increments` counts as nothing: the claim stayed at Beta(1, 1), every
+/// later update was a cold start, and no divergence row was ever written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rest_write_on_an_unlinked_claim_moves_beta_and_then_records_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "1ce62137-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    let body = serde_json::json!({
+        "claim_id": w.claim, "reliability": 1.0, "masses": {"0": 0.7, "0,1": 0.3},
+    });
+
+    let first = post(&w, &token_a, body.clone()).await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.7, 1.3),
+        "the first write moves the track",
+    );
+    let index: Option<i32> = sqlx::query_scalar(
+        "SELECT hypothesis_index FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",
+    )
+    .bind(w.claim)
+    .bind(w.frame)
+    .fetch_one(&w.pool)
+    .await
+    .expect("the write links the claim to the frame");
+    assert_eq!(index, Some(0), "a new link names hypothesis 0");
+
+    // A second, independent BBA (an Inserted write under a perspective the
+    // caller owns, its confidence calibration cleared): the track is no longer
+    // at the prior, so this write records the claim's divergence.
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("1ce62137-p-{}", Uuid::new_v4()))
+    .bind(a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed perspective");
+    let mut second = body;
+    second["perspective_id"] = serde_json::json!(perspective);
+    let second = post(&w, &token_a, second).await;
+    assert_eq!(second["write_outcome"], "inserted", "{second}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (2.4, 1.6),
+        "the second write adds its own increment",
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
+            .bind(w.claim)
+            .fetch_one(&w.pool)
+            .await
+            .expect("count divergence rows");
+    assert_eq!(rows, 1, "the second write records one divergence row");
+}

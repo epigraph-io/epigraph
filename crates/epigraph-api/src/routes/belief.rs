@@ -1650,13 +1650,23 @@ pub async fn submit_evidence(
     //    and the COMMIT would silently roll the BBA back).
     //    ON CONFLICT DO NOTHING preserves an existing hypothesis_index;
     //    `FrameRepository::assign_claim` would overwrite it with NULL.
+    //    A NEW link names hypothesis 0, the index every belief read resolves a
+    //    missing one to (`edge_factor::resolve_hypothesis_index`). Linked with
+    //    a NULL index, the claim's Beta update below counted nothing
+    //    (`ds_divergence::beta_increments` has no singleton to read), so a
+    //    claim written only through this route never left Beta(1, 1) and,
+    //    every update being a cold start, never recorded a divergence row
+    //    (backlog 1ce62137). An existing NULL link is left as it is: the BBAs
+    //    already stored on it were counted as nothing, and a replacement
+    //    withdraws what its row was counted with (see 13b).
     {
         use sqlx::Acquire as _;
         let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
             message: format!("Failed to open a savepoint: {e}"),
         })?;
         let assigned = sqlx::query(
-            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(request.claim_id)
         .bind(frame_id)
