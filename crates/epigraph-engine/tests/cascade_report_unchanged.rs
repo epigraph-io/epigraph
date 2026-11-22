@@ -35,6 +35,7 @@ mod fixture;
 
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, PgPool, ScopedPool, SessionGucMode};
+use epigraph_engine::admin_cascade::report_for_caller;
 use epigraph_engine::edge_factor::{ensure_binary_frame, resolve_claim_validity_frame};
 use epigraph_engine::retraction_cascade::{cascade_after_edge_withdrawal, CascadeReport};
 use uuid::Uuid;
@@ -377,4 +378,54 @@ async fn a_cache_clear_row_security_refuses_is_reported_as_an_error(pool: PgPool
         vec![claim],
         "CALIBRATION: the owner clears the same cache: {control:?}"
     );
+}
+
+/// The caller's copy of a report (`admin_cascade::report_for_caller`) drops
+/// every claim id outside the caller's view from EVERY bucket, `unchanged`
+/// included: that bucket carries claim ids to callers who may not be members
+/// of the claims' groups. A public claim in each bucket stays; a group claim
+/// of a group the caller is not in is dropped from each.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_callers_copy_drops_unchanged_claims_outside_its_view(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "caller-copy-author").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "caller-copy-stranger").await;
+    let public = fixture::seed_public_claim(&pool, author, "readable by all").await;
+    let hidden = fixture::seed_group_claim(&pool, author, group, "not the caller's").await;
+    let both = vec![public, hidden];
+    let report = CascadeReport {
+        targets: both.clone(),
+        recomputed: both.clone(),
+        unbacked: both.clone(),
+        unchanged: both.clone(),
+        ..CascadeReport::default()
+    };
+
+    let url = fixture::database_url_for(&pool).await;
+    let app =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let viewer = Viewer::resolve(&pool, stranger)
+        .await
+        .expect("resolve the stranger");
+    let mut tx = app.begin_as(&viewer).await.expect("stamped app session");
+    let copy = report_for_caller(&mut tx, &viewer, &report).await;
+    tx.rollback().await.expect("rollback");
+
+    assert_eq!(
+        copy.unchanged,
+        vec![public],
+        "an unchanged claim outside the caller's view is dropped: {copy:?}"
+    );
+    for (name, bucket) in [
+        ("targets", &copy.targets),
+        ("recomputed", &copy.recomputed),
+        ("unbacked", &copy.unbacked),
+    ] {
+        assert_eq!(
+            bucket,
+            &vec![public],
+            "CALIBRATION: {name} is filtered the same way: {copy:?}"
+        );
+    }
 }
