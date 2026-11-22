@@ -304,7 +304,24 @@ pub async fn create_agent(
         }
     }
 
-    Ok(Json(created_agent.into()))
+    // On a find-hit the response is an EXISTING agent's row, and `orcid` /
+    // `ror_id` are its profile DETAILS (backlog 761c2b05): posting someone
+    // else's public key (which `GET /api/v1/agents` serves) must not read back
+    // a private profile's ORCID. This handler has no viewer, so it applies
+    // the strict arms of the profile rule only: the agent itself or
+    // `claims:admin` sees them; everyone else gets null, even for a public
+    // profile, whose detail `GET /api/v1/agents/:id` still serves. A newly
+    // created row echoes what this caller just supplied.
+    let mut response: AgentResponse = created_agent.into();
+    if !was_created
+        && auth.agent_id != Some(new_agent_id)
+        && !auth.has_scope(epigraph_core::canonical_scopes::CLAIMS_ADMIN)
+    {
+        response.orcid = None;
+        response.ror_id = None;
+    }
+
+    Ok(Json(response))
 }
 
 /// Create a new agent (placeholder - no database)

@@ -202,3 +202,93 @@ async fn registering_an_agent_mints_no_login_without_an_admin_login_request(pool
         "only the admin's explicit login is active"
     );
 }
+
+/// `POST /api/v1/agents` with an EXISTING agent's key is a find-hit that
+/// returns that agent's row. It must not read back a private ORCID / ROR id
+/// (backlog 761c2b05): `GET /api/v1/agents` serves every agent's
+/// `public_key`, and `agents:write` is in every read-write token, so posting
+/// the key back would undo the profile-visibility rule in two requests.
+/// Positive controls: the agent itself and a `claims:admin` caller still read
+/// them, and a fresh registration echoes what its caller supplied.
+#[sqlx::test(migrations = "../../migrations")]
+async fn re_registering_an_existing_key_does_not_read_back_its_private_profile(pool: PgPool) {
+    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let (writer_client, writer_agent) = caller(&pool, "outsider-writer").await;
+    let writer = token(&state, writer_client, writer_agent, &["agents:write"]);
+    let (admin_client, admin_agent) = caller(&pool, "admin").await;
+    let admin = token(
+        &state,
+        admin_client,
+        admin_agent,
+        &["agents:write", "claims:admin"],
+    );
+    // The profiled agent holds its own client, so it can post its own key.
+    let (own_client, profiled) = caller(&pool, "private-profile").await;
+    let own = token(&state, own_client, profiled, &["agents:write"]);
+    sqlx::query(
+        "UPDATE agents SET orcid = '0000-0002-1825-0097', ror_id = '03yrm5c26', \
+                profile_visibility = 'group' WHERE id = $1",
+    )
+    .bind(profiled)
+    .execute(&pool)
+    .await
+    .expect("private profile");
+    let key_hex = hex::encode(blake3::hash(b"private-profile").as_bytes());
+
+    let post = |access: String, body: Value| {
+        let state = state.clone();
+        async move {
+            let resp = create_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/v1/agents")
+                        .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+            )
+        }
+    };
+
+    // The outsider posts the private agent's key: the SAME row comes back
+    // (a find-hit, not a new agent), with no profile detail.
+    let (status, body) = post(writer.clone(), json!({ "public_key": key_hex })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["id"],
+        profiled.to_string(),
+        "CALIBRATION: a find-hit returns the existing agent: {body}"
+    );
+    assert!(
+        body["orcid"].is_null() && body["ror_id"].is_null(),
+        "re-registering an existing key read back its private ORCID / ROR id: {body}"
+    );
+
+    // Positive controls: the agent itself, and an admin, read both.
+    for (who, access) in [("self", own), ("admin", admin)] {
+        let (status, body) = post(access, json!({ "public_key": key_hex })).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {body}");
+        assert_eq!(body["id"], profiled.to_string(), "{who}: {body}");
+        assert_eq!(body["orcid"], "0000-0002-1825-0097", "{who}: {body}");
+        assert_eq!(body["ror_id"], "03yrm5c26", "{who}: {body}");
+    }
+
+    // A fresh registration echoes the ORCID its caller supplied.
+    let (status, body) = post(
+        writer,
+        json!({ "public_key": hex::encode([0x51u8; 32]), "orcid": "0000-0001-5109-3700" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_ne!(body["id"], profiled.to_string(), "{body}");
+    assert_eq!(body["orcid"], "0000-0001-5109-3700", "{body}");
+}
