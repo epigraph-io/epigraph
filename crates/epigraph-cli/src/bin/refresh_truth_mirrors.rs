@@ -40,7 +40,8 @@
 //!
 //! Output files are never overwritten (they are created new, before the
 //! database is touched; a run refused because one exists leaves no file of
-//! its own behind). A run that stops on an error still writes its report,
+//! its own behind). A run that stops on an error, including one that cannot
+//! connect, still writes its report,
 //! marked `"partial": true` with the error, holding the outcomes of every
 //! batch that committed (for an apply, exactly the writes in the record
 //! file). A writing run (`--apply`, or `--restore` without
@@ -80,7 +81,10 @@ struct Cli {
     /// Admit round-valued mirrors (multiples of 0.001), held by default.
     #[arg(long, conflicts_with = "restore")]
     include_round: bool,
-    /// Undo the writes of a record file.
+    /// Undo the writes of a record file: each `truth_before` goes back where
+    /// `truth_value` still holds what the refresh wrote, current or not; a
+    /// restored claim that is no longer current is counted
+    /// `restored_not_current`, apart from `restored`.
     #[arg(long)]
     restore: Option<PathBuf>,
     /// Write nothing. For a refresh this is the default, spelled out; with
@@ -209,48 +213,50 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let report_w = writers.next().expect("the report writer");
     let mut record_w = writers.next();
 
-    let maint = epigraph_cli::MaintenancePool::connect(BIN)
-        .await
-        .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    // The bypass viewer is spent on `claim_role::roles_batch` only, on the
-    // maintenance connection, for as long as the run lasts.
-    let session = maint
-        .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
-        .await
-        .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
-    let viewer = session.viewer();
     let opts = RefreshOptions {
         batch_size: cli.batch_size,
         include_round: cli.include_round,
     };
 
+    // Everything from the first connection on is inside `result`, so a run
+    // that cannot even connect still writes its (empty, partial) report.
     let mut report = MirrorReport::default();
-    let result = match (cli.apply, record_w.as_mut()) {
-        (true, Some(w)) => {
-            apply_into(
-                maint.pool(),
-                viewer,
-                &candidates,
-                &opts,
-                &mut report,
-                |rec| {
-                    write_truth_record(w, rec)?;
-                    w.flush()?;
-                    w.get_ref().sync_data()?;
-                    Ok(())
-                },
-            )
+    let result: anyhow::Result<()> = async {
+        let maint = epigraph_cli::MaintenancePool::connect(BIN)
             .await
-        }
-        (true, None) => Err(anyhow::anyhow!("--apply without a record file")),
-        (false, _) => match dry_run(maint.pool(), viewer, &candidates, &opts).await {
-            Ok(r) => {
-                report = r;
+            .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
+        // The bypass viewer is spent on `claim_role::roles_batch` only, on the
+        // maintenance connection, for as long as the run lasts.
+        let session = maint
+            .viewer(epigraph_db::visibility::SystemReason::BeliefRecomputation)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
+        let viewer = session.viewer();
+        match (cli.apply, record_w.as_mut()) {
+            (true, Some(w)) => {
+                apply_into(
+                    maint.pool(),
+                    viewer,
+                    &candidates,
+                    &opts,
+                    &mut report,
+                    |rec| {
+                        write_truth_record(w, rec)?;
+                        w.flush()?;
+                        w.get_ref().sync_data()?;
+                        Ok(())
+                    },
+                )
+                .await
+            }
+            (true, None) => Err(anyhow::anyhow!("--apply without a record file")),
+            (false, _) => {
+                report = dry_run(maint.pool(), viewer, &candidates, &opts).await?;
                 Ok(())
             }
-            Err(e) => Err(e),
-        },
-    };
+        }
+    }
+    .await;
 
     let dry = !cli.apply;
     let mut json = report.to_json(dry, cli.include_round, records.len());
@@ -303,17 +309,22 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
         PathBuf::from(p)
     });
     let report_w = create_new(&report_path)?;
-    let maint = epigraph_cli::MaintenancePool::connect(BIN)
-        .await
-        .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
+    // Connecting is inside `result` too: a restore that cannot connect still
+    // writes its (empty, partial) report.
     let mut report = TruthRestoreReport::default();
-    let result = restore_into(
-        maint.pool(),
-        &records,
-        cli.batch_size,
-        cli.dry_run,
-        &mut report,
-    )
+    let result: anyhow::Result<()> = async {
+        let maint = epigraph_cli::MaintenancePool::connect(BIN)
+            .await
+            .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
+        restore_into(
+            maint.pool(),
+            &records,
+            cli.batch_size,
+            cli.dry_run,
+            &mut report,
+        )
+        .await
+    }
     .await;
 
     let mut buckets = serde_json::Map::new();

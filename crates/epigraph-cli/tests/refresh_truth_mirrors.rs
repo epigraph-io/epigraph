@@ -1985,3 +1985,107 @@ async fn a_run_that_stops_writes_a_partial_report_of_what_it_committed(pool: PgP
     assert_ne!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── (24) a run that cannot connect still writes its (partial) report ───────
+
+/// The fixture's URL with its database renamed to one that does not exist:
+/// the server refuses the connection at once (3D000), after the binary has
+/// created its outputs.
+async fn url_of_a_missing_database(pool: &PgPool) -> String {
+    let url = fixture::database_url_for(pool).await;
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(url.matches(db.as_str()).count(), 1, "precondition: {url}");
+    url.replacen(db.as_str(), "refresh_truth_mirrors_no_such_db", 1)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_cannot_connect_still_writes_a_partial_report(pool: PgPool) {
+    let bad = url_of_a_missing_database(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let records = wave(&pool, &[a], "L1").await;
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+
+    // An apply: the report says why it stopped, and the record is empty
+    // (nothing was written).
+    let record = dir.join("RECORD.jsonl");
+    let report = dir.join("apply.json");
+    let o = run_bin(
+        &dir,
+        &bad,
+        &[
+            "--waves",
+            wave_file.to_str().unwrap(),
+            "--apply",
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert!(
+        j["error"].as_str().unwrap().contains("maintenance pool"),
+        "{}",
+        j["error"]
+    );
+    assert_eq!(j["claims"], 0);
+    assert!(std::fs::read(&record).unwrap().is_empty());
+
+    // A restore, likewise.
+    let restore_record = dir.join("RESTORE-RECORD.jsonl");
+    let mut rec = Vec::new();
+    write_truth_record(
+        &mut rec,
+        &TruthRecord {
+            claim_id: a,
+            truth_before: 0.4,
+            truth_written: truth_of(&pool, a).await,
+            cache_old: 0.4,
+            cache_new: 0.6,
+            waves: vec!["L1".into()],
+            at: Utc::now(),
+        },
+    )
+    .unwrap();
+    std::fs::write(&restore_record, rec).unwrap();
+    let report = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &bad,
+        &[
+            "--restore",
+            restore_record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["buckets"]["restored"]["count"], 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
