@@ -512,6 +512,8 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
 | `EPIGRAPH_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM or SIGINT the server stops accepting connections and lets in-flight requests finish for at most this long, then exits 0. Keep it below the unit's `TimeoutStopSec` (systemd's default is 90 s). Not a whole number → exit 1. |
 | `EPIGRAPH_MAX_REQUEST_BYTES` | `10485760` (10 MiB) | The request-body limit on authenticated routes; over it the request is answered 413. The anonymous routes (`/oauth/*`, `/.well-known/*`, `/health`, `/api/v1/openapi.json`, `/elevate/*`) are held to 64 KiB whatever this says. Not a positive whole number → exit 1. |
+| `EPIGRAPH_DB_MAX_CONNECTIONS` | `10` | The most connections the request pool holds open (section 5, "Connection budget"). Not a positive whole number → exit 1. |
+| `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` | unset (the database's own `statement_timeout`) | Each request-pool connection's `statement_timeout`, in milliseconds, set once when the connection opens; a statement running longer is cancelled and its request fails. `0` is the same as unset. Keep it above your slowest legitimate query (ingestion, synthesis and belief propagation walk large parts of the graph), and below `EPIGRAPH_REQUEST_TIMEOUT_SECS`, which abandons the request but not its query. A session setting, so it is not reliable behind a transaction-mode pooler (`EPIGRAPH_SESSION_GUC_MODE=transaction`). The drain timer's pool has its own (`EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`). Not a whole number → exit 1. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
@@ -952,7 +954,10 @@ reversed by `reown-reverse`.
 ### Connection budget
 
 The API process opens its application pool only: **10** connections per
-replica. Each `epigraph-mcp-full` process opens **10** on the application DSN.
+replica by default, `EPIGRAPH_DB_MAX_CONNECTIONS` to change it (section 3's
+`server` table; `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` bounds each statement on
+it). Keep the sum over every process below Postgres' `max_connections` minus
+its reserved slots. Each `epigraph-mcp-full` process opens **10** on the application DSN.
 The timers add, while they run, up to 11 for `replay_deferred_cascades` (the
 `MaintenancePool` cap, below) and up to 4 for `drain_jobs`, plus the one
 connection that holds its advisory lock.
@@ -4649,6 +4654,7 @@ Do not improvise it against a live database without that entry's context.
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
 | `ERROR: refusing to serve: pgvector <v> is installed but 0.8.0 or newer is required ...` | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2), and restart. |
 | ``ERROR: refusing to serve: the pgvector extension (`vector`) is not installed in this database ...`` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
+| `FATAL: the request pool is misconfigured: ...` | `EPIGRAPH_DB_MAX_CONNECTIONS` or `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` does not parse; the message names it (section 3). |
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |

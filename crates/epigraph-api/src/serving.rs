@@ -152,6 +152,94 @@ impl ServeSettings {
     }
 }
 
+/// The request pool's maximum number of connections.
+pub const DB_MAX_CONNECTIONS_ENV: &str = "EPIGRAPH_DB_MAX_CONNECTIONS";
+/// The request pool's per-connection `statement_timeout`, in milliseconds;
+/// `0` (like unset) leaves the database's own setting in place.
+pub const DB_STATEMENT_TIMEOUT_ENV: &str = "EPIGRAPH_DB_STATEMENT_TIMEOUT_MS";
+
+/// The request pool's size before this setting existed (sqlx's
+/// `PgPool::connect` default, which `epigraph_db::ScopedPoolOptions::default`
+/// reproduces), kept as the default.
+pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
+
+/// The request pool's sizing and statement timeout (backlog b4c4337f), read
+/// once at boot like [`ServeSettings`].
+///
+/// Before these existed `bin/server.rs` built its pool with
+/// `ScopedPoolOptions::default()`: ten connections and no statement timeout,
+/// so the pool could not be sized to the host or to Postgres'
+/// `max_connections` without a code change, and a runaway query held one of
+/// the ten for as long as it ran. Every default is that behaviour.
+///
+/// The timeout is a session `SET statement_timeout` issued once on each new
+/// connection, so it holds only on a session-mode endpoint: behind a
+/// transaction-mode pooler (`EPIGRAPH_SESSION_GUC_MODE=transaction`) the
+/// setting lands on whichever server connection the pooler handed out and is
+/// not reliable. A handler that sets its own timeout (`SET LOCAL`, or a
+/// session `SET` it restores) overrides it for that statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestPoolSettings {
+    /// The most connections the request pool holds open.
+    pub max_connections: u32,
+    /// Each connection's `statement_timeout`; `None` leaves the database's.
+    pub statement_timeout: Option<Duration>,
+}
+
+impl Default for RequestPoolSettings {
+    fn default() -> Self {
+        Self {
+            max_connections: DEFAULT_DB_MAX_CONNECTIONS,
+            statement_timeout: None,
+        }
+    }
+}
+
+impl RequestPoolSettings {
+    /// Parse the raw variable values (`None` = unset; blank = unset). A value
+    /// that does not parse is an error, not a default.
+    pub fn parse(
+        max_connections: Option<&str>,
+        statement_timeout_ms: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut settings = Self::default();
+        if let Some(raw) = blank_is_unset(max_connections) {
+            settings.max_connections =
+                raw.parse::<u32>().ok().filter(|n| *n >= 1).ok_or_else(|| {
+                    format!("{DB_MAX_CONNECTIONS_ENV}={raw:?} is not a positive whole number")
+                })?;
+        }
+        if let Some(raw) = blank_is_unset(statement_timeout_ms) {
+            settings.statement_timeout = match whole_number(DB_STATEMENT_TIMEOUT_ENV, raw)? {
+                0 => None,
+                ms => Some(Duration::from_millis(ms)),
+            };
+        }
+        Ok(settings)
+    }
+
+    /// Read and parse the variables from the process environment.
+    pub fn from_env() -> Result<Self, String> {
+        let var = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            var(DB_MAX_CONNECTIONS_ENV).as_deref(),
+            var(DB_STATEMENT_TIMEOUT_ENV).as_deref(),
+        )
+    }
+
+    /// The pool options these settings describe; everything else (the
+    /// acquire timeout) is `ScopedPoolOptions::default()`'s.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn pool_options(&self) -> epigraph_db::ScopedPoolOptions {
+        epigraph_db::ScopedPoolOptions {
+            max_connections: self.max_connections,
+            statement_timeout: self.statement_timeout,
+            ..epigraph_db::ScopedPoolOptions::default()
+        }
+    }
+}
+
 /// Wrap the application router in the request-id, trace and timeout layers.
 ///
 /// Outermost first: a request id is set (an incoming `x-request-id` is kept
@@ -443,6 +531,56 @@ mod tests {
             (None, None, None, Some("10MB"), MAX_REQUEST_BYTES_ENV),
         ] {
             let err = ServeSettings::parse(bind, timeout, grace, bytes)
+                .expect_err("a malformed value must refuse, not default");
+            assert!(err.contains(var), "the refusal must name {var}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_request_pool_defaults_are_the_pre_existing_pool() {
+        let unset = RequestPoolSettings::parse(None, None).expect("defaults");
+        assert_eq!(unset, RequestPoolSettings::default());
+        assert_eq!(
+            RequestPoolSettings::parse(Some(" "), Some("")).expect("blank"),
+            unset
+        );
+        #[cfg(feature = "db")]
+        assert_eq!(
+            unset.pool_options(),
+            epigraph_db::ScopedPoolOptions::default(),
+            "unset must build exactly the pool the server built before"
+        );
+    }
+
+    #[test]
+    fn the_request_pool_values_are_read_and_a_zero_timeout_is_off() {
+        let s = RequestPoolSettings::parse(Some("25"), Some("15000")).expect("valid");
+        assert_eq!(s.max_connections, 25);
+        assert_eq!(s.statement_timeout, Some(Duration::from_millis(15_000)));
+        #[cfg(feature = "db")]
+        {
+            let o = s.pool_options();
+            assert_eq!(o.max_connections, 25);
+            assert_eq!(o.statement_timeout, Some(Duration::from_millis(15_000)));
+            assert_eq!(
+                o.acquire_timeout,
+                epigraph_db::ScopedPoolOptions::default().acquire_timeout
+            );
+        }
+        let off = RequestPoolSettings::parse(None, Some("0")).expect("zero");
+        assert_eq!(off.statement_timeout, None);
+    }
+
+    #[test]
+    fn malformed_request_pool_values_are_refused_and_named() {
+        for (max, timeout, var) in [
+            (Some("0"), None, DB_MAX_CONNECTIONS_ENV),
+            (Some("ten"), None, DB_MAX_CONNECTIONS_ENV),
+            (Some("-1"), None, DB_MAX_CONNECTIONS_ENV),
+            (None, Some("30s"), DB_STATEMENT_TIMEOUT_ENV),
+            (None, Some("-5"), DB_STATEMENT_TIMEOUT_ENV),
+        ] {
+            let err = RequestPoolSettings::parse(max, timeout)
                 .expect_err("a malformed value must refuse, not default");
             assert!(err.contains(var), "the refusal must name {var}: {err}");
         }

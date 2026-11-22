@@ -231,6 +231,21 @@ async fn main() {
         max_request_bytes = serve.max_request_bytes,
         "serving settings"
     );
+    // The request pool's size and statement timeout (backlog b4c4337f), read
+    // here for the same reason: a malformed value refuses before any
+    // connection.
+    let request_pool = match epigraph_api::serving::RequestPoolSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: the request pool is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        db_max_connections = request_pool.max_connections,
+        db_statement_timeout_ms = ?request_pool.statement_timeout.map(|t| t.as_millis()),
+        "request pool settings"
+    );
     if serve.request_timeout.is_none() {
         tracing::warn!(
             "EPIGRAPH_REQUEST_TIMEOUT_SECS=0: the request timeout is OFF; a stuck handler \
@@ -466,11 +481,13 @@ async fn main() {
         // `connect_recording_elevated_access`: this binary RECORDS every
         // elevated access (the router's per-access recorder layer, elevation
         // plan EL-8), so its pool declares the recorder, migration 125's second
-        // key. Sizing is `connect`'s (`ScopedPoolOptions::default()`).
+        // key. Sizing and statement timeout are EPIGRAPH_DB_MAX_CONNECTIONS
+        // and EPIGRAPH_DB_STATEMENT_TIMEOUT_MS (read at the top of `main`;
+        // unset, `ScopedPoolOptions::default()`'s ten and none).
         let scoped = epigraph_db::ScopedPool::connect_recording_elevated_access(
             &database_url,
             guc_mode,
-            epigraph_db::ScopedPoolOptions::default(),
+            request_pool.pool_options(),
         )
         .await
         .expect("Failed to connect to PostgreSQL");

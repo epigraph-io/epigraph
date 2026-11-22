@@ -7,6 +7,9 @@
 //! - the listener binds `EPIGRAPH_BIND_ADDR`;
 //! - every response carries an `x-request-id`;
 //! - the anonymous routers hold a body to 64 KiB (413 above it);
+//! - a malformed `EPIGRAPH_DB_MAX_CONNECTIONS` or
+//!   `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` refuses to start, and well-formed
+//!   ones size the request pool and set its statement timeout;
 //! - SIGTERM drains and exits 0 instead of killing the process: a request in
 //!   flight at the signal is answered, and one still in flight when the grace
 //!   ends is abandoned so the process exits anyway.
@@ -90,6 +93,39 @@ fn well_formed_serving_settings_get_past_the_check() {
     ]);
     assert_ne!(code, Some(0), "it cannot serve an unreachable database");
     assert!(!stderr.contains(MISCONFIGURED), "{stderr}");
+}
+
+const POOL_MISCONFIGURED: &str = "the request pool is misconfigured";
+
+/// Backlog b4c4337f: a malformed request-pool setting refuses to start by
+/// name, before any connection. On the parent commit the variables were not
+/// read: the boot went on to the unreachable database and failed there.
+#[test]
+fn a_malformed_request_pool_setting_refuses_to_start_before_any_connection() {
+    for (var, value) in [
+        ("EPIGRAPH_DB_MAX_CONNECTIONS", "0"),
+        ("EPIGRAPH_DB_MAX_CONNECTIONS", "ten"),
+        ("EPIGRAPH_DB_STATEMENT_TIMEOUT_MS", "30s"),
+    ] {
+        let (code, stderr, took) = unreachable_boot(&[(var, value)]);
+        assert_eq!(code, Some(1), "{var}={value:?}: {stderr}");
+        assert!(
+            stderr.contains(POOL_MISCONFIGURED) && stderr.contains(var),
+            "{var}={value:?} must be refused by name: {stderr}"
+        );
+        assert!(
+            took < Duration::from_secs(10),
+            "{var}={value:?}: refused after {took:?}, so after a connection attempt"
+        );
+    }
+    // The control: well-formed values get past the check and fail later, on
+    // the unreachable database.
+    let (code, stderr, _) = unreachable_boot(&[
+        ("EPIGRAPH_DB_MAX_CONNECTIONS", "25"),
+        ("EPIGRAPH_DB_STATEMENT_TIMEOUT_MS", "0"),
+    ]);
+    assert_ne!(code, Some(0), "it cannot serve an unreachable database");
+    assert!(!stderr.contains(POOL_MISCONFIGURED), "{stderr}");
 }
 
 #[cfg(feature = "db")]
@@ -253,6 +289,67 @@ mod served_binary {
             log.contains("shutdown grace elapsed"),
             "the abandoned request must be said:\n{log}"
         );
+    }
+
+    /// Backlog b4c4337f: the served binary builds its request pool from
+    /// EPIGRAPH_DB_MAX_CONNECTIONS and EPIGRAPH_DB_STATEMENT_TIMEOUT_MS (the
+    /// pool constructor logs what it was given). On the parent commit it
+    /// logged `max_connections=10` and no timeout, whatever was set.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_request_pool_is_built_from_its_settings(pool: PgPool) {
+        let server = start(
+            &pool,
+            &[
+                ("EPIGRAPH_DB_MAX_CONNECTIONS", "7"),
+                ("EPIGRAPH_DB_STATEMENT_TIMEOUT_MS", "4321"),
+            ],
+        )
+        .await;
+        let created: Vec<&str> = server
+            .boot_log
+            .lines()
+            .filter(|l| l.contains("ScopedPool created"))
+            .collect();
+        assert_eq!(
+            created.len(),
+            1,
+            "one request pool is built:\n{}",
+            server.boot_log
+        );
+        assert!(
+            created[0].contains("max_connections=7")
+                && created[0].contains("statement_timeout_ms=4321"),
+            "the request pool must be built with the configured size and timeout: {}",
+            created[0]
+        );
+    }
+
+    /// The options the settings describe put the timeout on every connection
+    /// of the pool (the session `SET` in the pool's after-connect hook) and
+    /// size it.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_request_pool_timeout_is_on_its_connections(pool: PgPool) {
+        let url = fixture::database_url_for(&pool).await;
+        let settings = epigraph_api::serving::RequestPoolSettings::parse(Some("3"), Some("4321"))
+            .expect("valid settings");
+        let scoped = epigraph_db::ScopedPool::connect_with_options(
+            &url,
+            epigraph_db::SessionGucMode::from_env(""),
+            settings.pool_options(),
+        )
+        .await
+        .expect("connect");
+        assert_eq!(scoped.inner().options().get_max_connections(), 3);
+        let mut conns = Vec::new();
+        for _ in 0..2 {
+            let mut conn = scoped.inner().acquire().await.expect("acquire");
+            let shown: String = sqlx::query_scalar("SHOW statement_timeout")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("show");
+            assert_eq!(shown, "4321ms", "every connection carries the timeout");
+            conns.push(conn);
+        }
     }
 
     #[sqlx::test(migrations = "../../migrations")]
