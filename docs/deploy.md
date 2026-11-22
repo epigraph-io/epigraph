@@ -1275,9 +1275,19 @@ The document itself is anonymous, which is correct.
 `clients:admin`, `entity-types:write` and `instance:admin`). Admin-only
 scopes are never in `read_only_scopes()`, the read-write role,
 `AGENT_PROVISION_SCOPES` or `PUBLIC_CLIENT_READ_SCOPES`. So every
-`epigraph-ro` token, every `epigraph-wo` token, every agent auto-provisioned
-by `POST /api/v1/agents` and every dynamically registered public client gets
-**403** on these routes. Point dashboards and monitoring at an
+`epigraph-ro` token, every `epigraph-wo` token, every agent client
+provisioned by `POST /api/v1/agents` and every dynamically registered public
+client gets **403** on these routes.
+
+`POST /api/v1/agents` registers an identity and provisions no login by
+default. A client is created only when the request body sets `"login": true`:
+ACTIVE with `AGENT_PROVISION_SCOPES` when the caller holds `claims:admin`,
+otherwise PENDING with nothing granted, awaiting the same approval as a
+`/oauth/register` agent client. Earlier servers gave every newly registered
+agent an active client; those clients stay active after an upgrade until an
+admin suspends them. On a find-hit (the key is already registered) the
+response carries the existing agent's `orcid` and `ror_id` only for the agent
+itself or a `claims:admin` caller. Point dashboards and monitoring at an
 `epigraph-admin` token, or mint a dedicated client with exactly
 `["claims:admin"]`. `groups:write` is in the read-write role, so `epigraph-wo`
 can create a community or group.
