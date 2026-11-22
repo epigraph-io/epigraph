@@ -3434,7 +3434,10 @@ restart.
   function only while its body is still the 235 body and its path is 271's, so it also
   reverts an identical out-of-band fix). **Deploy order:** none against the binaries. A
   lower-numbered migration applied after 271 is not swept by it and must state `pg_temp`
-  last itself (the ratchet fails on one that does not).
+  last itself. A test database applies migrations in version order, where 271 would mask
+  one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
+  235, then 271, then the rest (production's order) and fails on one that breaks either
+  rule.
 
 ## `-- no-transaction` migrations
 

@@ -49,6 +49,13 @@
 //!   catalog text into a statement, and an upper-case `PG_TEMP`, which
 //!   PostgreSQL reads as `pg_temp`), its non-append branches, its precheck
 //!   query and its undo runbook.
+//! * [`a_lower_migration_applied_after_271_keeps_both_rules`] -- both rules in
+//!   the PRODUCTION order: a test database applies migrations in version
+//!   order, so 271 always runs last and masks a lower-numbered migration that
+//!   re-states a path without `pg_temp`
+//!   ([`in_version_order_271_masks_a_bad_lower_migration`] shows it), while
+//!   production applies such a migration after 271. This test applies
+//!   everything up to 235, then 271, then the rest.
 //!
 //! # The rule for later migrations
 //!
@@ -68,7 +75,7 @@ mod retracted;
 
 use epigraph_db::repos::mass_function::MassFunctionRepository;
 use epigraph_db::visibility::Viewer;
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migration, MigrationType, Migrator};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{ConnectOptions, Connection, PgConnection, PgPool};
 use std::borrow::Cow;
@@ -83,6 +90,11 @@ static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 /// triggers) and the ten unpinned trigger functions. A later re-statement may
 /// fix one of them first, so 271 changing FEWER is fine; changing one not
 /// listed here is not (a new function must state its own path).
+///
+/// Do NOT add a function here to make a test pass. A new migration states
+/// `pg_temp` last itself, and pins every trigger function it creates: in
+/// production a migration numbered below 271 may be applied after it, and
+/// 271 does not sweep it then.
 const CHANGED_BY_271: &[&str] = &[
     "public.epigraph_agent_keys_attested_guard()",
     "public.epigraph_agents_competence_guard()",
@@ -1153,6 +1165,159 @@ async fn the_271_precheck_lists_exactly_what_271_refuses(pool: PgPool) {
     migrate(&pool, &below(272))
         .await
         .expect("POSITIVE CONTROL: 271 applies once the precheck lists nothing");
+}
+
+// ---------------------------------------------------------------------------
+// Production order: a lower-numbered migration applied after 271
+// ---------------------------------------------------------------------------
+
+/// The highest migration on main when 271 was written. Production applies 271
+/// on a database at about that head; a migration numbered between it and 271
+/// that merges later is applied AFTER 271 (sqlx applies a missing lower
+/// version), and 271 does not sweep it.
+const HEAD_WHEN_271_WRITTEN: i64 = 235;
+
+fn migrator_of(migrations: Vec<Migration>) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(migrations),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+/// Everything up to [`HEAD_WHEN_271_WRITTEN`], then 271: production's state
+/// right after 271 is deployed.
+fn up_to_head_then_271() -> Migrator {
+    migrator_of(
+        MIGRATOR
+            .migrations
+            .iter()
+            .filter(|m| m.version <= HEAD_WHEN_271_WRITTEN || m.version == 271)
+            .cloned()
+            .collect(),
+    )
+}
+
+/// What a lower-numbered migration could do that 271 then never sees: reset
+/// 184's retract guard to its pre-271 path (as a `CREATE OR REPLACE` with the
+/// old `SET` clause would) and add an unpinned trigger function.
+const BAD_LOWER_MIGRATION: &str = "\
+ALTER FUNCTION public.epigraph_mass_function_retract_guard() SET search_path = pg_catalog, public;
+CREATE FUNCTION public.t134_late_trigger() RETURNS trigger LANGUAGE plpgsql
+    AS $$ BEGIN RETURN NEW; END $$;
+";
+
+/// `MIGRATOR` plus [`BAD_LOWER_MIGRATION`] at the highest version below 271
+/// that no real migration takes.
+fn with_bad_lower_migration() -> (Migrator, i64) {
+    let taken: BTreeSet<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
+    let version = (1..271)
+        .rev()
+        .find(|v| !taken.contains(v))
+        .expect("a free version below 271");
+    let mut all: Vec<Migration> = MIGRATOR.migrations.to_vec();
+    all.push(Migration::new(
+        version,
+        Cow::Borrowed("t134 bad lower migration"),
+        MigrationType::Simple,
+        Cow::Borrowed(BAD_LOWER_MIGRATION),
+        false,
+    ));
+    all.sort_by_key(|m| m.version);
+    (migrator_of(all), version)
+}
+
+fn rule_breaks(fns: &BTreeMap<String, Routine>) -> (BTreeSet<String>, BTreeSet<String>) {
+    (
+        temp_shadowable(fns).into_keys().collect(),
+        unpinned_triggers(fns),
+    )
+}
+
+/// Both rules hold when the migrations numbered between
+/// [`HEAD_WHEN_271_WRITTEN`] and 271 are applied AFTER 271, as production
+/// applies one that merges after 271 deployed. A test database applies them
+/// in version order, where 271 sweeps them and masks a path one of them got
+/// wrong ([`in_version_order_271_masks_a_bad_lower_migration`]); here nothing
+/// sweeps them. CALIBRATION: a synthetic lower migration that resets a path
+/// and adds an unpinned trigger, applied the same way, is reported.
+#[sqlx::test(migrations = false)]
+async fn a_lower_migration_applied_after_271_keeps_both_rules(pool: PgPool) {
+    migrate(&pool, &up_to_head_then_271())
+        .await
+        .expect("migrate to the head 271 was written on, then 271");
+    let deployed = routines_of(&pool).await;
+    assert!(
+        applied(&pool, 271).await
+            && deployed["public.epigraph_mass_function_retract_guard()"]
+                .path
+                .as_deref()
+                == Some("pg_catalog, public, pg_temp"),
+        "CALIBRATION: 271 ran on the older head and swept the retract guard"
+    );
+
+    let late: Vec<i64> = MIGRATOR
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| *v > HEAD_WHEN_271_WRITTEN && *v < 271)
+        .collect();
+    migrate(&pool, &MIGRATOR).await.unwrap_or_else(|e| {
+        panic!(
+            "applying migration(s) {late:?} AFTER 271, as production does, fails: {e}. A \
+             lower migration's precondition must accept the paths 271 sets"
+        )
+    });
+    let (bad, unpinned) = rule_breaks(&routines_of(&pool).await);
+    assert!(
+        bad.is_empty() && unpinned.is_empty(),
+        "applied after 271 (production's order), migration(s) {late:?} leave functions that \
+         pin a path without pg_temp last: {bad:?}, and unpinned trigger functions: \
+         {unpinned:?}. 271 does not sweep a migration applied after it: state `pg_temp` last \
+         on every path and pin every trigger function in the migration itself"
+    );
+
+    let (with_bad, version) = with_bad_lower_migration();
+    migrate(&pool, &with_bad)
+        .await
+        .expect("the synthetic lower migration applies after 271");
+    assert_eq!(
+        rule_breaks(&routines_of(&pool).await),
+        (
+            BTreeSet::from(["public.epigraph_mass_function_retract_guard()".to_string()]),
+            BTreeSet::from(["public.t134_late_trigger()".to_string()]),
+        ),
+        "CALIBRATION: a lower migration ({version}) applied after 271 that resets a path and \
+         adds an unpinned trigger is reported"
+    );
+}
+
+/// Why [`a_lower_migration_applied_after_271_keeps_both_rules`] exists: in
+/// version order the same synthetic lower migration runs BEFORE 271, 271
+/// sweeps it, and both rules hold, so the catalog ratchets above cannot see
+/// what it would leave in production.
+#[sqlx::test(migrations = false)]
+async fn in_version_order_271_masks_a_bad_lower_migration(pool: PgPool) {
+    let (with_bad, version) = with_bad_lower_migration();
+    migrate(&pool, &with_bad)
+        .await
+        .expect("migrate in version order");
+    assert!(
+        applied(&pool, version).await && applied(&pool, 271).await,
+        "CALIBRATION: both the synthetic {version} and 271 applied"
+    );
+    let fns = routines_of(&pool).await;
+    assert_eq!(
+        fns["public.t134_late_trigger()"].path.as_deref(),
+        Some("pg_catalog, public, pg_temp"),
+        "271 swept the synthetic migration's trigger function"
+    );
+    assert_eq!(
+        rule_breaks(&fns),
+        (BTreeSet::new(), BTreeSet::new()),
+        "in version order both rules hold, masking the synthetic migration"
+    );
 }
 
 fn repo_text(rel: &str) -> String {

@@ -94,9 +94,13 @@
 -- ORDER: a migration numbered below 271 that is applied AFTER it (sqlx
 -- applies a missing lower version) is not swept by it, so it must state
 -- `pg_temp` last on every path it sets and pin every trigger function it
--- creates; `function_search_path_pg_temp_ratchet.rs` fails on one that does
--- not. A later `CREATE OR REPLACE` of any of these functions must restate its
--- path with `pg_temp` last (a replace replaces the path).
+-- creates. A test database applies migrations in version order, so 271
+-- always runs last there and would mask such a migration; the ratchet's
+-- `a_lower_migration_applied_after_271_keeps_both_rules` applies them in the
+-- production order instead (everything up to 235, then 271, then the rest)
+-- and fails on one that breaks either rule. A later `CREATE OR REPLACE` of
+-- any of these functions must restate its path with `pg_temp` last (a
+-- replace replaces the path).
 --
 -- UNDO: `docs/runbooks/271-undo.sql` restores each of the 19 functions' path
 -- as it was at 235, and only while its body is still the 235 body (md5 of
