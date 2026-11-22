@@ -947,7 +947,7 @@ pub async fn conflict_batch(
     Path(frame_id): Path<Uuid>,
     Json(request): Json<ConflictBatchRequest>,
 ) -> Result<Json<ConflictBatchResponse>, ApiError> {
-    use epigraph_ds::{combination::conflict_coefficient, FrameOfDiscernment, MassFunction};
+    use epigraph_ds::{FrameOfDiscernment, MassFunction};
     use std::collections::{HashMap, HashSet};
 
     if request.pairs.len() > 100 {
@@ -1024,47 +1024,63 @@ pub async fn conflict_batch(
         .pairs
         .iter()
         .map(|pair| {
-            let mf_a = mass_fns.get(&pair.claim_a);
-            let mf_b = mass_fns.get(&pair.claim_b);
-
-            match (mf_a, mf_b) {
-                (Some(a), Some(b)) => match conflict_coefficient(a, b) {
-                    Ok(k) => ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: Some(k),
-                        error: None,
-                    },
-                    Err(e) => ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: None,
-                        error: Some(e.to_string()),
-                    },
-                },
-                _ => {
-                    let missing = if mf_a.is_none() && mf_b.is_none() {
-                        format!(
-                            "No mass functions for claims {} and {}",
-                            pair.claim_a, pair.claim_b
-                        )
-                    } else if mf_a.is_none() {
-                        format!("No mass function for claim {}", pair.claim_a)
-                    } else {
-                        format!("No mass function for claim {}", pair.claim_b)
-                    };
-                    ConflictBatchResult {
-                        claim_a: pair.claim_a,
-                        claim_b: pair.claim_b,
-                        conflict_k: None,
-                        error: Some(missing),
-                    }
-                }
-            }
+            pair_conflict(
+                pair,
+                mass_fns.get(&pair.claim_a),
+                mass_fns.get(&pair.claim_b),
+            )
         })
         .collect();
 
     Ok(Json(ConflictBatchResponse { results }))
+}
+
+/// The fixed per-pair reason for a conflict the engine could not compute.
+#[cfg(feature = "db")]
+const CONFLICT_NOT_COMPUTED: &str = "conflict could not be computed for this pair; the detail \
+                                     is in the server log";
+
+/// One pair's slot in a `conflict_batch` answer.
+///
+/// The answer is a 200, so a slot's `error` never carries an error's
+/// `to_string()` (backlog f9acb220): an engine failure is logged and the slot
+/// says [`CONFLICT_NOT_COMPUTED`]. The missing-BBA texts name only the pair's
+/// own claim ids, which the caller sent.
+#[cfg(feature = "db")]
+fn pair_conflict(
+    pair: &ConflictPair,
+    mf_a: Option<&epigraph_ds::MassFunction>,
+    mf_b: Option<&epigraph_ds::MassFunction>,
+) -> ConflictBatchResult {
+    let (claim_a, claim_b) = (pair.claim_a, pair.claim_b);
+    let (conflict_k, error) = match (mf_a, mf_b) {
+        (Some(a), Some(b)) => match epigraph_ds::combination::conflict_coefficient(a, b) {
+            Ok(k) => (Some(k), None),
+            Err(e) => {
+                tracing::warn!(
+                    %claim_a,
+                    %claim_b,
+                    error = %e,
+                    "conflict_batch: conflict coefficient not computed"
+                );
+                (None, Some(CONFLICT_NOT_COMPUTED.to_string()))
+            }
+        },
+        (None, None) => (
+            None,
+            Some(format!(
+                "No mass functions for claims {claim_a} and {claim_b}"
+            )),
+        ),
+        (None, Some(_)) => (None, Some(format!("No mass function for claim {claim_a}"))),
+        (Some(_), None) => (None, Some(format!("No mass function for claim {claim_b}"))),
+    };
+    ConflictBatchResult {
+        claim_a,
+        claim_b,
+        conflict_k,
+        error,
+    }
 }
 
 /// Stub for non-db builds
@@ -3877,6 +3893,46 @@ mod tests {
         let json = serde_json::to_value(&result).unwrap();
         assert!(json["conflict_k"].is_null());
         assert!(json["error"].as_str().unwrap().contains("No mass function"));
+    }
+
+    /// Backlog f9acb220: a pair whose conflict the engine refuses (here two
+    /// BBAs on different frames) gets the fixed reason in its 200 slot, never
+    /// the engine error's text, which names both frames.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_pair_the_engine_refuses_carries_the_fixed_reason_not_the_error_text() {
+        let frame = |name: &str| {
+            epigraph_ds::FrameOfDiscernment::new(
+                name.to_string(),
+                vec!["yes".to_string(), "no".to_string()],
+            )
+            .unwrap()
+        };
+        let mf = |name: &str| {
+            epigraph_ds::MassFunction::from_json_masses(
+                frame(name),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            )
+            .unwrap()
+        };
+        let (a, b) = (mf("frame_canary_left"), mf("frame_canary_right"));
+        assert!(
+            epigraph_ds::combination::conflict_coefficient(&a, &b).is_err(),
+            "calibration: the engine refuses BBAs on different frames"
+        );
+        let pair = ConflictPair {
+            claim_a: Uuid::new_v4(),
+            claim_b: Uuid::new_v4(),
+        };
+        let slot = serde_json::to_value(pair_conflict(&pair, Some(&a), Some(&b))).unwrap();
+        assert!(slot["conflict_k"].is_null(), "{slot}");
+        assert_eq!(slot["error"], CONFLICT_NOT_COMPUTED, "{slot}");
+        assert!(!slot.to_string().contains("frame_canary"), "{slot}");
+
+        let same = mf("frame_canary_left");
+        let ok = serde_json::to_value(pair_conflict(&pair, Some(&a), Some(&same))).unwrap();
+        assert!(ok["conflict_k"].is_number(), "calibration: {ok}");
+        assert!(ok.get("error").is_none(), "calibration: {ok}");
     }
 
     #[test]
