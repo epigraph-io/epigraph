@@ -24,6 +24,14 @@
 //! that each of the four still holds caller-text constructor sites, so a
 //! rename cannot drop them from it silently.
 //!
+//! In those four files it also scans the caller-error constructors that send
+//! their message as written: `invalid_request(` (rmcp's
+//! `McpError::invalid_request`), `invalid_params(` (the crate helper and
+//! rmcp's), and `Cow::from(` (the message of an `McpError { .. }` struct
+//! literal). Only there: crate-wide those spellings are ~270 sites, many of
+//! them a caller-input parse error (`invalid UUID: {e}`) whose text is the
+//! caller's own input, not driver text, and they are designed.
+//!
 //! # What it flags, inside a constructor's message argument
 //!
 //! * a format capture of an error binding, Display or Debug (`{e}`,
@@ -39,7 +47,14 @@
 //!
 //! It recognises an error by its binding NAME: a closure that names its error
 //! `x` and interpolates `{x}` is not caught, nor is a message built into a
-//! `let` first and passed by name. Comments are stripped
+//! `let` first and passed by name. Text taken out of an error through a method
+//! call is not caught either: `db.message().to_string()` or
+//! `format!("x: {}", d.message())` (a `.to_string()` whose receiver ends in
+//! `)` or follows a field is skipped, and `d` is not an error binding). Nor is
+//! a struct-literal message built with `.into()` (`message: format!(..).into()`)
+//! rather than `Cow::from`, and the caller-error constructors
+//! (`invalid_request(`, `invalid_params(`, `Cow::from(`) are scanned in the
+//! four converted files only. Comments are stripped
 //! (`lint_text::strip_comments`), string literals are kept, so a `tracing`
 //! line that logs `{e}` beside a constructor is not a site. The stripper drops
 //! the byte after a `\` escape, so a line continuation inside a string shifts
@@ -62,6 +77,12 @@ const CONVERTED: &[&str] = &[
     "claim_helper.rs",
     "tools/workflow_authority.rs",
 ];
+
+/// Caller-error constructors that also send their message as written,
+/// scanned in the [`CONVERTED`] files only (see the module doc for why not
+/// crate-wide). The bare spellings match `McpError::invalid_request(` and
+/// `crate::errors::invalid_params(` too, once each.
+const CONVERTED_CONSTRUCTORS: &[&str] = &["invalid_request(", "invalid_params(", "Cow::from("];
 
 /// Sites allowed to interpolate an error, per file, with why. Counts are
 /// exact: a change in either direction fails.
@@ -266,9 +287,9 @@ fn leaks(message: &str) -> Vec<String> {
 /// Every caller-text constructor site in `text` (comment-stripped): its
 /// 1-based line and the reasons its message carries an error (empty when it
 /// does not).
-fn sites(text: &str) -> Vec<(usize, Vec<String>)> {
+fn sites(text: &str, spellings: &[&str]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
-    for spelling in CONSTRUCTORS {
+    for spelling in spellings {
         let mut from = 0;
         while let Some(off) = text[from..].find(spelling) {
             let at = from + off;
@@ -327,10 +348,15 @@ fn no_caller_facing_internal_error_carries_an_error() {
             .to_string_lossy()
             .replace('\\', "/");
         let text = strip(&std::fs::read_to_string(path).expect("read source"));
-        let found = sites(&text);
-        if CONVERTED.contains(&rel.as_str()) {
-            converted_seen.insert(rel.clone(), found.len());
-        }
+        let found = if CONVERTED.contains(&rel.as_str()) {
+            let internal = sites(&text, CONSTRUCTORS);
+            converted_seen.insert(rel.clone(), internal.len());
+            let mut all = internal;
+            all.extend(sites(&text, CONVERTED_CONSTRUCTORS));
+            all
+        } else {
+            sites(&text, CONSTRUCTORS)
+        };
         let leaking: Vec<_> = found
             .into_iter()
             .filter(|(_, why)| !why.is_empty())
@@ -379,7 +405,7 @@ fn no_caller_facing_internal_error_carries_an_error() {
 #[test]
 fn the_scanner_catches_error_text_in_every_constructor() {
     let leaky = |src: &str| -> Vec<usize> {
-        sites(&strip(src))
+        sites(&strip(src), CONSTRUCTORS)
             .into_iter()
             .filter(|(_, why)| !why.is_empty())
             .map(|(line, _)| line)
@@ -402,15 +428,52 @@ fn the_scanner_catches_error_text_in_every_constructor() {
                  log_internal_error_text(format!(\"{e}\"));\n\
                  tracing::error!(\"failed: {e}\"); internal_error_text(\"failed\");\n\
                  McpError::internal_error(format!(\"the viewer names {viewer:?}\"), None);";
-    assert!(leaky(clean).is_empty(), "{:?}", sites(&strip(clean)));
+    assert!(
+        leaky(clean).is_empty(),
+        "{:?}",
+        sites(&strip(clean), CONSTRUCTORS)
+    );
     assert_eq!(
-        sites(&strip(clean)).len(),
+        sites(&strip(clean), CONSTRUCTORS).len(),
         7,
         "every constructor in the clean sample is still SEEN: {:?}",
-        sites(&strip(clean))
+        sites(&strip(clean), CONSTRUCTORS)
     );
 
     let commented = "// internal_error_text(format!(\"x: {e}\"));\n\
                      /* McpError::internal_error(format!(\"{e}\"), None) */";
     assert!(leaky(commented).is_empty());
+}
+
+/// The caller-error constructors scanned in the converted files: an error
+/// interpolated into `invalid_request`, `invalid_params` or a struct literal's
+/// `Cow::from` message is caught, designed text is not, and each spelling is
+/// seen once per site (the bare spelling matches the qualified call too).
+#[test]
+fn the_scanner_catches_error_text_in_the_caller_error_constructors() {
+    let scan = |src: &str| sites(&strip(src), CONVERTED_CONSTRUCTORS);
+    let leaky = |src: &str| -> Vec<usize> {
+        scan(src)
+            .into_iter()
+            .filter(|(_, why)| !why.is_empty())
+            .map(|(line, _)| line)
+            .collect()
+    };
+    let caught = "a.map_err(|e| McpError::invalid_request(format!(\"viewer: {e}\"), None))?;\n\
+                  b.map_err(|err| crate::errors::invalid_params(err.to_string()))?;\n\
+                  McpError { code: ErrorCode::INVALID_REQUEST, message: std::borrow::Cow::from(format!(\"x: {}\", e)), data: None };\n\
+                  c.map_err(|source| ErrorData::invalid_params(format!(\"{source:?}\"), None))?;";
+    assert_eq!(leaky(caught), vec![1, 2, 3, 4]);
+
+    let clean = "McpError::invalid_request(format!(\"no principal for {tool}\"), None);\n\
+                 crate::errors::invalid_params(format!(\"{entity} {id} not found\"));\n\
+                 McpError { message: std::borrow::Cow::from(message), code, data: None };\n\
+                 pub fn invalid_params(msg: impl Into<String>) -> McpError {}";
+    assert!(leaky(clean).is_empty(), "{:?}", scan(clean));
+    assert_eq!(
+        scan(clean).len(),
+        3,
+        "every constructor in the clean sample is SEEN once: {:?}",
+        scan(clean)
+    );
 }
