@@ -1740,14 +1740,25 @@ pub async fn get_claim(
     )
     .await?;
 
+    // Whether the caller may read the trace the claim names, on the same
+    // stamped connection: a claim's `trace_id` is a bare FK, and a trace
+    // private to another group can hang off a public claim. Unreadable, the
+    // body's `trace_id` is null, the same answer as no trace and the answer
+    // `POST /api/v1/claims/batch-get` gives (backlog b3d3049b). This changed
+    // GET's wire: it used to name the trace whatever the trace's own tenancy.
+    let trace_readable = match claim.trace_id {
+        Some(t) => {
+            let t: Uuid = t.into();
+            epigraph_db::ReasoningTraceRepository::readable_ids(&mut *read, &viewer, &[t])
+                .await?
+                .contains(&t)
+        }
+        None => true,
+    };
+
     drop(read);
 
-    // `trace_readable = true` keeps GET's wire unchanged: it still names the
-    // row's `trace_id` whatever that trace's own tenancy. `POST
-    // /api/v1/claims/batch-get` checks the trace against the viewer
-    // (`ReasoningTraceRepository::readable_ids`) and passes the answer here;
-    // doing the same on GET is a separate, wire-changing follow-up.
-    let mut response = claim_response_for_read(claim, labels, encryption, true);
+    let mut response = claim_response_for_read(claim, labels, encryption, trace_readable);
     // GET only: `POST /api/v1/claims/batch-get` shares the body above and
     // carries no `authored_by` (the field is omitted there).
     response.authored_by = Some(authored_by.into());
