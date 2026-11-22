@@ -2169,3 +2169,97 @@ async fn verify_skips_the_registry_edge_check_before_migration_258(pool: PgPool)
         "and it must SAY it skipped; stderr:\n{stderr}"
     );
 }
+
+/// Turn `edges_validate_refs` off or on inside `tx` (harness superuser): the
+/// only way to write or re-stamp an edge whose endpoint no longer exists, the
+/// shape a deleted endpoint leaves behind.
+async fn set_ref_check(tx: &mut sqlx::PgConnection, on: bool) {
+    let verb = if on { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE edges {verb} TRIGGER edges_validate_refs"
+    ))
+    .execute(tx)
+    .await
+    .expect("toggle edges_validate_refs");
+}
+
+/// An edge from a private frame to an agent that does not exist cannot be
+/// re-met (`edges_validate_refs` refuses any UPDATE of it), so the registry
+/// arm SKIPS it, counts it, and still re-meets the rest; `verify` fails on it
+/// with its own remediation (delete or restore), since the arm cannot fix it.
+///
+/// Verified to fail without the `refs_ok` guard: the arm's UPDATE aborts on
+/// the reference check and `run --entity registry-edges` exits non-zero.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_registry_arm_skips_an_edge_with_a_dangling_endpoint(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-dangling").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e_stale = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    let mut tx = pool.begin().await.expect("begin");
+    set_ref_check(&mut tx, false).await;
+    let e_dangling: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'frame', $2, 'agent', 'relates_to') RETURNING id",
+    )
+    .bind(frame)
+    .bind(Uuid::new_v4())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert an edge onto an agent that does not exist");
+    // The pre-258 stamps (the frame counted as public).
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = ANY($1)",
+    )
+    .bind([e_stale, e_dangling].as_slice())
+    .bind(WORLD)
+    .execute(&mut *tx)
+    .await
+    .expect("force the pre-258 world-owned stamps");
+    set_ref_check(&mut tx, true).await;
+    tx.commit().await.expect("commit");
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "one dangling edge must not abort the arm; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("re-met 1 edge(s)")
+            && stdout.contains("1 skipped with a dangling endpoint")
+            && stdout.contains("relates_to\tskipped: dangling endpoint\t1"),
+        "stdout:\n{stdout}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_stale).await,
+        ("group".to_string(), group_g, None),
+        "the other stale edge is still re-met"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_dangling).await,
+        ("public".to_string(), WORLD, None),
+        "the dangling edge is not written"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("1 edge(s) with a non-public frame") && stderr.contains("no longer exists"),
+        "verify names the dangling edge and its own remediation; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("are not on their endpoints' meet (migration 258)"),
+        "and does not send it to the arm that skips it; stderr:\n{stderr}"
+    );
+}

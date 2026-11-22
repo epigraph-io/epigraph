@@ -164,7 +164,8 @@
 //! claims walk). `--entity registry-edges` re-meets every edge with a
 //! non-public frame, context, perspective or community endpoint (migration
 //! 258; see [`registry_edge_remeet`]); its `--dry-run` lists what it would
-//! re-meet, by relationship and transition. `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! re-meet, by relationship and transition, and what it holds or skips (an
+//! edge with a dangling endpoint). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
 //! once the budget is spent and exits 3 ("partial, re-run to resume"); the
 //! cursor of every committed batch is already persisted.
 //!
@@ -1338,12 +1339,19 @@ fn endpoint_side_sql(column: &str, side_alias: &str) -> String {
 /// groups, more than an edge can carry.
 const REGISTRY_EDGE_HELD: &str = "held: needs three groups";
 
+/// The label of an edge [`registry_edge_remeet`] skips because its other
+/// endpoint no longer exists: an UPDATE of `edges` fires `edges_validate_refs`
+/// on every row it writes, so writing it would abort the whole statement
+/// (migration 175's header; 258 section 4 skips the same rows). Takes
+/// precedence over [`REGISTRY_EDGE_HELD`].
+const REGISTRY_EDGE_DANGLING: &str = "skipped: dangling endpoint";
+
 /// The re-meet of every edge with a NON-PUBLIC frame, context, perspective or
 /// community endpoint (migration 258 section 4's statement, read from the
 /// endpoints' own rows rather than through `epigraph_node_tenancy`, which is
 /// revoked from PUBLIC): `apply` writes it, otherwise it only counts. Returns
 /// `(relationship, transition, count)` rows; a transition of
-/// [`REGISTRY_EDGE_HELD`] is never written.
+/// [`REGISTRY_EDGE_HELD`] or [`REGISTRY_EDGE_DANGLING`] is never written.
 ///
 /// The rule is the cascade's meet (072, 120), never widening: an edge is
 /// written only when the meet is `group`. One addition, which only a ONE-TIME
@@ -1378,6 +1386,8 @@ async fn registry_edge_remeet(
         "WITH reg_edges AS ({reg_edges}), \
          m AS ( \
            SELECT e2.id, e2.relationship, \
+                  (public.validate_edge_reference(e2.source_id, e2.source_type) \
+                   AND public.validate_edge_reference(e2.target_id, e2.target_type)) AS refs_ok, \
                   e2.owner_group_id AS old_g, e2.visibility AS old_v, \
                   e2.co_owner_group_id AS old_co, \
                   CASE WHEN s.v = 'public' AND t.v = 'public' \
@@ -1404,7 +1414,7 @@ async fn registry_edge_remeet(
          ), \
          d AS ( \
            SELECT n.id, n.relationship, n.g, n.v, n.others[1] AS co, \
-                  cardinality(n.others) > 1 AS held, \
+                  cardinality(n.others) > 1 AS held, n.refs_ok, \
                   CASE WHEN n.old_v = 'public' THEN 'public to group' \
                        WHEN n.others[1] IS NOT NULL AND n.old_co IS NULL THEN 'group to co-owned' \
                        WHEN n.old_g IS DISTINCT FROM n.g THEN 'group to another group' \
@@ -1419,18 +1429,22 @@ async fn registry_edge_remeet(
                 ", upd AS ( \
                    UPDATE public.edges e \
                       SET owner_group_id = d.g, visibility = d.v, co_owner_group_id = d.co \
-                     FROM d WHERE e.id = d.id AND NOT d.held \
+                     FROM d WHERE e.id = d.id AND NOT d.held AND d.refs_ok \
                    RETURNING d.relationship, d.transition) \
                  SELECT relationship, transition, count(*)::bigint FROM upd GROUP BY 1, 2 \
                  UNION ALL \
-                 SELECT relationship, '{REGISTRY_EDGE_HELD}', count(*)::bigint FROM d \
-                  WHERE d.held GROUP BY 1 \
+                 SELECT relationship, \
+                        CASE WHEN NOT d.refs_ok THEN '{REGISTRY_EDGE_DANGLING}' \
+                             ELSE '{REGISTRY_EDGE_HELD}' END, \
+                        count(*)::bigint FROM d \
+                  WHERE d.held OR NOT d.refs_ok GROUP BY 1, 2 \
                  ORDER BY 1, 2"
             )
         } else {
             format!(
                 "SELECT relationship, \
-                        CASE WHEN held THEN '{REGISTRY_EDGE_HELD}' ELSE transition END, \
+                        CASE WHEN NOT refs_ok THEN '{REGISTRY_EDGE_DANGLING}' \
+                             WHEN held THEN '{REGISTRY_EDGE_HELD}' ELSE transition END, \
                         count(*)::bigint \
                    FROM d GROUP BY 1, 2 ORDER BY 1, 2"
             )
@@ -1453,15 +1467,27 @@ async fn registry_endpoints_met(pool: &PgPool) -> anyhow::Result<bool> {
     .await?)
 }
 
-/// `(re-met or to re-meet, held)` totals of [`registry_edge_remeet`]'s rows.
-fn registry_edge_totals(rows: &[(String, String, i64)]) -> (i64, i64) {
-    rows.iter().fold((0, 0), |(n, h), (_, t, c)| {
-        if t == REGISTRY_EDGE_HELD {
-            (n, h + c)
-        } else {
-            (n + c, h)
-        }
-    })
+/// The totals of [`registry_edge_remeet`]'s rows.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RegistryEdgeTotals {
+    /// Re-met (or, counting, to re-meet).
+    remet: i64,
+    /// Held: the meet and the current tuple need three groups.
+    held: i64,
+    /// Skipped: an endpoint no longer exists.
+    dangling: i64,
+}
+
+fn registry_edge_totals(rows: &[(String, String, i64)]) -> RegistryEdgeTotals {
+    rows.iter()
+        .fold(RegistryEdgeTotals::default(), |mut acc, (_, t, c)| {
+            match t.as_str() {
+                REGISTRY_EDGE_HELD => acc.held += c,
+                REGISTRY_EDGE_DANGLING => acc.dangling += c,
+                _ => acc.remet += c,
+            }
+            acc
+        })
 }
 
 /// `run --entity registry-edges` (and the same step of a full run): re-meet,
@@ -1469,11 +1495,16 @@ fn registry_edge_totals(rows: &[(String, String, i64)]) -> (i64, i64) {
 /// print one line per relationship and transition.
 async fn remeet_registry_edges(pool: &PgPool, dry_run: bool) -> anyhow::Result<()> {
     let rows = registry_edge_remeet(pool, !dry_run).await?;
-    let (n, held) = registry_edge_totals(&rows);
+    let RegistryEdgeTotals {
+        remet: n,
+        held,
+        dangling,
+    } = registry_edge_totals(&rows);
     let verb = if dry_run { "would re-meet" } else { "re-met" };
     println!(
         "{}registry-edges: {verb} {n} edge(s) with a non-public frame, context, perspective or \
-         community endpoint; {held} held (their meet and current tuple need three groups).",
+         community endpoint; {held} held (their meet and current tuple need three groups); \
+         {dangling} skipped with a dangling endpoint.",
         if dry_run { "dry-run: " } else { "run: " }
     );
     for (relationship, transition, count) in &rows {
@@ -3934,7 +3965,11 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     // until 258's own re-meet runs. Read from the catalog (the oracle's body),
     // not from `_sqlx_migrations`, as the 086 gate does.
     let registry_met = registry_endpoints_met(pool).await?;
-    let (registry_stale, registry_held) = if registry_met {
+    let RegistryEdgeTotals {
+        remet: registry_stale,
+        held: registry_held,
+        dangling: registry_dangling,
+    } = if registry_met {
         registry_edge_totals(&registry_edge_remeet(pool, false).await?)
     } else {
         eprintln!(
@@ -3942,7 +3977,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
              context, perspective or community endpoint with its own row, has not been \
              applied. Until it is, this check is UNCHECKED, not passing."
         );
-        (0, 0)
+        RegistryEdgeTotals::default()
     };
     if registry_stale > 0 {
         failures += 1;
@@ -3961,6 +3996,16 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
              community endpoint need three groups (their meet plus the groups their current \
              tuple requires), more than an edge can carry; `--entity registry-edges` holds \
              them. An operator decides each one (delete it, or re-declare an endpoint)."
+        );
+    }
+    if registry_dangling > 0 {
+        failures += 1;
+        eprintln!(
+            "FAIL: {registry_dangling} edge(s) with a non-public frame, context, perspective \
+             or community endpoint are off their endpoints' meet and name an endpoint that no \
+             longer exists, so no UPDATE can re-meet them (`edges_validate_refs` refuses the \
+             write) and `--entity registry-edges` skips them. Remediation: an operator deletes \
+             each dangling edge (or restores its missing endpoint), then re-runs `verify`."
         );
     }
 
