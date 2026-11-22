@@ -122,7 +122,8 @@ pub struct AssessClaimResponse {
 /// The owner's earlier assessment a call replaced.
 #[derive(Debug, Serialize)]
 pub struct ReplacedAssessment {
-    /// The slot row (now holding this call's masses).
+    /// The slot row (now holding this call's masses), or, when `retired`, the
+    /// separate row this call retracted.
     pub mass_function_id: Uuid,
     /// The owner it was recorded under.
     pub source_agent_id: Option<Uuid>,
@@ -131,6 +132,13 @@ pub struct ReplacedAssessment {
     /// Whether it pointed the other way (more belief against the claim's
     /// hypothesis than for it, or the reverse): the new assessment contests it.
     pub contested: bool,
+    /// `true` when this was not the owner's slot row but the assessment the
+    /// CALLING agent recorded under itself while it was bound to no human
+    /// (backlog 840bc5ed): once the agent is linked, its human owns the slot,
+    /// so this call retracted that row (audited, `mass_functions.retract`)
+    /// instead of leaving the human with two assessments. `false` for the
+    /// slot row overwritten in place.
+    pub retired: bool,
 }
 
 // =============================================================================
@@ -383,29 +391,81 @@ pub async fn assess_claim(
     .map_err(|e| ApiError::InternalError {
         message: format!("lock assessment slot: {e}"),
     })?;
+    let replaced = |row: &epigraph_db::MassFunctionRow, retired: bool| {
+        let old = MassFunction::from_json_masses(ds_frame.clone(), &row.masses).ok();
+        ReplacedAssessment {
+            mass_function_id: row.id,
+            source_agent_id: row.source_agent_id,
+            prior_pignistic_prob: old
+                .as_ref()
+                .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
+            contested: old
+                .as_ref()
+                .is_some_and(|m| direction(m) * new_direction < 0.0),
+            retired,
+        }
+    };
+    let rows_before = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+        &mut *tx, &viewer, claim_id, frame_id,
+    )
+    .await?;
     // The owner's assessment this call replaces: exactly the row the upsert
     // below overwrites.
-    let replaced_assessments: Vec<ReplacedAssessment> =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(
-            &mut *tx, &viewer, claim_id, frame_id,
-        )
-        .await?
-        .into_iter()
+    let mut replaced_assessments: Vec<ReplacedAssessment> = rows_before
+        .iter()
         .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
-        .map(|row| {
-            let old = MassFunction::from_json_masses(ds_frame.clone(), &row.masses).ok();
-            ReplacedAssessment {
-                mass_function_id: row.id,
-                source_agent_id: row.source_agent_id,
-                prior_pignistic_prob: old
-                    .as_ref()
-                    .map(|m| super::belief::compute_hypothesis_belief(m, &ds_frame, h_idx).2),
-                contested: old
-                    .as_ref()
-                    .is_some_and(|m| direction(m) * new_direction < 0.0),
-            }
-        })
+        .map(|row| replaced(row, false))
         .collect();
+    // And the calling agent's OWN earlier assessment, when the agent now
+    // assesses for a human (backlog 840bc5ed). Written while the agent was
+    // bound to no human, it is keyed on the agent's slot, not the human's,
+    // so the upsert below does not reach it, and the human would hold two
+    // assessments that combine as independent evidence (ruling Q-U027F-2:
+    // one per claim, frame and owner). It is retracted (migration 184: kept
+    // for audit, a `mass_functions.retract` security event, out of every
+    // fold) on this transaction, under the owner's slot lock, and reported.
+    // Retracted rather than re-keyed: a retracted row holds its key, so the
+    // agent's old slot cannot be refilled, and the history stays readable.
+    // Best-effort, under a SAVEPOINT: a refusal (the agent no longer writes
+    // the row's owning group) leaves the row as it was, logged, rather than
+    // refusing the assessment. Only the CALLER's own row is handled; a
+    // sibling agent's pre-link row is retired when that sibling assesses.
+    if let Some(agent) = caller.filter(|a| owner != Some(*a)) {
+        let own_slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent));
+        for row in rows_before
+            .iter()
+            .filter(|r| r.source_agent_id == Some(agent) && r.perspective_id == Some(own_slot))
+        {
+            use sqlx::Acquire as _;
+            let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to open a savepoint: {e}"),
+            })?;
+            let retracted = epigraph_db::MassFunctionRepository::retract_conn(
+                &mut sp,
+                row.id,
+                "assessment superseded by the agent's human's assessment slot: the agent \
+                 assessed this claim before it was linked to its human",
+                None,
+            )
+            .await;
+            let close = |e: sqlx::Error| ApiError::DatabaseError {
+                message: format!("Failed to close a savepoint: {e}"),
+            };
+            match retracted {
+                Ok(_) => {
+                    sp.commit().await.map_err(close)?;
+                    replaced_assessments.push(replaced(row, true));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        mass_function_id = %row.id,
+                        "assess_claim: the caller's pre-link assessment was not retracted: {e}"
+                    );
+                    sp.rollback().await.map_err(close)?;
+                }
+            }
+        }
+    }
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         &mut *tx,
         claim_id,

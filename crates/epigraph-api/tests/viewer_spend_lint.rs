@@ -173,7 +173,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // `insert_on` records the `claim.assessed` writer event (ids and booleans
     // only; the event list hides it from a reader who cannot read the claim);
     // the `claim_frames` INSERT, the global scoped belief and the WITHIN_FRAME
-    // edge are best-effort under savepoints.
+    // edge are best-effort under savepoints. write (backlog 840bc5ed):
+    // `retract_conn` retires the caller's own pre-link assessment row, read
+    // through the viewer (`get_for_claim_frame`); its definer decides on the
+    // stamped session principal and audits it.
     (
         "assess.rs",
         "assess_claim",
@@ -181,6 +184,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::human_of",
             "AgentRepository::human_of",
             "EventRepository::insert_on",
+            "MassFunctionRepository::retract_conn",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
