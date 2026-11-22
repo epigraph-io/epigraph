@@ -8739,6 +8739,16 @@ impl ClaimRepository {
     /// with a sum computed from a stale read. A `NULL` parameter counts as the
     /// `Beta(1, 1)` prior (`COALESCE`), the column default.
     ///
+    /// # Never below the prior
+    ///
+    /// An increment may be negative: a write that replaces its author's
+    /// earlier BBA withdraws that BBA's increment as it adds its own
+    /// (`epigraph_engine::ds_divergence::apply_beta_update`, backlog 862d8404).
+    /// A parameter is the prior's `1.0` plus counted evidence, so each is held
+    /// at or above `1.0` (`GREATEST`): withdrawing more than the track counted
+    /// (a row stored before its writer kept the track) leaves the prior, never
+    /// a parameter below it. For non-negative increments this changes nothing.
+    ///
     /// # Gated on the claim's group
     ///
     /// The statement splices `{WRITABLE:c}`, so it touches the row only when
@@ -8758,8 +8768,8 @@ impl ClaimRepository {
     ) -> Result<Option<(f64, f64)>, DbError> {
         let sql = viewer.splice_write(
             "UPDATE claims AS c \
-                SET beta_alpha = COALESCE(c.beta_alpha, 1.0) + $2, \
-                    beta_beta = COALESCE(c.beta_beta, 1.0) + $3, \
+                SET beta_alpha = GREATEST(COALESCE(c.beta_alpha, 1.0) + $2, 1.0), \
+                    beta_beta = GREATEST(COALESCE(c.beta_beta, 1.0) + $3, 1.0), \
                     updated_at = NOW() \
               WHERE c.id = $1 /* {WRITABLE:c} */ \
           RETURNING c.beta_alpha, c.beta_beta",

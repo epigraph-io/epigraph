@@ -1606,8 +1606,13 @@ pub async fn submit_evidence(
     //      id, so read the row first, on this transaction, and compare it with
     //      exactly what 5b stores. The caller's row has an agent, so the
     //      cached-combination exclusion never hides it.
-    let write_outcome = {
-        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite};
+    //
+    //      A replacement also yields what the replaced row was counted with on
+    //      the Beta track, for 13b to withdraw (backlog 862d8404), at the
+    //      claim's index on the frame as it stood when that row was counted:
+    //      read here, before step 6 can create the link.
+    let (write_outcome, withdrawn) = {
+        use epigraph_db::bba_write_outcome::{classify, prior_for, BbaWrite, BbaWriteOutcome};
         let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
             &mut *tx,
             &viewer,
@@ -1615,8 +1620,9 @@ pub async fn submit_evidence(
             frame_id,
         )
         .await?;
-        classify(
-            prior_for(&rows, request.agent_id, request.perspective_id),
+        let prior = prior_for(&rows, request.agent_id, request.perspective_id);
+        let outcome = classify(
+            prior,
             &BbaWrite {
                 masses: &masses_json,
                 combination_method: "discount",
@@ -1626,7 +1632,22 @@ pub async fn submit_evidence(
                 conflict_k: None,
                 evidence_id: None,
             },
-        )
+        );
+        let withdrawn = match (outcome, prior) {
+            (BbaWriteOutcome::Replaced, Some(row)) => {
+                let prior_index = epigraph_db::FrameRepository::get_claim_assignment(
+                    &mut *tx,
+                    &viewer,
+                    request.claim_id,
+                    frame_id,
+                )
+                .await?
+                .and_then(|ca| ca.hypothesis_index);
+                epigraph_engine::ds_divergence::replaced_increments(row, &ds_frame, prior_index)
+            }
+            _ => None,
+        };
+        (outcome, withdrawn)
     };
 
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
@@ -1787,8 +1808,9 @@ pub async fn submit_evidence(
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Replaced => warnings.push(
             "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
-             perspective_id (same mass_function_id); it was not added beside it. To add \
-             independent evidence, submit it under a distinct perspective_id."
+             perspective_id (same mass_function_id); it was not added beside it, and \
+             bayesian_posterior counts it in place of the replaced BBA. To add independent \
+             evidence, submit it under a distinct perspective_id."
                 .to_string(),
         ),
         epigraph_db::bba_write_outcome::BbaWriteOutcome::Inserted => {}
@@ -1835,7 +1857,9 @@ pub async fn submit_evidence(
         // An identical resubmission stored nothing new (backlog 33ce3f5d):
         // its Beta update was applied when the BBA was first stored, and
         // applying it again would count the same evidence twice. The
-        // posterior is reported from the parameters as they stand.
+        // posterior is reported from the parameters as they stand. A
+        // replacement withdraws the replaced BBA's increment (`withdrawn`,
+        // step 5a') as it adds its own (backlog 862d8404).
         let counted = write_outcome != epigraph_db::bba_write_outcome::BbaWriteOutcome::Unchanged;
         // The submitted evidence's singleton mass is the evidence strength
         // (shared with the MCP DS tools: `epigraph_engine::ds_divergence`).
@@ -1846,6 +1870,7 @@ pub async fn submit_evidence(
             &viewer,
             request.claim_id,
             increments,
+            withdrawn,
             "submit_evidence",
         )
         .await
