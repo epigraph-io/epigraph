@@ -3773,8 +3773,8 @@ impl PrivatizationRepository {
             if !emptied.is_empty() {
                 tracing::warn!(
                     themes = ?emptied,
-                    "seal left these themes with no embedded member: they have no centroid \
-                     and are unassignable until re-seeded or retired"
+                    "this seal's transaction leaves these themes with no embedded member \
+                     (if it commits): no centroid, so unassignable until re-seeded or retired"
                 );
             }
         }
