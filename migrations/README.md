@@ -3419,8 +3419,9 @@ restart.
   and `epigraph-cli/tests/decomposes_to_factor_sweep.rs`. Undo: `docs/runbooks/262-undo.sql`
   (re-states 217's body; swept rows come back only through `--restore`). **Deploy order:**
   migrate; deploy the binaries (the cascade change); then `decomposes_to_factor_sweep
-  --manifest-out <file>` (dry run), review, `--manifest-out <new file> --apply`, and
-  `--remaining` must print 0.
+  --manifest-out <file>` (dry run; EXPLAIN its selection and pass `--statement-timeout-ms`
+  on a large corpus), review, `--manifest-out <new file> --apply --expect <file>` (refused
+  unless the live selection is exactly the reviewed one), and `--remaining` must print 0.
 
 ## `-- no-transaction` migrations
 

@@ -246,7 +246,12 @@ impl Drop for Dir {
     }
 }
 
-async fn run_lib(pool: &PgPool, out: &Path, apply: bool) -> Result<sweep::SweepReport, SweepError> {
+/// `apply`: the reviewed dry run's ids, or `None` for a dry run.
+async fn run_lib(
+    pool: &PgPool,
+    out: &Path,
+    apply: Option<&[Uuid]>,
+) -> Result<sweep::SweepReport, SweepError> {
     let mut file = std::fs::File::create(out).expect("manifest file");
     let mut conn = pool.acquire().await.expect("acquire");
     sweep::run(&mut conn, &mut file, apply, None).await
@@ -285,7 +290,7 @@ async fn a_stranger_reads_no_decomposition_factor_after_the_sweep(pool: PgPool) 
 
     // Dry run: the manifest is the export, and nothing changes.
     let all_before = all_factors(&pool).await;
-    let dry = run_lib(&pool, &dir.path("dry.jsonl"), false)
+    let dry = run_lib(&pool, &dir.path("dry.jsonl"), None)
         .await
         .expect("dry run");
     assert!(!dry.applied);
@@ -319,9 +324,9 @@ async fn a_stranger_reads_no_decomposition_factor_after_the_sweep(pool: PgPool) 
         Some("legacy")
     );
 
-    // Apply: exactly the manifest is deleted, the rest is kept.
+    // Apply: exactly the reviewed manifest is deleted, the rest is kept.
     let snapshot = full_rows(&pool, &want).await;
-    let applied = run_lib(&pool, &dir.path("apply.jsonl"), true)
+    let applied = run_lib(&pool, &dir.path("apply.jsonl"), Some(&dry.ids))
         .await
         .expect("apply");
     assert!(applied.applied);
@@ -356,12 +361,14 @@ async fn a_stranger_reads_no_decomposition_factor_after_the_sweep(pool: PgPool) 
         );
     }
     let mut conn = pool.acquire().await.expect("acquire");
-    assert_eq!(sweep::remaining(&mut conn).await.expect("remaining"), 0);
+    assert_eq!(
+        sweep::remaining(&mut conn, None).await.expect("remaining"),
+        0
+    );
     drop(conn);
 
-    // The sweep for rows minted later: a row restored by hand is caught by a
-    // re-run, and a re-run with nothing to do deletes nothing.
-    let none = run_lib(&pool, &dir.path("again.jsonl"), true)
+    // A re-run with nothing to do selects and deletes nothing.
+    let none = run_lib(&pool, &dir.path("again.jsonl"), Some(&[]))
         .await
         .expect("idempotent re-run");
     assert!(none.ids.is_empty(), "nothing left to sweep");
@@ -397,11 +404,64 @@ async fn a_stranger_reads_no_decomposition_factor_after_the_sweep(pool: PgPool) 
     assert_eq!(again.skipped, want, "a held id is skipped, not duplicated");
     drop(conn);
 
-    // ...and the next sweep removes the restored rows again.
-    let swept = run_lib(&pool, &dir.path("later.jsonl"), true)
+    // The sweep for rows minted later: a dry run finds the restored rows, and
+    // an apply of that dry run removes them again.
+    let later = run_lib(&pool, &dir.path("later-dry.jsonl"), None)
+        .await
+        .expect("dry run over the restored rows");
+    assert_eq!(later.ids, want, "a re-run finds rows that appeared since");
+    let swept = run_lib(&pool, &dir.path("later.jsonl"), Some(&later.ids))
         .await
         .expect("sweep the restored rows");
-    assert_eq!(swept.ids, want, "a re-run sweeps rows that appeared since");
+    assert_eq!(swept.ids, want, "and deletes them");
+}
+
+/// An apply deletes only the set the operator reviewed: a row that matches
+/// since the dry run (here a new keyed row) makes it refuse, writing nothing
+/// to the database or the manifest.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_apply_refuses_a_selection_that_changed_since_the_dry_run(pool: PgPool) {
+    let w = world(&pool).await;
+    let dir = Dir::new();
+    let dry = run_lib(&pool, &dir.path("dry.jsonl"), None)
+        .await
+        .expect("dry run");
+    let (agent, group) = seed_agent_with_group(&pool, "dtfs-late").await;
+    let p = seed_group_claim(&pool, agent, group, "dtfs late compound").await;
+    let q = seed_group_claim(&pool, agent, group, "dtfs late atom").await;
+    let late = factor(
+        &pool,
+        "directional_support",
+        &sorted(p, q),
+        json!({"relationship": "decomposes_to"}),
+    )
+    .await;
+
+    let out = dir.path("apply.jsonl");
+    let err = run_lib(&pool, &out, Some(&dry.ids))
+        .await
+        .expect_err("the live selection gained a row the operator never reviewed");
+    assert!(
+        matches!(
+            err,
+            SweepError::PlanChanged {
+                added: 1,
+                missing: 0
+            }
+        ),
+        "{err}"
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM factors WHERE id = ANY($1)")
+        .bind(vec![w.legacy, w.keyed, late])
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 3, "nothing was deleted");
+    assert_eq!(
+        std::fs::metadata(&out).expect("file").len(),
+        0,
+        "no manifest is written for a refused apply"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -415,7 +475,7 @@ async fn the_sweep_refuses_a_session_under_row_security(pool: PgPool) {
     conn.execute("SET SESSION AUTHORIZATION epigraph_app")
         .await
         .expect("downgrade");
-    let err = sweep::run(&mut conn, &mut file, true, None)
+    let err = sweep::run(&mut conn, &mut file, Some(&[]), None)
         .await
         .expect_err("an application session would see only its own decompositions");
     assert!(matches!(err, SweepError::NotPrivileged), "{err}");
@@ -539,12 +599,24 @@ async fn the_binary_exports_then_deletes_on_the_maintenance_login(pool: PgPool) 
     );
     assert_eq!(again.code, Some(1), "{}", again.stderr);
 
-    // Apply, then measure.
+    // An apply without the reviewed dry run is refused before connecting.
     let applied = dir.path("apply.jsonl");
     let applied_s = applied.to_string_lossy().into_owned();
     let r = run_bin(
         &dir.0,
         &["--manifest-out", &applied_s, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stderr, r.stdout);
+    assert!(r.stderr.contains("--expect"), "{}", r.stderr);
+    assert!(!applied.exists(), "the refused apply leaves no manifest");
+    assert_eq!(all_factors(&pool).await, all_before, "and deletes nothing");
+
+    // Apply the reviewed dry run, then measure.
+    let r = run_bin(
+        &dir.0,
+        &["--manifest-out", &applied_s, "--apply", "--expect", &dry_s],
         &app_url,
         Some(&maint_url),
     );

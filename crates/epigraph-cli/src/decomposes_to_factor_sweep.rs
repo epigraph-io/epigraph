@@ -36,14 +36,19 @@
 //! MANIFEST (JSONL: a [`ManifestHeader`] line, then one [`ManifestRow`] per
 //! factor carrying the whole row as `to_jsonb`) and syncs it. A dry run (the
 //! default) then rolls back: the manifest is the export. An apply deletes
+//! only the set the operator reviewed: it is given the dry run's ids and
+//! refuses, before writing anything, unless the live selection equals them
+//! exactly ([`SweepError::PlanChanged`]; a new decomposition can turn an
+//! unkeyed row into a legacy one between the two runs). It then deletes
 //! exactly the manifest's ids that still match the predicate, requires the
 //! deleted set to equal the manifest, re-measures (no such row may remain),
 //! and commits. `bp_messages` rows of a deleted factor go with it
 //! (`ON DELETE CASCADE`); the manifest counts them.
 //!
 //! The sweep for rows minted later (a restore, a hand insert, a writer added
-//! after 262) is the same run again: it selects whatever matches at that time,
-//! and finds nothing when nothing matches.
+//! after 262) is the same pair of runs again: a dry run selects whatever
+//! matches at that time (nothing, when nothing does), and an apply of that
+//! dry run deletes it.
 //!
 //! # Restore
 //!
@@ -95,6 +100,11 @@ pub enum SweepError {
     NotPrivileged,
     #[error("another decomposes_to_factor_sweep run holds the sweep lock; nothing was written")]
     LockHeld,
+    #[error(
+        "the live selection is not the reviewed dry run's ({added} rows added, {missing} \
+         missing since); nothing was written: run a new dry run and review it"
+    )]
+    PlanChanged { added: usize, missing: usize },
     #[error(
         "the delete removed {deleted} rows but the manifest lists {listed}; rolled back, \
          nothing was written"
@@ -224,17 +234,25 @@ async fn take_lock(conn: &mut sqlx::PgConnection) -> Result<(), SweepError> {
     }
 }
 
-/// Export (and, with `apply`, delete) every `decomposes_to` factor: see the
-/// module doc. The manifest is written to `out` and synced before any delete.
+/// Export every `decomposes_to` factor; with `apply` (the ids of the dry run
+/// the operator reviewed), delete them: see the module doc. The manifest is
+/// written to `out` and synced before any delete.
 ///
 /// # Errors
 /// See [`SweepError`]; only [`SweepError::CommitUnknown`] can follow a write.
 pub async fn run(
     conn: &mut sqlx::PgConnection,
     out: &mut File,
-    apply: bool,
+    apply: Option<&[Uuid]>,
     statement_timeout_ms: Option<u64>,
 ) -> Result<SweepReport, SweepError> {
+    let expected = apply.map(|ids| {
+        let mut v = ids.to_vec();
+        v.sort_unstable();
+        v.dedup();
+        v
+    });
+    let apply = expected.is_some();
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
     sqlx::query(if apply {
         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"
@@ -265,6 +283,22 @@ pub async fn run(
             },
         )
         .collect();
+    let mut ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    if let Some(expected) = &expected {
+        if *expected != ids {
+            let added = ids
+                .iter()
+                .filter(|i| expected.binary_search(i).is_err())
+                .count();
+            let missing = expected
+                .iter()
+                .filter(|i| ids.binary_search(i).is_err())
+                .count();
+            tx.rollback().await?;
+            return Err(SweepError::PlanChanged { added, missing });
+        }
+    }
     let header = ManifestHeader {
         kind: MANIFEST_KIND.to_string(),
         mode: if apply { "apply" } else { "dry_run" }.to_string(),
@@ -277,8 +311,6 @@ pub async fn run(
     write_manifest(&mut *out, &header, &rows)?;
     out.sync_all()?;
 
-    let mut ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
-    ids.sort_unstable();
     if !apply {
         tx.rollback().await?;
         return Ok(SweepReport {
@@ -329,15 +361,25 @@ pub async fn run(
 ///
 /// # Errors
 /// A database error, or [`SweepError::NotPrivileged`].
-pub async fn remaining(conn: &mut sqlx::PgConnection) -> Result<i64, SweepError> {
-    require_bypass(&mut *conn).await?;
-    Ok(sqlx::query_scalar(&format!(
+pub async fn remaining(
+    conn: &mut sqlx::PgConnection,
+    statement_timeout_ms: Option<u64>,
+) -> Result<i64, SweepError> {
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query("SET TRANSACTION READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    set_statement_timeout(&mut tx, statement_timeout_ms).await?;
+    require_bypass(&mut tx).await?;
+    let n: i64 = sqlx::query_scalar(&format!(
         "-- VISIBILITY-EXEMPT: maintenance read; the decomposes_to sweep runs on the privileged connection.
          SELECT count(*) FROM factors f WHERE NOT ({})",
         bp_readable_factor_sql()
     ))
-    .fetch_one(&mut *conn)
-    .await?)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.rollback().await?;
+    Ok(n)
 }
 
 /// Write a manifest: the header line, then one line per row.
