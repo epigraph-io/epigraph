@@ -3427,12 +3427,14 @@ restart.
   maintenance role. Pinned by `epigraph-db/tests/function_search_path_pg_temp_ratchet.rs`
   (both catalog rules, calibrated with probes; the behavioural proof on a real
   NOSUPERUSER application login, which fails below 271; what 271 changes, its refusal,
-  its empty-path / other-schema / procedure branches, its letter-case reading, and the undo). `TEMP` on the
-  database is NOT revoked here (the application role holds it through PUBLIC; see the
-  header). Undo: `docs/runbooks/271-undo.sql` (reverts each function only while its body
-  is still the 235 body and its path is 271's). **Deploy order:** none against the
-  binaries. A lower-numbered migration applied after 271 is not swept by it and must
-  state `pg_temp` last itself (the ratchet fails on one that does not).
+  its empty-path / other-schema / procedure branches, its letter-case reading, the
+  precheck and the undo). `TEMP` on the database is NOT revoked here (the application role
+  holds it through PUBLIC; see the header). Precheck: `docs/runbooks/271-precheck.sql`
+  lists every function 271 would refuse. Undo: `docs/runbooks/271-undo.sql` (reverts each
+  function only while its body is still the 235 body and its path is 271's, so it also
+  reverts an identical out-of-band fix). **Deploy order:** none against the binaries. A
+  lower-numbered migration applied after 271 is not swept by it and must state `pg_temp`
+  last itself (the ratchet fails on one that does not).
 
 ## `-- no-transaction` migrations
 

@@ -19,6 +19,14 @@
 -- statement it runs is built from the constants below, never from catalog
 -- text (a function's owner controls its stored path).
 --
+-- OUT-OF-BAND FIX: if an `ALTER FUNCTION .. SET search_path = .., pg_temp`
+-- was applied by hand before 271 (an interim mitigation for the same defect),
+-- 271 skipped those functions, but this undo cannot tell that path from the
+-- one 271 sets: it reverts them too, re-opening a fix 271 never made. To keep
+-- it, delete those functions' rows from the list below before running (an
+-- interim fix that appended `pg_temp` to every pinned path covers the first
+-- nine rows), or re-apply it after.
+--
 -- WHAT IT LEAVES: 271's `_sqlx_migrations` row, and any function a migration
 -- after 271 created. Re-introducing the change is a NEW migration, never a
 -- re-run of 271. Idempotent: a second run finds nothing on 271's path.
@@ -34,6 +42,7 @@ DECLARE
 BEGIN
     FOR r IN SELECT * FROM (VALUES
         -- (signature, md5(prosrc) at 235, path at 235 (NULL: unpinned), path 271 set)
+        -- The first nine were pinned without pg_temp at 235; the last ten were unpinned.
         ('public.epigraph_agent_keys_attested_guard()',
          '865574a43103a4a38a60db8a13cb3434', 'pg_catalog, public', 'pg_catalog, public, pg_temp'),
         ('public.epigraph_agents_competence_guard()',

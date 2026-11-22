@@ -42,12 +42,13 @@
 //!   [`migration_271_refuses_pg_temp_before_another_schema`],
 //!   [`migration_271_pins_an_empty_path_and_an_unpinned_trigger_in_any_schema`],
 //!   [`migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it`],
-//!   [`migration_271_reads_path_items_as_postgres_does`] and
+//!   [`migration_271_reads_path_items_as_postgres_does`],
+//!   [`the_271_precheck_lists_exactly_what_271_refuses`] and
 //!   [`the_271_undo_restores_the_paths_below_271`] -- what 271 changes, its
 //!   refusals (including a stored path whose items are SQL: 271 never splices
 //!   catalog text into a statement, and an upper-case `PG_TEMP`, which
-//!   PostgreSQL reads as `pg_temp`), its non-append branches, and its undo
-//!   runbook.
+//!   PostgreSQL reads as `pg_temp`), its non-append branches, its precheck
+//!   query and its undo runbook.
 //!
 //! # The rule for later migrations
 //!
@@ -197,7 +198,8 @@ const PATH_SPACE: &[char] = &[' ', '\t', '\n', '\r', '\x0C', '\x0B'];
 /// Each item of a stored `search_path` as PostgreSQL reads it: an unquoted
 /// item ASCII lower-cased, a quoted one with its quotes stripped and `""`
 /// unescaped. So `PG_TEMP` and `"pg_temp"` both read as `pg_temp`. 271's
-/// sweep and postcondition read items the same way.
+/// sweep and postcondition and `docs/runbooks/271-precheck.sql` read items
+/// the same way.
 fn path_items(path: &str) -> Vec<String> {
     if path.trim_matches(PATH_SPACE).is_empty() {
         return Vec::new();
@@ -1042,6 +1044,115 @@ async fn migration_271_reads_path_items_as_postgres_does(pool: PgPool) {
             "271 leaves {sig} as stored"
         );
     }
+}
+
+/// Runs `docs/runbooks/271-precheck.sql` and returns `function -> reason`.
+async fn precheck(pool: &PgPool) -> BTreeMap<String, String> {
+    let sql = repo_text("docs/runbooks/271-precheck.sql");
+    let rows: Vec<(String, String, String)> = sqlx::query_as(&format!(
+        "SELECT pg_catalog.regexp_replace(q.function::pg_catalog.text, '^public\\.', ''), \
+                q.setting, q.reason \
+           FROM ({}\n) AS q",
+        sql.trim_end().trim_end_matches(';')
+    ))
+    .fetch_all(pool)
+    .await
+    .expect("the precheck runs");
+    rows.into_iter().map(|(f, _, why)| (f, why)).collect()
+}
+
+/// `docs/runbooks/271-precheck.sql` lists exactly the functions 271's sweep
+/// refuses, reading each `proconfig` entry on its own. The one-liner the
+/// deploy row used to give joined a function's settings into one string, so
+/// it reported 184's un-retract definer (`search_path` followed by a second
+/// setting) on every database, a function 271 accepts.
+#[sqlx::test(migrations = false)]
+async fn the_271_precheck_lists_exactly_what_271_refuses(pool: PgPool) {
+    migrate(&pool, &below(271))
+        .await
+        .expect("migrate below 271");
+    let old_hits: Vec<String> = sqlx::query_scalar(
+        "SELECT oid::regprocedure::text FROM pg_proc \
+          WHERE array_to_string(proconfig, ',') ~ 'search_path=.*pg_temp *,'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the old one-liner");
+    assert!(
+        old_hits
+            .iter()
+            .any(|f| f.contains("epigraph_unretract_mass_function(")),
+        "CALIBRATION: the old one-liner reports the un-retract definer ({old_hits:?})"
+    );
+    assert_eq!(
+        precheck(&pool).await,
+        BTreeMap::new(),
+        "below 271 nothing would be refused, the un-retract definer included"
+    );
+
+    sqlx::raw_sql(
+        "CREATE FUNCTION public.t134_pc_temp_first() RETURNS integer LANGUAGE sql \
+             SET search_path = pg_temp, public AS $$ SELECT 1 $$; \
+         CREATE FUNCTION public.t134_pc_append() RETURNS integer LANGUAGE sql \
+             SET search_path = pg_catalog, public AS $$ SELECT 1 $$; \
+         CREATE FUNCTION public.t134_pc_empty() RETURNS integer LANGUAGE sql \
+             SET search_path = '' AS $$ SELECT 1 $$; \
+         CREATE FUNCTION public.t134_pc_multi() RETURNS integer LANGUAGE sql \
+             SET search_path = pg_catalog, public, pg_temp SET work_mem = '64kB' \
+             AS $$ SELECT 1 $$;",
+    )
+    .execute(&pool)
+    .await
+    .expect("fixtures");
+    create_verbatim_probes(
+        &pool,
+        &[
+            ("public.t134_pc_upper_first()", "PG_TEMP, public, pg_temp"),
+            ("public.t134_pc_quoted_item()", "pg_catalog, \"Public\""),
+            (
+                "public.t134_pc_quoted_temp_last()",
+                "pg_catalog, \"pg_temp\"",
+            ),
+        ],
+    )
+    .await;
+    let first = "lists pg_temp before another schema".to_string();
+    let item = "an item is not a plain lower-case schema name or \"$user\"".to_string();
+    let listed = precheck(&pool).await;
+    assert_eq!(
+        listed,
+        BTreeMap::from([
+            ("t134_pc_quoted_item()".to_string(), item),
+            ("t134_pc_temp_first()".to_string(), first.clone()),
+            ("t134_pc_upper_first()".to_string(), first),
+        ]),
+        "the precheck lists the temp-first paths (in any letter case) and the path with an \
+         item 271 cannot rebuild, and not a path 271 appends to, an empty one, a quoted \
+         pg_temp last, or a function with a second setting"
+    );
+
+    // The precheck and the sweep agree: 271 refuses while any listed
+    // function remains, and applies once they are gone.
+    let r = migrate(&pool, &below(272)).await;
+    assert_eq!(sqlstate(&r).as_deref(), Some("55000"), "271 refuses: {r:?}");
+    let refusal = format!("{:?}", r.as_ref().err());
+    assert!(
+        listed
+            .keys()
+            .any(|f| refusal.contains(f.trim_end_matches("()"))),
+        "271 refuses a function the precheck listed: {refusal}"
+    );
+    sqlx::raw_sql(
+        "DROP FUNCTION public.t134_pc_temp_first(); DROP FUNCTION public.t134_pc_upper_first(); \
+         DROP FUNCTION public.t134_pc_quoted_item();",
+    )
+    .execute(&pool)
+    .await
+    .expect("drop the listed functions");
+    assert_eq!(precheck(&pool).await, BTreeMap::new());
+    migrate(&pool, &below(272))
+        .await
+        .expect("POSITIVE CONTROL: 271 applies once the precheck lists nothing");
 }
 
 fn repo_text(rel: &str) -> String {

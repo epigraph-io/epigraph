@@ -83,11 +83,13 @@
 --
 -- NOT CHANGED HERE: `TEMP` on the database. The application role holds it
 -- only through PUBLIC (PostgreSQL's default grant), so a revoke from
--- `epigraph_app` alone changes nothing; removing it means revoking from
--- PUBLIC and re-granting per login, a deployment decision, and command-line
--- tools create temporary tables on their connections. With every path
--- listing `pg_temp` last, a temporary object no longer shadows a name a body
--- means.
+-- `epigraph_app` alone changes nothing. Removing it means `REVOKE TEMP ON
+-- DATABASE .. FROM PUBLIC` and granting TEMP to the roles whose logins need
+-- it (the maintenance role and the migrating role; member logins inherit
+-- it). The API and MCP server create no temporary tables; only command-line
+-- tools do, on maintenance connections. That is a deployment decision, left
+-- to the operator. With every path listing `pg_temp` last, a temporary
+-- object no longer shadows a name a body means.
 --
 -- ORDER: a migration numbered below 271 that is applied AFTER it (sqlx
 -- applies a missing lower version) is not swept by it, so it must state
