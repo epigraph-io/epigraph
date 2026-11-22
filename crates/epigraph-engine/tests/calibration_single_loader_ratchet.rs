@@ -200,3 +200,103 @@ fn after_tests() -> &'static str { "{" }
         "an ALLOWED fragment is per file"
     );
 }
+
+/// Every `DsAutoInput { .. }` literal in `src`, from its opening brace to the
+/// matching closing one, with its 1-based starting line.
+fn ds_auto_inputs(src: &str) -> Vec<(usize, String)> {
+    const OPEN: &str = "DsAutoInput {";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = src[from..].find(OPEN) {
+        let start = from + at;
+        let body_start = start + OPEN.len();
+        let mut depth = 1usize;
+        let mut end = src.len();
+        for (i, ch) in src[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = body_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out.push((
+            src[..start].matches('\n').count() + 1,
+            src[body_start..end].to_string(),
+        ));
+        from = body_start;
+    }
+    out
+}
+
+/// True when a struct-literal body sets `weight` to a numeric literal.
+fn sets_a_literal_weight(body: &str) -> bool {
+    body.split(',').any(|field| {
+        let mut kv = field.splitn(2, ':');
+        let key = kv.next().unwrap_or("").trim();
+        let value = kv.next().unwrap_or("").trim_start();
+        key == "weight" && value.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// Ratchet (backlog 26a12f41): no production `DsAutoInput` passes a literal
+/// `weight`. The weight is the evidence type's reliability, which the served
+/// calibration owns; `memorize` passed `weight: 0.6`, which matched the
+/// shipped `testimonial` weight but ignored a `CALIBRATION_PATH` retune.
+#[test]
+fn no_ds_auto_input_hardcodes_its_evidence_type_weight() {
+    let root = workspace_root();
+    let mut seen = 0;
+    let mut offending = Vec::new();
+    for (file, src) in production_sources(&root) {
+        for (line, body) in ds_auto_inputs(&production_code(&src)) {
+            seen += 1;
+            if sets_a_literal_weight(&body) {
+                offending.push(format!("  {file}:{line}: DsAutoInput {{{}}}", body.trim()));
+            }
+        }
+    }
+    assert!(
+        seen >= 2,
+        "found {seen} DsAutoInput literals; the scan no longer sees the writers (moved? \
+         update this ratchet)"
+    );
+    assert!(
+        offending.is_empty(),
+        "DsAutoInput with a literal weight (use CalibrationConfig::cached()\
+         .get_evidence_type_weight(<the evidence row's tag>)):\n{}",
+        offending.join("\n")
+    );
+}
+
+/// The `DsAutoInput` scanner: a literal weight is a hit, a resolved one,
+/// a shorthand field and a `weight_*` field are not, and a nested brace does
+/// not end the literal early.
+#[test]
+fn the_ds_auto_input_scanner_flags_only_a_literal_weight() {
+    let src = "fn a() {\n    f(DsAutoInput {\n        confidence,\n        weight: 0.6,\n        \
+               supports: true,\n        evidence_type: Some(\"testimony\"),\n    });\n}\n\
+               fn b() { g(ds_auto::DsAutoInput { confidence, weight, supports: true, \
+               evidence_type: None, evidence_id: None }); }\n\
+               fn c() { g(DsAutoInput { confidence: { 0.5 }, weight: w(), supports: true, \
+               evidence_type: None, evidence_id: None }); }\n\
+               fn d() { g(DsAutoInput { weight_hint: 1.0, weight: cached().get_evidence_type_weight(t), \
+               supports: true, evidence_type: None, evidence_id: None }); }\n";
+    let found = ds_auto_inputs(src);
+    assert_eq!(
+        found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec![2, 9, 10, 11]
+    );
+    let literal: Vec<bool> = found
+        .iter()
+        .map(|(_, b)| sets_a_literal_weight(b))
+        .collect();
+    assert_eq!(literal, vec![true, false, false, false], "{found:?}");
+    // After the nested `{ 0.5 }` block the scan still reaches `weight: w()`.
+    assert!(found[2].1.contains("weight: w()"), "{:?}", found[2]);
+}

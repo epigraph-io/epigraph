@@ -67,7 +67,13 @@ pub async fn memorize(
     )
     .await?;
 
-    let raw_truth = (confidence * 0.6).clamp(0.01, 0.99);
+    // The served testimonial weight (`CALIBRATION_PATH`, else the compiled-in
+    // copy), as `submit_claim` resolves its own: a literal here ignored an
+    // operator's retune of `testimonial` (backlog 26a12f41). The evidence row
+    // below is `EvidenceType::Testimony` (DB tag `testimony`).
+    let weight = epigraph_engine::calibration::CalibrationConfig::cached()
+        .get_evidence_type_weight("testimony");
+    let raw_truth = (confidence * weight).clamp(0.01, 0.99);
     let truth_value = TruthValue::clamped(raw_truth);
 
     let mut claim = Claim::new(params.content.clone(), agent_id_typed, pub_key, truth_value);
@@ -290,13 +296,13 @@ pub async fn memorize(
                 claim_uuid,
                 ds_auto::DsAutoInput {
                     confidence,
-                    weight: 0.6,
+                    weight,
                     supports: true,
                     // The evidence row this call wrote above is
                     // `EvidenceType::Testimony` (DB tag `testimony`), and DS runs
                     // only on first create, when that row always exists. ds_auto
                     // resolves the tag to its canonical key, `testimonial`, whose
-                    // calibrated weight is the 0.6 stored above (bc06ec6f).
+                    // served weight is `weight` above (bc06ec6f, 26a12f41).
                     evidence_type: Some("testimony"),
                     // memorize takes no source_url, so its evidence row can
                     // carry no source identity; the BBA stays unkeyed.
