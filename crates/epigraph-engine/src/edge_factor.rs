@@ -2122,7 +2122,9 @@ pub async fn recompute_atom_cache(
 /// group member's write never carries its group's sources into the one
 /// cache everyone reads. When the atom has AEF input and none of it is
 /// admitted, an atom with a fold cache gets the explicit vacuous value
-/// ([`AtomCacheOutcome::Vacated`]); one without a cache is left without.
+/// ([`AtomCacheOutcome::Vacated`], logged under target
+/// `epigraph::atom_cache::scope_vacate` when the cache took it, apart from
+/// the evidence-removal vacate list); one without a cache is left without.
 ///
 /// **Row security.** The role is read without a splice, which makes "a
 /// compound is never written" hold on a connection that bypasses row
@@ -2239,13 +2241,20 @@ pub async fn recompute_atom_cache_with(
             &thresholds,
         )
         .await?;
-        tracing::warn!(
-            target: "epigraph::atom_cache::vacate",
-            claim = %claim_id,
-            written,
-            "derivation-scope vacate: no AEF input row may enter the atom's cache; \
-             explicit vacuous cache (basis unproven)"
-        );
+        if written {
+            tracing::warn!(
+                target: "epigraph::atom_cache::scope_vacate",
+                claim = %claim_id,
+                "derivation-scope vacate: no AEF input row may enter the atom's cache; \
+                 explicit vacuous cache (basis unproven)"
+            );
+        } else {
+            tracing::info!(
+                claim = %claim_id,
+                "derivation-scope vacate not taken by the cache (non-owner write on \
+                 another recorded frame); the cache is unchanged"
+            );
+        }
         return Ok(AtomCacheOutcome::Vacated { written });
     }
 
@@ -2318,7 +2327,12 @@ pub enum VacateOutcome {
 /// The caller decides WHICH atoms (only ids on an operator-accepted list);
 /// this function refuses every claim the vacate is not for, whatever the
 /// list says ([`vacate_refusal`]). The PR-0 guard keeps every bulk recompute
-/// from writing this value, so this is the one bulk path to it.
+/// from writing this value to a residue atom, so this is the one bulk path to
+/// it for those. The single atom-cache writer writes it on its own in two
+/// cases only, neither of them residue: an atom that lost all its AEF input
+/// to a lifecycle act, and an atom that HAS AEF input of which the
+/// derivation-scope rule admits none to its cache (as the claim cache's
+/// recompute vacates such a claim); see [`recompute_atom_cache_with`].
 ///
 /// # Errors
 /// A database read or write.
