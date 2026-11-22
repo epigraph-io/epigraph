@@ -3404,17 +3404,26 @@ restart.
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
 
-- **248**: `role_attach_register_first_and_may_run_self` (backlog 30ec8d72). Re-states
-  166's `epigraph_attach_agent_to_role` (an md5 precondition refuses to apply over any
-  other body; owner and grants unchanged). The attach verb now refuses `ROL03` (nothing
-  written) an identity the host's registration would still ADOPT (never registered, no
-  authored claim, and fresh by 161's own freshness scan, copied verbatim), because the
-  attachment would make that first registration abort `AID09` for good; an identity the
-  registration refuses anyway is attached as before. A direct maintenance INSERT into
-  `role_agents` is unchanged. Pinned by `epigraph-db/tests/role_attached_agents.rs`
+- **248**: `role_attach_register_first_and_may_run_self` (backlog 30ec8d72, 1afdc93d).
+  Re-states 166's `epigraph_attach_agent_to_role` and `epigraph_role_agent_may_run` (an
+  md5 precondition refuses to apply over any other body; owners and grants unchanged).
+  The attach verb now refuses `ROL03` (nothing written) an identity the host's
+  registration would still ADOPT (never registered, no authored claim, and fresh by 161's
+  own freshness scan, copied verbatim), because the attachment would make that first
+  registration abort `AID09` for good; an identity the registration refuses anyway is
+  attached as before. A direct maintenance INSERT into `role_agents` is unchanged.
+  `epigraph_role_agent_may_run` answers a privileged session and an
+  `epigraph_identity_attestor` login about any agent, and any other session only about
+  its own stamped principal (`42501` otherwise), so an application session can no longer
+  enumerate the role roster; `AgentRepository::role_agent_may_run` stamps the agent it
+  asks about, transaction-local. The stamp is a session setting, so a session that forges
+  its own principal still learns about that one agent per ask. Pinned by
+  `epigraph-db/tests/role_attached_agents.rs`
   (`attaching_an_identity_the_host_has_not_registered_is_refused`, replacing the pinned
-  AID09 case, and `the_248_undo_restores_166s_bodies`). Undo:
-  `docs/runbooks/248-undo.sql`. **Deploy order:** none required.
+  AID09 case, and `may_run_answers_an_app_session_only_about_its_own_principal`). Undo:
+  `docs/runbooks/248-undo.sql`. **Deploy order:** `epigraph-mcp-full` built with this
+  file's repository change first (or together): an older binary asks unstamped and
+  refuses to boot after the migration. The host asks on the attestor login.
 
 ## `-- no-transaction` migrations
 

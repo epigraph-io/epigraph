@@ -21,7 +21,8 @@
 //!   transaction's start.
 //! * `epigraph_role_agent_may_run(agent)` answers the host and epigraph-mcp
 //!   without exposing the roster. Both the application role and the identity
-//!   attestor can EXECUTE it.
+//!   attestor can EXECUTE it; since 248 the application role is answered only
+//!   about its own stamped principal.
 //! * Since 248 the attach verb refuses (`ROL03`) an identity the host has not
 //!   registered yet, whose first registration the attachment would abort.
 //! * A succession registered by the attestor copies the parent's live
@@ -264,14 +265,32 @@ struct MayRun {
     reason: String,
 }
 
+/// `epigraph_role_agent_may_run(agent)` on a `role` session stamped with
+/// `agent` as its principal: the way an application session asks about
+/// ITSELF (248 answers it about nobody else; the attestor is not bound).
 async fn may_run_as(pool: &PgPool, role: &str, agent: Uuid) -> Result<MayRun, sqlx::Error> {
+    may_run_stamped(pool, role, Some(agent), agent).await
+}
+
+/// `epigraph_role_agent_may_run(agent)` on a `role` session stamped with
+/// `principal` (`None`: unstamped).
+async fn may_run_stamped(
+    pool: &PgPool,
+    role: &str,
+    principal: Option<Uuid>,
+    agent: Uuid,
+) -> Result<MayRun, sqlx::Error> {
     fixture::as_role(pool, role, |mut conn| async move {
+        if let Some(p) = principal {
+            stamp(&mut conn, p, &[]).await;
+        }
         let r = sqlx::query_as::<_, MayRun>(
             "SELECT may_run, role, holder, reason FROM public.epigraph_role_agent_may_run($1)",
         )
         .bind(agent)
         .fetch_one(&mut *conn)
         .await;
+        unstamp(&mut conn).await;
         (conn, r)
     })
     .await
@@ -741,6 +760,60 @@ async fn may_run_answers_the_app_role_and_the_attestor(pool: PgPool) {
                 reason: "not_holder".into()
             },
             "{caller}: an agent of the previous holder"
+        );
+    }
+}
+
+/// Backlog 1afdc93d (migration 248). `agents` is world-readable, so under
+/// 166 an application session could ask `epigraph_role_agent_may_run` about
+/// every agent id and rebuild the role roster (which agents are attached to
+/// which role, and whether each role has a holder). 248 answers an
+/// application session only about its OWN stamped principal: about any other
+/// agent, or unstamped, it is refused `42501` and returns no row. The identity
+/// attestor (the host, which asks before starting any container) and a
+/// maintenance session still get the full answer about any agent.
+///
+/// Verified to fail: on 166's body (248 reverted) the unstamped and the
+/// other-principal app sessions both get the full answer, role included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn may_run_answers_an_app_session_only_about_its_own_principal(pool: PgPool) {
+    seed_role(&pool, ROLE).await;
+    let (h, _) = human(&pool, "holder").await;
+    let attached = agent_of(&pool, h, "curator").await;
+    let other = agent_of(&pool, h, "other").await;
+    attach(&pool, ROLE, attached).await;
+    let gap = MayRun {
+        may_run: false,
+        role: Some(ROLE.into()),
+        holder: None,
+        reason: "no_holder".into(),
+    };
+
+    for (what, principal) in [
+        ("unstamped", None),
+        ("stamped as another agent", Some(other)),
+    ] {
+        let r = may_run_stamped(&pool, "epigraph_app", principal, attached).await;
+        assert_eq!(
+            code_of(&r).as_deref(),
+            Some(INSUFFICIENT_PRIVILEGE),
+            "an app session {what} asks about another agent: {r:?}"
+        );
+    }
+    assert_eq!(
+        may_run_stamped(&pool, "epigraph_app", Some(attached), attached)
+            .await
+            .expect("an app session asks about its own principal"),
+        gap,
+        "its own answer, in full"
+    );
+    for privileged in [ATTESTOR, "epigraph_maintenance"] {
+        assert_eq!(
+            may_run_stamped(&pool, privileged, None, attached)
+                .await
+                .unwrap_or_else(|e| panic!("{privileged} asks about any agent: {e}")),
+            gap,
+            "{privileged}: the full answer, unstamped"
         );
     }
 }
@@ -2864,9 +2937,10 @@ async fn attaching_an_identity_the_host_has_not_registered_is_refused(pool: PgPo
         .expect("CONTROL: an identity that authored claims unregistered is attached as before");
 }
 
-/// `docs/runbooks/248-undo.sql` puts back exactly 166's body (the md5 248's
-/// precondition names), owner and grants kept, and with it 166's behaviour:
-/// the early attach lands again. CONTROL first: at head it is refused.
+/// `docs/runbooks/248-undo.sql` puts back exactly 166's two bodies (the md5s
+/// 248's precondition names), owner and grants kept, and with them 166's
+/// behaviour: the early attach lands again and an unstamped application
+/// session is answered again. CONTROL first: at head both are refused.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_248_undo_restores_166s_bodies(pool: PgPool) {
     seed_role(&pool, ROLE).await;
@@ -2890,6 +2964,10 @@ async fn the_248_undo_restores_166s_bodies(pool: PgPool) {
             "public.epigraph_attach_agent_to_role(text, uuid, timestamptz, timestamptz, text)",
             "434b06ab5e01ac9d13953ed1c4a4b647",
         ),
+        (
+            "public.epigraph_role_agent_may_run(uuid)",
+            "eac9e167f74f426e664fd2c5e7f1f428",
+        ),
     ] {
         let found: Option<String> = sqlx::query_scalar(
             "SELECT md5(prosrc) FROM pg_catalog.pg_proc WHERE oid = to_regprocedure($1)",
@@ -2907,6 +2985,11 @@ async fn the_248_undo_restores_166s_bodies(pool: PgPool) {
     try_attach(&pool, ROLE, early)
         .await
         .expect("166's attach admits the unregistered identity again");
+    let (h, _) = human(&pool, "undo-holder").await;
+    let other = agent_of(&pool, h, "undo-other").await;
+    may_run_stamped(&pool, "epigraph_app", None, other)
+        .await
+        .expect("166's may_run answers an unstamped application session again");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

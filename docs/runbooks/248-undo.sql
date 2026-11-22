@@ -1,18 +1,23 @@
 -- ===================================================================
 -- 248-undo.sql: take migration 248 (the attach verb's register-first
--- refusal) back out, in ONE transaction, on the migration (superuser) DSN.
+-- refusal, and may_run answering an application session only about its own
+-- stamped principal) back out, in ONE transaction, on the migration
+-- (superuser) DSN.
 --
--- WHAT IT DOES: re-states the body 248 replaced, verbatim from 166
+-- WHAT IT DOES: re-states the two bodies 248 replaced, verbatim from 166
 -- (CREATE OR REPLACE keeps owner and grants):
 --   * `epigraph_attach_agent_to_role` (166's body: attaches any agent the
 --     guards admit, including one the host has not registered yet, whose
 --     first registration then aborts AID09);
+--   * `epigraph_role_agent_may_run`   (166's body: answers any session
+--     holding EXECUTE about any agent).
 --
 -- WHAT IT LEAVES: every attachment written in between (each is an ordinary
 -- 166 row), and 248's `_sqlx_migrations` row. Re-introducing either rule is
 -- a NEW migration, never a re-run of 248.
 --
--- No binary needs rolling back first.
+-- No binary needs rolling back first: the repository's stamped ask works on
+-- both bodies.
 -- ===================================================================
 
 BEGIN;
@@ -37,5 +42,13 @@ BEGIN
     RETURNING id INTO v_id;
     RETURN v_id;
 END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_role_agent_may_run(p_agent uuid)
+RETURNS TABLE (may_run boolean, role text, holder uuid, reason text)
+LANGUAGE sql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+    SELECT g.may_run, g.role, g.holder, g.reason
+      FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g
+$$;
 
 COMMIT;

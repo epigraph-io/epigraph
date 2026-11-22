@@ -1,5 +1,6 @@
 -- 248_role_attach_register_first_and_may_run_self.sql
--- The role-attach verb refuses an identity the host has not registered yet.
+-- The role-attach verb refuses an identity the host has not registered yet,
+-- and an application session asks "may this agent run?" only about itself.
 --
 -- ===================================================================
 -- 1. WHY
@@ -15,6 +16,16 @@
 -- new job identity, then start it) got a job that could never register, and
 -- a database error at start rather than a refusal at attach. 166 only
 -- documented the order ("REGISTER, THEN ATTACH").
+--
+-- (b) MAY-RUN IS ABOUT ONESELF (backlog 1afdc93d). 166's
+-- `epigraph_role_agent_may_run(agent)` answered `(may_run, role, holder,
+-- reason)` about ANY agent to the application role. `agents` is
+-- world-readable, so an application session could ask about every agent id
+-- and rebuild the role roster (which agents are attached to which role) and
+-- whether each role has a holder. Agent containers hold the application
+-- DSN, so that reached beyond the server. 166 recorded it as an accepted
+-- disclosure because epigraph-mcp needs the answer to refuse its own boot;
+-- that need is about its own agent only.
 --
 -- ===================================================================
 -- 2. THE RULES
@@ -45,24 +56,50 @@
 -- own succession copy and the lineage follow attach registered successors
 -- only.
 --
+-- (b) `epigraph_role_agent_may_run(agent)` answers in full, as before, a
+-- PRIVILEGED session (`epigraph_bypass()`: a maintenance member or a
+-- superuser) and a session whose login is a member of
+-- `epigraph_identity_attestor` (the host, which asks about every identity it
+-- starts). Any other session (the application role) is answered only about
+-- its own stamped principal (`epigraph_principal_id()`); about any other
+-- agent, or unstamped, it is refused `42501` and gets no row.
+-- `AgentRepository::role_agent_may_run` (epigraph-mcp's boot check) stamps
+-- the agent it asks about, transaction-local, on the connection it asks on.
+-- LIMIT: the principal is a session setting, and a holder of the
+-- application DSN can set it to any agent before asking. So this binds the
+-- question to the caller's DECLARED principal, as 198's own-assignment read
+-- does: it closes enumeration by code that stamps the principal it serves,
+-- not by a session that forges its own stamp (the limit every check keyed on
+-- the session's stamp shares).
+--
 -- ===================================================================
 -- 3. RE-STATEMENTS
 --
--- 166's body with the delta marked `248`. Signature, owner and ACL are
--- unchanged (CREATE OR REPLACE keeps both). A precondition refuses (55000,
--- nothing changed) unless it still carries 166's body (md5 of `prosrc`).
+-- Both are 166's bodies with the deltas marked `248`. Signatures, owners and
+-- ACLs are unchanged (CREATE OR REPLACE keeps both; `may_run` changes
+-- LANGUAGE from sql to plpgsql, which CREATE OR REPLACE allows). A
+-- precondition refuses (55000, nothing changed) unless each still carries
+-- 166's body (md5 of `prosrc`).
 --
 -- ===================================================================
 -- 4. UNDO
 --
--- `docs/runbooks/248-undo.sql` re-states 166's body verbatim. No order
--- against the binaries.
+-- `docs/runbooks/248-undo.sql` re-states both 166 bodies verbatim. No
+-- binary needs rolling back first: the repository's stamped ask works on
+-- both bodies.
+--
+-- DEPLOY ORDER: `epigraph-mcp-full` built with this file's repository change
+-- FIRST (or together), then this file. An older epigraph-mcp asks may_run
+-- unstamped; on an application login it is then refused `42501` and refuses
+-- to boot ("could not ask whether agent ... may run"). The new binary works
+-- on a database below this file (166's body ignores the stamp). The host
+-- asks on the attestor login and is unaffected.
 
 SET LOCAL lock_timeout = '3s';
 
 -- -------------------------------------------------------------------
--- Precondition: the function this file re-states still carries 166's
--- body. Any other body (a later re-statement applied out of order) would
+-- Precondition: the two functions this file re-states still carry 166's
+-- bodies. Any other body (a later re-statement applied out of order) would
 -- be silently dropped by CREATE OR REPLACE; refuse instead.
 -- -------------------------------------------------------------------
 DO $$
@@ -73,7 +110,9 @@ BEGIN
     FOR v_check IN
         SELECT * FROM (VALUES
             ('public.epigraph_attach_agent_to_role(text, uuid, timestamptz, timestamptz, text)',
-             '434b06ab5e01ac9d13953ed1c4a4b647')
+             '434b06ab5e01ac9d13953ed1c4a4b647'),
+            ('public.epigraph_role_agent_may_run(uuid)',
+             'eac9e167f74f426e664fd2c5e7f1f428')
         ) AS c(signature, expected)
     LOOP
         SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
@@ -188,4 +227,35 @@ BEGIN
     VALUES (p_role, p_agent, COALESCE(p_valid_from, now()), p_valid_to, p_reason)
     RETURNING id INTO v_id;
     RETURN v_id;
+END $$;
+
+-- ===================================================================
+-- (b) The question (166's body); delta: an application session asks only
+-- about its own stamped principal.
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_role_agent_may_run(p_agent uuid)
+RETURNS TABLE (may_run boolean, role text, holder uuid, reason text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+#variable_conflict use_column
+BEGIN
+    -- 248: session_user, never current_user (this frame runs as its owner).
+    IF NOT public.epigraph_bypass()
+       AND NOT COALESCE(
+               (SELECT pg_has_role(session_user, 'epigraph_identity_attestor', 'MEMBER')
+                 WHERE EXISTS (SELECT 1 FROM pg_roles
+                                WHERE rolname = 'epigraph_identity_attestor')),
+               false)
+       AND p_agent IS DISTINCT FROM public.epigraph_principal_id() THEN
+        RAISE EXCEPTION 'epigraph_role_agent_may_run: an application session asks only about '
+                        'its own stamped principal (asked about %, stamped %)',
+                        p_agent, COALESCE(public.epigraph_principal_id()::text, 'none')
+            USING ERRCODE = '42501',
+                  HINT = 'Stamp the agent as epigraph.principal_id on the asking connection '
+                         '(AgentRepository::role_agent_may_run does), or ask on the identity '
+                         'attestor''s login.';
+    END IF;
+    RETURN QUERY
+    SELECT g.may_run, g.role, g.holder, g.reason
+      FROM public.epigraph_role_agent_gate(p_agent, clock_timestamp()) g;
 END $$;
