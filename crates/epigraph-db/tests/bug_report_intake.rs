@@ -628,6 +628,90 @@ async fn moved_and_earlier_intake_reports_stay_in_the_list(pool: PgPool) {
     );
 }
 
+/// A repro or evidence with nothing visible in it (zero-width, format, filler
+/// characters) is no repro / no evidence, by the same rule as the title and
+/// description (backlog 64584278 part 2), on both sides that compose the
+/// content: the stored claim has no `Repro:` section and `has_repro` false,
+/// and the evidence row holds the description, under the description's
+/// digest. A repro with one visible character is kept as given.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invisible_only_repro_or_evidence_is_absent(pool: PgPool) {
+    let w = world(&pool).await;
+    let mut input = report("invisible extras");
+    input.repro = Some("\u{200B}\u{2060}\u{FEFF}".into());
+    input.evidence = Some("\u{3164}\u{200D}".into());
+    let r = submit_as(&pool, w.reporter, &input).await.expect("filed");
+    let (content, has_repro, has_evidence): (String, bool, bool) = sqlx::query_as(
+        "SELECT content, (properties #>> '{bug_report,has_repro}')::boolean, \
+                (properties #>> '{bug_report,has_evidence}')::boolean \
+           FROM claims WHERE id = $1",
+    )
+    .bind(r.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the report");
+    assert_eq!(content, format!("{}\n\n{}", input.title, input.description));
+    assert!(!has_repro && !has_evidence, "{has_repro} {has_evidence}");
+    let (raw, hash): (Option<String>, Vec<u8>) =
+        sqlx::query_as("SELECT raw_content, content_hash FROM evidence WHERE claim_id = $1")
+            .bind(r.claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the evidence");
+    assert_eq!(raw.as_deref(), Some(input.description.as_str()));
+    assert_eq!(
+        hash,
+        epigraph_crypto::ContentHasher::hash(input.description.as_bytes()).to_vec(),
+        "the stored digest is the stored text's"
+    );
+
+    // The DEFINER's own rule, without the server's composition: the raw
+    // invisible-only repro and evidence are sent as given, with the content
+    // and digests composed WITHOUT them. The definer must compose the same
+    // content (else BUG05) and store the description as the evidence.
+    let viewer = Viewer::resolve(&pool, w.reporter).await.expect("resolve");
+    let scoped = app(&pool).await;
+    let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
+    let (title, description) = ("raw", "raw: sent straight to the definer");
+    let content = format!("{title}\n\n{description}");
+    let raw_id: Uuid = sqlx::query_scalar(
+        "SELECT claim_id FROM public.epigraph_submit_bug_report( \
+             $1, $2, NULL, NULL, $3, $4, $5, $6, $7, NULL)",
+    )
+    .bind(title)
+    .bind(description)
+    .bind("\u{200B}\u{2060}")
+    .bind("\u{3164}\u{200D}")
+    .bind(&content)
+    .bind(epigraph_crypto::ContentHasher::hash(content.as_bytes()).to_vec())
+    .bind(epigraph_crypto::ContentHasher::hash(description.as_bytes()).to_vec())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("the definer composes the content without the invisible repro");
+    tx.commit().await.expect("commit");
+    let (has_repro, raw): (bool, Option<String>) = sqlx::query_as(
+        "SELECT (c.properties #>> '{bug_report,has_repro}')::boolean, e.raw_content \
+           FROM claims c JOIN evidence e ON e.claim_id = c.id WHERE c.id = $1",
+    )
+    .bind(raw_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the raw report");
+    assert!(!has_repro);
+    assert_eq!(raw.as_deref(), Some(description), "the evidence fell back");
+
+    // CALIBRATION: one visible character makes it a repro, kept as given.
+    let mut kept = report("visible repro");
+    kept.repro = Some("\u{200B}x".into());
+    let k = submit_as(&pool, w.reporter, &kept).await.expect("filed");
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(k.claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the report");
+    assert!(content.ends_with("\n\nRepro:\n\u{200B}x"), "{content:?}");
+}
+
 /// The application role cannot write the intake's marker, in any spelling,
 /// while it can still write its own ordinary audit rows.
 #[sqlx::test(migrations = "../../migrations")]

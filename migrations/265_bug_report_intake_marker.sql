@@ -50,8 +50,18 @@
 --       row before it writes anything and holds its lock to commit, so a
 --       report in flight on 207's/211's body commits before the backfill
 --       reads, and none starts until the new body below is in place.
---   (c) `epigraph_submit_bug_report`, redefined from 211's body with ONE
---       added statement: the marker INSERT after the audit row.
+--   (c) `epigraph_submit_bug_report`, redefined from 211's body with two
+--       changes: the marker INSERT after the audit row, and the blank test
+--       for the repro and the evidence (backlog 64584278 part 2): an
+--       invisible-only one (zero-width, format, control or blank filler
+--       characters, `c_invisible`) is now absent, as an invisible-only title
+--       or description is already refused (BUG04). It was whitespace-only, so
+--       such a repro was stored as given. The server's composition
+--       (`epigraph_db::repos::bug_report::present`) changes with it: the two
+--       must agree byte for byte or the write refuses BUG05, so the binary of
+--       this change ships with or before this migration (an older binary
+--       sending an invisible-only repro is refused BUG05 here; a newer binary
+--       on 211's body composes what 211 composes).
 --   (d) `epigraph_my_bug_reports`, redefined from 207's body: it reads the
 --       caller's markers (`reporter_id = principal`) joined to their claims,
 --       still requiring the claim's author to be the caller (a second,
@@ -150,7 +160,7 @@ BEGIN
 END $$;
 
 -- ===================================================================
--- (c) THE WRITE (211's body plus the marker INSERT)
+-- (c) THE WRITE (211's body plus the marker INSERT and the repro/evidence blank rule)
 -- ===================================================================
 CREATE OR REPLACE FUNCTION public.epigraph_submit_bug_report(
     p_title         text,
@@ -255,13 +265,18 @@ BEGIN
                         'written', pg_catalog.octet_length(p_description)
             USING ERRCODE = '22023';
     END IF;
-    v_repro := CASE WHEN p_repro IS NULL OR p_repro ~ '^[[:space:]]*$' THEN NULL
+    -- 265 (backlog 64584278): a repro or evidence with nothing visible in it
+    -- is absent, by `c_invisible` as for the title and description (it was
+    -- `^[[:space:]]*$`, so an invisible-only repro was stored as given). The
+    -- server's `bug_report::present` applies the same rule, so the content
+    -- both compose still agrees byte for byte (BUG05 below).
+    v_repro := CASE WHEN p_repro IS NULL OR p_repro ~ c_invisible THEN NULL
                     ELSE p_repro END;
     IF pg_catalog.octet_length(v_repro) > 20480 THEN
         RAISE EXCEPTION 'BUG04: the repro is % bytes; the maximum is 20480; nothing was '
                         'written', pg_catalog.octet_length(v_repro) USING ERRCODE = '22023';
     END IF;
-    v_evidence := CASE WHEN p_evidence IS NULL OR p_evidence ~ '^[[:space:]]*$' THEN NULL
+    v_evidence := CASE WHEN p_evidence IS NULL OR p_evidence ~ c_invisible THEN NULL
                        ELSE p_evidence END;
     IF pg_catalog.octet_length(v_evidence) > 51200 THEN
         RAISE EXCEPTION 'BUG04: the evidence is % bytes; the maximum is 51200; nothing was '
@@ -363,7 +378,8 @@ COMMENT ON FUNCTION public.epigraph_submit_bug_report(text, text, text, text, te
                                                       bytea, bytea, text) IS
     'Migration 207: file one bug report into the configured intake group as the session '
     'principal, who need not be a member of it. Returns the receipt (claim id, submitted_at) '
-    'and nothing about the group''s other contents. 265: records the intake marker.';
+    'and nothing about the group''s other contents. 265: records the intake marker; an '
+    'invisible-only repro or evidence is absent.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_submit_bug_report(text, text, text, text, text, text,
                                                              text, bytea, bytea, text)
     FROM PUBLIC;

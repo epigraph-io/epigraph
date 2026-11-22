@@ -3408,7 +3408,9 @@ restart.
   into, `submitted_at`; no row security, no foreign keys; the application role holds
   NOTHING on it, the maintenance role SELECT and INSERT), written by
   `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
-  SECURITY DEFINER from 211's body (one added INSERT) and 207's `epigraph_my_bug_reports`,
+  SECURITY DEFINER from 211's body (one added INSERT; and an invisible-only repro or evidence,
+  `c_invisible`, is now absent as an invisible-only title is refused, backlog 64584278, with
+  the server's `bug_report::present` changed to match) and 207's `epigraph_my_bug_reports`,
   which now lists the caller's markers joined to their claims (author still the caller)
   instead of the claims owned by the CURRENT intake group: a report triage moved out of the
   intake group, or one filed under an intake group the operator replaced, stays listed.
@@ -3425,8 +3427,10 @@ restart.
   intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
   this file. Undo: `docs/runbooks/265-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 265). Checked before claiming: no migration on main or an origin branch
-  carries a `265`. **Deploy order:** migrate, then run the theme scripts of this change
-  (theirs read the table: 42P01 below 265); the binaries are unaffected either way. A
+  carries a `265`. **Deploy order:** the MCP binary of this change ships with or BEFORE the
+  migration (an older binary's invisible-only repro is refused BUG05 by 265's body; the new
+  binary on 211's body composes what 211 does); migrate before running the theme scripts of
+  this change (they read the table: 42P01 below 265). A
   read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
