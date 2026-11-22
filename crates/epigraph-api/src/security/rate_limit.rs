@@ -480,6 +480,15 @@ impl BucketMap {
     }
 }
 
+/// The limit and balance of one rate-limit bucket ([`AgentRateLimiter::quota`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quota {
+    /// Requests a minute the bucket allows (its capacity).
+    pub limit: u32,
+    /// Requests the bucket allows now.
+    pub remaining: u32,
+}
+
 /// Per-agent rate limiter with global limits
 ///
 /// # Thread Safety
@@ -720,9 +729,28 @@ impl AgentRateLimiter {
     /// Get the remaining quota for an agent
     ///
     /// Returns the approximate number of requests the agent can make
-    /// before hitting their limit.
+    /// before hitting their limit. [`Self::quota`]'s `remaining`.
     #[must_use]
     pub fn remaining_quota(&self, agent_id: &AgentId) -> u32 {
+        self.quota(agent_id).remaining
+    }
+
+    /// The limit and the balance of the bucket `agent_id` is charged to, read
+    /// together under one lock, so the two always describe the same bucket.
+    ///
+    /// The bucket is the key's own when it is tracked (its capacity is the
+    /// custom limit [`Self::set_agent_limit`] gave it, else `default_rpm`);
+    /// the shared overflow bucket when it is untracked at the cap (capacity
+    /// `default_rpm`, whatever custom limit the key has, because that is the
+    /// bucket [`Self::check`] charged); and, for a key not tracked yet with
+    /// room to be, the full bucket its first request would get.
+    ///
+    /// The middleware reports this as `X-RateLimit-Limit` and
+    /// `X-RateLimit-Remaining`. Before backlog a65cc870 the limit header was
+    /// always `default_rpm`, so a key with a custom limit was told a limit
+    /// that was not the one throttling it.
+    #[must_use]
+    pub fn quota(&self, agent_id: &AgentId) -> Quota {
         // Limit first, bucket lock second: the order `check_agent` uses. Taking
         // the limits lock while holding the bucket lock inverts
         // `set_agent_limit`'s order and can deadlock against it.
@@ -733,22 +761,31 @@ impl AgentRateLimiter {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let buckets = &mut *guard;
 
-        if let Some(bucket) = buckets.map.get_mut(agent_id) {
+        let of = |bucket: &mut TokenBucket| {
             bucket.refill();
-            bucket.tokens as u32
+            Quota {
+                limit: bucket.max_tokens as u32,
+                remaining: bucket.tokens as u32,
+            }
+        };
+        if let Some(bucket) = buckets.map.get_mut(agent_id) {
+            of(bucket)
         } else if buckets.map.len() >= self.max_tracked_keys {
             // An untracked key at the cap is charged to the shared overflow
-            // bucket (`check_agent`), so that bucket's tokens are its quota.
+            // bucket (`check_agent`), so that bucket is its quota.
             match buckets.overflow.as_mut() {
-                Some(bucket) => {
-                    bucket.refill();
-                    bucket.tokens as u32
-                }
-                None => self.config.default_rpm,
+                Some(bucket) => of(bucket),
+                None => Quota {
+                    limit: self.config.default_rpm,
+                    remaining: self.config.default_rpm,
+                },
             }
         } else {
             // Not tracked and room to be: its first request gets a full bucket.
-            limit
+            Quota {
+                limit,
+                remaining: limit,
+            }
         }
     }
 
@@ -958,6 +995,59 @@ mod tests {
             0,
             "an overflow-charged key whose shared bucket is spent has no quota left"
         );
+    }
+
+    /// a65cc870: the quota reports the limit of the bucket the key was
+    /// charged to, not `default_rpm`. A tracked key with a custom limit has
+    /// that limit; the same custom-limit key, untracked at the cap, is charged
+    /// to the overflow bucket and has ITS limit (`default_rpm`), not the
+    /// custom one.
+    #[test]
+    fn the_quota_is_the_charged_buckets_limit_and_balance() {
+        let limiter = per_key(5);
+        limiter.set_agent_limit(key(1), 2);
+        assert_eq!(
+            limiter.quota(&key(1)),
+            Quota {
+                limit: 2,
+                remaining: 2
+            },
+            "untracked with room: the full bucket its custom limit gives"
+        );
+        limiter.check(&key(1)).unwrap();
+        assert_eq!(
+            limiter.quota(&key(1)),
+            Quota {
+                limit: 2,
+                remaining: 1
+            }
+        );
+        limiter.check(&key(2)).unwrap();
+        assert_eq!(
+            limiter.quota(&key(2)),
+            Quota {
+                limit: 5,
+                remaining: 4
+            },
+            "a key with no custom limit has default_rpm"
+        );
+
+        // At the cap: a custom-limit key that is not tracked is charged to
+        // the overflow bucket, whose capacity is default_rpm.
+        let capped = per_key(5).with_max_tracked_keys(1);
+        capped.check(&key(0)).unwrap();
+        capped.set_agent_limit(key(9), 2);
+        capped.check(&key(9)).unwrap();
+        assert_eq!(capped.tracked_keys(), 1, "CALIBRATION: key 9 overflowed");
+        assert_eq!(
+            capped.quota(&key(9)),
+            Quota {
+                limit: 5,
+                remaining: 4
+            },
+            "an overflow-charged key reports the overflow bucket, not its custom limit"
+        );
+        assert_eq!(capped.remaining_quota(&key(9)), 4);
     }
 
     /// `set_agent_limit` takes the limits lock, then the bucket lock.

@@ -282,7 +282,10 @@ pub async fn rate_limit_middleware(
     // ([`rate_limit_key`]).
     let agent_id = rate_limit_key(&request, rate_limiter.trusted_proxies())
         .unwrap_or_else(|| fallback_key(request.uri().path()));
-    charge(&state, &rate_limiter, agent_id, request, next).await
+    refuse_if_limited(&state, &rate_limiter, agent_id, request.uri().path())?;
+    let mut response = next.run(request).await;
+    set_quota_headers(&mut response, rate_limiter.quota(&agent_id));
+    Ok(response)
 }
 
 /// The guest reads' default limiter (the operator's ruling of 2026-11-16).
@@ -317,7 +320,10 @@ pub async fn guest_rate_limit_middleware(
     let agent_id = client_ip(&request, rate_limiter.trusted_proxies())
         .map(ip_to_agent_id)
         .unwrap_or_else(|| fallback_key(request.uri().path()));
-    charge(&state, &rate_limiter, agent_id, request, next).await
+    refuse_if_limited(&state, &rate_limiter, agent_id, request.uri().path())?;
+    let mut response = next.run(request).await;
+    set_quota_headers(&mut response, rate_limiter.quota(&agent_id));
+    Ok(response)
 }
 
 /// The bucket of a request no key could be read for. Reachable only for a
@@ -332,19 +338,17 @@ fn fallback_key(path: &str) -> AgentId {
     AgentId::from_uuid(uuid::Uuid::nil())
 }
 
-/// Charge `agent_id`'s bucket in `rate_limiter`: refuse 429 (recording the
-/// refusal once per bucket per window) or run the request and add the
-/// rate-limit headers. Shared by [`rate_limit_middleware`] and
-/// [`guest_rate_limit_middleware`], which differ only in which limiter and
-/// which key.
-async fn charge(
+/// Charge `agent_id`'s bucket in `rate_limiter`: `Err` is the 429 to answer
+/// (the refusal is recorded once per bucket per window), `Ok` lets the
+/// request run. Shared by every rate-limit middleware here, which differ only
+/// in which limiter, which key, and whether they report the quota.
+fn refuse_if_limited(
     state: &AppState,
     rate_limiter: &crate::security::AgentRateLimiter,
     agent_id: AgentId,
-    request: Request<Body>,
-    next: Next,
-) -> Result<Response, RateLimitResponse> {
-    let path = request.uri().path().to_string();
+    path: &str,
+) -> Result<(), RateLimitResponse> {
+    let path = path.to_string();
 
     // Check rate limit
     if let Err(err) = rate_limiter.check(&agent_id) {
@@ -421,30 +425,21 @@ async fn charge(
         });
     }
 
-    // Run the next middleware/handler
-    let mut response = next.run(request).await;
+    Ok(())
+}
 
-    // Add rate limit headers to successful responses
-    let remaining = rate_limiter.remaining_quota(&agent_id);
-    let limit = rate_limiter.config().default_rpm;
-
+/// Report `quota`, the limit and balance of the bucket the request was
+/// charged to ([`crate::security::AgentRateLimiter::quota`]), as
+/// `X-RateLimit-Limit` and `X-RateLimit-Remaining`.
+fn set_quota_headers(response: &mut Response, quota: crate::security::Quota) {
     response.headers_mut().insert(
         "X-RateLimit-Limit",
-        limit
-            .to_string()
-            .parse()
-            .expect("Numeric limit is valid header"),
+        axum::http::HeaderValue::from(quota.limit),
     );
-
     response.headers_mut().insert(
         "X-RateLimit-Remaining",
-        remaining
-            .to_string()
-            .parse()
-            .expect("Numeric remaining is valid header"),
+        axum::http::HeaderValue::from(quota.remaining),
     );
-
-    Ok(response)
 }
 
 // ============================================================================
@@ -628,6 +623,89 @@ mod tests {
         assert_eq!(
             ip_to_agent_id("::ffff:192.0.2.1".parse().unwrap()),
             ip_to_agent_id("192.0.2.1".parse().unwrap())
+        );
+    }
+
+    /// One request to a router with only [`rate_limit_middleware`] on it,
+    /// from `peer`; the status and the two rate-limit headers.
+    #[cfg(feature = "db")]
+    async fn limited_get(
+        limiter: &crate::security::AgentRateLimiter,
+        peer: &str,
+    ) -> (StatusCode, Option<String>, Option<String>) {
+        use tower::ServiceExt;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://ratelimit:unused@127.0.0.1:1/unused")
+            .expect("lazy pool");
+        let state =
+            AppState::with_db(pool, crate::ApiConfig::default()).with_rate_limiter(limiter.clone());
+        let router = axum::Router::new()
+            .route("/x", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit_middleware,
+            ))
+            .with_state(state);
+        let response = router.oneshot(req(Some(peer), &[])).await.unwrap();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        (
+            response.status(),
+            header("X-RateLimit-Limit"),
+            header("X-RateLimit-Remaining"),
+        )
+    }
+
+    /// a65cc870: `X-RateLimit-Limit` is the limit of the bucket that charged
+    /// the request. Before the fix it was always `default_rpm` (5 here), so a
+    /// client with a custom limit (2) was told 5 and throttled at 2.
+    ///
+    /// The overflow half passes on the old code too (the overflow bucket's
+    /// capacity IS `default_rpm`); it pins that a custom-limit key charged to
+    /// the overflow bucket reports the overflow bucket's 5, not its own 2, so
+    /// a fix that read the key's custom limit instead of the charged bucket
+    /// fails it.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn the_limit_header_is_the_charged_buckets_limit() {
+        let config = crate::security::RateLimitConfig {
+            default_rpm: 5,
+            global_rpm: 1_000_000,
+            replenish_interval_secs: 60,
+            enable_global_limit: false,
+        };
+        let custom = crate::security::AgentRateLimiter::new(config.clone());
+        custom.set_agent_limit(ip_to_agent_id("203.0.113.5".parse().unwrap()), 2);
+        assert_eq!(
+            limited_get(&custom, "203.0.113.5:1").await,
+            (StatusCode::OK, Some("2".into()), Some("1".into())),
+            "a custom-limit key is told its own limit"
+        );
+        assert_eq!(
+            limited_get(&custom, "203.0.113.6:1").await,
+            (StatusCode::OK, Some("5".into()), Some("4".into())),
+            "CALIBRATION: a key with no custom limit is told default_rpm"
+        );
+
+        let capped = crate::security::AgentRateLimiter::new(config).with_max_tracked_keys(1);
+        assert_eq!(
+            limited_get(&capped, "203.0.113.7:1").await.0,
+            StatusCode::OK
+        );
+        capped.set_agent_limit(ip_to_agent_id("203.0.113.8".parse().unwrap()), 2);
+        assert_eq!(
+            limited_get(&capped, "203.0.113.8:1").await,
+            (StatusCode::OK, Some("5".into()), Some("4".into())),
+            "a custom-limit key charged to the overflow bucket is told that bucket's limit"
+        );
+        assert_eq!(
+            capped.tracked_keys(),
+            1,
+            "CALIBRATION: 203.0.113.8 overflowed"
         );
     }
 
