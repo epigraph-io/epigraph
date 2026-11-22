@@ -583,13 +583,32 @@ pub(crate) async fn mark_duplicates_onto(
     let n = dups.len();
     let rolled_back = |e: epigraph_db::DbError| -> McpError {
         let mut err = match e {
-            // A source another writer changed (or removed) since the gates:
-            // the caller's to re-read, not a fault to retry blindly.
+            // A source another writer changed (or removed) since the gates,
+            // or a malformed pair: the caller's to re-read, not a fault to
+            // retry blindly.
             epigraph_db::DbError::Refused {
-                kind: epigraph_db::RefusalKind::State,
+                kind: epigraph_db::RefusalKind::State | epigraph_db::RefusalKind::Input,
                 message,
             } => invalid_params(message),
             e @ epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+            // A denial of the caller's authority the gates do not predict
+            // (the act's FA04 / FA07 refusals, a row-security refusal): the
+            // denial class, as `db_caller_error` answers it on every write
+            // tool, not a server fault an agent would retry.
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            } => McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: message.into(),
+                data: None,
+            },
+            other
+                if matches!(other, epigraph_db::DbError::WriteRefused { .. })
+                    || other.is_write_authority_refusal() =>
+            {
+                crate::errors::db_caller_error(other)
+            }
             other => internal_error(other),
         };
         err.message = format!(
@@ -648,7 +667,18 @@ pub(crate) async fn mark_duplicates_onto(
             (None, deferred)
         }
     };
-    tx.commit().await.map_err(rolled_back)?;
+    // A failed COMMIT is not a known rollback: the server may have committed
+    // before the connection failed, so the answer must not say nothing was
+    // marked.
+    tx.commit().await.map_err(|e| {
+        crate::errors::internal_error_logged(
+            format!(
+                "{tool}: the commit of the {n} marks failed, and whether they stand is unknown; \
+                 re-read the sources before retrying"
+            ),
+            e,
+        )
+    })?;
 
     let mut deferred = deferred.into_iter();
     let mut out = Vec::with_capacity(n);
