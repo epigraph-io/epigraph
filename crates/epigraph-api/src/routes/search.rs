@@ -58,7 +58,7 @@
 //!   - A pinned walk (and `theme_core`) pages by position, `o:<offset>`,
 //!     over its exact ranking.
 //!   - An unpinned walk pages by KEY (backlog 4f1c2aec):
-//!     `k:<position>.<limit>.<query>.<distance>.<claim id>`. The next page
+//!     `k:<position>.<limit>.<query>.<distance>.<claim id>.<mac>`. The next page
 //!     holds the rows ranked strictly after the last row of this one, in the
 //!     ranking's total order `(distance, id)`, so a row inserted or retired
 //!     between pages cannot shift a boundary and a walk never repeats a row.
@@ -73,14 +73,27 @@
 //!     from `o:0`.
 //!   - `o:<n>` with `n > 0` on an unpinned search, and `k:` on a pinned one,
 //!     are 400s.
+//!   - The key is AUTHENTICATED: `<mac>` is a truncated HMAC-SHA256, under a
+//!     server key, of everything before it, and a key whose MAC does not
+//!     verify is a 400 on `cursor`. A caller can therefore only send back a
+//!     boundary the server served. Without it a caller could rewrite the
+//!     position to 0 (walking past the 1,000-row window without end) or set
+//!     the distance to any value, which empties the iterative pass and
+//!     forces the exact kNN retry (`epigraph_db`'s `vector_scan` module)
+//!     aimed at a distance band of the caller's choice. The server key is derived from
+//!     `EPIGRAPH_JWT_SECRET` (domain-separated, never the secret itself), or
+//!     drawn at random per process when that is unset; rotating the secret,
+//!     or restarting without one, turns every in-flight key into a 400, and
+//!     the walk restarts from `o:0`.
 //!   - The key carries the id and distance of a row the viewer was just
 //!     served, so it discloses nothing new. Read back, it only narrows the
-//!     reader's own visibility-spliced ranking: a forged key is a bound, not
-//!     a lookup (the row it names need not exist or be visible), and no
-//!     response carries a count of rows the reader cannot see. This is why
-//!     this cursor may hold an id where the house rule for position cursors
-//!     (`privatization.rs`) forbids one. That rule exists because a
-//!     caller-chosen key there is applied to rows reported back as a count.
+//!     reader's own visibility-spliced ranking: even a key from another
+//!     viewer's walk is a bound, not a lookup (the row it names need not be
+//!     visible to the reader), and no response carries a count of rows the
+//!     reader cannot see. This is why this cursor may hold an id where the
+//!     house rule for position cursors (`privatization.rs`) forbids one. That
+//!     rule exists because a caller-chosen key there is applied to rows
+//!     reported back as a count.
 //! * **Pinned diverse** (`theme_id` with `diverse=true`) skips the theme
 //!   shortlist and the coverage guard, draws exact candidates from the pinned
 //!   theme with `created_after` and `min_similarity` applied in SQL, refuses
@@ -481,12 +494,21 @@ const SEARCH_CURSOR_PREFIX: &str = "o:";
 /// docs for why this one may carry an id.
 const SEARCH_KEY_CURSOR_PREFIX: &str = "k:";
 
+/// Hex digits of the key cursor's MAC: the left 128 bits of an
+/// HMAC-SHA256.
+const KEY_CURSOR_MAC_HEX: usize = 32;
+
+/// Domain label under which the key cursor's MAC key is derived from the JWT
+/// secret, so the derived key is good for nothing else.
+const KEY_CURSOR_MAC_LABEL: &[u8] = b"epigraph-api search key cursor mac v1";
+
 /// A parsed `cursor`.
 #[derive(Debug, Clone, PartialEq)]
 enum SearchCursor {
     /// `o:<offset>`.
     Offset(i64),
-    /// `k:<position>.<limit>.<query>.<distance bits>.<claim id>`.
+    /// `k:<position>.<limit>.<query>.<distance bits>.<claim id>.<mac>`,
+    /// MAC verified.
     Key(WalkKey),
 }
 
@@ -526,16 +548,55 @@ fn walk_query_hash(query_vec: &str) -> String {
     hex::encode(&Sha256::digest(query_vec.as_bytes())[..8])
 }
 
+/// The key cursor's MAC key: HMAC-SHA256(`EPIGRAPH_JWT_SECRET`,
+/// [`KEY_CURSOR_MAC_LABEL`]) when the secret is set, so every process that
+/// shares the secret accepts the others' keys and a restart keeps walks
+/// alive; otherwise 32 random bytes for this process's lifetime. Read once.
+fn key_cursor_mac_key() -> &'static [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| match std::env::var("EPIGRAPH_JWT_SECRET") {
+        Ok(secret) if !secret.is_empty() => {
+            use hmac::{Hmac, Mac};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(KEY_CURSOR_MAC_LABEL);
+            mac.finalize().into_bytes().into()
+        }
+        _ => rand::random(),
+    })
+}
+
+/// A fresh HMAC-SHA256 under [`key_cursor_mac_key`] over a key cursor's body
+/// (the text between `k:` and the MAC).
+fn key_cursor_mac(body: &str) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key_cursor_mac_key())
+        .expect("HMAC accepts any key length");
+    mac.update(body.as_bytes());
+    mac
+}
+
+/// `k:<body>.<mac>` for a key cursor body.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn sign_key_cursor_body(body: &str) -> String {
+    use hmac::Mac;
+    let tag = key_cursor_mac(body).finalize().into_bytes();
+    format!(
+        "{SEARCH_KEY_CURSOR_PREFIX}{body}.{}",
+        hex::encode(&tag[..KEY_CURSOR_MAC_HEX / 2])
+    )
+}
+
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
 fn encode_key_cursor(k: &WalkKey) -> String {
-    format!(
-        "{SEARCH_KEY_CURSOR_PREFIX}{}.{}.{}.{:016x}.{}",
+    sign_key_cursor_body(&format!(
+        "{}.{}.{}.{:016x}.{}",
         k.position,
         k.limit,
         k.query,
         k.distance.to_bits(),
         k.claim_id
-    )
+    ))
 }
 
 // ============================================================================
@@ -591,9 +652,11 @@ fn parse_rank_by(raw: Option<&str>) -> Result<RankBy, ApiError> {
 
 /// `cursor`: `None` when absent or blank, so the handler can tell a supplied
 /// cursor (a paged request) from none. Otherwise `o:` plus a non-negative
-/// integer below [`MAX_SEARCH_WINDOW`], or a well-formed `k:` key whose
-/// position is below it too. Whether the kind fits the request (pinned or
-/// not, same `limit`, same query vector) is the handler's check.
+/// integer below [`MAX_SEARCH_WINDOW`], or a `k:` key whose MAC verifies
+/// (checked first, in constant time, over the raw body) and whose fields are
+/// well formed, its position below the window too. Whether the kind fits the
+/// request (pinned or not, same `limit`, same query vector) is the handler's
+/// check.
 fn parse_search_cursor(raw: Option<&str>) -> Result<Option<SearchCursor>, ApiError> {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
@@ -604,7 +667,21 @@ fn parse_search_cursor(raw: Option<&str>) -> Result<Option<SearchCursor>, ApiErr
     };
     let malformed = || bad("cursor must be a next_cursor value from a previous page");
     let digits_only = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
-    if let Some(key) = s.strip_prefix(SEARCH_KEY_CURSOR_PREFIX) {
+    if let Some(signed) = s.strip_prefix(SEARCH_KEY_CURSOR_PREFIX) {
+        // The MAC first: a key the server did not issue is refused before any
+        // of its fields is read, whatever they say.
+        let (key, tag) = signed.rsplit_once('.').ok_or_else(malformed)?;
+        let is_lower_hex = |h: &str| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if tag.len() != KEY_CURSOR_MAC_HEX || !is_lower_hex(tag) {
+            return Err(malformed());
+        }
+        let tag = hex::decode(tag).map_err(|_| malformed())?;
+        {
+            use hmac::Mac;
+            key_cursor_mac(key)
+                .verify_truncated_left(&tag)
+                .map_err(|_| malformed())?;
+        }
         let parts: Vec<&str> = key.split('.').collect();
         let [pos, limit, query, dist, id] = parts.as_slice() else {
             return Err(malformed());
@@ -622,8 +699,7 @@ fn parse_search_cursor(raw: Option<&str>) -> Result<Option<SearchCursor>, ApiErr
         if limit == 0 || limit > MAX_LIMIT as usize {
             return Err(malformed());
         }
-        let hex16 =
-            |h: &str| h.len() == 16 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let hex16 = |h: &str| h.len() == 16 && is_lower_hex(h);
         if !hex16(query) || !hex16(dist) {
             return Err(malformed());
         }
@@ -2156,33 +2232,92 @@ mod tests {
         assert_ne!(a, walk_query_hash("[0.1,0.20001]"));
     }
 
+    /// Each body carries a VALID MAC, so what rejects it is the field check
+    /// it names, not the MAC.
     #[test]
     fn parse_search_cursor_rejects_malformed_keys() {
         let k = a_key();
-        let good = encode_key_cursor(&k);
         let id = k.claim_id;
         let q = &k.query;
         let bits = format!("{:016x}", k.distance.to_bits());
         let nan = format!("{:016x}", f64::NAN.to_bits());
-        for bad in [
-            format!("k:1000.10.{q}.{bits}.{id}"),
-            format!("k:20.0.{q}.{bits}.{id}"),
-            format!("k:20.101.{q}.{bits}.{id}"),
-            format!("k:20.10.{}.{bits}.{id}", &q[..15]),
-            format!("k:20.10.{}.{bits}.{id}", q.to_uppercase()),
-            format!("k:20.10.{q}.{nan}.{id}"),
-            format!("k:20.10.{q}.{bits}.not-a-uuid"),
-            format!("k:20.10.{q}.{bits}"),
-            format!("k:-1.10.{q}.{bits}.{id}"),
-            format!("{good}.extra"),
-            "k:".to_string(),
+        let good_body = format!("20.10.{q}.{bits}.{id}");
+        assert!(
+            parse_search_cursor(Some(&sign_key_cursor_body(&good_body))).is_ok(),
+            "calibration: the well-formed body signed the same way parses"
+        );
+        for body in [
+            format!("1000.10.{q}.{bits}.{id}"),
+            format!("20.0.{q}.{bits}.{id}"),
+            format!("20.101.{q}.{bits}.{id}"),
+            format!("20.10.{}.{bits}.{id}", &q[..15]),
+            format!("20.10.{}.{bits}.{id}", q.to_uppercase()),
+            format!("20.10.{q}.{nan}.{id}"),
+            format!("20.10.{q}.{bits}.not-a-uuid"),
+            format!("20.10.{q}.{bits}"),
+            format!("-1.10.{q}.{bits}.{id}"),
+            format!("{good_body}.extra"),
+            String::new(),
         ] {
+            let bad = sign_key_cursor_body(&body);
             assert_eq!(
                 field_of(parse_search_cursor(Some(&bad)).unwrap_err()),
                 "cursor",
                 "{bad:?} must be rejected"
             );
         }
+        assert_eq!(
+            field_of(parse_search_cursor(Some("k:")).unwrap_err()),
+            "cursor"
+        );
+    }
+
+    /// Backlog 4f1c2aec review: a key the server did not issue is refused,
+    /// so a caller cannot reset the position past the window or aim the
+    /// exact retry at a distance band of its choice.
+    #[test]
+    fn parse_search_cursor_rejects_keys_the_server_did_not_sign() {
+        let k = a_key();
+        let good = encode_key_cursor(&k);
+        let (body, tag) = good
+            .strip_prefix("k:")
+            .and_then(|b| b.rsplit_once('.'))
+            .expect("k:<body>.<mac>");
+        assert_eq!(tag.len(), KEY_CURSOR_MAC_HEX);
+        let other = encode_key_cursor(&WalkKey {
+            position: 30,
+            ..k.clone()
+        });
+        let other_tag = other.rsplit_once('.').unwrap().1;
+        let id = k.claim_id;
+        let q = &k.query;
+        let bits = format!("{:016x}", k.distance.to_bits());
+        let far = format!("{:016x}", 2.0f64.to_bits());
+        for bad in [
+            // No MAC at all (the pre-MAC format).
+            format!("k:{body}"),
+            // A truncated, an uppercased and an extended MAC.
+            format!("k:{body}.{}", &tag[..KEY_CURSOR_MAC_HEX - 1]),
+            format!("k:{body}.{}", tag.to_uppercase()),
+            format!("k:{body}.{tag}0"),
+            // Another real cursor's MAC on this body.
+            format!("k:{body}.{other_tag}"),
+            // A field changed, the original MAC kept.
+            format!("k:0.10.{q}.{bits}.{id}.{tag}"),
+            format!("k:20.10.{q}.{far}.{id}.{tag}"),
+            format!("k:20.10.{q}.{bits}.{}.{tag}", Uuid::new_v4()),
+            format!("k:20.11.{q}.{bits}.{id}.{tag}"),
+            format!("k:20.10.{}.{bits}.{id}.{tag}", walk_query_hash("[0.3]")),
+        ] {
+            assert_ne!(bad, good);
+            assert_eq!(
+                field_of(parse_search_cursor(Some(&bad)).unwrap_err()),
+                "cursor",
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(parse_search_cursor(Some(&good)).is_ok());
+        assert!(parse_search_cursor(Some(&other)).is_ok());
     }
 
     #[test]

@@ -1635,6 +1635,78 @@ async fn unpinned_cursor_is_refused_for_another_limit_query_or_a_position(pool: 
     assert_eq!(validation_field(e), "cursor", "k: on a pinned search");
 }
 
+/// Review finding on 4f1c2aec: the key cursor is authenticated. A caller who
+/// rewrites a served key (the position back to 0, which would walk past the
+/// 1,000-row window without end, or the distance to the far end of the
+/// cosine range, which empties the iterative pass and forces the exact
+/// retry) is refused with a 400 on `cursor`, the served key's MAC kept. The
+/// test edits whatever the server emitted, so it does not depend on the
+/// key's exact layout beyond its dot-separated fields.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unpinned_key_cursor_is_refused_when_tampered(pool: PgPool) {
+    let embedder = mock_embedder();
+    let q = "unpinned tampered cursor";
+    let p = probe_vec(&embedder, q).await;
+    let (agent, _g) = seed_agent_with_group(&pool, "tf-key-tamper").await;
+    for i in 0..8 {
+        public_unpinned_at(
+            &pool,
+            agent,
+            &format!("tf-kx {i}"),
+            &p,
+            2.0 * (i + 1) as f64,
+        )
+        .await;
+    }
+    let state = split_state_with_embedder(&pool, embedder).await;
+
+    let first = search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some("o:0".into())),
+    )
+    .await
+    .expect("first page");
+    let cursor = first.next_cursor.clone().expect("cursor");
+    let fields: Vec<&str> = cursor.split('.').collect();
+    assert!(
+        fields[0] == "k:3" && fields.len() >= 5,
+        "calibration: an unpinned walk continues with a k: key at position 3: {cursor}"
+    );
+    search(
+        &pool,
+        state.clone(),
+        agent,
+        unpinned(q, 3, Some(cursor.clone())),
+    )
+    .await
+    .expect("calibration: the served key continues the walk");
+
+    let with = |i: usize, v: &str| {
+        let mut f = fields.clone();
+        f[i] = v;
+        f.join(".")
+    };
+    for (what, forged) in [
+        ("position reset to 0", with(0, "k:0")),
+        ("distance set to 2.0", with(3, "4000000000000000")),
+        ("distance set to 0.0", with(3, "0000000000000000")),
+        ("claim id replaced", with(4, &Uuid::new_v4().to_string())),
+    ] {
+        assert_ne!(forged, cursor);
+        let e = search(
+            &pool,
+            state.clone(),
+            agent,
+            unpinned(q, 3, Some(forged.clone())),
+        )
+        .await
+        .expect_err(&format!("a forged key ({what}) must be refused: {forged}"));
+        assert_eq!(validation_field(e), "cursor", "{what}");
+    }
+}
+
 /// Identical embeddings (a tie group) straddling a page boundary. The HNSW
 /// scan orders by distance alone, so its LIMIT cuts a tie group arbitrarily;
 /// a key boundary inside the cut would skip the tied rows with smaller ids.
