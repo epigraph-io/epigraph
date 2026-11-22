@@ -221,7 +221,7 @@ fn log_designed_refusal(e: &dyn std::any::Any, text: &str) {
 
 /// Whether a database message opens with a schema refusal code: two to five
 /// ASCII capitals, two digits, a colon (`FA07: ...`), at the very start.
-fn coded(message: &str) -> bool {
+pub(crate) fn coded(message: &str) -> bool {
     let b = message.as_bytes();
     let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
     (2..=5).contains(&caps)

@@ -1620,7 +1620,7 @@ pub async fn deprecate_workflow(
         epigraph_core::ClaimId::from_uuid(workflow_id),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(deprecate_write_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
@@ -1630,7 +1630,7 @@ pub async fn deprecate_workflow(
     let row_rows =
         epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
     // REPORT ONLY WHAT CHANGED (U017). The id used to be listed whether or not
     // anything was written.
     if root_rows > 0 || row_rows > 0 {
@@ -1718,11 +1718,11 @@ pub async fn deprecate_workflow(
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
-                .map_err(internal_error)?;
+                .map_err(deprecate_write_error)?;
                 // Mirror onto the hierarchical row, if any.
                 epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
-                    .map_err(internal_error)?;
+                    .map_err(deprecate_write_error)?;
                 // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
                 // `rows_affected`, and a cascade child can legitimately yield 0:
                 // `claims_tenancy`'s USING side filters the UPDATE's target, so a
@@ -1749,6 +1749,48 @@ pub async fn deprecate_workflow(
         kept_shared_claim_ids: Vec::new(),
         reason: params.reason,
     })
+}
+
+/// `deprecate_workflow`'s answer when row security refuses one of its writes
+/// (backlog ab353d54): an UNCODED `42501` from a deprecation UPDATE (the
+/// claims tenancy policy's WITH CHECK, `new row violates row-level security
+/// policy`), the transaction aborted and nothing written. Since the delegate
+/// arm was added, the workflow gate admits callers that need not write the
+/// workflow's owner group (a delegate acting for the submitter, say), and a
+/// public plan's rows pass row security's read side, so the refusal comes
+/// from the write. It is a
+/// denial the caller can act on, `INVALID_REQUEST` naming the missing group
+/// write authority, as `evolve_step` answers its own `42501`; it used to be
+/// the opaque INTERNAL_ERROR, which reads as a server fault and invites a
+/// retry. A CODED refusal (`XX00: ...`) and every other error keep
+/// [`internal_error`]'s handling.
+fn deprecate_write_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
+    let any: &dyn std::any::Any = &e;
+    let source = match any.downcast_ref::<epigraph_db::DbError>() {
+        Some(epigraph_db::DbError::QueryFailed { source }) => Some(source),
+        _ => any.downcast_ref::<sqlx::Error>(),
+    };
+    if let Some(sqlx::Error::Database(d)) = source {
+        if d.code().as_deref() == Some("42501") && !crate::errors::coded(d.message()) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                tool = "deprecate_workflow",
+                error = %e,
+                "row security refused the deprecation write"
+            );
+            return McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::from(
+                    "deprecate_workflow: refused: the caller does not write the group that owns \
+                     this workflow or a claim it executes, so row security refused the \
+                     deprecation. It needs write authority over that owner group as well as \
+                     authority over the workflow. Nothing was written.",
+                ),
+                data: None,
+            };
+        }
+    }
+    internal_error(e)
 }
 
 /// `deprecate_workflow`'s answer for an id that names nothing the caller can
@@ -1901,7 +1943,7 @@ async fn deprecate_hierarchical_workflow(
     for (&row, grant) in targets.iter().zip(&grants) {
         let row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
         let claims = WorkflowRepository::executed_structural_claims(&mut *tx, row, &targets)
             .await
             .map_err(internal_error)?;
@@ -1917,7 +1959,7 @@ async fn deprecate_hierarchical_workflow(
                 epigraph_core::ClaimId::from_uuid(c.id),
             )
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
             if n > 0 {
                 row_retired.push(c.id.to_string());
             }

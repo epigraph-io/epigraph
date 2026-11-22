@@ -1785,9 +1785,9 @@ async fn workflow_truth(pool: &PgPool, wf: Uuid) -> f64 {
 /// naming `p`. Over `p`'s public workflow in team group `t` (which `d` does
 /// not write) the gate admits it but row security refuses the deprecation of
 /// `t`'s claims, so nothing is written or recorded (tenancy unchanged; the
-/// refusal surfaces as the tool's opaque internal error, the write path's
-/// existing answer to a row-security refusal there). Another principal's
-/// delegate is refused by the gate itself.
+/// refusal is the tool's designed answer naming the missing group write,
+/// backlog ab353d54, where it used to be the opaque internal error). Another
+/// principal's delegate is refused by the gate itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let w = world(&pool).await;
@@ -1822,9 +1822,12 @@ async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
         .deprecate(in_t)
         .await
         .expect_err("tenancy refuses the delegate's deprecation of t's claims");
-    assert_eq!(
-        err, "internal error; the detail is in the server log",
-        "admitted by the gate (not its refusal), refused below it: {err}"
+    assert!(
+        err.contains("does not write the group that owns")
+            && err.contains("Nothing was written")
+            && !err.contains(GATE_REFUSAL),
+        "admitted by the gate (not its refusal), refused below it by row security, and told \
+         so: {err}"
     );
     assert_eq!(row_counts(&pool).await, before, "nothing written");
     assert_eq!(workflow_truth(&pool, in_t).await, truth_before);
