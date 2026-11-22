@@ -407,3 +407,207 @@ async fn identity_mode_checks_authority_over_every_pair_before_marking(pool: PgP
     }
     assert_eq!(identity_edges(&pool, dup_own, survivor).await, 0);
 }
+
+/// What another writer does to the last source of an identity call while the
+/// call waits on that source's row.
+#[derive(Clone, Copy)]
+enum ConcurrentChange {
+    /// Marked a duplicate of some other claim (`supersedes` set).
+    MarkedElsewhere,
+    /// Retired (`is_current = false`), `supersedes` left NULL: the shape a
+    /// claim superseded by a revision, or deprecated, has.
+    Retired,
+}
+
+/// Run `consolidate_claims(mode='identity')` over `[survivor, first, last]`
+/// while a second connection holds `last`'s row lock, and apply `change` to
+/// `last` on that connection once the call is waiting on the lock: after the
+/// call's checks read every source as markable, before its act on `last`.
+/// Returns the call's result and the ids.
+async fn identity_call_racing_a_change_to_the_last_source(
+    pool: &PgPool,
+    change: ConcurrentChange,
+) -> (
+    Result<rmcp::model::CallToolResult, rmcp::model::ErrorData>,
+    [Uuid; 4],
+) {
+    let server = build_scoped_test_server(
+        pool.clone(),
+        fixture::scoped_pool(pool)
+            .await
+            .with_maintenance_pool(pool.clone()),
+    );
+    let survivor = seed_claim(pool, "the restated fact", 0.6).await;
+    let first = seed_claim(pool, "the restated fact, again", 0.5).await;
+    // LAST in the call's order, so that a per-source loop marks `first`
+    // before it reaches the source the other writer changes.
+    let last = seed_claim(pool, "the restated fact, once more", 0.5).await;
+    let elsewhere = seed_claim(pool, "another writer's canonical", 0.5).await;
+    let (auth, viewer) = common::granted_server_admin(&server, pool).await;
+
+    // The other writer, on its own connection: it holds `last`'s row lock
+    // from before the call starts.
+    let mut writer = pool.begin().await.expect("writer tx");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .bind(last)
+        .execute(&mut *writer)
+        .await
+        .expect("lock the last source");
+    let mut watcher = pool.acquire().await.expect("watcher connection");
+
+    let call = consolidate_claims(
+        &server,
+        &viewer,
+        params("identity", &[survivor, first, last], "", Some(survivor)),
+        Some(&auth),
+    );
+    let interfere = async move {
+        let mut waited = false;
+        for _ in 0..400 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                  WHERE datname = current_database() AND pid <> pg_backend_pid() \
+                    AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&mut *watcher)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                waited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            waited,
+            "the identity call never waited on the last source's row lock"
+        );
+        match change {
+            ConcurrentChange::MarkedElsewhere => {
+                sqlx::query("UPDATE claims SET supersedes = $2, is_current = false WHERE id = $1")
+                    .bind(last)
+                    .bind(elsewhere)
+                    .execute(&mut *writer)
+                    .await
+                    .expect("mark the last source elsewhere");
+            }
+            ConcurrentChange::Retired => {
+                sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+                    .bind(last)
+                    .execute(&mut *writer)
+                    .await
+                    .expect("retire the last source");
+            }
+        }
+        writer.commit().await.expect("commit the concurrent change");
+    };
+    let (result, ()) = tokio::join!(call, interfere);
+    (result, [survivor, first, last, elsewhere])
+}
+
+/// The call is all-or-nothing under concurrency (backlog 635dbfae): a source
+/// another writer changes after the call's checks and before its own act
+/// refuses the WHOLE call, and the source before it is not left marked.
+///
+/// Before the fix each source was marked in its own committed transaction,
+/// so here `first` stayed marked onto the survivor (with its identity edge)
+/// and the error only named it ("... stay marked").
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_marks_nothing_when_a_later_source_is_marked_elsewhere_concurrently(
+    pool: PgPool,
+) {
+    let (result, [survivor, first, last, elsewhere]) =
+        identity_call_racing_a_change_to_the_last_source(&pool, ConcurrentChange::MarkedElsewhere)
+            .await;
+    let err = result.expect_err("the changed source refuses the call");
+    assert_eq!(
+        standing(&pool, first).await,
+        (None, true),
+        "the earlier source is not left marked: {err:?}"
+    );
+    assert_eq!(identity_edges(&pool, first, survivor).await, 0);
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains(&last.to_string()), "{err:?}");
+    assert!(
+        err.message.contains("no source was marked"),
+        "the refusal says nothing was marked: {err:?}"
+    );
+    assert_eq!(identity_edges(&pool, last, survivor).await, 0);
+    assert_eq!(standing(&pool, survivor).await, (None, true));
+    assert_eq!(
+        standing(&pool, last).await,
+        (Some(elsewhere), false),
+        "the other writer's mark stands"
+    );
+}
+
+/// The same race with a source RETIRED concurrently (`is_current = false`,
+/// `supersedes` NULL). The dedup act refuses only a duplicate that already
+/// supersedes a claim, so this one is caught only by the call's own re-check
+/// under the row lock. Before the fix the call marked the retired source
+/// onto the survivor and reported success.
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_marks_nothing_when_a_later_source_is_retired_concurrently(pool: PgPool) {
+    let (result, [survivor, first, last, _]) =
+        identity_call_racing_a_change_to_the_last_source(&pool, ConcurrentChange::Retired).await;
+    let err = result.expect_err("the retired source refuses the call");
+    assert_eq!(
+        standing(&pool, first).await,
+        (None, true),
+        "the earlier source is not left marked: {err:?}"
+    );
+    assert_eq!(identity_edges(&pool, first, survivor).await, 0);
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{err:?}");
+    assert!(err.message.contains(&last.to_string()), "{err:?}");
+    assert!(
+        err.message.contains("no source was marked"),
+        "the refusal says nothing was marked: {err:?}"
+    );
+    assert_eq!(
+        standing(&pool, last).await,
+        (None, false),
+        "the retired source is not marked onto the survivor"
+    );
+    assert_eq!(identity_edges(&pool, last, survivor).await, 0);
+}
+
+/// With no administrative connection, every source's cascade deferral is
+/// recorded in the call's one transaction, one audit row per source, and
+/// every source is marked. Guards the batch path's deferral branch, which
+/// records several deferrals before a single commit.
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_mode_without_an_admin_connection_defers_each_sources_cascade(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let survivor = seed_claim(&pool, "the restated fact", 0.6).await;
+    let dup_a = seed_claim(&pool, "the restated fact, again", 0.5).await;
+    let dup_b = seed_claim(&pool, "the restated fact, once more", 0.5).await;
+    let (auth, viewer) = common::granted_server_admin(&server, &pool).await;
+
+    let out = consolidate_claims(
+        &server,
+        &viewer,
+        params("identity", &[dup_a, survivor, dup_b], "", Some(survivor)),
+        Some(&auth),
+    )
+    .await
+    .expect("identity consolidation with deferred cascades");
+    let b = body(&out);
+    let marked = b["marked"].as_array().expect("marked");
+    assert_eq!(marked.len(), 2, "{b}");
+    let mut audit_rows = std::collections::HashSet::new();
+    for (m, dup) in marked.iter().zip([dup_a, dup_b]) {
+        assert_eq!(m["duplicate_id"], serde_json::json!(dup), "{b}");
+        assert_eq!(m["cascade"]["status"], "deferred", "{b}");
+        let row = m["cascade"]["audit_event_id"]
+            .as_str()
+            .expect("a deferral audit row")
+            .to_string();
+        assert!(audit_rows.insert(row), "one deferral row per source: {b}");
+        assert_eq!(
+            standing(&pool, dup).await,
+            (Some(survivor), false),
+            "{dup} marked"
+        );
+        assert_eq!(identity_edges(&pool, dup, survivor).await, 1);
+    }
+}

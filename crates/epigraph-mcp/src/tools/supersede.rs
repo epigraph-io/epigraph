@@ -473,18 +473,18 @@ pub async fn mark_duplicate(
 /// The gate `mark_duplicate` applies before it writes `dup` onto `canon`,
 /// and nothing else: the caller's authority over both claims, read through
 /// the caller ([`begin_claim_act`]). The transaction it opens is rolled back.
-/// `consolidate_claims(mode='identity')` asks it for every source before it
-/// marks any, so a source the caller may not mark refuses the whole call with
-/// nothing written.
-pub(crate) async fn mark_duplicate_preflight(
+/// Returns the principal the act would be stamped as (the caller, or this
+/// server's agent on a `claims:admin` borrow). [`mark_duplicates_onto`] asks
+/// it for every duplicate before it opens its one transaction.
+async fn mark_duplicate_preflight(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     auth: Option<&epigraph_auth::AuthContext>,
     dup: uuid::Uuid,
     canon: uuid::Uuid,
     tool: &'static str,
-) -> Result<(), McpError> {
-    let (tx, _, _) = begin_claim_act(
+) -> Result<uuid::Uuid, McpError> {
+    let (tx, actor, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -495,13 +495,187 @@ pub(crate) async fn mark_duplicate_preflight(
     )
     .await?;
     drop(tx);
-    Ok(())
+    Ok(actor)
+}
+
+/// Several dedup acts onto ONE canonical, all or nothing
+/// (`consolidate_claims(mode='identity')`, backlog 635dbfae). Each duplicate
+/// gets exactly what [`mark_duplicate_pair`] gives one: the act with its
+/// identity edge, then the cascade. Returns one `mark_duplicate` answer per
+/// duplicate, in the order given.
+///
+/// 1. Every pair's gate ([`mark_duplicate_preflight`]) first, each on its own
+///    rolled-back transaction, so one pair the caller may not mark refuses
+///    the call before anything is written.
+/// 2. ONE transaction, stamped as those gates decided, holds every act. All
+///    the pairs must share that stamp: a `claims:admin` caller that writes
+///    some duplicates' owning groups and not others' would need two stamps,
+///    and is refused with nothing written (split the call).
+/// 3. Inside it, every duplicate is locked in id order and re-checked
+///    ([`ClaimRepository::lock_dedup_sources_conn`]): one another writer
+///    marked, revised or retired after the gates refuses the whole batch.
+///    Any refusal before the commit rolls back every mark; the answer says
+///    no source was marked.
+/// 4. The administrative session is asked for once, before the commit; with
+///    none, each duplicate's cascade deferral is recorded inside the same
+///    transaction. After the commit the cascades run one by one on that
+///    session, best-effort, as for a single mark.
+///
+/// The canonical is not locked (a caller may mark onto a canonical it can
+/// read but not write, and a lock takes the UPDATE policy). Each act still
+/// refuses a canonical that is not current when it runs, which rolls the
+/// batch back too.
+///
+/// `dups` must be distinct and must not contain `canon`; the caller checks.
+pub(crate) async fn mark_duplicates_onto(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
+    dups: &[uuid::Uuid],
+    canon: uuid::Uuid,
+    reason: Option<&str>,
+    tool: &'static str,
+) -> Result<Vec<serde_json::Value>, McpError> {
+    let Some(&first) = dups.first() else {
+        return Ok(Vec::new());
+    };
+
+    // 1. Every gate, before anything is written; each names its stamp.
+    let mut stamp: Option<uuid::Uuid> = None;
+    for dup in dups {
+        let actor = mark_duplicate_preflight(server, viewer, auth, *dup, canon, tool).await?;
+        match stamp {
+            None => stamp = Some(actor),
+            Some(s) if s == actor => {}
+            Some(_) => {
+                return Err(invalid_params(format!(
+                    "{tool}: claims {first} and {dup} would be marked under different write \
+                     identities (your own for a claim whose owning group you write, this \
+                     server's agent through the claims:admin borrow for one you do not), and \
+                     the marks are one transaction, which carries one; nothing was written. \
+                     Split the call by owning group."
+                )))
+            }
+        }
+    }
+
+    // 2. The one transaction. The identity edges are attested at INSERT with
+    // the server's key (backlog `dae795f8`), resolved before it opens.
+    let edge_key = server.edge_signing_key().await?;
+    let (mut tx, actor, _) = begin_claim_act(
+        server,
+        viewer,
+        auth,
+        first,
+        Some(canon),
+        tool,
+        "mark as a duplicate",
+    )
+    .await?;
+    if stamp != Some(actor) {
+        return Err(invalid_params(format!(
+            "{tool}: the write identity for claim {first} changed while the call ran (a \
+             membership change); nothing was written. Retry."
+        )));
+    }
+    let n = dups.len();
+    let rolled_back = |e: epigraph_db::DbError| -> McpError {
+        let mut err = match e {
+            // A source another writer changed (or removed) since the gates:
+            // the caller's to re-read, not a fault to retry blindly.
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::State,
+                message,
+            } => invalid_params(message),
+            e @ epigraph_db::DbError::NotFound { .. } => invalid_params(e.to_string()),
+            other => internal_error(other),
+        };
+        err.message = format!(
+            "{} (no source was marked: the {n} marks are one transaction, and this refusal \
+             rolled it back)",
+            err.message
+        )
+        .into();
+        err
+    };
+
+    // 3. Lock and re-check every duplicate, then every act.
+    ClaimRepository::lock_dedup_sources_conn(&mut tx, dups)
+        .await
+        .map_err(rolled_back)?;
+    let provenance = DuplicateProvenance::new(tool, DuplicateProvenance::RULE_CALLER_ASSERTED)
+        .marked_by(Some(actor))
+        .reason(reason);
+    for dup in dups {
+        ClaimRepository::mark_duplicate_act_attributed_conn(
+            &mut tx,
+            Some(edge_key),
+            ClaimId::from_uuid(*dup),
+            ClaimId::from_uuid(canon),
+            &provenance,
+        )
+        .await
+        .map_err(rolled_back)?;
+    }
+
+    // 4. One administrative session for every cascade, or every deferral
+    // recorded with the acts.
+    let triggers: Vec<CascadeTrigger> = dups
+        .iter()
+        .map(|dup| {
+            CascadeTrigger::new(
+                CascadeCause::Dedup,
+                Some(actor),
+                oauth_principal(auth),
+                *dup,
+                Some(canon),
+            )
+        })
+        .collect();
+    let (mut session, deferred) = match crate::maintenance::admin_cascade_session(server).await {
+        Ok(session) => (Some(session), Vec::new()),
+        Err(why) => {
+            let mut deferred = Vec::with_capacity(n);
+            for trigger in &triggers {
+                deferred.push(
+                    admin_cascade::record_deferral(&mut *tx, trigger, &why)
+                        .await
+                        .map_err(rolled_back)?,
+                );
+            }
+            (None, deferred)
+        }
+    };
+    tx.commit().await.map_err(rolled_back)?;
+
+    let mut deferred = deferred.into_iter();
+    let mut out = Vec::with_capacity(n);
+    for (dup, trigger) in dups.iter().zip(&triggers) {
+        let (cascade, belief_cascade) = match session.as_mut() {
+            Some(session) => {
+                let (conn, v) = session.split();
+                admin_cascade::apply_after_dedup(conn, v, viewer, trigger, *dup, canon).await
+            }
+            None => (
+                deferred.next().unwrap_or_default(),
+                CascadeReport::default(),
+            ),
+        };
+        out.push(serde_json::json!({
+            "duplicate_id": dup,
+            "canonical_id": canon,
+            "mode": "mark_duplicate",
+            "cascade": cascade,
+            "belief_cascade": belief_cascade,
+        }));
+    }
+    Ok(out)
 }
 
 /// One dedup act, `dup` onto `canon`, and its cascade: the whole of
-/// `mark_duplicate`, shared with `consolidate_claims(mode='identity')`, which
-/// runs it once per non-survivor source. `tool` is recorded in the identity
-/// edge's provenance.
+/// `mark_duplicate`. `tool` is recorded in the identity edge's provenance.
+/// Several duplicates onto one canonical go through [`mark_duplicates_onto`]
+/// instead, which holds every act in one transaction.
 pub(crate) async fn mark_duplicate_pair(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
