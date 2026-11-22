@@ -1335,10 +1335,16 @@ scopes; arming is an operator step (`docs/deploy.md`).
   calling token's refresh family; whether a connector shares one family
   across chats is not measured, so connector mode stays OFF and the CLI path
   is the served one.
-* **MCP reads are not widened.** The MCP read tools read on the server's own
-  unstamped pool, so an elevated MCP request reads no more than before; its
-  calls are still recorded (attributed when the answer names a row). The REST
-  surface is widened.
+* **MCP reads are widened, the federated tools are refused.** The MCP read
+  tools read on a connection stamped from the request's viewer
+  (`EpiGraphMcpFull::read_as`), so an elevated MCP read is widened by 126's
+  arms exactly as a REST read is, and recorded like one (attributed when the
+  answer names a row). A federated tool is never served to an elevated
+  request: `call_tool` refuses it at dispatch with `ELEVATED READ-ONLY`
+  (`refuse_elevated_federated`), so no extension receives an elevated call
+  and none has an elevated read to record. Pinned on the application role by
+  `epigraph-api`'s
+  `elevation_acceptance::p_after_sudo_reads_bs_canaries_and_b_reads_every_access`.
 * **Lockdown, group-held assignments, a two-person rule and signed audit
   events are out of scope** for this stack.
 
