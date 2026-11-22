@@ -17,6 +17,11 @@
 //!   calibration): the guard passes; the run stops at the missing
 //!   `DATABASE_URL`.
 //!
+//! And the report file (backlog 7c1bdeec (4)): an existing `--json` path is
+//! refused before connecting, and the existing report is left as it was (the
+//! failed run removes only a file it created itself); an unknown `--items`
+//! entry is refused, naming it, before the report file is created.
+//!
 //! No database is needed. The environment is CLEARED and the working
 //! directory is a fresh temp dir: the binary loads a `.env`, and an inherited
 //! `DATABASE_URL` or `CALIBRATION_PATH` would change what it does.
@@ -101,4 +106,42 @@ fn the_guard_is_r173s_alone_and_passes_the_shipped_calibration() {
     assert!(!out.status.success(), "{stderr}");
     assert!(!stderr.contains(REFUSAL), "{stderr}");
     assert!(stderr.contains(NO_DSN), "{stderr}");
+}
+
+#[test]
+fn an_existing_report_path_is_refused_and_the_report_kept() {
+    let dir = TempDir::new();
+    let report = dir.0.join("out.json");
+    std::fs::write(&report, b"an earlier report\n").expect("write an earlier report");
+    let (out, stderr) = run(&dir.0, "r131", None);
+    assert!(!out.status.success(), "refused: {stderr}");
+    assert!(
+        stderr.contains("out.json"),
+        "the refusal names the path: {stderr}"
+    );
+    assert!(
+        !stderr.contains(NO_DSN),
+        "refused before any connection was attempted: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&report).expect("the earlier report is still there"),
+        b"an earlier report\n",
+        "the earlier report is neither overwritten nor removed"
+    );
+}
+
+#[test]
+fn an_unknown_item_is_refused_before_the_report_is_created() {
+    let dir = TempDir::new();
+    let (out, stderr) = run(&dir.0, "r131,bogus", None);
+    assert!(!out.status.success(), "refused: {stderr}");
+    assert!(
+        stderr.contains("unknown item `bogus`"),
+        "the refusal names the item: {stderr}"
+    );
+    assert!(!stderr.contains(NO_DSN), "{stderr}");
+    assert!(
+        !dir.0.join("out.json").exists(),
+        "refused before the report file was created"
+    );
 }

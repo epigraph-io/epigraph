@@ -1036,3 +1036,62 @@ fn totals(claims: &[ClaimDelta], top: usize) -> DeltaTotals {
     t.top_movers = movers.into_iter().take(top).map(|(_, id)| id).collect();
     t
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DeltaItems;
+
+    #[test]
+    fn parse_selects_exactly_the_named_items() {
+        assert_eq!(
+            DeltaItems::parse("r131"),
+            Ok(DeltaItems {
+                r131: true,
+                ..DeltaItems::default()
+            })
+        );
+        assert_eq!(
+            DeltaItems::parse("k10-retro,k12b"),
+            Ok(DeltaItems {
+                k10_retro: true,
+                k12b: true,
+                ..DeltaItems::default()
+            })
+        );
+        // Whitespace and empty segments are tolerated; a repeat is harmless.
+        assert_eq!(
+            DeltaItems::parse(" r131 , k10-retro,,k12b, r173 ,r131"),
+            Ok(DeltaItems {
+                r131: true,
+                k10_retro: true,
+                k12b: true,
+                r173: true,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_refuses_an_empty_selection() {
+        for list in ["", " ", ",", " , ,"] {
+            let err = DeltaItems::parse(list).expect_err(list);
+            assert!(err.contains("no item selected"), "{list:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_refuses_an_unknown_item_and_names_it() {
+        for (list, bad) in [
+            ("bogus", "bogus"),
+            ("r131,bogus", "bogus"),
+            // Exact spellings only: neither case nor the struct's field name.
+            ("R131", "R131"),
+            ("k10_retro", "k10_retro"),
+        ] {
+            let err = DeltaItems::parse(list).expect_err(list);
+            assert!(
+                err.contains(&format!("unknown item `{bad}`")),
+                "{list:?}: {err}"
+            );
+        }
+    }
+}
