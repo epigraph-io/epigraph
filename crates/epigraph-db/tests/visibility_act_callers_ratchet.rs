@@ -11,8 +11,8 @@
 //!
 //! Narrowing the two functions to `pub(crate)` is not possible, because the
 //! caller lives in another crate, so this ratchet fails instead when any Rust
-//! source under `crates/` other than the places below names either function
-//! in a code line:
+//! source under `crates/` or the workspace's `tests/` other than the places
+//! below names either function in a code line:
 //!
 //! * `epigraph-db/src/repos/claim_visibility.rs`, which defines them;
 //! * `epigraph-engine/src/visibility_act.rs`, the one sanctioned caller;
@@ -20,7 +20,10 @@
 //!
 //! It also fails when a non-test source outside the defining file calls either
 //! definer in SQL (`epigraph_publicize_claims($…` /
-//! `epigraph_share_claims_with_team($…`), the same bypass one layer down.
+//! `epigraph_share_claims_with_team($…`, matched with whitespace removed, so
+//! `( $1` counts), the same bypass one layer down. A call whose SQL text is
+//! split across lines or assembled at run time is not seen; the database still
+//! lets any application session execute the definers.
 //!
 //! A new caller must go through `epigraph_engine::visibility_act` instead.
 //! Static: no database.
@@ -95,11 +98,13 @@ fn names_ident(line: &str, ident: &str) -> bool {
     })
 }
 
-/// Every Rust source under `crates/`, repo-relative, with its text.
+/// Every Rust source under `crates/` and `tests/`, repo-relative, with its
+/// text.
 fn sources() -> BTreeMap<String, String> {
     let root = repo_root();
     let mut files = Vec::new();
     collect(&root.join("crates"), &mut files);
+    collect(&root.join("tests"), &mut files);
     files
         .into_iter()
         .map(|p| {
@@ -121,12 +126,13 @@ fn violations(files: &BTreeMap<String, String>) -> Vec<String> {
     let mut out = Vec::new();
     for (rel, src) in files {
         let allowed = ALLOWED.contains(&rel.as_str()) || rel.starts_with(ALLOWED_TEST_DIR);
-        let is_test = rel.contains("/tests/");
+        let is_test = rel.starts_with("tests/") || rel.contains("/tests/");
         for (n, line) in code_lines(src) {
             if !allowed && FUNCTIONS.iter().any(|f| names_ident(line, f)) {
                 out.push(format!("{rel}:{n}: {}", line.trim()));
             }
-            if !allowed && !is_test && SQL_CALLS.iter().any(|s| line.contains(s)) {
+            let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+            if !allowed && !is_test && SQL_CALLS.iter().any(|s| squeezed.contains(s)) {
                 out.push(format!("{rel}:{n}: {}", line.trim()));
             }
         }
@@ -158,6 +164,10 @@ fn the_scan_is_not_vacuous() {
         files.len() > 100,
         "only {} sources under crates/",
         files.len()
+    );
+    assert!(
+        files.keys().any(|k| k.starts_with("tests/")),
+        "no source under the workspace's tests/ was scanned"
     );
     let caller = files
         .get(CALLER)
@@ -201,6 +211,16 @@ fn the_detector_reports_a_direct_call() {
             .to_string(),
     );
     files.insert(
+        "crates/epigraph-cli/src/bin/spaced.rs".to_string(),
+        "sqlx::query(\"SELECT * FROM epigraph_publicize_claims ( $1, $2 )\")\n".to_string(),
+    );
+    files.insert(
+        "tests/engine-integration/src/lib.rs".to_string(),
+        "sqlx::query(\"SELECT * FROM epigraph_publicize_claims($1, $2)\")\n\
+         ClaimRepository::share_with_team_conn(&mut c, &ids, g, r).await?;\n"
+            .to_string(),
+    );
+    files.insert(
         "crates/epigraph-api/tests/t.rs".to_string(),
         "sqlx::query(\"SELECT * FROM epigraph_publicize_claims($1, $2)\")\n".to_string(),
     );
@@ -211,8 +231,14 @@ fn the_detector_reports_a_direct_call() {
             "crates/epigraph-api/src/routes/x.rs:1: sqlx::query(\"SELECT * FROM \
              public.epigraph_share_claims_with_team($1, $2, $3)\")"
                 .to_string(),
+            "crates/epigraph-cli/src/bin/spaced.rs:1: sqlx::query(\"SELECT * FROM \
+             epigraph_publicize_claims ( $1, $2 )\")"
+                .to_string(),
             "crates/epigraph-mcp/src/tools/visibility.rs:2: let o = \
              ClaimRepository::publicize_conn(&mut tx, &ids, r).await?;"
+                .to_string(),
+            "tests/engine-integration/src/lib.rs:2: \
+             ClaimRepository::share_with_team_conn(&mut c, &ids, g, r).await?;"
                 .to_string(),
         ]
     );
