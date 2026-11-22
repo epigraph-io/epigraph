@@ -1100,14 +1100,6 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim_theme.rs",
-        "delete_all_conn",
-        "WRITE. The body of `delete_all` (unassign every claim, delete every theme), on a \
-         caller-owned connection so the k-means rebuild could wipe and rebuild in ONE transaction \
-         (batch H-a; that caller is retired, backlog a0ed0180). A corpus-wide maintenance \
-         statement with no row to filter; the SQL is unchanged.",
-    ),
-    (
-        "claim_theme.rs",
         "begin_iterative_hnsw",
         "NO ROW READ. A private helper that opens a savepoint and sets two transaction-local \
          pgvector knobs (`hnsw.iterative_scan`, `hnsw.ef_search`) for the viewer-spliced theme \
@@ -2852,7 +2844,7 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE. Deletes all but the newest N rows of the untenanted `atlas_layout_runs` \
          (migration 197), its child rows going by the FK cascade; a corpus-wide maintenance \
          statement in the operator CLI `atlas_layout`, with no claim row to filter and no tenancy \
-         column to name (the shape of claim_theme.rs `delete_all_conn`).",
+         column to name.",
     ),
     // Atlas W2 (migration 210): the nightly's writes of a team or public map.
     (
