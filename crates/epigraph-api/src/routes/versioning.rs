@@ -807,6 +807,7 @@ pub async fn supersede_claim(
         (status = 403),
         (status = 404),
         (status = 409),
+        (status = 500),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -1108,6 +1109,7 @@ pub fn unmark_refusal(e: epigraph_engine::admin_cascade::UnmarkRefusal) -> ApiEr
         (status = 403),
         (status = 404),
         (status = 409),
+        (status = 500),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
