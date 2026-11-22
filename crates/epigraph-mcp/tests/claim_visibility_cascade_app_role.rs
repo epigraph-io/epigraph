@@ -617,6 +617,74 @@ async fn share_holds_a_fragment_a_claim_that_stays_also_cites(pool: PgPool) {
     assert_eq!(events[0]["harvester_sources_moved"], 0, "{events:?}");
 }
 
+/// Backlog fc33ef1a, share, a co-citer the SHARER cannot read: bob's private
+/// claim (bob's home group, which alice does not read) also cites the
+/// fragment. The definer still sees it, so the fragment is held in alice's
+/// home group and a team reader does not read it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_holds_a_fragment_a_claim_the_sharer_cannot_read_also_cites(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "blind-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "blind-bob").await;
+    let (dan, _) = fixture::seed_agent_with_group(&pool, "blind-dan").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, dan, "reader").await;
+    let c = write(&pool, &s, alice, "harvested finding", "private", None).await;
+    let hidden = write(&pool, &s, bob, "bob's private note", "private", None).await;
+    let (_, shared) = harvested(&pool, c).await;
+    cite(&pool, hidden, shared).await;
+    assert!(
+        !reads_row(&pool, &s, alice, "claims", hidden).await,
+        "PREMISE: the sharer cannot read the other citer"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t), "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(home),
+        "held although the sharer cannot see the claim that holds it"
+    );
+    assert!(!reads_row(&pool, &s, dan, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.shared_with_team").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize, a co-citer the publisher cannot read: carol's
+/// private claim also cites the team's fragment. It stays the team's (218's
+/// guard), is counted held, and a stranger does not read it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_holds_a_fragment_a_claim_the_publisher_cannot_read_also_cites(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "blind-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "blind-carol").await;
+    let (dan, _) = fixture::seed_agent_with_group(&pool, "blind-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let hidden = write(&pool, &s, carol, "carol's private note", "private", None).await;
+    let (_, shared) = harvested(&pool, c).await;
+    cite(&pool, hidden, shared).await;
+    assert!(
+        !reads_row(&pool, &s, eve, "claims", hidden).await,
+        "PREMISE: the publisher cannot read the other citer"
+    );
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "claims", c).await.0, "public", "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(t),
+        "held although the publisher cannot see the claim that holds it"
+    );
+    assert!(!reads_row(&pool, &s, dan, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+}
+
 /// Backlog fc33ef1a, share, the other half of the hold: a co-citer that is
 /// ALREADY in the target team does not hold the fragment. Two claims that
 /// cite one fragment, shared into the same team in two calls: after the
