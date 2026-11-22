@@ -3,8 +3,10 @@
 //!
 //! # Why this exists
 //!
-//! The kernel's only client-status route is the approval
-//! (`POST /api/v1/admin/clients/:id/approve`). Suspending or revoking one
+//! The kernel's only client-status path is the approval of a pending client
+//! (`epigraph-operator approve-client` on the maintenance DSN; the
+//! `POST /api/v1/admin/clients/:id/approve` route answers 501 since migration
+//! 188). Suspending or revoking one
 //! client (a leaked service secret, a compromised connector) took a
 //! hand-written `UPDATE oauth_clients SET status = ...` on an admin DSN: no
 //! audit row, and the client's live refresh chains left in place.
