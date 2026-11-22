@@ -1106,18 +1106,63 @@ struct EpistemicPacket {
     signature: String,
 }
 
+/// The wire shape of the server's `routes::submit::ClaimSubmission`, field for
+/// field as the server RE-serializes it, because the packet signature covers
+/// the server's canonical bytes (`EpistemicPacket::signable_bytes`): an absent
+/// `initial_truth` is skipped (the server refuses `null`), and `properties` /
+/// `labels` are always present (`null` / `[]`), as the server writes them.
 #[derive(Debug, Serialize)]
 struct ClaimSubmission {
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     initial_truth: Option<f64>,
     agent_id: Uuid,
     idempotency_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<serde_json::Value>,
     /// Labels set on the claim AT CREATION by the server (creator-owned), so a
     /// multi-principal writer needs no ownership-gated label PATCH / claims:admin.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Signed like every other claim field, so a packet is (re-)signed after
+    /// its labels are set ([`labelled_and_signed`]).
     pub labels: Vec<String>,
+}
+
+/// The bytes the submit route verifies a packet signature over: the canonical
+/// JSON of `(claim, evidence, reasoning_trace)`, signature excluded — the same
+/// construction as the server's `EpistemicPacket::signable_bytes`.
+#[derive(Serialize)]
+struct PacketSignable<'a> {
+    claim: &'a ClaimSubmission,
+    evidence: &'a [EvidenceSubmission],
+    reasoning_trace: &'a ReasoningTraceSubmission,
+}
+
+/// Sign `packet` as its claim's agent, over [`PacketSignable`]. The server
+/// checks this signature (raw Ed25519 over the canonical bytes, not a
+/// domain-separated entity signature) when `EPIGRAPH_REQUIRE_SIGNATURES` is on.
+fn sign_packet(packet: &mut EpistemicPacket, signer: &AgentSigner) {
+    let canonical = epigraph_crypto::to_canonical_bytes(&PacketSignable {
+        claim: &packet.claim,
+        evidence: &packet.evidence,
+        reasoning_trace: &packet.reasoning_trace,
+    })
+    .expect("a packet of strings, numbers and JSON values always serializes");
+    packet.signature = hex::encode(signer.sign(&canonical));
+}
+
+/// Set the creation labels on `packet`, then sign it when the ingester holds
+/// the claim agent's key. Labels are inside the signed bytes, so signing must
+/// come after they are set; a packet whose agent key the ingester does not
+/// hold (`signer = None`, the PR node) keeps whatever signature it carries.
+fn labelled_and_signed(
+    mut packet: EpistemicPacket,
+    labels: &[&str],
+    signer: Option<&AgentSigner>,
+) -> EpistemicPacket {
+    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
+    if let Some(signer) = signer {
+        sign_packet(&mut packet, signer);
+    }
+    packet
 }
 
 #[derive(Debug, Serialize)]
@@ -1630,20 +1675,17 @@ fn build_packet(
         labels: Vec::new(), // set by submit_find_or_create at creation
     };
 
-    // Use placeholder signature — the API server does not yet verify real Ed25519
-    // signatures on submit_packet (it only accepts all-zeros placeholders).
-    // The real signature is computed but stored as evidence signatures instead.
-    let _packet_bytes =
-        serde_json::to_vec(&(&claim_submission, &evidence_items, &trace)).unwrap_or_default();
-    let _real_signature = hex::encode(signer.sign(&_packet_bytes));
-    let packet_signature = "0".repeat(128); // placeholder accepted by server
-
-    EpistemicPacket {
+    // Signed over the submit route's canonical bytes, so the packet passes
+    // with EPIGRAPH_REQUIRE_SIGNATURES on. `submit_find_or_create` re-signs it
+    // after setting its labels (PR mode).
+    let mut packet = EpistemicPacket {
         claim: claim_submission,
         evidence: evidence_items,
         reasoning_trace: trace,
-        signature: packet_signature,
-    }
+        signature: String::new(),
+    };
+    sign_packet(&mut packet, signer);
+    packet
 }
 
 /// Build packets for all commits, using a shared signer and agent ID
@@ -1679,7 +1721,7 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
             &ContentHasher::hash(evidence_text.as_bytes()),
         ))),
     };
-    EpistemicPacket {
+    let mut packet = EpistemicPacket {
         claim: ClaimSubmission {
             content,
             initial_truth: Some(0.95),
@@ -1698,8 +1740,10 @@ fn build_repo_packet(repo_slug: &str, agent_id: Uuid, signer: &AgentSigner) -> E
             explanation: format!("Root node for repository {repo_slug}"),
             signature: None,
         },
-        signature: "0".repeat(128),
-    }
+        signature: String::new(),
+    };
+    sign_packet(&mut packet, signer);
+    packet
 }
 
 /// Metadata describing a single merged pull request, supplied by the CI caller.
@@ -1764,6 +1808,11 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
             explanation: format!("PR #{} merged at {}", meta.number, meta.merged_at),
             signature: None,
         },
+        // UNSIGNED: the PR node is authored by the orchestrator agent, whose
+        // private key this ingester does not hold, and the submit route verifies
+        // the signature against `claim.agent_id`'s key. This placeholder is
+        // accepted only while EPIGRAPH_REQUIRE_SIGNATURES is off; with it on,
+        // the PR node is refused (401). See backlog 7d9e60c6.
         signature: "0".repeat(128),
     }
 }
@@ -1782,10 +1831,11 @@ fn build_pr_packet(meta: &PrMeta, orchestrator_id: Uuid) -> EpistemicPacket {
 async fn submit_find_or_create(
     client: &reqwest::Client,
     endpoint: &str,
-    mut packet: EpistemicPacket,
+    packet: EpistemicPacket,
     labels: &[&str],
+    signer: Option<&AgentSigner>,
 ) -> Result<Uuid, String> {
-    packet.claim.labels = labels.iter().map(|s| s.to_string()).collect();
+    let packet = labelled_and_signed(packet, labels, signer);
     let url = format!("{endpoint}/api/v1/submit/packet");
     let resp = client
         .post(&url)
@@ -1825,6 +1875,7 @@ async fn ensure_repo_node(
         endpoint,
         packet,
         &["source:git-history", "node:repo", &label],
+        Some(signer),
     )
     .await
 }
@@ -2242,6 +2293,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
         &args.endpoint,
         pr_packet,
         &["source:git-history", "node:pr", &pr_label],
+        None, // the orchestrator's key is not held here; see build_pr_packet
     )
     .await?;
     // repo --decomposes_to--> PR, stamped at merge time.
@@ -2274,6 +2326,7 @@ async fn run_pr_ingest(args: &Args) -> Result<(), String> {
             &args.endpoint,
             packet,
             &["source:git-history", "node:commit", &commit_label],
+            Some(&signer),
         )
         .await?;
         // PR --decomposes_to--> commit, stamped at commit time.
@@ -5948,5 +6001,113 @@ crates/epigraph-core/src/domain/mod.rs",
             .contains(&"9699e396-380b-4105-99c3-e4938dc3e156".parse().unwrap()));
         assert!(refs.pr_numbers.contains(&219));
         assert!(refs.pr_numbers.contains(&237));
+    }
+
+    // -------------------------------------------------------------------------
+    // Packet signatures (backlog 7d9e60c6)
+    // -------------------------------------------------------------------------
+
+    /// Exactly what `routes/submit.rs` does on the `require_packet_signatures`
+    /// path: parse the wire JSON into the SERVER's packet type, recompute
+    /// `signable_bytes()` and verify `signature` under the agent's key. Any
+    /// drift between the client's serialization and the server's (defaulted
+    /// `labels` / `properties`, a skipped `initial_truth`) fails here.
+    fn server_accepts(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
+        let wire = serde_json::to_value(packet).expect("client packet serializes");
+        let server: epigraph_api::routes::submit::EpistemicPacket =
+            serde_json::from_value(wire).expect("server parses the client packet");
+        let canonical = server.signable_bytes().expect("canonical bytes");
+        let Ok(sig) = <[u8; 64]>::try_from(hex::decode(&server.signature).unwrap()) else {
+            return false;
+        };
+        epigraph_crypto::SignatureVerifier::verify(&signer.public_key(), &canonical, &sig)
+            .unwrap_or(false)
+    }
+
+    fn signing_fixture_commit() -> ParsedCommit {
+        ParsedCommit {
+            hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            author_name: "Sig Author".to_string(),
+            author_email: "sig@example.com".to_string(),
+            date: "2026-11-22T12:00:00+00:00".to_string(),
+            commit_type: CommitType::Fix,
+            scope: "cli".to_string(),
+            claim_text: "sign packets over the canonical message".to_string(),
+            evidence: vec!["submit verifies Ed25519 when signatures are required".to_string()],
+            reasoning: vec!["an all-zero signature is refused".to_string()],
+            verification: vec!["server_accepts passes".to_string()],
+            parent_hashes: vec![],
+            trailers: vec![],
+            files_changed: vec!["crates/epigraph-cli/src/bin/ingest_git.rs".to_string()],
+        }
+    }
+
+    #[test]
+    fn commit_packet_signature_verifies_like_the_server() {
+        let signer = test_keys().author("sig@example.com");
+        let packet = build_packet(&signing_fixture_commit(), &signer, Uuid::new_v4(), None);
+        assert_ne!(
+            packet.signature,
+            "0".repeat(128),
+            "no placeholder signature"
+        );
+        assert!(
+            server_accepts(&packet, &signer),
+            "a commit packet must pass require_packet_signatures verification"
+        );
+        // The oracle is not vacuous: another key does not verify it.
+        assert!(!server_accepts(&packet, &AgentSigner::generate()));
+    }
+
+    #[test]
+    fn pr_mode_packets_verify_after_their_labels_are_set() {
+        let signer = test_keys().author("sig@example.com");
+        let built = build_packet(&signing_fixture_commit(), &signer, Uuid::new_v4(), None);
+        let submitted = labelled_and_signed(
+            built,
+            &[
+                "source:git-history",
+                "node:commit",
+                "repo:epigraph-io/epigraph",
+            ],
+            Some(&signer),
+        );
+        assert_eq!(submitted.claim.labels.len(), 3);
+        assert!(
+            server_accepts(&submitted, &signer),
+            "the labels are signed bytes: the packet must be signed after they are set"
+        );
+
+        let repo_signer = test_keys().repo_root();
+        let repo = labelled_and_signed(
+            build_repo_packet("epigraph-io/epigraph", Uuid::new_v4(), &repo_signer),
+            &[
+                "source:git-history",
+                "node:repo",
+                "repo:epigraph-io/epigraph",
+            ],
+            Some(&repo_signer),
+        );
+        assert!(server_accepts(&repo, &repo_signer));
+    }
+
+    #[test]
+    fn labels_are_covered_by_the_packet_signature() {
+        // Changing a label after signing invalidates the signature, which is
+        // why `labelled_and_signed` signs last.
+        let signer = test_keys().author("sig@example.com");
+        let mut packet = build_packet(&signing_fixture_commit(), &signer, Uuid::new_v4(), None);
+        packet.claim.labels = vec!["node:commit".to_string()];
+        assert!(!server_accepts(&packet, &signer));
+    }
+
+    #[test]
+    fn repo_packet_signature_verifies_like_the_server() {
+        let signer = test_keys().repo_root();
+        let packet = build_repo_packet("epigraph-io/epigraph", Uuid::new_v4(), &signer);
+        assert!(
+            server_accepts(&packet, &signer),
+            "a repo-root packet must pass require_packet_signatures verification"
+        );
     }
 }
