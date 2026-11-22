@@ -1,0 +1,6 @@
+# The pip-audit tool the `audit` job in .github/workflows/ci.yml runs over
+# tests/requirements-ci.txt. Edit THIS file, then recompile the hash-locked
+# tests/requirements-audit.txt that CI installs:
+#   uv pip compile tests/requirements-audit.in -o tests/requirements-audit.txt \
+#     --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_39
+pip-audit==2.10.1
