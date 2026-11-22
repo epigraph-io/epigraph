@@ -2073,6 +2073,33 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          own read did not return as a missing parent. Returns workflow ids only, never content.",
     ),
     (
+        "workflow.rs",
+        "lock_lineages_for_deprecation",
+        "LOCK of `workflows` rows, nothing returned. Moved here from EXECUTOR_WITHOUT_VIEWER by \
+         migration 237 (workflows UPDATE owner scope): a row lock is checked against the UPDATE \
+         policy, which since 237 admits only a writer of the row's owner group, so the old \
+         `SELECT ... FOR UPDATE` on the stamp would lock only the caller's own-group rows of a \
+         public lineage and let two deprecations write-skew. It now issues N+1 statements on ONE \
+         connection, which a generic executor cannot express: the rows sharing a \
+         `canonical_name` with the targets are read on the CALLER's stamped transaction \
+         (183's `workflows_read` row security bounds them, no lock), then each is locked in id \
+         order through 237's SECURITY DEFINER `epigraph_workflow_lock_readable`, which restates \
+         183's read predicate for the session. The caller's authority is \
+         `require_workflow_authority`; no row, id or count reaches the caller.",
+    ),
+    (
+        "workflow.rs",
+        "admin_deprecate_row",
+        "WRITE through migration 237's SECURITY DEFINER `epigraph_admin_deprecate_workflow_row`, \
+         for the workflow authority gate's admin arm only (the `admin_patch_claim_conn` shape). \
+         The function takes the admin from the session's `epigraph.principal_id`, re-checks the \
+         token's live `claims:admin` grant in `oauth_clients` through `client_id`, and writes \
+         `workflows.truth_value` (0.05, nothing else) plus its `workflows.admin_write` \
+         `security_events` audit row on the caller's transaction; it returns a changed-row \
+         count. There is no read to filter, and the target is the one row \
+         `require_workflow_authority`'s admin arm admitted.",
+    ),
+    (
         "agent_lookup.rs",
         "author_nodes",
         "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
@@ -3728,6 +3755,17 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          REST handler runs it on the caller's stamped transaction after its authority check, so \
          it updates only a row the caller reads; there is no read for a viewer to filter.",
     ),
+    (
+        "workflow.rs",
+        "truth_value_of",
+        "READ of `workflows` only: one `truth_value` scalar by primary key, asked by \
+         `deprecate_workflow` (REST and MCP) after a `set_truth_value` that changed 0 rows, to \
+         tell an already-deprecated row (0.05) from a write migration 237's owner-scoped UPDATE \
+         policy filtered out. It runs on the same caller-stamped transaction as that write, so \
+         183's `workflows_read` row security bounds it exactly as it bounds `set_truth_value`: \
+         a hidden row reads `None`, the same answer as a missing one (MCP answers it as \
+         not-found). A viewer predicate would restate the policy; no content leaves.",
+    ),
     // ── Unit E (R3 release gate). Every entry below was a viewer-less `&PgPool`
     // function before this branch; ONLY its executor widened, so the ingest
     // executor's plan walk and the DS belief chain can run on ONE stamped
@@ -3987,15 +4025,6 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          183 (ruling R-74) `workflows` carries its plan's tenancy and row security, so the \
          stamp of the connection it runs on (the caller's) bounds what it sees; the targets \
          were themselves read on that stamp, and there is no read for a viewer to filter.",
-    ),
-    (
-        "workflow.rs",
-        "lock_lineages_for_deprecation",
-        "READ of `workflows` only, `FOR UPDATE`: locks the rows sharing a `canonical_name` with \
-         a deprecation's targets, so two concurrent deprecations cannot each keep a claim the \
-         other retires. Since migration 183 (ruling R-74) `workflows` carries its plan's \
-         tenancy and row security, so the stamp of the connection it runs on bounds what it \
-         sees: the caller's authority is `require_workflow_authority`.",
     ),
     (
         "workflow.rs",
