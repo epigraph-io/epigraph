@@ -18,24 +18,45 @@
 //! target directive is consulted. A layered `Targets` filter is ANDed with
 //! the `EnvFilter`, so neither form can lift the cap.
 //!
-//! The level cap does not cover rmcp lines logged at INFO or above, and two
-//! of those carry a whole MCP message in a field (backlog e6ed6cc9). In rmcp
-//! 3.9: `received notification` (INFO, `?notification`) in the service loop,
-//! on every notification a peer sends, and `Received unexpected message`
-//! (WARN, `?notification` / `?message`) in the client handshake, which this
-//! binary runs as a federation client of every extension. A third layer
-//! drops every rmcp event that carries such a field
+//! The level cap does not cover rmcp lines logged at INFO or above, and
+//! several of those carry peer-supplied data in a field (backlog e6ed6cc9).
+//! In rmcp 3.9:
+//!
+//! - `received notification` (INFO, `?notification`) in the service loop, on
+//!   every notification a peer sends;
+//! - `cancelled` (INFO, `reason`), on both sides of the service loop, when a
+//!   `notifications/cancelled` cancels a call in flight: `reason` is the
+//!   peer's free text, copied from its message;
+//! - `Received unexpected message` (WARN, `?notification` / `?message`) in
+//!   the client handshake, which this binary runs as a federation client of
+//!   every extension.
+//!
+//! A third layer drops every rmcp event that carries such a field
 //! ([`carries_rmcp_payload`]), at any level. It matches on the callsite's
 //! field NAMES (metadata), so the decision is made once per callsite and no
-//! payload is formatted to make it.
+//! payload is formatted to make it. The match fails closed: a dropped line is
+//! lost whole, not redacted. That also drops rmcp's `rejected peer request`
+//! (WARN, `message = %error.message`), whose second `message` field matches
+//! the `?message` rule; in rmcp 3.9 that text is a fixed constant, so only
+//! visibility is lost, and the rule is kept so a later rmcp that puts the
+//! request into it cannot leak.
 //!
 //! Local debugging can lift both the cap and the drop explicitly with
 //! [`PAYLOAD_LOGGING_ENV`]`=1`; [`init_stderr`] then logs a WARN at boot.
 //!
-//! Known residual: rmcp's `response error` (WARN, `?error`) logs the
-//! `ErrorData` a tool answered with, whose message a tool may build from the
-//! caller's input. It is the answer's error, not a payload field, and is not
-//! dropped here.
+//! Known residuals (not dropped; the filter sees field names, so data
+//! formatted into a line's TEXT or into a field not named above passes):
+//!
+//! - `response error` (WARN, `?error`) logs the `ErrorData` a tool answered
+//!   with, whose message a tool may build from the caller's input;
+//! - `Service initialized as server` (INFO, `?peer_info`) logs the caller's
+//!   `initialize` parameters (its self-reported client name, version and
+//!   capabilities);
+//! - `worker quit with fatal: {error}` (ERROR) formats a transport error into
+//!   the text; a session worker's `UnexpectedEvent` error carries the whole
+//!   event, which can hold a client message, and a streamable-HTTP client's
+//!   `UnexpectedServerResponse` carries the extension's response body. Not
+//!   traced to a peer-triggerable path.
 //!
 //! This is the binary's only subscriber: `tests/one_log_subscriber.rs` fails
 //! on any other file under `src/` that builds or installs one, so a second
@@ -58,9 +79,11 @@ pub const DEFAULT_DIRECTIVES: &str = "epigraph_mcp=info,tenancy=info";
 /// Target prefix capped at INFO (covers `rmcp::service`, `rmcp::transport::*`).
 pub const RMCP_TARGET: &str = "rmcp";
 
-/// Field names rmcp logs a whole MCP message under. An rmcp event with one
-/// of these fields is dropped (see [`carries_rmcp_payload`]).
-pub const RMCP_PAYLOAD_FIELDS: &[&str] = &["notification", "request", "result", "params"];
+/// Field names rmcp logs a whole MCP message, or a peer's free text, under.
+/// An rmcp event with one of these fields is dropped (see
+/// [`carries_rmcp_payload`]). `reason` is the `cancelled` line's copy of a
+/// `notifications/cancelled` reason.
+pub const RMCP_PAYLOAD_FIELDS: &[&str] = &["notification", "request", "result", "params", "reason"];
 
 /// Is `target` one of rmcp's (`rmcp` or `rmcp::…`)? Not `rmcp_foo`.
 fn is_rmcp_target(target: &str) -> bool {

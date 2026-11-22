@@ -1,9 +1,11 @@
-//! rmcp logs two lines ABOVE the INFO cap with a whole MCP message in a
-//! field, and the binary's subscriber must drop both under every `RUST_LOG`
+//! rmcp logs three lines ABOVE the INFO cap with peer-supplied data in a
+//! field, and the binary's subscriber must drop them under every `RUST_LOG`
 //! (backlog e6ed6cc9):
 //!
 //! - `received notification` (INFO, `?notification`) in the service loop, on
 //!   every notification a peer sends;
+//! - `cancelled` (INFO, `reason`) when a peer's `notifications/cancelled`
+//!   cancels a call that is in flight; `reason` is the peer's free text;
 //! - `Received unexpected message` (WARN, `?notification` / `?message`) in the
 //!   client handshake, on a server message that arrives before the
 //!   `initialize` answer. The gateway is a client of every extension it
@@ -23,9 +25,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use epigraph_mcp::log_filter;
-use rmcp::model::{CancelledNotificationParam, NumberOrString, RequestId};
-use rmcp::{ServerHandler, ServiceExt};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CancelledNotificationParam, ClientRequest,
+    NumberOrString, Request, RequestId, ServerCapabilities, ServerConfig,
+};
+use rmcp::service::{PeerRequestOptions, RequestContext};
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Notify;
 use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Clone, Default)]
@@ -96,6 +103,68 @@ async fn peer_sends_a_notification() {
         .expect("send the notification");
     // Answered (an error is an answer too) only after the notification ahead
     // of it was handled.
+    let _ = tokio::time::timeout(Duration::from_secs(10), client.peer().list_all_tools())
+        .await
+        .expect("the server answers");
+    let _ = client.cancel().await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), server).await;
+}
+
+/// A server whose every tool call signals `started`, then blocks until the
+/// call is cancelled.
+struct Blocker {
+    started: Arc<Notify>,
+}
+
+impl ServerHandler for Blocker {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+    }
+
+    async fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        self.started.notify_one();
+        context.ct.cancelled().await;
+        Err(ErrorData::internal_error("cancelled", None))
+    }
+}
+
+/// A client starts a tool call, waits until the server's handler is running
+/// (so the call is in flight on both sides), then cancels it with the canary
+/// as its `reason`: the branch of rmcp's loop that logs `cancelled`. A
+/// cancellation of an id that is NOT in flight never reaches that line.
+async fn peer_cancels_a_call_in_flight() {
+    let started = Arc::new(Notify::new());
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    let server_started = Arc::clone(&started);
+    let server = tokio::spawn(async move {
+        let running = Blocker {
+            started: server_started,
+        }
+        .serve(tokio::io::split(server_end))
+        .await
+        .expect("server handshake");
+        let _ = running.waiting().await;
+    });
+    let client = ().serve(tokio::io::split(client_end)).await.expect("client handshake");
+    let call = client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(CallToolRequestParams::new("block"))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .expect("send the call");
+    tokio::time::timeout(Duration::from_secs(10), started.notified())
+        .await
+        .expect("the server starts the call");
+    call.cancel(Some(CANARY.to_string()))
+        .await
+        .expect("send the cancellation");
+    // Answered only after the cancellation ahead of it was handled.
     let _ = tokio::time::timeout(Duration::from_secs(10), client.peer().list_all_tools())
         .await
         .expect("the server answers");
@@ -213,6 +282,36 @@ async fn an_unexpected_message_before_the_handshake_is_never_logged_with_its_pay
         assert!(
             !out.contains(CANARY),
             "RUST_LOG={rust_log}: an unexpected message's payload reached the log:\n{out}"
+        );
+    }
+}
+
+/// Mutation: remove `reason` from `log_filter::RMCP_PAYLOAD_FIELDS` -> the
+/// `cancelled` line logs the peer's reason under every value here (the
+/// `received notification` line carrying the same text is dropped by its own
+/// field), and this fails.
+#[tokio::test]
+async fn a_cancellation_reason_is_never_logged() {
+    let calibration = logged("info", true, peer_cancels_a_call_in_flight).await;
+    assert!(
+        calibration
+            .lines()
+            // The `cancelled` event itself, not the `received notification`
+            // line that carries the same notification (the fmt output has
+            // ANSI codes between the target and the message, so match parts).
+            .any(|line| line.contains("rmcp::service")
+                && line.contains(" cancelled ")
+                && !line.contains("received notification")
+                && line.contains(CANARY)),
+        "CALIBRATION: rmcp's `cancelled` line fires for the call in flight and carries the \
+         peer's reason when the opt-in lifts the filter:\n{calibration}"
+    );
+
+    for rust_log in RUST_LOGS {
+        let out = logged(rust_log, false, peer_cancels_a_call_in_flight).await;
+        assert!(
+            !out.contains(CANARY),
+            "RUST_LOG={rust_log}: a cancellation's reason reached the log:\n{out}"
         );
     }
 }
