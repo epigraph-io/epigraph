@@ -85,6 +85,17 @@ struct Cli {
     #[arg(long, env = "EPIGRAPH_JWT_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
 
+    /// The kernel's token-verification keys as a JWK Set (the HTTP API's
+    /// `/.well-known/jwks.json`), for an API that signs EdDSA
+    /// (`EPIGRAPH_JWT_SIGNING_KEY`).
+    ///
+    /// Verify-only: this process can check an EdDSA token but holds nothing
+    /// that mints one. With `--jwt-secret` as well, HS256 tokens from the
+    /// shared secret are also accepted (the migration window); drop the
+    /// secret to close it. Either this or `--jwt-secret` enables Bearer auth.
+    #[arg(long, env = "EPIGRAPH_JWT_JWKS", hide_env_values = true)]
+    jwt_jwks: Option<String>,
+
     /// Acknowledge that HTTP transport exposes all MCP tools without authentication.
     ///
     /// Accepted ONLY for a unix-socket listener (`--listen unix:/abs/path`), whose
@@ -456,12 +467,13 @@ fn parse_hex32(raw: &str, name: &str) -> Result<[u8; 32], String> {
 fn check_listen_auth_mode(
     listen: &str,
     jwt_secret: Option<&str>,
+    jwt_jwks: Option<&str>,
     allow_unauthenticated_http: bool,
 ) -> Result<(), String> {
-    match (jwt_secret, allow_unauthenticated_http) {
-        (Some(secret), false) => epigraph_auth::assert_production_secret(secret.as_bytes())
-            .map_err(|reason| format!("--jwt-secret rejected: {reason}")),
-        (None, true) => {
+    let bearer = jwt_secret.is_some() || jwt_jwks.is_some();
+    match (bearer, allow_unauthenticated_http) {
+        (true, false) => bearer_jwt_config(jwt_secret, jwt_jwks).map(|_| ()),
+        (false, true) => {
             if epigraph_mcp::is_unix_listener(listen) {
                 Ok(())
             } else {
@@ -475,15 +487,48 @@ fn check_listen_auth_mode(
                 ))
             }
         }
-        (Some(_), true) => {
-            Err("--jwt-secret and --allow-unauthenticated-http are mutually exclusive.".to_string())
-        }
-        (None, false) => Err(
-            "--listen requires either --jwt-secret <SECRET> (Bearer auth) or\n\
+        (true, true) => Err(
+            "--jwt-secret / --jwt-jwks and --allow-unauthenticated-http are mutually exclusive."
+                .to_string(),
+        ),
+        (false, false) => Err(
+            "--listen requires either --jwt-secret <SECRET> or --jwt-jwks <JWKS> (Bearer auth) or\n\
              --allow-unauthenticated-http (unix-socket listeners only, behind filesystem\n\
              permissions). See https://github.com/epigraph-io/epigraph/issues/122."
                 .to_string(),
         ),
+    }
+}
+
+/// The Bearer verifier for the HTTP transport. This process only VERIFIES
+/// kernel tokens (the HTTP API mints them):
+///
+/// * `--jwt-jwks`: verify-only by the API's Ed25519 public keys
+///   (`epigraph_auth::JwtConfig::verifier_from_jwks`), plus the HS256 accept
+///   window when `--jwt-secret` is also set;
+/// * `--jwt-secret` alone: HS256 with the shared secret, as before.
+///
+/// A set secret is held to the production bar either way.
+fn bearer_jwt_config(
+    jwt_secret: Option<&str>,
+    jwt_jwks: Option<&str>,
+) -> Result<epigraph_auth::JwtConfig, String> {
+    use epigraph_auth::JwtConfig;
+    if let Some(secret) = jwt_secret {
+        epigraph_auth::assert_production_secret(secret.as_bytes())
+            .map_err(|reason| format!("--jwt-secret rejected: {reason}"))?;
+    }
+    match (jwt_jwks, jwt_secret) {
+        (Some(jwks), secret) => {
+            let config = JwtConfig::verifier_from_jwks(jwks)
+                .map_err(|reason| format!("--jwt-jwks rejected: {reason}"))?;
+            Ok(match secret {
+                Some(secret) => config.with_hs256_accept(secret.as_bytes()),
+                None => config,
+            })
+        }
+        (None, Some(secret)) => Ok(JwtConfig::from_secret(secret.as_bytes())),
+        (None, None) => Err("no Bearer verifier: set --jwt-secret or --jwt-jwks".to_string()),
     }
 }
 
@@ -573,6 +618,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(reason) = check_listen_auth_mode(
             listen,
             cli.jwt_secret.as_deref(),
+            cli.jwt_jwks.as_deref(),
             cli.allow_unauthenticated_http,
         ) {
             eprintln!("ERROR: {reason}");
@@ -1097,14 +1143,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // See `epigraph_mcp::session_status`.
         let router = epigraph_mcp::session_status::nest_mcp_service(service);
 
-        let router = if let Some(secret) = cli.jwt_secret.as_deref() {
-            use epigraph_auth::JwtConfig;
+        let router = if cli.jwt_secret.is_some() || cli.jwt_jwks.is_some() {
             use epigraph_mcp::auth::{
                 bearer_auth_middleware, DbAccessTokenRevocation, McpAuthState,
             };
 
+            // Checked by `check_listen_auth_mode` before the DB connect; a
+            // refusal here is unreachable but must not fall through to an
+            // unauthenticated router.
+            let jwt_config =
+                match bearer_jwt_config(cli.jwt_secret.as_deref(), cli.jwt_jwks.as_deref()) {
+                    Ok(config) => config,
+                    Err(reason) => {
+                        eprintln!("ERROR: {reason}");
+                        std::process::exit(1);
+                    }
+                };
             let state = McpAuthState {
-                jwt_config: Arc::new(JwtConfig::from_secret(secret.as_bytes())),
+                jwt_config: Arc::new(jwt_config),
                 resource_metadata_url: cli.resource_metadata_url.clone(),
                 // The denylist `/oauth/revoke` writes on the HTTP API, read on
                 // this process's pool (migration 141).
@@ -1266,7 +1322,7 @@ mod listen_auth_gate_tests {
     #[test]
     fn tcp_listener_with_no_credential_is_refused() {
         for listen in [TCP, "0.0.0.0:3100", "[::1]:3100", "localhost:3100"] {
-            let err = check_listen_auth_mode(listen, None, true)
+            let err = check_listen_auth_mode(listen, None, None, true)
                 .expect_err("unauthenticated TCP listener must be refused");
             assert!(
                 err.contains("unix-socket"),
@@ -1281,7 +1337,7 @@ mod listen_auth_gate_tests {
     /// socket deployment would break.
     #[test]
     fn unix_listener_with_no_credential_is_still_accepted() {
-        assert!(check_listen_auth_mode(UNIX, None, true).is_ok());
+        assert!(check_listen_auth_mode(UNIX, None, None, true).is_ok());
     }
 
     /// A TCP listener WITH a real Bearer secret is the supported production
@@ -1289,7 +1345,7 @@ mod listen_auth_gate_tests {
     /// credential, not on the transport being TCP.
     #[test]
     fn tcp_listener_with_a_real_jwt_secret_is_accepted() {
-        assert!(check_listen_auth_mode(TCP, Some(GOOD_SECRET), false).is_ok());
+        assert!(check_listen_auth_mode(TCP, Some(GOOD_SECRET), None, false).is_ok());
     }
 
     /// Pre-existing guards must survive the extraction: the committed dev
@@ -1301,21 +1357,22 @@ mod listen_auth_gate_tests {
         let dev = check_listen_auth_mode(
             TCP,
             Some("epigraph-dev-secret-change-in-production!!"),
+            None,
             false,
         )
         .expect_err("dev literal must be refused");
         assert!(dev.contains("--jwt-secret rejected"), "got: {dev}");
 
-        let short = check_listen_auth_mode(TCP, Some("too-short"), false)
+        let short = check_listen_auth_mode(TCP, Some("too-short"), None, false)
             .expect_err("a sub-32-byte secret must be refused");
         assert!(short.contains("--jwt-secret rejected"), "got: {short}");
 
-        let both = check_listen_auth_mode(TCP, Some(GOOD_SECRET), true)
+        let both = check_listen_auth_mode(TCP, Some(GOOD_SECRET), None, true)
             .expect_err("both modes at once must be refused");
         assert!(both.contains("mutually exclusive"), "got: {both}");
 
         // ...including on a unix listener, where the unauth path is otherwise legal.
-        assert!(check_listen_auth_mode(UNIX, Some(GOOD_SECRET), true).is_err());
+        assert!(check_listen_auth_mode(UNIX, Some(GOOD_SECRET), None, true).is_err());
     }
 
     /// `--listen` with neither mode selected is still refused on both transports
@@ -1323,10 +1380,75 @@ mod listen_auth_gate_tests {
     #[test]
     fn listen_with_no_mode_selected_is_refused() {
         for listen in [TCP, UNIX] {
-            let err = check_listen_auth_mode(listen, None, false)
+            let err = check_listen_auth_mode(listen, None, None, false)
                 .expect_err("--listen with no auth mode must be refused");
             assert!(err.contains("--jwt-secret"), "got: {err}");
         }
+    }
+
+    /// Backlog 7b834860: with the API signing EdDSA, this process verifies by
+    /// the API's PUBLIC keys and holds nothing that mints. A TCP listener with
+    /// only `--jwt-jwks` is accepted; its verifier admits the kernel's EdDSA
+    /// token, refuses an HS256 token until `--jwt-secret` opens the window,
+    /// and signs nothing either way. Mutations caught: the gate ignoring
+    /// `--jwt-jwks` (refused as "no mode"), and the window opened without a
+    /// secret.
+    #[test]
+    fn a_jwks_listener_verifies_by_public_key_and_mints_nothing() {
+        use super::bearer_jwt_config;
+        use epigraph_auth::{AccessTokenBinding, JwtConfig};
+        let mint = |cfg: &JwtConfig| {
+            cfg.issue_access_token(
+                uuid::Uuid::new_v4(),
+                vec!["claims:read".to_string()],
+                "agent",
+                None,
+                Some(uuid::Uuid::new_v4()),
+                chrono::Duration::minutes(5),
+                AccessTokenBinding::NONE,
+            )
+            .unwrap()
+            .0
+        };
+        let kernel = JwtConfig::from_ed25519_seed(&[0x2a; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        let eddsa = mint(&kernel);
+        let hs256 = mint(&JwtConfig::from_secret(GOOD_SECRET.as_bytes()));
+
+        assert!(check_listen_auth_mode(TCP, None, Some(&jwks), false).is_ok());
+        let verifier = bearer_jwt_config(None, Some(&jwks)).unwrap();
+        assert_eq!(verifier.signing_algorithm(), None);
+        assert!(verifier.validate_token(&eddsa).is_ok());
+        assert!(verifier.validate_token(&hs256).is_err());
+
+        let window = bearer_jwt_config(Some(GOOD_SECRET), Some(&jwks)).unwrap();
+        assert_eq!(window.signing_algorithm(), None);
+        assert!(window.validate_token(&eddsa).is_ok());
+        assert!(window.validate_token(&hs256).is_ok());
+    }
+
+    /// A JWK Set that is not all Ed25519, a weak secret beside a good set, and
+    /// `--jwt-jwks` with the unauthenticated opt-out are all refused at boot.
+    #[test]
+    fn a_bad_jwks_or_a_weak_window_secret_is_refused() {
+        for bad in [
+            "",
+            "{}",
+            r#"{"keys":[]}"#,
+            r#"{"keys":[{"kty":"oct","k":"c2VjcmV0"}]}"#,
+        ] {
+            let err = check_listen_auth_mode(TCP, None, Some(bad), false)
+                .expect_err("a bad JWKS must be refused");
+            assert!(err.contains("--jwt-jwks rejected"), "{bad}: {err}");
+        }
+        let kernel = epigraph_auth::JwtConfig::from_ed25519_seed(&[0x2b; 32]);
+        let jwks = serde_json::to_string(&kernel.jwks()).unwrap();
+        let weak = check_listen_auth_mode(TCP, Some("too-short"), Some(&jwks), false)
+            .expect_err("a weak window secret must be refused");
+        assert!(weak.contains("--jwt-secret rejected"), "got: {weak}");
+        let both = check_listen_auth_mode(UNIX, None, Some(&jwks), true)
+            .expect_err("--jwt-jwks with the opt-out must be refused");
+        assert!(both.contains("mutually exclusive"), "got: {both}");
     }
 }
 

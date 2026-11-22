@@ -57,6 +57,9 @@ fn rejection_reason(kind: &jsonwebtoken::errors::ErrorKind) -> &'static str {
         K::InvalidSignature => "bad_signature",
         K::InvalidIssuer => "bad_issuer",
         K::InvalidAudience => "bad_audience",
+        // An algorithm this verifier holds no key for: an HS256 token after
+        // the shared-secret window closed, or a forgery.
+        K::InvalidAlgorithm => "bad_algorithm",
         K::ImmatureSignature => "not_yet_valid",
         K::InvalidToken | K::Base64(_) | K::Json(_) | K::Utf8(_) => "malformed",
         _ => "other",
@@ -176,7 +179,11 @@ pub async fn bearer_auth_middleware(
                     // this server did not mint — misconfiguration or probing,
                     // either way worth seeing at default log levels. Expiry is
                     // routine and stays at debug so it cannot drown the journal.
-                    if matches!(e.kind(), jsonwebtoken::errors::ErrorKind::InvalidSignature) {
+                    if matches!(
+                        e.kind(),
+                        jsonwebtoken::errors::ErrorKind::InvalidSignature
+                            | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                    ) {
                         tracing::warn!(reason, "MCP bearer token rejected");
                     } else {
                         tracing::debug!(reason, "MCP bearer token rejected");

@@ -127,3 +127,31 @@ fn rejects_unauthenticated_writes_without_an_unauthenticated_listener() {
     }
     let _ = std::fs::remove_file(&socket);
 }
+
+/// Backlog 7b834860: `main` consults the `--jwt-jwks` verifier at boot, so a
+/// JWK Set that is not all Ed25519 keys refuses to start (here an empty set)
+/// before the DB connect. A binary without the flag fails differently (clap's
+/// unknown-argument error), which this assertion does not accept.
+#[test]
+fn rejects_a_jwks_that_holds_no_ed25519_key() {
+    let out = Command::new(mcp_bin())
+        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_JWT_SECRET")
+        .args([
+            "--database-url",
+            "postgres://invalid:invalid@127.0.0.1:1/nope",
+            "--listen",
+            "127.0.0.1:0",
+            "--jwt-jwks",
+            r#"{"keys":[]}"#,
+        ])
+        .output()
+        .expect("run mcp bin");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--jwt-jwks rejected"),
+        "stderr must name the JWKS check; got: {stderr}"
+    );
+}
