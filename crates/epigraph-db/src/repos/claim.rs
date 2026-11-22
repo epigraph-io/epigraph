@@ -11278,10 +11278,14 @@ impl ClaimRepository {
     /// workflow is about to execute again: `is_current = true`, the recorded
     /// truth value back, the marker removed. `true` when this call revived it.
     ///
-    /// Only a MARKED, non-current claim with no successor (no claim
-    /// `supersedes` it) is revived, so a claim an `evolve_step` superseded, or
-    /// one retired by any other path, stays retired. The vectors were nulled
-    /// at retirement; the caller re-embeds the revived claim.
+    /// Only a MARKED, non-current claim that names no claim it was retired
+    /// into (its own `supersedes` is NULL) and has no successor (no claim
+    /// `supersedes` it) is revived, so a claim an `evolve_step` superseded,
+    /// one a later `mark_duplicate` or consolidation folded into another claim
+    /// (both write the target into the retired row's own `supersedes`, and
+    /// leave the marker in place), or one retired by any other path, stays
+    /// retired. The vectors were nulled at retirement; the caller re-embeds
+    /// the revived claim.
     ///
     /// # Errors
     /// Returns `DbError` if the statement fails, including a `42501` refusal
@@ -11296,7 +11300,7 @@ impl ClaimRepository {
                  truth_value = (c.properties -> $2::text ->> 'truth_value')::float8, \
                  properties = c.properties - $2::text, \
                  updated_at = NOW() \
-             WHERE c.id = $1 AND NOT c.is_current \
+             WHERE c.id = $1 AND NOT c.is_current AND c.supersedes IS NULL \
                AND (c.properties -> $2::text ->> 'truth_value') IS NOT NULL \
                AND NOT EXISTS (SELECT 1 FROM claims s WHERE s.supersedes = c.id)",
         )

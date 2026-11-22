@@ -25,7 +25,9 @@ mod fixture;
 mod common;
 
 use common::{first_text, seed_caller};
+use epigraph_core::ClaimId;
 use epigraph_crypto::AgentSigner;
+use epigraph_db::ClaimRepository;
 use epigraph_ingest::common::schema::ThesisDerivation;
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
 use epigraph_ingest::workflow::WorkflowExtraction;
@@ -187,6 +189,69 @@ impl World {
         .unwrap_or_else(|e| panic!("step {text:?} of {wf}: {e}"))
     }
 
+    /// Deprecate generation 0 while generation 1 (which no longer runs DROP)
+    /// stays live: DROP is retired and marked, generation 1 is the head
+    /// `add_step` writes into. Returns `(gen1, DROP's claim id)`.
+    async fn retire_drop_under_a_live_head(&self) -> (Uuid, Uuid) {
+        let gen0 = self.ingest(&[KEEP, DROP]).await;
+        let dropped = self.step(gen0, DROP).await;
+        let gen1 = self.improve(&[KEEP], 1).await;
+        self.deprecate(gen0).await;
+        assert_eq!(
+            self.state(dropped).await,
+            (false, 0.05, false, true),
+            "PRECONDITION: retired, unembedded and marked"
+        );
+        (gen1, dropped)
+    }
+
+    /// `add_step` of `text` onto the live head; its JSON answer.
+    async fn add_step(&self, text: &str) -> serde_json::Value {
+        first_text(
+            &tools::step_ops::add_step(
+                &self.server,
+                &self.viewer,
+                AddStepParams {
+                    canonical_name: self.canonical.clone(),
+                    step_text: text.to_string(),
+                    position: None,
+                },
+                Some(&self.token),
+            )
+            .await
+            .expect("add_step"),
+        )
+    }
+
+    /// A current public claim outside every workflow, by its own agent.
+    async fn unrelated_current_claim(&self) -> Uuid {
+        let agent: Uuid = sqlx::query_scalar(
+            "INSERT INTO agents (public_key, display_name, agent_type, labels) \
+             VALUES (sha256(gen_random_uuid()::text::bytea), 'revival-canonical', 'system', \
+                     ARRAY['test']) RETURNING id",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .expect("agent");
+        sqlx::query_scalar(
+            "INSERT INTO claims (content, content_hash, truth_value, agent_id) \
+             VALUES ($1, sha256($1::bytea), 0.6, $2) RETURNING id",
+        )
+        .bind(format!("revival canonical {}", Uuid::new_v4()))
+        .bind(agent)
+        .fetch_one(&self.pool)
+        .await
+        .expect("canonical claim")
+    }
+
+    async fn supersedes_of(&self, claim: Uuid) -> Option<Uuid> {
+        sqlx::query_scalar("SELECT supersedes FROM claims WHERE id = $1")
+            .bind(claim)
+            .fetch_one(&self.pool)
+            .await
+            .expect("supersedes")
+    }
+
     /// `(is_current, truth_value, embedding IS NOT NULL, marked)`.
     async fn state(&self, claim: Uuid) -> (bool, f64, bool, bool) {
         sqlx::query_as(
@@ -339,5 +404,80 @@ async fn a_superseded_step_is_not_revived(pool: PgPool) {
         w.state(keep).await,
         superseded,
         "a superseded step stays exactly as the supersede left it"
+    );
+}
+
+/// A marked step that a later `mark_duplicate` folded into another claim is
+/// not revived. The dedup act writes the canonical into the RETIRED row's own
+/// `supersedes` and requires only the canonical to be current, so it accepts a
+/// step a deprecation already retired and leaves the marker in place. Reviving
+/// it would put a deduplicated claim back into search with `supersedes` still
+/// naming its canonical.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_marked_step_folded_into_a_duplicate_is_not_revived(pool: PgPool) {
+    let w = World::new(pool, "no-revive-dedup").await;
+    let (_gen1, dropped) = w.retire_drop_under_a_live_head().await;
+    let canonical = w.unrelated_current_claim().await;
+    ClaimRepository::mark_duplicate(
+        &w.pool,
+        ClaimId::from_uuid(dropped),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("mark_duplicate onto a current canonical");
+    assert_eq!(
+        (w.state(dropped).await, w.supersedes_of(dropped).await),
+        ((false, 0.05, false, true), Some(canonical)),
+        "PRECONDITION: still marked, and folded into the canonical"
+    );
+
+    let added = w.add_step(DROP).await;
+    assert_eq!(
+        added["step_claim_id"],
+        serde_json::json!(dropped),
+        "PRECONDITION: add_step reuses the folded row: {added}"
+    );
+    assert_eq!(
+        (w.state(dropped).await, w.supersedes_of(dropped).await),
+        ((false, 0.05, false, true), Some(canonical)),
+        "a step folded into a duplicate stays retired, unembedded and folded"
+    );
+}
+
+/// A marked step that another claim supersedes is not revived: its lineage
+/// head is the successor. No path writes this state today (a supersede
+/// requires a current predecessor, and a deprecation marks only a current
+/// claim), so the successor is planted directly; the test pins the guard so a
+/// later path that can reach the state does not revive past it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_marked_step_with_a_successor_is_not_revived(pool: PgPool) {
+    let w = World::new(pool, "no-revive-successor").await;
+    let (_gen1, dropped) = w.retire_drop_under_a_live_head().await;
+    let agent: Uuid = sqlx::query_scalar("SELECT agent_id FROM claims WHERE id = $1")
+        .bind(dropped)
+        .fetch_one(&w.pool)
+        .await
+        .expect("agent");
+    sqlx::query(
+        "INSERT INTO claims (content, content_hash, truth_value, agent_id, supersedes) \
+         VALUES ($1, sha256($1::bytea), 0.6, $2, $3)",
+    )
+    .bind(format!("revival successor {}", Uuid::new_v4()))
+    .bind(agent)
+    .bind(dropped)
+    .execute(&w.pool)
+    .await
+    .expect("planted successor");
+
+    let added = w.add_step(DROP).await;
+    assert_eq!(
+        added["step_claim_id"],
+        serde_json::json!(dropped),
+        "PRECONDITION: add_step reuses the superseded row: {added}"
+    );
+    assert_eq!(
+        w.state(dropped).await,
+        (false, 0.05, false, true),
+        "a marked step with a successor stays retired, unembedded and marked"
     );
 }
