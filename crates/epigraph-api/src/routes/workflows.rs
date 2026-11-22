@@ -363,15 +363,18 @@ pub async fn store_workflow(
             .map_err(workflow_ingest_error)?;
     }
 
-    // Embed the goal ONCE, best-effort (a query vector: the embedding
-    // service, whichever provider it is). It decides whether this goal is a
-    // rewording of a workflow already in the tenancy this store would use
-    // (backlog 51d599a9, the rule MCP `store_workflow` applies:
+    // Embed the goal ONCE, best-effort, with the STORING embedding service:
+    // the match compares it with `workflows.goal_embedding`, which only that
+    // service writes, so a provider that does not own the column (another
+    // vector space, perhaps another dimension) matches nothing rather than
+    // comparing across spaces. It decides whether this goal is a rewording of
+    // a workflow already in the tenancy this store would use (backlog
+    // 51d599a9, the rule MCP `store_workflow` applies:
     // `epigraph_ingest_executor::matching_workflow_conn`), and the same vector
-    // is stored as a new row's goal embedding below when the provider may
-    // store. Without a service, or when it fails, nothing is matched, as
-    // before.
-    let goal_vec = match state.embedding_service() {
+    // is stored as a new row's goal embedding below. Without such a service,
+    // or when it or the match read fails, nothing is matched and the store
+    // goes on as before.
+    let goal_vec = match state.storing_embedding_service() {
         Some(embedder) => match embedder.generate(&request.goal).await {
             Ok(v) => Some(v),
             Err(e) => {
@@ -392,27 +395,31 @@ pub async fn store_workflow(
                 &canonical_name,
                 qvec,
             )
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("store_workflow: could not match the goal: {e}"),
-            })?;
-            tx.rollback().await.map_err(|e| ApiError::InternalError {
-                message: format!("store_workflow: could not end the match read: {e}"),
-            })?;
-            if let Some(hit) = found {
-                // Nothing was stored, so nothing is announced: no event.
-                return Ok(Json(serde_json::json!({
-                    "workflow_id": hit.id,
-                    "canonical_name": hit.canonical_name,
-                    "goal": hit.goal,
-                    "generation": hit.generation,
-                    "step_count": 0,
-                    "claims_ingested": 0,
-                    "already_ingested": false,
-                    "matched_existing": true,
-                    "similarity": hit.similarity,
-                    "hint": hit.hint("POST /api/v1/workflows"),
-                })));
+            .await;
+            // Read-only: roll back whatever the read left.
+            if let Err(e) = tx.rollback().await {
+                tracing::warn!(error = %e, "store_workflow: could not end the match read");
+            }
+            match found {
+                Ok(Some(hit)) => {
+                    // Nothing was stored, so nothing is announced: no event.
+                    return Ok(Json(serde_json::json!({
+                        "workflow_id": hit.id,
+                        "canonical_name": hit.canonical_name,
+                        "goal": hit.goal,
+                        "generation": hit.generation,
+                        "step_count": 0,
+                        "claims_ingested": 0,
+                        "already_ingested": false,
+                        "matched_existing": true,
+                        "similarity": hit.similarity,
+                        "hint": hit.hint("POST /api/v1/workflows"),
+                    })));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "store_workflow: goal match failed; not matching");
+                }
             }
         }
     }
@@ -527,8 +534,8 @@ pub async fn store_workflow(
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
         // only on a row this call's insert CREATED: an existing row (one the
         // walk was admitted under) keeps the goal embedding of its own goal.
-        // The vector computed for the match above is the same service's, so
-        // it is reused; it is generated here only when that one failed.
+        // The vector computed for the match above is this service's, so it
+        // is reused; it is generated here only when that one failed.
         if result.row_created {
             let qvec = match goal_vec {
                 Some(v) => Ok(v),

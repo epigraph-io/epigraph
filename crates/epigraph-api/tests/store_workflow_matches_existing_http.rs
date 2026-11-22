@@ -96,13 +96,25 @@ impl EmbeddingService for WordSetEmbedder {
 /// The router over an `epigraph_app` `ScopedPool` (as `bin/server.rs` builds
 /// it), with [`WordSetEmbedder`] as its embedding service.
 async fn app(pool: &PgPool) -> axum::Router {
+    app_with_provider(pool, None).await
+}
+
+/// [`app`], declaring which provider the embedding service is (`None`: not
+/// declared, which may store, as a process that never says).
+async fn app_with_provider(
+    pool: &PgPool,
+    provider: Option<epigraph_api::embedding_restore::EmbeddingProviderKind>,
+) -> axum::Router {
     let url = fixture::database_url_for(pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
             .await
             .expect("app-role ScopedPool");
-    let state = AppState::with_scoped_pool(scoped, ApiConfig::default())
+    let mut state = AppState::with_scoped_pool(scoped, ApiConfig::default())
         .with_embedding_service(std::sync::Arc::new(WordSetEmbedder));
+    if let Some(p) = provider {
+        state = state.with_embedding_provider(p);
+    }
     state
         .load_entity_type_cache()
         .await
@@ -250,4 +262,128 @@ async fn a_workflow_in_another_tenancy_is_not_matched(pool: PgPool) {
         rows_named(&pool, "deploy-rust-binary-to-windows-server").await,
         1
     );
+}
+
+async fn tenancy_of(pool: &PgPool, wf: &Value) -> (String, Uuid) {
+    let id: Uuid = wf.as_str().expect("workflow_id").parse().expect("uuid");
+    sqlx::query_as("SELECT visibility::text, owner_group_id FROM workflows WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("tenancy")
+}
+
+/// The HTTP twin of MCP's `matching_never_discloses_a_plan_the_caller_cannot_read`:
+/// the match reads on the caller's own stamp and viewer, and only a plan in
+/// exactly the tenancy the store would use is matched. A stranger that
+/// declares nothing (a new lineage is private to its own group):
+///
+/// * a paraphrase of another agent's group-private plan it cannot read mints
+///   a new lineage, and the answer never carries the private goal;
+/// * a paraphrase of that agent's PUBLIC plan, which it reads, is not matched
+///   either (its outcome reports would land on another group's plan); the new
+///   lineage keeps the stranger's private tenancy;
+/// * a paraphrase of its own earlier plan IS matched (the positive control).
+///
+/// Old code had no match to disclose with; VERIFIED TO FAIL with the
+/// helper's tenancy comparison removed (the public plan was matched).
+#[sqlx::test(migrations = "../../migrations")]
+async fn matching_never_discloses_a_plan_the_caller_cannot_read(pool: PgPool) {
+    let (owner, owner_g) = fixture::seed_agent_with_group(&pool, "store-match-owner").await;
+    let (stranger, stranger_g) =
+        fixture::seed_agent_with_group(&pool, "store-match-stranger").await;
+    let router = app(&pool).await;
+    let tag = Uuid::new_v4().simple().to_string();
+    let private_goal = format!("Rotate the private signing keys of the vault {tag}");
+    let public_goal = format!("Publish the weekly release notes to the wiki {tag}");
+    let own_goal = format!("Compact the audit log archive on the replica {tag}");
+
+    let (status, private) = store(&router, owner, &request(&private_goal)).await;
+    assert_eq!(status, StatusCode::OK, "{private}");
+    let mut public_req = request(&public_goal);
+    public_req["tenancy"] = json!({"visibility": "public", "owner_group_id": owner_g});
+    let (status, public) = store(&router, owner, &public_req).await;
+    assert_eq!(status, StatusCode::OK, "{public}");
+    let (status, own) = store(&router, stranger, &request(&own_goal)).await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+
+    let (status, r) = store(
+        &router,
+        stranger,
+        &request(&format!("Rotate private signing keys of vault {tag}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["matched_existing"], false, "{r}");
+    assert_ne!(r["workflow_id"], private["workflow_id"], "{r}");
+    assert!(
+        !r.to_string().contains(&private_goal),
+        "the private plan's goal left the database: {r}"
+    );
+
+    let (status, r) = store(
+        &router,
+        stranger,
+        &request(&format!("Publish weekly release notes to wiki {tag}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(
+        r["matched_existing"], false,
+        "a private-by-default store was redirected onto another group's public plan: {r}"
+    );
+    assert_ne!(r["workflow_id"], public["workflow_id"], "{r}");
+    assert_eq!(
+        tenancy_of(&pool, &r["workflow_id"]).await,
+        ("group".to_string(), stranger_g),
+        "the new lineage keeps the store's own private tenancy"
+    );
+
+    let (status, r) = store(
+        &router,
+        stranger,
+        &request(&format!("Compact audit log archive on replica {tag}")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["matched_existing"], true, "the positive control: {r}");
+    assert_eq!(r["workflow_id"], own["workflow_id"], "{r}");
+}
+
+/// The match compares the goal with `workflows.goal_embedding`, which only
+/// the STORING embedding service writes, so it embeds with that service: a
+/// provider declared as not owning the column (another vector space) matches
+/// nothing, even against a stored vector equal to its own output, and the
+/// store mints as it did before matching existed.
+///
+/// VERIFIED TO FAIL when the match embedded with the query service: the
+/// reworded goal was matched across vector spaces.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provider_that_does_not_own_the_goal_column_matches_nothing(pool: PgPool) {
+    let (caller, _) = fixture::seed_agent_with_group(&pool, "store-match-jina").await;
+    let router = app_with_provider(
+        &pool,
+        Some(epigraph_api::embedding_restore::EmbeddingProviderKind::Jina),
+    )
+    .await;
+    let (status, first) = store(&router, caller, &request(GOAL)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    // Seed the row with the reworded goal's vector in this provider's space:
+    // a match embedded with the query service would now score 1.0.
+    let id: Uuid = first["workflow_id"]
+        .as_str()
+        .expect("workflow_id")
+        .parse()
+        .expect("uuid");
+    sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2")
+        .bind(epigraph_db::pgvector_literal(&goal_vector(REWORDED)))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("seed the goal embedding");
+
+    let (status, r) = store(&router, caller, &request(REWORDED)).await;
+    assert_eq!(status, StatusCode::OK, "{r}");
+    assert_eq!(r["matched_existing"], false, "{r}");
+    assert_ne!(r["workflow_id"], first["workflow_id"], "{r}");
 }
