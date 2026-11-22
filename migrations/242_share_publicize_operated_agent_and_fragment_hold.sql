@@ -1,5 +1,6 @@
--- 242: share and publicize refuse an operated agent (backlog ecd842bf; spec
--- docs/tenancy/share-with-team.md, ruling R1).
+-- 242: share and publicize refuse an operated agent, and hold a harvester
+-- fragment that a claim staying put also cites (backlog ecd842bf, fc33ef1a;
+-- spec docs/tenancy/share-with-team.md, ruling R1 and section 4.6).
 --
 -- ===================================================================
 -- 0. WHAT THIS FILE CHANGES, AND WHY ONE FILE
@@ -7,7 +8,9 @@
 --
 -- It re-states 215's two widening acts, `epigraph_publicize_claims(uuid[],
 -- text)` and `epigraph_share_claims_with_team(uuid[], uuid, text)`, with the
--- same signatures and the same refusals (VIS01, VIS03, VIS04). Everything
+-- same signatures and the same refusals (VIS01, VIS03, VIS04). Both fixes
+-- change the same two bodies, so they are one migration (215's header says
+-- why two files that each `CREATE OR REPLACE` one body lose a fix). Everything
 -- 206's and 215's headers say about these bodies still holds: SECURITY
 -- DEFINER on 172's path, every `public` object qualified, owned by
 -- `epigraph_maintenance`, EXECUTE for `epigraph_app` only; the write window;
@@ -50,7 +53,41 @@
 -- transport question. Those wait on the spec's phase P1.
 --
 -- ===================================================================
--- 2. PRECONDITION, OWNER, GRANTS
+-- 2. A FRAGMENT A CLAIM THAT STAYS ALSO CITES IS HELD (fc33ef1a)
+-- ===================================================================
+--
+-- THE GAP. Arm (d) (`epigraph_propagate_tenancy`, last re-stated in 218)
+-- re-stamps every fragment a changed claim cites. 218 added one guard: when
+-- the changed claims' winner is public, a fragment another group-private claim
+-- still cites is left. Nothing holds a fragment on a group-to-group move: a
+-- share took a fragment the moved claim cites into the team even when a claim
+-- that stays in the home group also cites it, and 215's source rule then saw
+-- the source's fragments "agree" and moved the source too. Nor did publicize
+-- hold a group fragment whose other citer is public. The spec's table (4.6,
+-- `harvester_fragments`) says such a fragment is HELD in its current tenancy
+-- (`shared-fragment`), for share and publicize alike.
+--
+-- THE FIX. Before the claims UPDATE each act collects the fragments that a
+-- moving claim cites AND a claim outside the moving set (current or not, any
+-- tenancy) also cites, locks them, and records their pair. After the UPDATE
+-- (arm (d) has run) and the edge re-meet, it puts each back on that pair; 173's
+-- trigger carries the fragment's audit reports back with it. 215's source
+-- rule then runs on the post-hold fragments, so a source with a held fragment
+-- and a moved one disagrees and is held (`harvester_sources_held`). The audit
+-- row counts the held fragments (`harvester_fragments_held`).
+--
+-- 218's arm (d) is NOT changed: `restrict-claims` and `regroup-claims` rely
+-- on it moving a fragment with a moved claim and put a kept node back
+-- themselves (218's header, "Moving A to another group also moves a fragment
+-- B cites with it; 218 keeps that"). The hold lives in the two app acts, as
+-- the tools' does in the tools.
+--
+-- A held fragment can be narrower than every claim that cites it (publicize
+-- when every other citer is public). That costs availability, never
+-- disclosure, and is the spec's rule.
+--
+-- ===================================================================
+-- 3. PRECONDITION, OWNER, GRANTS
 -- ===================================================================
 --
 -- The file refuses to apply over a body other than the one it was written
@@ -122,6 +159,10 @@ DECLARE
     v_moved bigint := 0;
     v_human uuid;
     v_operated boolean;
+    v_hold_ids uuid[];
+    v_hold_own uuid[];
+    v_hold_vis text[];
+    v_frags_held bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: publicize needs an authenticated principal; nothing was changed'
@@ -217,6 +258,23 @@ BEGIN
       JOIN public.evidence_visibility_pins vp ON vp.evidence_id = ev.id
      WHERE ev.claim_id = ANY(v_todo);
 
+    -- Section 2: the fragments a moved claim cites that a claim NOT moving
+    -- also cites, locked, with the pair each has now (before arm (d) runs).
+    SELECT array_agg(f.id ORDER BY f.id) INTO v_hold_ids
+      FROM public.harvester_fragments f
+     WHERE EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
+                    WHERE p.fragment_id = f.id AND p.claim_id = ANY(v_todo))
+       AND EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
+                    WHERE p.fragment_id = f.id AND NOT (p.claim_id = ANY(v_todo)));
+    IF v_hold_ids IS NOT NULL THEN
+        PERFORM 1 FROM public.harvester_fragments f
+          WHERE f.id = ANY(v_hold_ids) ORDER BY f.id FOR NO KEY UPDATE;
+        SELECT array_agg(f.id ORDER BY f.id), array_agg(f.owner_group_id ORDER BY f.id),
+               array_agg(f.visibility::text ORDER BY f.id)
+          INTO v_hold_ids, v_hold_own, v_hold_vis
+          FROM public.harvester_fragments f WHERE f.id = ANY(v_hold_ids);
+    END IF;
+
     PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);  -- see 206's header
     -- THE widening statement, and the only one the GUC is armed around.
     PERFORM set_config('epigraph.allow_declassify', 'yes', true);
@@ -282,6 +340,18 @@ BEGIN
           FROM upd;
     END IF;
 
+    -- Section 2: arm (d) moved every fragment of a moved claim; a held one
+    -- goes back to the pair it had (its audit reports follow it, 173), and
+    -- the source rule below then sees the post-hold fragments.
+    IF v_hold_ids IS NOT NULL THEN
+        UPDATE public.harvester_fragments f
+           SET owner_group_id = h.g, visibility = h.v
+          FROM unnest(v_hold_ids, v_hold_own, v_hold_vis) AS h(id, g, v)
+         WHERE f.id = h.id
+           AND (f.owner_group_id, f.visibility::text) IS DISTINCT FROM (h.g, h.v);
+        v_frags_held := cardinality(v_hold_ids);
+    END IF;
+
     -- 215 section 2: a source whose fragments now agree takes their pair.
     WITH touched AS (
         SELECT DISTINCT f.source_id
@@ -321,6 +391,7 @@ BEGIN
                                'reason', p_reason,
                                'edges_widened', v_edges,
                                'evidence_edges_rewritten', v_ev_edges,
+                               'harvester_fragments_held', v_frags_held,
                                'harvester_sources_moved', v_sources_moved,
                                'harvester_sources_held', v_sources_held,
                                'scoped_beliefs_cleared', v_scoped,
@@ -365,6 +436,10 @@ DECLARE
     v_divergence bigint := 0;
     v_human uuid;
     v_operated boolean;
+    v_hold_ids uuid[];
+    v_hold_own uuid[];
+    v_hold_vis text[];
+    v_frags_held bigint := 0;
 BEGIN
     IF v_principal IS NULL THEN
         RAISE EXCEPTION 'VIS01: sharing with a team needs an authenticated principal; '
@@ -454,6 +529,23 @@ BEGIN
              CASE WHEN m.sv = 'group' AND m.tv = 'group' AND m.sg <> m.tg
                        THEN m.tg ELSE NULL END);
 
+    -- Section 2: the fragments a moved claim cites that a claim NOT moving
+    -- also cites, locked, with the pair each has now (before arm (d) runs).
+    SELECT array_agg(f.id ORDER BY f.id) INTO v_hold_ids
+      FROM public.harvester_fragments f
+     WHERE EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
+                    WHERE p.fragment_id = f.id AND p.claim_id = ANY(v_cls_ids))
+       AND EXISTS (SELECT 1 FROM public.harvester_claim_provenance p
+                    WHERE p.fragment_id = f.id AND NOT (p.claim_id = ANY(v_cls_ids)));
+    IF v_hold_ids IS NOT NULL THEN
+        PERFORM 1 FROM public.harvester_fragments f
+          WHERE f.id = ANY(v_hold_ids) ORDER BY f.id FOR NO KEY UPDATE;
+        SELECT array_agg(f.id ORDER BY f.id), array_agg(f.owner_group_id ORDER BY f.id),
+               array_agg(f.visibility::text ORDER BY f.id)
+          INTO v_hold_ids, v_hold_own, v_hold_vis
+          FROM public.harvester_fragments f WHERE f.id = ANY(v_hold_ids);
+    END IF;
+
     PERFORM pg_catalog.set_config('search_path', 'public, pg_temp', true);  -- see 206's header
     UPDATE public.claims c
        SET owner_group_id = p_group_id, updated_at = now()
@@ -497,6 +589,18 @@ BEGIN
         GET DIAGNOSTICS v_ev_edges = ROW_COUNT;
     END IF;
 
+    -- Section 2: arm (d) moved every fragment of a moved claim; a held one
+    -- goes back to the pair it had (its audit reports follow it, 173), and
+    -- the source rule below then sees the post-hold fragments.
+    IF v_hold_ids IS NOT NULL THEN
+        UPDATE public.harvester_fragments f
+           SET owner_group_id = h.g, visibility = h.v
+          FROM unnest(v_hold_ids, v_hold_own, v_hold_vis) AS h(id, g, v)
+         WHERE f.id = h.id
+           AND (f.owner_group_id, f.visibility::text) IS DISTINCT FROM (h.g, h.v);
+        v_frags_held := cardinality(v_hold_ids);
+    END IF;
+
     -- 215 section 2: a source whose fragments now agree takes their pair.
     WITH touched AS (
         SELECT DISTINCT f.source_id
@@ -534,6 +638,7 @@ BEGIN
             jsonb_build_object('claim_ids', to_jsonb(v_cls_ids), 'from_group_id', v_home,
                                'to_group_id', p_group_id, 'reason', p_reason,
                                'evidence_edges_rewritten', v_ev_edges,
+                               'harvester_fragments_held', v_frags_held,
                                'harvester_sources_moved', v_sources_moved,
                                'harvester_sources_held', v_sources_held,
                                'scoped_beliefs_cleared', v_scoped,

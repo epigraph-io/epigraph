@@ -3403,18 +3403,23 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
-- **242**: `share_publicize_operated_agent_and_fragment_hold` (backlog ecd842bf;
-  share-with-team spec ruling R1). Re-states 215's `epigraph_publicize_claims` and
-  `epigraph_share_claims_with_team` (an md5 precondition refuses to apply over any other body,
-  55000). An operated agent, one whose `epigraph_human_of(principal, false)` is another agent
-  (an operator link of any state, or a client allowance), is refused by both acts with the new
-  outcome `refused_operated_agent` (403 / INVALID_REQUEST), whatever memberships it holds
-  itself; before, an operated agent that was itself a writer of the target team (share) or an
-  admin of the owning team (publicize) acted on its own authority. Share's target test names
-  `via = 'own'` only. Not R1's whole human gate: an agent that belongs to no human is still
-  judged by its own memberships. Audit rows carry `migration` 242. Pinned by
+- **242**: `share_publicize_operated_agent_and_fragment_hold` (backlog ecd842bf, fc33ef1a;
+  share-with-team spec ruling R1 and section 4.6). Re-states 215's
+  `epigraph_publicize_claims` and `epigraph_share_claims_with_team` (an md5 precondition
+  refuses to apply over any other body, 55000). (1) An operated agent, one whose
+  `epigraph_human_of(principal, false)` is another agent (an operator link of any state, or a
+  client allowance), is refused by both acts with the new outcome `refused_operated_agent`
+  (403 / INVALID_REQUEST), whatever memberships it holds itself; before, an operated agent that
+  was itself a writer of the target team (share) or an admin of the owning team (publicize)
+  acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole
+  human gate: an agent that belongs to no human is still judged by its own memberships.
+  (2) A harvester fragment that a moved claim cites and a claim outside the call also cites is
+  held on its pair (its audit reports with it, 173), counted in the audit row as
+  `harvester_fragments_held`; 215's source rule then runs on the post-hold fragments. 218's
+  arm (d) is unchanged. Audit rows carry `migration` 242. Pinned by
   `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs` (the operated agent with its own
-  writer / admin membership, a retired link, the human's control call) and
+  writer / admin membership, a retired link, the human's control call; the share and the
+  publicize hold, publicize with a PUBLIC other citer) and
   `epigraph-db/tests/share_publicize_operated_fragment_undo.rs` (the undo, run twice; the md5
   precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
   was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a

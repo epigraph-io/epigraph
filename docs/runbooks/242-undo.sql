@@ -1,19 +1,22 @@
 -- ===================================================================
 -- 242-undo.sql: take migration 242 (share and publicize refuse an operated
--- agent) back out, in ONE transaction, on the migration (superuser) DSN.
+-- agent and hold a fragment a claim staying put also cites) back out, in ONE
+-- transaction, on the migration (superuser) DSN.
 --
 -- READ FIRST: no binary needs rolling back. A 242 binary calls the same two
 -- functions with the same signatures; it only knows one more refusal text
 -- (`refused_operated_agent`), which 215's bodies never return. This undo
 -- RE-OPENS backlog ecd842bf (an operated agent that writes the target team, or
--- admins the owning team, shares or publicizes on its own authority).
+-- admins the owning team, shares or publicizes on its own authority) and
+-- fc33ef1a (a fragment a non-moving claim cites moves with the moved claim).
 --
 -- WHAT IT DOES: re-states 215's `epigraph_publicize_claims(uuid[], text)` and
 -- `epigraph_share_claims_with_team(uuid[], uuid, text)` bodies byte for byte;
 -- `CREATE OR REPLACE` keeps their owner and grants, re-asserted below.
 --
--- WHAT IT LEAVES: every row as 242 left it (a refused call changed nothing),
--- the `security_events` rows 242 wrote (`migration` 242), and 242's
+-- WHAT IT LEAVES: every row as 242 left it (a held fragment stays where it
+-- was held; a refused call changed nothing), the `security_events` rows 242
+-- wrote (`migration` 242, with `harvester_fragments_held`), and 242's
 -- `_sqlx_migrations` row. Re-introducing the fix is a NEW migration, never a
 -- re-run of 242.
 -- Idempotent: a second run changes nothing.

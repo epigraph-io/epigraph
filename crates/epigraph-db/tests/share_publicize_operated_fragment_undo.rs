@@ -1,5 +1,6 @@
 //! `docs/runbooks/242-undo.sql`, the rollback of migration 242 (share and
-//! publicize refuse an operated agent), and 242's md5 precondition.
+//! publicize refuse an operated agent, and hold a harvester fragment a claim
+//! that stays put also cites), and 242's md5 precondition.
 //!
 //! [`the_242_undo_returns_the_catalog_below_242`]: on a database migrated
 //! through 242, the undo leaves the `public` catalog (relations, functions
