@@ -2403,8 +2403,9 @@ fn wire<T: serde::Serialize>(response: &T) -> serde_json::Value {
 /// * a boundary edge from the selected claim, owned by another group;
 /// * the claim at that edge's far end, and its content;
 /// * that group, and its author;
-/// * that group's evidence row held ON the selected claim (ruling R-78: the
-///   seal neither serves nor encrypts it), and its body.
+/// * that group's evidence row held ON the selected claim (evidence can bear
+///   on several claims, so the seal neither serves nor encrypts another
+///   group's row), and its body.
 ///
 /// The selected claim itself is deliberately one the reader can read (the
 /// author's public claim, moved into the target group by the apply): whether
@@ -2416,9 +2417,16 @@ fn wire<T: serde::Serialize>(response: &T) -> serde_json::Value {
 /// an empty body cannot pass.
 ///
 /// Like the test cited above it runs on `split_state`, whose scoped arm is
-/// the harness superuser: migration 129's audit policy is NOT under test here
-/// (`crates/epigraph-db/tests/privatization_plan_policies.rs` measures the
-/// policies); the handlers' own assembly is.
+/// the harness superuser, so the row security of the handlers' reads is not
+/// in play there and the handlers' own assembly is what is measured. The
+/// audit read is ALSO driven through a state whose scoped arm is downgraded
+/// to `epigraph_app`, unfiltered and keyed on an entity, so the audit policy
+/// applies to the handler's own read (the policy's two arms in isolation are
+/// `crates/epigraph-db/tests/privatization_authz.rs::privatization_audit_entity_rows_follow_the_callers_group_adminship`).
+/// The seal and unseal manifests are read by the author only: after the
+/// group-admin authority gate both read on the maintenance session, not under
+/// the reader's row security, so which admin reads them does not change the
+/// body.
 ///
 /// # Verified to fail (mutations, each restored)
 ///
@@ -2426,6 +2434,8 @@ fn wire<T: serde::Serialize>(response: &T) -> serde_json::Value {
 ///   manifest serves the held row and its body.
 /// - Audit: `load_audit_conn`'s plan filter dropped -> the fixture audit row
 ///   of ANOTHER group's plan, naming the far-end claim, is served.
+/// - Audit: `get_audit` reading on the maintenance session instead of
+///   `read_as` -> the application-role reads serve that fixture row.
 /// - Unseal manifest: `unseal_manifest_page_conn`'s plan filter dropped -> the
 ///   far-end claim's fixture ciphertext row (an item of that other plan) is
 ///   served.
@@ -2722,5 +2732,70 @@ async fn every_lifecycle_response_field_names_only_what_the_reader_can_read(pool
             "CALIBRATION: {who}'s audit names the selected claim's rows: {audit:?}"
         );
         forbidden.assert_names_none(&format!("{who}: GET /audit"), &wire(&audit));
+    }
+
+    // ---- the audit read under the APPLICATION role ----
+    // `split_state`'s scoped arm is the harness superuser, so the loop above
+    // measures the handler's own filters and not the row security its read
+    // runs under. Here the scoped arm is downgraded to `epigraph_app` (the
+    // maintenance arm stays attached, or the lifecycle answers 501), so the
+    // audit policy applies to the handler's own read. Neither an UNFILTERED
+    // read nor one keyed on the far-end claim may name the other group's
+    // plan; the same reads keyed on nothing and on the selected claim still
+    // serve this plan's rows (the calibration).
+    let app_state = {
+        let url = viewer_fixture::database_url_for(&pool).await;
+        let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+            &url,
+            epigraph_db::SessionGucMode::Session,
+            "epigraph_app",
+        )
+        .await
+        .expect("an application-role scoped pool")
+        .with_maintenance_pool(pool.clone());
+        let raw = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+        let mut app_state =
+            epigraph_api::AppState::with_db(raw, epigraph_api::ApiConfig::default());
+        app_state.scoped = Some(scoped);
+        app_state
+    };
+    for (who, reader) in [("the author", world.actor), ("a co-admin", co_admin)] {
+        let mut reads = Vec::new();
+        for entity_id in [None, Some(subject), Some(far)] {
+            let Json(audit) = routes::get_audit(
+                viewer(reader).await,
+                State(app_state.clone()),
+                Some(Extension(fx::auth_for(reader))),
+                Query(routes::AuditQueryParams {
+                    plan_id: None,
+                    entity_id,
+                    since: None,
+                    limit: None,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{who}: the app-role audit read ({entity_id:?}) is served: {e:?}")
+            });
+            reads.push((entity_id, audit));
+        }
+        for (entity_id, audit) in &reads {
+            let surface = format!("{who}: GET /audit?entity_id={entity_id:?} (app role)");
+            if *entity_id == Some(far) {
+                assert!(
+                    audit.events.is_empty(),
+                    "{surface} serves no row: {audit:?}"
+                );
+            } else {
+                assert!(
+                    audit
+                        .events
+                        .iter()
+                        .any(|e| e.entity_id == Some(subject) && e.plan_id == plan),
+                    "CALIBRATION: {surface} names the selected claim's rows: {audit:?}"
+                );
+            }
+            forbidden.assert_names_none(&surface, &wire(audit));
+        }
     }
 }
