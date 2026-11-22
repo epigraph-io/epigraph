@@ -30,7 +30,7 @@
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
-use epigraph_db::Viewer;
+use epigraph_db::{MassFunctionRepository, Viewer};
 use epigraph_engine::atom_items::{
     atom_axiom_rows_under, atom_fold, AtomFoldMode, AxiomMode, AxiomRow, CompoundSourceEdges,
 };
@@ -312,5 +312,107 @@ async fn an_atom_whose_only_input_is_private_derived_is_vacated_or_left_without_
         cache(&pool, bare).await,
         (None, None, None),
         "an atom with no cache gets none from rows its readers cannot see"
+    );
+}
+
+// ── the same-human rule ─────────────────────────────────────────────────────
+
+async fn bare_agent(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key) VALUES (sha256(gen_random_uuid()::text::bytea)) \
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("agent")
+}
+
+/// Link `agent` to human operator `human` (migration 107's live link).
+async fn link(pool: &PgPool, agent: Uuid, human: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("link the agent to its human");
+    assert!(out.link_live, "{out:?}");
+}
+
+/// A reliability-1 simple support of `t` on TRUE by `agent`: no evidence and
+/// no perspective, so each row is its own item (`row:` key).
+async fn support(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, t: f64) {
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": t, "0,1": 1.0 - t}),
+        None,
+        None,
+        Some(1.0),
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store BBA");
+}
+
+/// The cached BetP after an AEF write of two supports (.6 by `a`, .7 by `b`)
+/// on a fresh public standalone claim.
+async fn two_support_betp(pool: &PgPool, author: Uuid, a: Uuid, b: Uuid) -> f64 {
+    let public = fixture::public_viewer(pool).await;
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary_truth");
+    let claim =
+        fixture::seed_public_claim(pool, author, &format!("atom same-human {}", Uuid::new_v4()))
+            .await;
+    support(pool, claim, frame, a, 0.6).await;
+    support(pool, claim, frame, b, 0.7).await;
+    let rows = aef_rows(pool, &public, claim).await;
+    assert_eq!(rows.len(), 2, "PREMISE: both supports are AEF input");
+    let out = write_as(pool, &public, claim).await;
+    let AtomCacheOutcome::Folded {
+        interval,
+        written: true,
+    } = out
+    else {
+        panic!("the AEF write folds and is written: {out:?}");
+    };
+    let cached = cache(pool, claim).await.0.expect("betp");
+    assert!(
+        (cached - interval.pignistic_prob()).abs() < TOL,
+        "the cache stores the fold"
+    );
+    // The same value the pure fold of the rows gives: compound derivations
+    // fold leaves through it, so they must agree with the cache.
+    assert!(
+        (atom_fold(&rows).expect("fold").pignistic_prob() - cached).abs() < TOL,
+        "atom_fold agrees with the atom cache"
+    );
+    cached
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_agents_of_one_human_do_not_aggregate_in_the_atom_cache(pool: PgPool) {
+    let (author, _) = fixture::seed_agent_with_group(&pool, "atom-same-human-author").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "atom-same-human").await;
+    let (a1, a2) = (bare_agent(&pool).await, bare_agent(&pool).await);
+    link(&pool, a1, human).await;
+    link(&pool, a2, human).await;
+
+    let siblings = two_support_betp(&pool, author, a1, a2).await;
+    assert!(
+        (siblings - 0.85).abs() < TOL,
+        "two agents of one human keep the stronger support (BetP .85), not Dempster's \
+         product (.94): got {siblings}"
+    );
+
+    // Control: agents of no human are their own owners, so they reinforce.
+    let (b1, b2) = (bare_agent(&pool).await, bare_agent(&pool).await);
+    let independent = two_support_betp(&pool, author, b1, b2).await;
+    assert!(
+        (independent - 0.94).abs() < TOL,
+        "agents of different owners reinforce by Dempster (BetP .94): got {independent}"
     );
 }

@@ -931,6 +931,8 @@ pub struct KeyedBba {
 pub struct KeyedItem {
     pub id: ItemId,
     pub atoms: Vec<(Uuid, MassFunction)>,
+    /// The row whose BBA the item carries on each atom, in `atoms` order.
+    pub kept_rows: Vec<Uuid>,
 }
 
 impl KeyedItem {
@@ -938,6 +940,17 @@ impl KeyedItem {
     #[must_use]
     pub fn on(&self, atom: Uuid) -> Option<&MassFunction> {
         self.atoms.iter().find(|(a, _)| *a == atom).map(|(_, m)| m)
+    }
+
+    /// [`Self::on`] with the row the BBA is: which row of the key and side
+    /// [`item_partition`] kept on `atom`.
+    #[must_use]
+    pub fn kept_on(&self, atom: Uuid) -> Option<(Uuid, &MassFunction)> {
+        self.atoms
+            .iter()
+            .zip(&self.kept_rows)
+            .find(|((a, _), _)| *a == atom)
+            .map(|((_, m), row)| (*row, m))
     }
 }
 
@@ -1015,6 +1028,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
             items.push(KeyedItem {
                 id,
                 atoms: Vec::new(),
+                kept_rows: Vec::new(),
             });
             kept.push(Vec::new());
             items.len() - 1
@@ -1023,6 +1037,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
         match item.atoms.iter().position(|(a, _)| *a == r.atom_id) {
             None => {
                 item.atoms.push((r.atom_id, r.bba));
+                item.kept_rows.push(r.row_id);
                 kept[i].push((w, r.row_id));
             }
             // A larger weight wins; on a tie, the smaller row id.
@@ -1032,6 +1047,7 @@ pub fn item_partition(rows: Vec<KeyedBba>) -> Vec<KeyedItem> {
                     .is_gt() =>
             {
                 item.atoms[j].1 = r.bba;
+                item.kept_rows[j] = r.row_id;
                 kept[i][j] = (w, r.row_id);
             }
             Some(_) => {}

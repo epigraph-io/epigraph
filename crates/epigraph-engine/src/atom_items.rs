@@ -29,8 +29,8 @@ use crate::edge_factor::{
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 use crate::source_dependence::{
-    dempster_across_items, item_key, item_partition, ItemEvidence, ItemKey, KeyedBba,
-    EDGE_FACTOR_METHOD,
+    combine_with_owner_dependence, item_key, item_partition, BbaSource, ItemEvidence, ItemKey,
+    KeyedBba, EDGE_FACTOR_METHOD,
 };
 
 /// Which rows of an atom's input a read takes (SPEC §3.4, §11.4).
@@ -117,6 +117,8 @@ pub enum AxiomClass {
 ///     class: todo!(),
 ///     coarse: todo!(),
 ///     bba: todo!(),
+///     agent_id: todo!(),
+///     owner_id: todo!(),
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -127,6 +129,8 @@ pub struct AxiomRow {
     class: AxiomClass,
     coarse: MassFunction,
     bba: MassFunction,
+    agent_id: Option<Uuid>,
+    owner_id: Option<Uuid>,
 }
 
 impl AxiomRow {
@@ -164,6 +168,20 @@ impl AxiomRow {
     #[must_use]
     pub const fn bba(&self) -> &MassFunction {
         &self.bba
+    }
+
+    /// The agent that wrote the row (`mass_functions.source_agent_id`).
+    #[must_use]
+    pub const fn agent_id(&self) -> Option<Uuid> {
+        self.agent_id
+    }
+
+    /// Who the row speaks for: the live human its agent acts for, else the
+    /// agent itself (`None` when the row names no agent). The same-human rule
+    /// of [`atom_fold`] groups items by it.
+    #[must_use]
+    pub const fn owner_id(&self) -> Option<Uuid> {
+        self.owner_id
     }
 }
 
@@ -704,6 +722,19 @@ async fn key_and_discount_two_sided(
         .await
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
+    // Who each row speaks for (the same-human rule of `atom_fold`): its
+    // agent's live human, read once for the batch, as
+    // `source_dependence::bba_sources_for_rows` reads it for the claim cache.
+    let agents: Vec<Uuid> = kept
+        .iter()
+        .filter_map(|(r, _, _)| r.row.source_agent_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let humans = epigraph_db::AgentRepository::humans_of(&mut *conn, &agents, true)
+        .await
+        .map_err(|e| format!("agent owners: {e}"))?;
+
     let mut out: Vec<(AxiomRow, MassFunction)> = Vec::with_capacity(kept.len());
     for (r, class, two_sided) in kept {
         let one_sided = matches!(
@@ -756,6 +787,11 @@ async fn key_and_discount_two_sided(
                 class,
                 coarse,
                 bba,
+                agent_id: r.row.source_agent_id,
+                owner_id: r
+                    .row
+                    .source_agent_id
+                    .map(|a| humans.get(&a).copied().unwrap_or(a)),
             },
             two_sided_bba,
         ));
@@ -930,6 +966,15 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
 /// open-world semantics (`~` meets anything else as conflict, which the fold
 /// normalises away and reports as the conflict it saw).
 ///
+/// **Same-human rule.** Each item carries one row's BBA (the row
+/// [`crate::source_dependence::item_partition`] kept), so it speaks for that
+/// row's agent and its owner ([`AxiomRow::owner_id`]). Items of two or more
+/// distinct agents of ONE owner never multiply: they are reduced by
+/// [`crate::source_dependence::combine_with_owner_dependence`] (per agent a
+/// Dempster fold, then Denoeux's cautious rule across the agents) before the
+/// Dempster fold, as the claim cache folds them. Without sibling agents the
+/// fold is the plain Dempster fold across items.
+///
 /// No rows is the vacuous interval, [`EvidencedInterval::is_unproven`].
 ///
 /// At total conflict between dogmatic items (K = 1) the fold does not fail:
@@ -976,10 +1021,30 @@ pub fn atom_fold_under(
             })
             .collect(),
     );
-    let for_fold: Vec<MassFunction> = items.iter().filter_map(|it| it.on(atom).cloned()).collect();
+    // Each item's BBA is ONE row's (the kept row of its key and side), so the
+    // item speaks for that row's agent and owner. The same-human rule then
+    // reduces the items of sibling agents of one owner cautiously, exactly as
+    // the claim cache's fold does; with no siblings it is the Dempster fold
+    // across items unchanged.
+    let by_row: HashMap<Uuid, &AxiomRow> = rows.iter().map(|r| (r.row_id, r)).collect();
+    let for_fold: Vec<(BbaSource, MassFunction)> = items
+        .iter()
+        .filter_map(|it| {
+            let (kept, m) = it.kept_on(atom)?;
+            let row = by_row.get(&kept);
+            Some((
+                BbaSource {
+                    agent_id: row.and_then(|r| r.agent_id),
+                    owner_id: row.and_then(|r| r.owner_id),
+                    source: None,
+                },
+                m.clone(),
+            ))
+        })
+        .collect();
     let n = for_fold.len();
     let (combined, conflict) =
-        dempster_across_items(for_fold, profile.combination.conflict_threshold)
+        combine_with_owner_dependence(for_fold, profile.combination.conflict_threshold)
             .map_err(|e| format!("atom_fold: {e}"))?;
     let t = FocalElement::positive(BTreeSet::from([0]));
     Ok(EvidencedInterval {
@@ -1044,6 +1109,8 @@ mod tests {
                 class,
                 coarse: bba(one_sided),
                 bba: bba(one_sided),
+                agent_id: None,
+                owner_id: None,
             },
             two_sided_bba: bba(two_sided),
             legacy_key: None,
