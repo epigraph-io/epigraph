@@ -179,6 +179,11 @@ pub const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 /// setting lands on whichever server connection the pooler handed out and is
 /// not reliable. A handler that sets its own timeout (`SET LOCAL`, or a
 /// session `SET` it restores) overrides it for that statement.
+///
+/// The "request pool" is the process's only pool, so the timeout bounds every
+/// statement on it, not only request handlers: the webhook dispatcher, the
+/// tenancy gauge and canary sampler and the boot checks share it. Time a
+/// statement spends waiting on a lock counts against it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestPoolSettings {
     /// The most connections the request pool holds open.
