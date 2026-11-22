@@ -19,7 +19,10 @@
 //!   an empty set or a NULL element is refused 22023;
 //! * the definer's catalog shape: SECURITY DEFINER, owned by
 //!   `epigraph_maintenance`, STABLE, path `pg_catalog, pg_temp`, no PUBLIC
-//!   EXECUTE, EXECUTE for the application role.
+//!   EXECUTE, EXECUTE for the application role;
+//! * the check-then-insert serialization: two sessions checking the two
+//!   directions of one 2-cycle. The second blocks on the advisory lock until
+//!   the first commits its edge, then its walk sees that edge.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -27,6 +30,7 @@ mod fixture;
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{EdgeRepository, ScopedPool, SessionGucMode};
 use sqlx::PgPool;
+use std::time::Duration;
 use uuid::Uuid;
 
 /// The definer's signature.
@@ -300,4 +304,85 @@ async fn the_definer_is_maintenance_owned_pinned_and_executable_by_the_app_role(
                 .expect("has_function_privilege");
         assert_eq!(can, expected, "EXECUTE on {DEFINER} for {role}");
     }
+}
+
+/// Whether backend `pid` is waiting on an advisory lock it has not been
+/// granted.
+async fn waits_on_advisory_lock(pool: &PgPool, pid: i32) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks \
+                         WHERE locktype = 'advisory' AND NOT granted AND pid = $1)",
+    )
+    .bind(pid)
+    .fetch_one(pool)
+    .await
+    .expect("read pg_locks")
+}
+
+/// The race the advisory lock closes. Writer 1 is about to add `a -> b` and
+/// writer 2 `b -> a` (both `depends_on`); each first asks whether its target
+/// reaches its source. Writer 1 checks (no path) and holds the lock. Writer 2's
+/// check must WAIT (barrier: `pg_locks` shows its backend waiting on an
+/// ungranted advisory lock), and once writer 1 commits `a -> b`, writer 2's
+/// walk runs on a fresh snapshot and sees it: the 2-cycle is refused. Without
+/// the lock writer 2 answers at once, from a snapshot without `a -> b`, and
+/// both edges would be written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_check_waits_for_the_first_writer_and_sees_its_edge(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "7149132e-race").await;
+    let a = node(&pool, agent, group, "public", "race a").await;
+    let b = node(&pool, agent, group, "public", "race b").await;
+    const WALK: &[&str] = &["depends_on"];
+
+    let mut writer1 = pool.begin().await.expect("writer 1");
+    assert!(
+        !EdgeRepository::reaches_in_force_conn(&mut writer1, b, a, WALK)
+            .await
+            .expect("writer 1 checks"),
+        "no path yet: writer 1 may add a -> b"
+    );
+
+    let mut writer2 = pool.begin().await.expect("writer 2");
+    let pid2: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *writer2)
+        .await
+        .expect("writer 2 pid");
+    let second = tokio::spawn(async move {
+        let reached = EdgeRepository::reaches_in_force_conn(&mut writer2, a, b, WALK)
+            .await
+            .expect("writer 2 checks");
+        writer2.rollback().await.expect("rollback writer 2");
+        reached
+    });
+
+    // Barrier: writer 2 is blocked on the lock writer 1 holds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if waits_on_advisory_lock(&pool, pid2).await {
+            break;
+        }
+        assert!(
+            !second.is_finished(),
+            "writer 2 finished its check without waiting for writer 1's lock: the \
+             check-then-insert is not serialized"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "writer 2 never waited on an advisory lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!second.is_finished(), "writer 2 is still blocked");
+
+    edge(&mut *writer1, a, b, "depends_on").await;
+    writer1.commit().await.expect("writer 1 commits a -> b");
+
+    let reached = tokio::time::timeout(Duration::from_secs(15), second)
+        .await
+        .expect("writer 2 resumes once writer 1 commits")
+        .expect("writer 2 task");
+    assert!(
+        reached,
+        "writer 2's walk runs after writer 1's commit and sees a -> b, so b -> a is refused"
+    );
 }
