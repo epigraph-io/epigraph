@@ -254,7 +254,7 @@ at the 12 rows pinned by `tenancy_coverage.rs::REGISTRY`.
 | `agents`, `jobs`, `claim_encryption`, `claim_version_encryption` | identity, queue, sealed keys | not content |
 | `experiments` | `protocol` discloses the design for a private hypothesis | **does not follow** a shared hypothesis claim; under-sharing, not a leak |
 | `counterfactual_scenarios`, `learning_events`, `match_candidates` | free text about two claims | do not follow. `match_candidates` is a near-duplicate oracle and stays exempt. |
-| `behavioral_executions` | a private step's `goal_text` and `goal_embedding` | a workflow share moves nothing here (section 3.2) |
+| `behavioral_executions` | a private step's `goal_text` and `goal_embedding` | a workflow share moves nothing here (section 3.2). Since migration 240 (after this measurement) a run carries its workflow's tenancy and follows it; a run of another plan naming a moved step does not |
 | `alternative_set`, `alt_set_decisions` (views) | closed by 077 (`security_invoker = true`) | follow `edges` and `claims` |
 
 ### 2.5 Untenanted dependencies
