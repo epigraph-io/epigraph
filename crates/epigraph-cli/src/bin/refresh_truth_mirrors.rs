@@ -27,7 +27,11 @@
 //! `--restore <record file>` puts each recorded `truth_before` back, last
 //! record first, only where `truth_value` still holds exactly what the
 //! refresh wrote; anything else is reported `superseded_since_refresh` and
-//! left alone. With `--dry-run` it runs the same statements and rolls back.
+//! left alone. The undo is faithful: a claim superseded or retired after the
+//! refresh, whose `truth_value` still holds what the refresh wrote, is
+//! restored too (as `restore_belief_cache` restores its cache), and is
+//! counted apart as `restored_not_current`, so `restored` counts live claims
+//! only. With `--dry-run` it runs the same statements and rolls back.
 //!
 //! Rollback order is last-in, first-out: restore this tool's record BEFORE
 //! `restore_belief_cache` restores the caches its waves wrote. Restoring the

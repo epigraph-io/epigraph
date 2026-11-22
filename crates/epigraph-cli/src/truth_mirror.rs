@@ -58,7 +58,10 @@
 //! [`dry_run`] evaluates the same rules in ONE `REPEATABLE READ, READ ONLY`
 //! transaction and writes nothing. [`restore`] is the reverse compare-and-set
 //! over a record file: `truth_before` goes back only where `truth_value` still
-//! holds exactly `truth_written`.
+//! holds exactly `truth_written`, current or not (a faithful undo, the
+//! counterpart of `restore_belief_cache`, which restores a retired row's cache
+//! too); a row restored while not current is reported apart
+//! (`restored_not_current`), so the counts say which restored rows are live.
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statement on
@@ -711,7 +714,12 @@ where
 /// Per-claim outcome of a [`restore`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TruthRestoreReport {
+    /// Restored, and current.
     pub restored: Vec<Uuid>,
+    /// Restored, but no longer current (superseded or retired after the
+    /// refresh): the undo is faithful, as `restore_belief_cache` restores
+    /// such a row's cache, but the row is not served.
+    pub restored_not_current: Vec<Uuid>,
     /// Already holds `truth_before` (a second restore, or a refresh whose
     /// commit never landed).
     pub already_restored: Vec<Uuid>,
@@ -723,9 +731,10 @@ pub struct TruthRestoreReport {
 impl TruthRestoreReport {
     /// Every outcome bucket with its name, in report order.
     #[must_use]
-    pub fn buckets(&self) -> [(&'static str, &Vec<Uuid>); 4] {
+    pub fn buckets(&self) -> [(&'static str, &Vec<Uuid>); 5] {
         [
             ("restored", &self.restored),
+            ("restored_not_current", &self.restored_not_current),
             ("already_restored", &self.already_restored),
             ("superseded_since_refresh", &self.superseded_since_refresh),
             ("missing", &self.missing),
@@ -735,8 +744,10 @@ impl TruthRestoreReport {
 
 /// Undo a refresh: per record, last record first (so chained refreshes of
 /// one claim unwind in reverse), set `truth_before` back only where
-/// `truth_value` still holds exactly `truth_written`. One transaction per
-/// `batch_size` records; `dry_run` rolls each back.
+/// `truth_value` still holds exactly `truth_written`, whether or not the
+/// claim is still current (a non-current one is reported
+/// `restored_not_current`). One transaction per `batch_size` records;
+/// `dry_run` rolls each back.
 ///
 /// # Errors
 /// Any database error; batches already committed stay committed.
@@ -751,18 +762,26 @@ pub async fn restore(
     for chunk in reversed.chunks(batch_size.max(1)) {
         let mut tx = pool.begin().await?;
         for r in chunk {
-            let hit: Option<Uuid> = sqlx::query_scalar(
+            // `is_current` as the write left it; NULL reads as not current.
+            let hit: Option<Option<bool>> = sqlx::query_scalar(
                 "UPDATE claims SET truth_value = $2 \
-                  WHERE id = $1 AND truth_value = $3 RETURNING id",
+                  WHERE id = $1 AND truth_value = $3 RETURNING is_current",
             )
             .bind(r.claim_id)
             .bind(r.truth_before)
             .bind(r.truth_written)
             .fetch_optional(&mut *tx)
             .await?;
-            if hit.is_some() {
-                report.restored.push(r.claim_id);
-                continue;
+            match hit {
+                Some(Some(true)) => {
+                    report.restored.push(r.claim_id);
+                    continue;
+                }
+                Some(_) => {
+                    report.restored_not_current.push(r.claim_id);
+                    continue;
+                }
+                None => {}
             }
             let now: Option<f64> =
                 sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")

@@ -1284,3 +1284,75 @@ async fn the_dry_run_transaction_is_read_only_and_repeatable_read(pool: PgPool) 
     tx.rollback().await.unwrap();
     assert_untouched(&pool, a, t, v, "read-only tx").await;
 }
+
+// ── (17) a claim superseded after the refresh, then restored ───────────────
+
+/// `actor` supersedes `old` through the real act (the privileged test pool);
+/// the predecessor's `truth_value` is not touched by it.
+async fn supersede(pool: &PgPool, old: Uuid, actor: Uuid) {
+    let t = truth_of(pool, old).await;
+    ClaimRepository::supersede(
+        pool,
+        ClaimId::from_uuid(old),
+        &format!("a restatement of {old}"),
+        TruthValue::clamped(0.6),
+        "refresh truth mirrors test",
+        epigraph_db::SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await
+    .expect("supersede");
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(old)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(!current, "precondition: the predecessor is retired");
+    assert_eq!(
+        truth_of(pool, old).await.to_bits(),
+        t.to_bits(),
+        "precondition: the supersede left the predecessor's truth_value"
+    );
+}
+
+/// Backlog 7e8a0ee2: the restore is a faithful undo (it also restores a claim
+/// superseded after the refresh, whose truth_value still holds what the
+/// refresh wrote, as `restore_belief_cache` restores its cache), and it says
+/// so: that claim is `restored_not_current`, never counted `restored`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_superseded_after_the_refresh_is_restored_and_reported_not_current(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let live = mirror_claim(&pool, author, 0.731_37).await;
+    let retired = mirror_claim(&pool, author, 0.682_91).await;
+    let t_live = truth_of(&pool, live).await;
+    let t_retired = truth_of(&pool, retired).await;
+    let records = wave(&pool, &[live, retired], "L1").await;
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+    assert_eq!(report.ids(Bucket::Refresh), vec![live, retired]);
+
+    supersede(&pool, retired, author).await;
+
+    let dry = restore(&pool, &written, 1, true).await.unwrap();
+    assert_eq!(dry.restored, vec![live], "dry run");
+    assert_eq!(dry.restored_not_current, vec![retired], "dry run");
+
+    let out = restore(&pool, &written, 1, false).await.unwrap();
+    assert_eq!(
+        out.restored,
+        vec![live],
+        "only the live claim counts restored"
+    );
+    assert_eq!(out.restored_not_current, vec![retired]);
+    assert!(out.superseded_since_refresh.is_empty() && out.missing.is_empty());
+    assert_eq!(truth_of(&pool, live).await.to_bits(), t_live.to_bits());
+    assert_eq!(
+        truth_of(&pool, retired).await.to_bits(),
+        t_retired.to_bits(),
+        "the faithful undo restores the retired row too"
+    );
+    let names: Vec<&str> = out.buckets().iter().map(|(n, _)| *n).collect();
+    assert!(names.contains(&"restored_not_current"), "{names:?}");
+
+    let again = restore(&pool, &written, 1, false).await.unwrap();
+    assert_eq!(again.already_restored, vec![retired, live]);
+}
