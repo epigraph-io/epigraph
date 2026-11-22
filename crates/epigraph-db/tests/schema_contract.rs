@@ -3680,7 +3680,8 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// keeps every fragment below (and adds its own to this list). 235 re-states
 /// `epigraph_live_memberships` (the personal-group lapse) and 164's
 /// `epigraph_team_group_add_member` (the personal-group arm); their fragments
-/// are pinned here too.
+/// are pinned here too. 256 re-states the writer scope (the derived arm
+/// admits only under READ COMMITTED); its fragment is pinned too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3693,6 +3694,8 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 // statement's clock.
                 "public.epigraph_role_derived_memberships(p_agent, clock_timestamp())",
                 "d.role = 'writer'",
+                // 256: the derived arm admits only under READ COMMITTED.
+                "v_derived AND current_setting('transaction_isolation') = 'read committed'",
             ][..],
         ),
         (
