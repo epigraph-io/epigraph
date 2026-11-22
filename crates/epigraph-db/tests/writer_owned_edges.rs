@@ -1333,6 +1333,9 @@ async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
 ///   * `mcp`: the MCP server's agent, recognised because it signed a claim
 ///     another agent authored (D1: the caller authors, the server signs).
 ///
+/// Both identifying rows are the caller's PRIVATE rows, as an agent's writes
+/// are by default: the lookup reads every row, not the public ones only.
+///
 /// The control, `genuine`, signs its own claim and its own stamped edge, and
 /// its legacy edge IS re-owned, so the exclusions are not vacuous. A run with
 /// an EMPTY list and one with a PARTIAL list each leave the three server
@@ -1352,6 +1355,9 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
         .expect("name the API signer");
     let a = fixture::seed_public_claim(&pool, author, "public A").await;
     let b = fixture::seed_public_claim(&pool, author, "public B").await;
+    // The caller's history is PRIVATE (an agent's default), so the lookup
+    // must read group-owned rows, not only public ones.
+    let callers_private = fixture::seed_group_claim(&pool, caller, caller_g, "caller's own").await;
     assert_app_role_does_not_bypass(&pool).await;
 
     // History that identifies (or, for `genuine`, clears) each signer.
@@ -1359,9 +1365,9 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
     let (callers_edge, genuines_edge) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, caller).await;
-            let c = insert_edge(&mut conn, (a, "claim"), (b, "claim"))
+            let c = insert_edge(&mut conn, (a, "claim"), (callers_private, "claim"))
                 .await
-                .expect("the HTTP caller links two public claims");
+                .expect("the HTTP caller links a public claim to its own private one");
             stamp(&mut conn, &p, genuine).await;
             let g = insert_edge(&mut conn, (b, "claim"), (a, "claim"))
                 .await
@@ -1371,14 +1377,15 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
         })
         .await;
     assert_eq!(
-        tuple(&pool, callers_edge).await.3,
-        Some(caller_g),
-        "the caller's edge records the caller as its writer"
+        tuple(&pool, callers_edge).await,
+        t(caller_g, "group", None, Some(caller_g)),
+        "the caller's private edge records the caller as its writer"
     );
     assert_eq!(tuple(&pool, genuines_edge).await.3, Some(genuine_g));
     sign_as(&pool, callers_edge, api_unnamed).await;
     sign_as(&pool, genuines_edge, genuine).await;
-    let callers_claim = fixture::seed_public_claim(&pool, caller, "the caller's claim").await;
+    let callers_claim =
+        fixture::seed_group_claim(&pool, caller, caller_g, "the caller's claim").await;
     let genuines_claim = fixture::seed_public_claim(&pool, genuine, "the genuine claim").await;
     for (claim, signer) in [(callers_claim, mcp), (genuines_claim, genuine)] {
         sqlx::query(
