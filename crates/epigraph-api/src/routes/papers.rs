@@ -278,7 +278,9 @@ pub struct PaginatedPaperResponse {
 /// (`epigraph_db::repos::paper::canonical_document_key`), or returns the
 /// existing one found under any spelling of that key, filling title/journal
 /// only where the stored value is NULL (an existing value is never
-/// overwritten; backlog 62ce37ca).
+/// overwritten; backlog 62ce37ca). An empty DOI, or a placeholder such as
+/// `"unknown"` ([`epigraph_core::domain::evidence::is_placeholder_id`]), is
+/// refused with 400 and writes nothing.
 #[cfg(feature = "db")]
 pub async fn create_paper(
     State(state): State<AppState>,
@@ -297,6 +299,21 @@ pub async fn create_paper(
         return Err(ApiError::ValidationError {
             field: "doi".to_string(),
             reason: "DOI cannot be empty".to_string(),
+        });
+    }
+    // A placeholder ("unknown", "n/a", ...) means "this document has no DOI";
+    // it is not an identity. Keyed on it, every caller posting one got the
+    // same row and unrelated documents collapsed onto one paper node
+    // (backlog 8ef80a04). Same test, and same first sentence, as the MCP
+    // ingestion tools' refusal.
+    if epigraph_core::domain::evidence::is_placeholder_id(&request.doi) {
+        return Err(ApiError::ValidationError {
+            field: "doi".to_string(),
+            reason: format!(
+                "{:?} is a placeholder, not a document identity. A document with no DOI \
+                 needs a stable key of its own (for example a `urn:epigraph:doc:*` key).",
+                request.doi
+            ),
         });
     }
 

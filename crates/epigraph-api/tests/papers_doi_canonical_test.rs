@@ -434,3 +434,60 @@ async fn a_scheme_less_resolver_spelling_is_the_bare_doi() {
     assert_eq!(body["total"], 1, "{body}");
     assert_eq!(body["items"][0]["id"], legacy_id.to_string(), "{body}");
 }
+
+/// `papers` rows whose key, trimmed and lower-cased, is `folded`.
+async fn rows_keyed_on_folded(pool: &PgPool, folded: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE lower(btrim(doi)) = $1")
+        .bind(folded)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Backlog 8ef80a04: a placeholder in the DOI slot ("unknown", "n/a", ...)
+/// means "this document has no DOI", not an identity. Keyed on it, every
+/// REST caller posting `doi: "unknown"` got the same paper row, collapsing
+/// unrelated documents onto one paper node. The MCP ingest path already
+/// refuses these (`is_placeholder_id`); the REST writer must too: 400, and no
+/// row written. Spellings are literal here, not read from the shared list, so
+/// emptying that list cannot pass this test vacuously.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placeholder_doi_is_refused_and_writes_nothing() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    for spelling in [
+        "unknown", "n/a", "na", "none", "null", "nil", "-", "tbd",
+        // Case and surrounding whitespace do not make a placeholder an id.
+        "UNKNOWN", "  N/A ", "Tbd", "None",
+    ] {
+        let key = spelling.trim().to_ascii_lowercase();
+        let before = rows_keyed_on_folded(&pool, &key).await;
+        let (status, body) = post_paper(addr, &token, spelling).await;
+        assert_eq!(
+            status, 400,
+            "POST doi={spelling:?} must be refused as a placeholder: {body}"
+        );
+        assert_eq!(body["details"]["field"], "doi", "{spelling:?}: {body}");
+        assert!(
+            body["details"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("placeholder")),
+            "{spelling:?}: the refusal names the reason: {body}"
+        );
+        assert_eq!(
+            rows_keyed_on_folded(&pool, &key).await,
+            before,
+            "{spelling:?}: no paper row written"
+        );
+    }
+
+    // Near miss: a real DOI whose suffix happens to contain a placeholder
+    // word is an identity, and is stored.
+    let real = format!("10.5555/unknown.{}", Uuid::new_v4());
+    let (status, body) = post_paper(addr, &token, &real).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["doi"], real.as_str(), "{body}");
+}
