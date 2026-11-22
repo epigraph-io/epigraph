@@ -68,6 +68,10 @@
 //! too); a row restored while not current is reported apart
 //! (`restored_not_current`), so the counts say which restored rows are live.
 //!
+//! [`apply_into`] and [`restore_into`] fill a report the caller owns, so a run
+//! that stops on an error still has the outcomes of every batch it committed
+//! (the binary writes them as a partial report).
+//!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statement on
 //! the maintenance connection, with no request path and no viewer to serve.
@@ -724,21 +728,43 @@ pub async fn dry_run(
 ///
 /// # Errors
 /// Any database error, or `on_record`'s; batches already committed stay
-/// committed and their records were already handed out.
+/// committed and their records were already handed out. [`apply_into`] keeps
+/// their outcomes.
 pub async fn apply<F>(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     candidates: &[Candidate],
     opts: &RefreshOptions,
-    mut on_record: F,
+    on_record: F,
 ) -> anyhow::Result<MirrorReport>
+where
+    F: FnMut(&TruthRecord) -> anyhow::Result<()>,
+{
+    let mut report = MirrorReport::default();
+    apply_into(pool, viewer, candidates, opts, &mut report, on_record).await?;
+    Ok(report)
+}
+
+/// [`apply`], appending each batch's outcomes to `report` as the batch
+/// commits. On an error `report` holds exactly the outcomes of the batches
+/// that committed (the failed batch rolled back and adds none).
+///
+/// # Errors
+/// As [`apply`].
+pub async fn apply_into<F>(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    candidates: &[Candidate],
+    opts: &RefreshOptions,
+    report: &mut MirrorReport,
+    mut on_record: F,
+) -> anyhow::Result<()>
 where
     F: FnMut(&TruthRecord) -> anyhow::Result<()>,
 {
     // The run's stamp, from the database clock, in its own statement, before
     // the first write.
     let at: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(pool).await?;
-    let mut report = MirrorReport::default();
     for chunk in candidates.chunks(opts.batch_size.max(1)) {
         let ids: Vec<Uuid> = chunk.iter().map(|c| c.claim_id).collect();
         let mut tx = pool.begin().await?;
@@ -777,7 +803,7 @@ where
         tx.commit().await?;
         report.outcomes.extend(batch);
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Per-claim outcome of a [`restore`].
@@ -819,7 +845,8 @@ impl TruthRestoreReport {
 /// `dry_run` rolls each back.
 ///
 /// # Errors
-/// Any database error; batches already committed stay committed.
+/// Any database error; batches already committed stay committed, and
+/// [`restore_into`] keeps their outcomes.
 pub async fn restore(
     pool: &PgPool,
     records: &[TruthRecord],
@@ -827,8 +854,26 @@ pub async fn restore(
     dry_run: bool,
 ) -> anyhow::Result<TruthRestoreReport> {
     let mut report = TruthRestoreReport::default();
+    restore_into(pool, records, batch_size, dry_run, &mut report).await?;
+    Ok(report)
+}
+
+/// [`restore`], appending each batch's outcomes to `report` once the batch
+/// has committed (or, for `dry_run`, rolled back). On an error `report`
+/// holds exactly the outcomes of the batches that finished.
+///
+/// # Errors
+/// As [`restore`].
+pub async fn restore_into(
+    pool: &PgPool,
+    records: &[TruthRecord],
+    batch_size: usize,
+    dry_run: bool,
+    report: &mut TruthRestoreReport,
+) -> anyhow::Result<()> {
     let reversed: Vec<&TruthRecord> = records.iter().rev().collect();
     for chunk in reversed.chunks(batch_size.max(1)) {
+        let mut batch = TruthRestoreReport::default();
         let mut tx = pool.begin().await?;
         for r in chunk {
             // `is_current` as the write left it; NULL reads as not current.
@@ -843,11 +888,11 @@ pub async fn restore(
             .await?;
             match hit {
                 Some(Some(true)) => {
-                    report.restored.push(r.claim_id);
+                    batch.restored.push(r.claim_id);
                     continue;
                 }
                 Some(_) => {
-                    report.restored_not_current.push(r.claim_id);
+                    batch.restored_not_current.push(r.claim_id);
                     continue;
                 }
                 None => {}
@@ -858,9 +903,9 @@ pub async fn restore(
                     .fetch_optional(&mut *tx)
                     .await?;
             match now {
-                None => report.missing.push(r.claim_id),
-                Some(t) if t == r.truth_before => report.already_restored.push(r.claim_id),
-                Some(_) => report.superseded_since_refresh.push(r.claim_id),
+                None => batch.missing.push(r.claim_id),
+                Some(t) if t == r.truth_before => batch.already_restored.push(r.claim_id),
+                Some(_) => batch.superseded_since_refresh.push(r.claim_id),
             }
         }
         if dry_run {
@@ -868,8 +913,17 @@ pub async fn restore(
         } else {
             tx.commit().await?;
         }
+        report.restored.extend(batch.restored);
+        report
+            .restored_not_current
+            .extend(batch.restored_not_current);
+        report.already_restored.extend(batch.already_restored);
+        report
+            .superseded_since_refresh
+            .extend(batch.superseded_since_refresh);
+        report.missing.extend(batch.missing);
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]

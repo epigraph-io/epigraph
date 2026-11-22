@@ -1435,3 +1435,156 @@ async fn a_claim_superseded_after_the_refresh_is_restored_and_reported_not_curre
     let again = restore(&pool, &written, 1, false).await.unwrap();
     assert_eq!(again.already_restored, vec![retired, live]);
 }
+
+// ── (23) a run that stops still writes its (partial) report ────────────────
+
+/// A test-only trigger that refuses any `truth_value` write to `id` (an
+/// error at a known batch, deterministically).
+async fn refuse_truth_writes_to(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION refresh_test_refuse() RETURNS trigger \
+         LANGUAGE plpgsql AS $$ BEGIN \
+           RAISE EXCEPTION 'refresh test: refused write of %', OLD.id; END $$",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS refresh_test_refuse ON claims")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER refresh_test_refuse BEFORE UPDATE OF truth_value ON claims \
+         FOR EACH ROW WHEN (OLD.id = '{id}'::uuid) EXECUTE FUNCTION refresh_test_refuse()"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn report_json(path: &Path) -> serde_json::Value {
+    let text = std::fs::read_to_string(path).expect("the report file");
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("report {text:?}: {e}"))
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_that_stops_writes_a_partial_report_of_what_it_committed(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let b = mirror_claim(&pool, author, 0.682_91).await;
+    let (ta, tb) = (truth_of(&pool, a).await, truth_of(&pool, b).await);
+    let records = wave(&pool, &[a, b], "L1").await;
+    assert_eq!(
+        plan_candidates(&records)
+            .iter()
+            .map(|c| c.claim_id)
+            .collect::<Vec<_>>(),
+        vec![a, b],
+        "precondition: a runs in the first batch"
+    );
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+    let w = wave_file.to_str().unwrap();
+
+    // The refresh: batch 1 (a) commits, batch 2 (b) fails.
+    refuse_truth_writes_to(&pool, b).await;
+    let r1 = dir.join("R1.jsonl");
+    let rep1 = dir.join("apply-1.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--batch",
+            "1",
+            "--record",
+            r1.to_str().unwrap(),
+            "--report",
+            rep1.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the run must stop");
+    let j = report_json(&rep1);
+    assert_eq!(j["partial"], true);
+    assert!(
+        j["error"].as_str().unwrap().contains("refused write"),
+        "{}",
+        j["error"]
+    );
+    assert_eq!(j["buckets"]["refresh"]["ids"], serde_json::json!([a]));
+    assert_eq!(j["claims"], 1, "only the committed batch's outcomes");
+    let recs1 =
+        read_truth_records(std::io::BufReader::new(std::fs::File::open(&r1).unwrap())).unwrap();
+    assert_eq!(
+        recs1.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![a]
+    );
+    assert_ne!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
+    assert_eq!(truth_of(&pool, b).await.to_bits(), tb.to_bits());
+
+    // A complete run says so.
+    sqlx::query("DROP TRIGGER refresh_test_refuse ON claims")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let r2 = dir.join("R2.jsonl");
+    let rep2 = dir.join("apply-2.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            w,
+            "--apply",
+            "--batch",
+            "1",
+            "--record",
+            r2.to_str().unwrap(),
+            "--report",
+            rep2.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let j = report_json(&rep2);
+    assert_eq!(j["partial"], false);
+    assert!(j["error"].is_null());
+    assert_eq!(j["buckets"]["refresh"]["ids"], serde_json::json!([b]));
+
+    // The restore of both records (last first: b, then a), stopped at a.
+    let r3 = dir.join("R3.jsonl");
+    let mut both = std::fs::read(&r1).unwrap();
+    both.extend(std::fs::read(&r2).unwrap());
+    std::fs::write(&r3, both).unwrap();
+    refuse_truth_writes_to(&pool, a).await;
+    let rep3 = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            r3.to_str().unwrap(),
+            "--batch",
+            "1",
+            "--report",
+            rep3.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the restore must stop");
+    let j = report_json(&rep3);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["buckets"]["restored"]["ids"], serde_json::json!([b]));
+    assert_eq!(truth_of(&pool, b).await.to_bits(), tb.to_bits());
+    assert_ne!(truth_of(&pool, a).await.to_bits(), ta.to_bits());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -39,7 +39,10 @@
 //! served.
 //!
 //! Output files are never overwritten (they are created new, before the
-//! database is touched). A writing run (`--apply`, or `--restore` without
+//! database is touched). A run that stops on an error still writes its report,
+//! marked `"partial": true` with the error, holding the outcomes of every
+//! batch that committed (for an apply, exactly the writes in the record
+//! file). A writing run (`--apply`, or `--restore` without
 //! `--dry-run`) first checks that its belief modes match the API's
 //! (`belief_mode_check`), as every wave bin does. It runs on the maintenance
 //! connection.
@@ -53,8 +56,8 @@ use clap::Parser;
 use epigraph_cli::belief_cache::read_wave;
 use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent};
 use epigraph_cli::truth_mirror::{
-    apply, dry_run, plan_candidates, read_truth_records, restore, write_truth_record, Bucket,
-    MirrorReport, RefreshOptions, DEFAULT_BATCH,
+    apply_into, dry_run, plan_candidates, read_truth_records, restore_into, write_truth_record,
+    Bucket, MirrorReport, RefreshOptions, TruthRestoreReport, DEFAULT_BATCH,
 };
 
 #[derive(Parser, Debug)]
@@ -130,6 +133,14 @@ fn create_new(path: &Path) -> anyhow::Result<BufWriter<File>> {
     Ok(BufWriter::new(f))
 }
 
+/// Mark a report complete, or partial with the error that stopped the run.
+fn mark_outcome(v: &mut serde_json::Value, err: Option<&anyhow::Error>) {
+    v["partial"] = serde_json::Value::Bool(err.is_some());
+    v["error"] = err.map_or(serde_json::Value::Null, |e| {
+        serde_json::Value::String(format!("{e:#}"))
+    });
+}
+
 fn write_json(mut out: BufWriter<File>, v: &serde_json::Value) -> anyhow::Result<()> {
     serde_json::to_writer_pretty(&mut out, v)?;
     out.write_all(b"\n")?;
@@ -178,25 +189,43 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         include_round: cli.include_round,
     };
 
+    let mut report = MirrorReport::default();
     let result = if let Some(w) = record_w.as_mut() {
-        apply(maint.pool(), viewer, &candidates, &opts, |rec| {
-            write_truth_record(w, rec)?;
-            w.flush()?;
-            w.get_ref().sync_data()?;
-            Ok(())
-        })
+        apply_into(
+            maint.pool(),
+            viewer,
+            &candidates,
+            &opts,
+            &mut report,
+            |rec| {
+                write_truth_record(w, rec)?;
+                w.flush()?;
+                w.get_ref().sync_data()?;
+                Ok(())
+            },
+        )
         .await
     } else {
-        dry_run(maint.pool(), viewer, &candidates, &opts).await
+        match dry_run(maint.pool(), viewer, &candidates, &opts).await {
+            Ok(r) => {
+                report = r;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     };
-    let report: MirrorReport = result
-        .map_err(|e| e.context("refresh stopped; the record file lists every committed write"))?;
 
     let dry = !cli.apply;
-    write_json(
-        report_w,
-        &report.to_json(dry, cli.include_round, records.len()),
-    )?;
+    let mut json = report.to_json(dry, cli.include_round, records.len());
+    mark_outcome(&mut json, result.as_ref().err());
+    write_json(report_w, &json)?;
+    if let Err(e) = result {
+        return Err(e.context(format!(
+            "refresh stopped; the record file lists every committed write, and the partial \
+             report {} holds their outcomes",
+            report_path.display()
+        )));
+    }
     if dry {
         println!("DRY RUN: nothing written");
     }
@@ -240,7 +269,15 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
     let maint = epigraph_cli::MaintenancePool::connect(BIN)
         .await
         .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    let report = restore(maint.pool(), &records, cli.batch_size, cli.dry_run).await?;
+    let mut report = TruthRestoreReport::default();
+    let result = restore_into(
+        maint.pool(),
+        &records,
+        cli.batch_size,
+        cli.dry_run,
+        &mut report,
+    )
+    .await;
 
     let mut buckets = serde_json::Map::new();
     for (name, ids) in report.buckets() {
@@ -249,15 +286,20 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
             serde_json::json!({ "count": ids.len(), "ids": ids }),
         );
     }
-    write_json(
-        report_w,
-        &serde_json::json!({
-            "restore": true,
-            "dry_run": cli.dry_run,
-            "records": records.len(),
-            "buckets": buckets,
-        }),
-    )?;
+    let mut json = serde_json::json!({
+        "restore": true,
+        "dry_run": cli.dry_run,
+        "records": records.len(),
+        "buckets": buckets,
+    });
+    mark_outcome(&mut json, result.as_ref().err());
+    write_json(report_w, &json)?;
+    if let Err(e) = result {
+        return Err(e.context(format!(
+            "restore stopped; the partial report {} lists the batches that finished",
+            report_path.display()
+        )));
+    }
     if cli.dry_run {
         println!("DRY RUN: every batch rolled back");
     }
