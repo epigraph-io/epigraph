@@ -730,3 +730,136 @@ async fn a_rest_write_on_an_unlinked_claim_moves_beta_and_then_records_divergenc
             .expect("count divergence rows");
     assert_eq!(rows, 1, "the second write records one divergence row");
 }
+
+async fn divergence_count(w: &World) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM ds_bayesian_divergence WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count divergence rows")
+}
+
+/// Backlog 862d8404's change to the cold-start rule: a replacement whose
+/// withdrawal leaves the track holding only the new BBA has no other evidence
+/// to diverge from, so it is a cold start and records no divergence row, as a
+/// fresh claim's first write does.
+///
+/// At origin/main the replacement counted the new BBA on top of the replaced
+/// one, so the track was no longer at the prior and the replacement recorded
+/// a divergence row against evidence that was the caller's own, revised.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_that_leaves_only_the_new_bba_records_no_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-cold").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    let first = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.7, "0,1": 0.3}}),
+    )
+    .await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    let replaced = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.2, 1.8),
+        "the track holds only the new BBA",
+    );
+    assert_eq!(
+        divergence_count(&w).await,
+        0,
+        "a replacement leaving only its own BBA on the track is a cold start"
+    );
+}
+
+/// The converse: a replacement on a track that also holds OTHER evidence (an
+/// independent BBA under a perspective the caller owns) is not a cold start.
+/// It records a divergence row, and the track holds the other evidence plus
+/// the new BBA. (This holds at origin/main too, where every write after the
+/// first recorded a row; it pins that the withdrawal does not make every
+/// replacement cold. Mutation-proved: treating any write that withdraws as a
+/// cold start fails it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_beside_other_evidence_records_divergence(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "862d8404-warm").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    assign_hypothesis_zero(&w).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("862d8404-warm-p-{}", Uuid::new_v4()))
+    .bind(a)
+    .fetch_one(&w.pool)
+    .await
+    .expect("seed perspective");
+
+    let other = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "perspective_id": perspective,
+                           "masses": {"0": 0.6, "0,1": 0.4}}),
+    )
+    .await;
+    assert_eq!(other["write_outcome"], "inserted", "{other}");
+    let first = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.7, "0,1": 0.3}}),
+    )
+    .await;
+    assert_eq!(first["write_outcome"], "inserted", "{first}");
+    assert_eq!(
+        divergence_count(&w).await,
+        1,
+        "the second BBA records a row"
+    );
+
+    let replaced = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.2, "0,1": 0.8}}),
+    )
+    .await;
+    assert_eq!(replaced["write_outcome"], "replaced", "{replaced}");
+    assert_beta(
+        beta(&w.pool, w.claim).await,
+        (1.8, 2.2),
+        "the other evidence plus the new BBA",
+    );
+    assert_eq!(
+        divergence_count(&w).await,
+        2,
+        "a replacement beside other evidence records its divergence"
+    );
+}

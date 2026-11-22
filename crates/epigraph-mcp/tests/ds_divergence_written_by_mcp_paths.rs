@@ -701,3 +701,93 @@ async fn replacing_an_uncounted_seed_bba_withdraws_nothing(pool: PgPool) {
         "an uncounted seed's mass is not withdrawn",
     );
 }
+
+/// Backlog 862d8404's change to the cold-start rule, MCP transport: a
+/// replacement whose withdrawal leaves the track holding only the new BBA is a
+/// cold start and records no divergence row. At origin/main the replacement
+/// was counted on top of the replaced BBA, so it recorded one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_that_leaves_only_the_new_bba_records_no_divergence(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 cold replacement over MCP").await;
+
+    let first =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("first submission");
+    assert_eq!(first_text(&first)["write_outcome"], "inserted");
+    let mut other = sde(claim, frame);
+    other.masses = serde_json::json!({"0": 0.3, "~": 0.7});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, other, None)
+        .await
+        .expect("different masses");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.3, 1.7),
+        "the track holds only the new BBA",
+    );
+    assert!(
+        divergence_rows(&pool, claim).await.is_empty(),
+        "a replacement leaving only its own BBA on the track is a cold start"
+    );
+}
+
+/// The converse, MCP transport: a replacement on a track that also holds an
+/// independent BBA (under a perspective the caller owns) is not a cold start
+/// and records a divergence row. (Holds at origin/main too; mutation-proved:
+/// treating any write that withdraws as a cold start fails it.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_replacement_beside_other_evidence_records_divergence(pool: PgPool) {
+    let (server, group, viewer) = app_role_server(&pool).await;
+    let (frame, _) = binary_truth(&pool).await;
+    let claim = own_claim(&pool, group, "862d8404 warm replacement over MCP").await;
+    let agent = server.server_agent_id().await.expect("server agent");
+    let perspective: Uuid = sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id, confidence_calibration) \
+         VALUES ($1, $2, NULL) RETURNING id",
+    )
+    .bind(format!("862d8404-warm-mcp-{}", Uuid::new_v4()))
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("seed perspective");
+
+    let mut independent = sde(claim, frame);
+    independent.masses = serde_json::json!({"0": 0.6, "~": 0.4});
+    independent.perspective_id = Some(perspective.to_string());
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, independent, None)
+        .await
+        .expect("independent evidence");
+    assert_eq!(first_text(&res)["write_outcome"], "inserted");
+    let res =
+        epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, sde(claim, frame), None)
+            .await
+            .expect("the caller's own evidence");
+    assert_eq!(first_text(&res)["write_outcome"], "inserted");
+    assert_eq!(
+        divergence_rows(&pool, claim).await.len(),
+        1,
+        "the second BBA records a row"
+    );
+
+    let mut other = sde(claim, frame);
+    other.masses = serde_json::json!({"0": 0.3, "~": 0.7});
+    let res = epigraph_mcp::tools::ds::submit_ds_evidence(&server, &viewer, other, None)
+        .await
+        .expect("replacement");
+    let body = first_text(&res);
+    assert_eq!(body["write_outcome"], "replaced", "{body}");
+    assert_beta(
+        beta(&pool, claim).await,
+        (1.9, 2.1),
+        "the independent evidence plus the new BBA",
+    );
+    assert_eq!(
+        divergence_rows(&pool, claim).await.len(),
+        2,
+        "a replacement beside other evidence records its divergence"
+    );
+}
