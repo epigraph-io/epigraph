@@ -528,14 +528,21 @@ async fn deferrals(pool: &PgPool) -> Vec<(Uuid, Option<Uuid>, serde_json::Value)
 ///   deferral under the custodian's name, whose ids row lists the incoming
 ///   strengthening edge as retargeted and the outgoing one as resourced (the
 ///   migrated set the supersede cascade's factor regeneration keys on); the
-///   edges have moved (`contradicts` stays); and the belief cascade ran: the
+///   edges have moved (`contradicts` stays); K3 re-minted both moved edges'
+///   BP factors on the successor (the incoming edge is a `corroborates`, an
+///   `evidential_support` factor, the outgoing a `supports`, a
+///   `directional_support` one): a factor row per edge over the new pair, and
+///   the applied row counts `factors_minted` = 2 (backlog d4810e69); and the
+///   belief cascade ran: the
 ///   target's BBA frozen from the RETIRED claim's interval, keyed on the
 ///   outgoing edge, is invalidated, and the target's cache, which no row backs
 ///   any more, is cleared.
 ///
 /// Verified to fail on the base: no deferral row (the custodial path recorded
 /// none and ran no belief cascade; its inline edge migration left the replay
-/// nothing to move).
+/// nothing to move). Verified to fail with K3 skipped in the replay
+/// (`apply_after_supersede` minting no factors): no factor row on the
+/// successor and `factors_minted` 0.
 #[sqlx::test(migrations = "../../migrations")]
 async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_replay(pool: PgPool) {
     let (a, _) = fixture::seed_human_operator(&pool, "k8-custodian-a").await;
@@ -545,9 +552,17 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
     let target = insert_claim(&pool, legacy, WORLD).await;
     let supporter = insert_claim(&pool, legacy, WORLD).await;
     let critic = insert_claim(&pool, legacy, WORLD).await;
-    let incoming = edge(&pool, supporter, old, "supports").await;
+    let incoming = edge(&pool, supporter, old, "corroborates").await;
     let outgoing = edge(&pool, old, target, "supports").await;
     let contradicts = edge(&pool, critic, old, "contradicts").await;
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, old).await,
+            factors_on(&pool, outgoing, old, target).await,
+        ),
+        (1, 1),
+        "precondition: each strengthening edge carries its factor"
+    );
 
     // The outgoing edge's BBA on the target, wired from the predecessor's
     // interval by the engine's own edge-factor path.
@@ -730,6 +745,30 @@ async fn custodial_supersede_of_world_corpus_defers_the_whole_cascade_to_the_rep
         touched["edges_resourced"],
         serde_json::json!([outgoing]),
         "the cascade migrated the outgoing strengthening edge: {touched}"
+    );
+    // K3 (backlog d4810e69): the retirement deleted the predecessor's
+    // factors and the migration's re-points are UPDATEs the INSERT-only
+    // factor trigger never sees, so these rows exist only if the replay's
+    // regeneration minted them.
+    assert_eq!(
+        ad["touched"]["factors_minted"],
+        serde_json::json!(2),
+        "the replay minted the two moved edges' factors: {ad}"
+    );
+    assert_eq!(
+        touched["factors_minted"].as_array().map(Vec::len),
+        Some(2),
+        "the ids row lists the two minted slots: {touched}"
+    );
+    assert_eq!(
+        (
+            factors_on(&pool, incoming, supporter, new).await,
+            factors_on(&pool, outgoing, new, target).await,
+            factors_on(&pool, incoming, supporter, old).await,
+            factors_on(&pool, outgoing, old, target).await,
+        ),
+        (1, 1, 0, 0),
+        "each moved edge's factor is over the successor, none over the retired claim"
     );
     let ends: (Uuid, Uuid, Uuid) = sqlx::query_as(
         "SELECT (SELECT target_id FROM edges WHERE id = $1), \
