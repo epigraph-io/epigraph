@@ -24,7 +24,10 @@
 //! definer checks says which ones. `groups:write` (not the admin-only
 //! `groups:admin` the keyed roster routes take) is the invite scope because
 //! the authority is the caller's live admin row in the group, re-read by the
-//! definer under the group's row lock.
+//! definer under the group's row lock, and because an invitation places no
+//! one: the invitee's accept does. This departs from the keyed routes'
+//! convention (`groups:admin` for an existing group's roster); see the note
+//! at `RequireScopeGroupsAdmin` in `middleware/bearer.rs`.
 //!
 //! An invitation places no one: the membership goes live only when the
 //! invitee accepts. The keyed `POST /api/v1/groups/:id/members` route still
@@ -124,7 +127,9 @@ pub struct MyGroupEntry {
     /// The caller's highest live role in it.
     pub role: String,
     pub created_by: Option<Uuid>,
-    /// `true` for an active keyless team group: one an admin may invite into.
+    /// `true` for an active team group a Person made with
+    /// `POST /api/v1/groups/team`: one its admins may invite into. A team
+    /// group the operator made is managed by the operator and is `false`.
     pub invitable: bool,
 }
 
@@ -239,14 +244,18 @@ pub async fn my_groups(
 }
 
 /// `POST /api/v1/groups/:id/invitations`: invite a Person. Writes a pending
-/// invitation and NO membership.
+/// invitation and NO membership. Only a group a Person made with
+/// `POST /api/v1/groups/team` takes invitations. Once the invitee accepts,
+/// their live-linked agents also read the group, and write in it at `writer`
+/// or `admin`.
 ///
 /// # Errors
 /// 400 the invitee is not a Person, is the caller, or a bad role or reason;
 /// 403 the caller is not a Person, or not an admin of the group; 404 the
 /// caller holds no live membership of it (as for a missing group); 409 the
 /// invitee is already a member or already invited, or the group takes no
-/// invitations.
+/// invitations (it is not an active team group a Person made, e.g. one the
+/// operator made).
 pub async fn invite_to_group(
     ViewerExtractor(viewer): ViewerExtractor,
     State(state): State<AppState>,
@@ -281,7 +290,8 @@ pub async fn invite_to_group(
 }
 
 /// `POST /api/v1/group-invitations/:id/accept`: the invitee accepts; the
-/// membership goes live now.
+/// membership goes live now, and with it the invitee's live-linked agents'
+/// access (read, and write at `writer` or `admin`).
 ///
 /// # Errors
 /// 403 the caller is not a Person signed in as themselves (an agent cannot

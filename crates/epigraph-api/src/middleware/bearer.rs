@@ -406,9 +406,14 @@ require_scope_extractor!(RequireScopeAdmin, "claims:admin");
 require_scope_extractor!(RequireScopeWrite, "claims:write");
 require_scope_extractor!(RequireScopeWebhooksWrite, "webhooks:write");
 // Group management. `groups:write` creates a group (the creator becomes its sole
-// admin); `groups:admin` manages an EXISTING group's membership and is checked
-// alongside a live `role='admin'` membership in that group
-// (`middleware::group_authz::require_group_admin_conn`) — scope AND membership.
+// admin); `groups:admin` manages an EXISTING keyed or community group's
+// membership and is checked alongside a live `role='admin'` membership in that
+// group (`middleware::group_authz::require_group_admin_conn`) — scope AND
+// membership. One exception: the consented invitations of a Person-made
+// keyless team group (`routes::team_groups`, migration 263) take
+// `groups:write` for invite, accept and decline, because an invitation places
+// no one (the invitee's own accept does) and the definer re-checks the
+// inviter's live admin row itself.
 // Using the extractor rather than `check_scopes` inside the handler matters
 // here: these routes take a `Json` body, and an extractor rejection runs before
 // body parsing, so a scope failure is 403 rather than 422 (issue #128).

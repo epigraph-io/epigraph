@@ -1800,7 +1800,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List your groups and the invitations waiting for you. groups: every group you hold a live membership of (personal, team, community), with your highest role and whether it is an invitable team group. invitations: pending invitations addressed to you (invitation_id, group, role, who invited you, their note); answer each with accept_group_invitation or decline_group_invitation. Shows nothing about anyone else's memberships or invitations. Returns {groups: [{group_id, display_name, kind, status, role, created_by, invitable}], invitations: [{invitation_id, group_id, display_name, role, invited_by, reason, created_at}]}."
+        description = "List your groups and the invitations waiting for you. groups: every group you hold a live membership of (personal, team, community), with your highest role and whether it is invitable (an active team group made with create_team_group; a team group the operator made is managed by the operator and takes no invitations). invitations: pending invitations addressed to you (invitation_id, group, role, who invited you, their note); answer each with accept_group_invitation or decline_group_invitation. Shows nothing about anyone else's memberships or invitations. Returns {groups: [{group_id, display_name, kind, status, role, created_by, invitable}], invitations: [{invitation_id, group_id, display_name, role, invited_by, reason, created_at}]}."
     )]
     async fn list_my_groups(
         &self,
@@ -1813,7 +1813,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Invite a Person into a team group you administer, at reader (default), writer or admin. This places NO ONE: the membership goes live only if the invitee accepts (accept_group_invitation); until then they read nothing of the group. Only a live admin of an active keyless team group may invite, and only a Person signed in as themselves; the invitee must be a registered human operator (their own agent id, not an agent they operate), not already a member, and without a pending invitation to the group. A group you are not a member of is reported as not found. Audited (group.invitation_created). Returns {invitation_id, group_id, agent_id, role, status: pending}."
+        description = "Invite a Person into a team group you administer, at reader (default), writer or admin. This places NO ONE: the membership goes live only if the invitee accepts (accept_group_invitation); until then they read nothing of the group. Only a live admin of an active team group made with create_team_group may invite (a team group the operator made takes no invitations: its roster is the operator's), and only a Person signed in as themselves; the invitee must be a registered human operator (their own agent id, not an agent they operate), not already a member, and without a pending invitation to the group. Once accepted, the invitee's own live-linked agents also read the group, and write in it at writer or admin. A group you are not a member of is reported as not found. Audited (group.invitation_created). Returns {invitation_id, group_id, agent_id, role, status: pending}."
     )]
     async fn invite_to_group(
         &self,
@@ -1827,7 +1827,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Accept an invitation addressed to you: your membership of the group goes live now, at the invited role. Only the invited Person, signed in as themselves, may accept; an agent acting for them is refused, because joining a group with other people is their own decision. Refused once the invitation was accepted or declined, or if the admin who sent it is no longer an admin of the group (ask a current admin to invite you again). An invitation not addressed to you is reported as not found. Audited (group.member_added). Returns {invitation_id, group_id, membership_id, role, status: accepted}."
+        description = "Accept an invitation addressed to you: your membership of the group goes live now, at the invited role, and the agents you operate (live links) then read the group too, and write in it at writer or admin. Only the invited Person, signed in as themselves, may accept; an agent acting for them is refused, because joining a group with other people is their own decision. Refused once the invitation was accepted or declined, or if the admin who sent it is no longer an admin of the group (ask a current admin to invite you again). An invitation not addressed to you is reported as not found. Audited (group.member_added). Returns {invitation_id, group_id, membership_id, role, status: accepted}."
     )]
     async fn accept_group_invitation(
         &self,
