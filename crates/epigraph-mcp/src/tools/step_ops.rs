@@ -83,7 +83,12 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
         // declaration): a denial, as on every other write tool.
         E::Repo(db) if db.is_write_authority_refusal() => crate::errors::db_caller_error(db),
         E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
-        E::Db(_) | E::Repo(_) => internal_error(e.to_string()),
+        // The TYPED error, never its `to_string()` (backlog 0bc4636e): a
+        // designed refusal (`DbError::Refused`, a coded database message) is
+        // recognised by its type and sent as written; anything else is
+        // redacted and logged. Stringified, a refusal was redacted too.
+        E::Db(e) => internal_error(e),
+        E::Repo(e) => internal_error(e),
     }
 }
 
@@ -300,4 +305,47 @@ pub async fn delete_step(
         step_lineage_id: r.step_lineage_id,
         truth_value: r.truth_value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_step_err;
+    use crate::errors::INTERNAL_ERROR_MESSAGE;
+    use epigraph_ingest_executor::StepOpError as E;
+
+    /// A refusal the repo layer authored reaches the `add_step` /
+    /// `delete_step` caller as written (backlog 0bc4636e). The mapper used to
+    /// stringify the error first (`internal_error(e.to_string())`), which
+    /// erased the `DbError` type `designed_refusal` recognises it by, so the
+    /// caller got the redacted internal error instead of the reason.
+    #[test]
+    fn a_repo_refusal_reaches_the_caller_as_written() {
+        const MESSAGE: &str = "workflow step 5c1e is not current; refusing";
+        let mapped = map_step_err(E::Repo(epigraph_db::DbError::Refused {
+            kind: epigraph_db::RefusalKind::State,
+            message: MESSAGE.to_string(),
+        }));
+        assert_eq!(mapped.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_eq!(
+            mapped.message, MESSAGE,
+            "the refusal was not sent as written"
+        );
+    }
+
+    /// The other half: a driver or protocol error, bare or converted into a
+    /// `DbError`, stays redacted. Passing the typed error must not open a
+    /// path for server text.
+    #[test]
+    fn a_driver_error_stays_redacted() {
+        const SECRET: &str = "connection to db-host-7f3a:5432 reset";
+        for mapped in [
+            map_step_err(E::Db(sqlx::Error::Protocol(SECRET.to_string()))),
+            map_step_err(E::Repo(epigraph_db::DbError::from(sqlx::Error::Protocol(
+                SECRET.to_string(),
+            )))),
+        ] {
+            assert_eq!(mapped.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            assert_eq!(mapped.message, INTERNAL_ERROR_MESSAGE, "{}", mapped.message);
+        }
+    }
 }

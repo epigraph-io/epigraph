@@ -16,12 +16,18 @@
 //! (`McpError::internal_error(format!(..), None)`), which sends its message as
 //! written.
 //!
-//! Known limits: it sees the `format!` only as the call's own argument. A
-//! string built first (`let m = format!(..); internal_error(m)`) and
-//! `internal_error(e.to_string())` are not caught. The latter also erases the
-//! error's type, so `designed_refusal` cannot recognise a `DbError::Refused`
-//! routed through it (tools/workflows.rs and tools/step_ops.rs each have one;
-//! `.map_err(internal_error)` is the shape that keeps it).
+//! It also refuses `internal_error(<expr>.to_string())` (backlog 0bc4636e):
+//! stringifying the error first erases its type, so `designed_refusal` cannot
+//! recognise a `DbError::Refused` (or a coded database refusal) routed
+//! through it and the caller gets the redacted message instead of the
+//! refusal. `.map_err(internal_error)`, handing over the typed error, is the
+//! shape that keeps it. Only a path expression (`e`, `x.source`) before
+//! `.to_string()` is flagged; a string literal's `"..".to_string()` is
+//! designed text and is not.
+//!
+//! Known limits: it sees the `format!` or `.to_string()` only as the call's
+//! own argument. A string built first (`let m = format!(..);
+//! internal_error(m)`) is not caught.
 
 mod lint_text;
 
@@ -81,11 +87,30 @@ fn sites(text: &str) -> Vec<usize> {
         }
         let arg = text[from..].trim_start();
         let arg = arg.strip_prefix('&').map_or(arg, str::trim_start);
-        if arg.starts_with("format!") {
+        if arg.starts_with("format!") || stringified_path(arg) {
             out.push(before.matches('\n').count() + 1);
         }
     }
     out
+}
+
+/// Whether `arg` opens with a path expression (`e`, `err.source`,
+/// `self.e`) stringified with `.to_string()`: the error's type is erased
+/// before `internal_error` can recognise a designed refusal by it. A string
+/// literal (`"text".to_string()`) does not start with an identifier and is
+/// not matched.
+fn stringified_path(arg: &str) -> bool {
+    if !arg
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
+    {
+        return false;
+    }
+    let run = arg
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(arg.len());
+    arg[..run].ends_with(".to_string") && arg[run..].trim_start().starts_with("()")
 }
 
 /// The source with `//` and `/* */` comments removed, string literals kept
@@ -141,8 +166,10 @@ fn no_internal_error_is_handed_a_formatted_string() {
     assert!(
         offenders.is_empty(),
         "internal_error(format!(..)) discards its own context (the caller gets only \
-         INTERNAL_ERROR_MESSAGE). Use internal_error_logged(\"<context>\", e), or \
-         .map_err(internal_error) to keep a designed refusal. Sites:\n  {}",
+         INTERNAL_ERROR_MESSAGE), and internal_error(e.to_string()) erases the error's type, \
+         so a designed refusal routed through it is redacted. Use \
+         internal_error_logged(\"<context>\", e), or .map_err(internal_error) to keep a \
+         designed refusal. Sites:\n  {}",
         offenders.join("\n  ")
     );
     for (file, allowed, bound, why) in ALLOWED {
@@ -180,6 +207,20 @@ fn the_scanner_tells_the_helper_from_the_rmcp_constructor() {
         sites(&strip(skipped)).is_empty(),
         "{:?}",
         sites(&strip(skipped))
+    );
+    // `.to_string()` on the error erases its type (backlog 0bc4636e).
+    let stringified = "a.map_err(|e| internal_error(e.to_string()))?;\n\
+                       E::Db(_) => internal_error(\n    err.source.to_string(),\n),\n\
+                       c.map_err(|e| internal_error(&e.to_string()))?;";
+    assert_eq!(sites(&strip(stringified)), vec![1, 2, 5]);
+    let designed = "internal_error(\"no pool\".to_string());\n\
+                    internal_error(e);\n\
+                    internal_error(e.to_string_lossy());\n\
+                    McpError::internal_error(e.to_string(), None);";
+    assert!(
+        sites(&strip(designed)).is_empty(),
+        "{:?}",
+        sites(&strip(designed))
     );
     let commented = "// a.map_err(|e| internal_error(format!(\"x: {e}\")))?;\n\
                      /* internal_error(format!(\"y\")) */";
