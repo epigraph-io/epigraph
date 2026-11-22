@@ -189,8 +189,8 @@ fn leaks(message: &str) -> Vec<String> {
         let mut rest = lit;
         while let Some(at) = rest.find('{') {
             let after = &rest[at + 1..];
-            if after.starts_with('{') {
-                rest = &after[1..];
+            if let Some(escaped) = after.strip_prefix('{') {
+                rest = escaped;
                 continue;
             }
             let Some(close) = after.find('}') else { break };
