@@ -600,12 +600,41 @@ async fn introspect(pool: &PgPool, access: &str) -> (bool, Option<i64>) {
     (v["active"] == serde_json::json!(true), life)
 }
 
+/// `GET /api/v1/webhooks` with `access` as the bearer: a route behind
+/// `bearer_auth_middleware` that answers from the caller's principal alone, so
+/// an admitted token gets 200 and a refused one 401. This is the bearer path
+/// itself, not introspection's re-implementation of it.
+async fn bearer_admits(pool: &PgPool, access: &str) -> (StatusCode, String) {
+    let app = epigraph_api::create_router(epigraph_api::AppState::with_db(
+        pool.clone(),
+        epigraph_api::ApiConfig::default(),
+    ));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/webhooks")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// Backlog 452a1330 part 4: the access-token NOTE is true. An access token
 /// minted before `revoke-client` is still accepted afterwards (the bearer
 /// check reads neither the client's status nor a mint-time `jti`), and its
 /// lifetime is within the window the command prints for the client's type.
 /// If a later change makes a revoke kill minted tokens, this fails and the
 /// NOTE (and module doc) must change with it.
+///
+/// "Still accepted" is checked on a bearer-protected route (`bearer_admits`)
+/// as well as through introspection, so a status check added to the bearer
+/// middleware alone also fails this test.
 ///
 /// Verified to fail: `access_token_window` returning "15 minutes" for a
 /// service client -> the minted token outlives the printed window.
@@ -621,6 +650,12 @@ async fn an_access_token_minted_before_a_revoke_lives_within_the_printed_window(
     let (before, life) = introspect(&pool, &access).await;
     assert!(before, "CALIBRATION: the fresh token is active");
     let life = life.expect("exp and iat");
+    let (admitted, body) = bearer_admits(&pool, &access).await;
+    assert_eq!(
+        admitted,
+        StatusCode::OK,
+        "CALIBRATION: the bearer route admits the fresh token: {body}"
+    );
 
     let (role, dsn) = maintenance_login(&pool).await;
     let c = id.to_string();
@@ -629,6 +664,7 @@ async fn an_access_token_minted_before_a_revoke_lives_within_the_printed_window(
         &dsn,
     );
     let (after, _) = introspect(&pool, &access).await;
+    let (admitted_after, body_after) = bearer_admits(&pool, &access).await;
     drop_role(&pool, &role).await;
 
     assert_eq!(revoked.code, 0, "{}", revoked.show());
@@ -636,6 +672,12 @@ async fn an_access_token_minted_before_a_revoke_lives_within_the_printed_window(
     assert!(
         after,
         "the NOTE says an already-minted access token outlives the revoke"
+    );
+    assert_eq!(
+        admitted_after,
+        StatusCode::OK,
+        "the NOTE says the bearer middleware still admits a token minted before \
+         the revoke: {body_after}"
     );
     let window = printed_window_secs(&revoked.stdout);
     assert!(
