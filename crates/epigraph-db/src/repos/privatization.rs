@@ -3705,14 +3705,25 @@ impl PrivatizationRepository {
         //     alternative would not be, and the alternative is the leak).
         //     `centroid_3072` is the same channel one column over (backlog
         //     288801f8): `scripts/seed_themes_from_textbooks.py` seeds it as
-        //     the mean of the L1 claim's and its descendants' `embedding_3072`
-        //     and assigns those same claims to the theme, and
-        //     `scripts/theme_cap_split.py` re-averages members into it, so a
-        //     one-member theme's `centroid_3072` IS the member's vector, read
-        //     by recall at `centroid_dim=3072`. It is recomputed here from the
-        //     remaining members' `embedding_3072` (NULL when none remain), and
-        //     only where it was set: a NULL one stays NULL, because the search
-        //     route picks the 3072 index by how many themes have one.
+        //     the mean of the L1 claim's and its `decomposes_to` descendants'
+        //     `embedding_3072` and then sets those claims' `theme_id` to the
+        //     theme, and `scripts/theme_cap_split.py` re-averages members into
+        //     it, so a one-member theme's `centroid_3072` IS the member's
+        //     vector, read by recall at `centroid_dim=3072`. It is recomputed
+        //     here from the remaining members' `embedding_3072` (NULL when none
+        //     remain), and only where it was set: a NULL one stays NULL,
+        //     because the search route picks the 3072 index by how many themes
+        //     have one.
+        //     Residual, not closed here: only the sealed claims' CURRENT
+        //     themes are recomputed. The seed script's later `theme_id`
+        //     assignment overwrites an earlier one, and atoms converge across
+        //     documents, so an atom under several seeded sections stays folded
+        //     into an earlier theme's seeded `centroid` / `centroid_3072`
+        //     without being its member; the seal cannot find that theme (no
+        //     record says which vectors a seeded centroid averaged). The
+        //     vector is diluted by the other members there, but it is the same
+        //     class of leak and needs a one-off recompute of seeded centroids
+        //     from their current members.
         //     Nothing retires or re-seeds a theme this leaves with no embedded
         //     member; that is a maintenance decision, not the seal's.
         //     An unseal does not restore `theme_id`; the unthemed-assignment
