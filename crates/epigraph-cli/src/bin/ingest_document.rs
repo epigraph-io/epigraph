@@ -16,9 +16,9 @@
 //! signer). Omitted, they resolve D-V1 (team, else private), so
 //! an operator ingest's claims are never public unless `--visibility public`
 //! says so. Where they landed is printed on stderr. The setting scopes the
-//! CLAIMS only: the `papers` row (title, DOI, journal), the author agents and
-//! the `processed_by` stamp stay world-readable whatever it is, so do not
-//! ingest a confidential document (docs/tenancy/papers-tenancy-followup.md).
+//! claims and, since migration 246, the `papers` row (title, DOI, journal)
+//! with its `processed_by` stamp and every edge onto it; the author agents
+//! stay world-readable whatever it is (docs/tenancy/papers-tenancy-followup.md).
 
 use std::path::PathBuf;
 

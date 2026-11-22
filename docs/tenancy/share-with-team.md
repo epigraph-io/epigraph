@@ -265,7 +265,7 @@ does, or a stale aggregate.
 
 | table(s) | references | note |
 |---|---|---|
-| `papers` | `asserts` / `authored` / `processed_by` edges | [papers-tenancy-followup.md](papers-tenancy-followup.md): a private ingest's paper row is world-readable today. Sharing does not make this worse. Publicizing makes it moot for that paper. |
+| `papers` | `asserts` / `authored` / `processed_by` edges | Since migration 246 a private ingest's paper row carries the ingest's tenancy and its edges take the meet with it. A share or publicize of the claims does not yet move or merge the paper row (follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)): the paper's edges stay its group's. |
 | `entities`, `experiment_entities`, `entity_merge_candidates` | `entity_mentions`, `experiment_entity_mentions` | the entity registry is instance-wide; mentions carry the tenancy |
 | `graph_cluster_runs`, `graph_clusters`, `cluster_centroids`, `cluster_edges`, `cluster_labels`, `graph_neighborhoods`, `neighborhood_edges` | `claim_cluster_membership`, `claim_neighborhood_membership` | aggregates; section 6.2 |
 | `workflow_executions`, `tasks` | `workflows` (by `workflow_id`, no FK) | execution telemetry; section 3.2 |

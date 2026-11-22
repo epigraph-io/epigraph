@@ -60,27 +60,30 @@ Added to:
   to every claim the ingest creates, with their evidence, traces and `asserts` edges. Claims it
   converges onto keep their own tenancy.
 
-  **An ingest's visibility scopes its CLAIMS only.** The rest of what an ingest writes stays
-  world-readable whatever `visibility` says, because it has no row security:
+  **An ingest's visibility scopes its claims and, since migration 246, its paper.** The
+  `papers` row (title, DOI or synthesized document key, journal) carries the ingest's tenancy
+  under FORCEd row security, and `epigraph_node_tenancy` meets a paper endpoint with that row,
+  so for a `team` or `private` ingest:
 
-  * the `papers` row: title, DOI (or synthesized document key) and journal. `papers` has no
-    row-level security in any migration (127: "papers and workflows carry no tenancy"), and
-    `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
-  * the author agents (`agents` rows named after the paper's authors) and their `authored`
-    edges to the paper;
-  * the paper's `processed_by` edge, which is what `check_already_ingested` reports;
-  * the `asserts` edge from the paper to every claim the ingest converged onto that is already
-    **public** (an existing atom with the same content). Both endpoints are public, so the edge
-    is public, and anyone can see which public statements the document contains. A converged
-    public claim the agent may write also gets the document's `doi:<doi>` label.
+  * the paper row is readable only by the group, and another group's private ingest of the
+    same document writes its own row (one row per document per scope; every public ingest of
+    a document still shares its one public row);
+  * the `authored` edges from the author agents to the paper, the paper's `processed_by` stamp
+    (what `check_already_ingested` reports) and its `asserts` edges, including those onto
+    already-public claims it converged onto, are the group's edges;
+  * outside the group, `check_already_ingested`, `query_paper` and `GET /api/v1/papers` answer
+    as for an unknown document.
 
-  The paper-to-agent edges have a paper or agent endpoint, and the converged `asserts` edges
-  two public endpoints, so 120's `epigraph_edges_tenancy` keeps them all public. So for a
-  `team` or `private` ingest, the new claims are scoped, but anyone can learn that the
-  document exists, its title and DOI, who wrote it, that it was ingested, and which
-  already-public statements it asserts. **Do not ingest a confidential document until a follow-up adds tenancy to these
-  rows** (operator ruling, 2026-11-11). The follow-up's design is
-  [papers-tenancy-followup.md](papers-tenancy-followup.md).
+  Still world-readable whatever `visibility` says (backlog 34864fb5, follow-ups):
+
+  * the author agents themselves (`agents` rows named after the paper's authors): an author's
+    NAME stays readable, though not which document it wrote. Do not ingest a document whose
+    author list is itself confidential;
+  * the `doi:<doi>` label a non-public ingest adds to a converged public claim it may write.
+
+  Publicizing or sharing the claims does not yet widen or merge the paper row: a publicized
+  claim's `asserts` edge from a group paper stays the group's. The design and what remains are
+  in [papers-tenancy-followup.md](papers-tenancy-followup.md).
 * The operator `ingest-document` CLI, as `--visibility` / `--group-id`, resolved for its acting
   agent (the `--agent-key` signer). Omitted, it is D-V1 like every other surface, so an operator
   ingest's claims land in that agent's team, else private, and are never public unless
@@ -207,10 +210,9 @@ team-or-private, where it used to write public:
   membership, its human's, or its default team), or pass `--visibility team --group-id <team>`
   for a team that agent writes. A human's default team reaches CLI ingests only through an
   agent linked to that human. A paper that must be public takes `--visibility public`.
-  Whatever the flags, the paper's own record (title, DOI, journal), its author agents and its
-  `processed_by` stamp stay world-readable (section 3.1); a confidential document should not
-  be ingested until the follow-up in [papers-tenancy-followup.md](papers-tenancy-followup.md)
-  lands.
+  The flags scope the paper's own record (title, DOI, journal) and its `processed_by` stamp
+  too (migration 246); its author agents stay world-readable (section 3.1 and
+  [papers-tenancy-followup.md](papers-tenancy-followup.md)).
 * **`create_claim_core`'s structural edges** (AUTHORED, HAS_TRACE, DERIVED_FROM) used to be
   written after the commit on the unstamped pool, best-effort. A group-visible claim is
   invisible there, so the edge's reference check refused them silently. For a group-visible
