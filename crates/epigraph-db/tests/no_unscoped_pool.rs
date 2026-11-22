@@ -814,7 +814,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 186 (backlog 6492de67): `rotate_agent_key`'s two key writes
+/// (`&state.db_pool` each) became one transaction begun on the same raw pool,
+/// shared with the admin audit row (`routes/agent_keys.rs` 6 -> 5). A merge of
+/// two sites, not a conversion; no file reached zero.
+const HIGH_WATER: usize = 186;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -896,7 +900,9 @@ const HIGH_WATER_FILES: usize = 34;
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
     ("routes/admin.rs", 4),
-    ("routes/agent_keys.rs", 6),
+    // 6 before backlog 6492de67: rotate's two key writes became one raw-pool
+    // transaction shared with the admin audit row.
+    ("routes/agent_keys.rs", 5),
     ("routes/agents.rs", 10),
     ("routes/assess.rs", 1),
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):

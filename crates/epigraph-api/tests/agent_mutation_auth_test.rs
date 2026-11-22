@@ -331,8 +331,12 @@ async fn revoke_agent_key_admin_override_returns_200() {
 
     let (agent_id, key_id) = seed_agent_with_key(&pool).await;
 
-    // Admin token — different agent_id but has claims:admin
-    let token = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+    // Admin token — different agent_id, and its client record grants
+    // claims:admin (the override is audited, and the audit re-checks the
+    // grant; migration 252).
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["agents:write", "claims:admin"])
+            .await;
 
     let body = serde_json::json!({"reason": "admin revocation test"});
     let resp = reqwest::Client::new()
@@ -641,8 +645,11 @@ async fn rotate_agent_key_admin_override_rotates() {
     let agent = seed_derived_llm_agent(&pool).await;
     let new_key = epigraph_crypto::AgentSigner::generate();
     let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
-    // Bound to a fresh principal that is NOT the target agent.
-    let token = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+    // Bound to a fresh principal that is NOT the target agent, whose client
+    // record grants claims:admin (the audited override re-checks it).
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["agents:write", "claims:admin"])
+            .await;
 
     let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
     assert_eq!(
@@ -963,7 +970,9 @@ async fn revoke_agent_key_records_the_agent_only_when_the_agent_revoked() {
     // Admin override: a different principal did it. The row must not claim
     // the agent revoked its own key.
     let (agent, key) = seed_agent_with_key(&pool).await;
-    let admin = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+    let (admin, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["agents:write", "claims:admin"])
+            .await;
     let status = post_revoke(addr, agent, key, &admin).await;
     assert_eq!(status, 200);
     assert_ne!(
@@ -1096,4 +1105,259 @@ async fn armed_rotate_agent_key_still_lets_the_agent_rotate(pool: sqlx::PgPool) 
         "armed: self-rotation is unaffected; got {status} — {text}"
     );
     assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
+}
+
+// ===========================================================================
+// Admin audit rows for the override on another agent's key (backlog 6492de67)
+// ===========================================================================
+//
+// An admin who rotates or revokes ANOTHER agent's key writes one
+// `security_events` row through migration 112's definer (event types added
+// by migration 252), on the key change's own transaction. The self path
+// writes none. The definer re-checks the token's client record, so a
+// `claims:admin` token whose client grants nothing is refused and changes
+// nothing. Every count below is filtered to the test's own target agent, so
+// the tests can share one database.
+
+/// An admin token whose client record grants `claims:admin`, and the admin
+/// principal it is bound to. Returns (token, client_id, admin agent id).
+async fn seeded_admin(pool: &sqlx::PgPool) -> (String, Uuid, Uuid) {
+    let (token, client_id) =
+        common::test_bearer_token_with_seeded_client(pool, &["agents:write", "claims:admin"]).await;
+    let admin: Uuid = sqlx::query_scalar("SELECT agent_id FROM oauth_clients WHERE id = $1")
+        .bind(client_id)
+        .fetch_one(pool)
+        .await
+        .expect("the seeded client is bound to an agent");
+    (token, client_id, admin)
+}
+
+/// (event_type, agent_id, success, details) of every agent-key admin audit
+/// row naming `target`.
+async fn key_audit_rows(
+    pool: &sqlx::PgPool,
+    target: Uuid,
+) -> Vec<(String, Option<Uuid>, Option<bool>, serde_json::Value)> {
+    sqlx::query_as(
+        "SELECT event_type::text, agent_id, success, details FROM security_events \
+          WHERE event_type IN ('agent_keys.admin_rotate', 'agent_keys.admin_revoke') \
+            AND details->>'target_agent_id' = $1::text \
+          ORDER BY created_at",
+    )
+    .bind(target)
+    .fetch_all(pool)
+    .await
+    .expect("read agent-key admin audit rows")
+}
+
+/// The id of `agent`'s active signing key.
+async fn active_signing_key_id(pool: &sqlx::PgPool, agent: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM agent_keys \
+          WHERE agent_id = $1 AND key_type = 'signing' AND status = 'active'",
+    )
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("one active signing key")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_rotation_of_another_agents_key_writes_one_admin_audit_row() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let old_key = active_signing_key_id(&pool, agent.id).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let (token, client_id, admin) = seeded_admin(&pool).await;
+
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(status, 200, "admin rotation: {text}");
+    assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
+    let new_key_id = active_signing_key_id(&pool, agent.id).await;
+
+    let rows = key_audit_rows(&pool, agent.id).await;
+    assert_eq!(rows.len(), 1, "exactly one admin audit row: {rows:?}");
+    let (event, who, success, details) = &rows[0];
+    assert_eq!(event, "agent_keys.admin_rotate");
+    assert_eq!(*who, Some(admin), "the row is attributed to the admin");
+    assert_eq!(*success, Some(true));
+    assert_eq!(details["admin_agent_id"], serde_json::json!(admin));
+    assert_eq!(details["client_id"], serde_json::json!(client_id));
+    assert_eq!(details["retired_key_id"], serde_json::json!(old_key));
+    assert_eq!(details["new_key_id"], serde_json::json!(new_key_id));
+    assert_eq!(
+        details["new_public_key"],
+        serde_json::json!(hex::encode(new_key.public_key()))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_revocation_of_another_agents_key_writes_one_admin_audit_row() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    let (token, client_id, admin) = seeded_admin(&pool).await;
+
+    let status = post_revoke(addr, agent, key, &token).await;
+    assert_eq!(status, 200);
+
+    let rows = key_audit_rows(&pool, agent).await;
+    assert_eq!(rows.len(), 1, "exactly one admin audit row: {rows:?}");
+    let (event, who, success, details) = &rows[0];
+    assert_eq!(event, "agent_keys.admin_revoke");
+    assert_eq!(*who, Some(admin), "the row is attributed to the admin");
+    assert_eq!(*success, Some(true));
+    assert_eq!(details["client_id"], serde_json::json!(client_id));
+    assert_eq!(details["key_id"], serde_json::json!(key));
+    assert_eq!(details["prior_status"], serde_json::json!("active"));
+    assert_eq!(details["reason"], serde_json::json!("attribution test"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_rotation_and_self_revocation_write_no_admin_audit_row() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    // Self-rotation, by a token that ALSO carries claims:admin: the caller is
+    // the target, so this is the self path, not the audited override.
+    let agent = seed_derived_llm_agent(&pool).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let token = token_as_agent(agent.id, &["agents:write", "claims:admin"]);
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(status, 200, "self rotation: {text}");
+    assert_rotated_to(&pool, &agent, &new_key.public_key()).await;
+    assert_eq!(key_audit_rows(&pool, agent.id).await.len(), 0);
+
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    let status = post_revoke(addr, agent, key, &token_as_agent(agent, &["agents:write"])).await;
+    assert_eq!(status, 200);
+    assert_eq!(key_audit_rows(&pool, agent).await.len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_override_without_a_live_client_grant_is_refused_and_changes_nothing() {
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL set");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&url)
+        .await
+        .unwrap();
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+
+    // The token carries claims:admin, but no client record grants it: the
+    // audit cannot attribute the act to a live admin grant (ADM02).
+    let token = common::test_bearer_token_with_scopes(&["agents:write", "claims:admin"]);
+
+    let agent = seed_derived_llm_agent(&pool).await;
+    let before = key_rows(&pool, agent.id).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(status, 403, "rotation on scope alone: {text}");
+    assert_eq!(
+        key_rows(&pool, agent.id).await,
+        before,
+        "nothing may change"
+    );
+    assert_eq!(rows_holding_key(&pool, &new_key.public_key()).await, 0);
+    assert_eq!(key_audit_rows(&pool, agent.id).await.len(), 0);
+
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    let before = key_rows(&pool, agent).await;
+    let status = post_revoke(addr, agent, key, &token).await;
+    assert_eq!(status, 403, "revocation on scope alone");
+    assert_eq!(key_rows(&pool, agent).await, before, "nothing may change");
+    assert_eq!(key_audit_rows(&pool, agent).await.len(), 0);
+}
+
+/// Make every write of `agent`'s keys fail, through a trigger on this
+/// per-test database: an INSERT of a key row, or an UPDATE to `revoked`.
+/// (A rotation's retirement, an UPDATE to `rotated`, still succeeds, so the
+/// failure lands after it.)
+async fn fail_key_writes_of(pool: &sqlx::PgPool, agent: Uuid) {
+    let name = format!("fail_key_write_{}", agent.simple());
+    sqlx::query(&format!(
+        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF NEW.agent_id = '{agent}'::uuid \
+              AND (TG_OP = 'INSERT' OR NEW.status = 'revoked') THEN \
+             RAISE EXCEPTION 'injected key-write failure'; \
+           END IF; \
+           RETURN NEW; \
+         END $$"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the failing trigger function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON agent_keys \
+         FOR EACH ROW EXECUTE FUNCTION {name}()"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the failing trigger");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_key_write_rolls_back_the_admin_audit_row_and_the_retirement(pool: sqlx::PgPool) {
+    let (addr, _shutdown) = common::spawn_app(&url_for(&pool).await).await;
+    let (token, _, _) = seeded_admin(&pool).await;
+
+    // Rotation: the audit row and the old key's retirement are written, then
+    // the new key's INSERT fails. All three must roll back together: the
+    // agent keeps its active key, and no audit row claims a rotation.
+    let agent = seed_derived_llm_agent(&pool).await;
+    let before = key_rows(&pool, agent.id).await;
+    let new_key = epigraph_crypto::AgentSigner::generate();
+    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
+    fail_key_writes_of(&pool, agent.id).await;
+    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
+    assert_eq!(status, 500, "the injected failure surfaces: {text}");
+    assert_eq!(
+        key_rows(&pool, agent.id).await,
+        before,
+        "the old key must stay active; a half-done rotation leaves no active key"
+    );
+    assert_eq!(
+        key_audit_rows(&pool, agent.id).await.len(),
+        0,
+        "no audit row for a rotation that did not happen"
+    );
+
+    // Revocation: the audit row is written, then the revoke fails.
+    let (agent, key) = seed_agent_with_key(&pool).await;
+    fail_key_writes_of(&pool, agent).await;
+    let before = key_rows(&pool, agent).await;
+    let status = post_revoke(addr, agent, key, &token).await;
+    assert_eq!(status, 500, "the injected failure surfaces");
+    assert_eq!(
+        key_rows(&pool, agent).await,
+        before,
+        "the key stays as it was"
+    );
+    assert_eq!(
+        key_audit_rows(&pool, agent).await.len(),
+        0,
+        "no audit row for a revocation that did not happen"
+    );
 }
