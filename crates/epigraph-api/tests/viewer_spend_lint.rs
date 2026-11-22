@@ -165,10 +165,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // gated (`ClaimRepository::get_by_id`) then write; `human_of` is an agents
     // read; the SELECT is an advisory lock. narrows: `retain_for_cache` (and
-    // the `acquire` it runs on) filters the BBAs just read through the viewer
-    // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
-    // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
-    // it took the viewer only while it read lineage, and no longer reads any.
+    // the `acquire` it runs on, which also carries the engine's viewed cache
+    // refresh and preview of the frame, backlog 735df6d7) filters the BBAs
+    // just read through the viewer (`get_for_claim_frame`) to count them.
     // write: `insert_on` records the `claim.assessed` writer event inside the
     // slot transaction (ids and booleans only; the event list hides it from a
     // reader who cannot read the claim).
@@ -188,10 +187,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "db_pool.acquire",
             "db_pool.acquire",
             "db_pool.acquire",
-            "db_pool.acquire",
             "db_pool.begin",
             "derivation_scope::retain_for_cache",
-            "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
         ],

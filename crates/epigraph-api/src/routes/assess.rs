@@ -480,130 +480,84 @@ pub async fn assess_claim(
     )
     .await;
 
-    // Retrieve all user-submitted BBAs for this (claim, frame). This fold is
-    // stored as the claim's global scoped belief and returned as its updated
-    // belief, so it takes only the BBAs whose every source is at least as
-    // widely readable as the claim (ruling R-22), as the cache refresh below
-    // does.
-    let all_rows =
-        epigraph_db::MassFunctionRepository::get_for_claim_frame(pool, &viewer, claim_id, frame_id)
-            .await?;
-    let all_rows = {
-        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-            message: format!("acquire connection: {e}"),
-        })?;
-        epigraph_engine::derivation_scope::retain_for_cache(&mut conn, all_rows).await?
-    };
-
-    let mut indexed_rows: Vec<(Uuid, Option<Uuid>, MassFunction)> = all_rows
-        .iter()
-        .filter(|row| row.combination_method.as_deref() == Some("discount"))
-        .filter_map(|row| {
-            MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row.id, row.source_agent_id, m))
-        })
-        .collect();
-    indexed_rows.sort_by_key(|(id, _, _)| *id);
-
-    // Independence analysis
-    let analysis = if indexed_rows.len() <= 1 {
-        super::independence::IndependenceAnalysis::all_independent(
-            indexed_rows.iter().map(|(_, _, m)| m.clone()).collect(),
-        )
-    } else {
-        super::independence::analyze_independence(pool, &indexed_rows).await?
-    };
-
-    // Reduce each dependent group (sibling agents of one owner, ruling R-36)
-    // by Denoeux's cautious rule, the reduction the engine fold applies
-    // (`source_dependence::cautious_reduce`). This response and the cache
-    // agree when each sibling has one row on the frame (the assessment slot,
-    // or one restating it). They can differ otherwise: this fold puts all of
-    // a group's rows into one cautious reduction, while the engine first
-    // Dempster-folds each agent's own rows (and applies the same-source rule
-    // and its reliability discounts). The cache is the engine's. The min-commonality
-    // `combination::cautious_combine` used here before drops open-world mass,
-    // which every default-shaped assessment carries. A group the rule is not
-    // defined on folds as independent, as before.
-    let mut for_combination: Vec<MassFunction> = analysis.independent.clone();
-    let mut used_cautious = false;
-    for group in &analysis.dependent_groups {
-        match epigraph_engine::source_dependence::cautious_reduce(group).map_err(|e| {
-            ApiError::InternalError {
-                message: format!("Cautious combine failed: {e}"),
-            }
-        })? {
-            Some((reduced, _)) => {
-                used_cautious = true;
-                for_combination.push(reduced);
-            }
-            None => for_combination.extend(group.iter().cloned()),
-        }
-    }
-
-    // Dempster fold (`combine_multiple`, U025); conflict via `fold_conflict`
-    let default_conflict_threshold = 0.3;
-    let (combined, reports) = if for_combination.len() <= 1 {
-        // Nothing admissible left to fold (the rows read above can be emptied
-        // by the derivation scope, e.g. a claim whose visibility changed
-        // between the write and this read): report this call's own
-        // assessment rather than index an empty list.
-        (
-            for_combination
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| mass_function.clone()),
-            vec![],
-        )
-    } else {
-        combination::combine_multiple(&for_combination, default_conflict_threshold).map_err(
-            |e| ApiError::InternalError {
-                message: format!("Combination failed: {e}"),
-            },
-        )?
-    };
-
-    // Compute belief/plausibility for the claim's hypothesis (`h_idx` was
-    // read before the slot transaction).
-    let (final_bel, final_pl, final_betp, m_missing) =
-        super::belief::compute_hypothesis_belief(&combined, &ds_frame, h_idx);
-
-    // Conflict the fold saw (U025: Dempster normalises it out of `combined`).
-    let m_empty = combination::fold_conflict(&combined, &reports);
-
     // Refresh the claim's cached belief under the one-frame-owns-the-cache
-    // rule. This used to write the numbers above straight into the cache with
-    // `belief_frame_id: None`, NULLing the frame reference and clobbering a
-    // `binary_truth`-owned cache with this one frame's combination. Now
-    // `binary_truth` keeps the cache when the claim has a BBA there; otherwise
-    // the last frame by name owns it (legacy `paper_validity_*` and
-    // `research_validity` frames sort after `claim_validity`). The response
-    // still reports THIS frame's numbers, which may legitimately differ from
-    // the cache: the cache owner's recompute folds every row on its frame.
-    {
+    // rule: `binary_truth` keeps the cache when the claim has a BBA there;
+    // otherwise `claim_validity`, then the frame the cache records, then the
+    // first writer (`MassFunctionRepository::cache_owner_frame_for_claim`).
+    //
+    // Then THIS frame's fold, by the same pipeline (backlog 735df6d7):
+    // `preview_claim_belief_on_frame` runs exactly the fold the cache refresh
+    // writes (each row discounted by its effective reliability, each agent's
+    // own rows folded first, same-human sibling agents reduced by the
+    // cautious rule (ruling R-36), only the rows the derivation scope admits
+    // (ruling R-22)). So when this frame owns the cache, the response IS the
+    // cached value; on another frame it is this frame's fold, as the framed
+    // `get_belief` serves it. The handler used to fold the raw masses of its
+    // `'discount'` rows itself: with no reliability discount (so it disagreed
+    // with the cache even for one assessment), without the edge-factor rows
+    // the cache folds, and with all of a sibling group's rows in one cautious
+    // reduction where the engine first folds each agent's own rows.
+    let (preview, total_sources) = {
         let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
             message: format!("acquire connection: {e}"),
         })?;
         epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, &viewer, claim_id)
             .await
             .map_err(|message| ApiError::InternalError { message })?;
-    }
-
-    // Conflict/method summary of this frame's fold, for the scoped-belief
-    // cache below (no combined mass_functions row is stored).
-    let final_k = reports.last().map(|r| r.conflict_k);
-
-    let final_method_str = if used_cautious {
-        let adaptive = reports
-            .last()
-            .map(|r| format!("{:?}", r.method_used))
-            .unwrap_or_else(|| "none".to_string());
-        Some(format!("cautious+{adaptive}"))
-    } else {
-        reports.last().map(|r| format!("{:?}", r.method_used))
+        let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+            &mut conn, &viewer, claim_id, frame_id,
+        )
+        .await
+        .map_err(|message| ApiError::InternalError { message })?;
+        // The rows that fold combined: the combine-input reader, narrowed by
+        // the derivation scope as the fold narrows it.
+        let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
+            &mut *conn, &viewer, claim_id, frame_id,
+        )
+        .await?;
+        let rows = epigraph_engine::derivation_scope::retain_for_cache(&mut conn, rows).await?;
+        (preview, rows.len())
     };
-    let final_method = final_method_str.as_deref();
+
+    // `None`: the derivation scope admits none of the frame's rows and there
+    // is no cache to vacate (e.g. the claim's visibility changed between the
+    // write and this read). Report this call's own assessment, as before.
+    let (final_bel, final_pl, final_betp, m_missing, m_empty) = match &preview {
+        Some(p) => (
+            p.belief,
+            p.plausibility,
+            p.pignistic_prob,
+            p.missing_mass,
+            p.conflict_k,
+        ),
+        None => {
+            let (bel, pl, betp, missing) =
+                super::belief::compute_hypothesis_belief(&mass_function, &ds_frame, h_idx);
+            (
+                bel,
+                pl,
+                betp,
+                missing,
+                combination::fold_conflict(&mass_function, &[]),
+            )
+        }
+    };
+
+    // Every combine step is Dempster since U025; a single BBA is not folded,
+    // so it has no combination step to report (`submit_evidence`'s shape).
+    let folded = preview.is_some() && total_sources > 1;
+    let final_k = folded.then_some(m_empty);
+    let final_method = folded.then_some("Dempster");
+    let reports: Vec<serde_json::Value> = if folded {
+        vec![serde_json::json!({
+            "method_used": "Dempster",
+            "conflict_k": m_empty,
+            "mass_on_conflict": m_empty,
+            "mass_on_missing": m_missing,
+        })]
+    } else {
+        vec![]
+    };
 
     // No "combined result" mass_functions row is stored any more: it sat on the
     // input BBA's key and overwrote it, and a recompute must never re-combine a
@@ -701,17 +655,7 @@ pub async fn assess_claim(
     };
 
     // ── 10. Build response ───────────────────────────────────────────────
-    let combination_reports: Vec<serde_json::Value> = reports
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "method_used": format!("{:?}", r.method_used),
-                "conflict_k": r.conflict_k,
-                "mass_on_conflict": r.mass_on_conflict,
-                "mass_on_missing": r.mass_on_missing,
-            })
-        })
-        .collect();
+    let combination_reports = reports;
 
     Ok(Json(AssessClaimResponse {
         claim_id,
