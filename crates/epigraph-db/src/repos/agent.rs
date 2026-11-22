@@ -2419,6 +2419,52 @@ impl AgentRepository {
         ))
     }
 
+    /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,
+    /// `properties`) `viewer` may see, by [`Self::get_public_profile`]'s rule:
+    /// a bypass viewer, a `public` profile, the viewer itself, or a live group
+    /// membership the viewer shares. Ids that name no agent are absent.
+    ///
+    /// For the routes that read whole `Agent` rows (`GET /api/v1/agents` and
+    /// `/api/v1/agents/:id`) and must null the detail fields themselves
+    /// (backlog 761c2b05): one round trip for a whole page. Run it on a
+    /// connection stamped from `viewer` (`AppState::read_as`): the shared-group
+    /// arm reads `group_memberships`, which row security hides on an unstamped
+    /// connection, so a raw-pool call answers "not visible" for a shared group.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn profile_details_visible<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT a.id
+            FROM agents a
+            WHERE a.id = ANY($1::uuid[])
+              AND (   $4::bool
+                   OR a.profile_visibility = 'public'
+                   OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
+                   OR EXISTS (SELECT 1 FROM group_memberships gm
+                               WHERE gm.agent_id = a.id
+                                 AND gm.revoked_at IS NULL
+                                 AND gm.group_id = ANY($3::uuid[])))
+            "#,
+        )
+        .bind(ids)
+        .bind(viewer.principal())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .bind(viewer.bypass_bind())
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.
     ///
     /// Returns `None` both for an unknown agent and for one whose `public_key`

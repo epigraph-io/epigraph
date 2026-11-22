@@ -1,6 +1,6 @@
 //! Agent endpoints.
 //!
-//! # Tenancy: 5 of this file's 15 raw-pool sites are converted
+//! # Tenancy: 6 of this file's 15 raw-pool sites are converted
 //!
 //! Conversion shard 6. `get_agent_reputation` (2 sites) and `agent_claims`
 //! (3 sites) each serve their whole request on one viewer-stamped connection
@@ -21,11 +21,13 @@
 //!   and a write routed through a `ScopedRead` type-checks and is then rolled
 //!   back on drop under `SessionGucMode::Transaction`. Owner is
 //!   `ScopedPool::begin_as` plus `Viewer::splice_write`.
-//! * `get_agent`, `list_agents` — the HANDLER, not the site: neither takes a
-//!   `Viewer`, so there is nothing for `read_as` to stamp a connection with.
-//!   The residual is already on record as `F-TAILRLS-P1` in
-//!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
-//!   which neither widens nor narrows it.
+//! * `list_agents` (4 sites) — `AgentRepository::list*` / `count*` take a
+//!   `&PgPool` and read only `agents`, which is `USING (true)`, so stamping
+//!   them would narrow nothing. Since backlog 761c2b05 both `get_agent` and
+//!   `list_agents` take a `Viewer` and null `orcid` / `ror_id` for a profile
+//!   the caller may not see, through
+//!   `AgentRepository::profile_details_visible` on a [`AppState::read_as`]
+//!   connection; `get_agent`'s one row read moved onto that connection too.
 //!
 //! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
 //! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
@@ -333,22 +335,66 @@ pub async fn create_agent(
 ///
 /// GET /agents/:id
 ///
-/// Returns agent information including their public key.
+/// Returns agent information including their public key. `orcid` and `ror_id`
+/// are profile DETAILS: null unless the caller may see the agent's profile
+/// (backlog 761c2b05; [`AgentRepository::profile_details_visible`], the rule
+/// `get_public_profile` and `find_agent` apply), so a private profile's ORCID
+/// is not disclosed to every authenticated caller.
 #[cfg(feature = "db")]
 pub async fn get_agent(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Path(id): Path<Uuid>,
 ) -> Result<Json<AgentResponse>, ApiError> {
     let agent_id = AgentId::from_uuid(id);
+    let mut read = scoped_read(&state, &viewer, "get_agent").await?;
 
-    let agent = AgentRepository::get_by_id(&state.db_pool, agent_id)
+    // `agents` is `USING (true)` (migration 077 section 9): the stamp narrows
+    // no row here; it is what the profile-visibility read below needs.
+    let agent = AgentRepository::get_by_id(&mut *read, agent_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
+    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &[id]).await?;
 
-    Ok(Json(agent.into()))
+    Ok(Json(redact_profile(agent.into(), &visible)))
+}
+
+/// A viewer-stamped connection for `handler`, or the 500 every scoped read in
+/// this file answers when none can be had.
+#[cfg(feature = "db")]
+async fn scoped_read<'s>(
+    state: &'s AppState,
+    viewer: &epigraph_db::Viewer,
+    handler: &'static str,
+) -> Result<epigraph_db::ScopedRead<'s>, ApiError> {
+    state.read_as(viewer).await.map_err(|e| {
+        tracing::error!(
+            target: "tenancy.scoped_read",
+            error = %e,
+            handler,
+            "could not acquire a viewer-stamped connection"
+        );
+        ApiError::InternalError {
+            message: "Failed to acquire a scoped connection".to_string(),
+        }
+    })
+}
+
+/// Null `orcid` and `ror_id` unless the agent's profile is in `visible`
+/// (backlog 761c2b05).
+#[cfg(feature = "db")]
+fn redact_profile(
+    mut response: AgentResponse,
+    visible: &std::collections::HashSet<Uuid>,
+) -> AgentResponse {
+    if !visible.contains(&response.id) {
+        response.orcid = None;
+        response.ror_id = None;
+    }
+    response
 }
 
 /// Get an agent by ID (placeholder - no database)
@@ -380,9 +426,12 @@ pub async fn get_agent(
 ///
 /// Returns a paginated list of agents ordered by creation date (newest first).
 /// When `label` is provided, only agents with that PROV-O label are returned.
+/// `orcid` and `ror_id` are null for every agent whose profile the caller may
+/// not see, as in [`get_agent`].
 #[cfg(feature = "db")]
 pub async fn list_agents(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Query(params): Query<AgentListParams>,
 ) -> Result<Json<PaginatedResponse<AgentResponse>>, ApiError> {
     let limit = params.limit.clamp(1, 100);
@@ -398,7 +447,17 @@ pub async fn list_agents(
         (agents, total)
     };
 
-    let items: Vec<AgentResponse> = agents.into_iter().map(Into::into).collect();
+    // The rows come from the raw pool (`agents` is `USING (true)`, so a stamp
+    // narrows none of them); the profile-visibility read needs the stamp, for
+    // the shared-group arm. Applied after both branches, so a label filter
+    // cannot skip it.
+    let ids: Vec<Uuid> = agents.iter().map(|a| Uuid::from(a.id)).collect();
+    let mut read = scoped_read(&state, &viewer, "list_agents").await?;
+    let visible = AgentRepository::profile_details_visible(&mut *read, &viewer, &ids).await?;
+    let items: Vec<AgentResponse> = agents
+        .into_iter()
+        .map(|a| redact_profile(a.into(), &visible))
+        .collect();
 
     Ok(Json(PaginatedResponse {
         items,
