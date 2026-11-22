@@ -1757,9 +1757,10 @@ pub enum StandingRefusal {
     /// configured root, or its row and credential disagree.
     #[error("the passkey's attestation is no longer in good standing: {0}")]
     NotInGoodStanding(String),
-    /// Its standing cannot be checked: no Android roots, or no current
-    /// attestation status list (stale, missing, unreadable). The operator's
-    /// remedy is to refresh the list.
+    /// Its standing cannot be checked: no Android roots configured (the
+    /// remedy is to restore them), or no current attestation status list
+    /// (stale, missing, unreadable: the remedy is to refresh it). The reason
+    /// says which.
     #[error("the passkey's attestation standing cannot be checked: {0}")]
     Unknown(String),
 }

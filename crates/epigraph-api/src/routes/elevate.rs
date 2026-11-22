@@ -134,10 +134,11 @@ use crate::state::AppState;
 /// The refusal of an assertion whose passkey's attestation is no longer in
 /// good standing (`Passkeys::assertion_standing`): the ceremony is left live,
 /// so a refreshed status list lets the same ticket or act be retried. A
-/// listed certificate is 403; a status list the API cannot check against is
-/// 503 (the operator's remedy is to refresh it). The 503's detail is fixed
-/// text: the full reason names the list's path on the server, so it goes to
-/// the log (the caller's WARN), not to this unauthenticated page.
+/// listed certificate is 403; a standing the API cannot check is 503 (no
+/// Android key roots configured, or no current status list: the log says
+/// which). The 503's detail is fixed text: the full reason names server
+/// paths and settings, so it goes to the log (the caller's WARN), not to
+/// this unauthenticated page.
 fn standing_refused(refusal: &StandingRefusal) -> Response {
     match refusal {
         StandingRefusal::NotInGoodStanding(_) => {
@@ -146,8 +147,9 @@ fn standing_refused(refusal: &StandingRefusal) -> Response {
         StandingRefusal::Unknown(_) => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             refusal.code(),
-            "this passkey's attestation standing cannot be checked: the server's attestation \
-             status list is not current; ask the operator to refresh it, then retry",
+            "this passkey's attestation standing cannot be checked: the server's Android key \
+             attestation configuration (its key roots or its status list) is not usable; ask the \
+             operator to check it, then retry",
         ),
     }
 }
