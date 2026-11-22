@@ -115,8 +115,14 @@ async fn the_255_undo_returns_the_catalog_below_255(pool: PgPool) {
     assert!(
         added
             .iter()
-            .any(|e| e.starts_with("colacl papers.doi ") && e.contains("epigraph_app=aw/")),
-        "CALIBRATION: 255 grants epigraph_app column INSERT and UPDATE: {added:?}"
+            .any(|e| e.starts_with("colacl papers.doi ") && e.contains("epigraph_app=a/")),
+        "CALIBRATION: 255 grants epigraph_app column INSERT (only) on doi: {added:?}"
+    );
+    assert!(
+        added
+            .iter()
+            .any(|e| e.starts_with("colacl papers.title ") && e.contains("epigraph_app=aw/")),
+        "CALIBRATION: 255 grants epigraph_app column INSERT and UPDATE on title: {added:?}"
     );
     assert!(
         added

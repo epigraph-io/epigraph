@@ -3,7 +3,9 @@
 //! written only by the operator, through the audited maintenance definer
 //! `epigraph_set_paper_licence`. Before 255 the application role held
 //! table-level INSERT and UPDATE on the registry table `papers`, so any
-//! application session could mark a paper open-licensed.
+//! application session could mark a paper open-licensed, either by writing
+//! `licence` or by moving an open-licensed row's `doi` onto a paywalled DOI
+//! (ingest finds the paper by DOI, then reads that row's licence).
 //!
 //! Every application write here runs on a pool whose connections are
 //! `SET SESSION AUTHORIZATION epigraph_app`, the operator's on one that is
@@ -21,12 +23,19 @@
 //! `the_app_role_still_registers_and_fills_papers`.
 //!
 //! * section 4 (the REVOKE and column re-grant) removed: fails
-//!   `the_app_role_cannot_write_a_paper_licence` (the UPDATE succeeds) and
-//!   `every_paper_column_but_licence_is_app_writable`.
+//!   `the_app_role_cannot_write_a_paper_licence` (the UPDATE succeeds),
+//!   `the_app_role_cannot_repoint_a_licensed_paper_onto_another_doi` and
+//!   `the_app_role_writes_only_the_allowlisted_paper_columns`.
 //! * section 4 revoking UPDATE only (table-level INSERT kept): fails
 //!   `the_app_role_cannot_write_a_paper_licence` (the INSERT naming
 //!   `licence` succeeds) and the catalog ratchet.
 //! * `licence` left in the re-granted column list: fails both, as above.
+//! * UPDATE granted on every column but `licence` (the first form of 255,
+//!   which a review refuted), with section 8 reduced to its `licence` arm:
+//!   fails `the_app_role_cannot_repoint_a_licensed_paper_onto_another_doi`
+//!   (the application's `UPDATE papers SET doi` succeeds) and the catalog
+//!   ratchet (measured). With section 8 kept whole, 255 refuses at migrate
+//!   time with `LIC09` naming `UPDATE (created_at), UPDATE (doi), UPDATE (id)`.
 //! * EXECUTE on the definer granted to `epigraph_app`: fails
 //!   `the_app_role_cannot_write_a_paper_licence`.
 //! * section 6 (the reserved `paper.licence` prefix) removed: fails
@@ -242,13 +251,88 @@ async fn the_app_role_still_registers_and_fills_papers(pool: PgPool) {
     );
 }
 
-/// CATALOG RATCHET: the application role holds INSERT and UPDATE on every
-/// `papers` column except `licence`, and neither on `licence`. A migration
-/// that adds a `papers` column the request path writes must grant it (255's
-/// grants are column-level, so a new column is not covered); one that
+/// The re-point route: with UPDATE on `doi`, an application session could
+/// move a paper that carries an open licence onto a paywalled DOI, and the
+/// next ingest of that DOI (`get_or_create` by DOI, then `licence` of the row
+/// found) would keep its publisher text. Neither `doi` nor `id` may move.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_repoint_a_licensed_paper_onto_another_doi(pool: PgPool) {
+    let open_doi = "10.9999/t67-open";
+    let paywalled_doi = "10.9999/t67-paywalled";
+    let open = seed_paper(&pool, open_doi).await;
+    let maint = role_pool(&pool, "epigraph_maintenance").await;
+    sqlx::query("SELECT epigraph_set_paper_licence($1, 'CC-BY-4.0', 'publisher page')")
+        .bind(open)
+        .execute(&maint)
+        .await
+        .expect("operator sets the open licence");
+    let app = role_pool(&pool, "epigraph_app").await;
+
+    // Move the open row onto a paywalled DOI not yet registered.
+    let r = sqlx::query("UPDATE papers SET doi = $2 WHERE id = $1")
+        .bind(open)
+        .bind(paywalled_doi)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE doi");
+
+    // The same through an upsert's conflict arm.
+    let r = sqlx::query(
+        "INSERT INTO papers (doi, title) VALUES ($1, 't')          ON CONFLICT (doi) DO UPDATE SET doi = $2",
+    )
+    .bind(open_doi)
+    .bind(paywalled_doi)
+    .execute(&app)
+    .await;
+    assert_eq!(
+        sqlstate(r).as_deref(),
+        Some("42501"),
+        "ON CONFLICT DO UPDATE SET doi"
+    );
+
+    // Swap ids with a paywalled row already registered.
+    let paywalled = seed_paper(&pool, paywalled_doi).await;
+    let r = sqlx::query("UPDATE papers SET id = gen_random_uuid() WHERE id = $1")
+        .bind(paywalled)
+        .execute(&app)
+        .await;
+    assert_eq!(sqlstate(r).as_deref(), Some("42501"), "UPDATE id");
+
+    // What ingest reads for the paywalled DOI: its own row, no licence.
+    let found = PaperRepository::get_or_create(&app, paywalled_doi, None, None)
+        .await
+        .expect("get_or_create on the application role");
+    assert_eq!(
+        found, paywalled,
+        "the paywalled DOI resolves to its own row"
+    );
+    assert_eq!(
+        PaperRepository::licence(&app, found)
+            .await
+            .expect("licence read"),
+        None,
+        "the paywalled DOI must not read as open-licensed"
+    );
+    // And the open row is where the operator left it.
+    let (doi, licence): (String, Option<String>) =
+        sqlx::query_as("SELECT doi, licence FROM papers WHERE id = $1")
+            .bind(open)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(doi, open_doi);
+    assert_eq!(licence.as_deref(), Some("CC-BY-4.0"));
+}
+
+/// CATALOG RATCHET: the application role holds INSERT on every `papers`
+/// column except `licence`, UPDATE on `title` and `journal` only (an
+/// allowlist: `doi` and `id` are what ingest finds a paper and its licence
+/// by), neither on `licence`, and nothing table-level. A migration that
+/// adds a `papers` column the request path UPDATEs must grant it by name and
+/// extend the allowlist here and in 255's section 8 deliberately; one that
 /// re-grants table-level INSERT or UPDATE re-opens the licence and fails here.
 #[sqlx::test(migrations = "../../migrations")]
-async fn every_paper_column_but_licence_is_app_writable(pool: PgPool) {
+async fn the_app_role_writes_only_the_allowlisted_paper_columns(pool: PgPool) {
     let rows: Vec<(String, bool, bool)> = sqlx::query_as(
         "SELECT a.attname::text, \
                 has_column_privilege('epigraph_app', 'public.papers'::regclass, a.attnum, 'INSERT'), \
@@ -264,6 +348,7 @@ async fn every_paper_column_but_licence_is_app_writable(pool: PgPool) {
         rows.iter().any(|(c, _, _)| c == "licence"),
         "papers.licence is missing: {rows:?}"
     );
+    const UPDATABLE: [&str; 2] = ["title", "journal"];
     for (col, ins, upd) in &rows {
         if col == "licence" {
             assert!(
@@ -271,13 +356,25 @@ async fn every_paper_column_but_licence_is_app_writable(pool: PgPool) {
                 "epigraph_app can write papers.licence (INSERT {ins}, UPDATE {upd}); only \
                  epigraph_set_paper_licence on the maintenance DSN may"
             );
-        } else {
-            assert!(
-                *ins && *upd,
-                "epigraph_app lacks INSERT ({ins}) or UPDATE ({upd}) on papers.{col}; grant it \
-                 column-level (never table-level, which re-opens papers.licence)"
-            );
+            continue;
         }
+        assert!(
+            *ins,
+            "epigraph_app lacks INSERT on papers.{col}; grant it column-level (never \
+             table-level, which re-opens papers.licence)"
+        );
+        assert_eq!(
+            *upd,
+            UPDATABLE.contains(&col.as_str()),
+            "epigraph_app UPDATE on papers.{col} is {upd}; only {UPDATABLE:?} may be updated \
+             (UPDATE of doi or id re-points a licensed row onto another DOI)"
+        );
+    }
+    for col in ["id", "doi"] {
+        assert!(
+            rows.iter().any(|(c, _, _)| c == col),
+            "papers.{col} is missing: {rows:?}"
+        );
     }
     let table_level: (bool, bool) = sqlx::query_as(
         "SELECT has_table_privilege('epigraph_app', 'public.papers', 'INSERT'), \

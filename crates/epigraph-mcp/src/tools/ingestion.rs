@@ -754,8 +754,10 @@ fn parse_ingest_visibility(
 /// free text. The graph is exported as a unit, so a licence that restricts
 /// reuse cannot ride along. An unrecognised spelling fails closed.
 ///
-/// The value comes from `papers.licence`, which the application role cannot
-/// write (migration 255, backlog 9ee6799d): only an operator sets it, through
+/// The value comes from `papers.licence` of the row found by DOI. Since
+/// migration 255 (backlog 9ee6799d) the application role can neither write
+/// that column nor UPDATE a paper's `doi` or `id` (which would move a
+/// licensed row onto another DOI): only an operator sets a licence, through
 /// the audited maintenance definer `epigraph_set_paper_licence`.
 #[must_use]
 pub fn passage_retention_permitted(licence: Option<&str>) -> bool {
