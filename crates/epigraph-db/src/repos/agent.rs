@@ -2267,7 +2267,23 @@ impl AgentRepository {
     ///
     /// 1. `profile_visibility = 'public'` (migration 062's default), or
     /// 2. the viewer **is** this agent, or
-    /// 3. the viewer shares a live group with it.
+    /// 3. the viewer shares a live group with it: the agent is a LIVE member
+    ///    of a group in the viewer's group set.
+    ///
+    /// "Live member" is `epigraph_live_memberships(agent)`, the definer
+    /// `Viewer::resolve` builds every viewer's group set from (backlog
+    /// f712db53), so a groupmate is recognised by the same rule on both sides:
+    /// a member DERIVED from a role binding (migration 165), which holds no
+    /// `group_memberships` row, counts; an unrevoked row that has LAPSED
+    /// (migrations 164 and 235) does not. The raw roster probe this replaced
+    /// refused the first and admitted the second.
+    ///
+    /// It is one `SECURITY DEFINER` call, which suits this one-agent read.
+    /// `AgentLookupRepository`'s search cards decide the same detail for up to
+    /// `CANDIDATE_POOL` agents per search, and their `kind` filter reads the
+    /// answer, so they still use the raw roster probe: a per-agent definer
+    /// call there measured in seconds per search, and moving them needs a
+    /// set-valued definer (a migration).
     ///
     /// A bypass viewer sees everything, as everywhere else.
     ///
@@ -2309,10 +2325,8 @@ impl AgentRepository {
                    (   $4::bool
                     OR a.profile_visibility = 'public'
                     OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                    OR EXISTS (SELECT 1 FROM group_memberships gm
-                                WHERE gm.agent_id = a.id
-                                  AND gm.revoked_at IS NULL
-                                  AND gm.group_id = ANY($3::uuid[]))
+                    OR EXISTS (SELECT 1 FROM public.epigraph_live_memberships(a.id) lm
+                                WHERE lm.group_id = ANY($3::uuid[]))
                    ) AS may_see_details,
                    a.properties,
                    a.orcid,
