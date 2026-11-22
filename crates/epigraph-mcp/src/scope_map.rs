@@ -196,6 +196,17 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("publicize_claims", "claims:write"),
     ("share_claims_with_team", "claims:write"),
     ("set_default_group", "claims:write"),
+    // Person-facing keyless team groups and consented invitations (migration
+    // 263). The same scopes as their REST twins (`routes/team_groups.rs`):
+    // groups:write to create, invite, accept or decline, groups:read to list.
+    // The definers decide which group and which invitation: only a Person
+    // signed in as themselves acts, only a live admin invites, and only the
+    // invitee answers.
+    ("accept_group_invitation", "groups:write"),
+    ("create_team_group", "groups:write"),
+    ("decline_group_invitation", "groups:write"),
+    ("invite_to_group", "groups:write"),
+    ("list_my_groups", "groups:read"),
     // Marks through mark_duplicate's act and writes labels through the
     // `update_labels` path, each claim under its own per-claim rule.
     ("apply_label_dedup", "claims:write"),

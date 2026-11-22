@@ -1786,6 +1786,75 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Create a private TEAM group (keyless: membership is the boundary, nothing is encrypted) that you administer. Only a Person signed in as themselves (a registered human operator's own token) may; an agent acting for one is refused. You become its one admin; add people with invite_to_group, and each joins only when they accept. A name you already use for one of your active team groups is refused. Audited (group.team_created). Returns {group_id, did_key, display_name, role: admin}."
+    )]
+    async fn create_team_group(
+        &self,
+        Parameters(params): Parameters<crate::types::CreateTeamGroupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::team_groups::create_team_group(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "List your groups and the invitations waiting for you. groups: every group you hold a live membership of (personal, team, community), with your highest role and whether it is an invitable team group. invitations: pending invitations addressed to you (invitation_id, group, role, who invited you, their note); answer each with accept_group_invitation or decline_group_invitation. Shows nothing about anyone else's memberships or invitations. Returns {groups: [{group_id, display_name, kind, status, role, created_by, invitable}], invitations: [{invitation_id, group_id, display_name, role, invited_by, reason, created_at}]}."
+    )]
+    async fn list_my_groups(
+        &self,
+        Parameters(params): Parameters<crate::types::ListMyGroupsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        crate::tools::team_groups::list_my_groups(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Invite a Person into a team group you administer, at reader (default), writer or admin. This places NO ONE: the membership goes live only if the invitee accepts (accept_group_invitation); until then they read nothing of the group. Only a live admin of an active keyless team group may invite, and only a Person signed in as themselves; the invitee must be a registered human operator (their own agent id, not an agent they operate), not already a member, and without a pending invitation to the group. A group you are not a member of is reported as not found. Audited (group.invitation_created). Returns {invitation_id, group_id, agent_id, role, status: pending}."
+    )]
+    async fn invite_to_group(
+        &self,
+        Parameters(params): Parameters<crate::types::InviteToGroupParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::team_groups::invite_to_group(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Accept an invitation addressed to you: your membership of the group goes live now, at the invited role. Only the invited Person, signed in as themselves, may accept; an agent acting for them is refused, because joining a group with other people is their own decision. Refused once the invitation was accepted or declined, or if the admin who sent it is no longer an admin of the group (ask a current admin to invite you again). An invitation not addressed to you is reported as not found. Audited (group.member_added). Returns {invitation_id, group_id, membership_id, role, status: accepted}."
+    )]
+    async fn accept_group_invitation(
+        &self,
+        Parameters(params): Parameters<crate::types::AcceptGroupInvitationParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::team_groups::accept_group_invitation(self, viewer, params, auth).await
+    }
+
+    #[tool(
+        description = "Decline an invitation addressed to you: no membership is written, and the admin may invite you again later. Refused once the invitation was already answered. An invitation not addressed to you is reported as not found. Audited (group.invitation_declined). Returns {invitation_id, group_id, status: declined}."
+    )]
+    async fn decline_group_invitation(
+        &self,
+        Parameters(params): Parameters<crate::types::DeclineGroupInvitationParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::team_groups::decline_group_invitation(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Retire a backlog claim in one call: submits a resolution claim via the canonical submit_claim pipeline (idempotent create + Evidence + Trace + DERIVED_FROM/HAS_TRACE/AUTHORED edges + DS auto-wire + embedding), prefixed with 'Resolves <original_id>: ' and labeled ['resolved'], then patches the original claim's labels with add=['resolved'] (keeping 'backlog'). Label-side retirement — original stays is_current=true / supersedes=None. Optionally takes basis_claim_ids: the claims that justified the closure, each recorded as a `basis -justifies-> resolution` edge so a later retraction of a basis can be reverse-queried to find the closures resting on it (it does not reopen anything by itself). Returns {resolution_claim_id, original_id, original_labels, basis_claim_ids, basis_edge_ids}. All-or-nothing: the resolution claim, its justifies edges and the original's 'resolved' label commit together on one transaction with the calling agent (your own OAuth agent over HTTP, where a caller with no authenticated principal cannot write; this server's own agent on stdio)'s write authority, or nothing is written and the call fails (a retry is safe). An original owned by a group the calling agent cannot write (another agent's claim) is refused that way, unless the token carries claims:admin: then the resolution claim is still yours, in your own group, and only the original's 'resolved' label is written through the AUDITED ADMIN PATH (recorded with you as principal, plus a security_events claims.admin_write audit row; it requires a live claims:admin grant on your token's own client record). On an --allow-unauthenticated-http listener the injected context carries claims:admin but no client record, so a claim owned by a group this server cannot write is refused there (ADM02) with nothing written. Only the resolution claim's embedding runs after commit, best-effort."
     )]
     async fn resolve_backlog_item(

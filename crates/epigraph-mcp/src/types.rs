@@ -3485,6 +3485,57 @@ pub struct ListMyBugReportsParams {
     pub limit: Option<i64>,
 }
 
+/// `create_team_group` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTeamGroupParams {
+    #[schemars(
+        description = "The group's name, 1 to 255 characters (surrounding space trimmed). You may hold only one active team group of a name (case-insensitive); other people's group names do not matter."
+    )]
+    pub name: String,
+    #[schemars(description = "Optional reason, recorded in the group.team_created audit event.")]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `list_my_groups` (migration 263). Takes no arguments.
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct ListMyGroupsParams {}
+
+/// `invite_to_group` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct InviteToGroupParams {
+    #[schemars(description = "UUID of the team group (you must be a live admin of it).")]
+    pub group_id: String,
+    #[schemars(
+        description = "UUID of the Person to invite: a registered human operator's own agent id, not an agent they operate."
+    )]
+    pub agent_id: String,
+    #[schemars(
+        description = "The role the membership will have if they accept: reader (the default), writer or admin."
+    )]
+    #[serde(default)]
+    pub role: Option<String>,
+    #[schemars(
+        description = "Optional note shown to the invitee and recorded in the audit event."
+    )]
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `accept_group_invitation` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AcceptGroupInvitationParams {
+    #[schemars(description = "UUID of an invitation addressed to you (see list_my_groups).")]
+    pub invitation_id: String,
+}
+
+/// `decline_group_invitation` (migration 263).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeclineGroupInvitationParams {
+    #[schemars(description = "UUID of an invitation addressed to you (see list_my_groups).")]
+    pub invitation_id: String,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResolveBacklogItemParams {
     #[schemars(description = "UUID of the backlog claim being retired")]
