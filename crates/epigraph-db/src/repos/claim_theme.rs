@@ -468,8 +468,8 @@ impl ClaimThemeRepository {
     /// the same walk and a caller would see one twice and the other never.
     ///
     /// Viewer-scoped in WHICH themes appear, not only in their counts
-    /// (backlog 06f5c5b2, following [`Self::overview_page`] and owner ruling
-    /// A1): a theme is listed only when the viewer can read at least one of its
+    /// (backlog 06f5c5b2, following [`Self::overview_page`]): a theme is
+    /// listed only when the viewer can read at least one of its
     /// current members. A zero row would publish the id and label of a theme
     /// made only of another team's private claims. `claim_themes` is not a
     /// tenancy table (migration 062's `tier_a` does not list it); the narrowing
