@@ -798,8 +798,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ through migration 207's principal-bound app-callable definer \
          `epigraph_my_bug_reports` on the requester's STAMPED connection: only the stamped \
          principal's own intake reports (no caller-supplied id or group), filtered in the \
-         definer by the unforgeable `bug_report.submitted` marker, the claim's author and the \
-         configured intake group; the viewer is spent on the stamp.",
+         definer by the intake marker the write definer recorded when the report was filed \
+         (migration 265, no application privilege on it) and the claim's author; the viewer is \
+         spent on the stamp.",
     ),
     (
         "bug_report.rs",

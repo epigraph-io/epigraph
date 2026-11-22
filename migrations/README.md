@@ -3403,6 +3403,32 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **265**: public `bug_report_intake_marker` (backlog e690866c). Adds
+  `bug_report_intake_marks` (claim id PK, reporter, the intake group the report was filed
+  into, `submitted_at`; no row security, no foreign keys; the application role holds
+  NOTHING on it, the maintenance role SELECT and INSERT), written by
+  `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
+  SECURITY DEFINER from 211's body (one added INSERT) and 207's `epigraph_my_bug_reports`,
+  which now lists the caller's markers joined to their claims (author still the caller)
+  instead of the claims owned by the CURRENT intake group: a report triage moved out of the
+  intake group, or one filed under an intake group the operator replaced, stays listed.
+  `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
+  existing `bug_report.submitted` audit row whose claim is still authored by its agent, with
+  `row_security` off (fails closed on a filtered migration login), after an ACCESS EXCLUSIVE
+  lock on `bug_report_intake_settings` (every write definer call reads it first, so none is
+  in flight across the backfill). Not changed: the list still shows the claim's current
+  labels (the label-disclosure question, e690866c part 2, is open). Owners and grants
+  re-asserted as 211 does. Pinned by `epigraph-db/tests/bug_report_intake.rs`
+  (`moved_and_earlier_intake_reports_stay_in_the_list`,
+  `the_application_role_cannot_read_or_forge_an_intake_marker`) and
+  `bug_report_intake_marker.rs` (the backfill across an upgrade from 264, the undo); the
+  intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
+  this file. Undo: `docs/runbooks/265-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 265). Checked before claiming: no migration on main or an origin branch
+  carries a `265`. **Deploy order:** migrate, then run the theme scripts of this change
+  (theirs read the table: 42P01 below 265); the binaries are unaffected either way. A
+  read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

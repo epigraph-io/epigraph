@@ -256,7 +256,11 @@ impl BugReportRepository {
     }
 
     /// The stamped principal's own intake reports, newest first, at most
-    /// `limit` (clamped to 1..=200 by the definer).
+    /// `limit` (clamped to 1..=200 by the definer). Keyed on the intake
+    /// marker recorded when each report was filed (migration 265), so a
+    /// report triage has moved out of the intake group, or one filed under an
+    /// earlier intake group, is still listed. The labels are the claim's
+    /// CURRENT labels, triage's included.
     ///
     /// # Errors
     /// [`DbError::Refused`] when the session has no principal (BUG01) or the

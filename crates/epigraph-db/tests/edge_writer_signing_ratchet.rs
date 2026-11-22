@@ -299,9 +299,11 @@ struct DbSite {
 /// The database-side inventory, measured from `migrations/*.sql`.
 const DB_REGISTER: &[DbSite] = &[
     // The bug-report intake's evidence -> claim edge (migration 211, backlog
-    // 2d60f619): a database function, so no transport key.
+    // 2d60f619): a database function, so no transport key. Its live
+    // definition is 265's (which adds the intake marker, backlog e690866c,
+    // and leaves the edge INSERT as 211 wrote it).
     DbSite {
-        migration: "211_bug_report_evidence_edge.sql",
+        migration: "265_bug_report_intake_marker.sql",
         function: "epigraph_submit_bug_report",
         count: 1,
         status: Unsigned(NO_KEY_DB_FUNCTION),
