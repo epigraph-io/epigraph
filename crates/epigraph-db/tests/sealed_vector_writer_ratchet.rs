@@ -1,7 +1,7 @@
 //! Every statement under `crates/*/src` that writes a non-NULL vector into
 //! `embedding` / `embedding_3072` must (a) carry the not-sealed predicate in
 //! the statement and (b) lock the row in an EARLIER statement of the same
-//! function (backlog f9807254).
+//! function, inside the same transaction as the write (backlog f9807254).
 //!
 //! # Why both halves
 //!
@@ -19,7 +19,11 @@
 //!   re-checks the qual on the new row version against the statement's
 //!   original snapshot for the encryption table, and the trigger (fresh
 //!   snapshot) raises. A `SELECT … FOR UPDATE` in a separate, earlier statement
-//!   makes the guarded UPDATE take a snapshot that includes that seal.
+//!   makes the guarded UPDATE take a snapshot that includes that seal. The lock
+//!   only helps while it is held: both statements must run on one transaction
+//!   (`let mut tx = ….begin(…)`, then `&mut *tx` as the executor of each). Two
+//!   autocommit statements on the pool release the lock in between, and a seal
+//!   that takes the row in that gap aborts the write exactly as before.
 //!   Pinned at runtime by `claim_store_embedding_seal_race.rs`,
 //!   `evidence_embedding_seal_race.rs` and
 //!   `epigraph-cli/tests/reembed_concurrent_seal.rs`.
@@ -27,7 +31,16 @@
 //! A future multi-row writer (`UPDATE … FROM unnest(…)`) needs the same two
 //! halves: the predicate inside the UPDATE, and the rows locked first in one
 //! statement (`WHERE id = ANY($1) ORDER BY id FOR UPDATE`, ordered so two
-//! writers cannot deadlock).
+//! writers cannot deadlock). The ordering is advice here, not enforced.
+//!
+//! # What counts as locking first
+//!
+//! The nearest non-comment `FOR UPDATE` above the vector write, a `let <tx> =
+//! ….begin(…)` above that lock, and the first sqlx executor call
+//! (`.execute(` / `.fetch_optional(` / `.fetch_one(` / `.fetch_all(` /
+//! `.fetch(`) after the lock and after the write both taking `<tx>`. Writers
+//! are expected to name the transaction binding and pass it as the executor;
+//! a writer that does something else fails and must be looked at.
 //!
 //! # What the scanner counts as a vector write
 //!
@@ -56,6 +69,8 @@ struct Writer {
     /// `crate/src/…/file.rs::function`
     site: String,
     has_predicate: bool,
+    /// The row is locked by an earlier `FOR UPDATE` statement on the same
+    /// transaction the write runs on.
     locks_first: bool,
 }
 
@@ -207,6 +222,73 @@ fn target_table(lines: &[&str], start: usize, i: usize) -> Option<String> {
     None
 }
 
+/// The executor argument of the first sqlx call at or after line `from` and
+/// before `end` (`&mut *tx` in `.execute(&mut *tx)`).
+fn executor_from(lines: &[&str], from: usize, end: usize) -> Option<String> {
+    // `(` directly after the name, so `.fetch(` does not match `.fetch_one(`.
+    const CALLS: [&str; 5] = [
+        ".execute(",
+        ".fetch_optional(",
+        ".fetch_one(",
+        ".fetch_all(",
+        ".fetch(",
+    ];
+    for line in lines.get(from..end)? {
+        if is_comment(line) {
+            continue;
+        }
+        let hit = CALLS
+            .iter()
+            .filter_map(|c| line.find(c).map(|p| p + c.len()))
+            .min();
+        if let Some(at) = hit {
+            let arg = &line[at..];
+            return Some(arg[..arg.find(')').unwrap_or(arg.len())].to_string());
+        }
+    }
+    None
+}
+
+/// The binding of the nearest transaction opened in `start..upto`:
+/// `tx` in `let mut tx = pool.begin().await?` or
+/// `let mut tx = sqlx::Connection::begin(&mut *conn).await?`.
+fn tx_binding(lines: &[&str], start: usize, upto: usize) -> Option<String> {
+    lines[start..upto].iter().rev().find_map(|line| {
+        if is_comment(line) || !line.contains("begin(") {
+            return None;
+        }
+        let rest = line.trim_start().strip_prefix("let ")?.trim_start();
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+        let n = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        (n > 0).then(|| rest[..n].to_string())
+    })
+}
+
+/// Whether the executor argument names the identifier `tx`.
+fn on_binding(arg: Option<String>, tx: &str) -> bool {
+    arg.is_some_and(|a| {
+        a.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| word == tx)
+    })
+}
+
+/// Whether the write at line `i` is preceded by a `FOR UPDATE` lock that runs
+/// on the same transaction as the write (see the module doc).
+fn locks_first_in_tx(lines: &[&str], start: usize, i: usize, end: usize) -> bool {
+    let Some(lock) = (start..i)
+        .rev()
+        .find(|&j| !is_comment(lines[j]) && lines[j].contains("FOR UPDATE"))
+    else {
+        return false;
+    };
+    let Some(tx) = tx_binding(lines, start, lock) else {
+        return false;
+    };
+    on_binding(executor_from(lines, lock, i), &tx) && on_binding(executor_from(lines, i, end), &tx)
+}
+
 fn scan_source(label: &str, text: &str) -> Vec<Writer> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -241,7 +323,6 @@ fn scan_source(label: &str, text: &str) -> Vec<Writer> {
                 .join("\n")
         };
         let body = code(start, end);
-        let before = code(start, i);
         let literal = body.contains("NOT EXISTS")
             && match key {
                 Some(k) => body.contains(k),
@@ -252,7 +333,7 @@ fn scan_source(label: &str, text: &str) -> Vec<Writer> {
         out.push(Writer {
             site: format!("{label}::{name}"),
             has_predicate: literal || spliced,
-            locks_first: before.contains("FOR UPDATE"),
+            locks_first: locks_first_in_tx(&lines, start, i, end),
         });
     }
     out
@@ -319,8 +400,9 @@ fn every_vector_writer_filters_sealed_rows_and_locks_the_row_first() {
     assert!(
         unlocked.is_empty(),
         "vector writers that do not take the row lock (`SELECT … FOR UPDATE`) in an earlier \
-         statement, so a seal committing while the UPDATE waits reaches migration 212's \
-         trigger and aborts it: {unlocked:#?}"
+         statement on the same transaction as the write, so a seal committing while the \
+         UPDATE waits (or in the gap between two autocommit statements) reaches migration \
+         212's trigger and aborts it: {unlocked:#?}"
     );
 }
 
@@ -342,9 +424,55 @@ async fn wrong_table_key(pool: &PgPool) {
                  AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = evidence.claim_id)");
 }
 async fn guarded(pool: &PgPool) {
-    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE");
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
     sqlx::query("UPDATE claims SET embedding_3072 = $1::vector WHERE id = $2 \
-                 AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)");
+                 AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)")
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+}
+async fn guarded_on_conn(conn: &mut PgConnection) {
+    let mut txn = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query("SELECT 1 FROM evidence WHERE id = $1 FOR UPDATE")
+        .fetch_optional(&mut *txn)
+        .await?;
+    let sql = splice("UPDATE evidence AS e SET embedding = $2::vector WHERE e.id = $1 \
+                 AND NOT EXISTS (SELECT 1 FROM evidence_encryption ee WHERE ee.evidence_id = e.id)");
+    let result = q.execute(&mut *txn).await?;
+    txn.commit().await?;
+}
+async fn autocommit_lock(pool: &PgPool) {
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .fetch_optional(pool)
+        .await?;
+    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)")
+        .execute(pool)
+        .await?;
+}
+async fn lock_outside_tx(pool: &PgPool) {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .fetch_optional(pool)
+        .await?;
+    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)")
+        .execute(&mut *tx)
+        .await?;
+}
+async fn update_outside_tx(pool: &PgPool) {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+        .fetch_optional(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE claims SET embedding = $1::vector WHERE id = $2 \
+                 AND NOT EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = claims.id)")
+        .execute(pool)
+        .await?;
 }
 async fn multi_row_unguarded(pool: &PgPool) {
     sqlx::query("UPDATE claims AS c SET \
@@ -385,8 +513,8 @@ async fn not_writers(pool: &PgPool) {
     };
     assert_eq!(
         found.len(),
-        7,
-        "exactly the seven claims/evidence writer fns are vector writes: {found:#?}"
+        11,
+        "exactly the eleven claims/evidence writer fns are vector writes: {found:#?}"
     );
     assert!(!get("bare").has_predicate && !get("bare").locks_first);
     assert!(get("predicate_only").has_predicate && !get("predicate_only").locks_first);
@@ -395,6 +523,16 @@ async fn not_writers(pool: &PgPool) {
         "an evidence writer keyed on claim_encryption is not guarded"
     );
     assert!(get("guarded").has_predicate && get("guarded").locks_first);
+    assert!(
+        get("guarded_on_conn").has_predicate && get("guarded_on_conn").locks_first,
+        "a transaction opened on a borrowed connection, under any binding name, locks first"
+    );
+    for racy in ["autocommit_lock", "lock_outside_tx", "update_outside_tx"] {
+        assert!(
+            get(racy).has_predicate && !get(racy).locks_first,
+            "{racy}: a lock and a write not on one transaction leave a gap a seal can take"
+        );
+    }
     assert!(!get("multi_row_unguarded").has_predicate);
     assert!(
         !get("multi_row_second_assignment").has_predicate,
