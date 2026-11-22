@@ -383,17 +383,23 @@ pub async fn recall(
 /// served, not discovered afterwards by a failed audit write.
 async fn assert_conn_spends_bypass(conn: &mut PgConnection) -> Result<(), RecallError> {
     let privilege = epigraph_db::probe_maintenance_privilege_conn(conn).await?;
-    epigraph_db::maintenance_verdict(privilege, epigraph_db::MaintenanceDsnSource::Configured)
-        .map_err(|e| match e {
-            epigraph_db::DbError::InvalidData { reason } => epigraph_db::DbError::InvalidData {
-                reason: format!(
-                    "engine recall refused a Bypass viewer: the `pool` passed to recall() \
-                     must be the maintenance pool its lease came from, or its agent-less \
-                     audit row is refused by row security and lost. {reason}"
-                ),
-            },
-            other => other,
-        })?;
+    let verdict =
+        epigraph_db::maintenance_verdict(privilege, epigraph_db::MaintenanceDsnSource::Configured)
+            .map_err(|e| match e {
+                epigraph_db::DbError::InvalidData { reason } => epigraph_db::DbError::InvalidData {
+                    reason: format!(
+                        "engine recall refused a Bypass viewer: the `pool` passed to recall() \
+                         must be the maintenance pool its lease came from, or its agent-less \
+                         audit row is refused by row security and lost. {reason}"
+                    ),
+                },
+                other => other,
+            })?;
+    // Not refused, but say so as `assert_maintenance_privilege` does: the
+    // Bypass is inert only until row security is enabled on a protected table.
+    if let epigraph_db::MaintenanceVerdict::UnprivilegedButRlsIsNotActive(warning) = verdict {
+        tracing::warn!("engine recall: Bypass viewer on an unprivileged pool: {warning}");
+    }
     Ok(())
 }
 
