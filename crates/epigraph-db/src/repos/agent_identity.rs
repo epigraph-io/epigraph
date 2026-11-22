@@ -11,10 +11,15 @@
 //!   the authorisation: the session principal is a variable any login can set,
 //!   so it is never consulted. Before the call it decompresses each frame it
 //!   is about to send and re-checks size and hash
-//!   ([`AgentIdentityRepository::verify_snapshot_document`]): the definer
-//!   checks only the shape, and drops a frame under an already-stored hash
-//!   without comparing it, so the writer is the one place a frame that is not
-//!   its key's text can be stopped before it reaches the append-only table.
+//!   ([`AgentIdentityRepository::verify_snapshot_document`]). That is defence
+//!   in depth, not a closed gap: `register` derives frame, hash and size from
+//!   the same bytes, so on this path the check fails only on an encoder
+//!   fault. It is public as the contract for a writer that builds its own
+//!   document; a writer that calls the definer directly is not covered by it.
+//!   It also cannot see a frame ALREADY stored under the hash: the definer
+//!   drops the incoming frame on conflict, comparing only `raw_size`, and the
+//!   attestor cannot read the blob table. Detecting that needs a definer
+//!   change.
 //! * [`AgentIdentityRepository::prompt_history`] calls
 //!   `epigraph_agent_prompt_history`, which reads the session principal
 //!   (operator or admin, else `AID06`), then decompresses every returned file
@@ -352,8 +357,10 @@ impl AgentIdentityRepository {
     /// being compared, and a new frame is stored without being checked. Blobs
     /// are append-only, so a frame that does not decode to its key would
     /// withhold that file from every later snapshot naming the hash. This is
-    /// the write-side half of the reader's check: with it, an equal hash
-    /// means equal content whatever encoder or level produced the frame.
+    /// the write-side half of the reader's check, for the frames THIS caller
+    /// sends; any frame of the right text passes, whatever encoder or level
+    /// produced it. It says nothing about a frame already stored under the
+    /// hash, and nothing about writers that do not call it.
     ///
     /// # Errors
     /// [`DbError::InvalidData`] naming the first file whose frame does not
@@ -368,7 +375,7 @@ impl AgentIdentityRepository {
                 continue;
             }
             let invalid = |why: String| DbError::InvalidData {
-                reason: format!("snapshot.{file}: {why}; refusing to record it"),
+                reason: format!("snapshot.{file}: {why}; refusing to send it"),
             };
             let decode = |key: &str| -> Result<Vec<u8>, DbError> {
                 entry
@@ -383,8 +390,11 @@ impl AgentIdentityRepository {
                 .get("raw_size")
                 .and_then(Value::as_u64)
                 .ok_or_else(|| invalid("`raw_size` is not a non-negative integer".into()))?;
+            // `verified_blob`'s reasons already start with "{file}: ".
             let blob = verified_blob(file, Some(hash), Some(content))
-                .map_err(invalid)?
+                .map_err(|why| DbError::InvalidData {
+                    reason: format!("snapshot.{why}; refusing to send it"),
+                })?
                 .ok_or_else(|| invalid("no blob".into()))?;
             if blob.bytes.len() as u64 != raw_size {
                 return Err(invalid(format!(
@@ -657,10 +667,10 @@ fn verified_blob(
         .try_into()
         .map_err(|_| format!("{file}: a blob key is not 32 bytes"))?;
     let bytes = zstd::bulk::decompress(&content, MAX_PROMPT_FILE_BYTES)
-        .map_err(|e| format!("{file}: the stored blob does not decompress: {e}"))?;
+        .map_err(|e| format!("{file}: the blob does not decompress: {e}"))?;
     if blake3::hash(&bytes).as_bytes() != &blob_hash {
         return Err(format!(
-            "{file}: the stored blob does not hash to its key {}",
+            "{file}: the blob does not hash to its key {}",
             hex::encode(blob_hash)
         ));
     }
@@ -786,8 +796,12 @@ mod tests {
         .expect_err("a frame that is not the hashed text must be refused");
         match err {
             DbError::InvalidData { reason } => {
-                assert!(reason.contains("snapshot.learned_md"), "{reason}");
+                assert!(reason.contains("snapshot.learned_md:"), "{reason}");
                 assert!(reason.contains("does not hash to its key"), "{reason}");
+                // Nothing is stored at write time: the refusal must not say
+                // it is, nor repeat the file key.
+                assert!(!reason.contains("stored"), "{reason}");
+                assert!(!reason.contains("learned_md: learned_md"), "{reason}");
             }
             other => panic!("expected InvalidData, got {other:?}"),
         }
