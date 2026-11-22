@@ -1006,3 +1006,132 @@ async fn a_seed_derived_signer_key_verifies_no_claim(pool: PgPool) {
         "the ed25519 control must still verify through the bare key: {resp}"
     );
 }
+
+/// Backlog 57943a39, the repair path: an agent registered before migration
+/// 230 was stored as `ed25519`, and 161's backfill
+/// (`epigraph_backfill_legacy_agent_keys()`, re-run at cut-over) gave it an
+/// ACTIVE, open-ended `identity-legacy` row carrying that same key. The
+/// operator repair re-marks the agent `seed-derived`; the bare-key fallback
+/// then refuses it, but both verifiers also admitted the legacy row, so a
+/// forgery under the publicly computable key still verified, and through
+/// `verify_claim` it was even `key_bound`.
+///
+/// Paired: the same backfilled agent left `ed25519` verifies through its
+/// legacy row (kind `identity-legacy`, so the control exercises the legacy
+/// path, not the bare key) in both verifiers. Claim and edge are checked
+/// together because they read different row sets.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_re_marked_seed_derived_key_is_refused_through_its_legacy_row(pool: PgPool) {
+    use epigraph_db::repos::{EdgeRepository, EdgeSignatureRepository, EdgeSigningKey};
+
+    let t0 = Utc::now() - Duration::days(10);
+    // Anyone can compute this private key from the author's name.
+    let forged = epigraph_crypto::did_key::keypair_from_name("Ada Example");
+    let real = signer(0xE7);
+    let seeded = seed_agent(&pool, &forged.public_key(), t0).await;
+    let control = seed_agent(&pool, &real.public_key(), t0).await;
+
+    // The real backfill, as 161 and the cut-over run it.
+    sqlx::query("SELECT public.epigraph_backfill_legacy_agent_keys()")
+        .execute(&pool)
+        .await
+        .expect("backfill legacy keys");
+    for agent in [seeded, control] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_keys \
+              WHERE agent_id = $1 AND key_type = 'identity-legacy' AND status = 'active'",
+        )
+        .bind(agent)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy rows");
+        assert_eq!(n, 1, "the backfill must give {agent} one active legacy row");
+    }
+    // The operator repair.
+    sqlx::query("UPDATE agents SET key_kind = 'seed-derived' WHERE id = $1")
+        .bind(seeded)
+        .execute(&pool)
+        .await
+        .expect("re-mark seed-derived");
+
+    let mut verdicts = Vec::new();
+    for (agent, key, label) in [
+        (seeded, &forged, "re-marked seed-derived"),
+        (control, &real, "ed25519 control"),
+    ] {
+        let claim = seed_signed_claim(
+            &pool,
+            agent,
+            agent,
+            key,
+            &format!("57943a39: a claim by the {label} legacy key"),
+            t0 + Duration::days(1),
+        )
+        .await;
+        let target = seed_signed_claim(
+            &pool,
+            agent,
+            agent,
+            key,
+            &format!("57943a39: the {label} edge's target"),
+            t0 + Duration::days(1),
+        )
+        .await;
+        let mut conn = pool.acquire().await.expect("conn");
+        let edge = EdgeRepository::create_signed_conn(
+            &mut conn,
+            Some(EdgeSigningKey {
+                signer: key,
+                signer_id: agent,
+            }),
+            claim,
+            "claim",
+            target,
+            "claim",
+            "supports",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("signed edge");
+        let viewer = epigraph_db::visibility::Viewer::resolve(&pool, agent)
+            .await
+            .expect("viewer");
+        let edge_check = EdgeSignatureRepository::verify_conn(&mut conn, &viewer, edge)
+            .await
+            .expect("verify edge")
+            .expect("edge readable");
+        drop(conn);
+        verdicts.push((verify(&pool, claim).await, edge_check));
+    }
+
+    let (claim, edge) = &verdicts[0];
+    assert_eq!(claim["signed"], Value::Bool(true), "{claim}");
+    assert_eq!(
+        bound(claim),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a re-marked seed-derived key verified a claim through its legacy row: {claim}"
+    );
+    assert_eq!(
+        (edge.signature_valid, edge.key_kind, edge.pre_attestation),
+        (false, None, false),
+        "a re-marked seed-derived key attested an edge through its legacy row: {edge:?}"
+    );
+
+    let (claim, edge) = &verdicts[1];
+    assert_eq!(
+        bound(claim),
+        (
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::from("identity-legacy")
+        ),
+        "the ed25519 control must verify through its legacy row: {claim}"
+    );
+    assert_eq!(
+        (edge.signature_valid, edge.key_kind),
+        (true, Some("identity-legacy")),
+        "the ed25519 control edge must verify through its legacy row: {edge:?}"
+    );
+}

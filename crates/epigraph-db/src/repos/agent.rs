@@ -274,7 +274,10 @@ pub struct AgentPublicProfile {
 /// the OAuth placeholder `derived`, and so do the verifiers that read the
 /// bare key directly (backlog 57943a39): `verify_claim`'s bare-key fallback
 /// ([`AgentRepository::key_kind_of_public_key`]), the edge-signature check
-/// and the OAuth agent assertion check. Insert these rows with
+/// and the OAuth agent assertion check. The claim and edge verifiers also
+/// skip such an agent's `identity-legacy` row, which carries the same key
+/// (`AgentKeyRepository::attested_keys_for_claim`), so re-marking an existing
+/// row is enough. Insert these rows with
 /// [`AgentRepository::create_seed_derived_conn`] (over HTTP, `POST /agents`
 /// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";

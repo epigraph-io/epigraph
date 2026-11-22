@@ -34,9 +34,9 @@
 //! them, and never treat a signature under one as proof of anything (backlog
 //! bfc2eff8). An agent row created for such a key is stored with
 //! `key_kind = 'seed-derived'`, which every signature verifier refuses
-//! (`AgentRepository::public_key_if_signer`, `verify_claim`'s bare-key
-//! fallback, the edge verifier and the OAuth assertion check; backlog
-//! 57943a39). A signer needs a
+//! (`AgentRepository::public_key_if_signer`, `verify_claim` and the edge
+//! verifier, through the bare key and through a 161 `identity-legacy` row,
+//! and the OAuth assertion check; backlog 57943a39). A signer needs a
 //! random key, or `keypair_from_llm_agent_keyed`, whose seed is keyed with a
 //! secret the host keeps.
 

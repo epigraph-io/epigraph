@@ -568,17 +568,34 @@ impl EdgeSignatureRepository {
                 // The raw key still feeds `attests` below: a v1 signature
                 // under it is a real attestation by an unadmitted key, not a
                 // pre-attestation one.
-                let (agent_key, agent_key_is_verifier) = match agent {
-                    Some((key, kind)) => (Some(key), kind == "ed25519"),
-                    None => (None, false),
+                let (agent_key, agent_kind) = match agent {
+                    Some((key, kind)) => (Some(key), Some(kind)),
+                    None => (None, None),
                 };
+                let agent_key_is_verifier = agent_kind.as_deref() == Some("ed25519");
+                // Nor is a `seed-derived` agent's `identity-legacy` row
+                // admitted: it carries that same publicly computable key
+                // (migration 161's backfill wrote one for every agent that
+                // predates 230), so re-marking the row `seed-derived` must be
+                // enough to refuse it. Filtered for ADMISSION only; every row
+                // still feeds `attests`. Mirrors
+                // `AgentKeyRepository::attested_keys_for_claim`.
+                let agent_is_seed_derived =
+                    agent_kind.as_deref() == Some(crate::repos::agent::KEY_KIND_SEED_DERIVED);
+                let admissible: Vec<KeyRow> = rows
+                    .iter()
+                    .filter(|(_, key_type, ..)| {
+                        !(agent_is_seed_derived && key_type == "identity-legacy")
+                    })
+                    .cloned()
+                    .collect();
                 // v1 ONLY: the edge-tagged message, never the bare digest.
                 let message = signing_message(SignedEntity::Edge, &h);
                 let v1 = |key: &[u8; 32]| {
                     SignatureVerifier::verify(key, &message, &sig).unwrap_or(false)
                 };
                 let admitted_agent_key = agent_key.clone().filter(|_| agent_key_is_verifier);
-                verified = admitted_keys(&rows, admitted_agent_key, created_at)
+                verified = admitted_keys(&admissible, admitted_agent_key, created_at)
                     .iter()
                     .find(|(key, _)| v1(key))
                     .map(|(_, kind)| *kind);
