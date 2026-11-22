@@ -102,8 +102,10 @@ pub struct RevokeKeyRequest {
 /// (the self path, which writes no admin audit row), `Some(admin)` when the
 /// caller was admitted through the `claims:admin` override on another agent's
 /// key. The override needs a principal to attribute the audit row to
-/// (migration 112's definer refuses a null admin, `ADM01`), so an override
-/// without one is refused here, before anything is read or written.
+/// (migration 112's definer refuses a null admin, `ADM01`). Both key routes
+/// take a `ViewerExtractor`, which already refuses a token with no principal
+/// (401) before the handler runs; the `None` arm below keeps this function
+/// sound for a caller that does not.
 ///
 /// [`AuthContext::has_scope`]: crate::middleware::bearer::AuthContext::has_scope
 #[cfg(feature = "db")]
@@ -277,8 +279,9 @@ fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
 /// # Errors
 ///
 /// - 400 Bad Request: a field is not valid hex or has the wrong length
-/// - 401 Unauthorized: Missing or invalid Bearer token, or the old-key or
-///   new-key signature does not verify (`SignatureError`)
+/// - 401 Unauthorized: Missing or invalid Bearer token, a token that carries
+///   no `agent_id` (the viewer extractor runs before the handler), or the
+///   old-key or new-key signature does not verify (`SignatureError`)
 /// - 403 Forbidden: Missing scope or caller is not the target agent, or the
 ///   `claims:admin` override's token has no live `claims:admin` grant on its
 ///   client record (`ADM02`)
@@ -291,6 +294,7 @@ fn attested_key_refusal(e: epigraph_db::DbError) -> ApiError {
 pub async fn rotate_agent_key(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path(id): Path<Uuid>,
     Json(request): Json<RotateKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
@@ -358,8 +362,20 @@ pub async fn rotate_agent_key(
 
     let agent_id = AgentId::from_uuid(id);
 
+    // Every read and write below, the admin audit row included, runs on ONE
+    // transaction stamped with the caller's viewer, so the retirement, the new
+    // key and (on the admin override) the audit row commit together or not at
+    // all: a failed store no longer leaves the agent with its old key retired
+    // and no active key, and an admin rotation is never committed unaudited.
+    // Stamped, not a bare pool transaction, because a database gate on the key
+    // writes keyed on the caller's principal sees the caller here. An early
+    // return drops `tx`, which rolls it back.
+    let mut tx = state
+        .write_as(&viewer, "agent_keys::rotate_agent_key")
+        .await?;
+
     // Look up the current active key
-    let active_key = AgentKeyRepository::get_active_key(&state.db_pool, agent_id, "signing")
+    let active_key = AgentKeyRepository::get_active_key(&mut *tx, agent_id, "signing")
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "ActiveAgentKey".to_string(),
@@ -401,20 +417,7 @@ pub async fn rotate_agent_key(
         });
     }
 
-    // ONE transaction for the retirement, the new key and (on the admin
-    // override) the admin audit row: they commit together or not at all, so a
-    // failed store no longer leaves the agent with its old key retired and no
-    // active key, and an admin rotation is never committed unaudited. An
-    // early return drops `tx`, which rolls it back.
     let new_key_id = Uuid::new_v4();
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("rotate_agent_key: could not begin the transaction: {e}"),
-        })?;
-
     if let Some(admin) = admin {
         audit_admin_key_change(
             &mut tx,
@@ -496,7 +499,8 @@ pub async fn rotate_agent_key(
 /// # Errors
 ///
 /// - 400 Bad Request: the key is already revoked
-/// - 401 Unauthorized: Missing or invalid Bearer token
+/// - 401 Unauthorized: Missing or invalid Bearer token, or a token that
+///   carries no `agent_id` (the viewer extractor runs before the handler)
 /// - 403 Forbidden: Missing scope or caller is not the target agent, or the
 ///   `claims:admin` override's token has no live `claims:admin` grant on its
 ///   client record (`ADM02`)
@@ -506,6 +510,7 @@ pub async fn rotate_agent_key(
 pub async fn revoke_agent_key(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Path((id, key_id)): Path<(Uuid, Uuid)>,
     Json(request): Json<RevokeKeyRequest>,
 ) -> Result<Json<KeyResponse>, ApiError> {
@@ -518,8 +523,16 @@ pub async fn revoke_agent_key(
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
     let admin = require_self_or_admin(auth, id)?;
 
+    // The lookup, the revocation and (on the admin override) its admin audit
+    // row share ONE transaction stamped with the caller's viewer, so an admin
+    // revocation is never committed unaudited, and a database gate on the key
+    // write keyed on the caller's principal sees the caller.
+    let mut tx = state
+        .write_as(&viewer, "agent_keys::revoke_agent_key")
+        .await?;
+
     // Look up the key to verify it belongs to this agent
-    let key = AgentKeyRepository::get_by_id(&state.db_pool, key_id)
+    let key = AgentKeyRepository::get_by_id(&mut *tx, key_id)
         .await?
         .ok_or_else(|| ApiError::NotFound {
             entity: "AgentKey".to_string(),
@@ -544,17 +557,6 @@ pub async fn revoke_agent_key(
     // an admin principal need not have an agents row, so recording it could
     // fail the emergency revoke path; recording the target would be false.
     // (`admin` is `None` exactly when the caller is the target agent.)
-    //
-    // The revocation and (on the admin override) its admin audit row share
-    // ONE transaction, so an admin revocation is never committed unaudited.
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("revoke_agent_key: could not begin the transaction: {e}"),
-        })?;
-
     if let Some(admin) = admin {
         audit_admin_key_change(
             &mut tx,

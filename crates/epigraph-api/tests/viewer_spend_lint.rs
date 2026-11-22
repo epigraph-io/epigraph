@@ -141,6 +141,33 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "list_acts",
         &["AdminActCeremony::list_mine"],
     ),
+    // stamped: `agent_keys` is untenanted identity data (no row security, no
+    // owner group; any `agents:read` holder lists an agent's keys). The route
+    // admits only the key's agent or a `claims:admin` caller first
+    // (`require_self_or_admin`); the lookup, the key change and the admin
+    // audit row (migration 112's definer, which re-checks the client grant)
+    // share the caller's stamped transaction (backlog 6492de67).
+    (
+        "agent_keys.rs",
+        "revoke_agent_key",
+        &[
+            "AgentKeyRepository::get_by_id",
+            "AgentKeyRepository::update_status",
+            "audit_admin_key_change",
+        ],
+    ),
+    // stamped: as `revoke_agent_key`; the rotation's lookup, retirement, new
+    // key and admin audit row share the caller's stamped transaction.
+    (
+        "agent_keys.rs",
+        "rotate_agent_key",
+        &[
+            "AgentKeyRepository::get_active_key",
+            "AgentKeyRepository::store",
+            "AgentKeyRepository::update_status",
+            "audit_admin_key_change",
+        ],
+    ),
     // stamped: a security-definer read that refuses a caller who is neither
     // the agent's operator nor an admin; agents are untenanted.
     (
