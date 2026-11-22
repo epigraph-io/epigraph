@@ -3092,6 +3092,18 @@ The policy:
   its anchor's certificate is later listed: it holds through its anchor, and
   stops only when the anchor is revoked (`revoke-passkey`). Under the
   software policy nothing is re-checked.
+- **Keep a retired Android root in the PEM while any passkey chains to it.**
+  The same re-check verifies the stored chain to a root configured NOW. An
+  enrolled `android-key` passkey whose chain reaches no root in
+  `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (for example after Google rotates
+  its attestation roots and an old one is dropped from the file) answers
+  `403 attestation_not_in_good_standing` at every elevation and admin-act
+  confirmation, as if revoked, and stops anchoring. Before removing a root,
+  count the enrolled `android-key` passkeys whose stored chain verifies only
+  to it, and re-enroll or revoke them first. An `android-key` passkey under
+  a policy with no Android roots at all answers
+  `503 attestation_status_unavailable` instead (the WARN log says that the
+  roots, not the list, are missing).
 
 Fetching and refreshing the file is an operator job outside the API. A job
 that fails leaves the old file in place, and nothing in the API refuses until

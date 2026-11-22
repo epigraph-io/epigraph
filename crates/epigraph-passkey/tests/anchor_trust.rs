@@ -778,6 +778,46 @@ async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
     );
 }
 
+/// The assertion re-check verifies the stored chain to an Android root
+/// configured NOW (the deploy guide's "keep a retired Android root" step):
+/// once the root an enrolled passkey chains to is dropped from the PEM, the
+/// passkey is not in good standing (403), and under a policy with no
+/// Android roots at all its standing cannot be checked (503).
+/// CALIBRATION: under the roots it registered with, it is in good standing.
+/// Mutations: the chain-verification failure in `android_key_serials`
+/// mapped to `Unknown` -> the dropped-root case is `Unknown`; the missing
+/// roots mapped to `NotInGoodStanding` -> the no-roots case is.
+#[tokio::test]
+async fn an_android_passkey_whose_root_is_no_longer_configured_does_not_assert() {
+    let google = TestAttestation::new("Android");
+    let rotated = TestAttestation::new("Android");
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(None, Some(&google), false);
+    let (_, reg) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let reg = reg.expect("a genuine phone registers");
+    assert_eq!(
+        rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+        Ok(()),
+        "CALIBRATION: under its own root"
+    );
+
+    let dropped = attested(None, Some(&rotated), false);
+    match dropped.assertion_standing(&reg.passkey, &reg.attestation_format) {
+        Err(StandingRefusal::NotInGoodStanding(why)) => {
+            assert!(why.contains("Android key root"), "{why}");
+        }
+        other => panic!("its root dropped from the PEM: {other:?}"),
+    }
+
+    let no_roots = attested(Some((&vendor, &[MODEL][..])), None, false);
+    match no_roots.assertion_standing(&reg.passkey, &reg.attestation_format) {
+        Err(StandingRefusal::Unknown(why)) => {
+            assert!(why.contains("no Android key roots"), "{why}");
+        }
+        other => panic!("no Android roots configured: {other:?}"),
+    }
+}
+
 /// What the assertion re-check does NOT do. It does not hold an Android
 /// passkey to its certificates' validity periods (an attestation speaks for
 /// its registration; an expiry is not a revocation): a stored chain whose
