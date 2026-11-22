@@ -1808,3 +1808,61 @@ mod less_readable_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "db"))]
+mod bp_run_permit_tests {
+    use super::run_bp_blocking;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    /// Backlog b02347c6: a run's permit is held by the blocking task, not
+    /// only by the request. When the request future is dropped mid-run (a
+    /// client that disconnects), the thread keeps computing, so the permit
+    /// must stay taken until the thread ends; otherwise every disconnect
+    /// lets one more run onto the blocking pool than the limit allows.
+    #[tokio::test]
+    async fn a_dropped_request_keeps_its_permit_until_the_blocking_run_ends() {
+        let runs = Arc::new(Semaphore::new(1));
+        let permit = Arc::new(runs.clone().try_acquire_owned().expect("one permit"));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Poll the run until it is on the blocking pool, then drop the
+        // request future, as axum does when the client goes away.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_bp_blocking(&permit, move || {
+                let _ = started_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            }),
+        )
+        .await;
+        assert!(dropped.is_err(), "the run must still be in flight");
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("join")
+            .expect("the blocking run started");
+        // The handler's own share goes with its dropped future.
+        drop(permit);
+
+        assert_eq!(
+            runs.available_permits(),
+            0,
+            "the blocking run is still computing, so its permit must still be taken"
+        );
+        assert!(
+            runs.clone().try_acquire_owned().is_err(),
+            "a new run must be refused while the disconnected one computes"
+        );
+
+        release_tx.send(()).expect("release the run");
+        let freed = tokio::time::timeout(Duration::from_secs(10), async {
+            while runs.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(freed.is_ok(), "the permit must come back once the run ends");
+    }
+}
