@@ -108,7 +108,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("graph_neighborhood.rs", 1),
     ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
-    ("papers.rs", 8),
+    ("papers.rs", 4),
     ("policies.rs", 4),
     ("revoke_signature.rs", 6),
     ("search.rs", 3),
@@ -137,7 +137,10 @@ const REGISTER: &[(&str, usize)] = &[
 /// Lowered to 94 on staging batch 4 by backlog batch B37 (#895): its route
 /// reads moved into the repo layer (`search.rs` 4 -> 3; `conflicts.rs`,
 /// `embeddings.rs`, `political.rs` and `workflows.rs` reached zero).
-const HIGH_WATER: usize = 91;
+/// Lowered to 87 by migration 246 (backlog 34864fb5): `create_paper`'s
+/// lookup, fill-only update, insert and re-fetch became
+/// `PaperRepository::get_or_create` and `registered_row` (`papers.rs` 8 -> 4).
+const HIGH_WATER: usize = 87;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

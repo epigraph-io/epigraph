@@ -11,14 +11,26 @@ use helpers::{make_agent, make_claim};
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
     let doi = "10.1234/test-paper-1";
-    let id1 = PaperRepository::get_or_create(&pool, doi, Some("Title 1"), Some("Journal X"))
-        .await
-        .expect("first insert");
+    let id1 = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Title 1"),
+        Some("Journal X"),
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("first insert");
 
     // Second call with the same DOI should return the same id (UNIQUE on doi).
-    let id2 = PaperRepository::get_or_create(&pool, doi, Some("Title 1 updated"), None)
-        .await
-        .expect("second insert");
+    let id2 = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Title 1 updated"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("second insert");
     assert_eq!(id1, id2, "same DOI must return same paper id");
 
     // A hit fills only what is missing (backlog 62ce37ca): the first
@@ -39,15 +51,22 @@ async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     let doi = "10.5555/repo-fill-only";
-    let id = PaperRepository::get_or_create(&pool, doi, Some("Original title"), None)
-        .await
-        .expect("first writer");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("Original title"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("first writer");
 
     let again = PaperRepository::get_or_create(
         &pool,
         doi,
         Some("Rewritten by a second ingester"),
         Some("Second journal"),
+        epigraph_core::TenancyDecl::instance_wide(),
     )
     .await
     .expect("second writer");
@@ -69,9 +88,15 @@ async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     );
 
     // And once filled, the journal is not rewritten either.
-    PaperRepository::get_or_create(&pool, doi, None, Some("Third journal"))
-        .await
-        .expect("third writer");
+    PaperRepository::get_or_create(
+        &pool,
+        doi,
+        None,
+        Some("Third journal"),
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("third writer");
     let row = PaperRepository::find_by_doi(&pool, doi)
         .await
         .expect("find_by_doi")
@@ -91,10 +116,15 @@ async fn find_by_doi_returns_none_for_unknown(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/has-pbe", Some("Has-PBE Paper"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/has-pbe",
+        Some("Has-PBE Paper"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
 
     // No edge yet → false.
     assert!(!PaperRepository::has_processed_by_edge(
@@ -222,9 +252,15 @@ async fn get_or_create_reuses_a_legacy_url_keyed_row_instead_of_twinning(pool: P
     let legacy_key = format!("https://doi.org/{bare}");
     let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
 
-    let id = PaperRepository::get_or_create(&pool, bare, Some("re-ingested"), None)
-        .await
-        .expect("get_or_create");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        Some("re-ingested"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
 
     assert_eq!(
         rows_ending_in(&pool, "repo-legacy-reuse").await,
@@ -251,9 +287,15 @@ async fn get_or_create_prefers_the_canonical_row_over_a_legacy_twin(pool: PgPool
     let _legacy = seed_raw_paper(&pool, &format!("https://doi.org/{bare}"), "legacy").await;
     let canonical = seed_raw_paper(&pool, bare, "canonical").await;
 
-    let id = PaperRepository::get_or_create(&pool, &format!("https://doi.org/{bare}"), None, None)
-        .await
-        .expect("get_or_create");
+    let id = PaperRepository::get_or_create(
+        &pool,
+        &format!("https://doi.org/{bare}"),
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("get_or_create");
     assert_eq!(
         id, canonical,
         "with both spellings stored, the canonical (bare) row is the one returned"
@@ -265,9 +307,15 @@ async fn get_or_create_prefers_the_canonical_row_over_a_legacy_twin(pool: PgPool
 async fn get_or_create_stores_a_new_paper_under_the_canonical_key(pool: PgPool) {
     let bare = "10.5555/repo-canonical-insert";
     for spelling in [format!("doi:{bare}"), format!("https://dx.doi.org/{bare}")] {
-        PaperRepository::get_or_create(&pool, &spelling, None, None)
-            .await
-            .expect("get_or_create");
+        PaperRepository::get_or_create(
+            &pool,
+            &spelling,
+            None,
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
+        .expect("get_or_create");
     }
     let rows = rows_ending_in(&pool, "repo-canonical-insert").await;
     assert_eq!(rows.len(), 1, "two spellings, one paper: {rows:?}");
@@ -290,7 +338,14 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
 
     let p = pool.clone();
     let writer = tokio::spawn(async move {
-        PaperRepository::get_or_create(&p, &format!("https://doi.org/{bare}"), None, None).await
+        PaperRepository::get_or_create(
+            &p,
+            &format!("https://doi.org/{bare}"),
+            None,
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
     });
 
     // Wait (bounded) until the writer blocks on the held row's unique-index
@@ -341,7 +396,14 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
 
     let p = pool.clone();
     let writer = tokio::spawn(async move {
-        PaperRepository::get_or_create(&p, bare, Some("loser"), Some("loser journal")).await
+        PaperRepository::get_or_create(
+            &p,
+            bare,
+            Some("loser"),
+            Some("loser journal"),
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
     });
 
     for _ in 0..200 {
@@ -393,10 +455,15 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
-    let paper_id =
-        PaperRepository::get_or_create(&pool, "10.1234/parallel-edges", Some("Parallel"), None)
-            .await
-            .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/parallel-edges",
+        Some("Parallel"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
     let author = AgentRepository::create(&pool, &make_agent(Some("Ysolde Pemberton")))
         .await
         .expect("create author")

@@ -1973,14 +1973,16 @@ async fn d1_tenancy_stamping_triggers_are_armed(pool: PgPool) {
     // 074's parentless-root body on another tier-A table.
     // 27 -> 30 (Atlas W2, backlog 77f4bf09): migration 210's
     // `atlas_map_{epochs,runs,levels}_require_tenancy`, the same root body.
+    // 30 -> 31 (backlog 34864fb5): migration 246's `papers_require_tenancy`,
+    // the same root body on the paper registry.
     assert_eq!(
         pr16.len(),
-        30,
-        "expected 30: after migration 074, 24 *_require_tenancy (claims, the 17 \
+        31,
+        "expected 31: after migration 074, 24 *_require_tenancy (claims, the 17 \
          claim-derived tables, the 6 parentless roots) plus claims_block_widening; \
          migration 173 adds harvester_sources_require_tenancy, migration 183 \
-         workflows_require_tenancy and migration 210 the three atlas_map_* triggers. \
-         Found {}: {pr16:?}",
+         workflows_require_tenancy, migration 210 the three atlas_map_* triggers and \
+         migration 246 papers_require_tenancy. Found {}: {pr16:?}",
         pr16.len()
     );
     let pr16_disabled: Vec<&(String, String)> = pr16.iter().filter(|(_, e)| e != "O").collect();
@@ -2364,6 +2366,9 @@ const FORCE_PROTECTED_SET: &[&str] = &[
     // them; their tenancy is inherited from the workflow row, so they carry no
     // tenancy columns and are reached through WORKFLOW_REPORT_TABLES below.
     "workflow_outcome_reports",
+    // Paper rows (246, backlog 34864fb5): tier-A since that migration, which
+    // FORCEs the table itself; reached through `tier_a` in the test below.
+    "papers",
 ];
 
 /// The ten non-`tier_a` members 079 FORCEs, named so the arithmetic below is
@@ -2516,11 +2521,14 @@ async fn d4_the_force_array_is_tier_a_plus_the_control_tables(pool: PgPool) {
     // columns and FORCEs it, so it joins `tier_a` here and in the catalog.
     // 28 -> 31 (Atlas W2, backlog 77f4bf09): migration 210's three
     // `atlas_map_*` tables carry both columns and are FORCEd by it.
+    // 31 -> 32 (backlog 34864fb5): migration 246 gives `papers` both tenancy
+    // columns and FORCEs it.
     assert_eq!(
         tier_a.len(),
-        31,
+        32,
         "migration 062's tier_a is 25 relations, 173 adds the two harvester neighbours, \
-         183 adds workflows and 210 the three atlas_map_* tables; got {}: {tier_a:?}",
+         183 adds workflows, 210 the three atlas_map_* tables and 246 papers; got {}: \
+         {tier_a:?}",
         tier_a.len()
     );
 

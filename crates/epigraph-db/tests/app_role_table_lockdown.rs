@@ -103,7 +103,6 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("match_candidates", MATCH),
     ("method_capabilities", REGISTRY),
     ("methods", REGISTRY),
-    ("papers", REGISTRY),
     ("tasks", OPERATIONAL),
     ("webhook_subscriptions", OPERATIONAL),
     ("workflow_executions", OPERATIONAL),

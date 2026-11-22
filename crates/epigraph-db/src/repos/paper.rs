@@ -1,10 +1,10 @@
 //! Paper entity repository.
 //!
 //! Papers are first-class graph nodes (entity_type = "paper") used by
-//! hierarchical document ingestion. The `papers` table has a UNIQUE
-//! constraint on `doi`, so re-ingestion of the same DOI returns the
-//! existing paper id (get-or-create semantics) rather than creating a
-//! second row. Re-ingestion is gated separately via the `processed_by`
+//! hierarchical document ingestion. Since migration 246 a row carries the
+//! tenancy of the ingest that wrote it and `papers` is unique on (document
+//! key, scope): every public ingest of a DOI returns the one public row
+//! (get-or-create semantics), and a group's private ingest returns its own. Re-ingestion is gated separately via the `processed_by`
 //! edge with a `pipeline` property.
 
 use sqlx::PgPool;
@@ -21,42 +21,82 @@ pub struct PaperRow {
     pub journal: Option<String>,
 }
 
+/// A `papers` row as `POST /api/v1/papers` answers it
+/// ([`PaperRepository::registered_row`]).
+#[derive(Debug, Clone)]
+pub struct RegisteredPaper {
+    pub id: Uuid,
+    pub doi: String,
+    pub title: Option<String>,
+    pub journal: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// `(visibility, owner_group_id)` of a declared paper write. A paper has no
+/// parent to inherit from, so an `Inherited` declaration is refused here
+/// rather than by the database's 23502.
+fn declared(decl: epigraph_core::TenancyDecl) -> Result<(&'static str, Uuid), DbError> {
+    match (decl.visibility_bind(), decl.owner_group_bind()) {
+        (Some(v), Some(g)) => Ok((v, g)),
+        _ => Err(DbError::InvalidData {
+            reason: "a papers row must be written with a declared tenancy (visibility and \
+                     owner group); a paper has no parent to inherit one from"
+                .to_string(),
+        }),
+    }
+}
+
 pub struct PaperRepository;
 
 impl PaperRepository {
-    /// Insert a paper, or return the existing id if the document key already
-    /// exists under any of its spellings.
+    /// Insert a paper in the scope `decl` names, or return the existing row of
+    /// that scope if the document key already exists there under any of its
+    /// spellings.
     ///
-    /// The key is matched through [`document_key_spellings`], canonical
-    /// first, so a row an older writer stored under a resolver URL
-    /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
-    /// ingest (backlog 90756d26). A new row is stored under the
-    /// [`canonical_document_key`]. Idempotent for repeat ingestion.
+    /// # One row per document per scope (migration 246)
     ///
-    /// **A hit fills only NULL fields** (backlog 62ce37ca). `papers` is one
-    /// global row per document with no row security, and this runs on the
-    /// plain pool before any per-caller authority over the paper is checked,
-    /// so the row found keeps its `title` and `journal`; a provided value is
-    /// written only where the stored one is NULL. Overwriting on hit let any
-    /// ingester naming an existing DOI rewrite that paper's bibliographic
-    /// fields for every reader. Both arms below hold this: the `updated` CTE
-    /// (an existing row) and `ON CONFLICT` (a concurrent writer inserted the
-    /// same new key first).
+    /// `papers` carries the tenancy of the ingest that wrote it. A PUBLIC row
+    /// is shared: every public writer of a document converges on its one public
+    /// row, whoever owns it (that is how two sources corroborate, and why a
+    /// public ingest behaves as it did before 246). A GROUP row belongs to its
+    /// owner group: a team's private ingest of a document another team holds
+    /// privately creates its own row and learns nothing about the other's.
+    /// The lookup therefore matches the declared SCOPE, not merely what the
+    /// session can see: a member sees both its group's row and the public one,
+    /// and must reuse the one its declaration names.
     ///
-    /// One statement: when no spelling exists yet, the insert falls through
-    /// to `ON CONFLICT (doi)` on the canonical key, so a concurrent writer
-    /// that inserted the same document under another spelling makes this
-    /// call wait and then return that writer's row, not a unique violation.
+    /// Run it on the writer's STAMPED connection (`decl` is the ingest's
+    /// resolved declaration). Row security admits the INSERT only for an owner
+    /// group the session writes; the conflicting row of a scope is always one
+    /// the writer can read (public, or its own group's), so the upsert never
+    /// lands on a hidden row.
+    ///
+    /// The key is matched through [`document_key_spellings`], canonical first,
+    /// so a row an older writer stored under a resolver URL is reused rather
+    /// than twinned (backlog 90756d26). A new row is stored under the
+    /// [`canonical_document_key`].
+    ///
+    /// **A hit fills only NULL fields** (backlog 62ce37ca): the row found keeps
+    /// its `title` and `journal`; a provided value is written only where the
+    /// stored one is NULL. Both arms hold this: the `updated` CTE (an existing
+    /// row) and `ON CONFLICT` (a concurrent writer inserted the same new key in
+    /// the same scope first, which makes this call wait and then return that
+    /// writer's row, not a unique violation).
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_or_create(
-        pool: &PgPool,
+    /// `DbError::InvalidData` for an undeclared (`Inherited`) `decl`: a paper
+    /// has no parent to inherit from. `DbError::QueryFailed` if the statement
+    /// fails, including a row-security refusal (42501) for an owner group the
+    /// session does not write.
+    #[instrument(skip(executor))]
+    pub async fn get_or_create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         doi: &str,
         title: Option<&str>,
         journal: Option<&str>,
+        decl: epigraph_core::TenancyDecl,
     ) -> Result<Uuid, DbError> {
+        let (visibility, owner) = declared(decl)?;
         let canonical = canonical_document_key(doi);
         let spellings = document_key_spellings(doi);
         // Runtime-checked, not `query!`: CI's migration runner is built
@@ -67,6 +107,8 @@ impl PaperRepository {
             WITH found AS (
                 SELECT id FROM papers
                 WHERE doi = ANY($1::text[])
+                  AND visibility = $5::text
+                  AND ($5::text = 'public' OR owner_group_id = $6::uuid)
                 ORDER BY array_position($1::text[], doi)
                 LIMIT 1
             ),
@@ -79,10 +121,13 @@ impl PaperRepository {
                 RETURNING p.id
             ),
             inserted AS (
-                INSERT INTO papers (doi, title, journal)
-                SELECT $2::text, $3::text, $4::text
+                INSERT INTO papers (doi, title, journal, visibility, owner_group_id)
+                SELECT $2::text, $3::text, $4::text, $5::text, $6::uuid
                 WHERE NOT EXISTS (SELECT 1 FROM found)
-                ON CONFLICT (doi) DO UPDATE SET
+                ON CONFLICT (doi, (CASE WHEN visibility = 'public'
+                                        THEN '00000000-0000-0000-0000-000000000000'::uuid
+                                        ELSE owner_group_id END))
+                DO UPDATE SET
                     title = COALESCE(papers.title, EXCLUDED.title),
                     journal = COALESCE(papers.journal, EXCLUDED.journal)
                 RETURNING id
@@ -96,9 +141,115 @@ impl PaperRepository {
         .bind(&canonical)
         .bind(title)
         .bind(journal)
-        .fetch_one(pool)
+        .bind(visibility)
+        .bind(owner)
+        .fetch_one(executor)
         .await?;
         Ok(id)
+    }
+
+    /// The id of the row of `doi` in the scope `decl` names (see
+    /// [`Self::get_or_create`]), under any spelling, canonical first; `None`
+    /// when that scope has none. The row a write declared with `decl` would
+    /// reuse, read on the writer's stamped connection.
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for an undeclared `decl`; `DbError::QueryFailed`
+    /// if the query fails.
+    pub async fn find_in_scope<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+        decl: epigraph_core::TenancyDecl,
+    ) -> Result<Option<Uuid>, DbError> {
+        let (visibility, owner) = declared(decl)?;
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM papers \
+              WHERE doi = ANY($1::text[]) AND visibility = $2::text \
+                AND ($2::text = 'public' OR owner_group_id = $3::uuid) \
+              ORDER BY array_position($1::text[], doi) LIMIT 1",
+        )
+        .bind(document_key_spellings(doi))
+        .bind(visibility)
+        .bind(owner)
+        .fetch_optional(executor)
+        .await?)
+    }
+
+    /// Every `papers` row of the document `raw` names that `viewer` may read,
+    /// under any of its [`document_key_spellings`]: spelling order first
+    /// (canonical, then as given, then legacy resolver spellings), then the
+    /// viewer's own GROUP rows before the public one (the copy a team's ingest
+    /// wrote is the one its member asked about), then oldest first.
+    ///
+    /// Migration 246 gives `papers` row security, so on `viewer`'s stamped
+    /// connection a row of another group's private ingest is simply absent: no
+    /// existence oracle. Run it on that connection so the predicate spliced
+    /// here and the row security agree.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the query fails.
+    pub async fn visible_by_document_key(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        raw: &str,
+    ) -> Result<Vec<PaperRow>, DbError> {
+        let sql = viewer.splice(
+            "SELECT p.id, p.doi, p.title, p.journal FROM papers p \
+              WHERE p.doi = ANY($1::text[]) /* {VISIBILITY:p} */ \
+              ORDER BY array_position($1::text[], p.doi), (p.visibility = 'group') DESC, \
+                       p.created_at, p.id",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, String, Option<String>, Option<String>)>(&sql)
+            .bind(document_key_spellings(raw));
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .map(|(id, doi, title, journal)| PaperRow {
+                id,
+                doi,
+                title,
+                journal,
+            })
+            .collect())
+    }
+
+    /// The row [`Self::get_or_create`] just returned, read back on the SAME
+    /// connection (the writer's stamped transaction) for a response:
+    /// `POST /api/v1/papers`. The id came from that write, so row security on
+    /// that connection already admits it; there is no viewer to spend.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the query fails or no row has this id.
+    pub async fn registered_row<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<RegisteredPaper, DbError> {
+        let (id, doi, title, journal, created_at) = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Option<String>,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT id, doi, title, journal, COALESCE(created_at, now()) FROM papers WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(executor)
+        .await?;
+        Ok(RegisteredPaper {
+            id,
+            doi,
+            title,
+            journal,
+            created_at,
+        })
     }
 
     /// Find a paper by DOI. Returns `None` if no paper has this DOI.

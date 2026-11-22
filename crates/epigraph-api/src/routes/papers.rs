@@ -8,17 +8,19 @@
 //!
 //! # Tenancy
 //!
-//! `list_papers` takes a `ViewerExtractor` (its items carry per-viewer
-//! authors, claim counts and ingests) and runs every statement, the registry
-//! rows included, on the caller's stamped connection.
+//! Since migration 246 a `papers` row carries the tenancy of the ingest that
+//! wrote it, under FORCEd row security (a team's or agent's private ingest
+//! writes a row only its group reads).
 //!
-//! `create_paper` holds no `Viewer` and keeps its four pool sites
-//! (`epigraph-db/tests/no_unscoped_pool.rs`): two of them write (its
-//! `UPDATE papers` and its `INSERT ... RETURNING`, the latter issued as a
-//! `fetch_one`), and `read_as` is read-only by construction (see
-//! `routes/belief.rs`'s module doc for why routing a write through it is a
-//! silent rollback rather than a compile error). Shard 4's schema measurement
-//! of this file is registered as `F-SHARD4-A3`.
+//! `list_papers` takes a `ViewerExtractor` (its items carry per-viewer
+//! authors, claim counts and ingests) and runs every statement, the paper rows
+//! included, on the caller's stamped connection, whose row security admits
+//! only the papers the caller may read.
+//!
+//! `create_paper` takes a `ViewerExtractor` too and registers a PUBLIC row
+//! owned by the caller's home group, written and read back on the caller's
+//! stamped transaction (`AppState::begin_claim_write`); the one pool site left
+//! (`epigraph-db/tests/no_unscoped_pool.rs`) is the home-group resolution.
 
 use crate::errors::ApiError;
 use crate::state::AppState;
@@ -274,15 +276,23 @@ pub struct PaginatedPaperResponse {
 ///
 /// POST /api/v1/papers
 ///
-/// Inserts a new paper under the canonical document key
+/// Registers a PUBLIC paper under the canonical document key
 /// (`epigraph_db::repos::paper::canonical_document_key`), or returns the
-/// existing one found under any spelling of that key, filling title/journal
-/// only where the stored value is NULL (an existing value is never
-/// overwritten; backlog 62ce37ca).
+/// existing public row of that document found under any spelling of the key,
+/// filling title/journal only where the stored value is NULL (an existing
+/// value is never overwritten; backlog 62ce37ca). A team's or agent's private
+/// copy of the document (a non-public ingest's row, migration 246) is neither
+/// returned nor touched.
+///
+/// The row is owned by the caller's home group, and written on a transaction
+/// stamped from the caller (`AppState::begin_claim_write`): since migration
+/// 246 `papers` has row security, and an unstamped write carries no writable
+/// group. A request with no `ViewerExtractor` principal is refused.
 #[cfg(feature = "db")]
 pub async fn create_paper(
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     Json(request): Json<CreatePaperRequest>,
 ) -> Result<Json<PaperResponse>, ApiError> {
     // Enforce scope unconditionally: a request with no AuthContext is refused
@@ -300,93 +310,61 @@ pub async fn create_paper(
         });
     }
 
-    use sqlx::Row;
+    let principal = viewer.principal().ok_or_else(|| ApiError::Unauthorized {
+        reason: "a paper must be registered by a principal".into(),
+    })?;
+    // The caller's home group owns the row (the same owner rule as a claim the
+    // caller writes); the row is public, as every row this route wrote before
+    // migration 246 was.
+    let home =
+        epigraph_db::ClaimRepository::default_decl_for_author_pool(&state.db_pool, principal)
+            .await?
+            .owner_group_bind()
+            .ok_or_else(|| ApiError::InternalError {
+                message: "the caller's home group did not resolve".to_string(),
+            })?;
+    let decl = epigraph_core::TenancyDecl::public(home);
 
     // One document key per paper, shared with the MCP ingestion tools
     // (backlog 90756d26): `https://doi.org/10.x/y`, `doi:10.x/y` and `10.x/y`
-    // are one paper. A new row is stored under the canonical (bare) key; an
-    // existing row is found under any of its spellings, canonical first, so a
+    // are one paper. `get_or_create` stores a new row under the canonical
+    // (bare) key and finds an existing one under any of its spellings, so a
     // row an older writer keyed on the resolver URL is reused rather than
-    // twinned.
-    let doi = epigraph_db::repos::paper::canonical_document_key(&request.doi);
-    let spellings = epigraph_db::repos::paper::document_key_spellings(&request.doi);
-
-    // Check for existing paper first
-    let existing: Option<_> = sqlx::query(
-        "SELECT id, doi, title, journal, created_at FROM papers \
-         WHERE doi = ANY($1) ORDER BY array_position($1, doi) LIMIT 1",
+    // twinned; a concurrent POST of the same new document under another
+    // spelling waits on the insert and gets the winner's row.
+    let mut tx = state.begin_claim_write(&viewer, "create_paper").await?;
+    let id = epigraph_db::PaperRepository::get_or_create(
+        &mut *tx,
+        &request.doi,
+        request.title.as_deref(),
+        request.journal.as_deref(),
+        decl,
     )
-    .bind(&spellings)
-    .fetch_optional(&state.db_pool)
     .await
-    .map_err(|e| ApiError::DatabaseError {
-        message: format!("Failed to query paper: {e}"),
-    })?;
-
-    let row = if let Some(existing_row) = existing {
-        // Paper exists — fill title/journal only where the stored value is
-        // NULL, then re-fetch. By id: the row found may be keyed on a legacy
-        // spelling. Fill-only, not overwrite (backlog 62ce37ca): `papers` is
-        // one global row per document with no row security, so overwriting
-        // let any `claims:write` caller naming an existing DOI rewrite that
-        // paper's title for every reader. Same rule as
-        // `PaperRepository::get_or_create`.
-        let existing_id: Uuid = existing_row.get("id");
-        if request.title.is_some() || request.journal.is_some() {
-            sqlx::query(
-                r#"UPDATE papers
-                   SET title   = COALESCE(title, $2),
-                       journal = COALESCE(journal, $3)
-                   WHERE id = $1"#,
-            )
-            .bind(existing_id)
-            .bind(&request.title)
-            .bind(&request.journal)
-            .execute(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::DatabaseError {
-                message: format!("Failed to update paper: {e}"),
-            })?;
-            // Re-fetch updated row
-            sqlx::query("SELECT id, doi, title, journal, created_at FROM papers WHERE id = $1")
-                .bind(existing_id)
-                .fetch_one(&state.db_pool)
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: format!("Failed to re-fetch paper: {e}"),
-                })?
+    .map_err(|e| {
+        if e.is_write_authority_refusal() {
+            ApiError::from(e)
         } else {
-            existing_row
+            ApiError::DatabaseError {
+                message: format!("Failed to register paper: {e}"),
+            }
         }
-    } else {
-        // New paper — insert under the canonical key. `ON CONFLICT`: every
-        // spelling now maps to that one key, so a concurrent POST of the same
-        // new document under another spelling collides here; the loser gets
-        // the winner's row instead of a unique violation (a 500).
-        sqlx::query(
-            r#"INSERT INTO papers (doi, title, journal)
-               VALUES ($1, $2, $3)
-               ON CONFLICT (doi) DO UPDATE SET
-                   title   = COALESCE(papers.title, EXCLUDED.title),
-                   journal = COALESCE(papers.journal, EXCLUDED.journal)
-               RETURNING id, doi, title, journal, created_at"#,
-        )
-        .bind(&doi)
-        .bind(&request.title)
-        .bind(&request.journal)
-        .fetch_one(&state.db_pool)
+    })?;
+    let row = epigraph_db::PaperRepository::registered_row(&mut *tx, id)
         .await
         .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to insert paper: {e}"),
-        })?
-    };
+            message: format!("Failed to re-fetch paper: {e}"),
+        })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit paper: {e}"),
+    })?;
 
     Ok(Json(PaperResponse {
-        id: row.get("id"),
-        doi: row.get("doi"),
-        title: row.get("title"),
-        journal: row.get("journal"),
-        created_at: row.get("created_at"),
+        id: row.id,
+        doi: row.doi,
+        title: row.title,
+        journal: row.journal,
+        created_at: row.created_at,
         listing: None,
     }))
 }

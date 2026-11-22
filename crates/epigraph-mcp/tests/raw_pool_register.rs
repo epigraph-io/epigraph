@@ -401,12 +401,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "preflight_write_authority",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
         "resolve_ingest_visibility",
         1,
         DEFINER_RESOLUTION,
@@ -482,24 +476,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/ingestion.rs",
         "begin_ingest_tx",
-        1,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_reporting",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "ensure_paper_node",
         1,
         REGISTERED_WRITE,
     ),
@@ -602,7 +578,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
 /// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// Migration 246 (backlog 34864fb5) gave `papers` row security, so the ingest
+/// tools' `papers` writes moved onto the ingesting agent's stamped transaction,
+/// removing four rows (six sites): 82 -> 76.
+const HIGH_WATER: usize = 76;
 
 // ===========================================================================
 // The scanner.

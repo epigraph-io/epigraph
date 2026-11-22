@@ -34,8 +34,9 @@
 //! A bare node is now emitted only for a type in
 //! `EgoEdges::untenanted_types` — `EgoRepository::untenanted_entity_types`,
 //! i.e. a registered type whose declared tier is not `'columns'` AND whose
-//! backing table has no `owner_group_id` to filter on (agent, paper, activity,
-//! …). Anything else that did not hydrate is DROPPED together with its edges:
+//! backing table has no `owner_group_id` to filter on (agent, activity, …;
+//! `paper` is hydrated, and filtered, since migration 246). Anything else
+//! that did not hydrate is DROPPED together with its edges:
 //! a tenanted row the viewer may not read, an id no table knows about, and a
 //! type this route cannot check are one answer, which is what stops the
 //! difference between them being readable off the response.
