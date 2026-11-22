@@ -377,6 +377,20 @@ impl FactorRepository {
     /// `decomposes_to` echo, SPEC §6.2 D3). Each hop asks only for the rows
     /// it can still afford (`cap + 1 - loaded`).
     ///
+    /// # Only factors whose every variable the viewer can read
+    ///
+    /// `factors` has no tenancy columns and no row security, and
+    /// `variable_ids` has no foreign key to `claims`, so a factor can name a
+    /// claim private to another group, or an id that is no claim at all. A BP
+    /// run SERVES its result to the caller (`updated_beliefs`,
+    /// `variables_count`, `factors_count`), so a factor with a variable the
+    /// caller cannot read would put that claim's id, and a value computed
+    /// through it, in the response, and would couple two readable claims
+    /// through a node the caller cannot see (tenancy finding F-SHARD4-A2).
+    /// Such a factor is not loaded, and the expansion does not walk through
+    /// it. An id that is no claim cannot be told apart from a claim the caller
+    /// cannot read without an existence oracle, so it is treated the same way.
+    ///
     /// Run it on the caller's stamped connection: the predicate's legacy arm
     /// reads `edges`, which row security filters (see
     /// [`bp_readable_factor_sql`]).
@@ -385,6 +399,7 @@ impl FactorRepository {
     /// `DbError` when a statement fails.
     pub async fn load_bp_scope(
         conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
         scope: &BpFactorScope<'_>,
         cap: usize,
     ) -> Result<BpScopeLoad, crate::DbError> {
@@ -392,17 +407,28 @@ impl FactorRepository {
         let mut rows: Vec<FactorRow> = Vec::new();
         match scope.claim_ids {
             None => {
-                let found: Vec<FactorRowTuple> = sqlx::query_as(&format!(
-                    "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
-                      WHERE ($1::uuid IS NULL OR f.frame_id = $1) AND {} \
-                      ORDER BY f.created_at, f.id LIMIT $2",
-                    bp_readable_factor_sql()
-                ))
-                .bind(scope.frame_id)
-                .bind(limit(0))
-                .fetch_all(&mut *conn)
-                .await
-                .map_err(crate::DbError::from)?;
+                let sql = viewer.splice(
+                    &format!(
+                        "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
+                          WHERE ($1::uuid IS NULL OR f.frame_id = $1) AND {} \
+                            AND NOT EXISTS (SELECT 1 FROM unnest(f.variable_ids) AS fv(id) \
+                                 WHERE NOT EXISTS (SELECT 1 FROM claims bpv \
+                                    WHERE bpv.id = fv.id /* {{VISIBILITY:bpv}} */)) \
+                          ORDER BY f.created_at, f.id LIMIT $2",
+                        bp_readable_factor_sql()
+                    ),
+                    3,
+                );
+                let mut q = sqlx::query_as::<_, FactorRowTuple>(&sql)
+                    .bind(scope.frame_id)
+                    .bind(limit(0));
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                let found = q
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(crate::DbError::from)?;
                 rows.extend(found.into_iter().map(factor_row));
             }
             Some(seeds) => {
@@ -414,21 +440,32 @@ impl FactorRepository {
                     if frontier.is_empty() || rows.len() > cap {
                         break;
                     }
-                    let found: Vec<FactorRowTuple> = sqlx::query_as(&format!(
-                        "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
-                          WHERE f.variable_ids && $1::uuid[] \
-                            AND NOT (f.id = ANY($2::uuid[])) \
-                            AND ($3::uuid IS NULL OR f.frame_id = $3) AND {} \
-                          ORDER BY f.created_at, f.id LIMIT $4",
-                        bp_readable_factor_sql()
-                    ))
-                    .bind(&frontier)
-                    .bind(&loaded_ids)
-                    .bind(scope.frame_id)
-                    .bind(limit(rows.len()))
-                    .fetch_all(&mut *conn)
-                    .await
-                    .map_err(crate::DbError::from)?;
+                    let sql = viewer.splice(
+                        &format!(
+                            "SELECT {FACTOR_ROW_COLUMNS} FROM factors f \
+                              WHERE f.variable_ids && $1::uuid[] \
+                                AND NOT (f.id = ANY($2::uuid[])) \
+                                AND ($3::uuid IS NULL OR f.frame_id = $3) AND {} \
+                                AND NOT EXISTS (SELECT 1 FROM unnest(f.variable_ids) AS fv(id) \
+                                     WHERE NOT EXISTS (SELECT 1 FROM claims bpv \
+                                        WHERE bpv.id = fv.id /* {{VISIBILITY:bpv}} */)) \
+                              ORDER BY f.created_at, f.id LIMIT $4",
+                            bp_readable_factor_sql()
+                        ),
+                        5,
+                    );
+                    let mut q = sqlx::query_as::<_, FactorRowTuple>(&sql)
+                        .bind(&frontier)
+                        .bind(&loaded_ids)
+                        .bind(scope.frame_id)
+                        .bind(limit(rows.len()));
+                    if let Some(g) = viewer.group_bind() {
+                        q = q.bind(g);
+                    }
+                    let found = q
+                        .fetch_all(&mut *conn)
+                        .await
+                        .map_err(crate::DbError::from)?;
                     frontier = Vec::new();
                     for t in found {
                         let row = factor_row(t);
@@ -448,6 +485,83 @@ impl FactorRepository {
         }
         rows.sort_by(|a, b| (a.created_at, a.id).cmp(&(b.created_at, b.id)));
         Ok(BpScopeLoad::Loaded(rows))
+    }
+
+    /// The stored BetP of each of `ids` that `viewer` can read, as BP's
+    /// scalar priors: `(id, pignistic_prob)`. An id the viewer cannot read is
+    /// absent, not an error.
+    ///
+    /// Role-blind, as the scalar engine always was: a compound's cached
+    /// value seeds it like any claim's (BP apply never writes a compound).
+    ///
+    /// # Errors
+    /// `DbError` when the statement fails.
+    pub async fn bp_priors(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Option<f64>)>, crate::DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "SELECT c.id, c.pignistic_prob FROM claims c \
+              WHERE c.id = ANY($1) /* {VISIBILITY:c} */",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Option<f64>)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(&mut *conn).await.map_err(crate::DbError::from)
+    }
+
+    /// The alternative-set class (migration 042's `alternative_set`) of each
+    /// of `ids` that has one, as CDST BP's `AltSetMembership`:
+    /// `(claim, the other claims it is mutually exclusive with)`.
+    ///
+    /// Seeded from `ids` and walked over `alternative_of` edges `viewer` can
+    /// read, stepping only onto claims `viewer` can read. The view it
+    /// replaces computed the transitive closure of every `alternative_of`
+    /// edge in the corpus on every CDST run, and through the raw pool it saw
+    /// only public edges (it is `security_invoker`), so a member's own
+    /// group's alternative sets were silently left out.
+    ///
+    /// # Errors
+    /// `DbError` when the statement fails.
+    pub async fn bp_alternative_sets(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, Vec<Uuid>)>, crate::DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = viewer.splice(
+            "WITH RECURSIVE closure(a, b) AS ( \
+                 SELECT s.id, s.id FROM unnest($1::uuid[]) AS s(id) \
+                 UNION \
+                 SELECT cl.a, CASE WHEN e.source_id = cl.b THEN e.target_id \
+                                   ELSE e.source_id END \
+                   FROM closure cl \
+                   JOIN edges e ON (e.source_id = cl.b OR e.target_id = cl.b) \
+                  WHERE e.relationship = 'alternative_of' \
+                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                    /* {EDGE_VISIBILITY:e} */ \
+                    AND EXISTS (SELECT 1 FROM claims m \
+                                 WHERE m.id = CASE WHEN e.source_id = cl.b THEN e.target_id \
+                                                   ELSE e.source_id END \
+                                   /* {VISIBILITY:m} */) \
+             ) \
+             SELECT cl.a, array_agg(DISTINCT cl.b ORDER BY cl.b) \
+               FROM closure cl WHERE cl.b <> cl.a GROUP BY cl.a",
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, Vec<Uuid>)>(&sql).bind(ids);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(&mut *conn).await.map_err(crate::DbError::from)
     }
 
     /// Upsert a BP message (factor↔variable, one direction).

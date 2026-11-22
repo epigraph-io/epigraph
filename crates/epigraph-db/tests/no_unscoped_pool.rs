@@ -814,7 +814,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 185 (backlog 073d24a3): `propagate_beliefs` reads its scalar priors
+/// and alternative-set classes on the caller's stamped read
+/// (`routes/computation.rs` 5 -> 3). No file reached zero.
+const HIGH_WATER: usize = 185;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -968,9 +971,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 6 -> 5 (HTTP public-only reads, 2026-11-05): `bp_seed_rows`' BBA load
     // moved onto the stamped read its source reads already used. On the
     // production pool (`scoped.inner()`, `epigraph_app`) the unstamped load saw
-    // public `mass_functions` rows only. What remains: `propagate_beliefs` (2,
-    // it writes) and `compose_subgraphs` (3, no `Viewer`).
-    ("routes/computation.rs", 5),
+    // public `mass_functions` rows only.
+    // 5 -> 3 (backlog 073d24a3, finding F-SHARD4-A2): `propagate_beliefs`'
+    // scalar-prior and alternative-set reads (both reads; its writes were on
+    // `AppState::write_as` already) moved onto the stamped read its factor
+    // load uses, each through a repo fn that splices the caller's viewer. What
+    // remains: `compose_subgraphs` (3, no `Viewer`).
+    ("routes/computation.rs", 3),
     // 12 before this PR. `classify_conflict` is the pilot conversion onto
     // `AppState::read_as`; see `epigraph-api/tests/scoped_read_is_fail_closed.rs`.
     ("routes/conflicts.rs", 8),

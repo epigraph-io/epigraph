@@ -98,7 +98,7 @@ const REGISTER: &[(&str, usize)] = &[
     ("belief.rs", 7),
     ("claims.rs", 3),
     ("clusters.rs", 8),
-    ("computation.rs", 8),
+    ("computation.rs", 6),
     ("conventions.rs", 3),
     ("cross_source.rs", 1),
     ("crud.rs", 3),
@@ -139,8 +139,11 @@ const REGISTER: &[(&str, usize)] = &[
 /// `embeddings.rs`, `political.rs` and `workflows.rs` reached zero).
 /// Lowered to 90 by backlog triage T52 (backlog b02347c6): `/bp/propagate`'s
 /// factor load moved into `FactorRepository::load_bp_scope`
-/// (`computation.rs` 9 -> 8).
-const HIGH_WATER: usize = 90;
+/// (`computation.rs` 9 -> 8), and to 88 when its priors and alternative-set
+/// reads moved into `FactorRepository::bp_priors` / `bp_alternative_sets`,
+/// both spending the caller's viewer (finding F-SHARD4-A2, `computation.rs`
+/// 8 -> 6).
+const HIGH_WATER: usize = 88;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

@@ -289,7 +289,7 @@ async fn a_scope_over_the_factor_cap_is_refused_not_truncated(pool: PgPool) {
         max_hops: 3,
     };
 
-    match FactorRepository::load_bp_scope(&mut read, &scope, 2)
+    match FactorRepository::load_bp_scope(&mut read, &viewer, &scope, 2)
         .await
         .expect("load")
     {
@@ -299,7 +299,7 @@ async fn a_scope_over_the_factor_cap_is_refused_not_truncated(pool: PgPool) {
             rows.len()
         ),
     }
-    match FactorRepository::load_bp_scope(&mut read, &scope, 3)
+    match FactorRepository::load_bp_scope(&mut read, &viewer, &scope, 3)
         .await
         .expect("load")
     {
@@ -318,7 +318,7 @@ async fn a_scope_over_the_factor_cap_is_refused_not_truncated(pool: PgPool) {
     };
     assert!(
         matches!(
-            FactorRepository::load_bp_scope(&mut read, &frame_scope, 3)
+            FactorRepository::load_bp_scope(&mut read, &viewer, &frame_scope, 3)
                 .await
                 .expect("load"),
             BpScopeLoad::OverCap { cap: 3 }

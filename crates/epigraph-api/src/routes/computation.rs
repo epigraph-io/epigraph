@@ -9,7 +9,7 @@
 //! - `POST /api/v1/graph/compose`         - Compose two subgraphs via decorated cospans
 //! - `GET  /api/v1/claims/:id/belief-at`  - Reconstruct belief at a past timestamp
 //!
-//! # Tenancy: 5 of this file's 15 raw-pool sites are converted, and 10 are not
+//! # Tenancy: 12 of this file's 15 raw-pool sites are converted, and 3 are not
 //!
 //! Conversion shard 4 against `D-PR17-request-path-never-stamps-session-gucs`
 //! (`epigraph-db/tests/no_unscoped_pool.rs`). Unlike `routes/belief.rs`, the
@@ -23,28 +23,18 @@
 //! statement on it. `sheaf_reconcile` is a POST and is still a read — it returns
 //! computed proposals and persists nothing.
 //!
+//! `propagate_beliefs` is converted whole (tenancy finding `F-SHARD4-A2`,
+//! closed by backlog 073d24a3). Its reads (the factor load, the scalar priors
+//! and the alternative-set classes) run on ONE [`AppState::read_as`]
+//! connection, each through a repo fn that splices the caller's viewer: a
+//! factor is loaded only when every claim it names is one the caller can
+//! read, so no id, prior or BP value of another group's claim reaches the run
+//! or the response. Its CDST seeds are read by `bp_seed_rows` on its own
+//! stamped read, and its apply writes on an [`AppState::write_as`]
+//! transaction (`apply_bp_updates`).
+//!
 //! Not converted, and NOT merely deferred:
 //!
-//! * `propagate_beliefs` (4 sites, all reads; its apply writes on a
-//!   `write_as` transaction since the batch H-a review). Converting only
-//!   its reads is the shape no shard in this series has reviewed — every prior
-//!   shard converted whole handlers — and a half-converted handler here would
-//!   change its own output silently and with a 200, so it is whole-handler work
-//!   or none. ONE statement is the deliberate exception: the factor load runs
-//!   on [`AppState::read_as`] because atom-level belief's `decomposes_to`
-//!   exclusion (SPEC §6.2) decides its legacy arm by reading `edges`, and that
-//!   read must see the caller's own private edges. `factors` has no row
-//!   security and the load splices no viewer, so the stamp changes nothing
-//!   else it returns. Converting the writes too is worse — `read_as` is
-//!   documented read-only, `ScopedRead::commit` is not called by `Drop`, and
-//!   under `SessionGucMode::Transaction` a write routed through it is rolled
-//!   back while still type-checking, because `ScopedRead` is
-//!   `DerefMut<Target = PgConnection>`. Its write side belongs to
-//!   `ScopedPool::begin_as` plus 16b's `Viewer::splice_write`, as a whole-handler
-//!   change with its own evidence. A separate question raised while classifying
-//!   this handler is registered as `F-SHARD4-A2`; analysis held outside this
-//!   repository, and its owner is NOT the conversion-shard series — see the
-//!   entry's `assigned` field.
 //! * `compose_subgraphs` (3 sites) is registered as `F-SHARD4-A1`; analysis
 //!   held outside this repository. Owner: the conversion-shard series. Two of
 //!   its three sites reach the database through [`extract_neighborhood`], which
@@ -620,7 +610,8 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// is derived only from sources at least as widely readable as the claim.
 /// BP messages travel along factors, so a claim's result can carry the belief
 /// of any claim in its connected component of the run's factor graph
-/// (`factor_variables`). A claim whose component holds a claim less readable
+/// (`factor_variables`: one variable list per factor and, on a CDST run, one
+/// per alternative-set class, which groups its members' messages). A claim whose component holds a claim less readable
 /// than itself (for a public claim, any non-public one; for a group claim,
 /// another group's; and any id that is no claim the caller can read) is
 /// skipped and counted in `skipped_less_readable_inputs`.
@@ -1105,8 +1096,8 @@ pub async fn propagate_beliefs(
     // exclusion's legacy arm matches a factor to its `decomposes_to` edge by
     // reading `edges`, which row security filters. Unstamped, that read sees
     // only public edges, so a legacy factor on a decomposition private to the
-    // caller's own group would be loaded. `factors` itself has no row security.
-    // The rest of this handler's reads stay where they were.
+    // caller's own group would be loaded. `factors` itself has no row
+    // security, so the loader also splices the caller's viewer (below).
     let mut read = state.read_as(&viewer).await.map_err(|e| {
         tracing::error!(
             target: "tenancy.scoped_read",
@@ -1118,8 +1109,15 @@ pub async fn propagate_beliefs(
             message: "Failed to acquire a scoped connection".to_string(),
         }
     })?;
-    let loaded = epigraph_db::repos::factor::FactorRepository::load_bp_scope(
+    // Every read below runs on this one stamped connection and spends the
+    // caller's viewer (tenancy finding F-SHARD4-A2): a factor is loaded only
+    // when every variable it names is a claim the caller can read, so no id,
+    // prior or BP value of a claim the caller cannot read reaches the run or
+    // the response.
+    let mode = request.mode.as_deref().unwrap_or("auto");
+    let factors_r = epigraph_db::repos::factor::FactorRepository::load_bp_scope(
         &mut read,
+        &viewer,
         &scope,
         BP_MAX_FACTORS,
     )
@@ -1127,10 +1125,10 @@ pub async fn propagate_beliefs(
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to load factors: {e}"),
     })?;
-    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
-    let factors = match loaded {
+    let factors = match factors_r {
         epigraph_db::repos::factor::BpScopeLoad::Loaded(rows) => rows,
         epigraph_db::repos::factor::BpScopeLoad::OverCap { cap } => {
+            crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
             return Err(ApiError::ValidationError {
                 field: if scope.claim_ids.is_some() {
                     "claim_ids".to_string()
@@ -1145,6 +1143,42 @@ pub async fn propagate_beliefs(
         }
     };
 
+    // Collect all variable IDs and load their current beliefs
+    let all_var_ids: Vec<Uuid> = factors
+        .iter()
+        .flat_map(|f| f.variable_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // The scalar engine's priors. Through the raw pool this read saw only
+    // public claims (the application role, unstamped), so a member's own
+    // group's claims ran from the engine default instead of their BetP.
+    let belief_rows =
+        epigraph_db::repos::factor::FactorRepository::bp_priors(&mut read, &viewer, &all_var_ids)
+            .await
+            .map_err(|e| ApiError::InternalError {
+                message: format!("Failed to load beliefs: {e}"),
+            })?;
+    // The CDST engine's alternative-set classes, seeded from the run's
+    // variables. Not read for an explicit scalar or interval run. A failed
+    // read is an error: it used to read as "no classes" and silently changed
+    // how the run combined its messages.
+    let alt_set_rows = if matches!(mode, "scalar" | "interval") {
+        Vec::new()
+    } else {
+        epigraph_db::repos::factor::FactorRepository::bp_alternative_sets(
+            &mut read,
+            &viewer,
+            &all_var_ids,
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("Failed to load alternative sets: {e}"),
+        })?
+    };
+    crate::routes::finish_scoped_read(read, "propagate_beliefs").await?;
+
     if factors.is_empty() {
         return Ok(Json(serde_json::json!({
             "iterations": 0,
@@ -1157,23 +1191,6 @@ pub async fn propagate_beliefs(
             "updated_beliefs": [],
         })));
     }
-
-    // Collect all variable IDs and load their current beliefs
-    let all_var_ids: Vec<Uuid> = factors
-        .iter()
-        .flat_map(|f| f.variable_ids.iter().copied())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    let belief_rows: Vec<(Uuid, Option<f64>)> =
-        sqlx::query_as("SELECT id, pignistic_prob FROM claims WHERE id = ANY($1)")
-            .bind(&all_var_ids)
-            .fetch_all(&state.db_pool)
-            .await
-            .map_err(|e| ApiError::InternalError {
-                message: format!("Failed to load beliefs: {e}"),
-            })?;
 
     let initial_beliefs: HashMap<Uuid, f64> = belief_rows
         .into_iter()
@@ -1195,7 +1212,6 @@ pub async fn propagate_beliefs(
         factors.iter().map(|f| f.variable_ids.as_slice()).collect();
 
     // -- CDST branch: decide mode, load mass functions if needed ---------------
-    let mode = request.mode.as_deref().unwrap_or("auto");
 
     // Only load mass functions when CDST might be used (skip for explicit
     // scalar/interval). The seed rows are the ones `bp_seed_rows` admits
@@ -1290,16 +1306,18 @@ pub async fn propagate_beliefs(
             })
             .collect();
 
-        // Load the alternative-set equivalence class for every claim from the
-        // `alternative_set` view (migration 042). Empty on a fresh graph —
-        // BP must not fail in that case, so we tolerate query failures and
-        // proceed with an empty map (== legacy pure-Dempster behavior).
-        let alt_set_rows: Vec<(Uuid, Vec<Uuid>)> =
-            sqlx::query_as("SELECT claim_id, alt_members FROM alternative_set")
-                .fetch_all(&state.db_pool)
-                .await
-                .unwrap_or_default();
-
+        // The alternative-set classes couple their members in this run as a
+        // factor does (a message's source is grouped by its class), so apply's
+        // R-22 guard reads each class as one more coupling: a claim whose
+        // class reaches a less readable claim is not written from it.
+        let alt_couplings: Vec<Vec<Uuid>> = alt_set_rows
+            .iter()
+            .map(|(claim_id, members)| {
+                std::iter::once(*claim_id)
+                    .chain(members.iter().copied())
+                    .collect()
+            })
+            .collect();
         let mut alt_set_membership: epigraph_engine::cdst_bp::AltSetMembership = HashMap::new();
         for (claim_id, members) in alt_set_rows {
             alt_set_membership.insert(claim_id, members);
@@ -1346,8 +1364,13 @@ pub async fn propagate_beliefs(
                     (*claim_id, *betp, Some((bel, pl)))
                 })
                 .collect();
+            let couplings: Vec<&[Uuid]> = factor_variables
+                .iter()
+                .copied()
+                .chain(alt_couplings.iter().map(Vec::as_slice))
+                .collect();
             (written, skipped, skipped_compounds, skipped_less_readable) =
-                apply_bp_updates(&state, &viewer, &updates, &factor_variables).await?;
+                apply_bp_updates(&state, &viewer, &updates, &couplings).await?;
         }
 
         return Ok(Json(serde_json::json!({
