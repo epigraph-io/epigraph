@@ -641,28 +641,30 @@ async fn consume_assertion_nonce(
     }
 }
 
-/// Refuse an agent assertion whose key is held by a `seed-derived` agent
-/// (backlog 57943a39): migration 230's kind for `BLAKE3(<public seed>)`, such
-/// as an ingested author's name key, so anyone who knows the seed can sign
-/// this assertion.
+/// Refuse an agent assertion whose key is held by an agent that is NOT a
+/// signature verifier (backlog 57943a39): any `key_kind` but `ed25519`, the
+/// rule the claim and edge verifiers apply to a bare key and
+/// `AgentRepository::public_key_if_signer` applies by id.
 ///
-/// Deliberately `seed-derived` ONLY, not "anything but `ed25519`" as the
-/// claim and edge verifiers decide. `derived` also marks a host-registered
-/// LLM identity (migrations 161 / 166 / 180 / 195 insert its identity key with
-/// `key_kind = 'derived'`); that key is keyed with a secret the host keeps, so
-/// its holder really can sign, and refusing it here could lock a live agent
-/// out. A keyless OAuth principal's `derived` placeholder has no known private
-/// key, so no assertion verifies under it anyway.
+/// * `seed-derived` (migration 230): `BLAKE3(<public seed>)`, such as an
+///   ingested author's name key, so anyone who knows the seed can sign.
+/// * `derived`: the unkeyed LLM identity (`BLAKE3("llm-agent:{model}:{prompt
+///   hash}")`, migration 161 section 7), equally computable, which 230 could
+///   not re-mark; a host-registered identity, whose key never signs (D1:
+///   its signatures bind through a separate `signing` key, and the host
+///   authenticates with secret-based clients, not assertions); and the keyless
+///   OAuth principal's placeholder. None of these is a credential.
 ///
-/// A key no agent holds is not refused: an `/oauth/register` agent client
-/// presents a key of its own and is linked to a `derived` principal at mint
-/// time (`AgentRepository::ensure_for_client`), so its key has no agents row.
+/// A key no agent holds is NOT refused: an `/oauth/register` agent client
+/// presents a key of its own and is linked to a separate `derived` principal
+/// (`blake3::derive_key` over the client row id) at mint time
+/// (`AgentRepository::ensure_for_client`), so its own key has no agents row.
 /// Runs after the signature verifies (an unauthenticated request learns
 /// nothing) and before the nonce is recorded. Shared by the
 /// `client_credentials` and refresh grants through
 /// [`authenticate_confidential_client`]. Fails CLOSED on a database error.
 #[cfg(feature = "db")]
-async fn refuse_seed_derived_agent_key(
+async fn refuse_non_verifier_agent_key(
     state: &AppState,
     client: &epigraph_db::repos::oauth_client::OAuthClientRow,
     public_key: &[u8; 32],
@@ -673,18 +675,22 @@ async fn refuse_seed_derived_agent_key(
             .map_err(|e| ApiError::InternalError {
                 message: format!("reading the assertion key's kind failed: {e}"),
             })?;
-    if kind.as_deref() == Some(epigraph_db::KEY_KIND_SEED_DERIVED) {
-        tracing::warn!(
-            client_id = %client.client_id,
-            "Agent assertion rejected: the key is derived from a public seed"
-        );
-        return Err(ApiError::Unauthorized {
-            reason: "the client's key is a seed-derived agent key, computable from a public \
-                     seed, so it authenticates nothing; register a random Ed25519 key"
-                .to_string(),
-        });
+    match kind.as_deref() {
+        None | Some("ed25519") => Ok(()),
+        Some(other) => {
+            tracing::warn!(
+                client_id = %client.client_id,
+                key_kind = other,
+                "Agent assertion rejected: the key is not a signature verifier"
+            );
+            Err(ApiError::Unauthorized {
+                reason: format!(
+                    "the client's key is a '{other}' agent key, which is not a signature \
+                     verifier, so it authenticates nothing; register a random Ed25519 key"
+                ),
+            })
+        }
     }
-    Ok(())
 }
 
 /// Access-token lifetime by client type: agent 15 min, human 1 h, service 1 h;
@@ -775,7 +781,7 @@ async fn authenticate_confidential_client(
                 })?;
             let verified =
                 verify_agent_assertion(&assertion_bytes, &pub_key_bytes, &client.client_id)?;
-            refuse_seed_derived_agent_key(state, client, &verified.public_key).await?;
+            refuse_non_verifier_agent_key(state, client, &verified.public_key).await?;
             consume_assertion_nonce(state, client, verified).await?;
         }
         "service" => {

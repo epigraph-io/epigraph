@@ -348,20 +348,16 @@ async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
     assert!(body.get("access_token").is_none(), "{body}");
 }
 
-/// The seed-derived refusal is NOT "anything but `ed25519`": a host-registered
-/// LLM identity stores its identity key as `derived` (migration 161's
-/// `epigraph_register_agent_identity`), and that key is keyed with a secret
-/// the host keeps, so its holder may authenticate with it. Catches a refusal
-/// widened to every non-`ed25519` kind, which would lock such a client out.
+/// The refusal is "anything but `ed25519`", not `seed-derived` only: the
+/// unkeyed LLM identity (`BLAKE3("llm-agent:{model}:{prompt hash}")`) is
+/// stored as `derived` (migration 161) and migration 230 could not re-mark it,
+/// so its key is just as computable. Calibrated on the SAME client: it mints
+/// while the row is `ed25519`, and is refused once the row is `derived`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_derived_identity_key_still_authenticates(pool: PgPool) {
-    let key = SigningKey::from_bytes(&rand::random());
+async fn a_derived_agent_key_cannot_authenticate(pool: PgPool) {
+    let seed = blake3::hash(b"llm-agent:example-model:0000");
+    let key = SigningKey::from_bytes(seed.as_bytes());
     let client_id = active_agent_client(&pool, &key).await;
-    sqlx::query("UPDATE agents SET key_kind = 'derived' WHERE public_key = $1")
-        .bind(key.verifying_key().to_bytes().to_vec())
-        .execute(&pool)
-        .await
-        .expect("mark derived");
     let app = create_router(AppState::with_db(pool.clone(), config()));
 
     let (status, body) =
@@ -369,6 +365,52 @@ async fn a_derived_identity_key_still_authenticates(pool: PgPool) {
     assert_eq!(
         status,
         StatusCode::OK,
-        "a derived (host-keyed) identity key must still mint: {body}"
+        "calibration: as an ed25519 row the key mints: {body}"
+    );
+
+    sqlx::query("UPDATE agents SET key_kind = 'derived' WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("mark derived");
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "client_credentials minted for a derived (non-verifier) key: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+}
+
+/// The refusal reads the kind of an agent that HOLDS the key; a key no agent
+/// holds is not refused. That is every `/oauth/register` agent client: its own
+/// key has no agents row (it is linked to a separate `derived` principal at
+/// mint time), so a refusal that treated "no row" as "not a verifier" would
+/// lock all of them out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_agent_client_whose_key_no_agent_holds_still_authenticates(pool: PgPool) {
+    let key = SigningKey::from_bytes(&rand::random());
+    let client_id = active_agent_client(&pool, &key).await;
+    // Detach the client from the fixture's agent row and drop the row, so the
+    // key is held by no agent, as for a client `/oauth/register` created.
+    sqlx::query("UPDATE oauth_clients SET agent_id = NULL WHERE client_id = $1")
+        .bind(&client_id)
+        .execute(&pool)
+        .await
+        .expect("detach client");
+    sqlx::query("DELETE FROM agents WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("drop agent row");
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an agent client whose key no agent holds must still mint: {body}"
     );
 }

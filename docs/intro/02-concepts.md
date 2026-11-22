@@ -142,8 +142,8 @@ source), `verify_claim`'s bare-key fallback and the edge-signature check
 admit an agent's bare key only when `key_kind = 'ed25519'` and never admit a
 `seed-derived` agent's `identity-legacy` key (the same key, written by
 migration 161's backfill), and the OAuth agent assertion check
-(`client_credentials` and refresh) refuses a `seed-derived` key (backlog
-57943a39). A client that registers such a key through `POST /api/v1/agents`
+(`client_credentials` and refresh) refuses a key held by any agent whose
+`key_kind` is not `ed25519` (backlog 57943a39). A client that registers such a key through `POST /api/v1/agents`
 declares it with `"key_kind": "seed-derived"`, and the route then provisions
 no OAuth client for it. Rows written before these checks may still be stored
 as `ed25519`; re-marking them `seed-derived` is an operator task, and it is
