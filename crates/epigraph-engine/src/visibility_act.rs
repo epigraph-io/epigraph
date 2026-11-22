@@ -33,6 +33,20 @@
 //! commits after both, so the act and the refold commit together or not at
 //! all.
 //!
+//! # `truth_value`
+//!
+//! Several writers persist `claims.truth_value` as a copy of the fold they
+//! just cached (`submit_claim`, `update_with_evidence`), and a later recompute
+//! of the cache leaves that copy as it was. So `truth_value` can carry the
+//! same inadmissible BBA as the old cache, and readers that order or filter
+//! on it (recall's fallback among them) would serve its influence to the new
+//! audience (backlog 0d9dfd24). Whenever the refold writes the cache, the act
+//! therefore sets `truth_value` to the refolded BetP in the same transaction
+//! (`ClaimRepository::mirror_refolded_cache_into_truth_conn`, which states
+//! the claims it leaves alone). A copy is not told apart from an authored
+//! value: an authored confidence (`memorize`) is replaced by the admissible
+//! fold, which still contains the author's own seed BBA.
+//!
 //! # Fail closed when the session cannot write the moved claim
 //!
 //! The refold writes `claims` on the caller's stamped session, under row
@@ -57,8 +71,11 @@
 //!   (`MassFunctionRepository::cache_owner_frame_keeping_recorded`). The
 //!   claim's next ordinary recompute hands the cache to that other frame
 //!   (the admissible-first owner rule, backlog 8d720490 (1)).
-//! * `claims.truth_value`, which some writers set from a fold, is not
-//!   recomputed.
+//! * `claims.truth_value` follows the refold only where the cache was
+//!   written (below). A claim the refold leaves unchanged (the first item)
+//!   keeps its `truth_value`, and so does a workflow, step or procedural
+//!   claim, whose `truth_value` tracks execution outcomes, and a retired claim
+//!   at the deprecation marker.
 //! * Claims moved by 206 before this ran keep the value folded then.
 
 use epigraph_db::errors::RefusalKind;
@@ -166,9 +183,16 @@ async fn refold_moved(
         .into());
     }
     for claim_id in moved {
-        edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
-            .await
-            .map_err(VisibilityActError::Cache)?;
+        let written =
+            edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
+                .await
+                .map_err(VisibilityActError::Cache)?;
+        // `truth_value` may be a copy of the cache as folded for the OLD
+        // audience (see the module doc, "truth_value"): replace it with the
+        // refolded value, which is admissible by construction.
+        if written {
+            ClaimRepository::mirror_refolded_cache_into_truth_conn(&mut *conn, claim_id).await?;
+        }
     }
     Ok(())
 }

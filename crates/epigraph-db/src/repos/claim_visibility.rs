@@ -740,6 +740,62 @@ impl ClaimRepository {
         .fetch_all(&mut *conn)
         .await?)
     }
+
+    /// After a widening act refolded `claim_id`'s cached belief for its new
+    /// audience (`epigraph_engine::visibility_act`), set its `truth_value` to
+    /// that refolded BetP (`pignistic_prob`, clamped to `[0, 1]`; NaN reads as
+    /// 0.5, as `TruthValue::clamped`), on the act's own stamped transaction.
+    /// Returns whether the row was written.
+    ///
+    /// Several writers persist `truth_value` as a copy of the fold they just
+    /// cached (`submit_claim`, `update_with_evidence`), so it can carry a BBA
+    /// the new audience may not read (evidence pinned behind, a private edge
+    /// source); a copy that a later recompute left stale carries it as well.
+    /// The refolded cache is admissible by construction, so it is the value
+    /// served from now on. Not written:
+    /// * a claim with no cache (`pignistic_prob IS NULL`);
+    /// * a retired claim at the deprecation marker (`is_current = false` and
+    ///   `truth_value` 0.05): the marker is a state, not a fold;
+    /// * a workflow or step claim (a `workflows` row, a step lineage, an
+    ///   `executes` in-edge or the `workflow` label) or a procedural one
+    ///   ([`crate::repos::claim_role::is_procedural_sql`]): its `truth_value`
+    ///   tracks execution outcomes;
+    /// * a claim whose `truth_value` already equals the new value.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the write fails.
+    pub async fn mirror_refolded_cache_into_truth_conn(
+        conn: &mut PgConnection,
+        claim_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let sql = format!(
+            "WITH n AS ( \
+                 SELECT c.id, \
+                        CASE WHEN c.pignistic_prob = 'NaN'::float8 THEN 0.5::float8 \
+                             ELSE LEAST(GREATEST(c.pignistic_prob, 0.0::float8), 1.0::float8) \
+                        END AS tv \
+                   FROM claims c \
+                  WHERE c.id = $1 \
+                    AND c.pignistic_prob IS NOT NULL \
+                    AND NOT (NOT c.is_current AND abs(c.truth_value - 0.05) <= 1e-9) \
+                    AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
+                    AND c.step_lineage_id IS NULL \
+                    AND NOT EXISTS (SELECT 1 FROM edges e \
+                                     WHERE e.target_id = c.id AND e.relationship = 'executes') \
+                    AND NOT COALESCE('workflow' = ANY (c.labels), false) \
+                    AND NOT {procedural}) \
+             UPDATE claims c SET truth_value = n.tv, updated_at = NOW() \
+               FROM n \
+              WHERE c.id = n.id AND c.truth_value IS DISTINCT FROM n.tv \
+             RETURNING c.id",
+            procedural = crate::repos::claim_role::is_procedural_sql("c"),
+        );
+        let written = sqlx::query_scalar::<_, Uuid>(&sql)
+            .bind(claim_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+        Ok(written.is_some())
+    }
 }
 
 #[cfg(test)]

@@ -1964,6 +1964,14 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          one caller (`epigraph_engine::visibility_act`) refuses the act on any id it returns.",
     ),
     (
+        "claim_visibility.rs",
+        "mirror_refolded_cache_into_truth_conn",
+        "WRITE of one claim's `truth_value` from its own just-refolded cache, on the widening \
+         act's own caller-STAMPED transaction: row security on the stamped connection is the \
+         filter, and the act has already refused unless the session writes every moved claim. \
+         It reads nothing it returns; its one caller is `epigraph_engine::visibility_act`.",
+    ),
+    (
         "security_event.rs",
         "workflow_caller_write",
         "WRITE of one `security_events` row: the provenance of a non-admin hierarchical-workflow \

@@ -32,6 +32,10 @@
 //!   the cache from `claim_validity`.
 //! * the refold fails closed: an operated agent whose session does not itself
 //!   write the target team is refused, and nothing moves.
+//! * backlog 0d9dfd24: `claims.truth_value`, which `update_with_evidence`
+//!   persisted as a copy of a fold that took in a BBA on evidence that stays
+//!   behind (pinned), is replaced by the refolded value: the new audience is
+//!   served the truth value of a control claim that never had that BBA.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -47,9 +51,11 @@ use epigraph_engine::edge_factor::{
     resolve_claim_validity_frame, EdgeFactorOutcome,
 };
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::claims::submit_claim;
+use epigraph_mcp::tools::claims::{submit_claim, update_with_evidence};
 use epigraph_mcp::tools::visibility::{publicize_claims, share_claims_with_team};
-use epigraph_mcp::types::{PublicizeClaimsParams, ShareClaimsWithTeamParams, SubmitClaimParams};
+use epigraph_mcp::types::{
+    PublicizeClaimsParams, ShareClaimsWithTeamParams, SubmitClaimParams, UpdateWithEvidenceParams,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -932,5 +938,177 @@ async fn share_vacates_a_cache_whose_owner_frame_holds_only_a_home_edge_factor_b
         vacuous(&served),
         "the teammate must be served full ignorance once binary_truth (the cache owner) holds \
          only the home edge's BBA; it was served {served:?}, the home fold was {stale:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0d9dfd24: truth_value follows the refold
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `agent` adds strongly refuting evidence to `claim` through MCP
+/// `update_with_evidence`, which stores a BBA citing a new evidence row and
+/// persists `truth_value` as a copy of the fold. The new evidence row's id.
+async fn refute_through_mcp(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> Uuid {
+    let seed = evidence_of(pool, claim).await;
+    update_with_evidence(
+        &s.server,
+        &viewer(pool, agent).await,
+        UpdateWithEvidenceParams {
+            claim_id: claim.to_string(),
+            canonical_name: None,
+            step_index: None,
+            evidence_data: format!("a refutation of {claim}"),
+            evidence_type: "empirical".to_string(),
+            supports: false,
+            strength: 0.95,
+            source_url: None,
+            labels: vec![],
+        },
+        Some(&token(agent)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("update_with_evidence on {claim}: {e:?}"));
+    sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1 AND id <> $2")
+        .bind(claim)
+        .bind(seed)
+        .fetch_one(pool)
+        .await
+        .expect("the refutation's evidence row")
+}
+
+/// `(truth_value, pignistic_prob)` as stored.
+async fn truth(pool: &PgPool, claim: Uuid) -> (f64, Option<f64>) {
+    sqlx::query_as("SELECT truth_value, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("truth")
+}
+
+/// `(truth_value, pignistic_prob)` as `agent` is served them, on its stamped
+/// app-role connection.
+async fn served_truth(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> (f64, Option<f64>) {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as("SELECT truth_value, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("{agent} reads the claim's truth value: {e}"))
+}
+
+/// The premise both tests share: `update_with_evidence` stored `truth_value`
+/// as a copy of its fold, which took in the refuting BBA, so it differs from
+/// `expected`, the control's refolded value (which never had that BBA).
+fn assert_truth_premise(stale: (f64, Option<f64>), expected: f64) {
+    let (t0, p0) = stale;
+    assert!(
+        p0.is_some_and(|p| (t0 - p).abs() < 1e-12),
+        "PREMISE: update_with_evidence persisted truth_value as a copy of its fold \
+         ({t0} vs {p0:?})"
+    );
+    assert!(
+        (t0 - expected).abs() > 0.05,
+        "PREMISE: the copy carries the refuting BBA ({t0}), so it differs from the control's \
+         value ({expected})"
+    );
+}
+
+/// Share: the private claim's `truth_value` was persisted from a fold that
+/// took in a BBA citing evidence pinned at home. After the act the teammate is
+/// served the truth value of a control claim that never had that BBA, the
+/// refolded cache, and not the home copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_at_home(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "truth-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "truth-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(
+        &pool,
+        &s,
+        alice,
+        "a private finding, refuted at home",
+        "private",
+        None,
+    )
+    .await;
+    let control = write(&pool, &s, alice, "the same finding, team", "team", Some(t)).await;
+    let hidden = refute_through_mcp(&pool, &s, alice, c).await;
+    pin(&pool, hidden, alice).await;
+    refold(&pool, &s, alice, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", hidden).await,
+        group(home),
+        "pinned"
+    );
+    let (served, betp) = served_truth(&pool, &s, bob, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "the teammate is served truth_value {served}, which must be the team-readable value \
+         {expected} (the control's), not the home copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Publicize: the team claim's `truth_value` was persisted from a fold that
+/// took in a BBA citing evidence pinned in the team. After the act a stranger
+/// is served the truth value of a public control claim that never had that
+/// BBA, not the team's copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_behind(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "truth-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "truth-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(
+        &pool,
+        &s,
+        eve,
+        "a team finding, refuted in the team",
+        "team",
+        Some(t),
+    )
+    .await;
+    let control = write(&pool, &s, eve, "the same finding, public", "public", None).await;
+    let hidden = refute_through_mcp(&pool, &s, eve, c).await;
+    pin(&pool, hidden, eve).await;
+    refold(&pool, &s, eve, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "a stranger is served truth_value {served}, which must be the public value {expected} \
+         (the control's), not the team's copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
     );
 }
