@@ -374,18 +374,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         PRE_VIEWER,
     ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "operator_arm_allows",
-        2,
-        PRE_VIEWER,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "delegate_arm_allows",
-        1,
-        PRE_VIEWER,
-    ),
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
         "epigraph-mcp/src/tools/ingestion.rs",
@@ -601,8 +589,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. The ownership
+/// gate's link arms (`operator_arm_allows`, `delegate_arm_allows`) then moved
+/// onto the act's own transaction (backlog 9a5bc055), removing three: 82 -> 79.
+const HIGH_WATER: usize = 79;
 
 // ===========================================================================
 // The scanner.

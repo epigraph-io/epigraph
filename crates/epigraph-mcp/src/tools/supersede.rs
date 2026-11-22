@@ -374,7 +374,8 @@ async fn begin_claim_act<'p>(
             .await
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
-        crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
+        crate::tools::claims::require_owner_or_admin(server, &mut tx, auth, caller, claim_author)
+            .await?;
         return Ok((tx, caller.agent_id(), caller.agent_id()));
     };
 

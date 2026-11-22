@@ -340,7 +340,7 @@ pub(crate) async fn require_workflow_authority(
     }
     // 2. The submitter's operator (#503; HTTP admits the operator itself, never
     //    the actor arm, exactly as `require_owner_or_admin` does).
-    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
     // 3. A delegate (R-183): the caller's acting link names the submitter,
@@ -601,7 +601,7 @@ async fn stdio_workflow_authority(
     if caller_agent == owner {
         return Ok(WorkflowArm::Submitter);
     }
-    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(WorkflowArm::Operator);
     }
     if let Some(operator) = delegate_arm(conn, caller_agent, owner, tool_name).await? {

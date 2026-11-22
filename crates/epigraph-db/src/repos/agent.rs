@@ -1798,6 +1798,60 @@ impl AgentRepository {
         Self::operator_actor(&mut conn, agent_id).await
     }
 
+    /// [`Self::operator_actor`] for an ACT that grants authority on the
+    /// answer: read on the act's own transaction, after taking 107's link
+    /// advisory lock (`epigraph.operator_links`) in SHARED mode, held until
+    /// that transaction ends.
+    ///
+    /// Every link writer and 191's retire verb (`epigraph_retire_operator_link`)
+    /// take that lock EXCLUSIVELY before they touch a link. So:
+    ///
+    /// * a retire in flight when the act asks makes the act wait; the read
+    ///   then runs after the retire commits and answers "not acting";
+    /// * a retire that starts after the read waits for the act to commit, so
+    ///   the act lands before the retire, never after it.
+    ///
+    /// Either way an act admitted on a link cannot land after that link's
+    /// retire committed. Shared mode does not serialise acts against each
+    /// other. Two acts holding it never wait on each other.
+    ///
+    /// # What the caller must guarantee
+    ///
+    /// * `conn` is the transaction the act COMMITS on. A lock taken on another
+    ///   connection, or one dropped before the write, is released before the
+    ///   write lands and guards nothing.
+    /// * That transaction is READ COMMITTED (a plain `BEGIN`, as `begin_as`
+    ///   sends). The lock and the read are two statements on purpose: a read
+    ///   statement's snapshot is taken when the statement starts. One
+    ///   statement that both waited on the lock and read would still see the
+    ///   pre-retire row, and so would any read under REPEATABLE READ.
+    /// * Take it before the act's first write. A retire locks the operator
+    ///   group's row `FOR UPDATE` after it takes the advisory lock. An act
+    ///   that already holds a key-share lock on that row (for example from an
+    ///   insert into that group) and then waits on the advisory lock would
+    ///   deadlock with it.
+    ///
+    /// It does NOT serialise a writer-membership revoke made through the
+    /// roster verbs (they take no link lock). Such a revoke also ends the
+    /// acting link. Nor does it serialise a direct maintenance `UPDATE` of
+    /// `operator_links.retired`, which 191 leaves unserialised.
+    ///
+    /// # Errors
+    /// As [`Self::operator_actor`]; the lock statement's failure is
+    /// `DbError::QueryFailed`.
+    pub async fn operator_actor_for_act(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+    ) -> Result<Option<OperatorLink>, DbError> {
+        sqlx::query(
+            "SELECT pg_catalog.pg_advisory_xact_lock_shared(\
+                 pg_catalog.hashtext('epigraph.operator_links'))",
+        )
+        .execute(&mut *conn)
+        .await?;
+        Self::operator_actor(conn, agent_id).await
+    }
+
     /// "May a token that `delegator_agent` asked for act as `principal`?" —
     /// THE per-request liveness check of a delegated run token (a token whose
     /// `dlg` claim names `delegator_agent`), run once per request by the REST
