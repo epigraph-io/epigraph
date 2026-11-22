@@ -516,7 +516,10 @@ async fn an_insert_into_one_generation_keeps_a_shared_pair_for_the_other(pool: P
     );
 
     let added = add(y, 1).await;
-    assert_eq!(added.workflow_id, gen1, "add_step edits the head generation");
+    assert_eq!(
+        added.workflow_id, gen1,
+        "add_step edits the head generation"
+    );
 
     assert_eq!(
         read_order(&pool, &viewer, gen1).await,

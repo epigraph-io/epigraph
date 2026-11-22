@@ -156,9 +156,7 @@ async fn a_workflow_goal_vector_is_stored_only_from_the_owning_provider(pool: Pg
 /// `POST /api/v1/workflows/hierarchical/:id/outcome`: the goal vector on every
 /// step row.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_hierarchical_outcome_goal_vector_is_stored_only_from_the_owning_provider(
-    pool: PgPool,
-) {
+async fn a_hierarchical_outcome_goal_vector_is_stored_only_from_the_owning_provider(pool: PgPool) {
     let (agent, _) = viewer_fixture::seed_agent_with_group(&pool, "hier-gate").await;
     for (provider, stores) in ARMS {
         let router = router(&pool, provider).await;
@@ -312,16 +310,18 @@ async fn an_added_step_is_embedded_only_from_the_owning_provider(pool: PgPool) {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{provider:?}: {out}");
-        let step = Uuid::parse_str(out["step_claim_id"].as_str().expect("step_claim_id"))
-            .expect("uuid");
-        let (current, embedded): (bool, bool) = sqlx::query_as(
-            "SELECT is_current, embedding IS NOT NULL FROM claims WHERE id = $1",
-        )
-        .bind(step)
-        .fetch_one(&pool)
-        .await
-        .expect("step claim");
+        let step =
+            Uuid::parse_str(out["step_claim_id"].as_str().expect("step_claim_id")).expect("uuid");
+        let (current, embedded): (bool, bool) =
+            sqlx::query_as("SELECT is_current, embedding IS NOT NULL FROM claims WHERE id = $1")
+                .bind(step)
+                .fetch_one(&pool)
+                .await
+                .expect("step claim");
         assert!(current, "{provider:?}: the added step is current");
-        assert_eq!(embedded, stores, "{provider:?}: the added step's claims.embedding");
+        assert_eq!(
+            embedded, stores,
+            "{provider:?}: the added step's claims.embedding"
+        );
     }
 }

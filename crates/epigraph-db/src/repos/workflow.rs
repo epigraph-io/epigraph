@@ -3127,7 +3127,10 @@ impl WorkflowRepository {
             std::collections::HashSet::new();
         let mut succ: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
         for (a, b) in follows {
-            if a == b || !rank.contains_key(a) || !rank.contains_key(b) || !distinct.insert((*a, *b))
+            if a == b
+                || !rank.contains_key(a)
+                || !rank.contains_key(b)
+                || !distinct.insert((*a, *b))
             {
                 continue;
             }

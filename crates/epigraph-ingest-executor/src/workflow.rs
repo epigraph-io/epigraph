@@ -319,11 +319,7 @@ impl WorkflowIngestExecutionResult {
     /// What a caller embeds post-commit (CLAUDE.md "Embedding policy").
     #[must_use]
     pub fn claims_to_embed(&self) -> Vec<(Uuid, String)> {
-        self.inserted
-            .iter()
-            .chain(&self.revived)
-            .cloned()
-            .collect()
+        self.inserted.iter().chain(&self.revived).cloned().collect()
     }
 }
 
