@@ -47,7 +47,10 @@
 --       `pg_catalog, <its schema>, pg_temp`;
 --    d. a path that lists `pg_temp` anywhere but last (including one that
 --       also lists it last) is refused (55000, nothing changed), not guessed
---       at (none exists at 235);
+--       at (none exists at 235). Items are compared as PostgreSQL reads
+--       them: an unquoted item ASCII lower-cased, a quoted one with its
+--       quotes stripped, so a stored `PG_TEMP` or `"pg_temp"` is `pg_temp`
+--       (the same reading in the postcondition and in the ratchet);
 --    e. a path it would rebuild whose items are not each a plain lower-case
 --       identifier or exactly "$user" is refused (55000, nothing changed).
 --       The stored text is whatever the function's owner set (`SET
@@ -106,6 +109,7 @@ DO $$
 DECLARE
     r record;
     v_items text[];
+    v_norm text[];
     v_n integer;
     v_bad text;
     v_new text;
@@ -136,25 +140,37 @@ BEGIN
                 CONTINUE;
             END IF;
             v_new := pg_catalog.format('pg_catalog, %I, pg_temp', r.nspname);
-        ELSIF pg_catalog.btrim(r.path, E' \t\r\n') IN ('', '""') THEN
+        ELSIF pg_catalog.btrim(r.path, E' \t\n\r\f\x0B') IN ('', '""') THEN
             -- `SET search_path = ''`: only pg_catalog, and pg_temp FIRST.
             v_new := 'pg_catalog, pg_temp';
         ELSE
-            v_items := ARRAY(SELECT pg_catalog.btrim(i, E' \t\r\n')
+            v_items := ARRAY(SELECT pg_catalog.btrim(i, E' \t\n\r\f\x0B')
                                FROM pg_catalog.unnest(pg_catalog.string_to_array(r.path, ','))
                                     WITH ORDINALITY AS u(i, ord)
                               ORDER BY ord);
             v_n := pg_catalog.cardinality(v_items);
+            -- Each item as PostgreSQL reads it: an unquoted name ASCII
+            -- lower-cased, a quoted one with its quotes stripped. So a stored
+            -- `PG_TEMP` or `"pg_temp"` IS pg_temp, and is compared as such.
+            v_norm := ARRAY(SELECT CASE WHEN i ~ '^".*"$'
+                                        THEN pg_catalog.replace(
+                                                 pg_catalog.substr(i, 2, pg_catalog.length(i) - 2),
+                                                 '""', '"')
+                                        ELSE pg_catalog.translate(i, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                                                                     'abcdefghijklmnopqrstuvwxyz')
+                                   END
+                              FROM pg_catalog.unnest(v_items) WITH ORDINALITY AS u(i, ord)
+                             ORDER BY ord);
             -- Refuse first: a path listing pg_temp before its last item is
             -- searched in that order whatever follows, so appending cannot
             -- fix it.
-            IF 'pg_temp' = ANY (v_items[1:v_n - 1]) THEN
+            IF 'pg_temp' = ANY (v_norm[1:v_n - 1]) THEN
                 RAISE EXCEPTION '271: % lists pg_temp before another schema '
                                 '(search_path=%); nothing was changed', r.sig, r.path
                     USING ERRCODE = '55000',
                           HINT = 'Re-state it with pg_temp last, then apply 271.';
             END IF;
-            IF v_items[v_n] = 'pg_temp' THEN
+            IF v_norm[v_n] = 'pg_temp' THEN
                 CONTINUE;
             END IF;
             -- The stored text is whatever the function's OWNER set (`ALTER
@@ -204,13 +220,28 @@ BEGIN
                         WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
                           AND d.objid = p.oid AND d.deptype = 'e')
        AND (
-            -- a pinned path without pg_temp listed once, last
-            EXISTS (SELECT 1 FROM pg_catalog.unnest(p.proconfig) c
+            -- a pinned path without pg_temp listed once, last, each item
+            -- read as the sweep reads it (unquoted: ASCII lower-cased;
+            -- quoted: quotes stripped)
+            EXISTS (SELECT 1
+                      FROM pg_catalog.unnest(p.proconfig) c
+                      CROSS JOIN LATERAL (
+                          SELECT pg_catalog.array_agg(
+                                     CASE WHEN b.t ~ '^".*"$'
+                                          THEN pg_catalog.replace(
+                                                   pg_catalog.substr(b.t, 2, pg_catalog.length(b.t) - 2),
+                                                   '""', '"')
+                                          ELSE pg_catalog.translate(b.t, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+                                                                         'abcdefghijklmnopqrstuvwxyz')
+                                     END ORDER BY u.ord) AS norm
+                            FROM pg_catalog.unnest(pg_catalog.string_to_array(pg_catalog.substr(c, 13), ','))
+                                 WITH ORDINALITY AS u(i, ord)
+                            CROSS JOIN LATERAL
+                                 (SELECT pg_catalog.btrim(u.i, E' \t\n\r\f\x0B') AS t) b) s
                      WHERE c LIKE 'search_path=%'
-                       AND (pg_catalog.regexp_replace(c, '[\s"]', '', 'g')
-                                !~ '^search_path=(.*,)?pg_temp$'
-                            OR pg_catalog.regexp_replace(c, '[\s"]', '', 'g')
-                                ~ '[=,]pg_temp,'))
+                       AND (s.norm IS NULL
+                            OR s.norm[pg_catalog.cardinality(s.norm)] IS DISTINCT FROM 'pg_temp'
+                            OR 'pg_temp' = ANY (s.norm[1:pg_catalog.cardinality(s.norm) - 1])))
             -- an unpinned trigger function
             OR ((p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype
                  OR EXISTS (SELECT 1 FROM pg_catalog.pg_trigger t

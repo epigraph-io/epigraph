@@ -41,10 +41,12 @@
 //! * [`migration_271_changes_only_search_paths`],
 //!   [`migration_271_refuses_pg_temp_before_another_schema`],
 //!   [`migration_271_pins_an_empty_path_and_an_unpinned_trigger_in_any_schema`],
-//!   [`migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it`] and
+//!   [`migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it`],
+//!   [`migration_271_reads_path_items_as_postgres_does`] and
 //!   [`the_271_undo_restores_the_paths_below_271`] -- what 271 changes, its
 //!   refusals (including a stored path whose items are SQL: 271 never splices
-//!   catalog text into a statement), its non-append branches, and its undo
+//!   catalog text into a statement, and an upper-case `PG_TEMP`, which
+//!   PostgreSQL reads as `pg_temp`), its non-append branches, and its undo
 //!   runbook.
 //!
 //! # The rule for later migrations
@@ -189,10 +191,26 @@ async fn routines_of(pool: &PgPool) -> BTreeMap<String, Routine> {
     routines(&mut conn).await
 }
 
+/// The whitespace PostgreSQL's list parser skips around an item.
+const PATH_SPACE: &[char] = &[' ', '\t', '\n', '\r', '\x0C', '\x0B'];
+
+/// Each item of a stored `search_path` as PostgreSQL reads it: an unquoted
+/// item ASCII lower-cased, a quoted one with its quotes stripped and `""`
+/// unescaped. So `PG_TEMP` and `"pg_temp"` both read as `pg_temp`. 271's
+/// sweep and postcondition read items the same way.
 fn path_items(path: &str) -> Vec<String> {
+    if path.trim_matches(PATH_SPACE).is_empty() {
+        return Vec::new();
+    }
     path.split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
+        .map(|s| {
+            let t = s.trim_matches(PATH_SPACE);
+            if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+                t[1..t.len() - 1].replace("\"\"", "\"")
+            } else {
+                t.to_ascii_lowercase()
+            }
+        })
         .collect()
 }
 
@@ -256,6 +274,64 @@ CREATE FUNCTION public.t134_probe_invoker_unpinned() RETURNS integer
     LANGUAGE sql AS $$ SELECT 1 $$;
 "#;
 
+/// Store `path` on `sig` VERBATIM, as `ALTER FUNCTION .. SET search_path FROM
+/// CURRENT` stores the session's value (a `CREATE FUNCTION .. SET` clause
+/// would normalise the spelling), and check it was.
+async fn store_path_verbatim(pool: &PgPool, sig: &str, path: &str) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+        .bind(path)
+        .execute(&mut *conn)
+        .await
+        .expect("the session takes the path");
+    sqlx::raw_sql(&format!(
+        "ALTER FUNCTION {sig} SET search_path FROM CURRENT; RESET search_path"
+    ))
+    .execute(&mut *conn)
+    .await
+    .expect("store it on the function");
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT (SELECT pg_catalog.substr(c, 13) FROM pg_catalog.unnest(p.proconfig) c \
+                  WHERE c LIKE 'search_path=%' LIMIT 1) \
+           FROM pg_catalog.pg_proc p WHERE p.oid = pg_catalog.to_regprocedure($1)",
+    )
+    .bind(sig)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("read the stored path");
+    assert_eq!(
+        stored.as_deref(),
+        Some(path),
+        "CALIBRATION: {sig}'s path is stored verbatim"
+    );
+}
+
+/// Probes whose spelling only `FROM CURRENT` stores: an upper-case `PG_TEMP`
+/// is `pg_temp` to PostgreSQL, so listing it first is reported and listing
+/// it last is not.
+const VERBATIM_PATH_PROBES: &[(&str, &str)] = &[
+    (
+        "public.t134_probe_invoker_upper_temp_first()",
+        "PG_TEMP, public, pg_temp",
+    ),
+    (
+        "public.t134_probe_invoker_upper_temp_last()",
+        "pg_catalog, public, PG_TEMP",
+    ),
+];
+
+async fn create_verbatim_probes(pool: &PgPool, probes: &[(&str, &str)]) {
+    for (sig, path) in probes {
+        sqlx::raw_sql(&format!(
+            "CREATE FUNCTION {sig} RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$"
+        ))
+        .execute(pool)
+        .await
+        .expect("a probe function");
+        store_path_verbatim(pool, sig, path).await;
+    }
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_function_that_pins_a_search_path_lists_pg_temp_last(pool: PgPool) {
     let at_head = routines_of(&pool).await;
@@ -281,6 +357,7 @@ async fn every_function_that_pins_a_search_path_lists_pg_temp_last(pool: PgPool)
         .execute(&pool)
         .await
         .expect("probes");
+    create_verbatim_probes(&pool, VERBATIM_PATH_PROBES).await;
     let with_probes = temp_shadowable(&routines_of(&pool).await);
     let probed: BTreeSet<&str> = with_probes
         .keys()
@@ -294,10 +371,12 @@ async fn every_function_that_pins_a_search_path_lists_pg_temp_last(pool: PgPool)
             "public.t134_probe_invoker_empty()",
             "public.t134_probe_invoker_no_temp()",
             "public.t134_probe_invoker_temp_first()",
+            "public.t134_probe_invoker_upper_temp_first()",
             "public.t134_probe_trigger_no_temp()",
         ]),
-        "CALIBRATION: exactly the invoker probes whose path omits pg_temp, lists it first or \
-         is empty are reported (not the temp-last or the unpinned one)"
+        "CALIBRATION: exactly the invoker probes whose path omits pg_temp, lists it first \
+         (in any letter case) or is empty are reported (not the temp-last ones, in either \
+         case, or the unpinned one)"
     );
 
     assert!(
@@ -903,6 +982,66 @@ async fn migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it(pool: P
     .execute(&pool)
     .await
     .expect("clean up the cluster-wide role");
+}
+
+/// 271 reads each path item as PostgreSQL does: an unquoted item ASCII
+/// lower-cased, a quoted one with its quotes stripped. A stored `PG_TEMP`
+/// (only `SET search_path FROM CURRENT` stores that spelling) IS `pg_temp`,
+/// so listing it first is refused (55000, nothing changed) even though the
+/// path also ends in `pg_temp`, and a path that ends in `PG_TEMP` or
+/// `"pg_temp"` already lists it last and is left as stored.
+#[sqlx::test(migrations = false)]
+async fn migration_271_reads_path_items_as_postgres_does(pool: PgPool) {
+    migrate(&pool, &below(271))
+        .await
+        .expect("migrate below 271");
+    let kept = [
+        (
+            "public.t134_upper_temp_last()",
+            "pg_catalog, public, PG_TEMP",
+        ),
+        (
+            "public.t134_quoted_temp_last()",
+            "pg_catalog, public, \"pg_temp\"",
+        ),
+    ];
+    create_verbatim_probes(
+        &pool,
+        &[("public.t134_upper_temp_first()", "PG_TEMP, public, pg_temp")],
+    )
+    .await;
+    create_verbatim_probes(&pool, &kept).await;
+    let before = routines_of(&pool).await;
+
+    let r = migrate(&pool, &below(272)).await;
+    assert_eq!(
+        sqlstate(&r).as_deref(),
+        Some("55000"),
+        "271 refuses a path listing PG_TEMP (pg_temp) before another schema: {r:?}"
+    );
+    assert!(
+        format!("{:?}", r.as_ref().err()).contains("t134_upper_temp_first"),
+        "the refusal names the function: {r:?}"
+    );
+    assert!(!applied(&pool, 271).await, "271 is not recorded");
+    assert_eq!(routines_of(&pool).await, before, "nothing was changed");
+
+    sqlx::raw_sql("DROP FUNCTION public.t134_upper_temp_first()")
+        .execute(&pool)
+        .await
+        .expect("drop the refused function");
+    migrate(&pool, &below(272)).await.expect(
+        "POSITIVE CONTROL: 271 applies; a path ending in PG_TEMP or \"pg_temp\" already lists \
+         pg_temp last",
+    );
+    let after = routines_of(&pool).await;
+    for (sig, path) in kept {
+        assert_eq!(
+            after[sig].path.as_deref(),
+            Some(path),
+            "271 leaves {sig} as stored"
+        );
+    }
 }
 
 fn repo_text(rel: &str) -> String {

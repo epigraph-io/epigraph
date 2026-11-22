@@ -3412,7 +3412,9 @@ restart.
   `pg_catalog, <its schema>, pg_temp`, and a path listing `pg_temp` before another schema,
   or one to rebuild whose items are not plain lower-case names or `"$user"`, is refused
   (55000, nothing changed; a stored path is owner-controlled text, so 271 rebuilds it from
-  validated items with `quote_ident` and never splices it into a statement). A postcondition refuses (55000) if either rule is
+  validated items with `quote_ident` and never splices it into a statement). Items are read
+  as PostgreSQL reads them (unquoted: ASCII lower-cased; quoted: quotes stripped), so a
+  stored `PG_TEMP` is `pg_temp`. A postcondition refuses (55000) if either rule is
   still broken. `ALTER ROUTINE .. SET search_path` only: no body, owner, ACL or other
   config entry moves, so md5-of-`prosrc` preconditions still hold. At 235 it changes 19
   functions: nine SECURITY INVOKER bodies on a path without `pg_temp` (six triggers, on
@@ -3425,7 +3427,7 @@ restart.
   maintenance role. Pinned by `epigraph-db/tests/function_search_path_pg_temp_ratchet.rs`
   (both catalog rules, calibrated with probes; the behavioural proof on a real
   NOSUPERUSER application login, which fails below 271; what 271 changes, its refusal,
-  its empty-path / other-schema / procedure branches, and the undo). `TEMP` on the
+  its empty-path / other-schema / procedure branches, its letter-case reading, and the undo). `TEMP` on the
   database is NOT revoked here (the application role holds it through PUBLIC; see the
   header). Undo: `docs/runbooks/271-undo.sql` (reverts each function only while its body
   is still the 235 body and its path is 271's). **Deploy order:** none against the
