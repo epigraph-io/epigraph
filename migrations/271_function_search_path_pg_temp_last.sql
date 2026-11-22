@@ -47,7 +47,15 @@
 --       `pg_catalog, <its schema>, pg_temp`;
 --    d. a path that lists `pg_temp` anywhere but last (including one that
 --       also lists it last) is refused (55000, nothing changed), not guessed
---       at (none exists at 235).
+--       at (none exists at 235);
+--    e. a path it would rebuild whose items are not each a plain lower-case
+--       identifier or exactly "$user" is refused (55000, nothing changed).
+--       The stored text is whatever the function's owner set (`SET
+--       search_path FROM CURRENT` stores a session value verbatim, and an
+--       unquoted list item may hold any character but a comma or
+--       whitespace), and the new path goes into a statement run as the
+--       migrating role, so it is rebuilt from validated items with
+--       `quote_ident` and the stored text never reaches EXECUTE.
 --    The sweep reads the catalog, so it also covers a function a
 --    lower-numbered migration created before this file is applied. Each
 --    change is reported as a NOTICE.
@@ -98,6 +106,8 @@ DO $$
 DECLARE
     r record;
     v_items text[];
+    v_n integer;
+    v_bad text;
     v_new text;
 BEGIN
     FOR r IN
@@ -126,26 +136,49 @@ BEGIN
                 CONTINUE;
             END IF;
             v_new := pg_catalog.format('pg_catalog, %I, pg_temp', r.nspname);
+        ELSIF pg_catalog.btrim(r.path, E' \t\r\n') IN ('', '""') THEN
+            -- `SET search_path = ''`: only pg_catalog, and pg_temp FIRST.
+            v_new := 'pg_catalog, pg_temp';
         ELSE
-            v_items := pg_catalog.array_remove(pg_catalog.string_to_array(
-                pg_catalog.regexp_replace(r.path, '[\s"]', '', 'g'), ','), '');
-            IF COALESCE(pg_catalog.cardinality(v_items), 0) = 0 THEN
-                v_new := 'pg_catalog, pg_temp';
-            ELSE
-                -- Refuse first: a path listing pg_temp before its last item
-                -- is searched in that order whatever follows, so appending
-                -- cannot fix it.
-                IF 'pg_temp' = ANY (v_items[1:pg_catalog.array_upper(v_items, 1) - 1]) THEN
-                    RAISE EXCEPTION '271: % lists pg_temp before another schema '
-                                    '(search_path=%); nothing was changed', r.sig, r.path
-                        USING ERRCODE = '55000',
-                              HINT = 'Re-state it with pg_temp last, then apply 271.';
-                END IF;
-                IF v_items[pg_catalog.array_upper(v_items, 1)] = 'pg_temp' THEN
-                    CONTINUE;
-                END IF;
-                v_new := r.path || ', pg_temp';
+            v_items := ARRAY(SELECT pg_catalog.btrim(i, E' \t\r\n')
+                               FROM pg_catalog.unnest(pg_catalog.string_to_array(r.path, ','))
+                                    WITH ORDINALITY AS u(i, ord)
+                              ORDER BY ord);
+            v_n := pg_catalog.cardinality(v_items);
+            -- Refuse first: a path listing pg_temp before its last item is
+            -- searched in that order whatever follows, so appending cannot
+            -- fix it.
+            IF 'pg_temp' = ANY (v_items[1:v_n - 1]) THEN
+                RAISE EXCEPTION '271: % lists pg_temp before another schema '
+                                '(search_path=%); nothing was changed', r.sig, r.path
+                    USING ERRCODE = '55000',
+                          HINT = 'Re-state it with pg_temp last, then apply 271.';
             END IF;
+            IF v_items[v_n] = 'pg_temp' THEN
+                CONTINUE;
+            END IF;
+            -- The stored text is whatever the function's OWNER set (`ALTER
+            -- FUNCTION .. SET search_path FROM CURRENT` stores a session value
+            -- verbatim), and the new path is spliced into a statement this
+            -- migration runs as the migrating role. So every item must be a
+            -- plain lower-case identifier or exactly "$user", and the path is
+            -- rebuilt from the validated items with quote_ident; the stored
+            -- text itself never reaches EXECUTE.
+            SELECT pg_catalog.string_agg(pg_catalog.quote_literal(i), ', ') INTO v_bad
+              FROM pg_catalog.unnest(v_items) AS i
+             WHERE i !~ '^[a-z_][a-z0-9_]*$' AND i <> '"$user"';
+            IF v_bad IS NOT NULL THEN
+                RAISE EXCEPTION '271: % pins a search_path whose items are not plain schema '
+                                'names (%); nothing was changed', r.sig, v_bad
+                    USING ERRCODE = '55000',
+                          HINT = 'Inspect who set that path, re-state it with plain schema '
+                                 'names and pg_temp last, then apply 271.';
+            END IF;
+            SELECT pg_catalog.string_agg(
+                       CASE WHEN i = '"$user"' THEN i ELSE pg_catalog.quote_ident(i) END,
+                       ', ' ORDER BY ord) || ', pg_temp'
+              INTO v_new
+              FROM pg_catalog.unnest(v_items) WITH ORDINALITY AS u(i, ord);
         END IF;
         RAISE NOTICE '271: % search_path % -> %', r.sig, COALESCE(r.path, '(unpinned)'), v_new;
         EXECUTE pg_catalog.format('ALTER ROUTINE %s SET search_path = %s', r.sig, v_new);

@@ -40,9 +40,12 @@
 //!   planted check never runs as `epigraph_maintenance`.
 //! * [`migration_271_changes_only_search_paths`],
 //!   [`migration_271_refuses_pg_temp_before_another_schema`],
-//!   [`migration_271_pins_an_empty_path_and_an_unpinned_trigger_in_any_schema`]
-//!   and [`the_271_undo_restores_the_paths_below_271`] -- what 271 changes, its
-//!   refusal, its two non-append branches, and its undo runbook.
+//!   [`migration_271_pins_an_empty_path_and_an_unpinned_trigger_in_any_schema`],
+//!   [`migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it`] and
+//!   [`the_271_undo_restores_the_paths_below_271`] -- what 271 changes, its
+//!   refusals (including a stored path whose items are SQL: 271 never splices
+//!   catalog text into a statement), its non-append branches, and its undo
+//!   runbook.
 //!
 //! # The rule for later migrations
 //!
@@ -814,6 +817,92 @@ async fn migration_271_pins_an_empty_path_and_an_unpinned_trigger_in_any_schema(
     ] {
         assert_eq!(after[sig].path.as_deref(), Some(want), "{sig}");
     }
+}
+
+/// A function's OWNER controls the text of its stored path: `ALTER FUNCTION
+/// .. SET search_path FROM CURRENT` stores the session's value verbatim, and
+/// a list item that is not quoted may hold any character but a comma or
+/// whitespace. 271 builds a statement from that path and runs it as the
+/// migrating role, so it must validate every item and rebuild the path, never
+/// splice the stored text. A non-superuser owner stores a path whose items
+/// are SQL; 271 refuses (55000) naming the function, and none of the SQL runs
+/// (the table it would create stays absent).
+#[sqlx::test(migrations = false)]
+async fn migration_271_refuses_a_crafted_stored_path_and_runs_none_of_it(pool: PgPool) {
+    migrate(&pool, &below(271))
+        .await
+        .expect("migrate below 271");
+    let role = format!("t134_owner_{}", Uuid::new_v4().simple());
+    sqlx::raw_sql(&format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS; \
+         CREATE FUNCTION public.t134_crafted() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$; \
+         ALTER FUNCTION public.t134_crafted() OWNER TO {role};"
+    ))
+    .execute(&pool)
+    .await
+    .expect("a function owned by a non-superuser role");
+    // Statements with no whitespace (comments stand in for spaces); the last
+    // one re-paths the function so a migration that ran them would still
+    // pass its own postcondition and commit.
+    const PAYLOAD: &str = "public;create/**/table/**/public.t134_pwned(x/**/int);\
+                           alter/**/function/**/public.t134_crafted()/**/set/**/\
+                           search_path=public,pg_temp;--";
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        sqlx::raw_sql(&format!("SET ROLE {role}"))
+            .execute(&mut *conn)
+            .await
+            .expect("act as the owner");
+        sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+            .bind(PAYLOAD)
+            .execute(&mut *conn)
+            .await
+            .expect("the session takes the crafted path");
+        sqlx::raw_sql(
+            "ALTER FUNCTION public.t134_crafted() SET search_path FROM CURRENT; \
+             RESET ROLE; RESET search_path",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("the owner stores it");
+    }
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_catalog.unnest(proconfig) FROM pg_catalog.pg_proc \
+          WHERE oid = 'public.t134_crafted()'::regprocedure",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the stored config");
+    assert_eq!(
+        stored,
+        vec![format!("search_path={PAYLOAD}")],
+        "CALIBRATION: the owner's path is stored verbatim"
+    );
+
+    let r = migrate(&pool, &below(272)).await;
+    assert_eq!(
+        sqlstate(&r).as_deref(),
+        Some("55000"),
+        "271 refuses the crafted path: {r:?}"
+    );
+    assert!(
+        format!("{:?}", r.as_ref().err()).contains("t134_crafted"),
+        "the refusal names the function: {r:?}"
+    );
+    let pwned: bool = sqlx::query_scalar("SELECT to_regclass('public.t134_pwned') IS NOT NULL")
+        .fetch_one(&pool)
+        .await
+        .expect("look for the marker table");
+    assert!(!pwned, "271 ran SQL from a stored search_path");
+    assert!(!applied(&pool, 271).await, "271 is not recorded");
+
+    sqlx::raw_sql(&format!(
+        "DROP TABLE IF EXISTS public.t134_pwned; DROP FUNCTION public.t134_crafted(); \
+         DROP ROLE {role};"
+    ))
+    .execute(&pool)
+    .await
+    .expect("clean up the cluster-wide role");
 }
 
 fn repo_text(rel: &str) -> String {

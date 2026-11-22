@@ -3409,8 +3409,10 @@ restart.
   outside the system schemas and extensions: a pinned path without `pg_temp` gets
   `, pg_temp` appended, an empty path becomes `pg_catalog, pg_temp`, an unpinned trigger
   function (returns `trigger` or is attached to one; not `c`/`internal`) gets
-  `pg_catalog, <its schema>, pg_temp`, and a path listing `pg_temp` before another schema
-  is refused (55000, nothing changed). A postcondition refuses (55000) if either rule is
+  `pg_catalog, <its schema>, pg_temp`, and a path listing `pg_temp` before another schema,
+  or one to rebuild whose items are not plain lower-case names or `"$user"`, is refused
+  (55000, nothing changed; a stored path is owner-controlled text, so 271 rebuilds it from
+  validated items with `quote_ident` and never splices it into a statement). A postcondition refuses (55000) if either rule is
   still broken. `ALTER ROUTINE .. SET search_path` only: no body, owner, ACL or other
   config entry moves, so md5-of-`prosrc` preconditions still hold. At 235 it changes 19
   functions: nine SECURITY INVOKER bodies on a path without `pg_temp` (six triggers, on

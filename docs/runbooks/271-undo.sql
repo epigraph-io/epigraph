@@ -15,7 +15,9 @@
 --   * the function still has its 235 body (md5 of `prosrc`); a later
 --     migration that re-stated the body set its own path, which stays; and
 --   * its path is the one 271 set; any other path stays.
--- It changes no body, owner, ACL or other configuration entry.
+-- It changes no body, owner, ACL or other configuration entry. Every
+-- statement it runs is built from the constants below, never from catalog
+-- text (a function's owner controls its stored path).
 --
 -- WHAT IT LEAVES: 271's `_sqlx_migrations` row, and any function a migration
 -- after 271 created. Re-introducing the change is a NEW migration, never a
