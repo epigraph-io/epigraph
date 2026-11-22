@@ -3383,6 +3383,15 @@ async fn writer_owned_fixture(pool: &PgPool) -> WoFx {
     .expect("seed the outsider's challenge");
     // The shape migrations 114 and 168 give a writer's row on a public claim
     // (the harness is privileged, so the rows inherited; set it directly).
+    // The group is the one their insert path picks, 114's
+    // `epigraph_writer_group()`: the acting operator's personal group if the
+    // session may write it, else the writer's own `did:epigraph:personal:`
+    // group. A session stamped by `Viewer::resolve` has a membership-only
+    // writable set, and neither the stranger nor the linked actor is a member
+    // of the operator's group, so both land on their personal groups
+    // (`stranger_group`, `actor_group`, from `seed_agent_with_group`). A row
+    // the first branch would give the operator's group already sits on the
+    // target and is not the case pinned here.
     // LAST, on purpose: 070's insert arm re-syncs every row of a table to its
     // claim on each new insert for that claim.
     for (t, id, g) in [
