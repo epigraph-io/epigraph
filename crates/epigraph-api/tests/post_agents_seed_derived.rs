@@ -7,6 +7,8 @@
 //! as the author and mint tokens. A caller now declares the key
 //! `seed-derived`: the row is stored as no verifier and gets no client.
 
+mod viewer_fixture;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -52,7 +54,20 @@ async fn post(
     auth: &AuthContext,
     body: serde_json::Value,
 ) -> (StatusCode, serde_json::Value) {
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    post_on(
+        AppState::with_db(pool.clone(), ApiConfig::default()),
+        auth,
+        body,
+    )
+    .await
+}
+
+/// `create_agent` on `state`.
+async fn post_on(
+    state: AppState,
+    auth: &AuthContext,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
     let req: CreateAgentRequest = serde_json::from_value(body).expect("request");
     let r = create_agent(State(state), Some(Extension(auth.clone())), Json(req)).await;
     let resp = r.into_response();
@@ -171,4 +186,30 @@ async fn a_key_kind_declaration_is_checked_and_never_rewrites_a_row(pool: PgPool
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(stored(&pool, &key).await, ("ed25519".to_string(), 1));
+}
+
+/// The route writes on the raw application pool, which in production is the
+/// non-bypassing `epigraph_app` login, not the superuser the tests above run
+/// on. The seed-derived insert must pass row security there (migration 077's
+/// `agents_provision` refuses only `derived`), or every author registration
+/// would fail and `ingest_literature` only warns.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_declaration_is_stored_on_the_application_role(pool: PgPool) {
+    let auth = caller(&pool).await;
+    let app_pool = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let state = AppState::with_db(app_pool, ApiConfig::default());
+    let author = key_of("10.0000/example.0003:Cy Example");
+    let (status, body) = post_on(
+        state,
+        &auth,
+        serde_json::json!({
+            "public_key": author, "display_name": "Cy Example", "key_kind": "seed-derived"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        stored(&pool, &author).await,
+        ("seed-derived".to_string(), 0)
+    );
 }
