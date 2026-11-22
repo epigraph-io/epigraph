@@ -920,11 +920,13 @@ jobs:
       - name: Python tests (NLI stance client and service)
         # scripts/lib/test_nli_stance.py and the services/nli stub tests ran
         # nowhere (backlog 4ea6edba). The service's web dependencies are
-        # installed at the versions services/nli/requirements.txt pins; its
-        # model dependencies (torch, transformers) are not, so
-        # test_model_smoke.py, which downloads a model, stays out.
+        # installed at the versions services/nli/requirements.txt pins (read
+        # from that file, so a pin bump is what CI tests); its model
+        # dependencies (torch, transformers) are not, so test_model_smoke.py,
+        # which downloads a model, stays out.
         run: |
-          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet fastapi==0.111.0 pydantic==2.7.4
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet \
+            $(grep -E '^(fastapi|starlette|pydantic)==' services/nli/requirements.txt)
           python3 -m pytest -rs scripts/lib/test_nli_stance.py \
             services/nli/test_app.py services/nli/test_requirements_floor.py
       - name: SciFact conformal calibration check
