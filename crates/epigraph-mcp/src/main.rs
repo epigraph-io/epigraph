@@ -288,8 +288,9 @@ fn select_signer(
         (Some(identity), Some(signing)) => {
             if agent_key.is_some() {
                 return Err(
-                    "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY name the agent \
-                     and its signing key; they cannot be combined with --agent-key \
+                    "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY (or \
+                     EPIGRAPH_AGENT_SIGNING_KEY_FILE) name the agent and its signing key; they \
+                     cannot be combined with --agent-key \
                      (EPIGRAPH_MCP_AGENT_KEY). Set one identity source."
                         .to_string(),
                 );
@@ -300,11 +301,11 @@ fn select_signer(
             let signer =
                 AgentSigner::from_bytes(&signing).map_err(|e| format!("agent-signing-key: {e}"))?;
             if signer.public_key() == identity {
-                return Err(
-                    "EPIGRAPH_AGENT_SIGNING_KEY is the identity key's own private half; the \
-                     signing key must be a separate random key (the identity key signs nothing)"
-                        .to_string(),
-                );
+                return Err("the signing key (EPIGRAPH_AGENT_SIGNING_KEY or the file \
+                     EPIGRAPH_AGENT_SIGNING_KEY_FILE names) is the identity key's own private \
+                     half; the signing key must be a separate random key (the identity key signs \
+                     nothing)"
+                    .to_string());
             }
             return Ok(SelectedSigner {
                 signer,
@@ -315,8 +316,10 @@ fn select_signer(
         _ => {
             return Err(
                 "EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set \
-                 together (the separate-signing-key mode); refusing to start with only one \
-                 rather than fall back to another identity"
+                 together (the separate-signing-key mode; the signing key comes from \
+                 EPIGRAPH_AGENT_SIGNING_KEY or from the file EPIGRAPH_AGENT_SIGNING_KEY_FILE \
+                 names, exactly one of them); refusing to start with only one half rather than \
+                 fall back to another identity"
                     .to_string(),
             );
         }
@@ -516,7 +519,8 @@ fn read_signing_key_file(
 fn check_separate_key_transport(listen: Option<&str>, separate: bool) -> Result<(), String> {
     if separate && listen.is_some() {
         return Err(
-            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY: the separate-signing-key \
+            "EPIGRAPH_AGENT_IDENTITY_PUBKEY / EPIGRAPH_AGENT_SIGNING_KEY(_FILE): the \
+             separate-signing-key \
              mode is stdio-only, and is refused on an HTTP listener (--listen): a listener signs \
              for every caller, and its signatures would bind to this agent. Run the listener \
              with its own --agent-key identity."
@@ -2021,6 +2025,29 @@ mod signer_selection_tests {
         assert!(status.success(), "mkfifo failed");
         let err = read_signing_key_file(&fifo, my_uid()).expect_err("fifo");
         assert!(err.contains("not a regular file"), "{err}");
+    }
+
+    /// A half pair names BOTH sources of the signing key: an operator who uses
+    /// the file and forgot the identity pubkey must not be told to set the key
+    /// variable (which would then be refused as a second source).
+    #[test]
+    fn a_half_pair_refusal_names_the_key_file_source() {
+        let identity_hex = "0c".repeat(32);
+        let signing_hex = "0d".repeat(32);
+        for pair in [
+            separate(Some(&identity_hex), None),
+            separate(None, Some(&signing_hex)),
+        ] {
+            let Err(err) = select_signer(None, None, None, None, pair) else {
+                panic!("a half pair must be refused");
+            };
+            assert!(
+                err.contains("EPIGRAPH_AGENT_IDENTITY_PUBKEY and EPIGRAPH_AGENT_SIGNING_KEY must be set together"),
+                "{err}"
+            );
+            assert!(err.contains("EPIGRAPH_AGENT_SIGNING_KEY_FILE"), "{err}");
+            assert!(!err.contains(&signing_hex[..16]), "{err}");
+        }
     }
 
     /// Too large, not UTF-8, or missing: each is a refusal, never "no key"
