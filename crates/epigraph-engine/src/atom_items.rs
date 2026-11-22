@@ -481,8 +481,11 @@ impl DriftRow {
 }
 
 /// The [`AxiomMode::Display`] rows of each atom under no lens, exactly as
-/// the single atom-cache writer reads them under `compound_source_edges`, as
-/// [`DriftRow`]s. Writes nothing.
+/// the single atom-cache writer reads them under `compound_source_edges`
+/// (derivation-scope rule included, [`atom_cache_rows_under`]), as
+/// [`DriftRow`]s. Writes nothing. The wave's per-scope resync folds the
+/// `ds_combined_beliefs` rows it writes from these, so no scoped row takes a
+/// row the cache may not fold.
 ///
 /// # Errors
 /// A database read.
@@ -499,7 +502,7 @@ pub async fn atom_drift_rows(
         ids,
         AxiomMode::Display,
         compound_source_edges,
-        RowScope::Viewer,
+        RowScope::Cache,
     )
     .await?
     .rows;
@@ -635,8 +638,10 @@ struct Selected {
 /// some fold of `ids` reads under `mode` and `compound_source_edges`, each
 /// classified and coarsened by [`read_rows`], in row order, not yet
 /// discounted or keyed. Under [`RowScope::Cache`] the derivation-scope rule
-/// runs between steps 2 and 3. [`atom_cache_rows_under`] selects through this
-/// under the cache scope.
+/// runs between steps 2 and 3. [`atom_cache_rows_under`] and
+/// [`atom_drift_rows`] both select through this under the cache scope, so
+/// the drift decomposition reads exactly the rows the single atom-cache
+/// writer folds.
 ///
 /// # Errors
 /// A database read.

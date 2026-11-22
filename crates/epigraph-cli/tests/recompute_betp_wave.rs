@@ -2332,6 +2332,117 @@ async fn a_wave_resyncs_existing_scoped_rows_and_a_restore_puts_them_back(pool: 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The resync folds a scoped row from the rows the atom's CACHE may fold (the
+/// derivation-scope rule): a BBA citing evidence narrowed to a private group
+/// never enters a public atom's `global` row, nor its cache. Checked against
+/// a TWIN that carries only the public row. Before the fix the resync folded
+/// the drift rows unfiltered, so the `global` row took the private BBA while
+/// the claim cache did not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_wave_resync_never_folds_a_private_derived_row_into_a_scoped_row(pool: PgPool) {
+    let dir = scratch_dir();
+    let owner = agent(&pool, "scope-resync-owner").await;
+    let source = agent(&pool, "scope-resync-source").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "scope-resync-member").await;
+    let bin = frame(&pool, "cohort_v2_binary").await;
+
+    let atom = claim(&pool, owner, "atom with a private-derived row").await;
+    let visibility: String =
+        sqlx::query_scalar("SELECT visibility::text FROM claims WHERE id = $1")
+            .bind(atom)
+            .fetch_one(&pool)
+            .await
+            .expect("claim visibility");
+    assert_eq!(visibility, "public", "PREMISE: the atom is public");
+    insert_row(&pool, atom, &evidence_row(bin, source, 0.8, None)).await;
+    // The second BBA cites evidence narrowed to the member's group, pinned as
+    // `epigraph-operator hide-evidence` pins it (the BBA row stays public).
+    let hidden = evidence(&pool, atom, None).await;
+    sqlx::query(
+        "INSERT INTO evidence_visibility_pins (evidence_id, pinned_by, reason) \
+         VALUES ($1, $2, 'test: hidden')",
+    )
+    .bind(hidden)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("pin the hidden evidence");
+    sqlx::query("UPDATE evidence SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(hidden)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .expect("narrow the evidence to the group");
+    let private_row = insert_row(&pool, atom, &evidence_row(bin, member, 0.55, Some(hidden))).await;
+    let admissible: bool = sqlx::query_scalar(&format!(
+        "SELECT {} FROM mass_functions mf JOIN claims c ON c.id = mf.claim_id WHERE mf.id = $1",
+        epigraph_db::repos::derivation_scope::cache_admissible_predicate("mf", "c")
+    ))
+    .bind(private_row)
+    .fetch_one(&pool)
+    .await
+    .expect("admissibility");
+    assert!(
+        !admissible,
+        "PREMISE: the hidden-evidence BBA may not enter the cache"
+    );
+
+    let twin = claim(&pool, owner, "twin with only the public row").await;
+    insert_row(&pool, twin, &evidence_row(bin, source, 0.8, None)).await;
+    set_sentinel(&pool, atom, bin, 0.0).await;
+    set_sentinel(&pool, twin, bin, 0.04).await;
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, scope_id, belief, \
+             plausibility, mass_on_empty, mass_on_missing, pignistic_prob) \
+         VALUES ($1, $2, 'global', NULL, 0.123, 0.9, 0.0, 0.0, 0.5)",
+    )
+    .bind(bin)
+    .bind(atom)
+    .execute(&pool)
+    .await
+    .expect("seed the global row");
+
+    let env = WaveEnv::new(&pool, "aef_standalone").await;
+    let wave_file = dir.join("wave.jsonl");
+    run(
+        RECOMPUTE_BETP,
+        &dir,
+        &real_run_args("standalone", s(&wave_file), s(&dir)),
+        &env.vars(),
+    )
+    .ok("the wave");
+
+    let twin_after = cache(&pool, twin).await;
+    let atom_after = cache(&pool, atom).await;
+    let rows: HashMap<String, (f64, f64, Option<f64>)> = scoped(&pool, atom)
+        .await
+        .into_iter()
+        .map(|(k, b, p, bp)| (k, (b, p, bp)))
+        .collect();
+    let (g_bel, g_pl, g_betp) = rows["global"];
+    for (got, want, what) in [
+        (g_bel, twin_after.belief.unwrap(), "belief"),
+        (g_pl, twin_after.plausibility.unwrap(), "plausibility"),
+        (
+            g_betp.expect("pignistic_prob"),
+            twin_after.pignistic_prob.unwrap(),
+            "pignistic_prob",
+        ),
+    ] {
+        assert!(
+            (got - want).abs() < 1e-12,
+            "the global row's {what} is the fold of the public row alone: {got} vs the \
+             twin's {want}"
+        );
+    }
+    assert_eq!(
+        (atom_after.belief, atom_after.pignistic_prob),
+        (twin_after.belief, twin_after.pignistic_prob),
+        "the atom's cache is the public row's fold too"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `(scope_type, scope_id, every value column)` of the claim's scoped rows,
 /// in scope order.
 async fn scoped_full(pool: &PgPool, claim: Uuid) -> Vec<(String, Option<Uuid>, ScopedRow)> {

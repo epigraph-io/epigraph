@@ -780,6 +780,11 @@ type ScopedRow = (
 /// hypotheses (its Bel/Pl are of one hypothesis of that frame, which the
 /// AEF's coarsened TRUE is not, `claim_validity` included); a scope with no
 /// AEF row on the row's frame; a community `override` row. No row is created.
+///
+/// The AEF rows are the cache's ([`atom_drift_rows`]: the derivation-scope
+/// rule applies), so no scoped row is rewritten from a BBA derived from a
+/// source narrower than the atom. A scope whose every AEF row is such a BBA
+/// has no AEF row here, and its stored row is kept as its own writer left it.
 /// Returns `(rewritten, kept)`.
 async fn resync_scoped_rows(
     tx: &mut sqlx::PgConnection,
