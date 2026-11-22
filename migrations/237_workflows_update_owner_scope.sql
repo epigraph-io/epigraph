@@ -1,6 +1,9 @@
 -- 237: an UPDATE of a `workflows` row is owner-scoped; a hierarchical outcome
 -- report moves its counters through two definers (backlog 524f89c1).
 --
+-- Sections: 0 why; 1 the outcome definers (why); 2 their bodies; 3 the
+-- policy (why); 4 the policy.
+--
 -- ===================================================================
 -- 0. WHY
 -- ===================================================================
@@ -66,6 +69,53 @@
 -- workflow it reads without a readable step and without writing the report's
 -- step rows. That is a reader inflating a usage counter it may already move
 -- through the tool; it is not a write of anything else.
+--
+-- ===================================================================
+-- 3. THE POLICY: UPDATE IS OWNER-SCOPED (section 4)
+-- ===================================================================
+--
+-- One RESTRICTIVE, FOR UPDATE policy, `workflows_update_owner`, AND-ed with
+-- 183's permissive `workflows_update`: the shape 117 gave `edges` and the
+-- four registries. USING and WITH CHECK are both 077's two bypass disjuncts
+-- OR `owner_group_id = ANY (epigraph_writable_groups())`, the predicate
+-- 183's `workflows_insert` and `workflows_delete_owner` already use. So an
+-- application session UPDATEs (or row-locks) a workflow row only when it
+-- WRITES the row's owner group, public rows included; any other row is
+-- filtered out of its UPDATE (0 rows, no error), as 117's are. 183's
+-- permissive policy is not restated, so its read-set rule still holds as
+-- well (a writable group is always a read group).
+--
+-- THE CARVE-OUT is 077's two bypass arms, unchanged: a maintenance session
+-- (`epigraph_bypass()`) and a body owned by `epigraph_maintenance`
+-- (`epigraph_definer_bypass()`). Every application path that must write a
+-- row the caller does not own goes through one of them: the outcome counters
+-- (section 1), the privatization and re-own verbs, `set-workflow-submitter`
+-- and `embed_backfill` (maintenance connections). An audited admin write of
+-- another group's rows takes the same road as 111's `epigraph_admin_patch_claim`:
+-- a definer that re-checks the live `claims:admin` grant. None exists for
+-- `workflows` yet. Measured before this file, as `epigraph_app`: the admin
+-- arm's hierarchical `deprecate_workflow` of another group's public plan
+-- already FAILS, because retiring the plan's claims is refused by
+-- `claims_tenancy`'s WITH CHECK (42501) on the admin's own stamp; the
+-- `workflows` row was the one write row security did not stop. So this file
+-- removes no admin deprecation that worked for a plan with a claim left to
+-- retire; for a plan with none (every claim shared or already retired) the
+-- admin's `truth_value` write now matches no row too.
+--
+-- WHAT THE ENTRY POINTS ADMIT AND THIS DOES NOT. The workflow authority gate
+-- (REST `workflow_authority`, MCP `require_workflow_authority`) admits, after
+-- the owner-group writer, the recorded SUBMITTER, its OPERATOR and a DELEGATE
+-- (operator ruling R-183) by identity, and the audited admin arm. A caller
+-- admitted by one of those arms that does not write the row's owner group now
+-- writes nothing to the row itself (its `truth_value` UPDATE and its
+-- `FOR UPDATE` locks match no row). For a row written since workflow writes
+-- are made as the caller, the submitter wrote it into a group it writes; the
+-- rows at stake are older ones whose recorded submitter does not write the
+-- owner group. Retiring their claims is refused to such a caller already,
+-- by the same `claims_tenancy` rule as the admin's (above).
+--
+-- 126's elevated census is unaffected: the policy's name has no `_elevated_`
+-- and it names no elevation helper.
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/237-undo.sql`.
@@ -206,3 +256,17 @@ DO $$ BEGIN
                 'TO epigraph_app';
     END IF;
 END $$;
+
+-- ===================================================================
+-- 4. THE POLICY
+-- ===================================================================
+DROP POLICY IF EXISTS workflows_update_owner ON public.workflows;
+CREATE POLICY workflows_update_owner ON public.workflows AS RESTRICTIVE FOR UPDATE TO PUBLIC
+    USING (
+        (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass())
+        OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]))
+    WITH CHECK (
+        (SELECT public.epigraph_bypass())
+        OR (SELECT public.epigraph_definer_bypass())
+        OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]));

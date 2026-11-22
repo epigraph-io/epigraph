@@ -343,3 +343,115 @@ async fn a_variance_outside_the_unit_interval_is_refused(pool: PgPool) {
         .await
         .expect("1 lands");
 }
+
+// ===================================================================
+// The policy (237 section 4): an UPDATE, or a row lock, reaches a row only
+// for a writer of its owner group, or a maintenance session.
+// ===================================================================
+
+/// `Ok(rows)` or `Err(SQLSTATE)` of `sql` (binding the row id, then the
+/// viewer's principal as text) on a transaction stamped from `viewer`, rolled
+/// back.
+async fn write(w: &World, viewer: &Viewer, sql: &str, id: Uuid) -> Result<u64, String> {
+    let mut tx = w.scoped.begin_as(viewer).await.expect("stamped tx");
+    let r = sqlx::query(sql)
+        .bind(id)
+        .bind(viewer.principal().map(|p| p.to_string()))
+        .execute(&mut *tx)
+        .await
+        .map(|r| r.rows_affected())
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+                .unwrap_or_else(|| e.to_string())
+        });
+    drop(tx);
+    r
+}
+
+const DEPRECATE: &str =
+    "UPDATE workflows SET truth_value = 0.05 WHERE id = $1 AND $2::text IS NOT NULL";
+const TAKE_OVER: &str = "UPDATE workflows \
+     SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', to_jsonb($2::text)) \
+     WHERE id = $1";
+const COUNTERS: &str = "UPDATE workflows SET metadata = metadata || '{\"use_count\": 99}' \
+     WHERE id = $1 AND $2::text IS NOT NULL";
+const LOCK: &str = "SELECT id FROM workflows WHERE id = $1 AND $2::text IS NOT NULL FOR UPDATE";
+
+/// THE DEFECT. A non-member of a PUBLIC row, and a READER of a group row (on
+/// that row and on the group's public row), reach neither with a direct
+/// UPDATE of `truth_value` (deprecation), of `epigraph_submitted_by` (taking
+/// the row over through the entry points' submitter arm) or of the counters,
+/// nor with a row lock. Below 237 each statement here wrote 1 row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_writer_updates_no_workflow_row(pool: PgPool) {
+    let w = world(&pool).await;
+    for (who, viewer, id) in [
+        ("non-member on a public row", &w.stranger, w.public),
+        ("reader on its group's row", &w.reader, w.private),
+        ("reader on its group's public row", &w.reader, w.public),
+    ] {
+        let before = row(&pool, id).await;
+        for (what, sql) in [
+            ("deprecate", DEPRECATE),
+            ("take over", TAKE_OVER),
+            ("counters", COUNTERS),
+            ("row lock", LOCK),
+        ] {
+            assert_eq!(
+                write(&w, viewer, sql, id).await,
+                Ok(0),
+                "{who}: {what} must reach no row"
+            );
+        }
+        assert_eq!(row(&pool, id).await, before, "{who}: the row is unchanged");
+        // It still READS the row (183's read rule is untouched).
+        let mut read = w.scoped.read_as(viewer).await.expect("stamped read");
+        let seen: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM workflows WHERE id = $1)")
+                .bind(id)
+                .fetch_one(&mut *read)
+                .await
+                .expect("read");
+        read.commit().await.expect("close read");
+        assert!(seen, "{who}: the row stays readable");
+    }
+}
+
+/// The positive control: a writer of the owner group still updates and locks
+/// its public and its group row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_writer_of_the_owner_group_still_updates_its_rows(pool: PgPool) {
+    let w = world(&pool).await;
+    for id in [w.public, w.private] {
+        for (what, sql) in [
+            ("deprecate", DEPRECATE),
+            ("counters", COUNTERS),
+            ("row lock", LOCK),
+        ] {
+            assert_eq!(write(&w, &w.member, sql, id).await, Ok(1), "{what}");
+        }
+    }
+}
+
+/// The carve-out: a maintenance session updates any row (077's bypass arm),
+/// as the privatization, re-own and submitter verbs do.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_session_still_updates_any_row(pool: PgPool) {
+    let w = world(&pool).await;
+    let ids = vec![w.public, w.private];
+    let r: Result<u64, String> =
+        fixture::as_role(&pool, "epigraph_maintenance", move |mut conn| async move {
+            let r = sqlx::query("UPDATE workflows SET truth_value = 0.05 WHERE id = ANY($1)")
+                .bind(ids)
+                .execute(&mut *conn)
+                .await
+                .map(|r| r.rows_affected())
+                .map_err(|e| e.to_string());
+            (conn, r)
+        })
+        .await;
+    assert_eq!(r, Ok(2));
+    assert_eq!(row(&pool, w.public).await.1, 0.05);
+    assert_eq!(row(&pool, w.private).await.1, 0.05);
+}

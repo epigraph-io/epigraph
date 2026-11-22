@@ -1776,9 +1776,10 @@ pub async fn deprecate_workflow(
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
-    // `workflows` is NOT RLS-protected (measured: no policy, not in 062's
-    // tier-A), so this half was never refused — it is in the transaction so the
-    // two halves of one deprecation cannot land apart.
+    // `workflows` has row security since migration 183, and since 237 its
+    // UPDATE reaches only a row whose owner group this stamp WRITES; any other
+    // row matches nothing here (0, reported as unchanged). It is in the
+    // transaction so the two halves of one deprecation cannot land apart.
     let row_rows =
         epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
             .await

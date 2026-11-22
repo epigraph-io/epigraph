@@ -178,10 +178,14 @@
 //! Writing as the caller adds the database's own check on top of these arms
 //! for the rows a write CREATES: they land in a group the caller writes
 //! (`epigraph_ingest_executor::owner`) and row security refuses a new claim or
-//! edge in one it does not. It is not a check on the existing `workflows` row
-//! itself: migration 183's `workflows_update` policy admits an UPDATE of any
-//! public row, so an entry point must never update an existing row on a path
-//! these arms did not admit (a re-ingest stores no goal embedding).
+//! edge in one it does not. On the existing `workflows` row itself, migration
+//! 237's `workflows_update_owner` admits an UPDATE (or a row lock) only from a
+//! writer of the row's owner group, public rows included, so the database
+//! backs the owner-group writer arm. The identity arms (submitter, operator,
+//! delegate) and the admin arm are NOT backed there: a caller they admit that
+//! does not write the owner group writes nothing to the row (its UPDATE
+//! matches no row). An entry point must still never update an existing row on
+//! a path these arms did not admit (a re-ingest stores no goal embedding).
 
 use crate::errors::{internal_error_logged, internal_error_text, McpError};
 use crate::server::EpiGraphMcpFull;
