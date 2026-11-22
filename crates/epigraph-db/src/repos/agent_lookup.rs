@@ -1184,7 +1184,11 @@ impl AgentLookupRepository {
 
 /// Is `public_key` the deterministic author key the document ingest derives
 /// (`did_key_for_author`) from this name, or from this (visible) ORCID?
-fn derived_key_evidence(
+///
+/// Also read by `AgentRepository::ensure_for_client`, which refuses to adopt
+/// such a row as an OAuth agent client's principal: its private half is
+/// computable from the name or ORCID.
+pub(crate) fn derived_key_evidence(
     public_key: &[u8],
     name: Option<&str>,
     orcid: Option<&str>,

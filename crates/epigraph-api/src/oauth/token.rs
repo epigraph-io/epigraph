@@ -339,10 +339,15 @@ async fn materialise_principal_agent(
     // no longer restores a revoked row. The transaction is aborted by the RAISE,
     // so the client stays UNLINKED and every later mint refuses the same way
     // until an operator restores the membership — loud, and reversible.
+    //
+    // A refusal to ADOPT an agent row whose key is computable from public
+    // inputs (an LLM identity or a name-derived author node, backlog 55fba366)
+    // is a designed denial too: `DbError::Refused`, answered 403 by kind.
     let agent_id = AgentRepository::ensure_for_client(&mut tx, client_row_id)
         .await
         .map_err(|e| match e {
             e if e.is_personal_group_refusal() => ApiError::from(e),
+            e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
             other => ApiError::InternalError {
                 message: format!("Failed to resolve principal agent: {other}"),
             },
