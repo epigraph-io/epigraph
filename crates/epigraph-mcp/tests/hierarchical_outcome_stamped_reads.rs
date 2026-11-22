@@ -538,6 +538,328 @@ async fn a_plan_without_ordinals_still_resolves_by_position(pool: PgPool) {
     assert!(unresolved(&json).is_empty(), "{json}");
 }
 
+// ── A hidden step INSIDE the plan's `step_follows` chain ────────────────────
+//
+// Backlog a1474e22. `add_step` places a step by rewiring `step_follows` and
+// leaves its `executes` edge without a `plan_index`, so a step another group
+// owns can sit in the middle of a plan whose other steps are all indexed and
+// visible. A reader that cannot see it reads no ordinal gap and no chain edge
+// into it (both of its `step_follows` edges, and its `executes` edge, are
+// its group's), so before the fix every visible step was "provable" and the
+// steps after it were listed one slot early: an outcome report's `step_index`
+// 1 was attributed to the step at plan slot 2, with no signal.
+
+async fn step_follows(pool: &PgPool, from: Uuid, to: Uuid) {
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, properties) \
+         VALUES ($1, 'claim', $2, 'claim', 'step_follows', '{}'::jsonb)",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(pool)
+    .await
+    .expect("step_follows edge");
+}
+
+/// `(visibility, plan_index text)` of the `executes` edge onto `claim`.
+async fn executes_shape(pool: &PgPool, workflow_id: Uuid, claim: Uuid) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT visibility::text, properties->>'plan_index' FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes'",
+    )
+    .bind(workflow_id)
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("executes edge shape")
+}
+
+async fn step_follows_visibility(pool: &PgPool, from: Uuid, to: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT visibility::text FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_one(pool)
+    .await
+    .expect("step_follows edge shape")
+}
+
+struct ChainPlan {
+    workflow_id: Uuid,
+    /// The public, indexed steps `a, b, c` (plan_index 0, 1, 2).
+    visible: [Uuid; 3],
+    /// The group-private, UNINDEXED step chained between `a` and `b`.
+    hidden: Uuid,
+    member: Viewer,
+    stranger: Viewer,
+}
+
+/// A public plan `a, b, c` (indexed, chained `a → b → c` as the executor
+/// writes it), then a group-private step `x` inserted at slot 1 the way
+/// `add_step` inserts it: an unindexed `executes` edge and the chain rewired
+/// to `a → x → b → c` (the old `a → b` pair deleted, as the rewire does).
+/// Plan order is `[a, x, b, c]`.
+async fn seed_chain_with_hidden_member(pool: &PgPool, name: &str) -> ChainPlan {
+    let (member, group) = fixture::seed_agent_with_group(pool, &format!("{name}-member")).await;
+    let (stranger, _) = fixture::seed_agent_with_group(pool, &format!("{name}-stranger")).await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        pool,
+        workflow_id,
+        name,
+        0,
+        "A public plan with a group-private step inserted in its chain.",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+
+    let mut visible = Vec::new();
+    for (i, label) in ["a", "b", "c"].iter().enumerate() {
+        let c =
+            fixture::seed_public_claim(pool, member, &format!("{name} step {label} {workflow_id}"))
+                .await;
+        set_level(pool, c, 2).await;
+        executes(pool, workflow_id, c, Some(i as i32)).await;
+        visible.push(c);
+    }
+    let visible: [Uuid; 3] = visible.try_into().expect("three steps");
+    let [a, b, c] = visible;
+    step_follows(pool, a, b).await;
+    step_follows(pool, b, c).await;
+
+    let hidden = fixture::seed_group_claim(
+        pool,
+        member,
+        group,
+        &format!("{name} inserted step {workflow_id}"),
+    )
+    .await;
+    set_level(pool, hidden, 2).await;
+    executes(pool, workflow_id, hidden, None).await;
+    sqlx::query(
+        "DELETE FROM edges WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(a)
+    .bind(b)
+    .execute(pool)
+    .await
+    .expect("delete a -> b");
+    step_follows(pool, a, hidden).await;
+    step_follows(pool, hidden, b).await;
+
+    // Fixture shape: the inserted step is unindexed and everything that names
+    // it is its group's; the rest of the plan is public and indexed.
+    assert_eq!(
+        executes_shape(pool, workflow_id, hidden).await,
+        ("group".to_string(), None),
+        "the inserted step's executes edge is the group's and carries no plan_index"
+    );
+    for (i, s) in visible.iter().enumerate() {
+        assert_eq!(
+            executes_shape(pool, workflow_id, *s).await,
+            ("public".to_string(), Some(i.to_string())),
+        );
+    }
+    assert_eq!(step_follows_visibility(pool, a, hidden).await, "group");
+    assert_eq!(step_follows_visibility(pool, hidden, b).await, "group");
+    assert_eq!(step_follows_visibility(pool, b, c).await, "public");
+
+    ChainPlan {
+        workflow_id,
+        visible,
+        hidden,
+        member: Viewer::resolve(pool, member).await.expect("member viewer"),
+        stranger: Viewer::resolve(pool, stranger)
+            .await
+            .expect("stranger viewer"),
+    }
+}
+
+/// A stranger reads `a, b, c` and none of what names `x`. `a` is step 0;
+/// `b` is step 2 in plan order, so the stranger's index 1 must NOT be
+/// attributed to `b`: it is unattributed and disclosed like an out-of-range
+/// index, and so is everything after it.
+///
+/// RED before the fix: the row for index 1 carried `b`'s id and the row for
+/// index 2 carried `c`'s, with no unresolved index.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_unindexed_chain_member_does_not_shift_the_steps_after_it(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_chain_with_hidden_member(&pool, "stamped-outcome-chain-stranger").await;
+    let [a, _, _] = w.visible;
+
+    let json = report(&server, &w.stranger, w.workflow_id, &[0, 1, 2]).await;
+
+    assert_eq!(
+        rows(&pool, w.workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(a)),
+            ("planned 1".to_string(), None),
+            ("planned 2".to_string(), None),
+        ],
+        "plan slot 1 is the hidden inserted step: the visible steps after it must not \
+         move onto its slot: {json}"
+    );
+    assert_eq!(unresolved(&json), vec![1, 2], "{json}");
+    assert_eq!(
+        json["warning"].as_str(),
+        epigraph_mcp::tools::workflow_hierarchical::unresolved_steps_warning(&[1, 2]).as_deref(),
+        "a hidden step and an absent one get the same warning: {json}"
+    );
+    assert!(
+        !json.to_string().contains(&w.hidden.to_string()),
+        "the response must not name the step the reporter cannot read: {json}"
+    );
+}
+
+/// The group's member reads the whole chain, so every slot resolves to its
+/// plan-order step, the inserted one included.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_member_resolves_every_slot_of_a_chain_with_an_inserted_step(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let w = seed_chain_with_hidden_member(&pool, "stamped-outcome-chain-member").await;
+    let [a, b, c] = w.visible;
+
+    let json = report(&server, &w.member, w.workflow_id, &[0, 1, 2, 3]).await;
+
+    assert_eq!(
+        rows(&pool, w.workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(a)),
+            ("planned 1".to_string(), Some(w.hidden)),
+            ("planned 2".to_string(), Some(b)),
+            ("planned 3".to_string(), Some(c)),
+        ],
+        "{json}"
+    );
+    assert!(unresolved(&json).is_empty(), "{json}");
+}
+
+/// No false cut: a step shared with ANOTHER plan carries that plan's
+/// `step_follows` edge to a step this plan does not execute. A stranger cannot
+/// read that edge or its target either, but it is not a member of this plan's
+/// chain, so it moves nothing here and every slot still resolves.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_step_of_another_plan_does_not_cut_this_plans_list(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "stamped-outcome-xgen-a").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-xgen-s").await;
+    let workflow_id = Uuid::new_v4();
+    let other_plan = Uuid::new_v4();
+    for (id, name) in [
+        (workflow_id, "stamped-outcome-xgen"),
+        (other_plan, "stamped-outcome-xgen-other"),
+    ] {
+        epigraph_db::WorkflowRepository::insert_root(
+            &pool,
+            id,
+            name,
+            0,
+            "Two plans sharing a step.",
+            None,
+            serde_json::json!({}),
+            epigraph_core::TenancyDecl::inherited(),
+        )
+        .await
+        .expect("insert workflow root");
+    }
+    let mut steps = Vec::new();
+    for i in 0..3 {
+        let c = fixture::seed_public_claim(&pool, author, &format!("xgen step {i} {workflow_id}"))
+            .await;
+        set_level(&pool, c, 2).await;
+        executes(&pool, workflow_id, c, Some(i)).await;
+        steps.push(c);
+    }
+    step_follows(&pool, steps[0], steps[1]).await;
+    step_follows(&pool, steps[1], steps[2]).await;
+    // The other plan runs `steps[1]` and then its own private, unindexed step.
+    let foreign =
+        fixture::seed_group_claim(&pool, author, group, &format!("xgen foreign {workflow_id}"))
+            .await;
+    set_level(&pool, foreign, 2).await;
+    executes(&pool, other_plan, steps[1], Some(0)).await;
+    executes(&pool, other_plan, foreign, None).await;
+    step_follows(&pool, steps[1], foreign).await;
+    assert_eq!(
+        step_follows_visibility(&pool, steps[1], foreign).await,
+        "group"
+    );
+
+    let stranger = Viewer::resolve(&pool, stranger).await.expect("stranger");
+    let json = report(&server, &stranger, workflow_id, &[0, 1, 2]).await;
+
+    assert_eq!(
+        rows(&pool, workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(steps[0])),
+            ("planned 1".to_string(), Some(steps[1])),
+            ("planned 2".to_string(), Some(steps[2])),
+        ],
+        "{json}"
+    );
+    assert!(unresolved(&json).is_empty(), "{json}");
+}
+
+/// The other residual the old rule documented: hidden ORDINAL steps after
+/// every visible ordinal one, followed by a visible unindexed step. The
+/// stranger reads ordinals `0` (no gap) and the unindexed step, which it used
+/// to list at slot 1; plan order puts it at slot 2, after the hidden one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_trailing_ordinal_does_not_shift_a_visible_unindexed_step(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "stamped-outcome-tail-a").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-tail-s").await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-tail",
+        0,
+        "A public plan whose last indexed step was re-owned.",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+    let first =
+        fixture::seed_public_claim(&pool, author, &format!("tail first {workflow_id}")).await;
+    set_level(&pool, first, 2).await;
+    executes(&pool, workflow_id, first, Some(0)).await;
+    let reowned =
+        fixture::seed_group_claim(&pool, author, group, &format!("tail reowned {workflow_id}"))
+            .await;
+    set_level(&pool, reowned, 2).await;
+    executes(&pool, workflow_id, reowned, Some(1)).await;
+    let appended =
+        fixture::seed_public_claim(&pool, author, &format!("tail appended {workflow_id}")).await;
+    set_level(&pool, appended, 2).await;
+    executes(&pool, workflow_id, appended, None).await;
+    assert_eq!(
+        executes_shape(&pool, workflow_id, reowned).await,
+        ("group".to_string(), Some("1".to_string()))
+    );
+
+    let stranger = Viewer::resolve(&pool, stranger).await.expect("stranger");
+    let json = report(&server, &stranger, workflow_id, &[0, 1]).await;
+
+    assert_eq!(
+        rows(&pool, workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(first)),
+            ("planned 1".to_string(), None),
+        ],
+        "slot 1 is the hidden re-owned step, not the appended one: {json}"
+    );
+    assert_eq!(unresolved(&json), vec![1], "{json}");
+}
+
 // ── Through the transports ──────────────────────────────────────────────────
 //
 // The tests above call the tool functions with a viewer the test resolved. The
