@@ -1139,13 +1139,23 @@ struct PacketSignable<'a> {
 /// Sign `packet` as its claim's agent, over [`PacketSignable`]. The server
 /// checks this signature (raw Ed25519 over the canonical bytes, not a
 /// domain-separated entity signature) when `EPIGRAPH_REQUIRE_SIGNATURES` is on.
+///
+/// The canonical bytes are taken from the packet as the server will PARSE it:
+/// serialized to JSON text and read back, so every float is the f64 the
+/// server's parser produces from the text the request carries, not the
+/// client's in-memory value (serde_json's default float parse is not
+/// guaranteed to round-trip every f64).
 fn sign_packet(packet: &mut EpistemicPacket, signer: &AgentSigner) {
-    let canonical = epigraph_crypto::to_canonical_bytes(&PacketSignable {
+    let wire = serde_json::to_vec(&PacketSignable {
         claim: &packet.claim,
         evidence: &packet.evidence,
         reasoning_trace: &packet.reasoning_trace,
     })
     .expect("a packet of strings, numbers and JSON values always serializes");
+    let as_parsed: serde_json::Value =
+        serde_json::from_slice(&wire).expect("serde_json reads back its own output");
+    let canonical =
+        epigraph_crypto::to_canonical_bytes(&as_parsed).expect("a JSON value always serializes");
     packet.signature = hex::encode(signer.sign(&canonical));
 }
 
@@ -6013,9 +6023,10 @@ crates/epigraph-core/src/domain/mod.rs",
     /// drift between the client's serialization and the server's (defaulted
     /// `labels` / `properties`, a skipped `initial_truth`) fails here.
     fn server_accepts(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
-        let wire = serde_json::to_value(packet).expect("client packet serializes");
+        // The request body as bytes, parsed the way axum's `Json` parses it.
+        let wire = serde_json::to_vec(packet).expect("client packet serializes");
         let server: epigraph_api::routes::submit::EpistemicPacket =
-            serde_json::from_value(wire).expect("server parses the client packet");
+            serde_json::from_slice(&wire).expect("server parses the client packet");
         let canonical = server.signable_bytes().expect("canonical bytes");
         let Ok(sig) = <[u8; 64]>::try_from(hex::decode(&server.signature).unwrap()) else {
             return false;

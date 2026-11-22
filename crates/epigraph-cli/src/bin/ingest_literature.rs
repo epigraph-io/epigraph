@@ -375,12 +375,18 @@ fn packet_signature(
     evidence: &[EvidenceSubmission],
     reasoning_trace: &ReasoningTraceSubmission,
 ) -> String {
-    let canonical = epigraph_crypto::to_canonical_bytes(&PacketSignable {
+    // Canonicalize the packet as the server will PARSE it (JSON text read
+    // back), so each float is the f64 the server derives from the request.
+    let wire = serde_json::to_vec(&PacketSignable {
         claim,
         evidence,
         reasoning_trace,
     })
     .expect("a packet of strings, numbers and JSON values always serializes");
+    let as_parsed: serde_json::Value =
+        serde_json::from_slice(&wire).expect("serde_json reads back its own output");
+    let canonical =
+        epigraph_crypto::to_canonical_bytes(&as_parsed).expect("a JSON value always serializes");
     hex::encode(signer.sign(&canonical))
 }
 
@@ -1989,9 +1995,10 @@ mod tests {
     /// the wire JSON into the server's packet, recompute `signable_bytes()`,
     /// verify the signature under the claim agent's key.
     fn server_accepts(packet: &EpistemicPacket, signer: &AgentSigner) -> bool {
-        let wire = serde_json::to_value(packet).expect("client packet serializes");
+        // The request body as bytes, parsed the way axum's `Json` parses it.
+        let wire = serde_json::to_vec(packet).expect("client packet serializes");
         let server: epigraph_api::routes::submit::EpistemicPacket =
-            serde_json::from_value(wire).expect("server parses the client packet");
+            serde_json::from_slice(&wire).expect("server parses the client packet");
         let canonical = server.signable_bytes().expect("canonical bytes");
         let Ok(sig) = <[u8; 64]>::try_from(hex::decode(&server.signature).unwrap()) else {
             return false;
@@ -2012,7 +2019,11 @@ mod tests {
         );
         // Withheld: the locator + hash body.
         let withheld = build_packets(&licensed_extraction(None), &signer, Uuid::new_v4(), false);
-        for p in open.iter().chain(&withheld) {
+        // A float with a long shortest representation travels as JSON text.
+        let mut awkward = licensed_extraction(None);
+        awkward.claims[0].confidence = 0.1 + 0.2;
+        let awkward = build_packets(&awkward, &signer, Uuid::new_v4(), false);
+        for p in open.iter().chain(&withheld).chain(&awkward) {
             assert_ne!(p.signature, "0".repeat(128), "no placeholder signature");
             assert!(
                 server_accepts(p, &signer),
