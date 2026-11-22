@@ -579,6 +579,94 @@ async fn protected_resource_metadata_points_at_this_as() {
     );
 }
 
+// ── /.well-known/jwks.json (DB-free) ─────────────────────────────────────────
+//
+// Backlog 7b834860: a federation extension must verify kernel tokens without
+// holding anything that can mint one. The kernel serves the public half of its
+// Ed25519 signing key; an extension built from that document verifies a kernel
+// token and cannot sign.
+
+fn app_with_jwt(cfg: epigraph_api::oauth::JwtConfig) -> axum::Router {
+    let _ = app(); // sets the dummy DATABASE_URL the state needs
+    let mut state = AppState::new(config()).with_providers(Arc::new(ProviderRegistry::default()));
+    state.jwt_config = Arc::new(cfg);
+    create_router(state)
+}
+
+fn kernel_token(cfg: &epigraph_api::oauth::JwtConfig) -> String {
+    cfg.issue_access_token(
+        uuid::Uuid::new_v4(),
+        vec!["claims:read".to_string()],
+        "agent",
+        None,
+        Some(uuid::Uuid::new_v4()),
+        chrono::Duration::minutes(5),
+        epigraph_auth::AccessTokenBinding::NONE,
+    )
+    .unwrap()
+    .0
+}
+
+/// The served JWK Set is the kernel's public key and nothing else: an
+/// extension built from it verifies a kernel token and refuses to mint, and
+/// the RFC 8414 document points at it. Fails on a kernel without the route
+/// (404) or one that serves a key an extension cannot verify with.
+#[tokio::test]
+async fn jwks_serves_the_public_key_an_extension_verifies_kernel_tokens_with() {
+    let kernel = epigraph_api::oauth::JwtConfig::from_ed25519_seed(&[0x42; 32]);
+    let token = kernel_token(&kernel);
+    let app = app_with_jwt(kernel);
+
+    let (status, body) = get_json(app.clone(), "/.well-known/jwks.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = body["keys"].as_array().expect("a JWK Set");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kty"], "OKP");
+    assert_eq!(keys[0]["crv"], "Ed25519");
+    assert!(
+        keys[0].get("d").is_none(),
+        "the private key is never served"
+    );
+
+    let extension = epigraph_api::oauth::JwtConfig::verifier_from_jwks(&body.to_string())
+        .expect("the served document is a verifier");
+    assert!(extension.validate_token(&token).is_ok());
+    assert!(
+        extension
+            .issue_access_token(
+                uuid::Uuid::new_v4(),
+                vec!["claims:admin".to_string()],
+                "service",
+                None,
+                None,
+                chrono::Duration::minutes(5),
+                epigraph_auth::AccessTokenBinding::NONE,
+            )
+            .is_err(),
+        "an extension holding the served key cannot mint a kernel token"
+    );
+
+    let (_, meta) = get_json(app, "/.well-known/oauth-authorization-server").await;
+    assert_eq!(
+        meta["jwks_uri"],
+        "https://test.example/.well-known/jwks.json"
+    );
+}
+
+/// A kernel still on the shared secret publishes nothing: an empty set and
+/// no `jwks_uri`. Mutation caught: publishing the HS256 secret as an `oct` key.
+#[tokio::test]
+async fn an_hs256_kernel_publishes_no_key_and_no_jwks_uri() {
+    let app = app_with_jwt(epigraph_api::oauth::JwtConfig::from_secret(
+        b"a-test-secret-that-is-long-enough-000",
+    ));
+    let (status, body) = get_json(app.clone(), "/.well-known/jwks.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, serde_json::json!({ "keys": [] }));
+    let (_, meta) = get_json(app, "/.well-known/oauth-authorization-server").await;
+    assert!(meta.get("jwks_uri").is_none());
+}
+
 // ── /oauth/authorize entry-point (DB-free) ───────────────────────────────────
 //
 // PKCE is MANDATORY on the authorization endpoint (OAuth 2.1 / RFC 9700). The

@@ -392,7 +392,7 @@ pub const ANONYMOUS_BODY_LIMIT: usize = 64 * 1024;
 ///
 /// ## `oauth` — anonymous by construction
 ///
-/// The 11 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
+/// The 12 `/oauth/*` and `/.well-known/*` endpoints. Discovery and token
 /// issuance must precede authentication, so they cannot sit behind it.
 ///
 /// # What changed in PR-03
@@ -1432,6 +1432,7 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        .route("/.well-known/jwks.json", get(crate::oauth::jwks_document))
         // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
         // global limit the merged router sets below.
         .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
@@ -1958,6 +1959,7 @@ pub fn create_router_with_extensions(
             "/.well-known/oauth-protected-resource",
             get(crate::oauth::protected_resource_metadata),
         )
+        .route("/.well-known/jwks.json", get(crate::oauth::jwks_document))
         // Anonymous, so held to `ANONYMOUS_BODY_LIMIT` rather than the
         // global limit the merged router sets below.
         .layer(DefaultBodyLimit::max(ANONYMOUS_BODY_LIMIT))
