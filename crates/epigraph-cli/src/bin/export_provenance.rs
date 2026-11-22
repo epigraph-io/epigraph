@@ -61,11 +61,11 @@ struct Cli {
     max_depth: Option<i32>,
 
     /// Most claims kept as entities, nearest-first (default 500).
-    #[arg(long, conflicts_with = "unbounded")]
+    #[arg(long, conflicts_with = "unbounded", value_parser = at_least_one())]
     max_nodes: Option<usize>,
 
     /// Most characters of each entity's content (default 4000).
-    #[arg(long, conflicts_with = "unbounded")]
+    #[arg(long, conflicts_with = "unbounded", value_parser = at_least_one())]
     max_content_chars: Option<usize>,
 
     /// Export the whole lineage with no node cap and no content clip.
@@ -75,6 +75,12 @@ struct Cli {
     /// Write the JSON-LD document to this file instead of stdout.
     #[arg(long)]
     output: Option<PathBuf>,
+}
+
+/// A limit of 0 would export a document with no root entity (or no content),
+/// so each limit is at least 1.
+fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
 }
 
 /// The limits this run passes: finite unless `--unbounded`.
@@ -189,6 +195,14 @@ mod tests {
     fn explicit_limits_override_the_defaults() {
         let l = limits(&parse(&["--max-nodes", "7", "--max-content-chars", "90"]).expect("parse"));
         assert_eq!((l.max_nodes, l.max_content_chars), (Some(7), Some(90)));
+    }
+
+    #[test]
+    fn a_zero_limit_is_refused() {
+        assert!(parse(&["--max-nodes", "0"]).is_err());
+        assert!(parse(&["--max-content-chars", "0"]).is_err());
+        let l = limits(&parse(&["--max-nodes", "1", "--max-content-chars", "1"]).expect("parse"));
+        assert_eq!((l.max_nodes, l.max_content_chars), (Some(1), Some(1)));
     }
 
     #[test]
