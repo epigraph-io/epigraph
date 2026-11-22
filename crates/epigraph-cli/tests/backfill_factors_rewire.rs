@@ -989,3 +989,79 @@ async fn rewire_refuses_to_rewrite_a_retracted_edge_factor_and_changes_nothing(p
         "the live off-key row was not deleted"
     );
 }
+
+/// A claim's whole cache: (belief, plausibility, BetP, recorded frame).
+async fn cache_row(
+    pool: &PgPool,
+    claim: Uuid,
+) -> (Option<f64>, Option<f64>, Option<f64>, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT belief, plausibility, pignistic_prob, belief_frame_id FROM claims WHERE id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("cache row")
+}
+
+/// Backlog 2be5efb8: the rewire's recompute goes through the single
+/// atom-cache writer, which never writes a compound. Removing an edge factor
+/// that ends at a compound leaves the compound's cache exactly as it was:
+/// neither cleared (a compound left with no BBA of its own) nor refolded from
+/// its remaining rows (a compound that still holds one). Before, the phase
+/// called the claim-cache writer directly and did both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rewire_removal_leaves_a_compound_targets_cache_untouched(pool: PgPool) {
+    let author = seed_agent(&pool, "rewire-author-cmp").await;
+    let wirer = seed_agent(&pool, "rewire-wirer-cmp").await;
+    let frame = binary_frame(&pool).await;
+    let factorless = seed_claim(&pool, author, "factorless source cmp", None).await;
+
+    // Two compounds: one backed by nothing but the edge row, one that also
+    // holds its own evidence BBA.
+    let bare = seed_claim(&pool, author, "compound bare", Some((SENTINEL, 1.0, 0.0))).await;
+    let backed = seed_claim(&pool, author, "compound backed", Some((SENTINEL, 1.0, 0.0))).await;
+    seed_evidence_bba(&pool, backed, frame, author).await;
+    for compound in [bare, backed] {
+        let leaf = seed_claim(
+            &pool,
+            author,
+            &format!("leaf of {compound}"),
+            Some((0.5, 0.9, 0.0)),
+        )
+        .await;
+        seed_edge(&pool, compound, leaf, "decomposes_to").await;
+    }
+    let e_bare = seed_edge(&pool, factorless, bare, "supports").await;
+    let e_backed = seed_edge(&pool, factorless, backed, "supports").await;
+    seed_stale_edge_factor(&pool, e_bare, bare, frame, wirer).await;
+    seed_stale_edge_factor(&pool, e_backed, backed, frame, wirer).await;
+    let before = [cache_row(&pool, bare).await, cache_row(&pool, backed).await];
+    assert_eq!(before[0].0, Some(SENTINEL), "PREMISE: sentinel caches");
+    assert_eq!(before[1].0, Some(SENTINEL), "PREMISE: sentinel caches");
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+
+    let summary = run_rewire_phase(&pool, &viewer, &RewireOptions::default())
+        .await
+        .expect("rewire");
+    assert_eq!(summary.eligible, 2, "{summary:?}");
+    assert_eq!(summary.removed_source_factorless, 2, "{summary:?}");
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    for edge in [e_bare, e_backed] {
+        assert!(
+            edge_rows(&pool, edge).await.is_empty(),
+            "PREMISE: the removal arm ran: edge {edge} still has a BBA"
+        );
+    }
+
+    assert_eq!(
+        cache_row(&pool, bare).await,
+        before[0],
+        "a compound left with no BBA of its own keeps its cache (was cleared)"
+    );
+    assert_eq!(
+        cache_row(&pool, backed).await,
+        before[1],
+        "a compound's cache is not refolded from its remaining rows"
+    );
+}

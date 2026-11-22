@@ -467,11 +467,12 @@ const NOT_FROZEN_COMPOUND_MARKER: &str = "/* {NOT_FROZEN_COMPOUND} */";
 /// [`MassFunctionRepository::cache_owner_frame_for_claim`] may rewrite it.
 /// MCP `submit_ds_evidence` and `POST /api/v1/frames/:id/evidence` resolve
 /// the owner here too, and refold only when the posted frame is the owner
-/// (backlog d33a5c9f). Other writers that fold a named frame directly (for
-/// example the post-removal recompute of `backfill_factors`' edge re-wire, or
-/// the remaining per-write `recompute_claim_belief_on_frame` callers) do not
-/// pass through this check; they are moved onto the single atom-cache writer
-/// separately.
+/// (backlog d33a5c9f). The post-removal recompute of `backfill_factors`' edge
+/// re-wire goes through the single atom-cache writer, which skips a compound
+/// on its own role check (backlog 2be5efb8). Other writers that fold a named
+/// frame directly (the remaining per-write `recompute_claim_belief_on_frame`
+/// callers) do not pass through this check; they are moved onto the single
+/// atom-cache writer separately.
 ///
 /// A procedural node (every root above it is a workflow thesis authored by the
 /// registered `workflow-ingest` system agent) is no compound and keeps today's
