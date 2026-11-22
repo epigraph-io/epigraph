@@ -165,7 +165,8 @@
 //! non-public frame, context, perspective or community endpoint (migration
 //! 258; see [`registry_edge_remeet`]); its `--dry-run` lists what it would
 //! re-meet, by relationship and transition, and what it holds or skips (an
-//! edge with a dangling endpoint). `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
+//! edge with a dangling endpoint). Below 258 it refuses to write, and its dry
+//! run measures what 258's section 4 will re-tenant. `--max-runtime <90m|2h|3600s>` stops cleanly BETWEEN batches
 //! once the budget is spent and exits 3 ("partial, re-run to resume"); the
 //! cursor of every committed batch is already persisted.
 //!
@@ -606,7 +607,7 @@ async fn run(
             }
         }
         if wants(Entity::RegistryEdges) {
-            remeet_registry_edges(pool, true).await?;
+            remeet_registry_edges(pool, true, entity.is_some()).await?;
         }
         return Ok(RunEnd::Complete);
     }
@@ -661,7 +662,7 @@ async fn run(
         backfill_harvester_fragments(pool).await?;
     }
     if wants(Entity::RegistryEdges) {
-        remeet_registry_edges(pool, false).await?;
+        remeet_registry_edges(pool, false, entity.is_some()).await?;
     }
     if let Some(e) = entity {
         println!(
@@ -1230,6 +1231,11 @@ fn fragment_restampable() -> String {
 /// CASE expressions and guards; every endpoint type 258's cascade reads from
 /// its own row, [`MET_ENDPOINTS`]). Returns the rows changed.
 ///
+/// `registries` is whether 258 is applied ([`registry_endpoints_met`]): below
+/// it the oracle still meets a frame, context, perspective or community as
+/// public, so this reads them as public too rather than stamp a meet the
+/// database's own re-meets disagree with.
+///
 /// Arm (d) repairs such an edge only when a claim UPDATE touches one of its
 /// endpoints. Under `--legacy-owner operator` every world-owned claim moves, so
 /// every stale edge is recomputed on the way; under `platform` the platform
@@ -1237,7 +1243,10 @@ fn fragment_restampable() -> String {
 /// group-private endpoint stayed world-owned, and `run` / `verify` failed on it
 /// with no command to fix it (review C4). Run in both modes: it touches only
 /// rows `verify` fails on.
-async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Result<u64> {
+async fn settle_world_edges_with_private_endpoints(
+    pool: &PgPool,
+    registries: bool,
+) -> anyhow::Result<u64> {
     Ok(sqlx::query(&format!(
         "UPDATE edges e
             SET owner_group_id    = m.g,
@@ -1268,8 +1277,8 @@ async fn settle_world_edges_with_private_endpoints(pool: &PgPool) -> anyhow::Res
             AND NOT (e.visibility = 'group' AND m.v = 'public')
             AND (e.owner_group_id, e.visibility, e.co_owner_group_id)
                 IS DISTINCT FROM (m.g, m.v, m.co)",
-        s_side = endpoint_side_sql("source", "s"),
-        t_side = endpoint_side_sql("target", "t"),
+        s_side = endpoint_side_sql("source", "s", registries),
+        t_side = endpoint_side_sql("target", "t", registries),
     ))
     .bind(WORLD)
     .execute(pool)
@@ -1307,9 +1316,15 @@ const MET_ENDPOINTS: &[(&str, &str, &str)] = &[
 
 /// One side of edge alias `e2`, as 258's propagation reads it: a LEFT JOIN per
 /// [`MET_ENDPOINTS`] type (aliases `<side letter><stem>`) and a `CROSS JOIN
-/// LATERAL` named `side_alias` with that endpoint's `(g, v)`.
-fn endpoint_side_sql(column: &str, side_alias: &str) -> String {
-    let joins: String = MET_ENDPOINTS
+/// LATERAL` named `side_alias` with that endpoint's `(g, v)`. With
+/// `registries` false the [`REGISTRY_ENDPOINTS`] types are left out, so the
+/// endpoint counts as `('public', world)` as the oracle below 258 meets it.
+fn endpoint_side_sql(column: &str, side_alias: &str, registries: bool) -> String {
+    let met: Vec<&(&str, &str, &str)> = MET_ENDPOINTS
+        .iter()
+        .filter(|(ty, _, _)| registries || !REGISTRY_ENDPOINTS.iter().any(|(r, _)| r == ty))
+        .collect();
+    let joins: String = met
         .iter()
         .map(|(ty, table, stem)| {
             format!(
@@ -1319,8 +1334,7 @@ fn endpoint_side_sql(column: &str, side_alias: &str) -> String {
         })
         .collect();
     let col = |c: &str| {
-        MET_ENDPOINTS
-            .iter()
+        met.iter()
             .map(|(_, _, stem)| format!("{side_alias}{stem}.{c}"))
             .collect::<Vec<_>>()
             .join(", ")
@@ -1422,8 +1436,8 @@ async fn registry_edge_remeet(
              FROM n \
             WHERE (n.old_g, n.old_v, n.old_co) IS DISTINCT FROM (n.g, n.v, n.others[1]) \
          ) {tail}",
-        s_side = endpoint_side_sql("source", "s"),
-        t_side = endpoint_side_sql("target", "t"),
+        s_side = endpoint_side_sql("source", "s", true),
+        t_side = endpoint_side_sql("target", "t", true),
         tail = if apply {
             format!(
                 ", upd AS ( \
@@ -1493,7 +1507,30 @@ fn registry_edge_totals(rows: &[(String, String, i64)]) -> RegistryEdgeTotals {
 /// `run --entity registry-edges` (and the same step of a full run): re-meet,
 /// or with `dry_run` count, every edge [`registry_edge_remeet`] covers, and
 /// print one line per relationship and transition.
-async fn remeet_registry_edges(pool: &PgPool, dry_run: bool) -> anyhow::Result<()> {
+///
+/// Below migration 258 ([`registry_endpoints_met`]) the WRITE is refused when
+/// the arm was asked for by name (`explicit`) and skipped with a note in a full
+/// run: the database's own re-meets (206's and 215's publicize, the claim
+/// cascade) still meet a registry row as public there and would undo it, and
+/// 258's section 4 performs the same re-meet when it applies. The dry run is
+/// allowed: it reads the endpoint rows directly, so below 258 it measures what
+/// section 4 will re-tenant (the pre-migration count).
+async fn remeet_registry_edges(pool: &PgPool, dry_run: bool, explicit: bool) -> anyhow::Result<()> {
+    let met = registry_endpoints_met(pool).await?;
+    if !met && !dry_run {
+        if explicit {
+            anyhow::bail!(
+                "registry-edges: migration 258 (which meets a frame, context, perspective or \
+                 community endpoint with its own row) has not been applied; apply it first (its \
+                 section 4 performs this re-meet). `--dry-run` measures what it will re-tenant."
+            );
+        }
+        println!(
+            "run: NOTE: skipping registry-edges: migration 258 has not been applied (its section \
+             4 performs this re-meet when it applies)."
+        );
+        return Ok(());
+    }
     let rows = registry_edge_remeet(pool, !dry_run).await?;
     let RegistryEdgeTotals {
         remet: n,
@@ -1504,8 +1541,13 @@ async fn remeet_registry_edges(pool: &PgPool, dry_run: bool) -> anyhow::Result<(
     println!(
         "{}registry-edges: {verb} {n} edge(s) with a non-public frame, context, perspective or \
          community endpoint; {held} held (their meet and current tuple need three groups); \
-         {dangling} skipped with a dangling endpoint.",
-        if dry_run { "dry-run: " } else { "run: " }
+         {dangling} skipped with a dangling endpoint.{}",
+        if dry_run { "dry-run: " } else { "run: " },
+        if met {
+            ""
+        } else {
+            " (Migration 258 is not applied: this is what its section 4 will re-tenant.)"
+        }
     );
     for (relationship, transition, count) in &rows {
         println!("  {relationship}\t{transition}\t{count}");
@@ -1514,7 +1556,8 @@ async fn remeet_registry_edges(pool: &PgPool, dry_run: bool) -> anyhow::Result<(
 }
 
 async fn settle_remaining(pool: &PgPool, mode: LegacyOwner) -> anyhow::Result<()> {
-    let edges = settle_world_edges_with_private_endpoints(pool).await?;
+    let registries = registry_endpoints_met(pool).await?;
+    let edges = settle_world_edges_with_private_endpoints(pool, registries).await?;
     if edges > 0 {
         tracing::info!(
             edges,

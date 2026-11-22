@@ -2263,3 +2263,77 @@ async fn the_registry_arm_skips_an_edge_with_a_dangling_endpoint(pool: PgPool) {
         "and does not send it to the arm that skips it; stderr:\n{stderr}"
     );
 }
+
+/// Below migration 258 the registry arm refuses to WRITE when asked for by
+/// name: the database's own re-meets still meet a registry row as public
+/// there, and 258's section 4 performs this re-meet when it applies. Its dry
+/// run is allowed and is the pre-migration measurement.
+///
+/// Verified to fail without the gate: the arm re-meets the edge and exits 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_registry_arm_refuses_to_write_before_migration_258(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-pre").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the pre-258 world-owned stamp");
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
+    )
+    .expect("read 258's undo runbook");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("undo 258's function bodies");
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "the dry run is allowed below 258; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("would re-meet 1 edge(s)") && stdout.contains("258 is not applied"),
+        "and is labelled as the pre-migration measurement; stdout:\n{stdout}"
+    );
+
+    let (code, _stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_ne!(code, 0, "below 258 the write is refused; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("migration 258") && stderr.contains("has not been applied"),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e).await,
+        ("public".to_string(), WORLD, None),
+        "and nothing is written"
+    );
+}
