@@ -23,6 +23,7 @@ use std::time::Duration;
 use axum::http::{Request, Response, StatusCode};
 use axum::Router;
 use tower::ServiceBuilder;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::request_id::{
     MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
 };
@@ -240,13 +241,20 @@ impl RequestPoolSettings {
     }
 }
 
-/// Wrap the application router in the request-id, trace and timeout layers.
+/// Wrap the application router in the request-id, trace, timeout and
+/// panic-catching layers.
 ///
 /// Outermost first: a request id is set (an incoming `x-request-id` is kept
 /// when [`is_acceptable_request_id`] passes it, otherwise a UUID is minted),
 /// the request is traced in a span carrying that id, the id is copied onto the
-/// response, and the handler runs under the timeout. So a 408 from the timeout
-/// is traced and carries the id too.
+/// response, the handler runs under the timeout, and a panic in it is caught.
+/// So a 408 from the timeout is traced and carries the id too.
+///
+/// The panic layer (backlog b4c4337f) is innermost: a handler that panics is
+/// answered `500` with the body `Service panicked` (the panic message is
+/// logged at ERROR inside the request span, never sent), traced and carrying
+/// the request id. Without it the panic unwound into hyper, which dropped the
+/// connection with no response at all.
 ///
 /// Every response is logged once at INFO (status and latency) by
 /// [`log_response`], and a 408 at WARN: tower-http's default response event is
@@ -258,6 +266,7 @@ impl RequestPoolSettings {
 /// `/oauth/callback` carry authorization codes and state there), no headers
 /// (bearer tokens), and not the passkey ceremonies' path credentials.
 pub fn apply_layers(router: Router, settings: &ServeSettings) -> Router {
+    let router = router.layer(CatchPanicLayer::new());
     let router = match settings.request_timeout {
         Some(timeout) => router.layer(TimeoutLayer::new(timeout)),
         None => router,
@@ -632,6 +641,41 @@ mod tests {
         );
         // Calibration: a request inside the timeout is served.
         let fast = call(apply_layers(slow_router(), &settings), "/fast", None).await;
+        assert_eq!(fast.status(), StatusCode::OK);
+    }
+
+    /// b4c4337f: a panicking handler is answered 500, with the request id and
+    /// without the panic message, and the router keeps serving. Without the
+    /// panic layer the panic unwinds out of `oneshot` and fails this test.
+    #[tokio::test]
+    async fn a_panicking_handler_is_answered_500_with_its_request_id() {
+        let router = slow_router().route(
+            "/panic",
+            get(|| async {
+                if std::hint::black_box(true) {
+                    panic!("handler exploded: secret-detail-7731");
+                }
+                "unreachable"
+            }),
+        );
+        let app = apply_layers(router, &ServeSettings::default());
+        let response = call(app.clone(), "/panic", Some("req-panic-1")).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER).unwrap(),
+            "req-panic-1",
+            "the 500 carries the request id"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("secret-detail-7731"),
+            "the panic message must not reach the client: {body}"
+        );
+        // The service is still up after the panic.
+        let fast = call(app, "/fast", None).await;
         assert_eq!(fast.status(), StatusCode::OK);
     }
 

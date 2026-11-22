@@ -350,6 +350,10 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `EPIGRAPH_TRUSTED_PROXIES` does not name it), well above
   `EPIGRAPH_RATE_LIMIT_RPM`. The boot log says `per-address rate limiter ON`
   or `OFF`.
+- **A handler that panics** is answered `500` with the body `Service
+  panicked` and the request's `x-request-id`; the panic message is logged at
+  ERROR (`Service panicked: ...`) in the request's span and never sent to the
+  client. The process keeps serving.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
