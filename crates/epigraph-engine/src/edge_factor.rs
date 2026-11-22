@@ -527,7 +527,7 @@ pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String
 /// records the target's DS-vs-Bayesian divergence with the BetP the wire
 /// wrote (`crate::ds_divergence::track_counted_bba`), inside this savepoint.
 /// A re-derivation that deleted the edge's BBA first goes through
-/// [`rederive_edge_if_epistemic`] instead, which does not count it again.
+/// `rederive_edge_if_epistemic` instead, which does not count it again.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_edge_if_epistemic(
     conn: &mut sqlx::PgConnection,

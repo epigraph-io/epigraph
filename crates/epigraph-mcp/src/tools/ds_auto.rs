@@ -1170,9 +1170,10 @@ async fn wire_single_batch_entry(
     // The claim's Beta-Bernoulli track counts this BBA on the hypothesis it
     // asserts (backlog d3648d3c), as the seed wire counts a submitted claim's.
     // Every batch entry is a claim the caller's walk just created (both
-    // callers wire only newly inserted atoms), so this update is the claim's
-    // cold start and would record no divergence row: the BetP is not read
-    // back for it. What it changes is the claim's NEXT update, whose track
+    // callers wire only newly inserted atoms), so this update is normally the
+    // claim's cold start (an edge the same walk wired onto the atom first may
+    // have counted already). No BetP is passed, so it records no divergence
+    // row either way. What it changes is the claim's NEXT update, whose track
     // then holds this evidence as the DS fold does.
     epigraph_engine::ds_divergence::track_counted_bba(
         &mut *conn,

@@ -14,21 +14,59 @@
 //! so a claim whose evidence arrived through the MCP DS tools
 //! (`submit_ds_evidence`, `update_with_evidence`) never got either one, and
 //! `get_divergence` answered "no divergence data" for it (backlog f50344c0).
-//! Those three writers now call the same functions.
 //!
-//! The other DS writers do NOT call them yet, so their claims still get no
-//! row: `submit_claim`'s seed wire (`ds_auto::auto_wire_ds_for_claim`), the
-//! batch ingest wire (`auto_wire_ds_batch`), the edge wire
-//! (`auto_wire_ds_for_edge`), `report_workflow_outcome`
-//! (`auto_wire_ds_update`) and the recompute paths. Rows older than
-//! `DivergenceRepository`'s TTL are not served either.
+//! # Which writers keep the track (backlog d3648d3c)
+//!
+//! Every writer below counts the BBA it stores on the claim's track and,
+//! unless the update is a cold start, records the divergence of the claim's
+//! BetP after the write, inside the write's own transaction:
+//!
+//! - `POST /frames/:id/evidence`, MCP `submit_ds_evidence` and MCP
+//!   `update_with_evidence`, each by [`apply_beta_update`] and
+//!   [`record_divergence`] directly;
+//! - MCP `report_workflow_outcome` (its outcome BBA, through
+//!   [`track_counted_bba`], as `update_with_evidence` counts its own);
+//! - the seed wire `submit_claim` and `memorize` run
+//!   (`ds_auto::auto_wire_ds_for_claim`) and the batch ingest wire
+//!   (`ds_auto::auto_wire_ds_batch`, `ingest_document` and the workflow
+//!   ingests). Both wire a claim the call has just created, so the update is
+//!   the claim's cold start and records no row itself (see below; the batch
+//!   wire passes no BetP and records none even when an edge the same ingest
+//!   wired onto the atom counted first); what they change is that the track
+//!   holds the claim's first BBA, so the claim's next live update compares
+//!   two tracks holding the same evidence and records its row;
+//! - the edge wire at edge creation and at a factorless edge's wake-up
+//!   (`edge_factor::auto_wire_edge_if_epistemic`: `link_epistemic`,
+//!   `POST /edges`, the ingests). It counts the first materialization of the
+//!   edge's BBA on its target, and records a row when the wire refolded the
+//!   target's cache, with the BetP it wrote.
+//!
+//! Deliberately excluded, each because counting would add evidence the DS
+//! fold does not add:
+//!
+//! - **The recompute paths** (`recompute_beliefs`, `recompute_claim_*`, the
+//!   retraction and dedup cascades' target repairs, the operator recompute
+//!   bins). They store no BBA, so there is nothing to count; a row from a
+//!   refold would measure a calibration or profile change, not evidence, and
+//!   a bulk recompute would write one per claim.
+//! - **Edge re-wires**: the cascades' re-derivation of an edge whose BBA they
+//!   just deleted (`edge_factor`'s re-derive entry point) and
+//!   `backfill_factors`' direct `auto_wire_ds_for_edge`. The re-wire replaces
+//!   the edge's BBA at its key, so the fold holds it once; counting it again
+//!   would hold it twice on the track.
+//!
+//! Not covered yet (their claims' tracks miss that evidence): REST
+//! `POST /claims/:id/assess`, the REST hypothesis and experiment routes, the
+//! CLI `hypothesis` and `experiment` bins, and the `truth_value` seed
+//! `ds_auto::auto_wire_ds_update` stores before an evidence update. Rows
+//! older than `DivergenceRepository`'s TTL are not served either.
 //!
 //! # A cold start records no divergence row
 //!
 //! A claim whose evidence was all stored by writers that do not keep this
-//! track (the seed and edge wires, assess discounts, evidence older than the
-//! track) still holds the `Beta(1, 1)` prior while its DS fold, and so its
-//! BetP, may be mature. Its first live update then compares that BetP against
+//! track (assess discounts, the `truth_value` seed, edge re-wires, evidence
+//! older than the track) still holds the `Beta(1, 1)` prior while its DS
+//! fold, and so its BetP, may be mature. Its first live update then compares that BetP against
 //! a posterior carrying one BBA's evidence and nothing else, which registers a
 //! large divergence that says nothing about the two calculi disagreeing.
 //! [`apply_beta_update`] reports such an update as a cold start
