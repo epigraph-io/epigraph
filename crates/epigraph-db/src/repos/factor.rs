@@ -150,6 +150,14 @@ pub enum BpScopeLoad {
     OverCap { cap: usize },
 }
 
+/// The `edges.id` a trigger-minted factor row `f` was derived from
+/// (`properties.source_edge_id`, migration 217's `auto_create_factor_from_edge`),
+/// or NULL when the row carries none or the value is not a uuid. Guarded by a
+/// CASE so a malformed value is never cast.
+const FACTOR_SOURCE_EDGE_ID: &str = "(CASE WHEN f.properties->>'source_edge_id' \
+     ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+     THEN (f.properties->>'source_edge_id')::uuid END)";
+
 /// The columns [`FactorRow`] is read from, over a `factors` row aliased `f`.
 const FACTOR_ROW_COLUMNS: &str = "f.id, f.factor_type, f.variable_ids, f.potential,      f.description, f.frame_id, f.properties, f.created_at";
 
@@ -391,6 +399,12 @@ impl FactorRepository {
     /// it. An id that is no claim cannot be told apart from a claim the caller
     /// cannot read without an existence oracle, so it is treated the same way.
     ///
+    /// A row the edge trigger minted names its edge (`properties.source_edge_id`),
+    /// and is loaded only while the viewer can read that edge: an edge can be
+    /// private to a group while both its ends are public, and its factor would
+    /// otherwise carry that group's coupling into anyone's run. A keyed row whose
+    /// edge no longer exists is not loaded either.
+    ///
     /// Run it on the caller's stamped connection: the predicate's legacy arm
     /// reads `edges`, which row security filters (see
     /// [`bp_readable_factor_sql`]).
@@ -414,6 +428,10 @@ impl FactorRepository {
                             AND NOT EXISTS (SELECT 1 FROM unnest(f.variable_ids) AS fv(id) \
                                  WHERE NOT EXISTS (SELECT 1 FROM claims bpv \
                                     WHERE bpv.id = fv.id /* {{VISIBILITY:bpv}} */)) \
+                            AND (NOT (f.properties ? 'source_edge_id') \
+                                 OR EXISTS (SELECT 1 FROM edges bpe \
+                                             WHERE bpe.id = {FACTOR_SOURCE_EDGE_ID} \
+                                             /* {{EDGE_VISIBILITY:bpe}} */)) \
                           ORDER BY f.created_at, f.id LIMIT $2",
                         bp_readable_factor_sql()
                     ),
@@ -449,6 +467,10 @@ impl FactorRepository {
                                 AND NOT EXISTS (SELECT 1 FROM unnest(f.variable_ids) AS fv(id) \
                                      WHERE NOT EXISTS (SELECT 1 FROM claims bpv \
                                         WHERE bpv.id = fv.id /* {{VISIBILITY:bpv}} */)) \
+                                AND (NOT (f.properties ? 'source_edge_id') \
+                                     OR EXISTS (SELECT 1 FROM edges bpe \
+                                                 WHERE bpe.id = {FACTOR_SOURCE_EDGE_ID} \
+                                                 /* {{EDGE_VISIBILITY:bpe}} */)) \
                               ORDER BY f.created_at, f.id LIMIT $4",
                             bp_readable_factor_sql()
                         ),

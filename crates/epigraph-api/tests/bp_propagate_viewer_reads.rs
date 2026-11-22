@@ -15,9 +15,11 @@
 //!   with the same two failure directions for CDST's alternative-set classes.
 //!
 //! Each test below pins one of them on the pool where its old shape was wrong.
-//! The last one pins the R-22 consequence of reading the caller's own
-//! alternative sets on an apply run: a class is a coupling like a factor, so a
-//! public claim whose class reaches a group claim is not written from it.
+//! One pins the R-22 consequence of reading the caller's own alternative sets
+//! on an apply run: a class is a coupling like a factor, so a public claim
+//! whose class reaches a group claim is not written from it. The last pins a
+//! factor the edge trigger minted from a group-private edge between two
+//! public claims: its variables are readable by anyone, its coupling is not.
 #![cfg(feature = "db")]
 
 mod viewer_fixture;
@@ -374,4 +376,58 @@ async fn bp_apply_never_writes_a_public_claim_whose_class_reaches_a_group_claim(
         "CONTROL: with a public class v is written with BP's value: {out}"
     );
     let _ = (g.s1, g.s2, g.stranger);
+}
+
+/// A factor the edge trigger minted from an edge private to a group, between
+/// two PUBLIC claims: every variable is readable by anyone, but the coupling
+/// itself is the group's. A stranger's run must not load it; the member's
+/// does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_strangers_run_does_not_load_a_factor_minted_from_a_private_edge(pool: PgPool) {
+    let (member, group) = seed_agent_with_group(&pool, "a2-edge-member").await;
+    let (stranger, _) = seed_agent_with_group(&pool, "a2-edge-stranger").await;
+    let a = seed_public_claim(&pool, member, "a2 edge public a").await;
+    let b = seed_public_claim(&pool, member, "a2 edge public b").await;
+    set_betp(&pool, a, 0.5).await;
+    set_betp(&pool, b, 0.9).await;
+    let edge: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            visibility, owner_group_id) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports', 'group', $3) RETURNING id",
+    )
+    .bind(b)
+    .bind(a)
+    .bind(group)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a group-private supports edge between two public claims");
+    let (visibility, minted): (String, i64) = sqlx::query_as(
+        "SELECT (SELECT visibility::text FROM edges WHERE id = $1), \
+                (SELECT count(*) FROM factors WHERE properties->>'source_edge_id' = $1::text)",
+    )
+    .bind(edge)
+    .fetch_one(&pool)
+    .await
+    .expect("read the edge and its factor");
+    assert_eq!(
+        (visibility.as_str(), minted),
+        ("group", 1),
+        "CALIBRATION: the edge is the group's, and the trigger minted its factor"
+    );
+
+    let state = bypass_state(&pool, false).await;
+    let body = json!({"claim_ids": [a], "max_hops": 1, "mode": "scalar", "max_iterations": 30});
+    let mine = run(&pool, &state, member, body.clone()).await;
+    assert_eq!(
+        mine["factors_count"].as_u64(),
+        Some(1),
+        "CONTROL: the member, who can read the edge, runs its factor: {mine}"
+    );
+    let theirs = run(&pool, &state, stranger, body).await;
+    assert_eq!(
+        theirs["factors_count"].as_u64(),
+        Some(0),
+        "a factor minted from an edge the caller cannot read is not loaded: {theirs}"
+    );
+    assert_eq!(theirs["variables_count"].as_u64(), Some(0), "{theirs}");
 }
