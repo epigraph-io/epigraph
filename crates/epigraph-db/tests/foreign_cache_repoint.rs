@@ -21,7 +21,8 @@
 //! writer that does NOT own the claim, so the write reaches the definer:
 //!
 //! * the re-point is accepted in the 0296077b shape, audited as
-//!   `belief_cache_repoint`, and the classification follows it;
+//!   `belief_cache_repoint`, and CLEARS the classification (the verdict on
+//!   the hidden fold), the cleared label recorded in the audit row;
 //! * a cached combination row on the recorded frame does not keep it (the
 //!   owner rule does not count one as an input either);
 //! * refusals, each a no-op that leaves the cache and the audit log as they
@@ -151,7 +152,7 @@ async fn audit(pool: &PgPool, claim: Uuid) -> Vec<(Option<Uuid>, String)> {
     .expect("read the audit rows")
 }
 
-/// The fold a non-owner offers on `frame`: BetP 0.7, `contradicted` after.
+/// The fold a non-owner offers on `frame`: BetP 0.7.
 fn offered(frame: Uuid) -> CachedBelief {
     CachedBelief {
         belief: 0.6,
@@ -163,9 +164,14 @@ fn offered(frame: Uuid) -> CachedBelief {
     }
 }
 
-/// The two writes of a recompute (cache, then its verdict) by `writer` on an
-/// `epigraph_app` session stamped as `writer`, committed. Returns whether the
-/// cache was written.
+/// The cache write of a recompute by `writer` on an `epigraph_app` session
+/// stamped as `writer`, committed. Returns whether the cache was written.
+///
+/// Only the cache statement: no verdict is written after it, so what the
+/// classification holds afterwards is the definer's doing alone. (The engine
+/// writes a verdict only for a `binary_truth` fold and clears it on any other
+/// frame; that half is pinned in epigraph-mcp's
+/// `recompute_vacates_inadmissible_only_cache.rs`.)
 async fn write_as(pool: &PgPool, writer: Uuid, claim: Uuid, frame: Uuid) -> bool {
     let bypassrls: bool =
         sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
@@ -191,9 +197,6 @@ async fn write_as(pool: &PgPool, writer: Uuid, claim: Uuid, frame: Uuid) -> bool
     let written = MassFunctionRepository::update_claim_belief(&mut *tx, claim, offered(frame))
         .await
         .expect("a declined write is a no-op, not an error");
-    MassFunctionRepository::update_claim_classification(&mut *tx, claim, "contradicted", frame)
-        .await
-        .expect("a declined verdict is a no-op, not an error");
     tx.commit().await.expect("commit");
     written
 }
@@ -240,7 +243,9 @@ fn stale(frame: Uuid) -> Cache {
 }
 
 /// The 0296077b shape: the non-owner's recompute moves the cache to
-/// `claim_validity`, the frame the owner rule elects, and its verdict follows.
+/// `claim_validity`, the frame the owner rule elects, and the verdict on the
+/// hidden fold (`supported`) does not survive the move: the definer clears it
+/// in the same statement, and audits the cleared label.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_non_owner_re_points_the_cache_off_a_frame_whose_every_input_is_hidden(pool: PgPool) {
     let w = world(&pool, "fcr-accept").await;
@@ -254,20 +259,30 @@ async fn a_non_owner_re_points_the_cache_off_a_frame_whose_every_input_is_hidden
     );
     assert_eq!(
         cache(&pool, claim).await,
-        (
-            Some(w.validity),
-            Some(0.7),
-            Some("contradicted".to_string())
-        ),
-        "the cache, and the verdict on it, now carry claim_validity's fold"
+        (Some(w.validity), Some(0.7), None),
+        "the cache now carries claim_validity's fold, and the hidden fold's verdict is gone"
     );
     assert_eq!(
         audit(&pool, claim).await,
-        vec![
-            (Some(w.writer), "belief_cache_repoint".to_string()),
-            (Some(w.writer), "classification".to_string()),
-        ],
-        "the re-point is audited under its own action, then the verdict"
+        vec![(Some(w.writer), "belief_cache_repoint".to_string())],
+        "the re-point is audited under its own action"
+    );
+    let cleared: (Option<String>, Option<String>, bool) = sqlx::query_as(
+        "SELECT details->'before'->>'classification', details->'after'->>'classification', \
+                details->'after' ? 'classification' \
+           FROM security_events \
+          WHERE event_type = 'claims.foreign_aggregate_write' \
+            AND details->>'action' = 'belief_cache_repoint' \
+            AND details->>'claim_id' = $1::text",
+    )
+    .bind(claim)
+    .fetch_one(&pool)
+    .await
+    .expect("read the re-point audit row");
+    assert_eq!(
+        cleared,
+        (Some("supported".to_string()), None, true),
+        "the audit row records the cleared verdict (before `supported`, after null)"
     );
 }
 
@@ -395,7 +410,13 @@ async fn claim_validity_takes_the_cache_only_when_binary_truth_has_no_admissible
         write_as(&pool, w.writer, claim, w.binary).await,
         "binary_truth, the owner-rule frame, takes the cache"
     );
-    assert_eq!(cache(&pool, claim).await.0, Some(w.binary));
+    let after = cache(&pool, claim).await;
+    assert_eq!(after.0, Some(w.binary));
+    assert_eq!(
+        after.2, None,
+        "a re-point TO binary_truth clears the old verdict too; that frame's own verdict is \
+         the next write's"
+    );
 }
 
 /// A compound has no owner frame (its belief is a query over its leaves), so

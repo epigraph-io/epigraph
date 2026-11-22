@@ -61,11 +61,17 @@
 -- The values are still the caller's, as for 114's refresh on the recorded
 -- frame (114 section 0, "WHY THE DEFINER TAKES THE CACHE VALUES FROM THE
 -- CALLER"); this file widens only WHICH frame, never what may be written.
--- 114's classification definer needs no change: it writes a verdict on the
--- frame the cache records, which after the re-point is P.
+-- An accepted re-point also CLEARS `claims.classification`: the old label is
+-- the verdict on R's fold, i.e. on the hidden evidence, and would otherwise
+-- outlive the move (the engine computes a verdict only on `binary_truth`, so
+-- nothing on `claim_validity` would ever overwrite it). 114's classification
+-- definer is unchanged: it writes a verdict only on the frame the cache
+-- records, which after the re-point is P, so a re-point to `binary_truth` is
+-- followed by that frame's own verdict.
 --
 -- An accepted re-point is audited as every 114 cache write is, with
--- `action = 'belief_cache_repoint'` (the before/after carry both frames).
+-- `action = 'belief_cache_repoint'` (the before/after carry both frames and
+-- the cleared classification).
 --
 -- NOT COVERED (fail-closed, left to a privileged recompute as before):
 --   * a VACATE that needs a re-point (no frame of the claim has an admissible
@@ -84,14 +90,18 @@
 --     an edge write's dependent propagation, a bulk recompute), not by the
 --     hide. An unstamped session still writes nothing (114's FA01), and a
 --     named-frame refold of another frame is still declined. A one-time
---     `recompute_beliefs` on the maintenance DSN clears every existing case.
+--     `recompute_beliefs` on the maintenance DSN clears every existing case,
+--     verdict included: a recompute that writes the cache on a frame with
+--     no verdict (any but `binary_truth`) now clears `classification`
+--     (`edge_factor::recompute_combined_belief`, the same change).
 --
 -- ===================================================================
 -- 3. PRECONDITION, PATH, OWNER, GRANTS
 --
 -- The body is 114's with the arm above, a `v_target` / `v_action`
--- declaration, the audit action taken from `v_action`, and two comment lines;
--- no other byte changed. It refuses to apply over any body other than 114's
+-- declaration, the audit action taken from `v_action`, the re-point's
+-- classification clear (and its audit keys), and comment lines; no other
+-- byte changed. It refuses to apply over any body other than 114's
 -- (md5 of `prosrc`; 190 changed only the path). The path stays 190's
 -- `pg_catalog, public, pg_temp`, so the function stays in
 -- `definer_search_path_ratchet.rs`'s `PUBLIC_PATH_REGISTER`. CREATE OR
@@ -325,10 +335,22 @@ BEGIN
                                   'mass_on_empty', p_mass_on_empty,
                                   'mass_on_missing', p_mass_on_missing,
                                   'belief_frame_id', p_belief_frame_id);
+    -- 243: a re-point also clears the verdict. It was the verdict on the
+    -- recorded frame's fold, the fold of evidence no reader may read; the
+    -- new frame's verdict, if it has one, is written after this (114's
+    -- classification definer, on the frame the cache now records).
+    IF v_action = 'belief_cache_repoint' THEN
+        v_before := v_before || jsonb_build_object(
+            'classification', (SELECT c.classification FROM public.claims c WHERE c.id = p_claim));
+        v_after := v_after || jsonb_build_object('classification', NULL::text);
+    END IF;
     UPDATE public.claims
        SET belief = p_belief, plausibility = p_plausibility, mass_on_empty = p_mass_on_empty,
            pignistic_prob = p_pignistic_prob, mass_on_missing = p_mass_on_missing,
-           belief_frame_id = p_belief_frame_id, updated_at = now()
+           belief_frame_id = p_belief_frame_id,
+           classification = CASE WHEN v_action = 'belief_cache_repoint' THEN NULL
+                                 ELSE classification END,
+           updated_at = now()
      WHERE id = p_claim;
     IF v_before IS DISTINCT FROM v_after THEN
         PERFORM public.epigraph_foreign_aggregate_audit(

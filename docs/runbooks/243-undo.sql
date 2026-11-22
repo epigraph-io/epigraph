@@ -39,9 +39,9 @@ BEGIN
      WHERE p.oid = to_regprocedure('public.epigraph_foreign_belief_cache(uuid, double precision, '
                                    'double precision, double precision, double precision, '
                                    'double precision, uuid)');
-    IF v_found IS DISTINCT FROM 'cf6e094743e66ac432fbc64a653f8263' THEN
+    IF v_found IS DISTINCT FROM 'bb583f1b40975d33b09c769cf9324b65' THEN
         RAISE EXCEPTION '243-undo: epigraph_foreign_belief_cache is not 243''s body (md5 '
-                        'cf6e094743e66ac432fbc64a653f8263); found md5 %. Nothing was changed', COALESCE(v_found, '(absent)')
+                        'bb583f1b40975d33b09c769cf9324b65); found md5 %. Nothing was changed', COALESCE(v_found, '(absent)')
             USING ERRCODE = '55000';
     END IF;
 END $$;
