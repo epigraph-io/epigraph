@@ -143,6 +143,9 @@ pub mod structural;
 pub mod submit;
 #[cfg(feature = "db")]
 pub mod tasks;
+/// Person-facing keyless team groups and consented invitations (migration 263).
+#[cfg(feature = "db")]
+pub mod team_groups;
 #[cfg(any(test, feature = "db"))]
 pub(crate) mod text;
 #[cfg(feature = "db")]
@@ -734,6 +737,25 @@ pub fn create_router_with_extensions(
         // interface table say. The `/rotate-key` spelling this comment used to
         // carry was never served by anything.
         .route("/api/v1/groups/:id/rotate", post(groups::rotate_key))
+        // Person-facing keyless team groups and consented invitations
+        // (migration 263, `routes/team_groups.rs`): a Person creates a group
+        // and invites another Person, whose membership goes live only when
+        // they accept. `/groups/team` and `/groups/mine` are static segments,
+        // matched ahead of `/groups/:id`.
+        .route("/api/v1/groups/team", post(team_groups::create_team_group))
+        .route("/api/v1/groups/mine", get(team_groups::my_groups))
+        .route(
+            "/api/v1/groups/:id/invitations",
+            post(team_groups::invite_to_group),
+        )
+        .route(
+            "/api/v1/group-invitations/:id/accept",
+            post(team_groups::accept_invitation),
+        )
+        .route(
+            "/api/v1/group-invitations/:id/decline",
+            post(team_groups::decline_invitation),
+        )
         // Admin OAuth client management
         .route(
             "/api/v1/admin/clients/:id/approve",

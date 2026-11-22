@@ -272,6 +272,12 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("tasks::complete_task", Scope("tasks:write")),
     ("tasks::create_task", Scope("tasks:write")),
     ("tasks::fail_task", Scope("tasks:write")),
+    // Migration 263: the definer decides which group and which invitation;
+    // the scope says the token class may manage groups at all.
+    ("team_groups::accept_invitation", Scope("groups:write")),
+    ("team_groups::create_team_group", Scope("groups:write")),
+    ("team_groups::decline_invitation", Scope("groups:write")),
+    ("team_groups::invite_to_group", Scope("groups:write")),
     ("versioning::mark_duplicate", Scope("claims:write")),
     ("versioning::supersede_claim", Scope("claims:write")),
     ("versioning::unmark_duplicate", Scope("claims:write")),
