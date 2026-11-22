@@ -102,13 +102,18 @@ fn uuid_of(n: u128) -> Uuid {
 /// The ways one DOI reaches the store: ingest's bare `properties.doi`, its
 /// `https://doi.org/<doi>` source_url, a `doi:` label, a dx link, case and
 /// slash variants.
-const SPELLINGS: [&str; 6] = [
+const SPELLINGS: [&str; 9] = [
     "10.5555/Paper.One",
     "https://doi.org/10.5555/paper.one",
     "http://dx.doi.org/10.5555/PAPER.ONE/",
     "doi:10.5555/paper.one",
     " DOI:10.5555/Paper.One ",
     "https://www.doi.org/10.5555/paper.one",
+    // The scheme-less resolver spellings the stored document key folds
+    // (`epigraph_db::repos::paper::DOI_KEY_PREFIXES`, backlog e34fd66e).
+    "doi.org/10.5555/paper.one",
+    "DX.DOI.ORG/10.5555/Paper.One",
+    "www.doi.org/10.5555/paper.one",
 ];
 
 /// Methods a row can carry that give it no structural key of its own.

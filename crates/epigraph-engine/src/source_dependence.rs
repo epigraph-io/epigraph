@@ -64,7 +64,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use epigraph_core::domain::evidence::is_placeholder_id;
+use epigraph_db::repos::paper::{is_bare_doi, peel_document_key_prefixes};
 use epigraph_db::{EvidenceRepository, MassFunctionRow};
 use epigraph_ds::{combination, DsError, FocalElement, MassFunction};
 
@@ -676,86 +676,22 @@ pub struct ItemEvidence {
     pub source_url: Option<String>,
 }
 
-/// Prefixes that turn a link or a label into a bare DOI, longest first;
-/// matched case-insensitively. What reaches the evidence row: ingest persists
-/// its document identifier bare in `properties.doi` (a DOI, an arXiv-style
-/// id, a synthesized document key, or the document's URI when it has none of
-/// those) and writes no `source_url` for literature; `source_url` holds what
-/// other writers passed, which may be a doi.org link, a `doi:<id>` label (the
-/// spelling ingest uses for a paper's label), any other link, or free text.
-// belief-profile: allow-literal (array length of a fixed prefix list)
-const DOI_PREFIXES: [&str; 7] = [
-    "https://www.doi.org/",
-    "http://www.doi.org/",
-    "https://dx.doi.org/",
-    "http://dx.doi.org/",
-    "https://doi.org/",
-    "http://doi.org/",
-    "doi:",
-];
-
-/// Strip one [`DOI_PREFIXES`] entry, if `t` starts with one.
-fn strip_doi_prefix(t: &str) -> Option<&str> {
-    DOI_PREFIXES.iter().find_map(|p| {
-        t.get(..p.len())
-            .filter(|head| head.eq_ignore_ascii_case(p))
-            .map(|_| &t[p.len()..])
-    })
-}
-
-/// A DOI resolver root with nothing behind it (`https://doi.org`, with or
-/// without the trailing `/`).
-fn is_doi_resolver_root(t: &str) -> bool {
-    let t = t.trim().trim_end_matches('/');
-    DOI_PREFIXES
-        .iter()
-        .filter(|p| p.ends_with('/'))
-        .any(|p| t.eq_ignore_ascii_case(p.trim_end_matches('/')))
-}
-
-/// What is behind the DOI prefixes of `t`, all of them peeled
-/// (`doi:https://doi.org/10.x` names `10.x`); `""` for a resolver root with
-/// nothing behind it. `None` when `t` carries no DOI prefix.
-fn peel_doi_prefixes(t: &str) -> Option<&str> {
-    let mut rest = match strip_doi_prefix(t) {
-        Some(r) => r,
-        None if is_doi_resolver_root(t) => "",
-        None => return None,
-    };
-    loop {
-        rest = rest.trim();
-        if is_doi_resolver_root(rest) {
-            return Some("");
-        }
-        match strip_doi_prefix(rest) {
-            Some(r) => rest = r,
-            None => return Some(rest),
-        }
-    }
-}
-
-/// Normalize a DOI as evidence stores it (`properties.doi`, usually bare)
-/// or links to it (`doi:<id>`, `https://doi.org/<doi>`, `dx.` / `www.`
-/// variants): prefixes removed, trimmed, trailing `/` removed,
-/// ASCII-lowercased (DOIs are case-insensitive). `None` for a blank result,
-/// a placeholder ([`is_placeholder_id`]: "unknown", "n/a", ...; a document
-/// key built on one would merge every DOI-less document) or anything that is
-/// still a URL after the prefixes are removed (a web page is not a DOI).
-/// Percent-encoded DOIs are not decoded, so one DOI written both ways counts
-/// as two sources, which errs toward the pre-key behaviour.
-#[must_use]
-pub fn normalize_doi(raw: &str) -> Option<String> {
-    let t = raw.trim();
-    let t = peel_doi_prefixes(t)
-        .unwrap_or(t)
-        .trim()
-        .trim_end_matches('/');
-    if t.is_empty() || t.contains("://") || is_placeholder_id(t) {
-        None
-    } else {
-        Some(t.to_ascii_lowercase())
-    }
-}
+/// Normalize a DOI for the same-source key: the shared case-folded document
+/// identity, [`epigraph_db::repos::paper::document_identity_key`] (backlog
+/// e34fd66e; the engine used to keep its own normalizer, which missed the
+/// scheme-less `doi.org/` spellings the stored key folds). Prefixes
+/// (`doi:`, `https://doi.org/`, `dx.` / `www.` and scheme-less variants)
+/// removed, trimmed, trailing `/` removed, ASCII-lowercased. `None` for a
+/// blank result, a placeholder ("unknown", "n/a", ...) or anything that is
+/// still a URL once the prefixes are gone.
+///
+/// What reaches the evidence row: ingest persists its document identifier
+/// bare in `properties.doi` (a DOI, an arXiv-style id, a synthesized document
+/// key, or the document's URI when it has none of those) and writes no
+/// `source_url` for literature; `source_url` holds what other writers passed,
+/// which may be a doi.org link, a `doi:<id>` label (the spelling ingest uses
+/// for a paper's label), any other link, or free text.
+pub use epigraph_db::repos::paper::document_identity_key as normalize_doi;
 
 /// An `http://` or `https://` link with something after the scheme.
 fn is_web_url(t: &str) -> bool {
@@ -764,20 +700,6 @@ fn is_web_url(t: &str) -> bool {
             .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
             && !t[scheme.len()..].trim().trim_matches('/').is_empty()
     })
-}
-
-/// A bare DOI as free text would hold one: `10.`, a 4–9 digit registrant
-/// code, `/`, a non-blank suffix. "10.0.0.5/notes" and "10.5 mg dose" are not.
-fn is_bare_doi(t: &str) -> bool {
-    let Some(rest) = t.strip_prefix("10.") else {
-        return false;
-    };
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    // belief-profile: allow-literal (DOI syntax: a 4-9 digit registrant code)
-    (4..=9).contains(&digits)
-        && rest[digits..]
-            .strip_prefix('/')
-            .is_some_and(|suffix| !suffix.trim().is_empty())
 }
 
 /// The source one identity value names, if any. `doi:` and `url:` are
@@ -793,7 +715,7 @@ fn is_bare_doi(t: &str) -> bool {
 /// - a bare value names a DOI when `bare_is_doi` accepts it, else nothing.
 fn named_source(raw: &str, bare_is_doi: fn(&str) -> bool) -> Option<ItemKey> {
     let t = raw.trim();
-    let (t, bare) = match peel_doi_prefixes(t) {
+    let (t, bare) = match peel_document_key_prefixes(t) {
         Some(inner) => (inner.trim(), false),
         None => (t, true),
     };
