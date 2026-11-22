@@ -7581,9 +7581,9 @@ impl ClaimRepository {
     /// Taken one create at a time, in document order, those locks added wait
     /// edges that could close a cycle (40P01, backlog 5b587ae8): two
     /// transactions meeting shared NEW pairs in opposite orders, or an ingest
-    /// that holds a row lock (an edge's foreign-key share lock on an existing
-    /// claim, a label merge) while it waits on a pair that a consolidation
-    /// holds while it waits on that row (`consolidate_act_conn` takes the pair
+    /// that holds a row lock (the label merge onto an existing claim it
+    /// resolved an earlier atom to) while it waits on a pair that a
+    /// consolidation holds while it waits on that row (`consolidate_act_conn` takes the pair
     /// lock, then `FOR UPDATE` on its sources). So every writer that takes
     /// more than one pair in a transaction takes ALL of them first, in one
     /// statement and in key order, before any row lock of its own:

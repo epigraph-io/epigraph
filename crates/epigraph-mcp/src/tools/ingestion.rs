@@ -1692,8 +1692,8 @@ pub async fn do_ingest_document_reporting(
         .owner_decl(agent_id, "ingest_document", &resolution)
         .await?;
     // Every NEW atom's `(content_hash, agent)` dedup lock, taken here at once
-    // and in key order, before the walk takes any claim row lock (an edge's
-    // foreign-key share lock, a label merge). Taken one atom at a time in
+    // and in key order, before the walk takes any claim row lock (the label
+    // merge onto an existing claim an atom resolves to). Taken one atom at a time in
     // document order instead, they could deadlock (40P01) against another
     // multi-pair writer meeting the same new atoms in another order, or
     // against a consolidation that holds one of them while it waits on a row
