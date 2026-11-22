@@ -294,6 +294,63 @@ impl AgentKeyRepository {
         .await?)
     }
 
+    /// Whether the edge verifier would admit `public_key` as `signer_id`'s key
+    /// for an edge dated `at`: the verifier's own reads (every `agent_keys` row
+    /// of the signer, `key_type` and `status` in the SQL spelling, and its bare
+    /// `agents.public_key`) passed through [`admitted_signature_keys`], the one
+    /// admission rule (`repos::edge_signature::verify_conn`).
+    ///
+    /// A RUNNING signer asks this before it keeps signing: a key revoked,
+    /// rotated out or past its window while the process runs would otherwise
+    /// go on signing rows the verifier refuses. A pool, like
+    /// [`Self::rows_with_public_key`]: not a request-path read, and
+    /// `agent_keys` / `agents.public_key` carry no tenancy to filter.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if a query fails.
+    pub async fn signer_key_admitted(
+        pool: &PgPool,
+        signer_id: Uuid,
+        public_key: &[u8; 32],
+        at: DateTime<Utc>,
+    ) -> Result<bool, DbError> {
+        type Row = (
+            Vec<u8>,
+            String,
+            String,
+            DateTime<Utc>,
+            Option<DateTime<Utc>>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT public_key, lower(btrim(key_type)), lower(btrim(status)), \
+                    valid_from, valid_until \
+               FROM agent_keys WHERE agent_id = $1 ORDER BY created_at, id",
+        )
+        .bind(signer_id)
+        .fetch_all(pool)
+        .await?;
+        let agent_key: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+                .bind(signer_id)
+                .fetch_optional(pool)
+                .await?;
+        let lifecycle: Vec<KeyLifecycle<'_>> = rows
+            .iter()
+            .map(|(key, key_type, status, from, until)| KeyLifecycle {
+                public_key: key,
+                key_type,
+                status,
+                valid_from: *from,
+                valid_until: *until,
+            })
+            .collect();
+        Ok(
+            admitted_signature_keys(&lifecycle, agent_key.as_deref(), at)
+                .iter()
+                .any(|a| a.key == *public_key),
+        )
+    }
+
     /// The attested keys (`signing`, `identity-legacy`; any status) of a
     /// claim's AUTHOR (`claims.agent_id`) and of its SIGNER
     /// (`claims.signer_id`), for `verify_claim`'s key binding (agent identity

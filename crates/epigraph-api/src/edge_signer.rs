@@ -43,21 +43,37 @@
 //!    logs a WARNING ([`REGISTERED_A_SIGNER`]), so an unplanned rotation that
 //!    mints a second signer agent is visible.
 //!
-//! The key's admission is checked at boot only: after revoking or rotating
-//! the API's key, restart the API.
-//!
 //! Rotation needs no code change, but it is a maintenance act (`signing` rows
 //! are attested state, refused to the application role by migration 161).
 //! The OLD key must end up in `agent_keys` as a `rotated` row with
 //! `valid_until` set: a key that is only an `agents.public_key` (steps 2 and
 //! 3) is admitted by the verifier with no window while no row carries its
-//! bytes, so without that row a retired key keeps verifying. Then the new key
-//! is registered as the agent's active `signing` row and the variable points
-//! at its file. `docs/architecture/noun-claims-and-verb-edges.md` has the
-//! operator steps.
+//! bytes, so without that row a retired key keeps verifying. The new key is
+//! registered as the agent's active `signing` row and the variable pointed at
+//! its file BEFORE the old key's window closes: the running server stops once
+//! it does (below), and restarts on the new key.
+//! `docs/architecture/noun-claims-and-verb-edges.md` has the operator steps.
 //!
 //! The signer is never an edge's author: an edge's author is its source
 //! claim's (`backfill_factors::EDGE_QUERY`, the operator's edge-writer read).
+//!
+//! # While it runs
+//!
+//! Boot checks the key once; [`spawn_admission_watch`] keeps checking it. Every
+//! [`ENV_RECHECK_SECS`] seconds (default 30, clamped to 1..=300) it asks
+//! whether the edge verifier would still admit the key for the signer agent
+//! (`AgentKeyRepository::signer_key_admitted`, the verifier's own admission
+//! rule), and once it would not (the key was revoked, rotated out, or its
+//! window closed) it logs an ERROR ([`KEY_NO_LONGER_ADMITTED`]) and EXITS the
+//! process, as a boot with that key refuses to start. A key the verifier no
+//! longer admits signs only rows the verifier refuses, so the server neither
+//! keeps signing with it nor downgrades to unsigned writes. A failed re-read
+//! is logged at WARN and the server keeps serving: only a positive read of an
+//! inadmissible key stops it.
+//!
+//! So revoking or retiring the API's key stops the API within the interval,
+//! and a restart refuses until the variable points at an admitted key: point
+//! it at the new key FIRST, then close the old key's window (rotation, above).
 
 use std::sync::Arc;
 
@@ -294,6 +310,72 @@ pub async fn decide(pool: &PgPool, key_file: Option<&str>) -> Result<BootDecisio
         signer: Some(ApiEdgeSigner::new(signer, signer_id)),
         warnings,
     })
+}
+
+/// The variable setting how often, in seconds, the running server re-checks
+/// its signing key's admission ([`spawn_admission_watch`]).
+pub const ENV_RECHECK_SECS: &str = "EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS";
+
+/// The stop text's fixed part when the running server's key is no longer
+/// admitted ([`watch_admission`]).
+pub const KEY_NO_LONGER_ADMITTED: &str = "is no longer admitted by the edge verifier \
+     (revoked, rotated out, or outside its validity window): every edge signed with it from \
+     now on would fail verification. Stopping; point EPIGRAPH_API_SIGNING_KEY_FILE at the \
+     signer agent's active signing key and restart";
+
+/// Re-check every `interval` whether the edge verifier still admits
+/// `signer`'s key for its signer agent, and return the stop text once it does
+/// not. A failed re-read is logged at WARN and the watch goes on: the key
+/// passed its fail-closed boot check, and a transient database error must not
+/// stop the server. Only a positive read of an inadmissible key returns.
+pub async fn watch_admission(
+    pool: PgPool,
+    signer: Arc<ApiEdgeSigner>,
+    interval: std::time::Duration,
+) -> String {
+    let public_key = signer.signer.public_key();
+    loop {
+        tokio::time::sleep(interval).await;
+        match AgentKeyRepository::signer_key_admitted(
+            &pool,
+            signer.signer_id,
+            &public_key,
+            Utc::now(),
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let stop = format!(
+                    "{ENV_KEY_FILE}: the API's signing key ({}) of signer agent {} \
+                     {KEY_NO_LONGER_ADMITTED}",
+                    hex::encode(public_key),
+                    signer.signer_id
+                );
+                tracing::error!("{stop}");
+                return stop;
+            }
+            Err(e) => tracing::warn!(
+                "{ENV_KEY_FILE}: could not re-check the API signing key's admission ({e}); \
+                 still signing, re-checking in {}s",
+                interval.as_secs()
+            ),
+        }
+    }
+}
+
+/// Spawn [`watch_admission`] for `bin/server.rs`, at the interval
+/// [`ENV_RECHECK_SECS`] sets, and EXIT the process (status 1, the stop text on
+/// stderr) when it returns. Call it right after [`boot`] returns a signer.
+pub fn spawn_admission_watch(pool: PgPool, signer: Arc<ApiEdgeSigner>) {
+    let interval = epigraph_db::operator_binding::recheck_interval_from_env_value(
+        std::env::var(ENV_RECHECK_SECS).ok().as_deref(),
+    );
+    tokio::spawn(async move {
+        let stop = watch_admission(pool, signer, interval).await;
+        eprintln!("ERROR: {stop}");
+        std::process::exit(1);
+    });
 }
 
 /// The API's signer from `key_file` (the value of [`ENV_KEY_FILE`]).
