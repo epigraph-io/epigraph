@@ -1003,10 +1003,25 @@ async fn delete_frames_purges_a_retracted_companion_bba_then_deletes_the_frame(p
         purges[0]
     );
     assert_eq!(rows[0]["id"], r_bba.to_string(), "{}", purges[0]);
+    // Since 251 the grant stays in the ledger, consumed by the delete guard
+    // with the purged row (backlog 6bdac68f).
+    assert_eq!(
+        count(
+            &pool,
+            &format!(
+                "SELECT count(*) FROM mass_function_purge_grants \
+                  WHERE mf_id = '{r_bba}' AND kind = 'purge' \
+                    AND consumed_row->>'id' = '{r_bba}'"
+            )
+        )
+        .await,
+        1,
+        "one consumed ledger grant names the purged row"
+    );
     assert_eq!(
         count(&pool, "SELECT count(*) FROM mass_function_purge_grants").await,
-        0,
-        "no grant row is left"
+        1,
+        "and no other grant row"
     );
     let audit = audit_rows(&pool).await;
     assert_eq!(audit.len(), 1, "{audit:?}");

@@ -183,6 +183,12 @@ use uuid::Uuid;
 /// the role `epigraph_definer_bypass()` (migration 067) tests membership of.
 const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 
+/// Migration 251's NOLOGIN owner of the retracted-BBA grant ledger, and the
+/// registered definer it took over from the maintenance role (194's helper,
+/// which reads the ledger only that owner may).
+const LEDGER_OWNER_ROLE: &str = "epigraph_bba_guard_owner";
+const LEDGER_OWNED_DEFINERS: &[&str] = &["epigraph_mf_purge_granted"];
+
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
 
@@ -1652,10 +1658,8 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // retraction above. Fails CLOSED under a non-member owner the same way:
     // its audit INSERT and its UPDATE of another group's row are refused by
     // the tenancy policies, and the clear guard admits the clear only in a
-    // frame of its owner, so every un-retraction errors with nothing written
-    // (loud). Since 251 (backlog 6bdac68f) the owner is
-    // `epigraph_bba_guard_owner`, a NOLOGIN member of the maintenance role
-    // that no login can act as, which this check accepts as a member.
+    // maintenance-role frame, so every un-retraction errors with nothing
+    // written (loud).
     ("epigraph_unretract_mass_function", 184),
     // 193 (backlog 0dc20fad), the definer-rights compound test of the
     // cached-belief owner lookup. Fails OPEN under a non-member owner: its
@@ -1850,11 +1854,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_cascade_delete_edge_bbas", 115),
     ("epigraph_cascade_delete_node_edges", 115),
     // 194 (H10), the purge-grant helper the retracted-row delete guard calls.
-    // Fails CLOSED under any other owner: only its owner holds a privilege on
-    // `mass_function_purge_grants` (since 251, `epigraph_bba_guard_owner`, a
-    // NOLOGIN maintenance member no login can act as), so another owner's read
-    // is refused and every delete of a retracted row, the purge definer's
-    // included, errors with nothing deleted (loud).
+    // Fails CLOSED under a non-member owner: such an owner holds no privilege
+    // on `mass_function_purge_grants` (only `epigraph_maintenance` does), so
+    // its read is refused and every delete of a retracted row, the purge
+    // definer's included, errors with nothing deleted (loud). Since 251 its
+    // owner is the ledger's (`LEDGER_OWNER_ROLE`), which the ownership check
+    // accepts for it.
     ("epigraph_mf_purge_granted", 194),
     // 194 (H10), the audited purge of retracted mass functions. Fails CLOSED
     // under a non-member owner: its grant INSERT is refused (no privilege on
@@ -2485,6 +2490,10 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 );
             }
             Some((_, true)) => {}
+            // 251: the ledger's helper belongs to the ledger's owner, which no
+            // login can act as.
+            Some((rolname, false))
+                if rolname == LEDGER_OWNER_ROLE && LEDGER_OWNED_DEFINERS.contains(&f.as_str()) => {}
             Some((rolname, false)) => {
                 failures += 1;
                 eprintln!(
@@ -3958,18 +3967,6 @@ mod definer_register_tests {
     /// Last migration version whose re-owns may go unregistered.
     const PRE_REGISTER_CEILING: i64 = 110;
 
-    /// Registered definers a LATER migration moved off `epigraph_maintenance`
-    /// to `epigraph_bba_guard_owner` (251, backlog 6bdac68f): a NOLOGIN role
-    /// that is itself a member of the maintenance role (so `verify`'s
-    /// MEMBER check still holds them) and that no login can act as. The
-    /// catalog test requires `epigraph_bba_guard_owner` to own exactly these
-    /// and `epigraph_maintenance` none of them.
-    const GUARD_OWNER_REOWNED: &[(&str, i64)] = &[
-        ("epigraph_mf_purge_granted", 251),
-        ("epigraph_purge_mass_functions", 251),
-        ("epigraph_unretract_mass_function", 251),
-    ];
-
     /// Re-owned by a migration, then dropped by a later one: nothing to check.
     const DROPPED: &[(&str, i64)] = &[
         // 071's shim; 084 drops it with the table it wrote through.
@@ -4351,56 +4348,34 @@ mod definer_register_tests {
         );
 
         let owned: BTreeSet<&str> = rows.iter().map(|(_, n, _)| n.as_str()).collect();
-        let guard_owned: BTreeSet<&str> = GUARD_OWNER_REOWNED.iter().map(|(n, _)| *n).collect();
+        // 251: registered, but owned by the ledger's NOLOGIN owner at head.
+        let ledger_owned: BTreeSet<&str> = super::LEDGER_OWNED_DEFINERS.iter().copied().collect();
         let listed: BTreeSet<&str> = register()
             .into_iter()
             .chain(INVOKER_EXEMPT.iter().copied())
             .chain(PRE_REGISTER_DEFINERS.iter().copied())
-            .filter(|n| !guard_owned.contains(n))
+            .filter(|n| !ledger_owned.contains(n))
             .collect();
-
-        // 251: the guard definers belong to `epigraph_bba_guard_owner`, which
-        // is a member of the maintenance role (verify's predicate).
-        let by_guard_owner: BTreeSet<String> = sqlx::query_scalar::<_, String>(
-            "SELECT p.proname::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-              WHERE n.nspname = 'public' \
-                AND pg_get_userbyid(p.proowner) = 'epigraph_bba_guard_owner'",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("list the functions epigraph_bba_guard_owner owns")
-        .into_iter()
-        .collect();
-        assert_eq!(
-            by_guard_owner,
-            guard_owned
-                .iter()
-                .map(|n| (*n).to_string())
-                .collect::<BTreeSet<_>>(),
-            "epigraph_bba_guard_owner must own exactly GUARD_OWNER_REOWNED"
-        );
-        for name in &guard_owned {
+        for name in &ledger_owned {
             assert!(
                 register().contains(name),
-                "GUARD_OWNER_REOWNED names public.{name}, which is not registered"
+                "LEDGER_OWNED_DEFINERS names public.{name}, which is not registered"
             );
-            assert!(
-                !owned.contains(name),
-                "public.{name} is listed as moved to epigraph_bba_guard_owner, but \
-                 epigraph_maintenance owns it at head"
+            let owner: String = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = 'public' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("public.{name}: {e}"));
+            assert_eq!(
+                owner,
+                super::LEDGER_OWNER_ROLE,
+                "public.{name} is listed as the ledger owner's at head"
             );
         }
-        let member: bool = sqlx::query_scalar(
-            "SELECT pg_has_role('epigraph_bba_guard_owner', 'epigraph_maintenance', 'MEMBER')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("membership of the guard owner");
-        assert!(
-            member,
-            "epigraph_bba_guard_owner must be a member of epigraph_maintenance, or verify's \
-             ownership pre-flight fails the three guard definers"
-        );
         let unlisted: Vec<&&str> = owned.difference(&listed).collect();
         assert!(
             unlisted.is_empty(),

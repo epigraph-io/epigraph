@@ -4133,10 +4133,11 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
 /// no application role's to read or write (077's default privileges would
 /// otherwise grant `epigraph_app` everything on a new table), the table stays
 /// owned by the migration runner, and the purge definer is executable by the
-/// maintenance role alone. Since 251 (backlog 6bdac68f) the two definers are
-/// owned by `epigraph_bba_guard_owner`, which alone holds what they need on
-/// the table; the maintenance role holds nothing on it, so a maintenance login
-/// cannot write a grant itself.
+/// maintenance role alone. Since 251 (backlog 6bdac68f) the table is a ledger
+/// only `epigraph_bba_guard_owner` holds anything on (SELECT, INSERT, and
+/// UPDATE of the three consumption columns: no DELETE, no table-wide UPDATE),
+/// through the three functions it owns; the maintenance role holds nothing on
+/// it, so a maintenance login cannot write, rewrite or remove a grant itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_maintenance_only(
     pool: PgPool,
@@ -4194,10 +4195,25 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
                 .expect("privilege");
         assert_eq!(
             guard_owner,
-            matches!(privilege, "SELECT" | "INSERT" | "DELETE"),
+            matches!(privilege, "SELECT" | "INSERT"),
             "epigraph_bba_guard_owner {privilege} on {table}"
         );
     }
+    let owner_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_attribute a \
+          WHERE a.attrelid = $1::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+            AND has_column_privilege('epigraph_bba_guard_owner', a.attrelid, a.attnum, 'UPDATE') \
+          ORDER BY 1",
+    )
+    .bind(table)
+    .fetch_all(&pool)
+    .await
+    .expect("column privileges");
+    assert_eq!(
+        owner_columns,
+        vec!["consumed_at", "consumed_login", "consumed_row"],
+        "the owner updates only the consumption columns (251)"
+    );
     let column_level: bool = sqlx::query_scalar(
         "SELECT has_any_column_privilege('epigraph_app', $1, 'SELECT') \
              OR has_any_column_privilege('epigraph_app', $1, 'INSERT') \
@@ -4212,9 +4228,17 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
         "no column-level grant to epigraph_app on {table}"
     );
 
-    for (signature, app_executes) in [
-        ("public.epigraph_purge_mass_functions(uuid[], text)", false),
-        ("public.epigraph_mf_purge_granted(uuid)", true),
+    for (signature, app_executes, owned_by) in [
+        (
+            "public.epigraph_purge_mass_functions(uuid[], text)",
+            false,
+            "epigraph_maintenance",
+        ),
+        (
+            "public.epigraph_mf_purge_granted(uuid)",
+            true,
+            "epigraph_bba_guard_owner",
+        ),
     ] {
         let (secdef, owner, acl): (bool, String, Option<String>) = sqlx::query_as(
             "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, p.proacl::text \
@@ -4225,7 +4249,7 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
         .await
         .unwrap_or_else(|e| panic!("{signature} must exist (migration 194): {e}"));
         assert!(secdef, "{signature} is SECURITY DEFINER");
-        assert_eq!(owner, "epigraph_bba_guard_owner", "{signature} owner (251)");
+        assert_eq!(owner, owned_by, "{signature} owner (251)");
         assert!(
             acl.is_some(),
             "{signature} carries an explicit ACL (no PUBLIC default)"

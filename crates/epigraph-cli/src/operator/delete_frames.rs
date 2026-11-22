@@ -455,10 +455,19 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
     }
     // Migration 194 (H10): a retracted row is deleted only by the purge
     // definer, so the frames' cascade would be refused SR09 on one. Purge them
-    // first, with the run's reason; the definer writes one audit row and
-    // leaves no grant row. Their count is already in the planned
-    // `mass_functions` deletes.
+    // first, with the run's reason; the definer writes one audit row. Their
+    // count is already in the planned `mass_functions` deletes. Its grant
+    // rows: before 251 it inserts and deletes one per row; since 251 (the
+    // grant ledger, backlog 6bdac68f) it inserts one per row and the delete
+    // guard consumes it (an update), and the row stays.
     if !dry.purge.is_empty() {
+        let ledger: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure('public.epigraph_mf_guard_consume(text, uuid, jsonb)') \
+             IS NOT NULL",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .context("reading whether the retracted-BBA grant ledger exists")?;
         let purged: i32 = sqlx::query_scalar("SELECT public.epigraph_purge_mass_functions($1, $2)")
             .bind(&dry.purge)
             .bind(&opts.reason)
@@ -472,7 +481,12 @@ async fn apply(conn: &mut PgConnection, opts: &Options, dry: &Plan) -> anyhow::R
                  nothing was written"
             );
         }
-        expected.insert(PURGE_GRANT_TABLE.to_string(), (want, 0, want));
+        let grant_writes = if ledger {
+            (want, want, 0)
+        } else {
+            (want, 0, want)
+        };
+        expected.insert(PURGE_GRANT_TABLE.to_string(), grant_writes);
         expected.insert(PURGE_EVENT_TABLE.to_string(), (1, 0, 0));
     }
     let got = sqlx::query("DELETE FROM frames WHERE id = ANY($1)")
