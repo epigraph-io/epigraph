@@ -182,8 +182,9 @@ struct LiteratureSource {
     journal: Option<String>,
     /// The source's licence (an SPDX id such as `CC-BY-4.0`). Decides whether
     /// supporting passages and figures may be shipped verbatim; absent means
-    /// unknown, which withholds them.
-    #[serde(default)]
+    /// unknown, which withholds them. `license` (US spelling) is read too, so
+    /// a producer that spells it that way is not silently treated as unknown.
+    #[serde(default, alias = "license")]
     licence: Option<String>,
 }
 
@@ -1972,6 +1973,26 @@ mod tests {
             .iter()
             .any(|e| matches!(e.evidence_type, EvidenceTypeSubmission::Figure { .. })));
         assert_eq!(withheld_summary(&extraction, false), None);
+    }
+
+    #[test]
+    fn us_spelled_license_key_is_read() {
+        // A producer writing `license` must not be silently read as "unknown".
+        let mut json = serde_json::json!({
+            "source": {"doi": "10.9999/t88-us", "title": "US Spelling", "authors": []},
+            "claims": [{
+                "statement": "s", "page": 1, "confidence": 0.5,
+                "supporting_text": LICENSED_PASSAGE
+            }]
+        });
+        json["source"]["license"] = serde_json::json!("CC-BY-4.0");
+        let extraction: LiteratureExtraction = serde_json::from_value(json).unwrap();
+        assert_eq!(extraction.source.licence.as_deref(), Some("CC-BY-4.0"));
+        let packets = build_packets(&extraction, &AgentSigner::generate(), Uuid::new_v4(), false);
+        assert_eq!(
+            packets[0].evidence[0].raw_content.as_deref(),
+            Some(LICENSED_PASSAGE)
+        );
     }
 
     #[test]
