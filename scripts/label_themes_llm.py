@@ -15,7 +15,9 @@ connection for query consistency.
 Why nested-CLI file-write, with stdout as the second source: Claude CLI's
 `result` field is empty when invoked from inside another agent's session, so
 the prompt asks the model to Write a JSON file and the script polls for it on
-disk (`--dangerously-skip-permissions` lets the Write tool run unattended).
+disk (`--dangerously-skip-permissions` lets the Write tool run unattended;
+`--tools Write` makes it the only tool, and the CLI gets no database
+credentials in its environment: call_claude_cli).
 Outside such a session the model often answers inline instead (backlog
 b6191a3c: about two answers in three on a --relabel-all run), so when no file
 appears call_claude_cli reads the first JSON value in the envelope's `result`.
@@ -258,12 +260,41 @@ def _read_result_file(result_path):
             return None
 
 
+# Environment variables never handed to the Claude CLI: the database
+# credentials this script (and theme_pipeline's label step) run with.
+_CLI_SECRET_ENV = ("PGPASSWORD",)
+
+
+def claude_cli_env(environ=None):
+    """The Claude CLI's environment: this process's, minus database credentials.
+
+    The prompt quotes member text that any public-claim author controls, so
+    the CLI is given only the Write tool (`--tools Write` in call_claude_cli);
+    that is what stops an injected prompt from running commands. Dropping
+    every *DATABASE_URL* variable and PGPASSWORD as well means a model that
+    did get a shell would not find the DSN by listing its own environment.
+    It is not a boundary on its own: a same-user process can still read its
+    parent's /proc environ and cmdline. HOME, PATH and the CLI's own auth
+    state pass through unchanged.
+    """
+    environ = os.environ if environ is None else environ
+    return {
+        k: v for k, v in environ.items()
+        if "DATABASE_URL" not in k.upper() and k.upper() not in _CLI_SECRET_ENV
+    }
+
+
 def call_claude_cli(prompt, result_path, cwd, timeout=120):
     """Call Claude CLI and return its label answer ({label, description}) or None.
 
     The answer is taken from the result file the prompt asks the model to
     Write, else from the model's inline answer on stdout (inline_label_answer),
     else from the file once it appears within the poll window.
+
+    The CLI runs with `--tools Write`: Write is the only tool the file-answer
+    path needs, and `--dangerously-skip-permissions` would otherwise let a
+    prompt injected through member text run Bash unattended. Its environment
+    carries no database credentials (claude_cli_env).
     """
     try:
         proc = subprocess.run(
@@ -272,6 +303,7 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
                 "--output-format", "json",
                 "--model", "claude-haiku-4-5-20251001",
                 "--max-turns", "1",
+                "--tools", "Write",
                 "--dangerously-skip-permissions",
             ],
             capture_output=True,
@@ -279,6 +311,7 @@ def call_claude_cli(prompt, result_path, cwd, timeout=120):
             timeout=timeout,
             stdin=subprocess.DEVNULL,
             cwd=cwd,
+            env=claude_cli_env(),
         )
     except subprocess.TimeoutExpired:
         print(f"    TIMEOUT after {timeout}s", file=sys.stderr)

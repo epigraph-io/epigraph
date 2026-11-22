@@ -144,7 +144,10 @@ def label_env(database_url):
     projected the scratch database and then relabelled every theme of another.
     Both variables are set: with only the first, a DATABASE_URL naming another
     database makes maintenance_dsn refuse to start. An environment is readable
-    only by the same user and root.
+    only by the same user and root, unlike argv; that does not cover the
+    Claude CLI the label step spawns as the same user, so label_themes_llm
+    gives it only the Write tool and strips these variables from its
+    environment (claude_cli_env).
     """
     if not database_url:
         raise ValueError("label step needs the pipeline's database URL")
