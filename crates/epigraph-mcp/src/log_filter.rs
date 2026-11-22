@@ -37,8 +37,9 @@
 //! caller's input. It is the answer's error, not a payload field, and is not
 //! dropped here.
 //!
-//! `otel.rs::init_telemetry` (not compiled today) builds its own subscriber
-//! without the cap or the drop. Anything that wires it up must layer both.
+//! This is the binary's only subscriber: `tests/one_log_subscriber.rs` fails
+//! on any other file under `src/` that builds or installs one, so a second
+//! subscriber cannot skip the cap.
 
 use tracing::{Metadata, Subscriber};
 use tracing_subscriber::filter::{filter_fn, LevelFilter, Targets};
