@@ -3661,7 +3661,7 @@ pub struct ShareClaimsWithTeamParams {
     pub claim_ids: Vec<String>,
 
     #[schemars(
-        description = "UUID of the team to move the claims into. You (or your human operator) need a live writer or admin membership of it."
+        description = "UUID of the team to move the claims into. You need your own live writer or admin membership of it."
     )]
     pub group_id: String,
 

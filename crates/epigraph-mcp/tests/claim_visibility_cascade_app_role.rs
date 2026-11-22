@@ -30,8 +30,12 @@
 //!   (`cache_owner_frame_keeping_recorded`); the claim's NEXT ordinary
 //!   recompute applies the admissible-first owner rule (8d720490) and refolds
 //!   the cache from `claim_validity`.
-//! * the refold fails closed: an operated agent whose session does not itself
-//!   write the target team is refused, and nothing moves.
+//! * backlog ecd842bf (migration 242): an operated agent does not share or
+//!   publicize on its own authority, even when it holds the target team's
+//!   writer (share) or the owning team's admin (publicize) membership itself,
+//!   and even when its human's team is the target; its human makes the same
+//!   call and succeeds. (Before 242 the agent's session also failed the
+//!   refold check when only its human wrote the team; 242 refuses it first.)
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -730,38 +734,132 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
     assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
 }
 
-/// The refold fails closed. An agent its human operates writes a private
-/// claim (into the human's personal group, the agent's home) and shares it
-/// into a team the HUMAN writes: 206 admits the target through the operator
-/// arm, but the agent's own stamp does not write the team, so the refold
-/// could not reach the moved claim. The act is refused and nothing moves.
+/// An agent `human` operates through a LIVE link, the human a registered
+/// human operator. `(human, human_home, crew)`.
+async fn operated(pool: &PgPool, label: &str) -> (Uuid, Uuid, Uuid) {
+    let (human, human_home) = fixture::seed_human_operator(pool, &format!("{label}-human")).await;
+    let (crew, _) = fixture::seed_agent_with_group(pool, &format!("{label}-crew")).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
+        .await
+        .expect("live link");
+    (human, human_home, crew)
+}
+
+/// Backlog ecd842bf, the shape 215 already refused (through the refold check)
+/// and 242 refuses in the definer: the agent shares its private draft into a
+/// team only its HUMAN writes. Refused as an operated agent; nothing moves.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_act_whose_session_cannot_refold_the_moved_claim_is_refused(pool: PgPool) {
+async fn an_operated_agent_does_not_share_into_its_humans_team(pool: PgPool) {
     let s = app_role(&pool).await;
     let t = team(&pool, "human's team").await;
-    let (human, human_home) = fixture::seed_human_operator(&pool, "casc-human").await;
-    let (crew, _) = fixture::seed_agent_with_group(&pool, "casc-crew").await;
+    let (human, human_home, crew) = operated(&pool, "gate-humans-team").await;
     add_member(&pool, t, human, "writer").await;
-    {
-        let mut conn = pool.acquire().await.expect("acquire");
-        epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
-            .await
-            .expect("live link");
-    }
     let c = write(&pool, &s, crew, "crew draft", "private", None).await;
     assert_eq!(tenancy(&pool, "claims", c).await, group(human_home));
 
     let err = share(&pool, &s, crew, &[c], t)
         .await
-        .expect_err("the crew agent's session does not write the team");
+        .expect_err("an operated agent does not share on its own authority");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
-    assert!(err.message.contains("does not itself write"), "{err:?}");
+    assert!(err.message.contains("operated agent"), "{err:?}");
     assert_eq!(
         tenancy(&pool, "claims", c).await,
         group(human_home),
         "nothing moved"
     );
     assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
+}
+
+/// Backlog ecd842bf, the hole 215 left open: the operated agent holds its OWN
+/// writer membership of the team, so 215 admitted the target (`via = 'own'`)
+/// and the refold check passed. 242 refuses it; nothing moves and the
+/// teammate reads nothing. The human makes the same call and it succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_that_writes_the_team_itself_does_not_share_into_it(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (human, human_home, crew) = operated(&pool, "gate-share").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "gate-share-reader").await;
+    add_member(&pool, t, crew, "writer").await;
+    add_member(&pool, t, human, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(&pool, &s, crew, "crew draft", "private", None).await;
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(human_home),
+        "PREMISE: private to the human's personal group, the agent's home"
+    );
+
+    let err = share(&pool, &s, crew, &[c], t)
+        .await
+        .expect_err("an operated agent does not share on its own authority");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+    assert!(err.message.contains("operated agent"), "{err:?}");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(human_home),
+        "nothing moved"
+    );
+    assert!(!reads_row(&pool, &s, bob, "claims", c).await);
+    assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
+
+    share(&pool, &s, human, &[c], t)
+        .await
+        .expect("the human shares its agent's draft");
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t));
+    assert!(reads_row(&pool, &s, bob, "claims", c).await);
+    assert_eq!(audit(&pool, "claim.shared_with_team").await.len(), 1);
+}
+
+/// Backlog ecd842bf for publicize: an operated agent that is itself an ADMIN
+/// of the owning team (215 admitted it: D-V2 asks only for a live admin), and
+/// an agent whose link is RETIRED and that holds the same admin membership,
+/// are both refused and nothing is published. The human, an admin of the
+/// team, publishes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_that_admins_the_team_itself_does_not_publicize(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (human, _, crew) = operated(&pool, "gate-pub").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "gate-pub-retired").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "gate-pub-stranger").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    add_member(&pool, t, crew, "admin").await;
+    add_member(&pool, t, retired, "admin").await;
+    add_member(&pool, t, human, "admin").await;
+    let c = write(&pool, &s, crew, "crew finding", "team", Some(t)).await;
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t), "PREMISE");
+
+    for (who, agent) in [("live-linked", crew), ("retired-linked", retired)] {
+        let err = publicize(&pool, &s, agent, &[c])
+            .await
+            .expect_err("an operated agent does not publicize on its own authority");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "{who}: {err:?}"
+        );
+        assert!(err.message.contains("operated agent"), "{who}: {err:?}");
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            group(t),
+            "{who}: nothing published"
+        );
+        assert!(!reads_row(&pool, &s, carol, "claims", c).await, "{who}");
+    }
+    assert!(audit(&pool, "claim.publicized").await.is_empty());
+
+    publicize(&pool, &s, human, &[c])
+        .await
+        .expect("the human, an admin of the team, publishes it");
+    assert_eq!(tenancy(&pool, "claims", c).await.0, "public");
+    assert!(reads_row(&pool, &s, carol, "claims", c).await);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
