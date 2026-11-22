@@ -1938,24 +1938,45 @@ impl AgentRepository {
         }))
     }
 
-    /// The agent whose identity public key is `public_key`, with its recorded
-    /// LLM model (`properties ->> 'llm_model'`), for the run-token grant: the
-    /// principal a delegator names. `None` when no agent has the key; this
-    /// never creates one.
+    /// The agent whose identity public key is `public_key`, with its ATTESTED
+    /// LLM model, for the run-token grant: the principal a delegator names.
+    /// `None` when no agent has the key; this never creates one. The model is
+    /// `None` when the agent has no attested registration.
     ///
-    /// The model is DISPLAY state (the application role may rewrite the
-    /// agent's own `properties`); the grant uses it only to narrow which
-    /// identities it serves, never as authority, which is
-    /// [`Self::delegated_principal_pool`]'s.
+    /// The model is the one migration 161's registration recorded in
+    /// `agent_prompt_snapshots`, a table only the attestor's definer (or a
+    /// maintenance session) writes, never the application role
+    /// (and whose rows never change model: the registration refuses an
+    /// identity re-registered under another one). It is read through
+    /// migration 199's `epigraph_agent_prompt_snapshot_at`, the one definer
+    /// the application role may call on that table, at `infinity` (the
+    /// latest recorded start). It is NEVER `properties ->> 'llm_model'`: that
+    /// is display state the application role may rewrite on the agent's own
+    /// row (077's `agents_self_update`, 118's column grant), so an identity
+    /// outside the served fleet could list itself.
+    ///
+    /// `p_open = true` skips 199's prompt-history gate: the run-token grant is
+    /// pre-authentication (no principal is stamped), and the model never
+    /// leaves the server (the grant's refusal does not name it), so no caller
+    /// of the request server learns more than the gated audience would.
+    ///
+    /// The grant uses the model only to narrow which identities it serves,
+    /// never as authority, which is [`Self::delegated_principal_pool`]'s.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if the read fails.
+    /// `DbError::QueryFailed` if the read fails (including a database without
+    /// migration 199, or a role that may not EXECUTE it).
     pub async fn run_token_principal_pool(
         pool: &PgPool,
         public_key: &[u8; 32],
     ) -> Result<Option<(Uuid, Option<String>)>, DbError> {
         Ok(sqlx::query_as(
-            "SELECT id, properties ->> 'llm_model' FROM public.agents WHERE public_key = $1",
+            "SELECT a.id, \
+                    (SELECT s.model \
+                       FROM public.epigraph_agent_prompt_snapshot_at( \
+                                a.id, 'infinity'::timestamptz, true) s) \
+               FROM public.agents a \
+              WHERE a.public_key = $1",
         )
         .bind(public_key.as_slice())
         .fetch_optional(pool)

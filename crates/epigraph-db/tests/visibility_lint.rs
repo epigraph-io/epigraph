@@ -2938,7 +2938,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          SECURITY DEFINER function, the one spelling of the prompt-snapshot gate: it reads the \
          stamped session's principal and returns a row of `agent_prompt_snapshots` (no \
          `visibility` / `owner_group_id`) only to the agent's linked human and to admins. The \
-         viewer is spent on the stamp; an in-query predicate has nothing to name.",
+         viewer is spent on the stamp; an in-query predicate has nothing to name. (The one \
+         other caller of the definer, `AgentRepository::run_token_principal_pool`, passes \
+         `p_open = true` to read only the attested model for the run-token grant, which never \
+         returns it; a change to the audience ruling must re-check it.)",
     ),
     (
         "authored_by.rs",
