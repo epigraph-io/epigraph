@@ -28,6 +28,131 @@ use uuid::Uuid;
 /// group, so it holds two live memberships, one of them in a team.
 async fn agent_with_team(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     let (agent, _personal) = fixture::seed_agent_with_group(pool, label).await;
+    let team = direct_team(pool, agent, label).await;
+    (agent, team)
+}
+
+/// A human operator with its personal group (admin), a DIRECT writer row in a
+/// fresh team group, and a ROLE-DERIVED writer membership of a second team
+/// group (no membership row: `role_key` is defined and bound to that group,
+/// then granted to the human, 165's derivation). Three live memberships, the
+/// third answered only by the derived arm. Returns `(human, team, role_group)`.
+async fn human_with_team_and_role(
+    pool: &PgPool,
+    label: &str,
+    role_key: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let (human, _personal) = fixture::seed_human_operator(pool, label).await;
+    let team = direct_team(pool, human, label).await;
+    let (owner, _) = fixture::seed_human_operator(pool, &format!("{label}-role-owner")).await;
+    let role_group = team_group(pool, &format!("{label} role team"), owner).await;
+    define_group_role(pool, role_key, role_group).await;
+    grant_role(pool, role_key, human).await;
+    (human, team, role_group)
+}
+
+/// A connection whose `session_user` is `epigraph_maintenance`
+/// (`group_role_membership.rs`'s helper).
+async fn maint(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+    use sqlx::Executor;
+    let mut conn = pool.acquire().await.expect("acquire");
+    conn.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .expect("downgrade to the maintenance role");
+    conn
+}
+
+async fn reset(mut conn: sqlx::pool::PoolConnection<sqlx::Postgres>) {
+    use sqlx::Executor;
+    conn.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset session authorization");
+}
+
+/// A keyless team group made by migration 164's verb, administered by `admin`.
+async fn team_group(pool: &PgPool, name: &str, admin: Uuid) -> Uuid {
+    let mut c = maint(pool).await;
+    let g: Uuid = sqlx::query_scalar("SELECT public.epigraph_create_team_group($1, $2, $3)")
+        .bind(name)
+        .bind(admin)
+        .bind("live memberships test")
+        .fetch_one(&mut *c)
+        .await
+        .expect("create the team group");
+    reset(c).await;
+    g
+}
+
+/// `epigraph_define_group_role` on a maintenance session: a new catalog role
+/// bound to `group` at `writer`, holders only.
+async fn define_group_role(pool: &PgPool, key: &str, group: Uuid) {
+    let mut c = maint(pool).await;
+    let _binding: Uuid =
+        sqlx::query_scalar("SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5, $6)")
+            .bind(key)
+            .bind("synthetic team role")
+            .bind(group)
+            .bind("writer")
+            .bind(false)
+            .bind("live memberships test")
+            .fetch_one(&mut *c)
+            .await
+            .expect("define the role and bind it");
+    reset(c).await;
+}
+
+/// Grant `role` to `holder`, open-ended from now (123's definer, no grantor).
+async fn grant_role(pool: &PgPool, role: &str, holder: Uuid) {
+    let mut c = maint(pool).await;
+    let _assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now(), NULL, NULL, 'live memberships test')",
+    )
+    .bind(role)
+    .bind(holder)
+    .fetch_one(&mut *c)
+    .await
+    .expect("grant the role");
+    reset(c).await;
+}
+
+/// The superuser's answer for `agent` (always admitted): the calibration every
+/// refusal is read against.
+async fn superuser_groups(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar("SELECT group_id FROM public.epigraph_live_memberships($1) ORDER BY 1")
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .expect("superuser read")
+}
+
+/// Calibrate a role-derived fixture: the superuser reads all three of the
+/// human's groups, and `role_group` is held through the role ALONE (no
+/// membership row), so a refusal of it is a refusal of the derived arm.
+async fn assert_role_derived(pool: &PgPool, human: Uuid, team: Uuid, role_group: Uuid) {
+    let all = superuser_groups(pool, human).await;
+    assert_eq!(
+        all.len(),
+        3,
+        "CALIBRATION: personal, team, role-derived: {all:?}"
+    );
+    assert!(all.contains(&team), "CALIBRATION: the direct team: {all:?}");
+    assert!(
+        all.contains(&role_group),
+        "CALIBRATION: the role-derived group: {all:?}"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM group_memberships WHERE agent_id = $1 AND group_id = $2",
+    )
+    .bind(human)
+    .bind(role_group)
+    .fetch_one(pool)
+    .await
+    .expect("membership rows");
+    assert_eq!(rows, 0, "CALIBRATION: the role group has no membership row");
+}
+
+/// A writer row for `agent` in a fresh TEAM group.
+async fn direct_team(pool: &PgPool, agent: Uuid, label: &str) -> Uuid {
     let team: Uuid = sqlx::query_scalar(
         "INSERT INTO groups (display_name, did_key, public_key, kind, created_by_agent_id) \
          VALUES ($1, 'did:probe:' || $1, $2, 'team', $3) RETURNING id",
@@ -47,7 +172,7 @@ async fn agent_with_team(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     .execute(pool)
     .await
     .expect("seed team membership");
-    (agent, team)
+    team
 }
 
 /// How many rows `epigraph_live_memberships(agent)` answers on a connection
@@ -77,17 +202,14 @@ async fn count_as(pool: &PgPool, role: &str, principal: &str, agent: Uuid) -> i6
 
 /// The red test of fad5a6c4: an UNSTAMPED application-role session (the
 /// ambient case: no principal at all) asking for another agent's memberships
-/// gets nothing, where the superuser reads both of that agent's rows.
+/// gets nothing, where the superuser reads all three of that agent's rows,
+/// direct AND role-derived.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unstamped_app_session_reads_no_agents_memberships(pool: PgPool) {
-    let (b, _) = agent_with_team(&pool, "unstamped-b").await;
+    let (b, team, role_group) =
+        human_with_team_and_role(&pool, "unstamped-b", "role:probe-unstamped").await;
     fixture::grant_app_privileges(&pool, "epigraph_app").await;
-    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM public.epigraph_live_memberships($1)")
-        .bind(b)
-        .fetch_one(&pool)
-        .await
-        .expect("superuser read");
-    assert_eq!(all, 2, "CALIBRATION: the superuser reads B's two rows");
+    assert_role_derived(&pool, b, team, role_group).await;
     assert_eq!(
         count_as(&pool, "epigraph_app", "", b).await,
         0,
@@ -96,12 +218,16 @@ async fn an_unstamped_app_session_reads_no_agents_memberships(pool: PgPool) {
 }
 
 /// The red test, stamped: an application session stamped as A asking for B
-/// gets nothing, and asking for A (its own principal) gets A's rows.
+/// gets nothing (neither B's direct rows nor its role-derived one), and asking
+/// for A (its own principal) gets A's rows. B stamped as itself gets all three
+/// of its own, the role-derived one included.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_app_session_stamped_as_a_reads_its_own_memberships_not_bs(pool: PgPool) {
     let (a, _) = agent_with_team(&pool, "stamped-a").await;
-    let (b, _) = agent_with_team(&pool, "stamped-b").await;
+    let (b, team, role_group) =
+        human_with_team_and_role(&pool, "stamped-b", "role:probe-stamped").await;
     fixture::grant_app_privileges(&pool, "epigraph_app").await;
+    assert_role_derived(&pool, b, team, role_group).await;
     assert_eq!(
         count_as(&pool, "epigraph_app", &a.to_string(), b).await,
         0,
@@ -111,6 +237,11 @@ async fn an_app_session_stamped_as_a_reads_its_own_memberships_not_bs(pool: PgPo
         count_as(&pool, "epigraph_app", &a.to_string(), a).await,
         2,
         "POSITIVE CONTROL: a session stamped as A lists A's own two rows"
+    );
+    assert_eq!(
+        count_as(&pool, "epigraph_app", &b.to_string(), b).await,
+        3,
+        "POSITIVE CONTROL: a session stamped as B lists B's own three rows, role-derived included"
     );
 }
 
@@ -177,6 +308,11 @@ async fn viewer_resolve_stamps_its_principal_for_one_statement_only(pool: PgPool
 /// through the unbound twin, so they answer exactly as before on an unstamped
 /// application session: `epigraph_writable_teams(B)` and
 /// `epigraph_readable_teams(B)` both still name B's team (`own`).
+///
+/// KNOWN RESIDUAL, pinned on purpose: these two lists still answer B's teams
+/// (role-derived ones included) to any application session. Binding them is
+/// a separate change, which must flip this test (and `epigraph_writable_teams`
+/// then needs an arm for an agent the principal operates).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_team_definers_still_answer_on_an_unstamped_app_session(pool: PgPool) {
     let (b, team) = agent_with_team(&pool, "teams-b").await;
