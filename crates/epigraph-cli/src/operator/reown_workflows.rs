@@ -46,8 +46,12 @@
 //!   generation's runs (and a flat workflow claim's) when the narrowing writes
 //!   the parent, every batch accounts for and checks those re-stamps
 //!   (`tables::RunsFollow`), and the dry run counts them
-//!   (`BEHAVIORAL-EXECUTIONS`). On a database before 240 they carry no
-//!   tenancy, and the dry run says they stay readable.
+//!   (`BEHAVIORAL-EXECUTIONS`). A run follows its workflow only, so a run of
+//!   a plan this act does not narrow that names a narrowed step keeps its own
+//!   plan's tenancy: the dry run names those (`BEHAVIORAL-EXECUTIONS-OTHER-
+//!   PLANS`) and the audit row counts them as `behavioral_executions_unhidden`.
+//!   On a database before 240 no run carries tenancy, and the dry run says
+//!   they stay readable.
 //!
 //! # A private move (`--from-visibility group`)
 //!
@@ -2654,8 +2658,9 @@ async fn runs_follow_their_plan(conn: &mut PgConnection) -> anyhow::Result<bool>
 /// Since migration 240 such a run carries its workflow's tenancy and narrows
 /// with it (each batch checks the follow, `tables::RunsFollow`). A run of
 /// ANOTHER plan that names a narrowed step is that other plan's, and keeps
-/// its plan's tenancy, so it is not counted. Before 240 nothing hides a run,
-/// and the count also takes the runs recorded against a narrowed step.
+/// its plan's tenancy, so it is not counted here: [`other_plan_runs`] counts
+/// it as left readable. Before 240 nothing hides a run, and the count also
+/// takes the runs recorded against a narrowed step.
 async fn behavioral_rows(
     conn: &mut PgConnection,
     comps: &[&Component],
@@ -2686,6 +2691,30 @@ async fn behavioral_rows(
         .fetch_one(&mut *conn)
         .await
         .context("counting behavioral_executions")
+}
+
+/// Since migration 240: `behavioral_executions` rows of a plan OUTSIDE `comps`
+/// that name one of their narrowed claims as `step_claim_id`. A run follows
+/// its workflow only, so such a run keeps the other plan's tenancy, and its
+/// step id, tool pattern and deviation reasons stay readable wherever that
+/// plan is. Computed once over every component, never per component: a run of
+/// another NARROWED plan follows that plan and is not left readable.
+async fn other_plan_runs(conn: &mut PgConnection, comps: &[&Component]) -> anyhow::Result<i64> {
+    let claims: Vec<Uuid> = comps.iter().flat_map(|c| c.narrowed_claim_ids()).collect();
+    let ids: Vec<Uuid> = comps
+        .iter()
+        .flat_map(|c| c.all_workflow_ids())
+        .chain(claims.iter().copied())
+        .collect();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM behavioral_executions \
+          WHERE step_claim_id = ANY($2) AND NOT (workflow_id = ANY($1))",
+    )
+    .bind(&ids)
+    .bind(&claims)
+    .fetch_one(&mut *conn)
+    .await
+    .context("counting behavioral_executions of other plans naming a narrowed step")
 }
 
 async fn atlas_epoch(conn: &mut PgConnection) -> anyhow::Result<Option<i64>> {
@@ -3596,6 +3625,10 @@ pub struct RunReport {
     /// Whether those rows follow their plan's tenancy (migration 240); before
     /// 240 they carry none and stay readable.
     pub behavioral_follow: bool,
+    /// Since migration 240: rows of plans this run does not narrow that name a
+    /// narrowed step ([`other_plan_runs`]). They keep their own plan's
+    /// tenancy, so they are reported as left readable.
+    pub behavioral_other_plans: i64,
 }
 
 /// The process exit code of a run: 2 when a batch was rolled back; 3 when an
@@ -3840,6 +3873,17 @@ pub async fn run(
                  claim, and every batch checks that they did",
                 report.behavioral_rows
             )?;
+            report.behavioral_other_plans = other_plan_runs(conn, &all).await?;
+            if report.behavioral_other_plans > 0 {
+                writeln!(
+                    out,
+                    "BEHAVIORAL-EXECUTIONS-OTHER-PLANS\t{}\trow(s) recording runs of OTHER plans \
+                     that name a narrowed step (step id, tool pattern, deviation reasons) stay \
+                     readable: a run follows its own workflow only (migration 240), so they keep \
+                     their plan's tenancy",
+                    report.behavioral_other_plans
+                )?;
+            }
         } else {
             writeln!(
                 out,
@@ -3986,7 +4030,7 @@ pub async fn run(
         "from_visibility": act.from_state().visibility,
         "catch_up": act.catch_up,
         "behavioral_executions_unhidden": if report.behavioral_follow {
-            0
+            report.behavioral_other_plans
         } else {
             report.behavioral_rows
         },
@@ -4148,8 +4192,17 @@ pub async fn run(
                 "all held in every batch: the rows this run narrowed became unreadable to an \
                  unstamped session, the atlas epoch bumped once per batch that narrowed a \
                  public row, and the {} behavioral_executions row(s) about these plans followed \
-                 their workflow's tenancy",
-                report.behavioral_rows
+                 their workflow's tenancy{}",
+                report.behavioral_rows,
+                if report.behavioral_other_plans > 0 {
+                    format!(
+                        ". NOT covered: {} behavioral_executions row(s) of other plans naming a \
+                         narrowed step, which keep their own plan's tenancy and stay readable",
+                        report.behavioral_other_plans
+                    )
+                } else {
+                    String::new()
+                }
             )
         } else if act.narrows() {
             format!(

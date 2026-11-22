@@ -1964,6 +1964,68 @@ async fn a_recorded_run_the_follow_trigger_missed_rolls_the_batch_back(pool: PgP
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A run follows its WORKFLOW only (migration 240), so a run of a plan this
+/// act does not narrow keeps that plan's tenancy even when it names a step the
+/// act narrows: its `step_claim_id`, `tool_pattern` and deviation reasons stay
+/// readable. The audit must say so: the dry run names those runs, the audit
+/// row counts them as `behavioral_executions_unhidden`, and only the
+/// narrowed plan's own run counts as followed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_run_of_another_plan_naming_a_narrowed_step_is_reported_unhidden(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let own = recorded_run(&pool, fx.w_a0, fx.s2, "PRIVATE GOAL of alpha").await;
+    // gamma is public, another team's, and not listed: it is not narrowed.
+    let other = recorded_run(&pool, fx.w_g, fx.s2, "gamma run naming alpha's step").await;
+
+    let dir = scratch_dir();
+    let manifest = dir.join("m.jsonl");
+    let dry = reown_run(&pool, &fx, &dir, &manifest, fx.src, None, GROUP).await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        line_with(
+            &dry.stdout,
+            "BEHAVIORAL-EXECUTIONS-TOTAL\t1",
+            &["follow their workflow"]
+        ),
+        "only alpha's own run follows the narrowing: {}",
+        dry.show()
+    );
+    assert!(
+        line_with(
+            &dry.stdout,
+            "BEHAVIORAL-EXECUTIONS-OTHER-PLANS\t1",
+            &["stay readable"]
+        ),
+        "the other plan's run naming a narrowed step must be reported: {}",
+        dry.show()
+    );
+
+    let r = reown_run(&pool, &fx, &dir, &manifest, fx.src, Some("3"), GROUP).await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let (unhidden, followed): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT details->>'behavioral_executions_unhidden', \
+                details->>'behavioral_executions_followed' \
+           FROM security_events WHERE event_type = $1",
+    )
+    .bind("operator.workflows_reowned")
+    .fetch_one(&pool)
+    .await
+    .expect("the apply's audit row");
+    assert_eq!(
+        (unhidden.as_deref(), followed.as_deref()),
+        (Some("1"), Some("1")),
+        "the audit must count the other plan's run as unhidden: {}",
+        r.show()
+    );
+    assert_eq!(
+        app_reads_runs(&pool, &[own, other]).await,
+        vec!["gamma run naming alpha's step".to_string()],
+        "PREMISE (the residual as designed): the narrowed plan's run is hidden, the other \
+         plan's run keeps its public plan's tenancy"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A move that narrows must not make the target the OWNER of a row another
 /// group keeps private: S6's edge to the SOURCE's private note would be
 /// re-met to ('group', target, co-owner source). The whole lineage stays and
