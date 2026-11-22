@@ -1289,7 +1289,20 @@ pub async fn submit_evidence(
         } else {
             epigraph_ds::FocalElement::positive(subset)
         };
-        masses.insert(fe, value);
+        // Two keys naming one focal element ("0,1" and "1,0", "0" and " 0")
+        // are refused, as MCP `submit_ds_evidence` refuses them: the later
+        // one silently replaced the earlier, so a body whose masses did not
+        // sum to 1 could pass `MassFunction::new` and store a BBA other than
+        // the one sent (backlog 2b992740).
+        if masses.insert(fe, value).is_some() {
+            return Err(ApiError::ValidationError {
+                field: "masses".to_string(),
+                reason: format!(
+                    "key '{key}' names the same focal element as an earlier key; give each \
+                     focal element once"
+                ),
+            });
+        }
     }
 
     let raw_mass =

@@ -379,3 +379,85 @@ async fn an_unchanged_resubmission_leaves_bayesian_posterior_where_it_was(
          update"
     );
 }
+
+/// POST the evidence and return the status and the raw body, whatever it is.
+async fn post_raw(w: &World, token: &str, body: Value) -> (u16, String) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{}/api/v1/frames/{}/evidence",
+            w.addr, w.frame
+        ))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = resp.status().as_u16();
+    (status, resp.text().await.expect("body"))
+}
+
+/// Backlog 2b992740: two `masses` keys that name the same focal element
+/// (`"0,1"` and `"1,0"`, `"0"` and `" 0"`, `"0"` and `"0,0"`) are refused with
+/// a 400 naming `masses`, and nothing is stored, as MCP `submit_ds_evidence`
+/// refuses them. At origin/main the route's inline parser let the later key
+/// silently replace the earlier one, so each body below (whose raw masses sum
+/// to 1.5) collapsed to a valid BBA summing to 1 and was stored as a 201: a
+/// BBA different from the one sent.
+#[sqlx::test(migrations = "../../migrations")]
+async fn colliding_mass_keys_are_refused_and_nothing_is_stored(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let seed = pool_opts
+        .clone()
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seed pool");
+    let (a, group_a) = fixture::seed_agent_with_group(&seed, "2b992740-a").await;
+    let w = world(pool_opts, conn_opts, a, group_a).await;
+    let token_a = common::mint_token_with_agent(&["claims:write"], a);
+
+    for masses in [
+        serde_json::json!({"0": 0.5, "0,1": 0.5, "1,0": 0.5}),
+        serde_json::json!({"1": 0.5, "0": 0.5, " 0": 0.5}),
+        serde_json::json!({"1": 0.5, "0": 0.5, "0,0": 0.5}),
+    ] {
+        let (status, text) = post_raw(
+            &w,
+            &token_a,
+            serde_json::json!({"claim_id": w.claim, "reliability": 1.0, "masses": masses}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "colliding keys {masses} must be refused, got {status}: {text}"
+        );
+        assert!(
+            text.contains("masses") && text.contains("same focal element"),
+            "the refusal names the field and the collision: {text}"
+        );
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count BBAs");
+    assert_eq!(stored, 0, "a refused request stores no BBA");
+    let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM claim_frames WHERE claim_id = $1")
+        .bind(w.claim)
+        .fetch_one(&w.pool)
+        .await
+        .expect("count frame links");
+    assert_eq!(linked, 0, "a refused request links no frame");
+
+    // CALIBRATION: the same focal elements given once each are accepted, so
+    // the refusals above are about the collision and nothing else.
+    let ok = post(
+        &w,
+        &token_a,
+        serde_json::json!({"claim_id": w.claim, "reliability": 1.0,
+                           "masses": {"0": 0.5, "1,0": 0.5}}),
+    )
+    .await;
+    assert_eq!(ok["write_outcome"], "inserted", "{ok}");
+}
