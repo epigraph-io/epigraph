@@ -45,7 +45,12 @@
 //! (`ClaimRepository::mirror_refolded_cache_into_truth_conn`, which states
 //! the claims it leaves alone). A copy is not told apart from an authored
 //! value: an authored confidence (`memorize`) is replaced by the admissible
-//! fold, which still contains the author's own seed BBA.
+//! fold, which still contains the author's own seed BBA. Workflow, step and
+//! procedural claims are written too: `report_workflow_outcome` persists the
+//! same fold copy, and an outcome track kept without a BBA (the REST outcome
+//! route) is derived from reports the new audience may not read. Only a
+//! value at the deprecation marker (0.05) is kept, current or not: it is a
+//! retirement or a step's soft delete, not a fold, and carries no input.
 //!
 //! # Scoped beliefs
 //!
@@ -83,10 +88,11 @@
 //!   claim's next ordinary recompute hands the cache to that other frame
 //!   (the admissible-first owner rule, backlog 8d720490 (1)).
 //! * `claims.truth_value` follows the refold only where the cache was
-//!   written (below). A claim the refold leaves unchanged (the first item)
-//!   keeps its `truth_value`, and so does a workflow, step or procedural
-//!   claim, whose `truth_value` tracks execution outcomes, and a retired claim
-//!   at the deprecation marker.
+//!   written. A claim the refold leaves unchanged (the first item: a
+//!   template-only claim, a non-procedural compound) keeps its `truth_value`,
+//!   which can still carry an input the new audience cannot read (a value a
+//!   propagation wrote); there is no admissible fold to replace it with here.
+//!   A claim at the deprecation marker keeps it (see "`truth_value`").
 //! * Claims moved by 206 before this ran keep the value folded then.
 //! * A `community` scoped row is not written afresh: its fold reads the
 //!   community's members and mass override on the raw pool. It stays absent

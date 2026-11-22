@@ -753,16 +753,22 @@ impl ClaimRepository {
     /// the new audience may not read (evidence pinned behind, a private edge
     /// source); a copy that a later recompute left stale carries it as well.
     /// The refolded cache is admissible by construction, so it is the value
-    /// served from now on. Not written:
+    /// served from now on. That holds for workflow, step and procedural claims
+    /// too: `report_workflow_outcome` persists the same fold copy, and a
+    /// workflow's outcome track (the REST outcome route's Bayesian update) is
+    /// itself derived from outcome reports the new audience may not read, so
+    /// they are written like any other claim. Not written:
     /// * a claim with no cache (`pignistic_prob IS NULL`);
-    /// * a retired claim at the deprecation marker (`is_current = false` and
-    ///   `truth_value` 0.05): the marker is a state, not a fold;
-    /// * a workflow or step claim (a `workflows` row, a step lineage, an
-    ///   `executes` in-edge or the `workflow` label) or a procedural one
-    ///   ([`crate::repos::claim_role::is_procedural_sql`]): its `truth_value`
-    ///   tracks execution outcomes;
+    /// * a claim at the deprecation marker (`truth_value` 0.05, whether or not
+    ///   it is current): the marker is a state set by a retirement
+    ///   (`deprecate_claim`, `deprecate_workflow`) or a step's soft delete
+    ///   (`delete_step`, which leaves the step current), not a fold, so it
+    ///   carries no input, and writing over it would revive what was retired;
     /// * a claim whose `truth_value` already equals the new value;
     /// * a claim whose owner group `viewer` does not write (the write gate).
+    ///
+    /// The guards read only the claim's own row, so what the session can see
+    /// of the claim's edges or workflow rows cannot change what is written.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the write fails.
@@ -771,9 +777,8 @@ impl ClaimRepository {
         viewer: &Viewer,
         claim_id: Uuid,
     ) -> Result<bool, DbError> {
-        let sql = viewer
-            .splice_write(
-                "WITH n AS ( \
+        let sql = viewer.splice_write(
+            "WITH n AS ( \
                      SELECT c.id, \
                             CASE WHEN c.pignistic_prob = 'NaN'::float8 THEN 0.5::float8 \
                                  ELSE LEAST(GREATEST(c.pignistic_prob, 0.0::float8), 1.0::float8) \
@@ -781,25 +786,14 @@ impl ClaimRepository {
                        FROM claims c \
                       WHERE c.id = $1 \
                         AND c.pignistic_prob IS NOT NULL \
-                        AND NOT (NOT c.is_current AND abs(c.truth_value - 0.05) <= 1e-9) \
-                        AND NOT EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
-                        AND c.step_lineage_id IS NULL \
-                        AND NOT EXISTS (SELECT 1 FROM edges e \
-                                         WHERE e.target_id = c.id \
-                                           AND e.relationship = 'executes') \
-                        AND NOT COALESCE('workflow' = ANY (c.labels), false) \
-                        AND NOT __PROCEDURAL__) \
+                        AND abs(c.truth_value - 0.05) > 1e-9) \
                  UPDATE claims AS u SET truth_value = n.tv, updated_at = NOW() \
                    FROM n \
                   WHERE u.id = n.id AND u.truth_value IS DISTINCT FROM n.tv \
                   /* {WRITABLE:u} */ \
                  RETURNING u.id",
-                2,
-            )
-            .replace(
-                "__PROCEDURAL__",
-                &crate::repos::claim_role::is_procedural_sql("c"),
-            );
+            2,
+        );
         let mut q = sqlx::query_scalar::<_, Uuid>(&sql).bind(claim_id);
         // Conditional: a `Bypass` viewer renders no `$2`.
         if let Some(w) = viewer.writable_bind() {

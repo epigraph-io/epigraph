@@ -39,7 +39,10 @@
 //! * backlog 0d9dfd24: `claims.truth_value`, which `update_with_evidence`
 //!   persisted as a copy of a fold that took in a BBA on evidence that stays
 //!   behind (pinned), is replaced by the refolded value: the new audience is
-//!   served the truth value of a control claim that never had that BBA.
+//!   served the truth value of a control claim that never had that BBA. The
+//!   same holds for a flat workflow claim whose copy `report_workflow_outcome`
+//!   wrote, and for a vacated cache (`truth_value` 0.5). A current claim at
+//!   the deprecation marker (a step's soft delete) keeps 0.05.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -57,8 +60,10 @@ use epigraph_engine::edge_factor::{
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::claims::{submit_claim, update_with_evidence};
 use epigraph_mcp::tools::visibility::{publicize_claims, share_claims_with_team};
+use epigraph_mcp::tools::workflows::report_workflow_outcome;
 use epigraph_mcp::types::{
-    PublicizeClaimsParams, ShareClaimsWithTeamParams, SubmitClaimParams, UpdateWithEvidenceParams,
+    PublicizeClaimsParams, ReportWorkflowOutcomeParams, ShareClaimsWithTeamParams, StepExecution,
+    SubmitClaimParams, UpdateWithEvidenceParams,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -906,6 +911,13 @@ async fn publicize_vacates_a_cache_whose_owner_frame_cites_only_evidence_left_be
         cache_frame(&pool, c).await == Some(binary) && stale.0.is_some_and(|p| p > 0.6),
         "PREMISE: binary_truth owns the team's fold of the pinned evidence ({stale:?})"
     );
+    // `truth_value` as the mirroring writers leave it: a copy of that fold.
+    copy_cache_into_truth(&pool, c).await;
+    let stale_truth = truth(&pool, c).await.0;
+    assert!(
+        (stale_truth - 0.5).abs() > 0.1,
+        "PREMISE: the copy carries the pinned evidence ({stale_truth})"
+    );
 
     publicize(&pool, &s, eve, &[c]).await.expect("publicized");
 
@@ -922,6 +934,12 @@ async fn publicize_vacates_a_cache_whose_owner_frame_cites_only_evidence_left_be
          input it may read; it was served {served:?}, the team's fold was {stale:?}"
     );
     assert_eq!(cache_frame(&pool, c).await, Some(binary), "owner unchanged");
+    let (served_tv, _) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served_tv - 0.5).abs() < 1e-9,
+        "the vacated cache's value (0.5) must replace the team's copy {stale_truth} in \
+         truth_value; a stranger was served {served_tv}"
+    );
 }
 
 /// Share: the private claim's `binary_truth` holds only an edge-factor BBA
@@ -1159,6 +1177,155 @@ async fn publicize_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_be
     assert!(
         betp.is_some_and(|p| (p - served).abs() < 1e-12),
         "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Set `truth_value` to the claim's cached BetP, as the mirroring writers
+/// (`submit_claim`, `update_with_evidence`) persist it.
+async fn copy_cache_into_truth(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET truth_value = LEAST(GREATEST(pignistic_prob, 0.0), 1.0) \
+          WHERE id = $1 AND pignistic_prob IS NOT NULL",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("copy the cache into truth_value");
+}
+
+/// Make `claim` a legacy flat workflow claim (the `workflow` label, which
+/// `report_workflow_outcome`'s flat path and `find_workflow` key on).
+async fn label_workflow(pool: &PgPool, claim: Uuid) {
+    sqlx::query("UPDATE claims SET labels = array_append(labels, 'workflow') WHERE id = $1")
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("label the workflow claim");
+}
+
+/// Publicize a flat workflow claim: `report_workflow_outcome` persisted its
+/// `truth_value` as a copy of a fold that took in a failed run's outcome BBA,
+/// whose evidence stays in the team (pinned). After the act a stranger is
+/// served the value of a public control workflow that never had that report,
+/// not the team's copy, which `find_workflow` would filter and rank on.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_replaces_a_workflow_truth_value_copied_from_an_outcome_left_behind(
+    pool: PgPool,
+) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "wf-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "wf-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(
+        &pool,
+        &s,
+        eve,
+        "a team workflow: run the check",
+        "team",
+        Some(t),
+    )
+    .await;
+    let control = write(&pool, &s, eve, "the same workflow, public", "public", None).await;
+    label_workflow(&pool, c).await;
+    label_workflow(&pool, control).await;
+    let seed = evidence_of(&pool, c).await;
+    report_workflow_outcome(
+        &s.server,
+        &viewer(&pool, eve).await,
+        ReportWorkflowOutcomeParams {
+            workflow_id: c.to_string(),
+            success: false,
+            execution_log: vec![StepExecution {
+                step_index: 0,
+                planned: "run the check".to_string(),
+                actual: "the check failed".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            }],
+            outcome_details: "a team-internal failure".to_string(),
+            quality: Some(0.95),
+            goal_text: None,
+            idempotency_key: None,
+        },
+        Some(&token(eve)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("report_workflow_outcome on {c}: {e:?}"));
+    let outcome: Uuid =
+        sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1 AND id <> $2")
+            .bind(c)
+            .bind(seed)
+            .fetch_one(&pool)
+            .await
+            .expect("the outcome's evidence row");
+    pin(&pool, outcome, eve).await;
+    refold(&pool, &s, eve, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", outcome).await,
+        group(t),
+        "pinned"
+    );
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "a stranger is served the workflow's truth_value {served}, which must be the public \
+         value {expected} (the control's), not the team's copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Publicize a claim at the deprecation marker that is still current, as
+/// `delete_step` leaves a soft-deleted step: its cache is refolded, but its
+/// `truth_value` stays 0.05, so the act does not revive it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_keeps_a_current_claim_at_the_deprecation_marker(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "marker-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "marker-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "a soft-deleted team step", "team", Some(t)).await;
+    let hidden = refute_through_mcp(&pool, &s, eve, c).await;
+    pin(&pool, hidden, eve).await;
+    let stale = cache(&pool, c).await;
+    // `delete_step`'s write: the marker, and the claim stays current.
+    sqlx::query("UPDATE claims SET truth_value = 0.05 WHERE id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("soft delete");
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        betp.is_some_and(|p| stale.0.is_some_and(|q| (p - q).abs() > 0.05)),
+        "PREMISE: the act refolded the cache ({:?} -> {betp:?})",
+        stale.0
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(c)
+        .fetch_one(&pool)
+        .await
+        .expect("is_current");
+    assert!(current, "PREMISE: the soft-deleted step is still current");
+    assert!(
+        (served - 0.05).abs() < 1e-9,
+        "the deprecation marker must survive the act; a stranger was served {served}"
     );
 }
 
