@@ -273,3 +273,49 @@ async fn parallel_rows_of_one_fact_are_one_relation(pool: PgPool) {
     );
     assert_eq!(entity_set(&doc), claim_set(&[root, anc]));
 }
+
+/// The walk follows DERIVATION edges only. Disputing neighbours (`refutes`,
+/// `contradicts`) and a successor that `supersedes` the root (written
+/// new -> old, so it is an incoming edge but not an ancestor) are not
+/// ancestors; a `supports` ancestor still is. Under a node cap, the depth-2
+/// derivation ancestor is kept instead of the depth-1 disputers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_walk_follows_derivation_edges_only(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-walkset").await;
+    let root = fixture::seed_public_claim(&pool, agent, "walkset root").await;
+    let a = fixture::seed_public_claim(&pool, agent, "walkset parent").await;
+    let b = fixture::seed_public_claim(&pool, agent, "walkset grandparent").await;
+    let refuter = fixture::seed_public_claim(&pool, agent, "walkset refuter").await;
+    let contra = fixture::seed_public_claim(&pool, agent, "walkset contradicter").await;
+    let successor = fixture::seed_public_claim(&pool, agent, "walkset successor").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, b, a, "derived_from").await;
+    public_edge(&pool, refuter, root, "refutes").await;
+    public_edge(&pool, contra, root, "contradicts").await;
+    public_edge(&pool, successor, root, "supersedes").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let whole = export_as(&pool, &viewer, root, 5, None).await;
+    assert_eq!(
+        entity_set(&whole),
+        claim_set(&[root, a, b]),
+        "only derivation ancestors are in the export: {whole}"
+    );
+
+    let capped = export_as(&pool, &viewer, root, 5, Some(3)).await;
+    assert_eq!(
+        entity_set(&capped),
+        claim_set(&[root, a, b]),
+        "a capped export keeps the derivation ancestors, not disputing neighbours: {capped}"
+    );
+    assert_eq!(capped["truncated"], false, "nothing derivational was cut");
+
+    // A `supports` ancestor is still lineage (as in `get_lineage`).
+    let support = fixture::seed_public_claim(&pool, agent, "walkset support").await;
+    public_edge(&pool, support, root, "supports").await;
+    let with_support = export_as(&pool, &viewer, root, 5, None).await;
+    assert!(
+        entity_set(&with_support).contains(&format!("claim:{support}")),
+        "a supports ancestor is still walked: {with_support}"
+    );
+}

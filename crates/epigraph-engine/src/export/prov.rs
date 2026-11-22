@@ -132,12 +132,18 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 ///
 /// # What the walk follows
 ///
-/// [`epigraph_db::LineageRepository::get_ancestor_ids`] walks EVERY incoming
-/// claim-to-claim edge, of any relationship, not only the `derived_from`
-/// family. A claim that `refutes` or `contradicts` an ancestor is therefore
-/// in the export as a `prov:Entity` (with its attribution), but its edge has
-/// no PROV-O predicate ([`relationship_to_prov_predicate`]) and is omitted, so
-/// such an entity carries no `prov:Relation` to the rest of the document.
+/// [`epigraph_db::LineageRepository::get_ancestor_ids`] walks incoming
+/// claim-to-claim edges whose relationship is in
+/// [`epigraph_db::ANCESTOR_ID_RELATIONSHIPS`]: the `derived_from` family this
+/// module maps, plus the lineage relationships `get_provenance` walks
+/// (`supports`, `elaborates`, `decomposes_to`). A claim that only `refutes` or
+/// `contradicts` an ancestor, or that `supersedes` one (a successor, not an
+/// ancestor), is not walked, so it never takes a `max_nodes` slot from a
+/// derivation ancestor (backlog 19d325d5). A `supports` / `elaborates` /
+/// `decomposes_to` ancestor is in the export as a `prov:Entity` (with its
+/// attribution), but its edge has no PROV-O predicate
+/// ([`relationship_to_prov_predicate`]) and is omitted, so such an entity
+/// carries no `prov:Relation` to the rest of the document.
 ///
 /// # One relation per fact
 ///
@@ -418,6 +424,33 @@ mod tests {
         assert_eq!((kept.as_str(), none), ("abc", None));
         let (kept, none) = clip_content("abcdef".to_string(), None);
         assert_eq!((kept.as_str(), none), ("abcdef", None));
+    }
+
+    /// Every claim-to-claim derivation relationship this module maps (all but
+    /// `supersedes`, which the export expands by its own outgoing hop, and the
+    /// claim-to-agent attribution names) is one the ancestor walk follows, so
+    /// a mapped derivation ancestor is never silently out of the walk.
+    #[test]
+    fn the_ancestor_walk_follows_every_mapped_derivation_relationship() {
+        for r in ["derived_from", "derives_from", "generated", "uses_evidence"] {
+            assert!(relationship_to_prov_predicate(r).is_some(), "{r} is mapped");
+            assert!(
+                epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r),
+                "{r} is walked"
+            );
+        }
+        for r in [
+            "refutes",
+            "contradicts",
+            "supersedes",
+            "CORROBORATES",
+            "corroborates",
+        ] {
+            assert!(
+                !epigraph_db::ANCESTOR_ID_RELATIONSHIPS.contains(&r),
+                "{r} is not ancestry"
+            );
+        }
     }
 
     #[test]
