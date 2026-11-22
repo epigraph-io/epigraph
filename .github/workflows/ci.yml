@@ -479,6 +479,14 @@ jobs:
           cargo test -p epigraph-api --features integration --locked --no-fail-fast
           --test lineage_integration_tests --test semantic_search_tests
           -- --test-threads=1
+      - name: epigraph-api `tls` boot tests
+        # tests/boot_tls_served.rs boots the server's TLS serve path (rate
+        # limiter keyed on the peer, SIGTERM drain and its grace bound). It
+        # needs the `tls` feature AND a migrated database; `lint-features`,
+        # which runs the other `tls` tests, has no database (backlog a65cc870).
+        run: >-
+          cargo test -p epigraph-api --features tls --locked --no-fail-fast
+          --test boot_tls_served
       - name: epigraph-jobs `integration` feature tests
         # The integration-gated arms of postgres_queue_tests and the whole of
         # cluster_graph_neighborhoods_test. cluster_graph_test's gated arm is
