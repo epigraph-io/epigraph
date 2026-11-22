@@ -74,9 +74,9 @@ fn hnsw_ef_search_for_pool(candidate_pool: i64) -> i64 {
 }
 
 /// `hnsw.ef_search` for an unpinned [`ClaimRepository::semantic_search_flat`]
-/// page of `limit` rows. It takes no offset ON PURPOSE: every page of a cursor
-/// walk must run the same approximate scan, or `OFFSET` over a different scan
-/// can skip or repeat a row (see that fn's "Paging" section).
+/// page of `limit` rows. It takes no offset or keyset position ON PURPOSE:
+/// every page of a walk should run the same approximate scan (see that fn's
+/// "Paging" section).
 fn flat_ef_search(limit: i64) -> i64 {
     limit.clamp(40, 1000)
 }
@@ -457,6 +457,39 @@ pub struct SemanticFlatHit {
     /// `Option` to match the `SemanticSearchResult` DTO, which has always
     /// modelled this as nullable.
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The raw cosine distance the page is ordered by. Carried so a keyset
+    /// cursor can name the last row exactly: `1 - similarity` does not
+    /// round-trip to it in floating point.
+    pub distance: f64,
+}
+
+/// Where a [`ClaimRepository::semantic_search_flat_page`] page starts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlatPage {
+    /// Skip this many rows of the ranking (0 is the first page). Positional:
+    /// a row inserted or retired before the boundary between two pages moves
+    /// every later row by one, so a walk can skip or repeat a row. Exact
+    /// (pinned) rankings and one-shot reads use it.
+    Offset(i64),
+    /// Keyset paging over the ranking's total order `(distance, claim_id)`:
+    /// `None` is the first page of a walk, `Some((distance, claim_id))` the
+    /// rows strictly after the last row of the previous page. A boundary does
+    /// not drift with inserts or deletes between pages. Unpinned, the page is
+    /// also cut before a tie group the scan may have truncated (see that fn's
+    /// "Keyset paging").
+    Keyset(Option<(f64, Uuid)>),
+}
+
+/// One page of [`ClaimRepository::semantic_search_flat_page`].
+#[derive(Debug, Clone)]
+pub struct SemanticFlatPage {
+    pub hits: Vec<SemanticFlatHit>,
+    /// Whether the ranking has a row after `hits` that clears
+    /// `min_similarity` (the statement reads one row past the page to know).
+    /// Under keyset paging the page can be shorter than `limit` while this is
+    /// `true` (a tie group was held back), so callers decide on this, not on
+    /// the page's length.
+    pub more: bool,
 }
 
 /// One row of [`ClaimRepository::semantic_search_flat`]'s statement: the hit,
@@ -481,6 +514,55 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for FlatRow {
             hit: SemanticFlatHit::from_row(row)?,
             meets_min_similarity: row.try_get("meets_min_similarity")?,
         })
+    }
+}
+
+/// Cut [`ClaimRepository::semantic_search_flat_page`]'s rows (in
+/// `(distance, id)` order, at most `limit + 1` of them: the statement reads one
+/// row past the page) to the page and decide [`SemanticFlatPage::more`].
+///
+/// - With `hold_back_ties` (an unpinned keyset walk): when the row past the
+///   page has the same distance as the page's last row, the scan's `LIMIT` may
+///   have cut that tie group arbitrarily (the HNSW scan orders by distance
+///   alone), and the next page's `(distance, id) >` key would then skip a
+///   tied row with a smaller id that this read never fetched. So the whole
+///   tie group is held back for the next page, unless it is the entire page
+///   (a tie group longer than `limit`; residual).
+/// - `min_similarity`: rows come in ascending distance, so the rows that miss
+///   it are a suffix; the page stops there and nothing follows it.
+fn finish_flat_page(
+    mut rows: Vec<FlatRow>,
+    limit: usize,
+    hold_back_ties: bool,
+) -> SemanticFlatPage {
+    let next = if rows.len() > limit {
+        rows.truncate(limit + 1);
+        rows.pop()
+    } else {
+        None
+    };
+    if hold_back_ties {
+        if let (Some(n), Some(last)) = (&next, rows.last()) {
+            let boundary = last.hit.distance;
+            if n.hit.distance == boundary {
+                let first_tied = rows
+                    .iter()
+                    .position(|r| r.hit.distance == boundary)
+                    .unwrap_or(0);
+                if first_tied > 0 {
+                    rows.truncate(first_tied);
+                }
+            }
+        }
+    }
+    let below = rows.iter().position(|r| !r.meets_min_similarity);
+    if let Some(cut) = below {
+        rows.truncate(cut);
+    }
+    let more = below.is_none() && next.is_some_and(|n| n.meets_min_similarity);
+    SemanticFlatPage {
+        hits: rows.into_iter().map(|r| r.hit).collect(),
+        more,
     }
 }
 
@@ -3013,7 +3095,7 @@ impl ClaimRepository {
     /// `is_local`:
     ///
     ///  - `hnsw.iterative_scan = strict_order`: keep scanning past `ef_search`
-    ///    until `LIMIT $7 + $9` matching rows are found, in exact distance
+    ///    until `LIMIT $7 + $9 + 1` matching rows are found, in exact distance
     ///    order.
     ///  - `hnsw.ef_search = clamp(limit, 40, 1000)`: the first batch already
     ///    covers an unscoped first page. It deliberately does NOT depend on
@@ -3030,7 +3112,7 @@ impl ClaimRepository {
     /// 20,000), so a scope rarer than about `limit / 20,000` of the embedded
     /// claims, or a viewer with more hidden rows than that nearer the query
     /// than its own, got fewer than `limit` rows (backlog 28b79b1e). An
-    /// unpinned first pass whose scan yields fewer than `LIMIT $7 + $9` rows
+    /// unpinned first pass whose scan yields fewer than `LIMIT $7 + $9 + 1` rows
     /// therefore runs once more as an exact scan, under a timeout that falls
     /// back to the first pass (`vector_scan` module doc). `min_similarity` is
     /// applied AFTER the scan's `LIMIT`, not inside it: rows come in distance
@@ -3079,22 +3161,40 @@ impl ClaimRepository {
     /// # Paging
     ///
     /// `offset` skips that many rows of the ranking (0 is the first page). The
-    /// order is total, `(distance, id)`, on both statement shapes. Unpinned, a
-    /// tie group that straddles the inner `LIMIT $7 + $9` cut stays arbitrary,
-    /// the same residual the hybrid recall leg records.
+    /// order is total, `(distance, id)`, on both statement shapes. Offset
+    /// paging is positional, so it is stable only over a stable ranking: a
+    /// row inserted or retired before a page boundary between two calls moves
+    /// every later row across it. Unpinned, it also reads one approximate
+    /// scan only while `hnsw.ef_search` stays the same from page to page,
+    /// which is why `ef_search` is derived from `limit` alone. Cursor walks
+    /// over the unpinned ranking therefore use keyset paging instead
+    /// ([`Self::semantic_search_flat_page`] with [`FlatPage::Keyset`]).
     ///
-    /// Unpinned pages are prefixes of ONE approximate scan only while
-    /// `hnsw.ef_search` stays the same from page to page: an index access
-    /// method never sees the `LIMIT`, so with a fixed `ef_search` the
-    /// iterative scan emits the same stream and a deeper page just reads
-    /// further along it. A different `ef_search` is a different stream, and
-    /// `OFFSET` over a different stream can skip a row or repeat one. So
-    /// `ef_search` is derived from `limit` alone, never from `offset`, and a
-    /// walk with a constant `limit` reads one stream. Residuals: a caller that
-    /// changes `limit` mid-walk, index writes between pages, a planner that
-    /// switches away from the index at a deeper `LIMIT`, and a query
-    /// re-embedded differently on a later page can each still move a row
-    /// across a page boundary.
+    /// # Keyset paging (backlog 4f1c2aec)
+    ///
+    /// [`FlatPage::Keyset`]`(Some((d, id)))` returns only rows with
+    /// `(distance, id) > (d, id)`, the last row of the previous page. The
+    /// predicate sits inside the scan, above every cut, so the page is the
+    /// rows after the boundary whatever was inserted or retired before it,
+    /// and a row is never returned twice. `distance` is the raw float8
+    /// distance ([`SemanticFlatHit::distance`]), which compares exactly
+    /// between calls with the same query vector.
+    ///
+    /// The unpinned scan orders by distance alone (the only order the HNSW
+    /// index serves), so its `LIMIT` cuts a tie group (identical embeddings,
+    /// e.g. duplicate claims) arbitrarily, and a keyset boundary inside a cut
+    /// tie group would skip its members with smaller ids. The statement reads
+    /// one row past the page; when that row ties with the page's last row,
+    /// the tie group is held back for the next page. Residual: a tie group
+    /// longer than `limit` cannot be held back and is paged arbitrarily.
+    ///
+    /// What keyset paging does not fix: the scan is approximate, so an index
+    /// write between pages, a different `ef_search` (a caller that changes
+    /// `limit` mid-walk) or a planner switch can still change which rows the
+    /// scan finds past the boundary, and a query re-embedded differently on a
+    /// later page ranks by a different vector. The search route binds its
+    /// cursor to the walk's `limit` and query vector and refuses a page that
+    /// does not match (`routes/search.rs`).
     ///
     /// # Exactness of the pinned path
     ///
@@ -3127,6 +3227,47 @@ impl ClaimRepository {
     where
         A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
     {
+        Ok(Self::semantic_search_flat_page(
+            executor,
+            viewer,
+            ranking,
+            min_similarity,
+            claim_type,
+            created_after,
+            created_before,
+            agent_id,
+            limit,
+            theme_id,
+            FlatPage::Offset(offset),
+        )
+        .await?
+        .hits)
+    }
+
+    /// [`Self::semantic_search_flat`] with the page position as a
+    /// [`FlatPage`] (offset or keyset) and the answer to "is there more" in
+    /// [`SemanticFlatPage::more`]. The search route's cursor walks use it.
+    ///
+    /// # Errors
+    /// As [`Self::semantic_search_flat`].
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(executor, viewer, ranking))]
+    pub async fn semantic_search_flat_page<'a, A>(
+        executor: A,
+        viewer: &crate::visibility::Viewer,
+        ranking: FlatRanking<'_>,
+        min_similarity: f64,
+        claim_type: Option<&str>,
+        created_after: Option<chrono::DateTime<chrono::Utc>>,
+        created_before: Option<chrono::DateTime<chrono::Utc>>,
+        agent_id: Option<Uuid>,
+        limit: i64,
+        theme_id: Option<Uuid>,
+        page: FlatPage,
+    ) -> Result<SemanticFlatPage, DbError>
+    where
+        A: sqlx::Acquire<'a, Database = sqlx::Postgres>,
+    {
         // `begin`, not `acquire`: holding an acquired `&mut PgConnection`
         // across the awaits below makes this future fail rustc's `Send` proof
         // ("implementation of `sqlx::Acquire` is not general enough") for the
@@ -3144,7 +3285,7 @@ impl ClaimRepository {
             agent_id,
             limit,
             theme_id,
-            offset,
+            page,
         )
         .await;
         tx.rollback().await?;
@@ -3165,8 +3306,13 @@ impl ClaimRepository {
         agent_id: Option<Uuid>,
         limit: i64,
         theme_id: Option<Uuid>,
-        offset: i64,
-    ) -> Result<Vec<SemanticFlatHit>, DbError> {
+        page: FlatPage,
+    ) -> Result<SemanticFlatPage, DbError> {
+        let (offset, after) = match page {
+            FlatPage::Offset(o) => (o, None),
+            FlatPage::Keyset(k) => (0, k),
+        };
+        let (after_distance, after_id) = (after.map(|k| k.0), after.map(|k| k.1));
         let query_literal: Option<&str> = match (ranking, theme_id) {
             (FlatRanking::Query(v), _) => Some(v),
             (FlatRanking::ThemeCore, Some(_)) => None,
@@ -3196,9 +3342,11 @@ impl ClaimRepository {
                       AND ($5::timestamptz IS NULL OR k.created_at <= $5)
                       AND ($6::uuid IS NULL OR k.agent_id = $6)
                       AND $8::uuid IS NULL
+                      AND ($10::float8 IS NULL
+                           OR ((k.embedding <=> q.vec), k.id) > ($10::float8, $11::uuid))
                       /* {VISIBILITY:k} */
                     ORDER BY k.embedding <=> q.vec
-                    LIMIT $7 + $9
+                    LIMIT $7 + $9 + 1
                 )
                 SELECT
                     c.id AS claim_id,
@@ -3211,11 +3359,12 @@ impl ClaimRepository {
                     c.trace_id,
                     c.labels[1] AS claim_type,
                     c.created_at,
+                    n.dist::float8 AS distance,
                     (1 - n.dist >= $2) AS meets_min_similarity
                 FROM nearest n JOIN claims c ON c.id = n.id
                 WHERE c.embedding IS NOT NULL /* {VISIBILITY:c} */
                 ORDER BY n.dist, n.id
-                LIMIT $7 OFFSET $9
+                LIMIT $7 + 1 OFFSET $9
                 "#
             .to_string(),
             // (P) Pinned: exact, and independent of the planner. See
@@ -3256,8 +3405,9 @@ impl ClaimRepository {
                     page AS (
                         SELECT id, dist FROM members
                         WHERE 1 - dist >= $2
+                          AND ($10::float8 IS NULL OR (dist, id) > ($10::float8, $11::uuid))
                         ORDER BY dist, id
-                        LIMIT $7 OFFSET $9
+                        LIMIT $7 + 1 OFFSET $9
                     )
                     SELECT
                         c.id AS claim_id,
@@ -3270,6 +3420,7 @@ impl ClaimRepository {
                         c.trace_id,
                         c.labels[1] AS claim_type,
                         c.created_at,
+                        n.dist::float8 AS distance,
                         true AS meets_min_similarity
                     FROM page n JOIN claims c ON c.id = n.id
                     WHERE c.embedding IS NOT NULL /* {{VISIBILITY:c}} */
@@ -3280,8 +3431,9 @@ impl ClaimRepository {
         };
         // `{{` in the pinned template emits the single brace `splice` looks
         // for (the interpolated theme-core fragment is not a template and
-        // carries a single brace already). Every marker resolves to `$10`.
-        let sql = viewer.splice(&sql, 10);
+        // carries a single brace already). Every marker resolves to `$12`,
+        // after the keyset binds, which are bound (NULL or not) on every call.
+        let sql = viewer.splice(&sql, 12);
         // A macro, not a closure: a closure returning a query that borrows its
         // captures, held across `.await`, makes the future not `Send`.
         macro_rules! build {
@@ -3295,9 +3447,11 @@ impl ClaimRepository {
                     .bind(agent_id) // $6
                     .bind(limit) // $7
                     .bind(theme_id) // $8
-                    .bind(offset); // $9
+                    .bind(offset) // $9
+                    .bind(after_distance) // $10
+                    .bind(after_id); // $11
                 if let Some(g) = viewer.group_bind() {
-                    q = q.bind(g); // $10
+                    q = q.bind(g); // $12
                 }
                 q
             }};
@@ -3314,8 +3468,9 @@ impl ClaimRepository {
             let rows = fetched?;
             // See "Exact retry" above: the count is the scan's own, taken
             // before `min_similarity` is applied, so a page the threshold
-            // shortened does not trigger it.
-            if (rows.len() as i64) < limit {
+            // shortened does not trigger it. The statement reads one row past
+            // the page, so a full scan returns `limit + 1`.
+            if (rows.len() as i64) <= limit {
                 let mut tx = begin_exact_vector_scan(&mut *conn).await?;
                 let retried = build!().fetch_all(&mut *tx).await;
                 tx.rollback().await?;
@@ -3325,13 +3480,11 @@ impl ClaimRepository {
             }
         };
 
-        // Rows come in ascending distance, so the ones below
-        // `min_similarity` are a suffix.
-        Ok(rows
-            .into_iter()
-            .filter(|r| r.meets_min_similarity)
-            .map(|r| r.hit)
-            .collect())
+        Ok(finish_flat_page(
+            rows,
+            usize::try_from(limit).unwrap_or(0),
+            theme_id.is_none() && matches!(page, FlatPage::Keyset(_)),
+        ))
     }
 
     /// `claims.content` and `claims.properties` for one id, viewer-filtered.
