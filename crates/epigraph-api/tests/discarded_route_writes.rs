@@ -95,11 +95,12 @@ const REGISTER: &[(&str, usize)] = &[
     // transaction (`EvidenceRepository::link_to_claims_signed_conn`), and its
     // error propagates.
     ("conventions.rs", 3),
-    // 2 before `create_reasoning_trace` moved its trace and HAS_TRACE edge
-    // onto the caller-stamped `write_as` transaction (the edge stays
-    // best-effort through a savepoint, a form this register does not see):
-    // lowered because the `let _ =` write is gone.
-    ("crud.rs", 1),
+    // `crud.rs` is gone: 2 before `create_reasoning_trace` moved its trace
+    // and HAS_TRACE edge onto the caller-stamped `write_as` transaction, and
+    // 1 -> 0 when `create_evidence` did the same with its DERIVED_FROM edge
+    // (backlog 73d4f7ff). Both edges stay best-effort through a savepoint, a
+    // form this register does not see: lowered because the `let _ =` write is
+    // gone.
     ("gaps.rs", 1),
     ("perspective.rs", 1),
     ("reasoning.rs", 3),

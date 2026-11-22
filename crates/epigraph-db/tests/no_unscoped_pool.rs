@@ -814,7 +814,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 184 (backlog 73d4f7ff): `create_evidence` runs its author-key read,
+/// the evidence row and its `DERIVED_FROM` edge on the caller's
+/// `AppState::write_as` transaction (`routes/crud.rs` 26 -> 23). Its
+/// provenance append stays on the pool. `learn_convention`'s evidence moved
+/// onto a stamped transaction too, but its `pool` alias still serves the
+/// system-authored claim, so `routes/conventions.rs` keeps its count.
+const HIGH_WATER: usize = 184;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1034,7 +1040,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 27 -> 26 (backlog dae795f8): `promote_staged_edges`'s two arms (one
     // `&state.db_pool` each) became one transaction begun on it. Still the raw
     // pool, so not a conversion.
-    ("routes/crud.rs", 26),
+    // 26 -> 23 (backlog 73d4f7ff): `create_evidence` writes its author-key
+    // read, the evidence and its `DERIVED_FROM` edge on one
+    // `AppState::write_as` transaction; its provenance append stays on the pool.
+    ("routes/crud.rs", 23),
     // 10 before batch W12b (migration 120, D8), which moved `create_edge`,
     // `create_hierarchical_edge`, `patch_edge`, `delete_edge`, `relate_claims`
     // and the two helpers `create_edge` reaches (`is_valid_entity_type`,

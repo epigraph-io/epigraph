@@ -423,6 +423,32 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_optional",
         ],
     ),
+    // The convention claim, its labels, trace and structural edges are the
+    // SYSTEM agent's, written on the raw pool as before (the caller does not
+    // write that agent's group). The evidence and its signed `supports` edge
+    // (backlog 73d4f7ff) are ONE write on a transaction stamped with the
+    // caller's viewer (`state.write_as(&viewer, ..)`, passed as `&mut *tx`), as
+    // in `forget_convention`: migration 114 owns the evidence by the caller's
+    // group and migration 120 the edge. `embed_created_claim` stores the
+    // claim's vector where the claim was written.
+    (
+        "conventions.rs",
+        "learn_convention",
+        &[
+            "AgentRepository::create",
+            "AgentRepository::get_by_public_key",
+            "ClaimRepository::create",
+            "ClaimRepository::default_decl_for_author_pool",
+            "ClaimRepository::update_trace_id",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EdgeRepository::create_signed",
+            "EvidenceRepository::create",
+            "ReasoningTraceRepository::create",
+            "embed_created_claim",
+            "sqlx::query(UPDATE).execute",
+        ],
+    ),
     // `embed_created_claim` (backlog 56d2430b): the best-effort embed of the
     // shared copy this request just created. It cannot take the caller's
     // viewer: the copy is authored by the system agent and owned by that
@@ -467,6 +493,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "assign_claim_to_frame",
         &[
             "FrameRepository::assign_claim",
+            "provenance::record_provenance",
+        ],
+    ),
+    // stamped / write (backlog 73d4f7ff): the claim's viewer-spliced
+    // pre-read, the author-key read (agents are untenanted), the evidence with
+    // its `supports` edge and the best-effort `DERIVED_FROM` edge run on ONE
+    // `AppState::write_as` transaction, so the database decides the
+    // evidence's owner (migration 114) and refuses what the caller may not
+    // attach. Provenance is the audit-trail append.
+    (
+        "crud.rs",
+        "create_evidence",
+        &[
+            "AgentRepository::get_by_id",
+            "EvidenceRepository::create",
+            "belief::create_edge_under_savepoint",
             "provenance::record_provenance",
         ],
     ),
