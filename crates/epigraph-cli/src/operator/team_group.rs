@@ -1,5 +1,8 @@
 //! `create-group` and `group-member add|remove|set-role`: keyless TEAM groups
-//! (migration 164), on the maintenance DSN.
+//! (migration 164), on the maintenance DSN. Migration 235 adds one PERSONAL
+//! group arm to `add` and `remove`: a `writer` row for the client-allowlisted
+//! agent (migration 149) of the personal group's own owner (SR-3 GAP-4), and
+//! its revoke.
 //!
 //! Each command calls ONE maintenance-only, audited definer in one
 //! transaction, committed under `--apply` and rolled back otherwise (the audit
@@ -156,8 +159,9 @@ pub async fn create(
 /// Add `agent` to `group` at `role`.
 ///
 /// # Errors
-/// The definer refused (GRP05 not an active keyless team group; GRP04 the
-/// agent belongs to no live human; GRP03 an operated agent whose operator does
+/// The definer refused (GRP05 not an active keyless team group, nor, under
+/// migration 235, a `writer` add of the owner's client-allowlisted agent into
+/// an active personal group; GRP04 the agent belongs to no live human; GRP03 an operated agent whose operator does
 /// not write the group; GRP01 an operated agent as admin; a live member at a
 /// different role), or a statement failed.
 pub async fn add(
@@ -190,8 +194,10 @@ pub async fn add(
 /// Remove (revoke) `agent` from `group`.
 ///
 /// # Errors
-/// The definer refused (GRP05; GRP02 the last live admin; GRP03 the agent's
-/// operated agents are still live members), or a statement failed.
+/// The definer refused (GRP05: not an active keyless team group, nor, under
+/// migration 235, a personal-group row of an agent allowlisted, live or
+/// revoked, for the group's owner; GRP02 the last live admin; GRP03 the
+/// agent's operated agents are still live members), or a statement failed.
 pub async fn remove(
     conn: &mut PgConnection,
     group: Uuid,

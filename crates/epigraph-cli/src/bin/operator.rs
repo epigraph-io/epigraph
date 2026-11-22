@@ -121,6 +121,8 @@
 //!         (MEMBER: derived by a role binding; DIRECT: a row of the group's own roster)
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
 //!         --reason TEXT [--apply]
+//!         (a verb-made team group; or, --role writer only, the personal group of the operator
+//!          an allowlisted agent is bound to: migration 235)
 //!     epigraph-operator group-member set-role --group <uuid> --agent <uuid> \
 //!         --role reader|writer|admin --reason TEXT [--apply]
 //!     epigraph-operator group-member remove --group <uuid> --agent <uuid> --reason TEXT [--apply]
@@ -1373,8 +1375,10 @@ struct ScopeArgs {
 /// The `group-member` verbs.
 #[derive(Subcommand)]
 enum GroupMemberAction {
-    /// Add an agent: a registered human, or an agent operated by one whose
-    /// operator writes the group (never as admin).
+    /// Add an agent to a team group: a registered human, or an agent operated
+    /// by one whose operator writes the group (never as admin). In a PERSONAL
+    /// group, only `--role writer` of the owner's client-allowlisted agent
+    /// (migration 235).
     Add {
         #[command(flatten)]
         target: MemberTarget,
@@ -1383,7 +1387,8 @@ enum GroupMemberAction {
         role: String,
     },
     /// Remove (revoke) a member. Refused for the last live admin, and for an
-    /// operator whose operated agents are still live members.
+    /// operator whose operated agents are still live members. In a PERSONAL
+    /// group, only an agent allowlisted (live or revoked) for its owner.
     Remove {
         #[command(flatten)]
         target: MemberTarget,

@@ -1003,10 +1003,13 @@ its row names.
 **Arming it (operator, in order).** (1) Create the delegator `service`
 client (legal-entity fields; approve it to `active`) with `granted_scopes`
 inside the ceiling, and keep its secret in a host-only file. (2) Mint one
-`client_credentials` token for it so its agent exists. (3) Give that agent a
-`writer` MEMBERSHIP of the operator's group (never a link). (4)
+`client_credentials` token for it so its agent exists. (3)
 `epigraph-operator allow-author-binding-client` naming the operator
-(maintenance). (5) Set `EPIGRAPH_RUN_TOKENS=on` on BOTH `epigraph-api` (the
+(maintenance). (4) Give that agent a `writer` MEMBERSHIP of the operator's
+personal group (never a link): `epigraph-operator group-member add --group
+<operator's personal group> --agent <delegator agent> --role writer --reason
+"<why>" [--apply]` (migration 235; it requires the allowance of step 3, so the
+order matters). (5) Set `EPIGRAPH_RUN_TOKENS=on` on BOTH `epigraph-api` (the
 grant and the REST check) and the MCP HTTP listener (the MCP check), and
 `EPIGRAPH_RUN_TOKEN_MODELS` on `epigraph-api`. (6) Verify with one mint and
 its `oauth_run_token_minted` row. Disarming is the reverse; suspending the
@@ -1393,6 +1396,29 @@ database functions these commands call:
 * each audit row also carries `actor`: the CLI's tool, command, version and
   process identity (real and login uid), since `session_user` is a shared
   login.
+
+**One personal-group arm (migration 235, SR-3 GAP-4).** `group-member add`
+also adds ONE kind of member to a PERSONAL group, and `remove` revokes it:
+
+```bash
+epigraph-operator group-member add --group <owner's personal group> \
+    --agent <allowlisted agent> --role writer --reason "<why>" [--apply]
+```
+
+All of these must hold, otherwise the command is refused `GRP05` as before:
+the group is an active personal group carrying its owner's identity
+(`did:epigraph:personal:<owner>`); the agent's author binding is
+`client_allowlist` (a live `allow-author-binding-client` row, migration 149);
+the allowance names the group's OWNER; the role is `writer` (never `admin` or
+`reader`); and the caller is the maintenance DSN. A live-linked agent's row in
+its operator's group stays the link's (107), so it is refused here even when
+its operator revoked it. `remove` reaches only a row of an agent allowlisted
+for the owner (live or revoked); `set-role` still refuses every personal
+group. The row LAPSES with the allowance: once `revoke-author-binding-client`
+ends it, the agent's resolved viewer no longer carries the group (reads and
+writes), and the row stays until `group-member remove` revokes it. This is
+how a host service client (and a run-token delegator) gets the writer row the
+host needs in its operator's personal group.
 
 Two limits remain. Row security reads the SESSION's group set, so a session
 stamped before a removal (a cached viewer, a long-lived connection) still
