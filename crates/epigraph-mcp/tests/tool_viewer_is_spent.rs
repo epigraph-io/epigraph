@@ -46,6 +46,18 @@
 //! `visibility_lint.rs` gives: binding an array proves a parameter was
 //! supplied, not that the SQL reads it.
 
+//!
+//! # Since backlog ada8ee55: which statement, not only whether
+//!
+//! Spending the viewer once is not enough: a fn can spend it on a count while
+//! the read whose rows it returns runs without it, and every check above
+//! passes. [`REVIEWED_CALLS`] closes that the way
+//! `epigraph-api/tests/viewer_spend_lint.rs` does for the routes: every
+//! database call in a viewer-holding tool fn whose arguments and statement do
+//! not spend the viewer is named, with a reason class, as an exact register.
+//! The scanner is shared with `epigraph-db/tests/visibility_lint.rs`, which
+//! keeps the same register for the repo layer (`viewer_calls/mod.rs`).
+
 use std::path::{Path, PathBuf};
 
 /// Every viewer-taking fn under `src/tools/` that runs SQL and carries a
@@ -685,5 +697,1231 @@ fn an_sql_comment_does_not_hide_a_live_predicate_on_a_later_line() {
     assert!(
         !fixture_is_unspent(char_quote),
         "a `'\"'` char literal must not desynchronise the string state"
+    );
+}
+
+// ── the per-call register (backlog ada8ee55) ────────────────────────────────
+
+#[path = "../../epigraph-db/tests/viewer_calls/mod.rs"]
+mod viewer_calls;
+
+use viewer_calls::{Measured, Population, Surface};
+
+/// The MCP tools' database handles, for the per-call scanner.
+const TOOLS: Surface = Surface {
+    state_types: &["EpiGraphMcpFull"],
+    pool_fields: &["pool"],
+    state_db_methods: &["read_as"],
+    viewer_ctors: &[
+        "request_viewer(",
+        "caller_viewer(",
+        "maintenance_viewer(",
+        "Viewer::resolve(",
+        "Viewer::resolve_elevated(",
+    ],
+    conn_ctors: &["admin_cascade_session(", "maintenance_tool_session("],
+    marker_spend: spends_viewer,
+};
+
+/// Every database call in a viewer-holding tool fn that does not spend the
+/// fn's viewer, as measured and reviewed on **2026-11-22** (backlog ada8ee55):
+/// the per-call register `epigraph-api/tests/viewer_spend_lint.rs` keeps for
+/// the routes, for the MCP tools. The fn-level check above passes a fn that
+/// spends its viewer ONCE; this names every other call, so a content read
+/// running beside the spend without it cannot pass unseen.
+///
+/// The population is every fn under `src/tools/` that takes a `Viewer` or
+/// binds one (`request_viewer`, `Viewer::resolve`, a `unwrap_or(viewer)`
+/// fallback). The `#[tool]` methods in `server.rs` are not in it: each resolves
+/// the viewer and hands it to a fn here, and none touches a pool, a connection
+/// or a repository itself (measured 2026-11-22).
+///
+/// Asserted as an exact multiset per fn. The comment above each entry is the
+/// review, by reason class:
+///
+/// * **write** — the call writes, on the author-stamped transaction the fn
+///   opened, a row about a target the fn read through its viewer first. Write
+///   authority is the stamp's `WITH CHECK` plus the write registers
+///   (`residual_unstamped_writes.rs`; the few writes on `server.pool` are
+///   named in `raw_pool_register.rs`). A write returns at most the ids and
+///   flags it wrote.
+/// * **opener** — opens the transaction a write runs on, stamped from the
+///   AUTHOR (`begin_author_stamped_tx`, `begin_caller_workflow_tx`,
+///   `begin_ingest_tx`), or returns the server's `ScopedPool` (`scoped`). It
+///   is handed the server, not the viewer, by design, and reads no content.
+/// * **authority** — decides whether the caller may act on a target it has
+///   already read through its viewer: ownership and operator links
+///   (`require_owner_or_admin`, the workflow-authority arms), the target's
+///   tenancy or the caller's own default (`tenancy_on_session_conn`,
+///   `default_decl_for_author`), a hidden-row or foreign-owner boolean. It
+///   returns allow or refuse, never row content.
+/// * **stamped** — a read on the caller's viewer-stamped connection
+///   (`server.read_as`) or author-stamped transaction, of a table whose forced
+///   row security carries its tenancy (`workflows`, migration 183), or of the
+///   caller's own rows (its bug reports, its elevation, its memberships), or a
+///   boolean about an edge the fn just read or wrote. Stamping is not a spend
+///   (row security only), so each is listed.
+/// * **untenanted** — the table has no tenancy columns: `agents`, `papers`,
+///   `entities` and `entity_types`, `claim_themes`, `match_candidates`,
+///   `behavioral_executions`.
+/// * **narrows** — `derivation_scope::retain_for_cache` filters rows the fn
+///   already read through the viewer; it can drop a row, never add one.
+/// * **audit** — records the caller's own act (an event, a recall audit row,
+///   a workflow-write record, a cascade deferral).
+/// * **maintenance** — opens the admin cascade session, or records its
+///   deferral, after the act's gate; the cascade runs there by design.
+/// * **resolves** — `Viewer::resolve`, the membership read that builds the
+///   viewer itself.
+/// * **no SQL** — handed the server for something that is not a tenancy read:
+///   an embedding stored on the author's stamp, the label-dedup profile and
+///   its limits, the evidence-type vocabulary.
+///
+/// No entry reads content into a response without the viewer: the review
+/// found nothing to fix. Do not add an entry to make the build pass. Read the
+/// call; if it reads something the caller may not read, give it the viewer.
+const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
+    // write: `CountersignRepository::countersign_conn`; opener: `scoped`.
+    (
+        "agent_lookup.rs",
+        "countersign_authorship",
+        &["CountersignRepository::countersign_conn", "scoped"],
+    ),
+    // opener: `scoped`.
+    ("agent_lookup.rs", "find_agent", &["scoped"]),
+    // opener: `scoped`.
+    ("agent_lookup.rs", "get_agent", &["scoped"]),
+    // write: `MassFunctionRepository::retract_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`.
+    (
+        "bba_retract.rs",
+        "retract_bba",
+        &[
+            "MassFunctionRepository::retract_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // write: `MassFunctionRepository::unretract_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`.
+    (
+        "bba_retract.rs",
+        "unretract_bba",
+        &[
+            "MassFunctionRepository::unretract_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // stamped: `BugReportRepository::list_mine_conn`.
+    (
+        "bug_report.rs",
+        "list_my_bug_reports",
+        &["BugReportRepository::list_mine_conn"],
+    ),
+    // write: `BugReportRepository::submit_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority:
+    // `BugReportRepository::preflight_conn`.
+    (
+        "bug_report.rs",
+        "submit_bug_report",
+        &[
+            "BugReportRepository::preflight_conn",
+            "BugReportRepository::submit_conn",
+            "claim_helper::begin_author_stamped_tx",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // write: `ChallengeRepository::create`; opener: `claim_helper::begin_author_stamped_tx`;
+    // audit: `EventRepository::publish_or_log_conn`.
+    (
+        "challenges.rs",
+        "challenge_claim",
+        &[
+            "ChallengeRepository::create",
+            "EventRepository::publish_or_log_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // write: `ChallengeRepository::resolve_as_claim_owner`; opener:
+    // `claim_helper::begin_author_stamped_tx`.
+    (
+        "challenges.rs",
+        "resolve_challenge",
+        &[
+            "ChallengeRepository::resolve_as_claim_owner",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // no SQL: `claim_helper::embed_claim_author_stamped`.
+    (
+        "claims.rs",
+        "finish_submission",
+        &["claim_helper::embed_claim_author_stamped"],
+    ),
+    // authority: `require_owner_or_admin`.
+    (
+        "claims.rs",
+        "gate_retirement_label",
+        &["require_owner_or_admin"],
+    ),
+    // write: `ClaimRepository::patch_claim_atomic_conn`, `admin_write::admin_patch`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority: `require_owner_or_admin`.
+    (
+        "claims.rs",
+        "patch_claim",
+        &[
+            "ClaimRepository::patch_claim_atomic_conn",
+            "admin_write::admin_patch",
+            "claim_helper::begin_author_stamped_tx",
+            "require_owner_or_admin",
+        ],
+    ),
+    // authority: `claim_helper::resolve_claim_visibility`.
+    (
+        "claims.rs",
+        "prepare_submission",
+        &["claim_helper::resolve_claim_visibility"],
+    ),
+    // write: `ClaimRepository::update_labels_conn`, `admin_write::admin_patch`; authority:
+    // `require_owner_or_admin`.
+    (
+        "claims.rs",
+        "relabel_claim",
+        &[
+            "ClaimRepository::update_labels_conn",
+            "admin_write::admin_patch",
+            "require_owner_or_admin",
+        ],
+    ),
+    // write: `ClaimRepository::update_labels_conn`,
+    // `EdgeRepository::create_if_not_exists_signed_conn`, `admin_write::admin_patch`; opener:
+    // `claim_helper::begin_author_stamped_tx`, `claim_helper::begin_author_stamped_tx_for`;
+    // authority: `ClaimRepository::default_decl_for_author`,
+    // `ClaimRepository::tenancy_on_session_conn`, `require_owner_or_admin`.
+    (
+        "claims.rs",
+        "resolve_backlog_item",
+        &[
+            "ClaimRepository::default_decl_for_author",
+            "ClaimRepository::tenancy_on_session_conn",
+            "ClaimRepository::update_labels_conn",
+            "EdgeRepository::create_if_not_exists_signed_conn",
+            "admin_write::admin_patch",
+            "claim_helper::begin_author_stamped_tx",
+            "claim_helper::begin_author_stamped_tx_for",
+            "require_owner_or_admin",
+            "require_owner_or_admin",
+        ],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx_for`.
+    (
+        "claims.rs",
+        "submit_claim_response",
+        &["claim_helper::begin_author_stamped_tx_for"],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`.
+    (
+        "claims.rs",
+        "update_labels",
+        &["claim_helper::begin_author_stamped_tx"],
+    ),
+    // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_truth_value_conn`,
+    // `EvidenceRepository::create_with_source_url`, `ds_divergence::record_divergence`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority:
+    // `foreign_attach::is_foreign_public_claim`, `require_owner_or_admin`.
+    (
+        "claims.rs",
+        "update_with_evidence",
+        &[
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_truth_value_conn",
+            "EvidenceRepository::create_with_source_url",
+            "claim_helper::begin_author_stamped_tx",
+            "ds_divergence::record_divergence",
+            "foreign_attach::is_foreign_public_claim",
+            "require_owner_or_admin",
+        ],
+    ),
+    // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_trace_id_conn`,
+    // `EvidenceRepository::create_with_source_url`,
+    // `ReasoningTraceRepository::create_with_reasoning_type`,
+    // `claim_helper::emit_verb_edge_best_effort`; authority:
+    // `claim_helper::claim_tenancy_report`.
+    (
+        "claims.rs",
+        "write_submission",
+        &[
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EvidenceRepository::create_with_source_url",
+            "ReasoningTraceRepository::create_with_reasoning_type",
+            "claim_helper::claim_tenancy_report",
+            "claim_helper::emit_verb_edge_best_effort",
+            "claim_helper::emit_verb_edge_best_effort",
+        ],
+    ),
+    // write: `ClaimRepository::consolidate_act_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; maintenance:
+    // `supersede::admin_session_or_deferral`; no SQL:
+    // `claim_helper::embed_claim_author_stamped`.
+    (
+        "consolidate.rs",
+        "consolidate_claims",
+        &[
+            "ClaimRepository::consolidate_act_conn",
+            "claim_helper::begin_author_stamped_tx",
+            "claim_helper::embed_claim_author_stamped",
+            "supersede::admin_session_or_deferral",
+        ],
+    ),
+    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_with_perspective`,
+    // `ds_divergence::record_divergence`; opener: `claim_helper::begin_author_stamped_tx`;
+    // authority: `foreign_attach::is_foreign_public_claim`; no SQL: `evidence_type_resolves`.
+    (
+        "ds.rs",
+        "submit_ds_evidence",
+        &[
+            "FrameRepository::assign_claim",
+            "MassFunctionRepository::store_with_perspective",
+            "claim_helper::begin_author_stamped_tx",
+            "ds_divergence::record_divergence",
+            "evidence_type_resolves",
+            "foreign_attach::is_foreign_public_claim",
+        ],
+    ),
+    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_with_perspective`,
+    // `MassFunctionRepository::update_claim_belief`; stamped: `optional_read_under_savepoint`.
+    (
+        "ds_auto.rs",
+        "auto_wire_ds_for_claim",
+        &[
+            "FrameRepository::assign_claim",
+            "MassFunctionRepository::store_with_perspective",
+            "MassFunctionRepository::update_claim_belief",
+            "optional_read_under_savepoint",
+            "optional_read_under_savepoint",
+        ],
+    ),
+    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_with_perspective`,
+    // `MassFunctionRepository::update_claim_belief`,
+    // `PerspectiveRepository::ensure_evidence_perspective`; stamped:
+    // `optional_read_under_savepoint`; narrows: `derivation_scope::retain_for_cache`.
+    (
+        "ds_auto.rs",
+        "auto_wire_ds_update_filed_on",
+        &[
+            "FrameRepository::assign_claim",
+            "FrameRepository::assign_claim",
+            "MassFunctionRepository::store_with_perspective",
+            "MassFunctionRepository::store_with_perspective",
+            "MassFunctionRepository::update_claim_belief",
+            "PerspectiveRepository::ensure_evidence_perspective",
+            "derivation_scope::retain_for_cache",
+            "optional_read_under_savepoint",
+            "optional_read_under_savepoint",
+            "optional_read_under_savepoint",
+        ],
+    ),
+    // write: `FrameRepository::create`.
+    (
+        "ds_auto.rs",
+        "ensure_axis_frame",
+        &["FrameRepository::create"],
+    ),
+    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_with_perspective`.
+    (
+        "ds_auto.rs",
+        "wire_single_batch_entry",
+        &[
+            "FrameRepository::assign_claim",
+            "MassFunctionRepository::store_with_perspective",
+        ],
+    ),
+    // write: `EdgeRepository::retract_by_id`, `EdgeRepository::withdraw_edge_bbas_conn`;
+    // opener: `claim_helper::begin_author_stamped_tx`; audit:
+    // `EventRepository::publish_or_log_conn`.
+    (
+        "edge_mutation.rs",
+        "do_delete_edge",
+        &[
+            "EdgeRepository::retract_by_id",
+            "EdgeRepository::withdraw_edge_bbas_conn",
+            "EventRepository::publish_or_log_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // write: `EdgeRepository::update_valid_to_and_properties`,
+    // `EdgeRepository::withdraw_edge_bbas_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; audit: `EventRepository::publish_or_log_conn`.
+    (
+        "edge_mutation.rs",
+        "do_patch_edge",
+        &[
+            "EdgeRepository::update_valid_to_and_properties",
+            "EdgeRepository::withdraw_edge_bbas_conn",
+            "EventRepository::publish_or_log_conn",
+            "EventRepository::publish_or_log_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // opener: `scoped`.
+    ("elevation.rs", "propose_admin_act", &["scoped"]),
+    // write: `ElevationCeremony::create_ticket`; opener: `scoped`.
+    (
+        "elevation.rs",
+        "sudo",
+        &["ElevationCeremony::create_ticket", "scoped"],
+    ),
+    // write: `ElevationCeremony::end`; opener: `scoped`; stamped: `ElevationCeremony::live`.
+    (
+        "elevation.rs",
+        "unsudo",
+        &[
+            "ElevationCeremony::end",
+            "ElevationCeremony::live",
+            "scoped",
+        ],
+    ),
+    // audit: `EventRepository::insert`.
+    ("events.rs", "publish_event", &["EventRepository::insert"]),
+    // write: `ClaimRepository::evolve_step_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority: `require_lineage_authority`; audit:
+    // `record_lineage_writes`; maintenance: `supersede::admin_session_or_deferral`; no SQL:
+    // `workflow_ingest::embed_created_workflow_claims`.
+    (
+        "evolve_step.rs",
+        "evolve_step",
+        &[
+            "ClaimRepository::evolve_step_conn",
+            "ClaimRepository::evolve_step_conn",
+            "claim_helper::begin_author_stamped_tx",
+            "record_lineage_writes",
+            "record_lineage_writes",
+            "require_lineage_authority",
+            "require_lineage_authority",
+            "supersede::admin_session_or_deferral",
+            "workflow_ingest::embed_created_workflow_claims",
+        ],
+    ),
+    // authority: `check_explicit_author_ids`.
+    (
+        "ingest_authors.rs",
+        "preflight_document_authors",
+        &["check_explicit_author_ids"],
+    ),
+    // write: `AgentRepository::create_seed_derived_conn`; authority: `attributions`,
+    // `check_explicit_author_ids`; untenanted: `AgentLookupRepository::author_nodes`,
+    // `AgentLookupRepository::exact_name_candidates`, `AgentRepository::get_by_public_key`,
+    // `SystemAgentRepository::registered_agent_ids`.
+    (
+        "ingest_authors.rs",
+        "resolve_document_authors",
+        &[
+            "AgentLookupRepository::author_nodes",
+            "AgentLookupRepository::exact_name_candidates",
+            "AgentRepository::create_seed_derived_conn",
+            "AgentRepository::get_by_public_key",
+            "SystemAgentRepository::registered_agent_ids",
+            "attributions",
+            "check_explicit_author_ids",
+        ],
+    ),
+    // untenanted: `AgentRepository::get_by_public_key`.
+    (
+        "ingest_authors.rs",
+        "retract_replaced_name_nodes",
+        &["AgentRepository::get_by_public_key"],
+    ),
+    // untenanted: `find_paper_by_document_key`.
+    (
+        "ingestion.rs",
+        "check_already_ingested",
+        &["find_paper_by_document_key"],
+    ),
+    // write: `ClaimIngestRepository::record_signed_conn`,
+    // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
+    // `ClaimRepository::update_trace_id_conn`,
+    // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
+    // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
+    // `EvidenceRepository::create`, `PaperRepository::get_or_create`,
+    // `ReasoningTraceRepository::create`,
+    // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
+    // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
+    // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
+    // `spawn_ingest_embeds`.
+    (
+        "ingestion.rs",
+        "do_ingest_document_reporting",
+        &[
+            "ClaimIngestRepository::record_signed_conn",
+            "ClaimIngestRepository::record_signed_conn",
+            "ClaimRepository::set_properties_conn",
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EdgeRepository::create_if_absent_including_retracted_signed_conn",
+            "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
+            "EvidenceRepository::create",
+            "PaperRepository::get_or_create",
+            "PaperRepository::licence",
+            "ReasoningTraceRepository::create",
+            "begin_ingest_tx",
+            "begin_ingest_tx",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "label_resolved_claim",
+            "persist_planned_claim",
+            "resolve_ingest_visibility",
+            "spawn_ingest_embeds",
+        ],
+    ),
+    // write: `ClaimIngestRepository::record_signed_conn`,
+    // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
+    // `ClaimRepository::update_trace_id_conn`,
+    // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
+    // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
+    // `EvidenceRepository::create`, `PaperRepository::get_or_create`,
+    // `ReasoningTraceRepository::create`,
+    // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
+    // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
+    // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
+    // `spawn_ingest_embeds`.
+    (
+        "ingestion.rs",
+        "do_ingest_document_spine",
+        &[
+            "ClaimIngestRepository::record_signed_conn",
+            "ClaimIngestRepository::record_signed_conn",
+            "ClaimRepository::set_properties_conn",
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EdgeRepository::create_if_absent_including_retracted_signed_conn",
+            "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
+            "EvidenceRepository::create",
+            "PaperRepository::get_or_create",
+            "PaperRepository::licence",
+            "ReasoningTraceRepository::create",
+            "begin_ingest_tx",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "epigraph_db::create_ingest_written_edge_if_absent_conn",
+            "label_resolved_claim",
+            "persist_planned_claim",
+            "resolve_ingest_visibility",
+            "spawn_ingest_embeds",
+        ],
+    ),
+    // write: `ensure_paper_node`.
+    ("ingestion.rs", "ingest_document", &["ensure_paper_node"]),
+    // write: `ensure_paper_node`.
+    (
+        "ingestion.rs",
+        "ingest_document_inline",
+        &["ensure_paper_node"],
+    ),
+    // untenanted: `find_paper_by_document_key`.
+    (
+        "ingestion.rs",
+        "paper_already_ingested",
+        &["find_paper_by_document_key"],
+    ),
+    // opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`; untenanted:
+    // `find_paper_by_document_key`.
+    (
+        "ingestion.rs",
+        "preflight_write_authority",
+        &[
+            "begin_ingest_tx",
+            "find_paper_by_document_key",
+            "resolve_ingest_visibility",
+        ],
+    ),
+    // no SQL: `prepare`.
+    ("label_dedup.rs", "apply_label_dedup", &["prepare"]),
+    // authority: `owner_of`.
+    ("label_dedup.rs", "cross_owner", &["owner_of"]),
+    // authority: `is_foreign_duplicate`.
+    (
+        "label_dedup.rs",
+        "label_dedup_index_view",
+        &["is_foreign_duplicate"],
+    ),
+    // authority: `claims::require_owner_or_admin`.
+    (
+        "label_dedup.rs",
+        "member_not_owned",
+        &["claims::require_owner_or_admin"],
+    ),
+    // no SQL: `prepare`.
+    ("label_dedup.rs", "plan_label_dedup", &["prepare"]),
+    // no SQL: `load_profile`.
+    ("label_dedup.rs", "probe_label_dedup", &["load_profile"]),
+    // authority: `is_foreign_duplicate`.
+    ("label_dedup.rs", "read_family", &["is_foreign_duplicate"]),
+    // opener: `claim_helper::begin_author_stamped_tx`; maintenance:
+    // `maintenance::admin_cascade_session`.
+    (
+        "label_dedup.rs",
+        "revert_label_dedup",
+        &[
+            "claim_helper::begin_author_stamped_tx",
+            "maintenance::admin_cascade_session",
+        ],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`; authority:
+    // `claims::require_owner_or_admin`.
+    (
+        "label_dedup.rs",
+        "write_check",
+        &[
+            "claim_helper::begin_author_stamped_tx",
+            "claims::require_owner_or_admin",
+            "claims::require_owner_or_admin",
+        ],
+    ),
+    // write: `EdgeRepository::create_symmetric_if_absent_returning_signed_conn`.
+    (
+        "link_alternative.rs",
+        "do_link_alternative",
+        &["EdgeRepository::create_symmetric_if_absent_returning_signed_conn"],
+    ),
+    // write: `EdgeRepository::create_if_not_exists_signed_conn`,
+    // `EdgeRepository::create_symmetric_if_absent_oriented_signed_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority: `EdgeRepository::owned_by_session`;
+    // stamped: `EdgeRepository::is_in_force`; audit: `EventRepository::publish_or_log_conn`.
+    (
+        "link_epistemic.rs",
+        "do_link_epistemic",
+        &[
+            "EdgeRepository::create_if_not_exists_signed_conn",
+            "EdgeRepository::create_symmetric_if_absent_oriented_signed_conn",
+            "EdgeRepository::is_in_force",
+            "EdgeRepository::owned_by_session",
+            "EventRepository::publish_or_log_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // write: `EdgeRepository::create_if_not_exists_signed_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority: `EdgeRepository::owned_by_session`,
+    // `WorkflowRepository::submitter_of`, `workflow_authority::require_workflow_authority`;
+    // stamped: `EdgeRepository::reaches_in_force_conn`,
+    // `WorkflowRepository::canonical_names_of`, `WorkflowRepository::head_by_canonical`,
+    // `WorkflowRepository::workflows_executing_step_lineage`; untenanted:
+    // `EntityTypeRepository::get_by_name_conn`; audit:
+    // `workflow_authority::record_workflow_write`.
+    (
+        "link_hierarchical.rs",
+        "do_link_hierarchical",
+        &[
+            "EdgeRepository::create_if_not_exists_signed_conn",
+            "EdgeRepository::owned_by_session",
+            "EdgeRepository::reaches_in_force_conn",
+            "EntityTypeRepository::get_by_name_conn",
+            "WorkflowRepository::canonical_names_of",
+            "WorkflowRepository::canonical_names_of",
+            "WorkflowRepository::head_by_canonical",
+            "WorkflowRepository::submitter_of",
+            "WorkflowRepository::workflows_executing_step_lineage",
+            "WorkflowRepository::workflows_executing_step_lineage",
+            "claim_helper::begin_author_stamped_tx",
+            "workflow_authority::record_workflow_write",
+            "workflow_authority::require_workflow_authority",
+        ],
+    ),
+    // write: `MatchCandidateRepo::promote_if_pending_conn`,
+    // `MatchCandidateRepo::reject_if_pending`; opener: `claim_helper::begin_author_stamped_tx`;
+    // untenanted: `MatchCandidateRepo::get`, `MatchCandidateRepo::new`.
+    (
+        "matching.rs",
+        "decide_match_candidate",
+        &[
+            "MatchCandidateRepo::get",
+            "MatchCandidateRepo::get",
+            "MatchCandidateRepo::new",
+            "MatchCandidateRepo::promote_if_pending_conn",
+            "MatchCandidateRepo::reject_if_pending",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`; untenanted: `MatchCandidateRepo::get`,
+    // `MatchCandidateRepo::new`; audit: `admin_cascade::record_deferral`; maintenance:
+    // `maintenance::admin_cascade_session`.
+    (
+        "matching.rs",
+        "retire_match_candidate",
+        &[
+            "MatchCandidateRepo::get",
+            "MatchCandidateRepo::get",
+            "MatchCandidateRepo::new",
+            "admin_cascade::record_deferral",
+            "claim_helper::begin_author_stamped_tx",
+            "maintenance::admin_cascade_session",
+        ],
+    ),
+    // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_trace_id_conn`,
+    // `EvidenceRepository::create`, `ReasoningTraceRepository::create`; opener:
+    // `claim_helper::begin_author_stamped_tx_for`; authority:
+    // `claim_helper::claim_tenancy_report`, `claim_helper::resolve_claim_visibility`; no SQL:
+    // `claim_helper::embed_claim_author_stamped`.
+    (
+        "memory.rs",
+        "memorize",
+        &[
+            "ClaimRepository::update_labels_conn",
+            "ClaimRepository::update_trace_id_conn",
+            "EvidenceRepository::create",
+            "ReasoningTraceRepository::create",
+            "claim_helper::begin_author_stamped_tx_for",
+            "claim_helper::claim_tenancy_report",
+            "claim_helper::embed_claim_author_stamped",
+            "claim_helper::resolve_claim_visibility",
+        ],
+    ),
+    // untenanted: `ingestion::find_paper_by_document_key`.
+    (
+        "paper_queries.rs",
+        "query_paper",
+        &["ingestion::find_paper_by_document_key"],
+    ),
+    // write: `EdgeRepository::create_signed`, `PerspectiveRepository::create`.
+    (
+        "perspectives.rs",
+        "create_perspective",
+        &[
+            "EdgeRepository::create_signed",
+            "PerspectiveRepository::create",
+        ],
+    ),
+    // write: `PerspectiveRepository::set_source_reliability_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority: `claims::require_owner_or_admin`.
+    (
+        "perspectives.rs",
+        "set_source_reliability",
+        &[
+            "PerspectiveRepository::set_source_reliability_conn",
+            "claim_helper::begin_author_stamped_tx",
+            "claims::require_owner_or_admin",
+        ],
+    ),
+    // untenanted: `EntityRepository::find_by_name_and_type`, `EntityRepository::get`.
+    (
+        "rdf.rs",
+        "entity_neighborhood",
+        &[
+            "EntityRepository::find_by_name_and_type",
+            "EntityRepository::get",
+        ],
+    ),
+    // untenanted: `EntityRepository::find_by_name_and_type`.
+    (
+        "rdf.rs",
+        "query_triples",
+        &[
+            "EntityRepository::find_by_name_and_type",
+            "EntityRepository::find_by_name_and_type",
+        ],
+    ),
+    // stamped: `GroupMembershipRepository::visible_personal_group_conn`; resolves:
+    // `Viewer::resolve`.
+    (
+        "recall.rs",
+        "recall_audit_owner_group",
+        &[
+            "GroupMembershipRepository::visible_personal_group_conn",
+            "Viewer::resolve",
+        ],
+    ),
+    // audit: `spawn_recall_audit`.
+    (
+        "recall.rs",
+        "recall_with_context_core",
+        &["spawn_recall_audit", "spawn_recall_audit"],
+    ),
+    // write: `epigraph_ingest_executor::add_step`,
+    // `epigraph_ingest_executor::record_caller_authorship`; opener:
+    // `claim_helper::begin_caller_workflow_tx`; authority: `require_authority_over`; audit:
+    // `workflow_authority::record_workflow_write`; no SQL:
+    // `workflow_ingest::embed_created_workflow_claims`.
+    (
+        "step_ops.rs",
+        "add_step",
+        &[
+            "claim_helper::begin_caller_workflow_tx",
+            "epigraph_ingest_executor::add_step",
+            "epigraph_ingest_executor::record_caller_authorship",
+            "require_authority_over",
+            "workflow_authority::record_workflow_write",
+            "workflow_ingest::embed_created_workflow_claims",
+        ],
+    ),
+    // write: `epigraph_ingest_executor::delete_step`; opener:
+    // `claim_helper::begin_caller_workflow_tx`; authority: `require_authority_over`; audit:
+    // `workflow_authority::record_workflow_write`.
+    (
+        "step_ops.rs",
+        "delete_step",
+        &[
+            "claim_helper::begin_caller_workflow_tx",
+            "epigraph_ingest_executor::delete_step",
+            "require_authority_over",
+            "workflow_authority::record_workflow_write",
+        ],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`; authority:
+    // `admin_borrowed_server_identity`, `claims::require_owner_or_admin`.
+    (
+        "supersede.rs",
+        "begin_claim_act",
+        &[
+            "admin_borrowed_server_identity",
+            "claim_helper::begin_author_stamped_tx",
+            "claim_helper::begin_author_stamped_tx",
+            "claim_helper::begin_author_stamped_tx",
+            "claims::require_owner_or_admin",
+        ],
+    ),
+    // write: `ClaimRepository::mark_duplicate_act_attributed_conn`; maintenance:
+    // `admin_session_or_deferral`.
+    (
+        "supersede.rs",
+        "mark_duplicate_pair",
+        &[
+            "ClaimRepository::mark_duplicate_act_attributed_conn",
+            "admin_session_or_deferral",
+        ],
+    ),
+    // write: `ClaimRepository::supersede_act_conn`; maintenance:
+    // `supersede_session_or_deferral`; no SQL: `claim_helper::embed_claim_author_stamped`.
+    (
+        "supersede.rs",
+        "supersede_claim",
+        &[
+            "ClaimRepository::supersede_act_conn",
+            "claim_helper::embed_claim_author_stamped",
+            "supersede_session_or_deferral",
+        ],
+    ),
+    // maintenance: `maintenance::admin_cascade_session`; no SQL:
+    // `claim_helper::embed_claim_author_stamped`.
+    (
+        "supersede.rs",
+        "unmark_duplicate_expecting",
+        &[
+            "claim_helper::embed_claim_author_stamped",
+            "maintenance::admin_cascade_session",
+        ],
+    ),
+    // authority: `ClaimRepository::session_may_unmark_conn`.
+    (
+        "supersede.rs",
+        "unmark_gate",
+        &[
+            "ClaimRepository::session_may_unmark_conn",
+            "ClaimRepository::session_may_unmark_conn",
+        ],
+    ),
+    // untenanted: `ClaimThemeRepository::count_summaries`.
+    (
+        "themes.rs",
+        "list_themes",
+        &["ClaimThemeRepository::count_summaries"],
+    ),
+    // untenanted: `ClaimThemeRepository::find_by_label`.
+    (
+        "themes.rs",
+        "resolve_theme_selector",
+        &["ClaimThemeRepository::find_by_label"],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`.
+    (
+        "visibility.rs",
+        "publicize_claims",
+        &["claim_helper::begin_author_stamped_tx"],
+    ),
+    // write: `ClaimRepository::set_agent_default_conn`; opener:
+    // `claim_helper::begin_author_stamped_tx`; stamped: `ClaimRepository::writable_teams`.
+    (
+        "visibility.rs",
+        "set_default_group",
+        &[
+            "ClaimRepository::set_agent_default_conn",
+            "ClaimRepository::writable_teams",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // opener: `claim_helper::begin_author_stamped_tx`.
+    (
+        "visibility.rs",
+        "share_claims_with_team",
+        &["claim_helper::begin_author_stamped_tx"],
+    ),
+    // resolves: `Viewer::resolve`.
+    (
+        "workflow_authority.rs",
+        "caller_view_of",
+        &["Viewer::resolve"],
+    ),
+    // authority: `claims::operator_arm_allows`, `delegate_arm`, `owner_group_arm`,
+    // `unrecorded_row_owner_group_arm`; resolves: `Viewer::resolve`.
+    (
+        "workflow_authority.rs",
+        "stdio_workflow_authority",
+        &[
+            "Viewer::resolve",
+            "claims::operator_arm_allows",
+            "delegate_arm",
+            "owner_group_arm",
+            "unrecorded_row_owner_group_arm",
+        ],
+    ),
+    // write: `BehavioralExecutionRepository::create`.
+    (
+        "workflow_hierarchical.rs",
+        "do_report_hierarchical_outcome_as",
+        &["BehavioralExecutionRepository::create"],
+    ),
+    // stamped: `WorkflowRepository::find_hierarchical_by_embedding`,
+    // `WorkflowRepository::search_hierarchical_by_text`.
+    (
+        "workflow_hierarchical.rs",
+        "find_workflow_hierarchical",
+        &[
+            "WorkflowRepository::find_hierarchical_by_embedding",
+            "WorkflowRepository::search_hierarchical_by_text",
+        ],
+    ),
+    // resolves: `Viewer::resolve`.
+    ("workflow_ingest.rs", "caller_viewer", &["Viewer::resolve"]),
+    // no SQL: `embed_created_workflow_claims`, `store_workflow_goal_embedding`.
+    (
+        "workflow_ingest.rs",
+        "do_ingest_workflow",
+        &[
+            "embed_created_workflow_claims",
+            "store_workflow_goal_embedding",
+        ],
+    ),
+    // write: `epigraph_ingest_executor::execute_workflow_ingest_plan`.
+    (
+        "workflow_ingest.rs",
+        "do_ingest_workflow_via_pool",
+        &["epigraph_ingest_executor::execute_workflow_ingest_plan"],
+    ),
+    // write: `WorkflowRepository::record_submitter`,
+    // `epigraph_ingest_executor::record_caller_authorship`; opener:
+    // `claim_helper::begin_caller_workflow_tx`; authority:
+    // `workflow_authority::require_workflow_authority`; stamped:
+    // `WorkflowRepository::ingest_anchors`; audit:
+    // `workflow_authority::audit_admin_workflow_write`,
+    // `workflow_authority::record_caller_workflow_write`.
+    (
+        "workflow_ingest.rs",
+        "execute_workflow_ingest_with_inserted",
+        &[
+            "WorkflowRepository::ingest_anchors",
+            "WorkflowRepository::record_submitter",
+            "claim_helper::begin_caller_workflow_tx",
+            "claim_helper::begin_caller_workflow_tx",
+            "epigraph_ingest_executor::record_caller_authorship",
+            "workflow_authority::audit_admin_workflow_write",
+            "workflow_authority::record_caller_workflow_write",
+            "workflow_authority::require_workflow_authority",
+            "workflow_authority::require_workflow_authority",
+        ],
+    ),
+    // no SQL: `embed_created_workflow_claims`, `store_workflow_goal_embedding`.
+    (
+        "workflow_ingest.rs",
+        "improve_workflow_hierarchy",
+        &[
+            "embed_created_workflow_claims",
+            "store_workflow_goal_embedding",
+        ],
+    ),
+    // stamped: `WorkflowRepository::max_generation_by_canonical`.
+    (
+        "workflow_ingest.rs",
+        "improve_workflow_hierarchy_via_pool",
+        &["WorkflowRepository::max_generation_by_canonical"],
+    ),
+    // stamped: `WorkflowRepository::max_generation_by_canonical`.
+    (
+        "workflow_ingest.rs",
+        "lineage_max_generation",
+        &[
+            "WorkflowRepository::max_generation_by_canonical",
+            "WorkflowRepository::max_generation_by_canonical",
+        ],
+    ),
+    // write: `ClaimRepository::deprecate_claim_if_current`,
+    // `WorkflowRepository::set_truth_value`, `WorkflowRepository::set_truth_value_if_changed`,
+    // `deprecate_hierarchical_workflow`; opener: `claim_helper::begin_author_stamped_tx`;
+    // stamped: `WorkflowRepository::exists`.
+    (
+        "workflows.rs",
+        "deprecate_workflow",
+        &[
+            "ClaimRepository::deprecate_claim_if_current",
+            "ClaimRepository::deprecate_claim_if_current",
+            "WorkflowRepository::exists",
+            "WorkflowRepository::set_truth_value",
+            "WorkflowRepository::set_truth_value_if_changed",
+            "claim_helper::begin_author_stamped_tx",
+            "deprecate_hierarchical_workflow",
+        ],
+    ),
+    // untenanted: `BehavioralExecutionRepository::rolling_success_rate`.
+    (
+        "workflows.rs",
+        "enrich_workflow_result",
+        &["BehavioralExecutionRepository::rolling_success_rate"],
+    ),
+    // stamped: `WorkflowRepository::search_hierarchical_by_text`; untenanted:
+    // `BehavioralExecutionRepository::behavioral_affinity_hierarchical`.
+    (
+        "workflows.rs",
+        "find_workflow_post_embed",
+        &[
+            "BehavioralExecutionRepository::behavioral_affinity_hierarchical",
+            "WorkflowRepository::search_hierarchical_by_text",
+        ],
+    ),
+    // stamped: `WorkflowRepository::max_generation_by_canonical`.
+    (
+        "workflows.rs",
+        "hierarchical_workflow_result",
+        &["WorkflowRepository::max_generation_by_canonical"],
+    ),
+    // opener: `claim_helper::begin_caller_workflow_tx`; authority:
+    // `WorkflowRepository::name_has_hidden_rows_conn`, `owner::resolve_caller_owner`; stamped:
+    // `WorkflowRepository::head_by_canonical`.
+    (
+        "workflows.rs",
+        "matching_workflow",
+        &[
+            "WorkflowRepository::head_by_canonical",
+            "WorkflowRepository::head_by_canonical",
+            "WorkflowRepository::name_has_hidden_rows_conn",
+            "WorkflowRepository::name_has_hidden_rows_conn",
+            "claim_helper::begin_caller_workflow_tx",
+            "owner::resolve_caller_owner",
+        ],
+    ),
+    // write: `ClaimRepository::merge_properties`.
+    (
+        "workflows.rs",
+        "refresh_workflow_promotion",
+        &["ClaimRepository::merge_properties"],
+    ),
+    // write: `BehavioralExecutionRepository::create`,
+    // `ClaimRepository::update_truth_value_conn`, `EvidenceRepository::create`; opener:
+    // `claim_helper::begin_author_stamped_tx`; authority:
+    // `foreign_attach::is_foreign_public_claim`; stamped: `WorkflowRepository::exists`.
+    (
+        "workflows.rs",
+        "report_workflow_outcome",
+        &[
+            "BehavioralExecutionRepository::create",
+            "ClaimRepository::update_truth_value_conn",
+            "EvidenceRepository::create",
+            "WorkflowRepository::exists",
+            "claim_helper::begin_author_stamped_tx",
+            "foreign_attach::is_foreign_public_claim",
+        ],
+    ),
+    // no SQL: `workflow_ingest::embed_created_workflow_claims`,
+    // `workflow_ingest::store_workflow_goal_embedding`.
+    (
+        "workflows.rs",
+        "store_workflow",
+        &[
+            "workflow_ingest::embed_created_workflow_claims",
+            "workflow_ingest::store_workflow_goal_embedding",
+        ],
+    ),
+];
+
+fn measure_tools() -> (Measured, usize, usize, Population) {
+    let mut out = Measured::new();
+    let mut pop = Population::new();
+    let (mut n_fns, mut n_calls) = (0, 0);
+    for (file, src) in tool_files() {
+        let (f, c) = viewer_calls::measure_source(&file, &src, &TOOLS, &mut out, &mut pop);
+        n_fns += f;
+        n_calls += c;
+    }
+    (out, n_fns, n_calls, pop)
+}
+
+/// In a tool fn that holds a viewer, every database call whose arguments and
+/// statement do not spend that viewer is named in [`REVIEWED_CALLS`] (backlog
+/// ada8ee55).
+#[test]
+fn every_unviewed_database_call_in_a_viewer_tool_fn_is_reviewed() {
+    let (measured, _, _, _) = measure_tools();
+    let report = viewer_calls::drift(&measured, &viewer_calls::register(REVIEWED_CALLS));
+    assert!(
+        report.is_empty(),
+        "viewer-holding MCP tool fns' unviewed database calls drifted from REVIEWED_CALLS.\n\
+         A NEW call is a repo call, statement or helper handed the server, in a fn that \
+         holds a viewer, with neither the viewer in its arguments nor a spend marker in \
+         its statement: give it the viewer, or read it and register it with a reason \
+         class. A GONE call must be removed from REVIEWED_CALLS.\n{report}"
+    );
+}
+
+/// The population is the tool layer's viewer surface, not a corner of it.
+#[test]
+fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
+    let (measured, fns, calls, pop) = measure_tools();
+    eprintln!(
+        "population: {fns} viewer-holding tool fns, {calls} database calls, {} with an \
+         unviewed call, {} unviewed calls",
+        measured.len(),
+        measured.values().map(Vec::len).sum::<usize>()
+    );
+    for (file, f) in [
+        // The ten-statement enrichment read this file was written for.
+        ("recall.rs", "fetch_batched_context"),
+        // A viewer resolved in the body (`Viewer::resolve`), not a parameter.
+        ("recall.rs", "recall_audit_owner_group"),
+        ("workflow_authority.rs", "stdio_workflow_authority"),
+    ] {
+        assert!(
+            pop.contains(&(file.to_string(), f.to_string())),
+            "{file}::{f} holds a viewer and must be in the measured population"
+        );
+    }
+    // A maintenance session (`admin_cascade_session`) and a raw-pool write are
+    // database handles the scanner must see.
+    let key = (
+        "label_dedup.rs".to_string(),
+        "revert_label_dedup".to_string(),
+    );
+    assert!(
+        measured
+            .get(&key)
+            .is_some_and(|l| l.iter().any(|x| x == "maintenance::admin_cascade_session")),
+        "the maintenance-session open in revert_label_dedup must be measured: {:?}",
+        measured.get(&key)
+    );
+    assert!(
+        fns >= 180,
+        "found {fns} viewer-holding tool fns; measured 198 on 2026-11-22"
+    );
+    assert!(
+        calls >= 650,
+        "found {calls} database calls in them; measured 767 on 2026-11-22"
+    );
+}
+
+fn tool_unviewed(src: &str) -> Measured {
+    let mut out = Measured::new();
+    viewer_calls::measure_source("fixture.rs", src, &TOOLS, &mut out, &mut Population::new());
+    out
+}
+
+fn tool_labels(m: &Measured, f: &str) -> Vec<String> {
+    m.get(&("fixture.rs".to_string(), f.to_string()))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The defect the per-call register exists for, which the fn-level check
+/// above cannot see: a viewer spent on one statement while the content read
+/// beside it runs without it.
+#[test]
+fn the_per_call_register_sees_a_viewer_spent_on_the_wrong_statement() {
+    let src = r##"
+pub async fn content_beside_a_count(
+    server: &EpiGraphMcpFull,
+    viewer: &Viewer,
+    id: Uuid,
+) -> Result<CallToolResult, McpError> {
+    let mut read = server.read_as(viewer, "content_beside_a_count").await?;
+    let sql = viewer.splice("SELECT count(*) FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    let n: i64 = sqlx::query_scalar(&sql).fetch_one(&mut *read).await?;
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(&server.pool)
+        .await?;
+    success_json(&(n, content))
+}
+"##;
+    assert!(
+        unspent_offenders(&viewer_taking_fns_in("fixture.rs", src)).is_empty(),
+        "the fn-level check passes this fn: it spends its viewer once"
+    );
+    assert_eq!(
+        tool_labels(&tool_unviewed(src), "content_beside_a_count"),
+        vec!["sqlx::query_scalar(SELECT).fetch_one"],
+        "the per-call scan reports exactly the unviewed content read"
+    );
+}
+
+/// The tool layer's handle shapes: the server's pool, its stamped read, a
+/// helper handed the server, a maintenance session, a transaction returned in
+/// a tuple, and a viewer the fn resolves itself.
+#[test]
+fn the_per_call_scanner_reads_the_tool_layer_shapes() {
+    let src = r##"
+pub async fn handles(server: &EpiGraphMcpFull, viewer: &epigraph_db::visibility::Viewer, id: Uuid) -> R {
+    let a = Repo::get(&server.pool, id).await?;
+    let b = Repo::get_as(&server.pool, viewer, id).await?;
+    let mut read = server.read_as(viewer, "handles").await?;
+    let c = Repo::get(&mut *read, id).await?;
+    let d = helper(server, id).await?;
+    let e = helper_as(server, viewer, id).await?;
+    let f = Repo::get_in(&mut *read, viewer.writable_groups()).await?;
+    read.commit().await?;
+    Ok((a, b, c, d, e, f))
+}
+
+pub async fn sessions(server: &EpiGraphMcpFull, viewer: &Viewer, id: Uuid) -> R {
+    let (mut tx, actor, _) = begin_claim_act(server, viewer, id).await?;
+    let g = Repo::write(&mut tx, id).await?;
+    let session = crate::maintenance::admin_cascade_session(server).await;
+    let h = Repo::cascade(&mut session, id).await?;
+    Ok((g, h, actor))
+}
+
+pub async fn resolves_its_own(server: &EpiGraphMcpFull, caller: Uuid) -> R {
+    let viewer = epigraph_db::visibility::Viewer::resolve(&server.pool, caller).await?;
+    let i = Repo::get_as(&server.pool, &viewer, caller).await?;
+    let j = Repo::get(&server.pool, caller).await?;
+    Ok((i, j))
+}
+
+pub async fn holds_no_viewer(server: &EpiGraphMcpFull, id: Uuid) -> R {
+    Repo::get(&server.pool, id).await
+}
+"##;
+    let m = tool_unviewed(src);
+    assert_eq!(
+        tool_labels(&m, "handles"),
+        vec!["Repo::get", "Repo::get", "Repo::get_in", "helper"],
+        "a raw-pool read, a read on the stamped connection that does not pass the \
+         viewer (stamping is not a spend), a helper handed the server, and a scalar \
+         projection of the viewer are all unviewed"
+    );
+    assert_eq!(
+        tool_labels(&m, "sessions"),
+        vec![
+            "Repo::cascade",
+            "Repo::write",
+            "maintenance::admin_cascade_session"
+        ],
+        "a transaction opened by a `begin*` helper (handed the viewer, so viewed) and \
+         returned in a tuple, and a maintenance session opened from the server, are \
+         connections; the session open is itself a call handed the server"
+    );
+    assert_eq!(
+        tool_labels(&m, "resolves_its_own"),
+        vec!["Repo::get", "Viewer::resolve"],
+        "a fn that resolves its own viewer holds it: its calls are measured against it"
+    );
+    assert!(
+        !m.contains_key(&("fixture.rs".to_string(), "holds_no_viewer".to_string())),
+        "a fn that holds no viewer is not in the population"
     );
 }
