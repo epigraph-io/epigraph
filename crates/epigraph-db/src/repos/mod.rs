@@ -83,6 +83,7 @@ pub mod paper;
 pub mod passkey;
 pub mod passkey_ceremony;
 pub mod pattern_template;
+pub mod person_team_group;
 pub mod perspective;
 pub mod policy;
 pub mod political;

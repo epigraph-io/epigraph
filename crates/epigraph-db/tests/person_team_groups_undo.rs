@@ -110,7 +110,8 @@ async fn the_263_undo_returns_the_catalog_below_263(pool: PgPool) {
         "fn epigraph_team_group_row_verbs_only()",
     ] {
         assert!(
-            added.iter().any(|e| e.starts_with(guard)) && removed.iter().any(|e| e.starts_with(guard)),
+            added.iter().any(|e| e.starts_with(guard))
+                && removed.iter().any(|e| e.starts_with(guard)),
             "CALIBRATION: 263 re-states {guard}: added {added:?} removed {removed:?}"
         );
     }
@@ -163,7 +164,10 @@ async fn as_app(pool: &PgPool, who: uuid::Uuid, sql: &str, arg: Option<uuid::Uui
     if let Some(x) = arg {
         q = q.bind(x);
     }
-    let id = q.fetch_one(&mut *tx).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let id = q
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
     tx.commit().await.expect("commit");
     id
 }
@@ -222,7 +226,10 @@ async fn the_263_undo_keeps_the_groups_and_memberships_it_made(pool: PgPool) {
     .await
     .expect("rows");
     live.sort_by(|x, y| x.1.cmp(&y.1));
-    assert_eq!(live, vec![(a, "admin".to_string()), (b, "writer".to_string())]);
+    assert_eq!(
+        live,
+        vec![(a, "admin".to_string()), (b, "writer".to_string())]
+    );
     let mut m = pool.acquire().await.expect("acquire");
     sqlx::query("SET SESSION AUTHORIZATION epigraph_maintenance")
         .execute(&mut *m)

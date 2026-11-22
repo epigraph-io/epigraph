@@ -55,7 +55,10 @@ fn message_of<T: std::fmt::Debug>(r: &Result<T, sqlx::Error>) -> String {
 }
 
 /// An application-role connection stamped with `principal` (or with none).
-async fn app_as(pool: &PgPool, principal: Option<Uuid>) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
+async fn app_as(
+    pool: &PgPool,
+    principal: Option<Uuid>,
+) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
     let mut conn = pool.acquire().await.expect("acquire");
     conn.execute("SET SESSION AUTHORIZATION epigraph_app")
         .await
@@ -278,7 +281,9 @@ async fn the_functions_are_app_callable_maintenance_owned_definers(pool: PgPool)
 
     let a = human(&pool, "catalog-a").await;
     let b = human(&pool, "catalog-b").await;
-    let group = create(&pool, Some(a), "Synthetic Catalog Team").await.expect("create");
+    let group = create(&pool, Some(a), "Synthetic Catalog Team")
+        .await
+        .expect("create");
     invite(&pool, a, group, b, "reader").await.expect("invite");
     for who in [Some(a), Some(b), None] {
         let mut c = app_as(&pool, who).await;
@@ -289,7 +294,11 @@ async fn the_functions_are_app_callable_maintenance_owned_definers(pool: PgPool)
         reset(c).await;
         assert_eq!(n, 0, "{who:?}: no invitation row is readable directly");
     }
-    assert_eq!(my_invitations(&pool, b).await.len(), 1, "POSITIVE CONTROL: through the read");
+    assert_eq!(
+        my_invitations(&pool, b).await.len(),
+        1,
+        "POSITIVE CONTROL: through the read"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -311,14 +320,31 @@ async fn a_person_creates_a_keyless_team_group_they_administer(pool: PgPool) {
         .await
         .expect("group row");
     assert_eq!(kind, "team");
-    assert_eq!(did, format!("did:epigraph:group:{group}"), "164's namespace");
+    assert_eq!(
+        did,
+        format!("did:epigraph:group:{group}"),
+        "164's namespace"
+    );
     assert_eq!(key_len, 0, "keyless");
     assert_eq!(epochs, 0, "no key epoch");
     assert_eq!(creator, a);
     assert_eq!(name, "Synthetic Working Group", "trimmed");
-    assert_eq!(rows(&pool, group, a).await, vec![("admin".to_string(), false)]);
-    assert!(reads(&pool, a, group).await, "the creator's viewer carries the group");
-    assert_eq!(my_groups(&pool, a).await.iter().filter(|g| g.0 == group).count(), 1);
+    assert_eq!(
+        rows(&pool, group, a).await,
+        vec![("admin".to_string(), false)]
+    );
+    assert!(
+        reads(&pool, a, group).await,
+        "the creator's viewer carries the group"
+    );
+    assert_eq!(
+        my_groups(&pool, a)
+            .await
+            .iter()
+            .filter(|g| g.0 == group)
+            .count(),
+        1
+    );
     assert!(
         my_groups(&pool, a)
             .await
@@ -332,7 +358,10 @@ async fn a_person_creates_a_keyless_team_group_they_administer(pool: PgPool) {
     assert_eq!(events[0].0, "group.team_created");
     assert_eq!(events[0].1, Some(a));
     assert_eq!(events[0].2["arm"], "person");
-    assert!(events[0].2.get("actor").is_none(), "no caller-settable actor is recorded");
+    assert!(
+        events[0].2.get("actor").is_none(),
+        "no caller-settable actor is recorded"
+    );
 
     // One active group per name per creator; another Person may reuse it.
     let r = create(&pool, Some(a), "synthetic working group").await;
@@ -375,35 +404,59 @@ async fn only_a_person_signed_in_as_themselves_creates(pool: PgPool) {
 async fn a_membership_goes_live_only_when_the_invitee_accepts(pool: PgPool) {
     let a = human(&pool, "flow-a").await;
     let b = human(&pool, "flow-b").await;
-    let group = create(&pool, Some(a), "Synthetic Flow Team").await.expect("create");
+    let group = create(&pool, Some(a), "Synthetic Flow Team")
+        .await
+        .expect("create");
 
     let invitation = invite(&pool, a, group, b, "writer").await.expect("invite");
-    assert!(rows(&pool, group, b).await.is_empty(), "no membership before consent");
-    assert!(!reads(&pool, b, group).await, "the invitee does not read the group yet");
+    assert!(
+        rows(&pool, group, b).await.is_empty(),
+        "no membership before consent"
+    );
+    assert!(
+        !reads(&pool, b, group).await,
+        "the invitee does not read the group yet"
+    );
     assert!(!my_groups(&pool, b).await.iter().any(|g| g.0 == group));
     assert_eq!(
         my_invitations(&pool, b).await,
         vec![(invitation, group, "writer".to_string(), a)]
     );
-    assert!(my_invitations(&pool, a).await.is_empty(), "only the invitee sees it");
-    assert_eq!(invitation_state(&pool, invitation).await, ("pending".to_string(), None));
+    assert!(
+        my_invitations(&pool, a).await.is_empty(),
+        "only the invitee sees it"
+    );
+    assert_eq!(
+        invitation_state(&pool, invitation).await,
+        ("pending".to_string(), None)
+    );
 
     let (g, membership, role) = accept(&pool, b, invitation).await.expect("accept");
     assert_eq!((g, role.as_str()), (group, "writer"));
-    assert_eq!(rows(&pool, group, b).await, vec![("writer".to_string(), false)]);
+    assert_eq!(
+        rows(&pool, group, b).await,
+        vec![("writer".to_string(), false)]
+    );
     assert!(reads(&pool, b, group).await, "live once accepted");
     assert_eq!(
         invitation_state(&pool, invitation).await,
         ("accepted".to_string(), Some(membership))
     );
     assert!(my_invitations(&pool, b).await.is_empty());
-    assert!(my_groups(&pool, b).await.iter().any(|x| x.0 == group && x.1 == "writer"));
+    assert!(my_groups(&pool, b)
+        .await
+        .iter()
+        .any(|x| x.0 == group && x.1 == "writer"));
 
     let events = audit(&pool, group).await;
     let kinds: Vec<&str> = events.iter().map(|e| e.0.as_str()).collect();
     assert_eq!(
         kinds,
-        vec!["group.team_created", "group.invitation_created", "group.member_added"]
+        vec![
+            "group.team_created",
+            "group.invitation_created",
+            "group.member_added"
+        ]
     );
     assert_eq!(events[1].1, Some(a), "the invitation is the inviter's act");
     assert_eq!(events[2].1, Some(b), "the acceptance is the invitee's act");
@@ -424,15 +477,24 @@ async fn a_membership_goes_live_only_when_the_invitee_accepts(pool: PgPool) {
 async fn a_declined_invitation_places_no_one_and_can_be_reissued(pool: PgPool) {
     let a = human(&pool, "decline-a").await;
     let b = human(&pool, "decline-b").await;
-    let group = create(&pool, Some(a), "Synthetic Decline Team").await.expect("create");
+    let group = create(&pool, Some(a), "Synthetic Decline Team")
+        .await
+        .expect("create");
     let invitation = invite(&pool, a, group, b, "reader").await.expect("invite");
     assert_eq!(decline(&pool, b, invitation).await.expect("decline"), group);
     assert_eq!(invitation_state(&pool, invitation).await.0, "declined");
-    assert!(rows(&pool, group, b).await.is_empty(), "declining places no one");
+    assert!(
+        rows(&pool, group, b).await.is_empty(),
+        "declining places no one"
+    );
     let r = accept(&pool, b, invitation).await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP05"), "{r:?}");
     assert_eq!(
-        audit(&pool, group).await.last().map(|e| e.0.clone()).as_deref(),
+        audit(&pool, group)
+            .await
+            .last()
+            .map(|e| e.0.clone())
+            .as_deref(),
         Some("group.invitation_declined")
     );
     let again = invite(&pool, a, group, b, "reader")
@@ -448,8 +510,12 @@ async fn only_a_live_admin_invites_and_only_a_person_is_invited(pool: PgPool) {
     let c = human(&pool, "who-inv-c").await;
     let outsider = human(&pool, "who-inv-out").await;
     let agent = operated(&pool, c, "who-inv-agent").await;
-    let group = create(&pool, Some(a), "Synthetic Who Team").await.expect("create");
-    let inv_b = invite(&pool, a, group, b, "writer").await.expect("invite b");
+    let group = create(&pool, Some(a), "Synthetic Who Team")
+        .await
+        .expect("create");
+    let inv_b = invite(&pool, a, group, b, "writer")
+        .await
+        .expect("invite b");
     accept(&pool, b, inv_b).await.expect("b joins as writer");
 
     // A writer is not an admin.
@@ -461,7 +527,14 @@ async fn only_a_live_admin_invites_and_only_a_person_is_invited(pool: PgPool) {
     let r = invite(&pool, outsider, Uuid::new_v4(), c, "reader").await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP08"), "{r:?}");
     // An operated agent cannot send one for its human either.
-    let r = invite(&pool, operated(&pool, a, "who-inv-a-agent").await, group, c, "reader").await;
+    let r = invite(
+        &pool,
+        operated(&pool, a, "who-inv-a-agent").await,
+        group,
+        c,
+        "reader",
+    )
+    .await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP01"), "{r:?}");
     // Only a Person is invited; a member or a pending invitee is not again.
     let r = invite(&pool, a, group, agent, "reader").await;
@@ -485,7 +558,9 @@ async fn only_the_invitee_answers_and_its_agent_cannot(pool: PgPool) {
     let b = human(&pool, "answer-b").await;
     let other = human(&pool, "answer-other").await;
     let b_agent = operated(&pool, b, "answer-b-agent").await;
-    let group = create(&pool, Some(a), "Synthetic Answer Team").await.expect("create");
+    let group = create(&pool, Some(a), "Synthetic Answer Team")
+        .await
+        .expect("create");
     let invitation = invite(&pool, a, group, b, "reader").await.expect("invite");
 
     for caller in [other, a] {
@@ -515,10 +590,16 @@ async fn an_invitation_lapses_with_its_sender_and_other_groups_take_none(pool: P
     let a = human(&pool, "lapse-a").await;
     let a2 = human(&pool, "lapse-a2").await;
     let b = human(&pool, "lapse-b").await;
-    let group = create(&pool, Some(a), "Synthetic Lapse Team").await.expect("create");
-    let inv_a2 = invite(&pool, a, group, a2, "admin").await.expect("invite a2");
+    let group = create(&pool, Some(a), "Synthetic Lapse Team")
+        .await
+        .expect("create");
+    let inv_a2 = invite(&pool, a, group, a2, "admin")
+        .await
+        .expect("invite a2");
     accept(&pool, a2, inv_a2).await.expect("a2 joins as admin");
-    let invitation = invite(&pool, a, group, b, "reader").await.expect("invite b");
+    let invitation = invite(&pool, a, group, b, "reader")
+        .await
+        .expect("invite b");
 
     // The operator's verb removes a, the invitation's sender.
     let mut m = pool.acquire().await.expect("acquire");
@@ -532,7 +613,9 @@ async fn an_invitation_lapses_with_its_sender_and_other_groups_take_none(pool: P
         .fetch_one(&mut *m)
         .await
         .expect("remove the sender");
-    m.execute("RESET SESSION AUTHORIZATION").await.expect("reset");
+    m.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
 
     let r = accept(&pool, b, invitation).await;
     assert_eq!(code_of(&r).as_deref(), Some("TGP05"), "{r:?}");
@@ -543,9 +626,15 @@ async fn an_invitation_lapses_with_its_sender_and_other_groups_take_none(pool: P
         Some("TGP04"),
         "the lapsed invitation is still pending until answered: {again:?}"
     );
-    decline(&pool, b, invitation).await.expect("decline the lapsed one");
-    let fresh = invite(&pool, a2, group, b, "reader").await.expect("a current admin re-invites");
-    accept(&pool, b, fresh).await.expect("POSITIVE CONTROL: then it is accepted");
+    decline(&pool, b, invitation)
+        .await
+        .expect("decline the lapsed one");
+    let fresh = invite(&pool, a2, group, b, "reader")
+        .await
+        .expect("a current admin re-invites");
+    accept(&pool, b, fresh)
+        .await
+        .expect("POSITIVE CONTROL: then it is accepted");
 
     // A personal group (its owner is its admin) takes no invitation.
     let (owner, personal) = fixture::seed_human_operator(&pool, "lapse-personal").await;
@@ -565,7 +654,10 @@ async fn the_guards_admit_only_the_definers_own_rows(pool: PgPool) {
     let group = create_on(&mut tx, "Synthetic Guard Team")
         .await
         .expect("create in the transaction");
-    sqlx::query("SAVEPOINT direct").execute(&mut *tx).await.unwrap();
+    sqlx::query("SAVEPOINT direct")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let r = sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
          VALUES ($1, $2, ''::bytea, 0, 'writer')",
@@ -584,7 +676,10 @@ async fn the_guards_admit_only_the_definers_own_rows(pool: PgPool) {
         ),
         "176's text, unchanged"
     );
-    sqlx::query("ROLLBACK TO SAVEPOINT direct").execute(&mut *tx).await.unwrap();
+    sqlx::query("ROLLBACK TO SAVEPOINT direct")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     let probe = Uuid::new_v4();
     let r = sqlx::query(
         "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
@@ -595,8 +690,14 @@ async fn the_guards_admit_only_the_definers_own_rows(pool: PgPool) {
     .execute(&mut *tx)
     .await;
     assert_eq!(code_of(&r).as_deref(), Some("42501"), "{r:?}");
-    assert!(message_of(&r).starts_with("GRM06: groups: a keyless team group"), "{r:?}");
-    sqlx::query("ROLLBACK TO SAVEPOINT direct").execute(&mut *tx).await.unwrap();
+    assert!(
+        message_of(&r).starts_with("GRM06: groups: a keyless team group"),
+        "{r:?}"
+    );
+    sqlx::query("ROLLBACK TO SAVEPOINT direct")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     // The group the definer made is NOT a grant for the creator's own direct
     // write either (an UPDATE of its admin row).
     let r = sqlx::query(
@@ -607,10 +708,15 @@ async fn the_guards_admit_only_the_definers_own_rows(pool: PgPool) {
     .execute(&mut *tx)
     .await;
     assert!(message_of(&r).starts_with("GRM05:"), "{r:?}");
-    sqlx::query("ROLLBACK TO SAVEPOINT direct").execute(&mut *tx).await.unwrap();
+    sqlx::query("ROLLBACK TO SAVEPOINT direct")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
     // No grant row is left in this transaction (read as the superuser,
     // still inside it).
-    tx.execute("RESET SESSION AUTHORIZATION").await.expect("reset in tx");
+    tx.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset in tx");
     let left: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM team_group_roster_grants WHERE xact_id = pg_current_xact_id()",
     )
@@ -625,7 +731,100 @@ async fn the_guards_admit_only_the_definers_own_rows(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(total, 0);
-    assert_eq!(rows(&pool, group, a).await, vec![("admin".to_string(), false)]);
+    assert_eq!(
+        rows(&pool, group, a).await,
+        vec![("admin".to_string(), false)]
+    );
     assert!(rows(&pool, group, b).await.is_empty());
 }
 
+/// `PersonTeamGroupRepository` answers each designed refusal by its kind (the
+/// one mapping the REST routes and the MCP tools share): authority, input and
+/// state as `Refused`, and a group or invitation the caller may not see as
+/// `NotFound`, exactly like a missing one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_repository_maps_each_refusal_by_kind(pool: PgPool) {
+    use epigraph_db::{DbError, PersonTeamGroupRepository as Repo, RefusalKind};
+    fn kind_of<T: std::fmt::Debug>(r: &Result<T, DbError>) -> String {
+        match r {
+            Err(DbError::Refused { kind, message }) => {
+                format!("{kind:?}:{}", message.split(':').next().unwrap_or(""))
+            }
+            Err(DbError::NotFound { entity, .. }) => format!("NotFound:{entity}"),
+            other => format!("{other:?}"),
+        }
+    }
+    let a = human(&pool, "repo-a").await;
+    let b = human(&pool, "repo-b").await;
+    let agent = operated(&pool, a, "repo-agent").await;
+
+    let mut c = app_as(&pool, Some(agent)).await;
+    let r = Repo::create_conn(&mut c, "Synthetic Repo Team", None).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP01", RefusalKind::Authority));
+    reset(c).await;
+
+    let mut c = app_as(&pool, Some(a)).await;
+    let group = Repo::create_conn(&mut c, "Synthetic Repo Team", Some("a reason"))
+        .await
+        .expect("create");
+    let r = Repo::create_conn(&mut c, "Synthetic Repo Team", None).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP06", RefusalKind::State));
+    let r = Repo::invite_conn(&mut c, group, agent, "reader", None).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP03", RefusalKind::Input));
+    let r = Repo::invite_conn(&mut c, group, b, "owner", None).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP09", RefusalKind::Input));
+    let missing = Uuid::new_v4();
+    let r = Repo::invite_conn(&mut c, missing, b, "reader", None).await;
+    assert!(
+        matches!(&r, Err(DbError::NotFound { entity, id }) if entity == "group" && *id == missing),
+        "{r:?}"
+    );
+    let invitation = Repo::invite_conn(&mut c, group, b, "writer", Some("join"))
+        .await
+        .expect("invite");
+    let r = Repo::accept_conn(&mut c, invitation).await;
+    assert!(
+        matches!(&r, Err(DbError::NotFound { entity, .. }) if entity == "invitation"),
+        "only the invitee sees it: {r:?}"
+    );
+    reset(c).await;
+
+    let mut c = app_as(&pool, Some(b)).await;
+    let mine = Repo::my_invitations_conn(&mut c)
+        .await
+        .expect("my invitations");
+    assert_eq!(mine.len(), 1);
+    assert_eq!(
+        (
+            mine[0].invitation_id,
+            mine[0].group_id,
+            mine[0].role.as_str(),
+            mine[0].invited_by
+        ),
+        (invitation, group, "writer", a)
+    );
+    assert_eq!(mine[0].display_name.as_deref(), Some("Synthetic Repo Team"));
+    assert_eq!(mine[0].reason.as_deref(), Some("join"));
+    let accepted = Repo::accept_conn(&mut c, invitation).await.expect("accept");
+    assert_eq!(
+        (accepted.group_id, accepted.role.as_str()),
+        (group, "writer")
+    );
+    let r = Repo::accept_conn(&mut c, invitation).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP05", RefusalKind::State));
+    let groups = Repo::my_groups_conn(&mut c).await.expect("my groups");
+    let g = groups.iter().find(|g| g.group_id == group).expect("listed");
+    assert_eq!(
+        (
+            g.kind.as_str(),
+            g.status.as_str(),
+            g.role.as_str(),
+            g.created_by,
+            g.invitable
+        ),
+        ("team", "active", "writer", Some(a), true)
+    );
+    let r = Repo::invite_conn(&mut c, group, a, "reader", None).await;
+    assert_eq!(kind_of(&r), format!("{:?}:TGP02", RefusalKind::Authority));
+    reset(c).await;
+}
