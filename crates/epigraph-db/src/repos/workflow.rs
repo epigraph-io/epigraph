@@ -772,7 +772,12 @@ impl WorkflowRepository {
     /// (`ClaimRepository::evolve_step_conn`), so the key read here is the key
     /// until this transaction ends. A writer that read a NULL lineage before a
     /// concurrent back-fill keys on the claim id, which is the key the
-    /// back-filling evolve holds, so it waits for that evolve as well.
+    /// back-filling evolve holds, so it waits for that evolve. The back-fill
+    /// gives the lineage a NEW id, so once that evolve commits the claim id is
+    /// a stale key that the next evolve of the lineage no longer takes; the
+    /// writer therefore re-reads the key after its lock is granted and also
+    /// takes the new one ([`Self::lock_step_lineage_shared`]) before it
+    /// inserts.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if a query fails.
@@ -819,33 +824,63 @@ impl WorkflowRepository {
     /// (`ReusedClaimOutsideCallerGroups`) and `link_hierarchical` reads its
     /// target first, so the refusal costs no legitimate writer anything.
     ///
+    /// The key is re-read after each lock is granted, and a changed key is
+    /// locked too, until two reads agree. A writer that read a NULL lineage
+    /// keys on the claim id and so queues behind an evolve back-filling that
+    /// claim's lineage; but the back-fill writes a NEW lineage id, so once that
+    /// evolve commits, the next evolve of the lineage keys on the new id and
+    /// would not wait for a writer holding only the claim id (review of
+    /// bf2e9aa6). The key only ever changes from NULL to a lineage id, once,
+    /// under the back-filling evolve's exclusive lock on the old key, so the
+    /// second read is final; the loop is bounded and refuses past the bound.
+    ///
     /// # Errors
-    /// `DbError::NotFound` when this session cannot read `claim_id`; a
-    /// database error if a query fails.
+    /// `DbError::NotFound` when this session cannot read `claim_id` (on either
+    /// read); `DbError::WriteRefused` if the key never settles; a database
+    /// error if a query fails.
     pub async fn lock_step_lineage_shared(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
     ) -> Result<(), DbError> {
-        let key: Option<Uuid> = sqlx::query_scalar(
-            "-- VISIBILITY-EXEMPT: WRITE path. The lineage key of the claim an executes edge is \
-             about to target, for the writer's advisory lock; never returned to a caller.\n\
-             SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1",
-        )
-        .bind(claim_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        let Some(key) = key else {
-            return Err(DbError::NotFound {
-                entity: "Claim".to_string(),
-                id: claim_id,
-            });
-        };
-        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2::uuid::text))")
+        // The key changes at most once (NULL to a lineage id), so the second
+        // read settles it; one spare pass guards against a reading this
+        // reasoning missed, and past it the write is refused, never let
+        // through on a key the evolve may not hold.
+        const MAX_LOCKS: usize = 3;
+        let mut locked: Option<Uuid> = None;
+        for _ in 0..MAX_LOCKS {
+            let key: Option<Uuid> = sqlx::query_scalar(
+                "-- VISIBILITY-EXEMPT: WRITE path. The lineage key of the claim an executes edge \
+                 is about to target, for the writer's advisory lock; never returned to a \
+                 caller.\n\
+                 SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1",
+            )
+            .bind(claim_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(key) = key else {
+                return Err(DbError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: claim_id,
+                });
+            };
+            if locked == Some(key) {
+                return Ok(());
+            }
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2::uuid::text))",
+            )
             .bind(STEP_LINEAGE_LOCK)
             .bind(key)
             .execute(&mut *conn)
             .await?;
-        Ok(())
+            locked = Some(key);
+        }
+        Err(DbError::WriteRefused {
+            entity: "Claim".to_string(),
+            id: claim_id,
+            action: "executes edge: step lineage key did not settle".to_string(),
+        })
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.
