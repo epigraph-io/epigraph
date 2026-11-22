@@ -1684,8 +1684,12 @@ group: the detach takes it out there too. Limits: an
 attachment made by name is not tied to a folder, so an identity attached by
 name in another group's folder whose model and prompt files are identical
 to ones this job can put back keeps the group when the job runs it, and is
-not found from this folder until it registers here; a copy written by hand
-stays the limit stated above.
+not found from this folder until it registers here (pinned by
+`group_role_membership.rs::an_identity_attached_by_name_elsewhere_is_found_from_the_folder_only_once_it_registers_there`;
+the "root of every copy" half of the list adds no identity whose copies
+count, since a copy counts only when its root runs in the holder's folder:
+`a_copy_counts_only_when_its_root_runs_in_the_holders_folder`); a copy
+written by hand stays the limit stated above.
 
 #### Recipe: a role-private group for a scheduled job
 

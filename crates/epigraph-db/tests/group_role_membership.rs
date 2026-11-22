@@ -5242,3 +5242,138 @@ async fn a_flattened_copy_below_a_detached_identity_admits_nothing(pool: PgPool)
         "CONTROL: P, attached by name"
     );
 }
+
+// =====================================================================
+// AN IDENTITY ATTACHED BY NAME IS NOT TIED TO A FOLDER (stated limits of 195,
+// pinned as they stand). The database has no notion of a host's lane: a row
+// made by name names an identity, wherever it runs. Recording the folder on
+// rows made by name is a design choice left to a ruling; these tests pin the
+// current behaviour that docs/tenancy.md states.
+// =====================================================================
+
+/// The identities with a prompt snapshot in `folder`.
+async fn folder_identities(pool: &PgPool, folder: &str) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT agent_id FROM agent_prompt_snapshots WHERE group_folder = $1",
+    )
+    .bind(folder)
+    .fetch_all(pool)
+    .await
+    .expect("folder identities");
+    ids.sort();
+    ids
+}
+
+/// AN IDENTITY ATTACHED BY NAME IN ANOTHER GROUP'S FOLDER. X runs only in
+/// another folder (`g-other`), linked to the job's human, and is attached by
+/// name: it holds the group although it never ran in the job's folder. Step
+/// A, listed from the job's folder (`g-job`), takes out the job's Q and does
+/// not find X. The job then runs X (the same model and prompt files give the
+/// same identity; the host registers it in `g-job`, Q named as its parent):
+/// it keeps the group. Only now does step A from `g-job` find X and take it
+/// out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identity_attached_by_name_elsewhere_is_found_from_the_folder_only_once_it_registers_there(
+    pool: PgPool,
+) {
+    let (h, _) = human(&pool, "t249-cross-folder-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Cross Folder Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let x_key = identity_key();
+    let x = register_in(&pool, &x_key, None, "g-other").await;
+    link_to(&pool, x, h).await;
+    attach_to_role(&pool, ROLE, x).await;
+    assert!(
+        !folder_identities(&pool, "g-job").await.contains(&x),
+        "PREMISE: X has never run in g-job"
+    );
+    assert_eq!(
+        resolves(&pool, x, group).await,
+        (true, true),
+        "X, attached by name, holds the group without ever running in the job's folder"
+    );
+
+    let first = step_a(&pool, group, "g-job").await;
+    assert_eq!(
+        first,
+        vec![(ROLE.to_string(), q)],
+        "step A from g-job finds Q only"
+    );
+    assert_eq!(resolves(&pool, q, group).await, (false, false), "Q is out");
+    assert_eq!(
+        resolves(&pool, x, group).await,
+        (true, true),
+        "X, not found from g-job, keeps the group"
+    );
+
+    assert_eq!(register_in(&pool, &x_key, Some(q), "g-job").await, x);
+    assert_eq!(
+        resolves(&pool, x, group).await,
+        (true, true),
+        "the job runs X in g-job and keeps the group"
+    );
+    let second = step_a(&pool, group, "g-job").await;
+    assert_eq!(
+        second,
+        vec![(ROLE.to_string(), x)],
+        "once X registers in g-job, step A from g-job finds it"
+    );
+    assert_eq!(resolves(&pool, x, group).await, (false, false), "X is out");
+}
+
+/// STEP A'S "CHAINS UP TO" HALF. Step A lists every identity with a snapshot
+/// in the job's folder AND the root of every un-detached copy they hold;
+/// docs/tenancy.md argues the second half adds no identity whose copies
+/// admit anything, because a copy counts only when the root of its chain
+/// runs in the copy holder's folder. X runs only in `g-other` and is attached
+/// by name; Y, registered in `g-job` below X, holds a copy rooted at X and is
+/// OUT although X is in. Once X also runs in `g-job`, Y is in, and X is then
+/// an identity of the folder itself: every root of a copy that admits
+/// anything in `g-job` is a `g-job` identity. Detaching it takes Y out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_copy_counts_only_when_its_root_runs_in_the_holders_folder(pool: PgPool) {
+    let (h, _) = human(&pool, "t249-chains-up-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Chains Up Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let x_key = identity_key();
+    let x = register_in(&pool, &x_key, None, "g-other").await;
+    link_to(&pool, x, h).await;
+    attach_to_role(&pool, ROLE, x).await;
+    let y = register_in(&pool, &identity_key(), Some(x), "g-job").await;
+    assert_eq!(
+        copy_source(&pool, y).await,
+        Some(live_attachment(&pool, x).await),
+        "PREMISE: Y's copy is rooted at X's row made by name"
+    );
+    assert_eq!(resolves(&pool, x, group).await, (true, true), "PREMISE: X");
+    assert!(
+        !folder_identities(&pool, "g-job").await.contains(&x),
+        "PREMISE: X has never run in g-job"
+    );
+    assert_eq!(
+        resolves(&pool, y, group).await,
+        (false, false),
+        "a copy whose root never ran in the holder's folder admits nothing"
+    );
+
+    assert_eq!(register_in(&pool, &x_key, None, "g-job").await, x);
+    assert!(
+        folder_identities(&pool, "g-job").await.contains(&x),
+        "X now runs in g-job"
+    );
+    assert_eq!(
+        resolves(&pool, y, group).await,
+        (true, true),
+        "once its root runs in the holder's folder, the copy admits Y"
+    );
+
+    assert_eq!(detach_from_role(&pool, ROLE, x).await, 1, "X detached");
+    assert_eq!(
+        resolves(&pool, y, group).await,
+        (false, false),
+        "detaching the folder identity at the root takes Y out"
+    );
+}
