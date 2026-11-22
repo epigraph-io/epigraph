@@ -28,6 +28,8 @@
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+#[path = "support/maintenance_login.rs"]
+mod login;
 #[path = "support/retracted_bba_fixture.rs"]
 mod retracted;
 
@@ -552,34 +554,156 @@ async fn grant_table_exists(pool: &PgPool) {
     );
 }
 
-/// (d) THE RESIDUAL, pinned as documented (SPEC §2.8, §7.1 "Maintenance
-/// logins", SF-18): the maintenance role holds INSERT on the grant table
-/// because its definers need it, so a maintenance session that writes a grant
-/// row for the current transaction can then delete the retracted row,
-/// outside the audited definer. H10 defends against every non-maintenance
-/// session; it does not defend against this (OD-9 is the tightening).
-#[sqlx::test(migrations = "../../migrations")]
-async fn d_residual_a_maintenance_session_that_writes_a_grant_row_can_delete(pool: PgPool) {
-    grant_table_exists(&pool).await;
-    let w = world(&pool).await;
-    let m = maintenance(&pool).await;
-    let mut tx = m.begin().await.unwrap();
-    sqlx::query(
-        "INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, 'residual')",
-    )
-    .bind(w.retracted)
-    .execute(&mut *tx)
-    .await
-    .expect("the maintenance role holds INSERT on the grant table");
-    let n = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
-        .bind(w.retracted)
+/// The statements a session could run on the grant table, each of which 251
+/// refuses every maintenance session (42501, nothing written or read).
+const GRANT_TABLE_STATEMENTS: &[(&str, &str)] = &[
+    (
+        "INSERT",
+        "INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, 'forged')",
+    ),
+    (
+        "UPDATE",
+        "UPDATE public.mass_function_purge_grants SET reason = 'x' WHERE mf_id = $1",
+    ),
+    (
+        "DELETE",
+        "DELETE FROM public.mass_function_purge_grants WHERE mf_id = $1",
+    ),
+    (
+        "SELECT",
+        "SELECT count(*) FROM public.mass_function_purge_grants WHERE mf_id = $1",
+    ),
+];
+
+/// One maintenance session's attempt on the residual 194 recorded: write a
+/// purge grant for the retracted row itself, then delete the row, in ONE
+/// transaction. Every grant-table statement must be refused 42501 and the
+/// delete SR09, with the row left in place.
+async fn assert_no_forged_purge(session: &PgPool, pool: &PgPool, w: &World, who: &str) {
+    for (what, sql) in GRANT_TABLE_STATEMENTS {
+        let mut tx = session.begin().await.unwrap();
+        let r = sqlx::query(sql).bind(w.retracted).execute(&mut *tx).await;
+        let (code, message) = refusal(r, &format!("{who}: {what} on the grant table"));
+        assert_eq!(
+            code, "42501",
+            "{who}: {what} on the grant table is a privilege refusal: {message}"
+        );
+        assert!(
+            message.contains("mass_function_purge_grants"),
+            "{who}: {what}: {message}"
+        );
+        tx.rollback().await.unwrap();
+    }
+    // The attack as one transaction: whatever the grant attempt did, the
+    // delete that follows it in the same transaction is refused SR09.
+    let mut tx = session.begin().await.unwrap();
+    sqlx::query("SAVEPOINT forge")
         .execute(&mut *tx)
         .await
-        .expect("a grant for this transaction admits the delete")
-        .rows_affected();
-    tx.commit().await.unwrap();
-    assert_eq!(n, 1);
+        .unwrap();
+    let forged = sqlx::query(GRANT_TABLE_STATEMENTS[0].1)
+        .bind(w.retracted)
+        .execute(&mut *tx)
+        .await;
+    assert!(forged.is_err(), "{who}: the forged grant is refused");
+    sqlx::query("ROLLBACK TO SAVEPOINT forge")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let r = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+        .bind(w.retracted)
+        .execute(&mut *tx)
+        .await;
+    assert_sr09(
+        refusal(r, &format!("{who}: delete after a forged grant")),
+        who,
+    );
+    tx.rollback().await.unwrap();
+    assert!(
+        exists(pool, "mass_functions", w.retracted).await,
+        "{who}: the retracted row survives"
+    );
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'mass_functions.purge'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(audits, 0, "{who}: nothing was purged");
+}
+
+/// (d) THE RESIDUAL 194 RECORDED, CLOSED BY 251 (backlog 6bdac68f): before
+/// 251 the maintenance role held INSERT on the grant table (its definers
+/// needed it), so any maintenance session could write a grant row for the
+/// current transaction and then delete a retracted row outside the audited
+/// definer. Since 251 the definers' owner is `epigraph_bba_guard_owner`, a
+/// NOLOGIN role no login can act as, and the maintenance role holds nothing on
+/// the table. Checked on BOTH maintenance shapes: the role itself (`SET
+/// SESSION AUTHORIZATION epigraph_maintenance`) and a REAL NOSUPERUSER login
+/// that is a member of it, connected with its own password (its
+/// `current_user` is the login, as in production).
+#[sqlx::test(migrations = "../../migrations")]
+async fn d_a_maintenance_session_cannot_forge_a_purge_grant(pool: PgPool) {
+    grant_table_exists(&pool).await;
+    let w = world(&pool).await;
+
+    let m = maintenance(&pool).await;
+    assert_no_forged_purge(&m, &pool, &w, "the maintenance role").await;
+
+    let (role, login) = login::maintenance_login(&pool, "t63d").await;
+    assert_no_forged_purge(&login, &pool, &w, "a maintenance login").await;
+    login::drop_login(&pool, &role, login).await;
+}
+
+/// (d3) The purge definer still works for a REAL maintenance login after 251
+/// moved it off the maintenance role: it deletes the retracted row, writes one
+/// `mass_functions.purge` row and leaves no grant behind.
+#[sqlx::test(migrations = "../../migrations")]
+async fn d3_a_maintenance_login_still_purges_through_the_definer(pool: PgPool) {
+    proc_exists(&pool, PURGE_DEFINER).await;
+    let w = world(&pool).await;
+    let (role, login) = login::maintenance_login(&pool, "t63p").await;
+    let n = sqlx::query_scalar::<_, i32>("SELECT public.epigraph_purge_mass_functions($1, $2)")
+        .bind(vec![w.retracted])
+        .bind("t63 login purge")
+        .fetch_one(&login)
+        .await;
+    login::drop_login(&pool, &role, login).await;
+    assert_eq!(n.expect("the maintenance login purges"), 1);
     assert!(!exists(&pool, "mass_functions", w.retracted).await);
+    let (grants, audits): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM public.mass_function_purge_grants),                 (SELECT count(*) FROM security_events \
+                  WHERE event_type = 'mass_functions.purge' \
+                    AND details->>'reason' = 't63 login purge')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((grants, audits), (0, 1), "no grant left, one audit row");
+}
+
+/// Write a purge grant for `id` the only way a test still can since 251: as
+/// the definers' owner, on the harness transaction (`SET LOCAL ROLE`), then
+/// back to the maintenance role for what follows.
+async fn grant_as_owner(tx: &mut PgConnection, id: Uuid, reason: &str) {
+    sqlx::query("SET LOCAL ROLE epigraph_bba_guard_owner")
+        .execute(&mut *tx)
+        .await
+        .expect("act as the definers' owner (harness superuser)");
+    sqlx::query("INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, $2)")
+        .bind(id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .expect("the definers' owner writes a grant");
+    sqlx::query("RESET ROLE")
+        .execute(&mut *tx)
+        .await
+        .expect("RESET ROLE");
+    sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_maintenance")
+        .execute(&mut *tx)
+        .await
+        .expect("continue as the maintenance role");
 }
 
 /// (d2) A grant admits ONLY the row it names: the helper matches
@@ -595,15 +719,8 @@ async fn d2_a_grant_admits_only_the_row_it_names(pool: PgPool) {
     let r2 = bba(&pool, w.claim, w.frame, third, None).await;
     retracted::retract_through_definer(&pool, r2).await;
 
-    let m = maintenance(&pool).await;
-    let mut tx = m.begin().await.unwrap();
-    sqlx::query(
-        "INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, 'one row')",
-    )
-    .bind(w.retracted)
-    .execute(&mut *tx)
-    .await
-    .expect("the maintenance role holds INSERT on the grant table");
+    let mut tx = pool.begin().await.unwrap();
+    grant_as_owner(&mut tx, w.retracted, "one row").await;
     let r = sqlx::query("DELETE FROM mass_functions WHERE id = ANY($1)")
         .bind(vec![w.retracted, r2])
         .execute(&mut *tx)
@@ -630,13 +747,11 @@ async fn f_a_grant_from_an_earlier_transaction_admits_no_delete(pool: PgPool) {
     grant_table_exists(&pool).await;
     let w = world(&pool).await;
     let m = maintenance(&pool).await;
-    sqlx::query(
-        "INSERT INTO public.mass_function_purge_grants (mf_id, reason) VALUES ($1, 'stale')",
-    )
-    .bind(w.retracted)
-    .execute(&m)
-    .await
-    .expect("a grant row committed in its own transaction");
+    let mut tx = pool.begin().await.unwrap();
+    grant_as_owner(&mut tx, w.retracted, "stale").await;
+    tx.commit()
+        .await
+        .expect("a grant row committed in its own transaction");
     let r = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
         .bind(w.retracted)
         .execute(&m)
@@ -1166,7 +1281,8 @@ async fn at_head_the_rebody_and_the_new_definers_pin_pg_temp_last(pool: PgPool) 
             "{sig}"
         );
         if definer {
-            assert_eq!(owner, "epigraph_maintenance", "{sig} owner");
+            // 251 (backlog 6bdac68f): the NOLOGIN owner no login can act as.
+            assert_eq!(owner, "epigraph_bba_guard_owner", "{sig} owner");
         }
     }
     let trigger: (String, bool) = sqlx::query_as(

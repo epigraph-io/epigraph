@@ -3403,6 +3403,39 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **251**: public `retracted_bba_guard_owner` (backlog 6bdac68f). Closes the residual 184
+  and 194 recorded: a maintenance login could write a row of `mass_function_purge_grants`
+  itself (the maintenance role held INSERT on it because its definers needed it) and then
+  delete a retracted BBA with no `mass_functions.purge` audit row, and could set
+  `epigraph.mf_unretract_id` and clear a retraction with no `mass_functions.unretract` row
+  (184's clear guard admitted any statement run as the maintenance role). Creates
+  `epigraph_bba_guard_owner` (NOLOGIN, no attribute, a member of `epigraph_maintenance` with
+  INHERIT, granted to nothing) and `epigraph_bba_guard_owner_faults()` (SECURITY INVOKER,
+  runner-owned, EXECUTE revoked from PUBLIC: every way the role could be abused, `{}` when
+  sound). Re-owns `epigraph_mf_purge_granted`, `epigraph_purge_mass_functions` and
+  `epigraph_unretract_mass_function` to it (bodies and settings unchanged; the maintenance
+  role's EXECUTE re-granted, which OWNER TO had moved to the new owner; 194's FK-cascade
+  invoker grant re-stated); `REVOKE ALL` on the grant table from `epigraph_maintenance` and
+  `GRANT SELECT, INSERT, DELETE` to the new role (the table stays the runner's). Re-bodies
+  184's `epigraph_mass_function_retract_guard()` with one delta: the clear arm admits only
+  `current_user = 'epigraph_bba_guard_owner'` (plus the marker), not
+  `epigraph_definer_bypass()`; an md5 precondition (184's body and path) refuses `55000`
+  over any other. Refuses `55000` over an existing owner role with a fault, and `42501` on a
+  migration login that may not create the role, grant it or re-own to it (a superuser
+  migration login is required). With no `epigraph_maintenance` role it NOTICEs and only the
+  re-body applies. Not changed: 184's MARK arm still admits a maintenance session (it can
+  retract without audit), and maintenance-owned INVOKER triggers on `mass_functions` keep
+  their owner (their bodies cannot be replaced without CREATE on `public`). Pinned by
+  `epigraph-db/tests/bba_guard_owner.rs` (isolation and ownership at head, the fault check
+  calibrated on a reachable role, the guard body before and after, both refusals, the
+  undo), `mass_function_purge_guard.rs` (d: a forged grant and the delete after it, on the
+  maintenance role and on a real NOSUPERUSER login; d3: the purge still works for such a
+  login), `bba_retract.rs::a_maintenance_login_cannot_clear_a_retraction_but_the_definer_still_can`,
+  `schema_contract.rs` and the register test in `epigraph-cli`'s `tenancy_backfill.rs`.
+  Undo: `docs/runbooks/251-undo.sql` (leaves the role; names the statement that drops it).
+  Slot assigned by the 2026-11-22 backlog triage; checked before claiming: no migration on
+  main or any origin branch carries a `251`. **Deploy order:** none required; no binary
+  changes. **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

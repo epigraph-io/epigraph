@@ -869,8 +869,9 @@ impl MassFunctionRepository {
     /// masses it was retracted with (a retracted row's assessment cannot
     /// change, and a write to its key is refused).
     ///
-    /// Calls `public.epigraph_unretract_mass_function`, a maintenance-owned
-    /// SECURITY DEFINER, on `conn`, stamped from the CALLER's own viewer as for
+    /// Calls `public.epigraph_unretract_mass_function`, a SECURITY DEFINER
+    /// owned by `epigraph_bba_guard_owner` (migration 251: a NOLOGIN member of
+    /// the maintenance role that no login can act as), on `conn`, stamped from the CALLER's own viewer as for
     /// [`Self::retract_conn`], with the same authority: a writer of the row's
     /// owning group, or a token whose client record holds a live
     /// `claims:admin` grant bound to the principal. Authority is checked

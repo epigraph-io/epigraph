@@ -16,6 +16,8 @@
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+#[path = "support/maintenance_login.rs"]
+mod login;
 
 use epigraph_db::repos::atom_axiom::atom_input_rows;
 use epigraph_db::repos::compound_valuation::compound_own_rows;
@@ -1602,4 +1604,92 @@ async fn no_session_clears_a_retraction_outside_the_unretract_definer(pool: PgPo
         (true, Some(w.owner), Some("superseded".to_string()))
     );
     assert!(unretract_rows(&pool, id).await.is_empty());
+}
+
+/// Backlog 6bdac68f (migration 251): a MAINTENANCE session cannot clear a
+/// retraction outside the un-retract definer either. Before 251 the clear
+/// guard admitted any statement run "as the maintenance role"
+/// (`epigraph_definer_bypass()`) that also set `epigraph.mf_unretract_id`,
+/// and a maintenance login is the maintenance role, so it could set the marker
+/// and UPDATE the retract columns to NULL with no audit row. Since 251 the
+/// clear is admitted only inside the un-retract definer, whose owner
+/// (`epigraph_bba_guard_owner`) no login can act as. Checked on a REAL
+/// NOSUPERUSER login connected with its own password, and on the maintenance
+/// role itself; then the same login un-retracts through the definer (stamped
+/// as the owner), which still works and audits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_login_cannot_clear_a_retraction_but_the_definer_still_can(pool: PgPool) {
+    let w = world(&pool).await;
+    let p = pool.clone();
+    let (owner, id) = (w.owner, w.owner_bba);
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        MassFunctionRepository::retract_conn(&mut conn, id, "superseded", None)
+            .await
+            .expect("the owner retracts its BBA");
+        (conn, ())
+    })
+    .await;
+
+    const CLEAR: &str = "UPDATE mass_functions \
+                            SET retracted_at = NULL, retracted_by = NULL, retract_reason = NULL \
+                          WHERE id = $1";
+    let (role, login) = login::maintenance_login(&pool, "t63u").await;
+
+    // The forged clear, on the login: the marker set for this transaction,
+    // then the UPDATE.
+    let mut tx = login.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.mf_unretract_id', $1, true)")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("any session sets the marker");
+    let forged = sqlx::query(CLEAR).bind(id).execute(&mut *tx).await;
+    drop(tx);
+
+    // The same on the maintenance role itself.
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let mut tx = maint.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.mf_unretract_id', $1, true)")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("set the marker");
+    let forged_role = sqlx::query(CLEAR).bind(id).execute(&mut *tx).await;
+    drop(tx);
+    maint.close().await;
+
+    let state_after_forgery = retract_columns(&pool, id).await;
+    let audits_after_forgery = unretract_rows(&pool, id).await.len();
+
+    // The definer, on the same login, stamped as the BBA's owner.
+    let mut conn = login.acquire().await.expect("acquire");
+    stamp(&mut conn, &pool, owner).await;
+    let unretracted =
+        MassFunctionRepository::unretract_conn(&mut conn, id, "maintenance un-retract", None).await;
+    drop(conn);
+    login::drop_login(&pool, &role, login).await;
+
+    for (who, r) in [
+        ("a maintenance login", forged),
+        ("the maintenance role", forged_role),
+    ] {
+        let (code, message) = db_message(r, &format!("{who} cannot forge the clear"));
+        assert_eq!(code, "42501", "{who}: {message}");
+        assert!(message.contains("RT06"), "{who}: {message}");
+    }
+    assert_eq!(
+        state_after_forgery,
+        (true, Some(w.owner), Some("superseded".to_string())),
+        "the forged clears changed nothing"
+    );
+    assert_eq!(audits_after_forgery, 0);
+
+    let unretracted = unretracted.expect("the un-retract definer works on a maintenance login");
+    assert_eq!(unretracted.status, BbaUnretractStatus::Unretracted);
+    assert_eq!(unretracted.arm, BbaRetractArm::Owner);
+    assert_eq!(retract_columns(&pool, id).await, (false, None, None));
+    let audit = unretract_rows(&pool, id).await;
+    assert_eq!(audit.len(), 1, "the definer audits once: {audit:#?}");
+    assert_eq!(audit[0].1["reason"], "maintenance un-retract");
 }

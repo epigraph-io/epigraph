@@ -4131,10 +4131,12 @@ async fn migration_191_retire_operator_link_is_owned_and_granted(pool: PgPool) {
 
 /// Migration 194 (H10; SPEC §2.8, §7.1 "New tables"): the purge-grant table is
 /// no application role's to read or write (077's default privileges would
-/// otherwise grant `epigraph_app` everything on a new table), the maintenance
-/// role holds exactly what its two definers need, the table stays owned by
-/// the migration runner, and the purge definer is executable by the
-/// maintenance role alone.
+/// otherwise grant `epigraph_app` everything on a new table), the table stays
+/// owned by the migration runner, and the purge definer is executable by the
+/// maintenance role alone. Since 251 (backlog 6bdac68f) the two definers are
+/// owned by `epigraph_bba_guard_owner`, which alone holds what they need on
+/// the table; the maintenance role holds nothing on it, so a maintenance login
+/// cannot write a grant itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_maintenance_only(
     pool: PgPool,
@@ -4179,10 +4181,21 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
                 .fetch_one(&pool)
                 .await
                 .expect("privilege");
+        assert!(
+            !maintenance,
+            "epigraph_maintenance must hold no {privilege} on {table} (251)"
+        );
+        let guard_owner: bool =
+            sqlx::query_scalar("SELECT has_table_privilege('epigraph_bba_guard_owner', $1, $2)")
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .expect("privilege");
         assert_eq!(
-            maintenance,
+            guard_owner,
             matches!(privilege, "SELECT" | "INSERT" | "DELETE"),
-            "epigraph_maintenance {privilege} on {table}"
+            "epigraph_bba_guard_owner {privilege} on {table}"
         );
     }
     let column_level: bool = sqlx::query_scalar(
@@ -4212,7 +4225,7 @@ async fn migration_194_purge_grants_are_no_app_privilege_and_the_purge_is_mainte
         .await
         .unwrap_or_else(|e| panic!("{signature} must exist (migration 194): {e}"));
         assert!(secdef, "{signature} is SECURITY DEFINER");
-        assert_eq!(owner, "epigraph_maintenance", "{signature} owner");
+        assert_eq!(owner, "epigraph_bba_guard_owner", "{signature} owner (251)");
         assert!(
             acl.is_some(),
             "{signature} carries an explicit ACL (no PUBLIC default)"
