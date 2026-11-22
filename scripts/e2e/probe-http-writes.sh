@@ -221,7 +221,8 @@ if want propagate; then
   }
   bp owner/own-factor "$T_OWNER" "$P2"
   # A factor naming an id that is not a claim (`factors.variable_ids` has no
-  # foreign key): the apply must skip it and still write the real claims.
+  # foreign key): it is not loaded (backlog 073d24a3), and the apply still
+  # writes the real claims.
   q "UPDATE claims SET pignistic_prob = 0.9 WHERE id = '$P1'; UPDATE claims SET pignistic_prob = 0.2 WHERE id = '$P2'" >/dev/null
   q "INSERT INTO factors (factor_type, variable_ids, potential) VALUES ('evidential_support', ARRAY['$P2', gen_random_uuid()]::uuid[], '{\"strength\":0.9}')" >/dev/null
   bp owner/own+stale-factor "$T_OWNER" "$P2"

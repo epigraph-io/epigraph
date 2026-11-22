@@ -593,6 +593,12 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 /// written. A claim the caller can see but not WRITE is still refused (403),
 /// and the whole apply is rolled back.
 ///
+/// Since backlog 073d24a3 the loader (`FactorRepository::load_bp_scope`) no
+/// longer loads a factor naming such an id at all, for read-only runs and
+/// applies alike, so this check is a backstop: `skipped_not_visible` counts
+/// only a claim the caller stopped being able to see between the load and
+/// this transaction, and is otherwise 0.
+///
 /// # A COMPOUND is never written (SPEC §1.3 D4)
 ///
 /// Under atom-level belief a compound (`claim_role::IS_COMPOUND_SQL`; in
@@ -1061,11 +1067,13 @@ where
 /// When it is on, the results are written all-or-nothing on a
 /// transaction stamped with the caller's viewer (`apply_bp_updates`): a claim
 /// the caller can see but not write fails the request (403) and nothing is
-/// written. A BP variable that is not a claim the caller can see (a stale
-/// factor id, or another group's private claim) is skipped. `applied_count` is
-/// the number of claims written, `skipped_not_visible` the number skipped as
-/// not visible and `skipped_compounds` the number skipped as compounds (D4);
-/// `updated_beliefs` lists what BP computed, which is not the same list.
+/// written. A factor naming an id that is not a claim the caller can read (a
+/// stale factor id, or another group's private claim), or minted from an edge
+/// the caller cannot read, is not loaded at all (backlog 073d24a3).
+/// `applied_count` is the number of claims written, `skipped_not_visible` the
+/// number skipped as no longer visible at write time (otherwise 0) and
+/// `skipped_compounds` the number skipped as compounds (D4); `updated_beliefs`
+/// lists what BP computed, which is not the same list.
 ///
 /// A read-only run needs no scope beyond the bearer. `apply_updates: true`
 /// writes beliefs, so it needs `claims:write` (403 otherwise, before the
