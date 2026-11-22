@@ -3423,7 +3423,14 @@ restart.
   Undo: `docs/runbooks/236-undo.sql`. **Deploy order: BINARIES FIRST.** A binary that
   predates 236 resolves every viewer to public-only and refuses every delegated run token on a
   database with 236. That includes every service linking an older `epigraph-db` (bump its
-  pin first). **Applied to throwaway databases only, NOT to any deployed database.**
+  pin first). `EPIGRAPH_MIGRATE_ON_BOOT` applies every embedded migration too, so the first
+  restarted server of a 236-embedding build would apply 236 before the other binaries are
+  upgraded: unset it on every unit for this rollout and apply 236 with `epigraph-migrate`
+  only once every viewer-resolving binary is upgraded (or ship the binary change in a
+  release before the one that embeds 236). The team lists `epigraph_writable_teams(agent)` /
+  `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
+  open residual for a separate change). **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 

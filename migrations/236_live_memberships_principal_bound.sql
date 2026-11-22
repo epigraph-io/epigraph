@@ -87,6 +87,13 @@
 -- first; the new binaries work against 235's body as well (stamping the
 -- principal changes nothing there). Then migrate.
 --
+-- `EPIGRAPH_MIGRATE_ON_BOOT` applies every embedded migration, as
+-- `epigraph-migrate` does: the first server restarted on a build that embeds
+-- this file would apply it before the other binaries are upgraded. Unset it
+-- on every unit for this rollout and apply this file with `epigraph-migrate`
+-- last (or ship the binary change in a release before the one that embeds
+-- this file).
+--
 -- ===================================================================
 -- 6. PRECONDITION, OWNER, GRANTS
 --
