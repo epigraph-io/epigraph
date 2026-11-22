@@ -1324,7 +1324,7 @@ async fn supporting_evidence_filters_the_evidence_row_and_the_edge_independently
     .expect("privatise edge row");
 
     let owner_rows =
-        EvidenceRepository::by_relationship_for_claim(&pool, &owner, claim, "SUPPORTS")
+        EvidenceRepository::by_relationship_for_claim(&pool, &owner, claim, &["SUPPORTS"])
             .await
             .expect("owner supporting evidence");
     let owner_ids: Vec<Uuid> = owner_rows.iter().map(|r| r.evidence_id).collect();
@@ -1336,7 +1336,7 @@ async fn supporting_evidence_filters_the_evidence_row_and_the_edge_independently
     }
 
     let stranger_rows =
-        EvidenceRepository::by_relationship_for_claim(&pool, &stranger, claim, "SUPPORTS")
+        EvidenceRepository::by_relationship_for_claim(&pool, &stranger, claim, &["SUPPORTS"])
             .await
             .expect("stranger supporting evidence");
     let stranger_ids: Vec<Uuid> = stranger_rows.iter().map(|r| r.evidence_id).collect();

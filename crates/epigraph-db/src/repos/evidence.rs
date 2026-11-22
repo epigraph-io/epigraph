@@ -1229,14 +1229,21 @@ impl EvidenceRepository {
         Ok(q.fetch_all(executor).await?.into_iter().collect())
     }
 
-    /// Evidence linked to `claim_id` by an edge with the given `relationship`.
+    /// Evidence linked to `claim_id` by an edge with any of `relationships`.
     ///
     /// A case-folded relationship (`epigraph_core::edge::relationships::
-    /// CASE_FOLDED_RELATIONSHIPS`) matches BOTH stored spellings: the routes
-    /// pass `"SUPPORTS"` / `"CONTRADICTS"`, the DS writers store upper case and
-    /// MCP stores lower case, and both are the same relationship. Any other
-    /// relationship still matches byte-exactly. The spellings bind as an array
-    /// so the btree index on `edges.relationship` stays usable.
+    /// CASE_FOLDED_RELATIONSHIPS`) matches BOTH stored spellings: the DS
+    /// writers stored upper case, MCP and the evidence writers store lower
+    /// case, and both are the same relationship. Any other relationship still
+    /// matches byte-exactly. All the spellings bind as one array so the btree
+    /// index on `edges.relationship` stays usable.
+    ///
+    /// Several relationships, not one, because one direction can be stored
+    /// under more than one relationship: the supporting-evidence route passes
+    /// `supports`, and the contradicting-evidence route passes `contradicts`
+    /// AND `refutes` (`repos::edge::WEAKENING_RELATIONSHIPS`), since every
+    /// evidence write stores its refuting edge as `refutes` (backlog 2d60f619)
+    /// while older rows say `CONTRADICTS` (backlog 548a3c42).
     ///
     /// Backs `GET /api/v1/claims/:id/supporting-evidence` and
     /// `…/contradicting-evidence`. Both the edge and the evidence row are
@@ -1252,7 +1259,7 @@ impl EvidenceRepository {
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
-        relationship: &str,
+        relationships: &[&str],
     ) -> Result<Vec<EvidenceEdgeRow>, DbError> {
         let sql = viewer.splice(
             "SELECT ed.id as edge_id, ev.id as evidence_id, \
@@ -1270,7 +1277,10 @@ impl EvidenceRepository {
              LIMIT 100",
             3,
         );
-        let spellings = epigraph_core::edge::relationships::relationship_spellings(relationship);
+        let spellings: Vec<String> = relationships
+            .iter()
+            .flat_map(|r| epigraph_core::edge::relationships::relationship_spellings(r))
+            .collect();
         let mut q = sqlx::query_as::<_, EvidenceEdgeRow>(&sql)
             .bind(claim_id)
             .bind(&spellings);

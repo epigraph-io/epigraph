@@ -204,7 +204,7 @@ async fn probe(conn: &mut PgConnection, viewer: &Viewer, fx: &Fx) -> BTreeMap<&'
     );
     seen.insert(
         "EvidenceRepository::by_relationship_for_claim",
-        EvidenceRepository::by_relationship_for_claim(&mut *conn, viewer, fx.claim, "supports")
+        EvidenceRepository::by_relationship_for_claim(&mut *conn, viewer, fx.claim, &["supports"])
             .await
             .expect("by_relationship_for_claim")
             .iter()
