@@ -1354,6 +1354,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "lock_claims_in_id_order_conn",
+        "LOCKING READ of `claims` (`SELECT 1 ... ORDER BY c.id FOR NO KEY UPDATE`), returning \
+         nothing: the id-order pre-lock `seal_claims_conn`, `unseal_claims_conn`, \
+         `restrict_claims_conn` and `restore_claims_conn` take before their own writes (backlog \
+         d1818fd0). It takes no `Viewer` for those writes' reason: it must lock exactly the rows \
+         they write, on the same maintenance connection, and a viewer predicate would narrow the \
+         lock to rows somebody can see while the write still reaches the rest.",
+    ),
+    (
+        "privatization.rs",
         "restrict_claims_conn",
         "WRITE of `claims.visibility` and `claims.owner_group_id` — the whole of `restrict` mode. \
          This is a tenanted table, and it takes no `Viewer` because a viewer predicate on a \
