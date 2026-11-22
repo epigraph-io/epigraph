@@ -305,6 +305,9 @@ async fn input_is_normalised_as_the_mcp_twin_normalises_it(pool: PgPool) {
     assert_eq!(role, "writer");
 }
 
+/// `(case, path, caller, body, status, code)` of one designed refusal.
+type RefusalCase<'a> = (&'a str, String, Uuid, Value, u16, Option<&'a str>);
+
 /// Each designed refusal answers by its kind, carries its code, and writes
 /// nothing.
 #[sqlx::test(migrations = "../../migrations")]
@@ -342,7 +345,7 @@ async fn each_refusal_answers_by_its_kind_with_nothing_written(pool: PgPool) {
     let invite = format!("/api/v1/groups/{group}/invitations");
     let accept = format!("/api/v1/group-invitations/{invitation}/accept");
     let decline = format!("/api/v1/group-invitations/{invitation}/decline");
-    let cases: Vec<(&str, String, Uuid, Value, u16, Option<&str>)> = vec![
+    let cases: Vec<RefusalCase<'_>> = vec![
         // (case, path, caller, body, status, code)
         (
             "duplicate name",
