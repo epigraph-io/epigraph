@@ -3683,10 +3683,20 @@ async fn the_compromised_revoke_locks_and_walks_until_no_walked_passkey_is_unloc
 /// fail without 266 (the setting is ignored, so the cap-1 revoke runs a
 /// second pass and revokes all three), and with the cap check removed, its
 /// `RAISE` replaced by `EXIT`, or its `>=` turned into `>`.
+///
+/// The same growing lineage also runs under values that are not a cap from 1
+/// to 31 (zero, empty, non-numeric, negative, 32, out of range): each must
+/// leave 214's cap of 32, so the two-pass revoke succeeds and revokes all
+/// three. Mutations: the range widened to `BETWEEN 0 AND 31` (cap 0 refuses
+/// at the first pass), or an `ELSE v_cap := 1` for a value that does not
+/// parse (a typo refuses at the first pass) -> those rounds get 40001.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_compromised_revoke_refuses_40001_once_its_pass_cap_is_spent(pool: PgPool) {
     use sqlx::Executor;
-    for (round, cap) in ["1", "2"].into_iter().enumerate() {
+    for (round, cap) in ["1", "2", "0", "", "abc", "-1", "32", "99999999999"]
+        .into_iter()
+        .enumerate()
+    {
         let base = 10 * (u8::try_from(round).unwrap() + 1);
         let p = elevated_custodian(&pool, &format!("phone owner {round}"), base).await;
         let (_, e_backup) = anchored_enrollment(&pool, &p).await;
@@ -3771,16 +3781,22 @@ async fn the_compromised_revoke_refuses_40001_once_its_pass_cap_is_spent(pool: P
                 "cap 1: no revoke audit row"
             );
         } else {
-            let mut got = got.expect("the compromised revoke with the cap at 2");
+            let mut got = got.unwrap_or_else(|e| {
+                panic!("the compromised revoke with the setting {cap:?} refused: {e}")
+            });
             got.sort();
             let mut want = vec![(p.passkey, 0, true), (backup, 1, true), (n, 2, true)];
             want.sort();
             assert_eq!(
                 got, want,
-                "cap 2: the second pass locks N, ends the loop and revokes the lineage"
+                "setting {cap:?}: the second pass locks N, ends the loop and revokes the lineage"
             );
             let modes = revoke_modes(&pool, &lineage).await;
-            assert_eq!(modes.len(), 3, "cap 2: one audit row each: {modes:?}");
+            assert_eq!(
+                modes.len(),
+                3,
+                "setting {cap:?}: one audit row each: {modes:?}"
+            );
             assert!(
                 modes
                     .iter()
