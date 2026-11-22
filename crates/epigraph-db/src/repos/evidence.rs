@@ -1245,6 +1245,14 @@ impl EvidenceRepository {
     /// evidence write stores its refuting edge as `refutes` (backlog 2d60f619)
     /// while older rows say `CONTRADICTS` (backlog 548a3c42).
     ///
+    /// Each evidence row is returned at most once, keeping its newest-first
+    /// position and the first matching edge: one evidence row can hold edges
+    /// under two of the requested relationships (the writer's `refutes` plus
+    /// an explicit `contradicts` posted through the generic edge route), and
+    /// the routes report `total` as the number of rows. The `LIMIT 100` caps
+    /// matching edges before that step, so a claim with duplicates can list
+    /// slightly fewer than 100 evidence rows.
+    ///
     /// Backs `GET /api/v1/claims/:id/supporting-evidence` and
     /// `…/contradicting-evidence`. Both the edge and the evidence row are
     /// filtered: an edge the viewer cannot see must not surface its endpoint,
@@ -1287,7 +1295,10 @@ impl EvidenceRepository {
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        Ok(q.fetch_all(executor).await?)
+        let mut rows = q.fetch_all(executor).await?;
+        let mut seen = std::collections::HashSet::new();
+        rows.retain(|r| seen.insert(r.evidence_id));
+        Ok(rows)
     }
 
     /// Backfill `raw_content` on an evidence row the viewer may WRITE.

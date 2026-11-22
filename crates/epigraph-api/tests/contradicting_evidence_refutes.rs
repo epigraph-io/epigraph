@@ -202,3 +202,40 @@ async fn supporting_evidence_returns_only_supports(pool: PgPool) {
     );
     assert_eq!(out.relationship, "SUPPORTS");
 }
+
+/// One evidence row can carry BOTH weakening relationships to the same claim:
+/// the writer's `refutes` edge plus an explicit `contradicts` edge posted
+/// through the generic edge route. Matching `contradicts` and `refutes`
+/// together must still list that evidence once, and `total` must count
+/// evidence, not edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn contradicting_evidence_lists_an_evidence_row_once_across_relationships(pool: PgPool) {
+    let s = seed(&pool).await;
+    legacy_edge(&pool, s.refuting, s.subject, "contradicts").await;
+    let viewer = public_viewer(&pool).await;
+
+    let out = contradicting_evidence(
+        State(state(&pool).await),
+        Path(s.subject),
+        Query(EvidenceAccessParams { agent_id: None }),
+        ViewerExtractor(viewer),
+    )
+    .await
+    .expect("a public claim's contradicting evidence must serve")
+    .0;
+
+    let mut got: Vec<Uuid> = out.evidence.iter().map(|e| e.evidence_id).collect();
+    got.sort();
+    let mut want = vec![s.refuting, s.legacy];
+    want.sort();
+    assert_eq!(
+        got, want,
+        "the refuting evidence ({}) has a refutes AND a contradicts edge to the claim; \
+         it must be listed once, next to the legacy row ({})",
+        s.refuting, s.legacy
+    );
+    assert_eq!(
+        out.total, 2,
+        "total counts evidence rows, not matching edges"
+    );
+}
