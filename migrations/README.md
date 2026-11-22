@@ -3417,9 +3417,10 @@ restart.
   re-point is still a no-op, as in 114. The three owner-rule predicates are inlined
   verbatim; `epigraph-db/tests/foreign_cache_repoint.rs` pins the arm, each refusal
   (mutation-tested), that verbatim copy, and the undo. Undo: `docs/runbooks/243-undo.sql`.
-  **Deploy order:** none required (no binary change). Claims that already hold a fold of
-  narrowed evidence are cleared at their next recompute on any session; a one-time
-  `recompute_beliefs` on the maintenance DSN clears them all at once.
+  **Deploy order:** none required (no binary change). **Recommended after applying:** a
+  one-time `recompute_beliefs` on the maintenance DSN. Claims that already hold a fold of
+  narrowed evidence are otherwise cleared only at their next owner-rule recompute on a
+  stamped or maintenance session; nothing runs at the narrowing act itself.
 
 ## `-- no-transaction` migrations
 

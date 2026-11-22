@@ -1466,9 +1466,12 @@ impl MassFunctionRepository {
     /// Returns whether the claim's cache was written. `false` for a claim that
     /// does not exist (as before, silently), and for a non-owner whose frame is
     /// not the one the claim's cache carries: a non-owner refreshes the cache on
-    /// THAT frame or seeds it when there is none, and never re-points it (the
+    /// THAT frame or seeds it when there is none, and does not re-point it (the
     /// frame that carries a claim's belief is the owner's decision; migration
-    /// 114, section 5). The caller's BBA is stored either way.
+    /// 114, section 5). The one exception is migration 243 (backlog 0296077b):
+    /// a recorded frame that holds no cache-admissible input may be left for
+    /// the canonical frame the cache-owner rule elects. The caller's BBA is
+    /// stored either way.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

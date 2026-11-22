@@ -626,7 +626,10 @@ pub async fn recompute_claim_belief_binary(
 /// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
 /// reached through `MassFunctionRepository::update_claim_belief`): it may
 /// refresh the cache on the frame already recorded, or seed an empty cache on
-/// `binary_truth`; on any other frame its write is a no-op, not an error.
+/// `binary_truth`, or (migration 243, backlog 0296077b) move it off a recorded
+/// frame that holds no cache-admissible input onto the canonical frame the
+/// cache-owner rule elects; on any other frame its write is a no-op, not an
+/// error.
 ///
 /// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
 /// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation

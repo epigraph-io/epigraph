@@ -78,9 +78,13 @@
 --     even to `binary_truth`, which the owner rule ranks above it (R2 is
 --     stricter than the rule there): that fold leaks nothing, and which frame
 --     carries it stays the owner's call, as in 114.
---   * Nothing here runs at the narrowing act itself: the cache is cleared of
---     the hidden fold at the claim's next recompute on any session (an edge,
---     an evidence write, `routes::assess`, a bulk recompute), not by the hide.
+--   * Nothing here runs at the narrowing act itself. The hidden fold is
+--     cleared by the claim's next OWNER-RULE recompute on a stamped or
+--     maintenance session (`recompute_claim_cached_belief`: `routes::assess`,
+--     an edge write's dependent propagation, a bulk recompute), not by the
+--     hide. An unstamped session still writes nothing (114's FA01), and a
+--     named-frame refold of another frame is still declined. A one-time
+--     `recompute_beliefs` on the maintenance DSN clears every existing case.
 --
 -- ===================================================================
 -- 3. PRECONDITION, PATH, OWNER, GRANTS
