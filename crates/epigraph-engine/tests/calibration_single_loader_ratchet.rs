@@ -61,15 +61,21 @@ const ALLOWED: &[(&str, &str, &str)] = &[
          BeliefProfile::served)",
     ),
     (
-        "crates/epigraph-engine/src/matching/calibration.rs",
-        "Self::load_from(Path::new(\"calibration.toml\"))",
-        "MatcherConfig ([matcher] section, cross-source matcher), a separate loader that \
-         fails loudly instead of falling back; not the evidence-type calibration",
+        "crates/epigraph-cli/src/bin/cross_source_sweep.rs",
+        "MatcherConfig::load_from(p)",
+        "an explicit, optional `--calibration <PATH>` operator argument for the [matcher] \
+         section; without it the sweep takes [matcher] from the served calibration \
+         (`MatcherConfig::load_default` -> `CalibrationConfig::served_matcher`)",
     ),
 ];
 
 const NEEDLES: &[&str] = &[
-    "\"CALIBRATION_PATH\"",
+    // Any variable NAMED like the override (`"CALIBRATION_PATH"`, and a second
+    // one such as `"EPIGRAPH_CALIBRATION_PATH"`, backlog 26a12f41).
+    "CALIBRATION_PATH\"",
+    // A path read of the cross-source matcher's `[matcher]` section (backlog
+    // 26a12f41): `MatcherConfig::load_default` resolves it with the rest.
+    "MatcherConfig::load_from(",
     "CalibrationConfig::load(",
     "calibration.toml\"",
     "CalibrationConfig::embedded(",
@@ -159,13 +165,18 @@ const COPY: &str = include_str!("../../../calibration.toml");
 fn compiled_in_only() -> f64 { CalibrationConfig::embedded().get_evidence_type_weight("empirical") }
 fn empty_maps() -> CalibrationConfig { CalibrationConfig::default_for_phase2_fallback() }
 fn parsed(p: &Path) -> CalibrationConfig { toml::from_str::<CalibrationConfig>(&std::fs::read_to_string(p).unwrap()).unwrap() }
+    #[arg(long, env = "EPIGRAPH_CALIBRATION_PATH", hide_env_values = true)]
+fn matcher_cwd() -> MatcherConfig { Self::load_from(Path::new("calibration.toml")).unwrap() }
+fn matcher_path(p: &Path) -> MatcherConfig { MatcherConfig::load_from(p).unwrap() }
 "#;
     let hits = scan("x.rs", removed);
     assert_eq!(
         hits.iter().map(|h| h.line).collect::<Vec<_>>(),
-        vec![3, 4, 9, 10, 11, 12],
+        vec![3, 4, 9, 10, 11, 12, 13, 14, 15],
         "env + cwd literal (line 3), path load (line 4), embedded copy (line 9), \
-         compiled-in only (line 10), empty maps (line 11), text parse (line 12): {hits:?}"
+         compiled-in only (line 10), empty maps (line 11), text parse (line 12), a second \
+         override variable (line 13), the old cwd [matcher] read (line 14), a [matcher] \
+         path read (line 15): {hits:?}"
     );
 
     let quiet = r#"
