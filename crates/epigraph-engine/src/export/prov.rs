@@ -89,11 +89,11 @@ fn prov_relation_endpoints(
     }
 }
 
-/// Bounds on one export. [`Self::default`] is unbounded, which is what the
-/// operator CLI passes, so its output is the whole lineage as before. A
-/// request path (the MCP tool) passes finite limits, because the walk has no
-/// row cap of its own and every kept claim costs about two statements plus
-/// its full content.
+/// Bounds on one export. [`Self::default`] is unbounded: a caller passes it
+/// only on an explicit opt-in (the operator CLI's `--unbounded`). The MCP tool
+/// and the CLI by default pass finite limits, because the walk has no row cap
+/// of its own and every kept claim costs about two statements plus its full
+/// content.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProvExportLimits {
     /// Most claims kept as entities, nearest-first: the root, then its
