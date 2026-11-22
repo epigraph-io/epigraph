@@ -152,9 +152,10 @@ async fn state(pool: &PgPool, root: Uuid, successor: Uuid) -> (i64, i64, i64, i6
 
 /// The whole verb, end to end.
 ///
-/// Verified to fail: the dry run committing -> its "changes nothing"
-/// assertion fails; `--reason` not passed through -> the audit row's reason
-/// differs.
+/// Verified to fail (mutation probes on `role_restore`): the dry run
+/// committing (`if apply` -> `if true`) -> its "changes nothing" assertion
+/// fails; the dry run's `WOULD ` prefix dropped -> its stdout assertion fails
+/// (and the module's unit test).
 #[sqlx::test(migrations = "../../migrations")]
 async fn restore_role_successor_gives_the_running_successor_the_group_back(pool: PgPool) {
     let (owner, _) = fixture::seed_human_operator(&pool, "restore-cli-owner").await;
