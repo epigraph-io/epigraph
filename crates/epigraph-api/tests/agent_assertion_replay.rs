@@ -292,3 +292,58 @@ async fn an_assertion_spent_on_one_spelling_of_a_key_is_refused_on_another(pool:
     );
     assert!(body.get("access_token").is_none(), "{body}");
 }
+
+/// Backlog 57943a39: an agent client whose key is held by a `seed-derived`
+/// agent (migration 230) is refused on BOTH grants that run the assertion
+/// check. The key here is derived exactly as `ingest_literature` derived its
+/// author keys, `BLAKE3("<doi>:<name>")` as the Ed25519 secret, so anyone who
+/// knows the paper and the name can sign the assertion; the check verified the
+/// signature under `client_id` and never read `agents.key_kind`.
+///
+/// Calibration on the SAME client: while the agent row is `ed25519` the
+/// assertion mints (and yields a refresh chain), so the refusals after the
+/// row is re-marked are a function of `key_kind`, not of the client or key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
+    let seed = blake3::hash(b"10.0000/example.0001:Ada Example");
+    let key = SigningKey::from_bytes(seed.as_bytes());
+    let client_id = active_agent_client(&pool, &key).await;
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "calibration: as an ed25519 row the key mints: {body}"
+    );
+    let refresh = refresh_token_of(&body);
+
+    // The operator's repair: the row is marked for what its key is.
+    sqlx::query("UPDATE agents SET key_kind = 'seed-derived' WHERE public_key = $1")
+        .bind(key.verifying_key().to_bytes().to_vec())
+        .execute(&pool)
+        .await
+        .expect("re-mark seed-derived");
+
+    let (status, body) =
+        post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "client_credentials minted for a seed-derived key: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+
+    let (status, body) = post_token(
+        &app,
+        refresh_grant(&refresh, &client_id, &fresh_assertion(&key)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the refresh grant accepted a seed-derived key's assertion: {body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
+}
