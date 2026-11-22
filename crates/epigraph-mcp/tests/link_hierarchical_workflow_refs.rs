@@ -607,3 +607,98 @@ async fn executes_from_a_private_workflow_needs_the_plans_tenancy(pool: PgPool) 
     .expect("the edge");
     assert_eq!((vis.as_str(), owner), ("group", plan_owner));
 }
+
+/// The executes target of `workflow` at plan `level` (a thesis is level 0, a
+/// phase level 1), as `(edge, claim)`.
+async fn plan_claim_at_level(pool: &PgPool, workflow: Uuid, level: &str) -> (Uuid, Uuid) {
+    sqlx::query_as(
+        "SELECT e.id, c.id FROM edges e JOIN claims c ON c.id = e.target_id \
+         WHERE e.source_id = $1 AND e.relationship = 'executes' \
+           AND c.properties->>'level' = $2 AND e.valid_to IS NULL \
+         ORDER BY c.id LIMIT 1",
+    )
+    .bind(workflow)
+    .bind(level)
+    .fetch_one(pool)
+    .await
+    .unwrap_or_else(|e| panic!("a level-{level} executes target: {e}"))
+}
+
+/// Backlog 298317a7 (part 1): outside the plan's own lineage, `executes`
+/// admits only a claim shaped as a workflow STEP (plan level 2, with a step
+/// lineage), even one the caller wrote. Plan readers and the outcome reports
+/// take every level-2 `executes` target as a step, and `evolve_step` and a
+/// step-claim `invokes` gate on the workflows executing a step's lineage, so
+/// an ordinary claim (or a level-2 document paragraph, which has no step
+/// lineage) is not a step to adopt. Refused with nothing written.
+///
+/// CONTROLS: the caller's own step of another plan is still admitted, and the
+/// in-lineage repair still restores a dropped edge to a NON-step plan claim
+/// (the thesis and phases carry `executes` edges too).
+#[sqlx::test(migrations = "../../migrations")]
+async fn executes_refuses_an_own_claim_that_is_not_a_step(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let viewer = own_viewer(&server).await;
+    let me = stdio_agent(&server).await;
+    let workflow = store(&server, &["the plan's own step"]).await;
+
+    let plain = fixture::seed_public_claim(&pool, me, "my own ordinary claim").await;
+    let paragraph = fixture::seed_public_claim(&pool, me, "my own level-2 paragraph").await;
+    sqlx::query("UPDATE claims SET properties = '{\"level\": 2}'::jsonb WHERE id = $1")
+        .bind(paragraph)
+        .execute(&pool)
+        .await
+        .expect("a level-2 claim with no step lineage");
+    for (what, target) in [("an ordinary claim", plain), ("a level-2 paragraph", paragraph)] {
+        let err = do_link_hierarchical(
+            &server,
+            &viewer,
+            link(workflow, "workflow", target, "claim", "executes"),
+            None,
+        )
+        .await
+        .expect_err(&format!("{what} of the caller's is not a step to adopt"));
+        assert!(
+            err.message.contains("is not a workflow step"),
+            "{what}: {}",
+            err.message
+        );
+        assert_eq!(
+            in_force(&pool, workflow, target, "executes").await,
+            0,
+            "{what}: nothing written"
+        );
+    }
+
+    // CONTROL: the caller's own step of another of its plans is admitted.
+    let other = store(&server, &["a step of my other plan"]).await;
+    let (_, step) = step_claim(&pool, other, "a step of my other plan").await;
+    do_link_hierarchical(
+        &server,
+        &viewer,
+        link(workflow, "workflow", step, "claim", "executes"),
+        None,
+    )
+    .await
+    .expect("CONTROL: an own step of another plan is admitted");
+    assert_eq!(in_force(&pool, workflow, step, "executes").await, 1);
+
+    // CONTROL: a dropped edge to the plan's own non-step claim is repaired.
+    for level in ["0", "1"] {
+        let (dropped, node) = plan_claim_at_level(&pool, workflow, level).await;
+        sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+            .bind(dropped)
+            .execute(&pool)
+            .await
+            .expect("drop the executes edge");
+        do_link_hierarchical(
+            &server,
+            &viewer,
+            link(workflow, "workflow", node, "claim", "executes"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: the level-{level} edge is repaired: {e:?}"));
+        assert_eq!(in_force(&pool, workflow, node, "executes").await, 1);
+    }
+}

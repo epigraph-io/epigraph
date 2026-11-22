@@ -20,7 +20,10 @@
 //!   requires that authority over every workflow executing the step, and a
 //!   claim no workflow executes is refused,
 //! - `executes` writes from the HEAD generation of a lineage only (as
-//!   `add_step` does), so a frozen older generation's plan is not extended,
+//!   `add_step` does), so a frozen older generation's plan is not extended;
+//!   its target is a claim of the plan's own lineage (any level: the repair
+//!   path), or a workflow STEP the caller or the submitter wrote
+//!   (`WorkflowRepository::is_step_shaped`, backlog 298317a7),
 //! - `invokes` and `depends_on` refuse a NON-PUBLIC workflow endpoint: the
 //!   edges trigger derives an edge's tenancy from its claim endpoints only
 //!   (a workflow endpoint counts as public), so such an edge would be stored
@@ -392,6 +395,23 @@ pub async fn do_link_hierarchical(
                      neither the caller nor the workflow's submitter wrote it. executes repairs \
                      or extends this plan with its own steps; it does not adopt another agent's \
                      claim. Nothing was written."
+                )));
+            }
+            // An own claim is adopted only when it is a STEP (backlog
+            // 298317a7): plan readers and the outcome reports take every
+            // level-2 `executes` target as one, so an ordinary claim (or a
+            // level-2 paragraph, which has no step lineage) is refused. The
+            // in-lineage branch above repairs every level, as the executor
+            // writes `executes` to the thesis and phases too.
+            if !epigraph_db::WorkflowRepository::is_step_shaped(&mut tx, viewer, target_id)
+                .await
+                .map_err(internal_error)?
+            {
+                return Err(invalid_params(format!(
+                    "refused: claim {target_id} is not a step of this workflow's lineage, and it \
+                     is not a workflow step (a plan level-2 claim with a step lineage, as \
+                     store_workflow, add_step and evolve_step write). executes adopts only a \
+                     step; add_step writes a new one. Nothing was written."
                 )));
             }
         }
