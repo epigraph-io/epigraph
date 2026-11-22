@@ -4238,6 +4238,9 @@ impl ClaimRepository {
         // `Viewer::splice` looks for. `visibility_lint.rs` normalises `{{` to
         // `{` before matching, for the same reason.
         let sql = if paper_doi_filter.is_some() {
+            // `{doi_matches}` is the shared document-key predicate over the
+            // spellings bound at $4 (backlogs 90756d26, f3a3ca54).
+            let doi_matches = crate::repos::paper::document_key_match_sql("p.doi", 4);
             format!(
                 r#"
                 SELECT c.id AS claim_id,
@@ -4251,7 +4254,7 @@ impl ClaimRepository {
                       JOIN papers p ON p.id = e.source_id
                       WHERE e.target_id = c.id
                         AND e.relationship = 'asserts'
-                        AND p.doi = ANY($4::text[])
+                        AND {doi_matches}
                   )
                   /* {{VISIBILITY:c}} */
                 ORDER BY c.{column} <=> $1::vector
@@ -4286,8 +4289,9 @@ impl ClaimRepository {
             .bind(since);
         if let Some(doi) = paper_doi_filter {
             // Every stored spelling of the document key (backlog 90756d26),
-            // through the normalizer the paper writers use: a bare filter
-            // finds a URL-keyed legacy paper and vice versa.
+            // through the normalizer and predicate the paper writers use: a
+            // bare filter finds a URL-keyed legacy paper (any prefix case) and
+            // vice versa.
             q = q.bind(crate::repos::paper::document_key_spellings(doi));
         }
         if let Some(g) = viewer.group_bind() {

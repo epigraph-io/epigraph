@@ -27,10 +27,12 @@ impl PaperRepository {
     /// Insert a paper, or return the existing id if the document key already
     /// exists under any of its spellings.
     ///
-    /// The key is matched through [`document_key_spellings`], canonical
-    /// first, so a row an older writer stored under a resolver URL
-    /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
-    /// ingest (backlog 90756d26). A new row is stored under the
+    /// The key is matched through [`document_key_spellings`] and
+    /// [`document_key_match_sql`], canonical first, so a row an older writer
+    /// stored under a resolver URL (`https://doi.org/10.x/y`, or a case
+    /// variant of its prefix such as `HTTPS://DOI.ORG/10.x/y`) is reused
+    /// rather than twinned by a bare-key ingest (backlogs 90756d26,
+    /// f3a3ca54). A new row is stored under the
     /// [`canonical_document_key`]. Idempotent for repeat ingestion.
     ///
     /// **A hit fills only NULL fields** (backlog 62ce37ca). `papers` is one
@@ -62,12 +64,12 @@ impl PaperRepository {
         // Runtime-checked, not `query!`: CI's migration runner is built
         // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
         // before the schema it is checked against exists.
-        let id: Uuid = sqlx::query_scalar(
+        let id: Uuid = sqlx::query_scalar(&format!(
             r#"
             WITH found AS (
                 SELECT id FROM papers
-                WHERE doi = ANY($1::text[])
-                ORDER BY array_position($1::text[], doi)
+                WHERE {matches}
+                ORDER BY array_position($1::text[], doi), doi
                 LIMIT 1
             ),
             updated AS (
@@ -91,7 +93,8 @@ impl PaperRepository {
             UNION ALL
             SELECT id FROM inserted
             "#,
-        )
+            matches = document_key_match_sql("doi", 1),
+        ))
         .bind(&spellings)
         .bind(&canonical)
         .bind(title)
@@ -101,7 +104,45 @@ impl PaperRepository {
         Ok(id)
     }
 
-    /// Find a paper by DOI. Returns `None` if no paper has this DOI.
+    /// Find the paper a caller-supplied document key names, under any stored
+    /// spelling of it ([`document_key_spellings`] through
+    /// [`document_key_match_sql`]): the canonical key first, then the key as
+    /// given, then each legacy resolver-prefix spelling, then a legacy row
+    /// whose prefix differs from those only in letter case. `None` if no row
+    /// matches.
+    ///
+    /// Runtime-checked, not `query!`, for the reason given in
+    /// [`Self::get_or_create`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(pool))]
+    pub async fn find_by_document_key(
+        pool: &PgPool,
+        raw: &str,
+    ) -> Result<Option<PaperRow>, DbError> {
+        use sqlx::Row;
+        let row = sqlx::query(&format!(
+            "SELECT id, doi, title, journal FROM papers \
+             WHERE {matches} \
+             ORDER BY array_position($1::text[], doi), doi \
+             LIMIT 1",
+            matches = document_key_match_sql("doi", 1),
+        ))
+        .bind(document_key_spellings(raw))
+        .fetch_optional(pool)
+        .await?;
+        Ok(row.map(|r| PaperRow {
+            id: r.get("id"),
+            doi: r.get("doi"),
+            title: r.get("title"),
+            journal: r.get("journal"),
+        }))
+    }
+
+    /// Find a paper by DOI, matching the stored key EXACTLY (no spelling
+    /// expansion; see [`Self::find_by_document_key`]). Returns `None` if no
+    /// paper has this DOI.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -1323,7 +1364,8 @@ pub struct IngestAssertedClaimRow {
 // =============================================================================
 //
 // `papers.doi` is the document identity key. Every writer and every reader of
-// it, on every transport, goes through the two functions below: the MCP
+// it, on every transport, goes through the functions below (the key, its
+// spellings, and the lookup predicate over them): the MCP
 // ingestion and paper-query tools (`epigraph-mcp` `tools/ingestion.rs`) and the
 // REST paper routes (`epigraph-api` `routes/papers.rs`). Before they were
 // shared, the REST routes stored and matched the caller's spelling verbatim, so
@@ -1401,9 +1443,10 @@ pub fn canonical_document_key(raw: &str) -> String {
 /// order.
 ///
 /// The legacy spellings are what make a row written under a resolver URL
-/// before keys were canonicalized findable by the bare DOI. They are
-/// exact-match: a row keyed on a case variant of a prefix
-/// (`HTTPS://DOI.ORG/...`) is found only as given.
+/// before keys were canonicalized findable by the bare DOI. On their own
+/// they are exact-match; a lookup reaches a row keyed on a case variant of a
+/// prefix (`HTTPS://DOI.ORG/...`) only through
+/// [`document_key_match_sql`], which every `papers.doi` lookup uses.
 #[must_use]
 pub fn document_key_spellings(raw: &str) -> Vec<String> {
     let canonical = canonical_document_key(raw);
@@ -1422,6 +1465,40 @@ pub fn document_key_spellings(raw: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The SQL predicate a `papers.doi` lookup uses: true when `column` holds a
+/// stored spelling of the document key whose [`document_key_spellings`] are
+/// bound at `$bind` (as `text[]`).
+///
+/// A row matches when its key is one of the spellings exactly, OR when it
+/// equals one of them ignoring letter case AND ends in the canonical key
+/// (`$bind[1]`) exactly. The second arm is what finds a legacy row keyed on a
+/// case variant of a resolver prefix (`HTTPS://DOI.ORG/10.x/y`, `Doi:10.x/y`;
+/// backlog f3a3ca54), which [`canonical_document_key`] already folds onto the
+/// bare DOI but a byte-for-byte match missed, so a re-ingest twinned it. Only
+/// the PREFIX is compared case-insensitively: the suffix is the canonical key
+/// itself, so its case is kept (keys are not lowercased; see
+/// [`canonical_document_key`]). For a key that is not a bare DOI the spellings
+/// are just the key, and the second arm then admits nothing but that key.
+///
+/// Rank the rows with `array_position($bind::text[], column)`: an exact
+/// spelling ranks by its place in the list (canonical first), and a
+/// case-variant row is NULL, so it sorts after every exact one.
+///
+/// `column` must be a trusted identifier (a static literal such as `doi` or
+/// `p.doi`), never caller input.
+///
+/// The second arm is not served by the unique index on `papers.doi`, so the
+/// lookup scans `papers`; an expression index on `lower(doi)` would make it
+/// indexable.
+#[must_use]
+pub fn document_key_match_sql(column: &str, bind: usize) -> String {
+    format!(
+        "({column} = ANY(${bind}::text[]) \
+         OR (lower({column}) = ANY(SELECT lower(s) FROM unnest(${bind}::text[]) AS s) \
+             AND right({column}, char_length((${bind}::text[])[1])) = (${bind}::text[])[1]))"
+    )
 }
 
 #[cfg(test)]

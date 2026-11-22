@@ -475,3 +475,94 @@ async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(
         .expect("list_asserted_claims");
     assert_eq!(claims.len(), 1, "a claim listed twice");
 }
+
+// --- Case-variant resolver prefixes (backlog f3a3ca54) ----------------------
+//
+// A legacy row keyed on a resolver URL whose PREFIX differs from the listed
+// spellings only in letter case (`HTTPS://DOI.ORG/10.x/y`, `Doi:10.x/y`) is the
+// same document as the bare DOI: `canonical_document_key` already folds the
+// prefix's case. The lookup matched the legacy spellings byte-for-byte, so a
+// re-ingest under the bare DOI missed such a row and minted a bare twin. The
+// DOI suffix keeps its case: only the prefix is compared case-insensitively.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_or_create_reuses_a_case_variant_prefix_row_instead_of_twinning(pool: PgPool) {
+    for (n, prefix) in [
+        "HTTPS://DOI.ORG/",
+        "Http://Dx.Doi.Org/",
+        "WWW.DOI.ORG/",
+        "DOI:",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let suffix = format!("repo-case-variant-{n}");
+        let bare = format!("10.5555/{suffix}");
+        let legacy_key = format!("{prefix}{bare}");
+        let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
+
+        let id = PaperRepository::get_or_create(&pool, &bare, Some("re-ingested"), None)
+            .await
+            .expect("get_or_create");
+        assert_eq!(
+            rows_ending_in(&pool, &suffix).await,
+            vec![(legacy_id, legacy_key.clone())],
+            "an ingest under the bare DOI must reuse the {prefix:?}-keyed row, not mint a twin"
+        );
+        assert_eq!(id, legacy_id, "{legacy_key}");
+
+        // The read path the MCP paper tools use agrees with the writer, under
+        // the bare DOI and under another spelling of it.
+        for spelling in [bare.clone(), format!("https://doi.org/{bare}")] {
+            let row = PaperRepository::find_by_document_key(&pool, &spelling)
+                .await
+                .expect("find_by_document_key")
+                .unwrap_or_else(|| panic!("{spelling} must find the {legacy_key} row"));
+            assert_eq!(row.id, legacy_id, "{spelling} -> {legacy_key}");
+        }
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_case_variant_prefix_match_keeps_the_suffix_exact_and_prefers_the_exact_row(
+    pool: PgPool,
+) {
+    // The suffix is not folded: a stored `HTTPS://DOI.ORG/10.5555/REPO-SUFFIX`
+    // is not the paper a lookup for `10.5555/repo-suffix` names.
+    let upper = seed_raw_paper(&pool, "HTTPS://DOI.ORG/10.5555/REPO-SUFFIX", "upper").await;
+    let found = PaperRepository::find_by_document_key(&pool, "10.5555/repo-suffix")
+        .await
+        .expect("find_by_document_key");
+    assert!(
+        found.is_none(),
+        "the DOI suffix is compared exactly: {found:?}"
+    );
+    let id = PaperRepository::get_or_create(&pool, "10.5555/repo-suffix", None, None)
+        .await
+        .expect("get_or_create");
+    assert_ne!(id, upper, "a different suffix case is a different key");
+
+    // A non-DOI key is not matched case-insensitively at all.
+    seed_raw_paper(&pool, "URN:EPIGRAPH:DOC:repo-case", "urn").await;
+    assert!(
+        PaperRepository::find_by_document_key(&pool, "urn:epigraph:doc:repo-case")
+            .await
+            .expect("find_by_document_key")
+            .is_none()
+    );
+
+    // With both an exact spelling and a case-variant one stored, the exact
+    // (canonical) row wins, whatever the heap order.
+    let bare = "10.5555/repo-case-order";
+    let _variant = seed_raw_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "variant").await;
+    let canonical = seed_raw_paper(&pool, bare, "canonical").await;
+    let id = PaperRepository::get_or_create(&pool, bare, None, None)
+        .await
+        .expect("get_or_create");
+    assert_eq!(id, canonical);
+    let row = PaperRepository::find_by_document_key(&pool, bare)
+        .await
+        .expect("find_by_document_key")
+        .expect("row");
+    assert_eq!(row.id, canonical);
+}

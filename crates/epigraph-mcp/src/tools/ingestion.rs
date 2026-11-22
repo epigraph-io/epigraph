@@ -2231,26 +2231,22 @@ fn ingest_claim_labels(
 // identically (backlog 90756d26). See `epigraph_db::repos::paper`.
 pub(crate) use epigraph_db::repos::paper::canonical_document_key;
 
-/// Find the `papers` row a caller-supplied document key names, trying each of
+/// Find the `papers` row a caller-supplied document key names, under each of
 /// [`epigraph_db::repos::paper::document_key_spellings`] in order: the
 /// [`canonical_document_key`] first, then the key as given (trimmed), then,
-/// for a bare DOI, each legacy resolver-prefix spelling of it. A row written
-/// under a resolver-URL spelling before keys were canonicalized is thus found
-/// by that spelling AND by the bare DOI, which is what the monitor's dedup
-/// probe asks with.
+/// for a bare DOI, each legacy resolver-prefix spelling of it, then a legacy
+/// row whose prefix differs from those only in letter case
+/// ([`PaperRepository::find_by_document_key`], the predicate the ingest
+/// writer's `get_or_create` uses too). A row written under a resolver-URL
+/// spelling before keys were canonicalized is thus found by that spelling
+/// AND by the bare DOI, which is what the monitor's dedup probe asks with.
 pub(crate) async fn find_paper_by_document_key(
     pool: &sqlx::PgPool,
     raw: &str,
 ) -> Result<Option<epigraph_db::PaperRow>, McpError> {
-    for spelling in epigraph_db::repos::paper::document_key_spellings(raw) {
-        if let Some(row) = PaperRepository::find_by_doi(pool, &spelling)
-            .await
-            .map_err(internal_error)?
-        {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
+    PaperRepository::find_by_document_key(pool, raw)
+        .await
+        .map_err(internal_error)
 }
 
 /// Resolve the identity key a document's `papers` row is keyed on.

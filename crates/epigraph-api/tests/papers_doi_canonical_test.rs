@@ -491,3 +491,48 @@ async fn a_placeholder_doi_is_refused_and_writes_nothing() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["doi"], real.as_str(), "{body}");
 }
+
+/// Backlog f3a3ca54: a legacy row keyed on a resolver URL whose prefix differs
+/// from the listed spellings only in letter case (`HTTPS://DOI.ORG/...`) is
+/// found by the bare DOI on both routes, and the writer reuses it rather than
+/// minting a bare twin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_case_variant_prefix_paper_is_found_by_the_bare_doi_and_not_twinned() {
+    let (url, pool) = connect().await;
+    let (addr, _shutdown) = common::spawn_app(&url).await;
+    let (token, _) =
+        common::test_bearer_token_with_seeded_client(&pool, &["claims:write", "claims:read"]).await;
+
+    let suffix = format!("e2case.{}", Uuid::new_v4());
+    let bare = format!("10.5555/{suffix}");
+    let legacy_key = format!("HTTPS://DOI.ORG/{bare}");
+    let legacy_id: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'legacy') RETURNING id")
+            .bind(&legacy_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    for spelling in [bare.clone(), format!("https://doi.org/{bare}")] {
+        let (status, body) = list_by_doi(addr, &token, &spelling).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["total"], 1,
+            "GET ?doi={spelling} must find the {legacy_key} row: {body}"
+        );
+        assert_eq!(
+            body["items"][0]["id"],
+            legacy_id.to_string(),
+            "{spelling}: {body}"
+        );
+    }
+
+    let (status, body) = post_paper(addr, &token, &bare).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], legacy_id.to_string(), "{body}");
+    assert_eq!(
+        rows_ending_in(&pool, &suffix).await,
+        vec![(legacy_id, legacy_key)],
+        "POST with the bare DOI must reuse the case-variant row, not mint a bare twin"
+    );
+}
