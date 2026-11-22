@@ -2217,8 +2217,13 @@ pub struct BatchedContext {
 /// and whenever two ingest principals ingest one paper (the ingest keeps one
 /// marked row of a fact per principal, `epigraph_db::ingest_written`). The
 /// attribution is now ONE paper per neighbour, picked by a lateral subquery
-/// (the oldest visible asserting row), so the neighbour list and `total` count
-/// each neighbour once; a claim two papers assert shows one of their DOIs.
+/// (the oldest visible in-force asserting row, else the oldest visible one),
+/// so a neighbour's asserting rows no longer multiply it in the list or in
+/// `total`; a claim two papers assert shows one of their DOIs. This is about
+/// the attribution join only: the `neighbors` CTE still yields one row per
+/// visible `corroborates` row, so a neighbour linked by two of them (both
+/// directions, both spellings, or two parallel rows) is listed once per row,
+/// as before.
 ///
 /// # A deliberate deviation, recorded
 ///
@@ -2541,7 +2546,10 @@ pub async fn fetch_batched_context(
                            OR (asserts_e.owner_group_id = ANY($4::uuid[])
                                AND (asserts_e.co_owner_group_id IS NULL
                                     OR asserts_e.co_owner_group_id = ANY($4::uuid[]))))
-                    ORDER BY asserts_e.created_at, asserts_e.id
+                    -- An in-force row first: a retracted attribution
+                    -- (valid_to past) is the representative only alone.
+                    ORDER BY (asserts_e.valid_to IS NOT NULL AND asserts_e.valid_to <= now()),
+                             asserts_e.created_at, asserts_e.id
                     LIMIT 1
                 ) p ON true
             ),

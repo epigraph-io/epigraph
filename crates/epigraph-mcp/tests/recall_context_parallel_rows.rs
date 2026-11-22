@@ -9,7 +9,9 @@
 //! took a second slot of the per-paragraph limit, and counted twice in `total`.
 //!
 //! Both rows are written through the walk's own writer as two principals; a
-//! CALIBRATION pins that there are two. All names are invented.
+//! CALIBRATION pins that there are two. A second test pins that the one
+//! attribution kept prefers an in-force row over a retracted one. All names
+//! are invented.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -107,5 +109,82 @@ async fn a_doubly_ingested_neighbour_is_one_corroborator(pool: PgPool) {
         ctx.corroborates_total_by_paragraph.get(&p),
         Some(&1),
         "the window total counts the neighbour once"
+    );
+}
+
+/// The one attribution kept is an IN-FORCE one: when the older asserting row
+/// is retracted (`valid_to` reached) and a newer paper still asserts the
+/// neighbour, the newer paper's DOI is shown, not the retracted one's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_attribution_yields_to_an_in_force_one(pool: PgPool) {
+    let scoped = ScopedPool::connect_downgraded_for_tests(
+        &fixture::database_url_for(&pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let (first, _) = fixture::seed_agent_with_group(&pool, "rcp-retract").await;
+    let world = fixture::world_group(&pool).await;
+
+    let p = fixture::seed_public_claim(&pool, first, "rcp-r: paragraph").await;
+    let cor = fixture::seed_public_claim(&pool, first, "rcp-r: corroborator").await;
+    fixture::seed_edge_owned_by(&pool, cor, p, "public", world).await;
+    sqlx::query(
+        "UPDATE edges SET relationship = 'corroborates' WHERE source_id = $1 AND target_id = $2",
+    )
+    .bind(cor)
+    .bind(p)
+    .execute(&pool)
+    .await
+    .expect("corroborates");
+
+    let mut papers = Vec::new();
+    for doi in ["10.9999/rcp-retracted", "10.9999/rcp-in-force"] {
+        let paper: Uuid =
+            sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'p') RETURNING id")
+                .bind(doi)
+                .fetch_one(&pool)
+                .await
+                .expect("paper");
+        // Sequential transactions: the first paper's row is the older one.
+        walk_write(&pool, &scoped, first, paper, cor).await;
+        papers.push(paper);
+    }
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE target_id = $1 AND relationship = 'asserts'",
+    )
+    .bind(cor)
+    .bind(world)
+    .execute(&pool)
+    .await
+    .expect("force public");
+    let retracted = sqlx::query(
+        "UPDATE edges SET valid_to = now() \
+          WHERE source_id = $1 AND target_id = $2 AND relationship = 'asserts'",
+    )
+    .bind(papers[0])
+    .bind(cor)
+    .execute(&pool)
+    .await
+    .expect("retract the older attribution")
+    .rows_affected();
+    assert_eq!(retracted, 1, "CALIBRATION: one older row retracted");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let ctx = tools::recall::__test_only::fetch_batched_context(&pool, &viewer, &[p], 8, 8, 8)
+        .await
+        .expect("batched context");
+    let cors = ctx
+        .corroborates_by_paragraph
+        .get(&p)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(cors.len(), 1, "the neighbour is listed once");
+    assert_eq!(
+        cors[0].paper_doi.as_deref(),
+        Some("10.9999/rcp-in-force"),
+        "the in-force attribution represents the neighbour"
     );
 }

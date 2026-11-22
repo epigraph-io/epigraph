@@ -1219,7 +1219,8 @@ impl GraphViewRepository {
     /// principal (`crate::ingest_written`), and nothing else enforces triple
     /// uniqueness since migrations 017/018/053. A graph view draws a fact once,
     /// so this returns one row per fact (backlog 11402482): the oldest visible
-    /// row, by `created_at` then `id`. The visibility predicate sits in the
+    /// in-force row (`valid_to` unset or in the future), else the oldest
+    /// visible row, by `created_at` then `id`. The visibility predicate sits in the
     /// `WHERE`, before `DISTINCT ON` picks, so the representative is always a
     /// row the viewer can read.
     ///
@@ -1238,7 +1239,8 @@ impl GraphViewRepository {
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1) \
                /* {EDGE_VISIBILITY:edges} */ \
-             ORDER BY source_id, target_id, relationship, created_at, id",
+             ORDER BY source_id, target_id, relationship, \
+                      (valid_to IS NOT NULL AND valid_to <= now()), created_at, id",
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);

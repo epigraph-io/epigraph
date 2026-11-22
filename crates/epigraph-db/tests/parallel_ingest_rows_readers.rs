@@ -154,6 +154,25 @@ async fn subgraph_edges_render_a_doubly_ingested_fact_once(pool: PgPool) {
         "one fact renders as one edge, whatever the number of ingest principals: {rows:?}"
     );
 
+    // Retract the row picked: the in-force row now represents the fact.
+    let picked = asserts[0].id;
+    sqlx::query("UPDATE edges SET valid_to = now() WHERE id = $1")
+        .bind(picked)
+        .execute(&pool)
+        .await
+        .expect("retract the picked row");
+    let rows = GraphViewRepository::subgraph_edges(&pool, &viewer, &[author, x])
+        .await
+        .expect("subgraph edges after the retraction");
+    let asserts: Vec<_> = rows
+        .iter()
+        .filter(|r| r.source_id == author && r.target_id == x && r.relationship == "asserts")
+        .collect();
+    assert_eq!(asserts.len(), 1, "{rows:?}");
+    assert_ne!(
+        asserts[0].id, picked,
+        "a retracted row does not represent a fact that has an in-force row: {rows:?}"
+    );
 }
 
 /// `get_evidence_strength` over a method citing two claims, one of which two
