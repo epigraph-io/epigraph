@@ -3395,35 +3395,48 @@ manager's synced passkey. It is anchored by a passkey they already hold:
   hardware key registers on it. That hardware key never anchors, because
   its lineage holds the synced passkey. So the password-manager account
   cannot mint an anchor, through any number of acts.
-- **Not re-checked at use, for `packed`/`tpm`:** that the anchor's stored
-  certificate chain was the one that attested its stored key. That
-  certificate is the authenticator model's, and the attestation signature
-  that bound it to the key is not stored. The API's ceremony verified it when
-  it wrote the row, but the row has other writers:
+- **Re-checked at use, for `packed`/`tpm`: the attestation statement.** The
+  anchor's stored certificate chain is the authenticator model's, and what
+  binds it to the anchor's key is the attestation statement: a signature by
+  the model's certificate over authenticator data that carry the key. The
+  row has writers besides the API's ceremony:
   - the maintenance DSN;
   - a holder of the REQUEST DSN with a live enrollment id. They can call
     124's `epigraph_complete_passkey_enrollment` directly, with a key, a
     stored credential and the format, AAGUID and backup-eligible columns of
     their choosing.
 
-  Such a holder can already plant any key on that enrollment, and it elevates
-  as the person (the enrollment-link threat above). What a planted `packed`
-  or `tpm` row adds, when it pairs a genuine, public model certificate chain
-  with the planter's own key:
-  - it passes the anchor check, so it anchors later passkeys (on acts it
-    confirms, each opened by the operator's `passkey-enroll --act`);
-  - it counts as hardware on a lineage (its genuine chain also passes the
-    validity window);
-  - recorded as non-`none`, it is NOT revoked with its anchor. The cascade
-    deliberately spares attested rows, including a backup hardware key.
+  So registration stores the statement (the authenticator's registration
+  response) inside the row's stored credential, and every anchor check
+  re-verifies it over the stored key, for the anchor and for every passkey
+  on its lineage. A planted row that pairs a genuine, public model chain
+  with the planter's own key carries no statement over that key (making one
+  needs the model's attestation key, and another credential's statement
+  attests another key), so it anchors nothing and counts as hardware on no
+  lineage. An `android-key` row was never plantable this way: its leaf
+  certificate must certify the credential's key, which must then assert.
+  What a planted row still does is what its planter could already do: it
+  elevates as the person (the enrollment-link threat above), and, recorded
+  as non-`none`, it is NOT revoked with its anchor (the cascade deliberately
+  spares attested rows, and the database cannot verify a statement). Hand
+  enrollment links only to their person, and check `list-passkeys`.
 
-  An `android-key` row cannot be planted this way: its leaf certificate must
-  certify the credential's key, which must then assert, and the API checks
-  both at every use. Re-deriving the columns in the database would not close
-  it, because the stored credential is as freely chosen as the columns, and
-  the API already demands that they agree. Storing the attestation statement
-  and re-verifying its signature at use would close it; that is not done.
-  Hand enrollment links only to their person, and check `list-passkeys`.
+  **Upgrading.** A `packed` or `tpm` passkey registered before statements
+  were stored has none, and none can be recovered: after the upgrade it
+  still elevates and confirms acts, but it no longer anchors an anchored
+  enrollment or counts on a lineage. That includes a person's first,
+  maintenance-enrolled passkey, the root of every lineage, so a hardware key
+  enrolled later on an act it confirmed does not anchor either (its lineage
+  holds the old passkey, revoked or not). For a person who needs the
+  anchored path: revoke their live passkeys (`revoke-passkey`), enroll their
+  hardware key again through the bootstrap (`passkey-enroll` without
+  `--act`), and enroll further passkeys on acts that key confirms. With the
+  anchored setting off, nothing changes. The statement is re-verified under
+  the CURRENT relying-party configuration, so changing the origin (even
+  under the same rp id) stops `packed`/`tpm` anchors the same way, and so
+  can a `webauthn-rs` upgrade that narrows its default algorithm list or
+  tightens its registration checks: re-run the anchor tests
+  (`cargo test -p epigraph-passkey --test anchor_trust`) on such an upgrade.
 
 **The accepted cost.** Once a synced passkey is registered, an elevation (and
 every admin-act confirmation) is only as strong as the password-manager
