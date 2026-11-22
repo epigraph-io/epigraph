@@ -50,6 +50,10 @@
 //! be written rolls its claim back and stops the run (exit 3), so no write
 //! lands unrecorded. Unchanged claims are not recorded; `claims.updated_at` is
 //! not part of the record. See `epigraph_cli::recompute_claim_belief`.
+//! Before the first write the run also writes `<wave file>.run.json`: this
+//! process's belief modes, whether `--allow-mode-skew` overrode the mode
+//! check, and the disk gate (including a `--no-backup-check` opt-out), so the
+//! wave file carries how it was made.
 //!
 //! Mode check (backlog a7ab715d, 1ea4f6bf): before a WRITING run, and before
 //! it opens the database, the run reads the API's `/health` → `belief_modes`
@@ -273,10 +277,38 @@ async fn run(
             let wave = cli.wave.as_deref().unwrap_or(DEFAULT_WAVE);
             let log = epigraph_cli::recompute_betp::WaveLog::open(path, wave, at)
                 .map_err(|e| format!("--snapshot: {e}"))?;
+            // The run's own record beside its wave file, before the first
+            // write: this process's belief modes, whether the mode check was
+            // overridden, and the disk gate, including a backup-check
+            // opt-out, so the wave file shows how it was made (as
+            // `recompute_betp` records its runs).
+            let backup_check = match &gate.check_cmd {
+                Some(cmd) => serde_json::json!({ "command": cmd }),
+                None => serde_json::json!({ "command": null, "no_backup_check": true }),
+            };
+            epigraph_cli::recompute_betp::write_run_record(
+                path,
+                &serde_json::json!({
+                    "bin": "recompute_claim_belief",
+                    "wave": wave,
+                    "wave_at": at,
+                    "belief_modes": epigraph_engine::belief_modes::current(),
+                    "allow_mode_skew": cli.allow_mode_skew,
+                    "disk_gate": {
+                        "path": gate.path,
+                        "min_free_bytes": gate.min_free_bytes,
+                        "projected_bytes_per_claim": gate.projected_bytes_per_claim,
+                        "batch_size": cli.batch_size.max(1),
+                        "backup_check": backup_check,
+                    },
+                }),
+            )
+            .map_err(|e| format!("--snapshot: run record: {e}"))?;
             println!(
-                "wave file: {} (wave {wave}, wave_at {})",
+                "wave file: {} (wave {wave}, wave_at {}); run record: {}.run.json",
                 path.display(),
-                at.to_rfc3339()
+                at.to_rfc3339(),
+                path.display()
             );
             Some(log)
         }

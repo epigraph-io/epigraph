@@ -1108,7 +1108,13 @@ viewer the maintenance session owns.
   it. The wave file's own volume is not gated: a record that does not fit
   already rolls its claim back and stops the run (exit 3). The projection
   default is `recompute_betp`'s provisional figure; measure it for this
-  binary before relying on a tight headroom.
+  binary before relying on a tight headroom. `--disk-path` must be a path
+  the operator's user can `df` on the database's filesystem, or the gate
+  fails closed at batch 1 (exit 4).
+* **A `--snapshot` run writes `<wave file>.run.json` before its first
+  write**: the run's belief modes, whether `--allow-mode-skew` overrode the
+  mode check, and its disk gate, including a `--no-backup-check` opt-out
+  (as `recompute_betp` records its runs). Keep it with the wave file.
 
 ### The Python scripts
 

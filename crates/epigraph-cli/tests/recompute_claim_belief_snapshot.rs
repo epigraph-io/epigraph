@@ -1125,3 +1125,89 @@ async fn a_headroom_the_volume_lacks_stops_the_run_before_its_first_write(pool: 
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── the run record (review of backlog 1ea4f6bf / a7ab715d) ───────────────────
+
+/// `<wave file>.run.json`, the run's own record of how it was made.
+fn run_record(wave_file: &Path) -> serde_json::Value {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".run.json");
+    let text = std::fs::read_to_string(PathBuf::from(p)).expect("the run record exists");
+    serde_json::from_str(&text).expect("the run record is JSON")
+}
+
+/// A `--snapshot` run records its operator opt-outs beside the wave file: a
+/// run made with `--no-backup-check` and `--allow-mode-skew` leaves a run
+/// record that says so (and names its modes and gate), and a run with a
+/// backup check records the command and no opt-out. Without it, the only
+/// trace of either override is terminal output.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_snapshot_run_records_its_operator_opt_outs_beside_the_wave_file(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let (ids, _) = seeded(&pool, 2).await;
+    let list = write_ids(&dir, &ids);
+
+    // The harness's defaults: `--no-backup-check` and `--allow-mode-skew`.
+    let opted_out = dir.join("opted-out.jsonl");
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &["--input", s(&list), "--snapshot", s(&opted_out)],
+    )
+    .ok("recompute with both opt-outs");
+    let rec = run_record(&opted_out);
+    assert_eq!(rec["bin"], "recompute_claim_belief", "{rec}");
+    assert_eq!(rec["wave"], "recompute_claim_belief", "{rec}");
+    assert_eq!(
+        rec["allow_mode_skew"], true,
+        "mode override not recorded: {rec}"
+    );
+    assert_eq!(
+        rec["disk_gate"]["backup_check"]["no_backup_check"], true,
+        "backup-check opt-out not recorded: {rec}"
+    );
+    assert!(
+        rec["disk_gate"]["backup_check"]["command"].is_null(),
+        "{rec}"
+    );
+    assert_eq!(rec["disk_gate"]["path"], ".", "{rec}");
+    assert_eq!(rec["disk_gate"]["min_free_bytes"], 0, "{rec}");
+    assert!(
+        rec["belief_modes"]["atom_fold"].is_string(),
+        "the run's own modes are not recorded: {rec}"
+    );
+    assert!(rec["wave_at"].is_string(), "{rec}");
+
+    // A run with a backup check records the command and no opt-out. Its own
+    // gate, so none of the harness's gate flags are added.
+    let checked = dir.join("checked.jsonl");
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &[
+            "--input",
+            s(&list),
+            "--snapshot",
+            s(&checked),
+            "--disk-path",
+            ".",
+            "--min-free-gb",
+            "0",
+            "--disk-check-cmd",
+            "true",
+        ],
+    )
+    .ok("recompute with a backup check");
+    let rec = run_record(&checked);
+    assert_eq!(rec["disk_gate"]["backup_check"]["command"], "true", "{rec}");
+    assert!(
+        rec["disk_gate"]["backup_check"]
+            .get("no_backup_check")
+            .is_none(),
+        "a run with a backup check recorded the opt-out: {rec}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
