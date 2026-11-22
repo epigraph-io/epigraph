@@ -41,6 +41,11 @@ const CROSS_SOURCE_SWEEP: Option<&str> = None;
 /// relative to the crate root)`.
 const BINS: &[(&str, Option<&str>, &str)] = &[
     (
+        "assign_unthemed_themes",
+        Some(env!("CARGO_BIN_EXE_assign_unthemed_themes")),
+        "src/bin/assign_unthemed_themes.rs",
+    ),
+    (
         "atlas_layout",
         Some(env!("CARGO_BIN_EXE_atlas_layout")),
         "src/bin/atlas_layout.rs",

@@ -456,6 +456,18 @@ name = "atlas_nightly_units"
 path = "tests/atlas_nightly_units.rs"
 required-features = ["db"]
 
+# Backlog d5f9829a: the corpus-wide theme assignment the API route cannot do
+# under row security, on the maintenance connection.
+[[bin]]
+name = "assign_unthemed_themes"
+path = "src/bin/assign_unthemed_themes.rs"
+required-features = ["db"]
+
+[[test]]
+name = "assign_unthemed_themes"
+path = "tests/assign_unthemed_themes.rs"
+required-features = ["db"]
+
 # PR-12's tenancy backfill. A [[bin]] here rather than a new
 # `crates/epigraph-tenancy-backfill` workspace member, deliberately: the plan
 # names the binary with no path, the PR's own title is `feat(cli)`, every

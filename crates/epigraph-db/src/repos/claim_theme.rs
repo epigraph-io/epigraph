@@ -16,6 +16,16 @@ pub struct ClaimThemeRow {
     pub updated_at: DateTime<Utc>,
 }
 
+/// One theme of [`ClaimThemeRepository::preview_unthemed_assignment`]: how
+/// many unthemed claims the assignment would place on it. `theme_id` (and so
+/// `label`) is `None` for claims no theme can take (no theme has a centroid).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnthemedAssignmentPreviewRow {
+    pub theme_id: Option<Uuid>,
+    pub label: Option<String>,
+    pub claims: i64,
+}
+
 /// Read-path projection of a theme: everything a caller needs to decide
 /// whether to open it, without writing anything.
 ///
@@ -1208,6 +1218,63 @@ impl ClaimThemeRepository {
         .map_err(DbError::from)?;
 
         Ok(row.len() as i64)
+    }
+
+    /// What [`Self::assign_unthemed_batch`] WOULD do, computed read-only: for
+    /// every claim with an embedding and no theme that `viewer` may read, the
+    /// theme whose centroid is nearest (the same `<=>` ordering the writer
+    /// uses), counted per theme, largest first. `limit` caps how many unthemed
+    /// claims are looked at (`None`: all of them); with a cap the claims are
+    /// whichever the scan meets first, as in the writer's own `LIMIT`, so a
+    /// capped preview is a sample, not a promise about which rows a batch takes.
+    ///
+    /// A row with `theme_id = None` counts claims no theme can take because no
+    /// theme has a centroid (the writer leaves those unthemed).
+    ///
+    /// The operator CLI `assign_unthemed_themes` reports this in its dry run,
+    /// on the maintenance connection with a bypass viewer, where the predicate
+    /// is empty and the preview covers every team's claims.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn preview_unthemed_assignment<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        limit: Option<i64>,
+    ) -> Result<Vec<UnthemedAssignmentPreviewRow>, DbError> {
+        let sql = viewer.splice(
+            "WITH unthemed AS ( \
+                 SELECT c.embedding FROM claims c \
+                  WHERE c.theme_id IS NULL AND c.embedding IS NOT NULL \
+                    /* {VISIBILITY:c} */ \
+                  LIMIT $1 \
+             ), nearest AS ( \
+                 SELECT (SELECT ct.id FROM claim_themes ct \
+                          WHERE ct.centroid IS NOT NULL \
+                          ORDER BY ct.centroid <=> u.embedding \
+                          LIMIT 1) AS theme_id \
+                   FROM unthemed u \
+             ) \
+             SELECT n.theme_id, t.label, COUNT(*)::int8 AS claims \
+               FROM nearest n \
+               LEFT JOIN claim_themes t ON t.id = n.theme_id \
+              GROUP BY n.theme_id, t.label \
+              ORDER BY claims DESC, n.theme_id",
+            2,
+        );
+        let mut q = sqlx::query(&sql).bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(executor).await.map_err(DbError::from)?;
+        Ok(rows
+            .iter()
+            .map(|row| UnthemedAssignmentPreviewRow {
+                theme_id: row.get("theme_id"),
+                label: row.get("label"),
+                claims: row.get("claims"),
+            })
+            .collect())
     }
 
     /// Recompute centroid and claim_count for a single theme.
