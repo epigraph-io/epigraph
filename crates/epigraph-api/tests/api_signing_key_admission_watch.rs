@@ -6,7 +6,8 @@
 //! watches the key (`edge_signer::watch_admission`, spawned by
 //! `bin/server.rs`, which exits the process when it returns): these tests pin
 //! the watch's verdict against the verifier's, with a positive control
-//! before every change.
+//! before every change. `api_signing_key_watch_server.rs` pins that the
+//! server binary runs the watch and exits on it.
 //!
 //! The watch runs here at a 50 ms interval; production reads
 //! `EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS` (default 30 s).
@@ -15,6 +16,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use epigraph_api::edge_signer::{self, ApiEdgeSigner};
 use epigraph_crypto::AgentSigner;
 use epigraph_db::repos::EdgeSignatureRepository;
@@ -124,7 +126,7 @@ async fn verdict(pool: &PgPool, edge: Uuid) -> (bool, bool) {
 /// revocation fails verification. A restart would refuse the key too (the
 /// boot rule agrees).
 ///
-/// Mutation: `signer_key_admitted` returning `Ok(true)` -> the watch never
+/// Mutation: `signer_key_admission` reading every key as `Open` -> the watch never
 /// stops and this fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn revoking_the_running_apis_signing_key_stops_its_signer() {
@@ -194,7 +196,7 @@ async fn revoking_the_running_apis_signing_key_stops_its_signer() {
 /// the API: an application session cannot take the server down by planting
 /// one.
 ///
-/// Mutations: `signer_key_admitted` returning `Ok(true)` -> never stops; the
+/// Mutations: `signer_key_admission` reading every key as `Open` -> never stops; the
 /// window's end ignored (`key_window_admits` without `valid_until`) -> never
 /// stops; non-attested rows treated as a lifecycle -> stops on the planted
 /// row.
@@ -337,4 +339,103 @@ async fn the_watch_judges_the_key_on_the_application_role(pool: PgPool) {
     assert!(stop.contains(&hex::encode(bare.public_key())), "{stop}");
     let stop = stopped(attested_watch, "revoked key, application role").await;
     assert!(stop.contains(&hex::encode(attested.public_key())), "{stop}");
+}
+
+/// A PLANNED cut-over (the rotation runbook's future `valid_until`) stops the
+/// watch BEFORE the window closes, by the database clock that dates the
+/// edges, even with the longest interval (300 s): a fixed-interval sleep
+/// would keep signing for up to an interval past the cut-over, and every
+/// edge in that span fails verification.
+///
+/// Mutations: the watch sleeping the interval before its first read, or
+/// ignoring the recorded end (sleeping the full interval) -> no stop within
+/// 20 s; `STOP_LEAD_SECS` = 0 -> the stop comes at or after the cut-over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_planned_cut_over_stops_the_signer_before_the_window_closes() {
+    let (_url, pool) = pool().await;
+    let owner = common::seed_system_agent(&pool).await;
+    let key = AgentSigner::generate();
+    let lead = edge_signer::STOP_LEAD_SECS;
+    let cut_over: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, valid_until) \
+         VALUES ($1, $2, 'signing', 'active', now() - interval '1 minute', \
+                 clock_timestamp() + make_interval(secs => $3)) \
+         RETURNING valid_until",
+    )
+    .bind(owner)
+    .bind(key.public_key().as_slice())
+    .bind((lead + 3) as f64)
+    .fetch_one(&pool)
+    .await
+    .expect("an active signing row with a cut-over a few seconds out (test superuser)");
+    let mut w = tokio::spawn(edge_signer::watch_admission(
+        pool.clone(),
+        Arc::new(ApiEdgeSigner::new(twin(&key), owner)),
+        Duration::from_secs(300),
+    ));
+    // Positive control: well before the lead, it keeps signing.
+    still_watching(&mut w, "cut-over not yet within the lead").await;
+
+    let stop = tokio::time::timeout(Duration::from_secs(20), w)
+        .await
+        .expect("the watch kept signing toward a known cut-over (an interval-only sleep)")
+        .expect("watch task");
+    let db_now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        db_now < cut_over,
+        "the watch stopped at {db_now}, not before the cut-over {cut_over}: {stop}"
+    );
+    assert!(stop.contains(&hex::encode(key.public_key())), "{stop}");
+    assert!(stop.contains("its admission ends at"), "{stop}");
+}
+
+/// Boot and the watch agree: a key whose window ends within the stop lead
+/// passes the boot rule (an ACTIVE, in-window row) but the watch would stop
+/// the server at once, so the unit would restart in a loop until the end.
+/// Boot refuses it; the same key with an hour left boots (positive control).
+///
+/// Mutation: the admission read removed from `decide` -> the second
+/// decision boots.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_refuses_a_key_the_watch_would_stop_at_once() {
+    let (_url, pool) = pool().await;
+    let owner = common::seed_system_agent(&pool).await;
+    let key = AgentSigner::generate();
+    let row = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_keys (id, agent_id, public_key, key_type, status, valid_from, valid_until) \
+         VALUES ($1, $2, $3, 'signing', 'active', now() - interval '1 minute', \
+                 now() + interval '1 hour')",
+    )
+    .bind(row)
+    .bind(owner)
+    .bind(key.public_key().as_slice())
+    .execute(&pool)
+    .await
+    .expect("an active signing row (test superuser)");
+    let file = std::env::temp_dir().join(format!("api-signing-key-boot-{}.hex", Uuid::new_v4()));
+    std::fs::write(&file, hex::encode(key.secret_key())).expect("key file");
+    let path = file.to_str().unwrap().to_string();
+
+    let booted = edge_signer::decide(&pool, Some(&path))
+        .await
+        .expect("CALIBRATION: an hour left boots");
+    assert_eq!(booted.signer.map(|s| s.signer_id()), Some(owner));
+
+    sqlx::query(
+        "UPDATE agent_keys SET valid_until = clock_timestamp() + interval '2 seconds' \
+         WHERE id = $1",
+    )
+    .bind(row)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let refused = edge_signer::decide(&pool, Some(&path)).await;
+    std::fs::remove_file(&file).ok();
+    let err = refused.expect_err("a key ending within the stop lead is refused at boot");
+    assert!(err.contains(edge_signer::KEY_ADMISSION_ENDING), "{err}");
+    assert!(err.contains(&hex::encode(key.public_key())), "{err}");
 }

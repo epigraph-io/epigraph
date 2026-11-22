@@ -45,13 +45,17 @@
 //!
 //! Rotation needs no code change, but it is a maintenance act (`signing` rows
 //! are attested state, refused to the application role by migration 161).
-//! The OLD key must end up in `agent_keys` as a `rotated` row with
-//! `valid_until` set: a key that is only an `agents.public_key` (steps 2 and
-//! 3) is admitted by the verifier with no window while no row carries its
-//! bytes, so without that row a retired key keeps verifying. The new key is
-//! registered as the agent's active `signing` row and the variable pointed at
-//! its file BEFORE the old key's window closes: the running server stops once
-//! it does (below), and restarts on the new key.
+//! The NEW key comes first: register it as the signer agent's `active`
+//! `signing` row (`valid_from` no later than now) and point the variable at
+//! its file, so any restart from then on boots on it. Then retire the OLD key
+//! with a cut-over in the future: it must end up in `agent_keys` as a
+//! `rotated` row with `valid_until` = the cut-over, because a key that is only
+//! an `agents.public_key` (steps 2 and 3) is admitted by the verifier with no
+//! window while no row carries its bytes, so without that row a retired key
+//! keeps verifying. The running server stops [`STOP_LEAD_SECS`] before the
+//! cut-over (below) and restarts on the new key. Retiring the old key first
+//! would make boot refuse it (a `rotated` row is not an active one) on any
+//! restart before the new key is in place.
 //! `docs/architecture/noun-claims-and-verb-edges.md` has the operator steps.
 //!
 //! The signer is never an edge's author: an edge's author is its source
@@ -59,27 +63,37 @@
 //!
 //! # While it runs
 //!
-//! Boot checks the key once; [`spawn_admission_watch`] keeps checking it. Every
-//! [`ENV_RECHECK_SECS`] seconds (default 30, clamped to 1..=300) it asks
-//! whether the edge verifier would still admit the key for the signer agent
-//! (`AgentKeyRepository::signer_key_admitted`, the verifier's own admission
-//! rule), and once it would not (the key was revoked, rotated out, or its
-//! window closed) it logs an ERROR ([`KEY_NO_LONGER_ADMITTED`]) and EXITS the
-//! process, as a boot with that key refuses to start. A key the verifier no
-//! longer admits signs only rows the verifier refuses, so the server neither
-//! keeps signing with it nor downgrades to unsigned writes. A failed re-read
-//! is logged at WARN and the server keeps serving: only a positive read of an
-//! inadmissible key stops it.
+//! Boot checks the key; [`spawn_admission_watch`] keeps checking it, at once
+//! and then every [`ENV_RECHECK_SECS`] seconds (default 30, clamped to
+//! 1..=300). Each check asks, on the DATABASE clock (which dates the edges the
+//! verifier judges), whether and until when the edge verifier admits the key
+//! for the signer agent (`AgentKeyRepository::signer_key_admission`, the
+//! verifier's own admission rule). When it is not admitted (revoked, rotated
+//! out, window closed) or its recorded window ends within [`STOP_LEAD_SECS`],
+//! the watch logs an ERROR ([`KEY_NO_LONGER_ADMITTED`]) and EXITS the process.
+//! A known end is not left to the interval: the watch sleeps until the lead
+//! before it, so a planned cut-over stops the server before it, and no edge
+//! it signs falls outside the key's window. A REVOCATION is only seen at the
+//! next check, so edges written in the (at most one interval) between the
+//! revocation and that check carry a signature the verifier refuses; a
+//! shorter interval narrows that gap. Boot refuses a key the watch would stop
+//! at once ([`KEY_ADMISSION_ENDING`]), so a key that passes boot never
+//! restarts the unit in a loop.
 //!
-//! So revoking or retiring the API's key stops the API within the interval,
-//! and a restart refuses until the variable points at an admitted key: point
-//! it at the new key FIRST, then close the old key's window (rotation, above).
+//! A failed re-read is logged (WARN, ERROR after
+//! [`FAILED_RECHECKS_BEFORE_ERROR`] in a row) and the server keeps serving:
+//! only a positive read of an inadmissible key stops it. The exit is abrupt:
+//! requests in flight are cut off, as on any crash.
+//!
+//! So revoking or retiring the API's key stops the API (reads too) and a
+//! restart refuses until the variable points at an admitted key: register and
+//! point at the new key FIRST, then retire the old one (rotation, above).
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use epigraph_crypto::AgentSigner;
-use epigraph_db::repos::agent_key::key_window_admits;
+use epigraph_db::repos::agent_key::{key_window_admits, KeyAdmissionEnd, SignerKeyAdmission};
 use epigraph_db::repos::EdgeSigningKey;
 use epigraph_db::{AgentKeyRepository, AgentRepository};
 use sqlx::PgPool;
@@ -295,6 +309,19 @@ pub async fn decide(pool: &PgPool, key_file: Option<&str>) -> Result<BootDecisio
     text.extend(std::iter::repeat_n('0', len));
     let signer = signer?;
     let (signer_id, how) = resolve_signer(pool, &signer).await?;
+    // The running watch's own verdict, so a key that passes boot is never one
+    // the watch stops at once (a key whose window ends within the stop lead
+    // would restart the unit in a loop until the end).
+    let public_key = signer.public_key();
+    let read = AgentKeyRepository::signer_key_admission(pool, signer_id, &public_key)
+        .await
+        .map_err(|e| format!("{ENV_KEY_FILE}: could not read the key's admission: {e}"))?;
+    if let AdmissionVerdict::Stop(_) = admission_verdict(&read) {
+        return Err(format!(
+            "{ENV_KEY_FILE}: the key ({}) of signer agent {signer_id} {KEY_ADMISSION_ENDING}",
+            hex::encode(public_key)
+        ));
+    }
     let mut warnings = Vec::new();
     match how {
         SignerResolution::AgentPublicKey { dedicated: false } => warnings.push(format!(
@@ -316,16 +343,65 @@ pub async fn decide(pool: &PgPool, key_file: Option<&str>) -> Result<BootDecisio
 /// its signing key's admission ([`spawn_admission_watch`]).
 pub const ENV_RECHECK_SECS: &str = "EPIGRAPH_API_SIGNING_KEY_RECHECK_SECS";
 
-/// The stop text's fixed part when the running server's key is no longer
-/// admitted ([`watch_admission`]).
-pub const KEY_NO_LONGER_ADMITTED: &str = "is no longer admitted by the edge verifier \
-     (revoked, rotated out, or outside its validity window): every edge signed with it from \
-     now on would fail verification. Stopping; point EPIGRAPH_API_SIGNING_KEY_FILE at the \
-     signer agent's active signing key and restart";
+/// How long before its key's recorded admission ends (a known cut-over, a
+/// `valid_until`) the server stops signing with it. The server stops BEFORE
+/// the end, not an interval after it, so an edge it signed is dated inside
+/// the window; the lead covers the re-check's latency, the exit, and a
+/// transaction that began just before the stop.
+pub const STOP_LEAD_SECS: i64 = 5;
 
-/// Re-check every `interval` whether the edge verifier still admits
-/// `signer`'s key for its signer agent, and return the stop text once it does
-/// not. A failed re-read is logged at WARN and the watch goes on: the key
+/// The stop text's fixed part when the running server's key is not admitted,
+/// or stops being admitted within [`STOP_LEAD_SECS`] ([`watch_admission`]).
+pub const KEY_NO_LONGER_ADMITTED: &str = "is no longer admitted by the edge verifier, or stops \
+     being admitted within the stop lead (revoked, rotated out, or its validity window \
+     closes): an edge signed with it would fail verification. Stopping; point \
+     EPIGRAPH_API_SIGNING_KEY_FILE at the signer agent's active signing key and restart";
+
+/// The boot refusal's fixed part for a key whose admission ends within
+/// [`STOP_LEAD_SECS`]: it passes the boot rule but the watch would stop the
+/// server at once, so the unit would restart in a loop until the end.
+pub const KEY_ADMISSION_ENDING: &str = "stops being admitted by the edge verifier within the \
+     stop lead; the server would stop at once. Point the variable at the signer agent's next \
+     active signing key";
+
+/// What the server does with its key after an admission read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionVerdict {
+    /// Keep signing, re-reading within at most this long (`None`: no recorded
+    /// end; the watch interval alone decides).
+    Keep(Option<std::time::Duration>),
+    /// Stop: not admitted (`None`), or its admission ends at this instant,
+    /// within [`STOP_LEAD_SECS`] of the read.
+    Stop(Option<DateTime<Utc>>),
+}
+
+/// The verdict on one admission read: stop when the key is not admitted or
+/// its admission ends within [`STOP_LEAD_SECS`] of the read (both on the
+/// database clock), otherwise keep signing until at most the lead before the
+/// end.
+#[must_use]
+pub fn admission_verdict(read: &SignerKeyAdmission) -> AdmissionVerdict {
+    match read.end {
+        KeyAdmissionEnd::NotAdmitted => AdmissionVerdict::Stop(None),
+        KeyAdmissionEnd::Open => AdmissionVerdict::Keep(None),
+        KeyAdmissionEnd::At(end) => {
+            let left = end - read.checked_at - chrono::Duration::seconds(STOP_LEAD_SECS);
+            match left.to_std() {
+                Ok(left) if !left.is_zero() => AdmissionVerdict::Keep(Some(left)),
+                _ => AdmissionVerdict::Stop(Some(end)),
+            }
+        }
+    }
+}
+
+/// Consecutive failed re-reads after which the watch logs at ERROR, not WARN.
+pub const FAILED_RECHECKS_BEFORE_ERROR: u32 = 5;
+
+/// Check whether the edge verifier still admits `signer`'s key for its signer
+/// agent, now and then every `interval` (sooner when a recorded window ends
+/// first), and return the stop text once [`admission_verdict`] says stop. A
+/// failed re-read is logged (WARN, then ERROR after
+/// [`FAILED_RECHECKS_BEFORE_ERROR`] in a row) and the watch goes on: the key
 /// passed its fail-closed boot check, and a transient database error must not
 /// stop the server. Only a positive read of an inadmissible key returns.
 pub async fn watch_admission(
@@ -334,33 +410,51 @@ pub async fn watch_admission(
     interval: std::time::Duration,
 ) -> String {
     let public_key = signer.signer.public_key();
+    let mut failures: u32 = 0;
     loop {
-        tokio::time::sleep(interval).await;
-        match AgentKeyRepository::signer_key_admitted(
-            &pool,
-            signer.signer_id,
-            &public_key,
-            Utc::now(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
+        let read =
+            AgentKeyRepository::signer_key_admission(&pool, signer.signer_id, &public_key).await;
+        let next = match read.map(|r| admission_verdict(&r)) {
+            Ok(AdmissionVerdict::Keep(cap)) => {
+                failures = 0;
+                cap.map_or(interval, |c| c.min(interval))
+            }
+            Ok(AdmissionVerdict::Stop(end)) => {
+                let ends = end.map_or(String::new(), |t| {
+                    format!(" (its admission ends at {})", t.to_rfc3339())
+                });
                 let stop = format!(
                     "{ENV_KEY_FILE}: the API's signing key ({}) of signer agent {} \
-                     {KEY_NO_LONGER_ADMITTED}",
+                     {KEY_NO_LONGER_ADMITTED}{ends}",
                     hex::encode(public_key),
                     signer.signer_id
                 );
                 tracing::error!("{stop}");
                 return stop;
             }
-            Err(e) => tracing::warn!(
-                "{ENV_KEY_FILE}: could not re-check the API signing key's admission ({e}); \
-                 still signing, re-checking in {}s",
-                interval.as_secs()
-            ),
-        }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                log_failed_recheck(failures, &e, interval);
+                interval
+            }
+        };
+        tokio::time::sleep(next).await;
+    }
+}
+
+fn log_failed_recheck(failures: u32, e: &epigraph_db::DbError, interval: std::time::Duration) {
+    let secs = interval.as_secs();
+    if failures >= FAILED_RECHECKS_BEFORE_ERROR {
+        tracing::error!(
+            "{ENV_KEY_FILE}: could not re-check the API signing key's admission {failures} \
+             times in a row ({e}); the API keeps signing with a key whose admission it cannot \
+             confirm, re-checking in {secs}s"
+        );
+    } else {
+        tracing::warn!(
+            "{ENV_KEY_FILE}: could not re-check the API signing key's admission ({e}); still \
+             signing, re-checking in {secs}s"
+        );
     }
 }
 
