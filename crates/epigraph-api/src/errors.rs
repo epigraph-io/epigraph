@@ -310,6 +310,23 @@ pub enum ApiError {
         error: &'static str,
         description: String,
     },
+
+    /// RFC 6749 §5.2 `invalid_client` from the token endpoint: a confidential
+    /// client failed to authenticate (unknown or missing `client_id`, a
+    /// missing, malformed or wrong secret or assertion, a replayed assertion).
+    /// Body `{"error":"invalid_client","error_description":<text>}`, with a
+    /// generic description that does not say which check failed.
+    ///
+    /// `400` when the client authenticated in the request body
+    /// (`client_secret_post`, the one method this server accepts), which owes
+    /// no challenge. `401` with `WWW-Authenticate: Basic` when the request
+    /// carried `Authorization: Basic`, as §5.2 requires for a client that
+    /// tried the header.
+    #[error("invalid_client: {description}")]
+    OAuthInvalidClient {
+        description: String,
+        basic_attempted: bool,
+    },
 }
 
 impl ApiError {
@@ -419,6 +436,34 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
         // RFC 6749 §5.2: the token endpoint's own error body.
+        if let ApiError::OAuthInvalidClient {
+            description,
+            basic_attempted,
+        } = &self
+        {
+            let status = if *basic_attempted {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            let mut response = (
+                status,
+                Json(serde_json::json!({
+                    "error": "invalid_client",
+                    "error_description": description,
+                })),
+            )
+                .into_response();
+            if *basic_attempted {
+                response.headers_mut().insert(
+                    WWW_AUTHENTICATE,
+                    HeaderValue::from_static(
+                        "Basic realm=\"oauth\", charset=\"UTF-8\"",
+                    ),
+                );
+            }
+            return response;
+        }
         if let ApiError::OAuthGrantError { error, description } = &self {
             return (
                 StatusCode::BAD_REQUEST,
@@ -556,6 +601,17 @@ impl IntoResponse for ApiError {
             // Answered above with its own body; kept here so the match stays
             // exhaustive.
             ApiError::OAuthGrantError { error, .. } => (StatusCode::BAD_REQUEST, *error, None),
+            ApiError::OAuthInvalidClient {
+                basic_attempted, ..
+            } => (
+                if *basic_attempted {
+                    StatusCode::UNAUTHORIZED
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                "invalid_client",
+                None,
+            ),
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a

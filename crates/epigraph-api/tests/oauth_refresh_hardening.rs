@@ -626,11 +626,12 @@ fn agent_refresh(token: &str, client_id: &str, key: &SigningKey) -> Value {
 }
 
 /// A service chain refreshes only with the service's own secret, presented
-/// under the chain's own `client_id`. Without a credential (`400`), with a
-/// wrong secret (`401`), under another client's id with that client's secret
-/// (`401`), or under another client's id with the chain's OWN secret (`401`,
-/// the `client_id` binding), the refresh is refused and the presented token
-/// is left intact (it then refreshes with the right credential).
+/// under the chain's own `client_id`. Without a credential or with a wrong
+/// secret (`400 invalid_client`, backlog 31d799b3), under another client's id
+/// with that client's secret (`401`), or under another client's id with the
+/// chain's OWN secret (`401`, the `client_id` binding), the refresh is refused
+/// and the presented token is left intact (it then refreshes with the right
+/// credential).
 ///
 /// Catches: possession of the refresh token being the only authentication of
 /// a confidential client on the refresh grant (RFC 6749 section 6), and a
@@ -650,7 +651,7 @@ async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
         (
             "a wrong secret",
             service_refresh(&r0, &client_id, &hex::encode(wrong)),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::BAD_REQUEST,
         ),
         (
             "another client's id and secret",
@@ -680,8 +681,8 @@ async fn a_service_refresh_requires_the_services_own_secret(pool: PgPool) {
 }
 
 /// An agent chain refreshes only with a fresh assertion under the agent's own
-/// key, presented under the chain's own `client_id`. Without an assertion
-/// (`400`), with one under another key (`401`), or under ANOTHER agent's
+/// key, presented under the chain's own `client_id`. Without an assertion or
+/// with one under another key (`400 invalid_client`), or under ANOTHER agent's
 /// `client_id` with an assertion under the chain's own key (`401`, the
 /// `client_id` binding), the refresh is refused and the presented token is
 /// left intact.
@@ -704,7 +705,7 @@ async fn an_agent_refresh_requires_an_assertion_under_the_agents_key(pool: PgPoo
         (
             "an assertion under another key",
             agent_refresh(&r0, &client_id, &stranger),
-            StatusCode::UNAUTHORIZED,
+            StatusCode::BAD_REQUEST,
         ),
         (
             "another agent's client_id with the chain's own key",
@@ -726,6 +727,175 @@ async fn an_agent_refresh_requires_an_assertion_under_the_agents_key(pool: PgPoo
         StatusCode::OK,
         "the refused requests left the chain intact: {body}"
     );
+}
+
+// ── 31d799b3: a client-authentication failure is RFC 6749 invalid_client ────
+
+/// POST `/oauth/token` with an optional `Authorization` header. Returns the
+/// status, the `WWW-Authenticate` header (if any) and the JSON body.
+async fn post_token_authz(
+    app: &axum::Router,
+    body: Value,
+    authorization: Option<&str>,
+) -> (StatusCode, Option<String>, Value) {
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(a) = authorization {
+        req = req.header(header::AUTHORIZATION, a);
+    }
+    let resp = app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let challenge = resp
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .map(|v| v.to_str().unwrap_or_default().to_string());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        challenge,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Every way a confidential client can fail to authenticate at the token
+/// endpoint, on the `client_credentials` grant and on the refresh grant,
+/// answers RFC 6749 section 5.2's `invalid_client`: a 400 (the client
+/// authenticated in the body, `client_secret_post`, so no challenge is owed)
+/// with `{"error":"invalid_client"}` and ONE generic `error_description` for
+/// every case, so the body does not say which check failed. A client that
+/// tried HTTP Basic (which this server does not accept) gets the 401 with a
+/// `WWW-Authenticate: Basic` challenge section 5.2 requires for that case.
+/// The refused requests leave both chains usable.
+///
+/// Catches: the token endpoint answering client-authentication failures with
+/// the generic `{"error":"BadRequest"}` / `{"error":"Unauthorized"}` bodies
+/// (and so a client library keying on the RFC code not recognising them), and
+/// a description that differs by the check that failed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_authentication_failures_are_rfc_invalid_client(pool: PgPool) {
+    let (svc_id, secret) = service_client(&pool, &v(&["claims:read"])).await;
+    let key = SigningKey::from_bytes(&[0x6a; 32]);
+    let stranger = SigningKey::from_bytes(&[0x6b; 32]);
+    let agent_id = agent_client(&pool, &key).await;
+    let app = create_router(state(&pool).await);
+
+    let (status, body) = post_token(&app, service_grant(&svc_id, &secret)).await;
+    assert_eq!(status, StatusCode::OK, "service client_credentials: {body}");
+    let svc_chain = refresh_token_of(&body);
+    let (status, body) = post_token(&app, agent_grant(&agent_id, &key)).await;
+    assert_eq!(status, StatusCode::OK, "agent client_credentials: {body}");
+    let agent_chain = refresh_token_of(&body);
+
+    let wrong: [u8; 32] = rand::random();
+    let wrong = hex::encode(wrong);
+    let unknown = format!("a11_svc_{}", Uuid::new_v4().simple());
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "client_credentials: an unknown client_id",
+            service_grant(&unknown, &secret),
+        ),
+        (
+            "client_credentials: no client_id",
+            json!({ "grant_type": "client_credentials", "client_secret": secret }),
+        ),
+        (
+            "client_credentials: a service without a secret",
+            json!({ "grant_type": "client_credentials", "client_id": svc_id }),
+        ),
+        (
+            "client_credentials: a service with a wrong secret",
+            service_grant(&svc_id, &wrong),
+        ),
+        (
+            "client_credentials: a service with a secret that is not hex",
+            service_grant(&svc_id, "not-hex"),
+        ),
+        (
+            "client_credentials: an agent without an assertion",
+            json!({ "grant_type": "client_credentials", "client_id": agent_id }),
+        ),
+        (
+            "client_credentials: an agent assertion under another key",
+            agent_grant(&agent_id, &stranger),
+        ),
+        (
+            "client_credentials: an agent assertion that is not base64",
+            json!({
+                "grant_type": "client_credentials",
+                "client_id": agent_id,
+                "client_assertion_type": "urn:epigraph:ed25519",
+                "client_assertion": "%%%",
+            }),
+        ),
+        (
+            "refresh: a service chain without a credential",
+            refresh_grant(&svc_chain),
+        ),
+        (
+            "refresh: a service chain with a wrong secret",
+            service_refresh(&svc_chain, &svc_id, &wrong),
+        ),
+        (
+            "refresh: an agent chain without an assertion",
+            refresh_grant(&agent_chain),
+        ),
+        (
+            "refresh: an agent chain with an assertion under another key",
+            agent_refresh(&agent_chain, &agent_id, &stranger),
+        ),
+    ];
+    let mut description: Option<String> = None;
+    for (what, req) in cases {
+        let (status, challenge, body) = post_token_authz(&app, req, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert_eq!(body["error"], "invalid_client", "{what}: {body}");
+        assert!(body.get("access_token").is_none(), "{what}: {body}");
+        assert_eq!(challenge, None, "{what}: no challenge for body auth");
+        let d = body["error_description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: an error_description: {body}"))
+            .to_string();
+        match &description {
+            None => description = Some(d),
+            Some(first) => assert_eq!(
+                &d, first,
+                "{what}: one generic description, whichever check failed"
+            ),
+        }
+    }
+
+    // HTTP Basic: not accepted here, so the credential is missing from the
+    // body; RFC 6749 section 5.2 then requires a 401 with a challenge.
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{svc_id}:{secret}"))
+    );
+    let (status, challenge, body) = post_token_authz(
+        &app,
+        json!({ "grant_type": "client_credentials", "client_id": svc_id }),
+        Some(&basic),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "HTTP Basic: {body}");
+    assert_eq!(body["error"], "invalid_client", "HTTP Basic: {body}");
+    assert!(
+        challenge
+            .as_deref()
+            .is_some_and(|c| c.to_ascii_lowercase().starts_with("basic ")),
+        "HTTP Basic: a Basic challenge, got {challenge:?}"
+    );
+
+    // Calibration: nothing above spent either chain.
+    let (status, body) = post_token(&app, service_refresh(&svc_chain, &svc_id, &secret)).await;
+    assert_eq!(status, StatusCode::OK, "the service chain is intact: {body}");
+    let (status, body) = post_token(&app, agent_refresh(&agent_chain, &agent_id, &key)).await;
+    assert_eq!(status, StatusCode::OK, "the agent chain is intact: {body}");
 }
 
 // ── 7a2111e6: an authorization-code chain is bound to its connector app ──────

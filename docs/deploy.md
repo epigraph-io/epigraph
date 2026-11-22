@@ -1948,9 +1948,9 @@ scopes, narrowed to the client's current `granted_scopes` (RFC 6749 section
    `client_assertion_type=urn:epigraph:ed25519`), and a service sends its
    `client_secret`. Each is checked exactly as the `client_credentials` grant
    checks it (one shared check). A `client_id` on the request must be the
-   chain's own. A refresh that does not authenticate is refused (`400` for a
-   missing credential, `401` for a wrong one or a foreign `client_id`) and
-   changes nothing: the presented token is neither burned nor rotated, so the
+   chain's own. A refresh that does not authenticate is refused (`400
+   invalid_client` for a missing or wrong credential, see "Token-endpoint
+   error bodies" below; `401` for a foreign `client_id`) and changes nothing: the presented token is neither burned nor rotated, so the
    client can retry with its credential. A later secret rotation or key change
    therefore cuts a live chain. No in-tree consumer refreshes an agent or
    service chain (the agents re-run `client_credentials`). An out-of-tree
@@ -1991,6 +1991,42 @@ scopes, narrowed to the client's current `granted_scopes` (RFC 6749 section
    `epigraph_refresh_token_revoke_client_app`, drop the partial index, and
    drop the column. The rotate definer is untouched by 174, so nothing is
    re-run for it.
+
+### Token-endpoint and revocation error bodies (RFC 6749 section 5.2, RFC 7009)
+
+A contract change for clients of `POST /oauth/token` and `POST /oauth/revoke`
+(backlog 31d799b3 and cd96cd49):
+
+1. **A confidential client that fails to authenticate gets `invalid_client`.**
+   On the `client_credentials` grant and on the refresh grant of an agent or
+   service chain, every client-authentication failure (an unknown or missing
+   `client_id`, a missing, malformed or wrong `client_secret` or
+   `client_assertion`, a replayed assertion) answers
+   `{"error":"invalid_client","error_description":"client authentication failed"}`.
+   The description is the same for every case; the reason is in the API log
+   (`confidential client authentication failed`, with `reason=`).
+   * The status is `400`: the client authenticated in the request body
+     (`client_secret_post`, the only method the server metadata advertises),
+     so RFC 6749 section 5.2 owes no challenge.
+   * A request that carried `Authorization: Basic ...` (not accepted) gets
+     `401` with `WWW-Authenticate: Basic realm="oauth", charset="UTF-8"`, as
+     section 5.2 requires for a client that tried the header.
+   * **Before:** `{"error":"Unauthorized",...}` (`401`) for an unknown client
+     or a wrong credential and `{"error":"BadRequest",...}` (`400`) for a
+     missing or malformed one. A caller that matched the old body text
+     (`Unknown client_id`, `Invalid client_secret`) or keyed on `401` for a
+     wrong secret must key on `error == "invalid_client"` instead. The
+     in-tree and host callers measured treat every non-2xx mint alike.
+   * Unchanged: a refresh token that is unknown, spent or presented under a
+     foreign `client_id` (`401`), a suspended client (`403`), a human client
+     on `client_credentials` (`400`), and a database failure (`500`).
+2. **A malformed revocation request gets `invalid_request`.** `POST
+   /oauth/revoke` with no `token`, or a body that does not parse, answers
+   `400 {"error":"invalid_request","error_description":...}` (RFC 7009
+   section 2.2.1) instead of `{"error":"BadRequest",...}`. The status is
+   unchanged.
+
+Rollback: the previous API binary. No migration.
 
 ## 9. Operator binding, the custodian role, identities, groups and the operator CLI
 
