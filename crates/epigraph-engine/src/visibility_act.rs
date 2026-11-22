@@ -33,18 +33,34 @@
 //! commits after both, so the act and the refold commit together or not at
 //! all.
 //!
+//! # An operated agent is refused in the definer (migration 242)
+//!
+//! Neither act runs on an operated agent's own authority (share-with-team
+//! spec ruling R1, backlog ecd842bf): when the session principal belongs to
+//! another agent (`epigraph_human_of(principal, false)`: a live or retired
+//! operator link, or a client allowance), 242's definers classify every
+//! readable claim `refused_not_human` and the call changes nothing,
+//! whatever memberships the agent holds itself. Its human makes the same
+//! call. That is the definer's decision, not this module's: both transports
+//! reach it through these functions, and a caller that skipped them would
+//! still meet it.
+//!
 //! # Fail closed when the session cannot write the moved claim
 //!
 //! The refold writes `claims` on the caller's stamped session, under row
-//! security. A share admits a target team the caller writes only through its
-//! live human (the operator arm, `epigraph_writable_teams` `via = 'operator'`), and the
-//! caller's own stamp does not carry that team. After the move the session
-//! then cannot read or write the claim, the refold would silently match
-//! nothing, and the stale value would be served to the team. Every moved claim
-//! must therefore be in the session's writable groups; if one is not, the act
-//! is refused ([`RefusalKind::Authority`]) and, because the caller then drops
-//! the transaction, nothing is changed. A member of the team (the human
-//! itself) can make the same call.
+//! security. If the session cannot write a moved claim after the move, the
+//! refold would silently match nothing and the stale value would be served to
+//! the new audience. Every moved claim must therefore be in the session's
+//! writable groups; if one is not, the act is refused
+//! ([`RefusalKind::Authority`]) and, because the caller then drops the
+//! transaction, nothing is changed.
+//!
+//! Under 215 this was reachable: a share admitted a target team the caller
+//! wrote only through its live human (`epigraph_writable_teams`
+//! `via = 'operator'`), which the caller's own stamp does not carry. Under 242
+//! the operated caller is refused first and share admits `via = 'own'` only,
+//! so no shipped path reaches the check; it stays as a backstop against a
+//! future definer that admits a target the session does not write.
 //!
 //! # What is not refolded here (residuals)
 //!

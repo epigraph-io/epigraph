@@ -286,15 +286,19 @@ Every id is classified first, in this order, and nothing changes unless every id
 
 1. The row must exist and be readable by the session. Otherwise it is answered as `not_found`;
    existence of an unreadable claim is never disclosed.
-2. It must be `visibility = 'group'`. An already-public claim is a no-op, `already_public`.
-3. The caller must be authorized under **D-V2**, else `refused_not_admin`.
-4. It must not be sealed (`claim_encryption` row), else `refused_sealed`. This is a returned
+2. The caller must not be an operated agent (migration 242, share-with-team ruling R1): when
+   `epigraph_human_of(caller, false)` is another agent (an operator link of any state, or a
+   client allowance), every readable id is `refused_not_human`, whatever memberships the agent
+   holds itself. Its human makes the call.
+3. It must be `visibility = 'group'`. An already-public claim is a no-op, `already_public`.
+4. The caller must be authorized under **D-V2**, else `refused_not_admin`.
+5. It must not be sealed (`claim_encryption` row), else `refused_sealed`. This is a returned
    outcome, not a raised error, and it is checked before anything changes. The 074 trigger is
    the backstop.
 
 Then, for the `publicize` claims:
 
-5. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
+6. `set_config('epigraph.allow_declassify','yes', true)`, then `UPDATE claims SET
    visibility='public'` with the owner unchanged, then reset the GUC to `''` in the same body.
    The UPDATE moves a claim only while it is still `group` and still owned by the group it was
    classified under. If fewer claims move than were classified (a claim that was not locked
@@ -302,19 +306,19 @@ Then, for the `publicize` claims:
    (SQLSTATE 40001) and nothing is changed; the repo maps it to a `State` refusal (409 over
    REST), and a retry classifies the new state. Propagation copies `public` onto the 17 derived
    tables. Pinned evidence stays `group`, and its owner never moves.
-6. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
+7. Recompute the edge meet for every edge incident to the claims, **widening allowed**. This is
    the same CASE as `recompute_boundary_meet_conn`: both endpoints public and in writer scope →
    `('public', writer_group_id)`, otherwise world. One endpoint still private → the private
    side's group. An edge explicitly declared `('group', G)` between public endpoints is kept,
    as 120 does on INSERT. That declaration is not recorded, so the rule is narrowed: only edges
    whose whole `(visibility, owner_group_id, co_owner_group_id)` tuple equals the meet that the
    old tenancy produces get rewritten. Anything else was a declaration and is left alone.
-7. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
+8. Insert one `security_events` row, `event_type = 'claim.publicized'`, with `agent_id` set to
    the principal and details `{claim_ids, owner_group_ids, reason, edges_widened,
    evidence_kept_private, migration, session_user}`.
 
 It returns per-claim `(claim_id, outcome)` where outcome is `publicized | already_public |
-not_found | refused_not_admin | refused_sealed`. If any id is `not_found` or `refused_*`,
+not_found | refused_not_human | refused_not_admin | refused_sealed`. If any id is `not_found` or `refused_*`,
 nothing is changed and the classification is returned as it stands. The repo wrapper
 (`ClaimRepository::publicize_conn`) answers `not_found` as a missing claim and any refusal as a
 designed refusal, so a caller never sees a partial act.
@@ -325,18 +329,23 @@ This handles `private → team`. Each claim must be `('group', H)`, where `H` is
 group (its own personal group, or its operator's for an operated caller). The caller must be the
 claim's author (`claims.agent_id`), **or** a live admin of `H`. The second arm lets the human
 whose personal group it is share what its agents wrote there; it is the share-side counterpart
-of D-V2's note that the human is admin of its own personal group. `p_group_id` must be in
-`epigraph_writable_teams(caller)` and must not be `H`.
+of D-V2's note that the human is admin of its own personal group. `p_group_id` must be a team
+the caller writes by its **own** live membership (`epigraph_writable_teams(caller)` rows with
+`via = 'own'`, migration 242) and must not be `H`. An operated caller (an agent whose
+`epigraph_human_of(caller, false)` is another agent) is refused outright (242, share-with-team
+ruling R1): it may write into its human's teams (D-V3), but it does not move existing work out
+of a group on its own authority.
 
 Every id is classified first, in this order, all or nothing as in §4.2:
 
 | Outcome | When |
 |---|---|
 | `not_found` | no such claim, or the session cannot read it |
+| `refused_not_human` | the caller is an operated agent (242); every readable id gets it |
 | `refused_not_private` | the claim is public, or owned by a group other than `H` |
 | `refused_not_author` | the caller neither wrote it nor is a live admin of `H` |
 | `refused_sealed` | it has a `claim_encryption` row (its key material is bound to its group) |
-| `refused_not_team_writer` | the target group is not writable by the caller, or is `H` |
+| `refused_not_team_writer` | the caller has no own writer or admin membership of the target, or it is `H` |
 | `share` | to be moved; returned as `shared` once moved |
 
 The rows are locked before they are classified, as in §4.2. If every id is `share`, the
