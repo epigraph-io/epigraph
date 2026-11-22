@@ -2430,9 +2430,12 @@ at boot, on every transport, and refuses to start on `may_run = false`.
 Attachments are written by a maintenance session
 (`epigraph_attach_agent_to_role` / `epigraph_detach_agent_from_role`, or a
 direct statement that meets the same guards) and by the identity
-registration. Order: REGISTER, THEN ATTACH. Attaching an identity before the
-host first registers it makes that registration abort `AID09`, and the
-identity stays refused. An operator link counts the same way. The database
+registration. Order: REGISTER, THEN ATTACH. Since migration 248 the attach
+verb refuses (`ROL03`, nothing written) an identity the host has not
+registered yet and nothing else binds, because the attachment would make its
+first registration abort `AID09` for good; start the identity under the host
+once, then attach it. An operator link written before the first registration
+still has that effect (the link verb does not check). The database
 enforces the rule against a writer that does not choose its own principal
 (the API, which stamps the authenticated viewer). A container that holds the
 application DSN directly can stamp another identity of the same human; the
@@ -4342,6 +4345,7 @@ here. Each migration's header is authoritative and holds its full undo.
 | 194 | **Binding order.** Migrate 194 only after every binary that can delete `mass_functions` rows on a privileged connection runs the release that keeps retracted rows on those paths. A binary still on an older build deletes a retracted row, the guard refuses it, and the whole administrative cascade aborts and is replayed for ever. Install a `delete-frames` built for 194 after the migrate. A precondition refuses (`55000`) unless `epigraph_cascade_delete_edge_bbas(uuid[], text)` has 117's body (md5 `39f3eacd53e7717a323759ec91b5c2c0`) and its `proconfig` is `search_path=pg_catalog, public` or `search_path=pg_catalog, public, pg_temp`. Check first with `SELECT md5(prosrc), proconfig FROM pg_proc WHERE oid = to_regprocedure('public.epigraph_cascade_delete_edge_bbas(uuid[], text)')`. Undo: `docs/runbooks/194-undo.sql`. |
 | 220 | `jobs.redelivery_count`, which bounds the crash re-delivery of a one-attempt job. **Migrate BEFORE** rolling out a `drain_jobs` built with the bounded reaper: its reaper names the column, and on a database below 220 every run fails at its first statement (`42703`) and drains nothing. An older `drain_jobs` ignores the column. Undo: `docs/runbooks/220-undo.sql`, only after rolling every such `drain_jobs` back. |
 | 231 | `epigraph_app` becomes NOLOGIN. **Binding order: move every service off an `epigraph_app` DSN first.** Create a login of its own for each one (section 2, step 4), point its DSN at it, restart it, and check `SELECT usename, count(*) FROM pg_stat_activity WHERE usename = 'epigraph_app' GROUP BY 1` returns no row. 231 refuses (`55000`, nothing changed, nothing recorded) while any session is logged in as `epigraph_app`, so migrating with the API still on the old DSN stops the deploy instead of the API; re-run `epigraph-migrate` once it has moved. It sees only OPEN sessions: a unit that is stopped during the migration, or a timer that connects now and then, passes it and is refused at its next connect (`role "epigraph_app" is not permitted to log in`), so find every DSN naming `epigraph_app` before migrating. A migration login that is neither a superuser nor holds CREATEROLE with ADMIN on the role fails it (`42501`) while the role can log in; run `ALTER ROLE epigraph_app NOLOGIN;` as a superuser and re-run. A cluster where the role is already NOLOGIN (every fresh install) is unchanged. Undo: `ALTER ROLE epigraph_app LOGIN;` as a superuser (the password is kept). |
+| 248 | The attach verb refuses an identity the host has not registered yet (`ROL03`). A precondition checks 166's attach body by md5 (`55000` otherwise). No order against the binaries. Undo: `docs/runbooks/248-undo.sql`. |
 
 The md5 values above are copied from the migrations' own preconditions. They
 are properties of the public function bodies, not of any deployment.

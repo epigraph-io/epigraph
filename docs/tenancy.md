@@ -1729,7 +1729,8 @@ new, non-elevating role that the same human holds, here
 4. Register the job's identity, through the host's identity attestor, in the
    group folder the job runs in, and link it to that human. Do this BEFORE
    step 5: an identity that already has an attachment when the host first
-   registers it is refused (`AID09`).
+   registers it is refused (`AID09`), so since migration 248 step 5 refuses
+   (`ROL03`) an identity the host has not registered yet.
 
 5. Attach the identity to the role (166; no CLI verb yet):
 
