@@ -1609,6 +1609,43 @@ pub async fn replay_deferred(
 mod tests {
     use super::*;
 
+    /// The act's errors split three ways (backlog dca9ed56): a designed
+    /// refusal keeps its kind; a duplicate deleted after the caller read it
+    /// is a state refusal (409 / INVALID_PARAMS), with the fixed not-found
+    /// text naming the id the caller supplied; anything else is a failure,
+    /// redacted by both transports. No request path can delete the duplicate
+    /// between the caller's read and the act on demand, so the `NotFound` arm
+    /// is pinned here.
+    #[test]
+    fn an_act_error_is_a_refusal_only_when_it_is_designed() {
+        use epigraph_db::{DbError, RefusalKind};
+        let refused = act_refusal(DbError::Refused {
+            kind: RefusalKind::Authority,
+            message: "unmark_duplicate: refused".into(),
+        });
+        assert_eq!(
+            refused,
+            UnmarkRefusal::Act {
+                kind: RefusalKind::Authority,
+                message: "unmark_duplicate: refused".into(),
+            }
+        );
+        let id = Uuid::new_v4();
+        let deleted = act_refusal(DbError::NotFound {
+            entity: "Claim".into(),
+            id,
+        });
+        let UnmarkRefusal::Act { kind, message } = &deleted else {
+            panic!("a deleted duplicate must be a state refusal: {deleted:?}");
+        };
+        assert_eq!(*kind, RefusalKind::State);
+        assert_eq!(message, &format!("Claim with ID {id} not found"));
+        let failed = act_refusal(DbError::QueryFailed {
+            source: sqlx::Error::PoolTimedOut,
+        });
+        assert!(matches!(failed, UnmarkRefusal::Failed(_)), "{failed:?}");
+    }
+
     #[test]
     fn counts_only_replaces_every_array_by_its_length() {
         let v = serde_json::json!({
