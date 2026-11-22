@@ -52,22 +52,37 @@ def maintenance_dsn(default=DEFAULT_DATABASE_URL):
 
 
 def not_intake_owned(alias="c"):
-    """SQL predicate: claim `alias` is NOT owned by the bug-report intake group.
+    """SQL predicate: claim `alias` is NOT a bug-report intake claim.
 
     Migration 207's intake files private bug reports, written by agents that
     are not members of the group that triages them, as claims owned by the
-    group `bug_report_intake_settings` names. It is keyed on the CURRENTLY
-    configured intake group: a report triage moves out of that group (or every
-    report, once the operator names another group) is no longer matched. With
-    no settings row it matches nothing.
+    group `bug_report_intake_settings` names. A claim is an intake claim when
+    EITHER
+      * it carries the intake marker the write recorded when it was filed
+        (`bug_report_intake_marks`, migration 265), wherever triage has moved
+        it since and whichever group was the intake then (backlog e690866c:
+        keyed on the current group alone, a report moved out of it, or every
+        report once the operator named another group, was sampled again); or
+      * it is owned by the CURRENTLY configured intake group (207's rule,
+        kept: whatever triage puts in that group stays out too). With no
+        settings row this arm matches nothing.
+
+    Both tables are rowless and read by plain SELECT, so a login without
+    SELECT on either (a read-only role for a dry run; see docs/deploy.md)
+    FAILS with 42501 instead of silently excluding nothing. Do not rewrite
+    this over `security_events`' `bug_report.submitted` rows: that table is
+    under row security, and a login that does not bypass it reads no marker
+    there, so the exclusion would pass every claim with no error.
 
     Not used on its own by any label path: `public_label_source` conjoins it
     with the public-visibility test, so a report the intake group made public
     is still never quoted in a stored label.
     """
     return (
-        "NOT EXISTS (SELECT 1 FROM bug_report_intake_settings bri "
-        f"WHERE bri.intake_group_id = {alias}.owner_group_id)"
+        "(NOT EXISTS (SELECT 1 FROM bug_report_intake_marks brm "
+        f"WHERE brm.claim_id = {alias}.id) "
+        "AND NOT EXISTS (SELECT 1 FROM bug_report_intake_settings bri "
+        f"WHERE bri.intake_group_id = {alias}.owner_group_id))"
     )
 
 
