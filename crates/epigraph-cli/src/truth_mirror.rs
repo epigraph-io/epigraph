@@ -59,7 +59,9 @@
 //! (the BEFORE UPDATE trigger bumps `updated_at`).
 //!
 //! [`dry_run`] evaluates the same rules in ONE `REPEATABLE READ, READ ONLY`
-//! transaction and writes nothing. [`restore`] is the reverse compare-and-set
+//! transaction and writes nothing; it reads the transaction's mode back and
+//! refuses to run in any other, and the report carries what it read
+//! ([`MirrorReport::transaction`]). [`restore`] is the reverse compare-and-set
 //! over a record file: `truth_before` goes back only where `truth_value` still
 //! holds exactly `truth_written`, current or not (a faithful undo, the
 //! counterpart of `restore_belief_cache`, which restores a retired row's cache
@@ -505,10 +507,22 @@ impl Default for RefreshOptions {
     }
 }
 
+/// The mode a dry run's transaction reported for itself, read inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TxMode {
+    /// `current_setting('transaction_read_only')`: `on` for a dry run.
+    pub read_only: String,
+    /// `current_setting('transaction_isolation')`: `repeatable read`.
+    pub isolation: String,
+}
+
 /// Every claim's outcome of one run.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MirrorReport {
     pub outcomes: Vec<Outcome>,
+    /// A dry run's transaction mode, as the transaction itself reported it;
+    /// `None` for an apply.
+    pub transaction: Option<TxMode>,
 }
 
 impl MirrorReport {
@@ -608,6 +622,7 @@ impl MirrorReport {
             })).collect::<Vec<_>>(),
             "delta_bins": bins,
             "crossings": crossings,
+            "transaction": self.transaction,
         })
     }
 }
@@ -640,9 +655,13 @@ pub async fn begin_dry_run_tx(
 
 /// Evaluate every rule for `candidates` and write nothing: one
 /// [`begin_dry_run_tx`] transaction (a write inside it fails), rolled back.
+/// The transaction's mode is read back inside it before the first claim
+/// read; anything but `READ ONLY` and `REPEATABLE READ` stops the run, and
+/// the report carries what was read.
 ///
 /// # Errors
-/// Any database error.
+/// Any database error, or a transaction that is not read-only and
+/// repeatable-read.
 pub async fn dry_run(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -650,7 +669,25 @@ pub async fn dry_run(
     opts: &RefreshOptions,
 ) -> anyhow::Result<MirrorReport> {
     let mut tx = begin_dry_run_tx(pool).await?;
-    let mut report = MirrorReport::default();
+    let (read_only, isolation): (String, String) = sqlx::query_as(
+        "SELECT current_setting('transaction_read_only'), \
+                current_setting('transaction_isolation')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if read_only != "on" || isolation != "repeatable read" {
+        anyhow::bail!(
+            "the dry run's transaction is read_only={read_only}, isolation={isolation}; \
+             it must be read-only and repeatable read"
+        );
+    }
+    let mut report = MirrorReport {
+        transaction: Some(TxMode {
+            read_only,
+            isolation,
+        }),
+        ..MirrorReport::default()
+    };
     for chunk in candidates.chunks(opts.batch_size.max(1)) {
         let ids: Vec<Uuid> = chunk.iter().map(|c| c.claim_id).collect();
         let states = read_states(&mut tx, viewer, &ids, false).await?;
@@ -989,6 +1026,7 @@ mod tests {
                 // Not refreshed: crosses everything upward, counted nowhere.
                 outcome_of(Bucket::NotAMirror, 0.1, 0.9),
             ],
+            ..MirrorReport::default()
         };
         let j = report.to_json(true, false, 5);
         let cross = |t: &str, dir: &str| j["crossings"][t][dir].as_u64().unwrap();

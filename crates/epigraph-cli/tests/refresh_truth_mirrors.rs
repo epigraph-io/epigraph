@@ -39,7 +39,7 @@ use epigraph_cli::belief_cache::{
 use epigraph_cli::belief_mode_check::MODE_CHECK_REFUSED_EXIT;
 use epigraph_cli::truth_mirror::{
     apply, begin_dry_run_tx, cas_refresh, dry_run, plan_candidates, read_truth_records, restore,
-    write_truth_record, Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord,
+    write_truth_record, Bucket, Candidate, MirrorReport, RefreshOptions, TruthRecord, TxMode,
 };
 use epigraph_core::{ClaimId, TruthValue};
 use epigraph_db::repos::claim_role::{self, ClaimRole};
@@ -753,9 +753,21 @@ async fn the_dry_run_writes_nothing_and_reports_the_would_change_set(pool: PgPoo
     for (&id, (t, v)) in [a, b].iter().zip(before) {
         assert_untouched(&pool, id, t, v, "dry run").await;
     }
+    // The dry run's own transaction reported itself read-only and
+    // repeatable-read: it ran in `begin_dry_run_tx`'s transaction, where any
+    // write fails (test (15)).
+    assert_eq!(
+        report.transaction,
+        Some(TxMode {
+            read_only: "on".into(),
+            isolation: "repeatable read".into(),
+        })
+    );
     let json = report.to_json(true, false, records.len());
     assert_eq!(json["buckets"]["refresh"]["count"], 2);
     assert_eq!(json["refresh"].as_array().unwrap().len(), 2);
+    assert_eq!(json["transaction"]["read_only"], "on");
+    assert_eq!(json["transaction"]["isolation"], "repeatable read");
 }
 
 // ── (11) restore ───────────────────────────────────────────────────────────
