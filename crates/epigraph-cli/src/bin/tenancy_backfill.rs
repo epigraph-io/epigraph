@@ -2322,6 +2322,30 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 240 (backlog 88cf603b), a recorded run's stamp from its workflow. Its
+    // reads of the FORCEd `workflows` and `claims` are admitted for every
+    // writer by `epigraph_definer_bypass()` (the owner). Under a non-member
+    // owner they are filtered to what the session itself reads, so a run of
+    // a workflow the session cannot read is refused 23503 instead of 42501:
+    // fail CLOSED (loud). Not measured: a filtered `workflows` row whose id is
+    // also a readable claim's would take the claim's pair.
+    ("epigraph_behavioral_execution_inherit_tenancy", 240),
+    // 240, the runs-follow-their-workflow re-stamp (AFTER UPDATE of a
+    // `workflows` row's pair). Its UPDATE is admitted by
+    // `behavioral_executions_maintenance_update`: `epigraph_bypass()` (keyed
+    // on `session_user`, so a maintenance session's re-tenant still follows
+    // under any owner) or `epigraph_definer_bypass()` (the owner). Under a
+    // non-member owner a re-tenant made from any other session (a
+    // maintenance-owned definer the application calls, for one) matches no
+    // run and raises nothing: fail OPEN (quiet). The narrowed workflow's runs
+    // keep the old pair and stay readable to its old readers; only the
+    // operator CLIs' `tables::RunsFollow` check would notice.
+    ("epigraph_workflow_behavioral_executions_follow", 240),
+    // 240, the same re-stamp for a flat workflow CLAIM's runs (AFTER UPDATE of
+    // a claim's pair). The same stake as the `workflows` re-stamp above: fail
+    // OPEN (quiet). Its read of `workflows` (to leave a hierarchical id to
+    // that trigger) is filtered too under a non-member owner; not measured.
+    ("epigraph_claim_behavioral_executions_follow", 240),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
