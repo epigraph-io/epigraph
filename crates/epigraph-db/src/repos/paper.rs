@@ -21,27 +21,87 @@ pub struct PaperRow {
     pub journal: Option<String>,
 }
 
+/// A `papers` row as [`PaperRepository::get_or_create_stored`] left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPaper {
+    pub id: Uuid,
+    /// The STORED title, which a fill-only hit keeps even when the caller
+    /// passed a different one (backlog 288801f8).
+    pub title: Option<String>,
+}
+
+/// [`PaperRepository::planned`]: what a get-or-create would return, read
+/// without writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPaper {
+    pub id: Uuid,
+    pub title: Option<String>,
+    /// Whether a row already exists under some spelling of the key.
+    pub exists: bool,
+}
+
+/// UUIDv5 namespace for [`new_paper_id`].
+pub const PAPER_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x5a, 0x9e, 0x7d, 0x10, 0x3c, 0x2b, 0x4f, 0x61, 0x8e, 0x0d, 0x6a, 0x47, 0xb3, 0x19, 0xc2, 0xf8,
+]);
+
+/// The id a NEW `papers` row for `doi` is inserted with: a UUIDv5 of its
+/// [`canonical_document_key`]. Deterministic so a detached ingest can tell
+/// its caller the id before the walk that writes the row commits, and so two
+/// concurrent ingests of one new document agree on it. Rows written before
+/// this (and by the REST route) keep their random ids; an existing row's id
+/// always wins over this one.
+#[must_use]
+pub fn new_paper_id(doi: &str) -> Uuid {
+    Uuid::new_v5(&PAPER_NAMESPACE, canonical_document_key(doi).as_bytes())
+}
+
 pub struct PaperRepository;
 
 impl PaperRepository {
     /// Insert a paper, or return the existing id if the document key already
-    /// exists under any of its spellings.
+    /// exists under any of its spellings. [`Self::get_or_create_stored`]
+    /// without the stored title.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    pub async fn get_or_create<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+        title: Option<&str>,
+        journal: Option<&str>,
+    ) -> Result<Uuid, DbError> {
+        Ok(Self::get_or_create_stored(executor, doi, title, journal)
+            .await?
+            .id)
+    }
+
+    /// Insert a paper, or return the existing row if the document key already
+    /// exists under any of its spellings, with the title the row holds AFTER
+    /// the call.
     ///
     /// The key is matched through [`document_key_spellings`], canonical
     /// first, so a row an older writer stored under a resolver URL
     /// (`https://doi.org/10.x/y`) is reused rather than twinned by a bare-key
     /// ingest (backlog 90756d26). A new row is stored under the
-    /// [`canonical_document_key`]. Idempotent for repeat ingestion.
+    /// [`canonical_document_key`], with the id [`new_paper_id`] derives from
+    /// that key, so a caller can be told a new document's id before the
+    /// transaction that writes it commits ([`Self::planned`]). Idempotent for
+    /// repeat ingestion.
     ///
     /// **A hit fills only NULL fields** (backlog 62ce37ca). `papers` is one
-    /// global row per document with no row security, and this runs on the
-    /// plain pool before any per-caller authority over the paper is checked,
-    /// so the row found keeps its `title` and `journal`; a provided value is
-    /// written only where the stored one is NULL. Overwriting on hit let any
-    /// ingester naming an existing DOI rewrite that paper's bibliographic
-    /// fields for every reader. Both arms below hold this: the `updated` CTE
-    /// (an existing row) and `ON CONFLICT` (a concurrent writer inserted the
-    /// same new key first).
+    /// global row per document with no row security, so the row found keeps
+    /// its `title` and `journal`; a provided value is written only where the
+    /// stored one is NULL. Overwriting on hit let any ingester naming an
+    /// existing DOI rewrite that paper's bibliographic fields for every
+    /// reader. Both arms below hold this: the `updated` CTE (an existing row)
+    /// and `ON CONFLICT` (a concurrent writer inserted the same new key
+    /// first). Because of that, the returned `title` can differ from the one
+    /// passed in, and it is the one a response should report.
+    ///
+    /// Generic over the executor so a document ingest can write the row on
+    /// its walk's own transaction: a walk that fails then leaves no
+    /// `papers` row behind (backlog b995f117).
     ///
     /// One statement: when no spelling exists yet, the insert falls through
     /// to `ON CONFLICT (doi)` on the canonical key, so a concurrent writer
@@ -50,19 +110,19 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn get_or_create(
-        pool: &PgPool,
+    #[instrument(skip(executor))]
+    pub async fn get_or_create_stored<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         doi: &str,
         title: Option<&str>,
         journal: Option<&str>,
-    ) -> Result<Uuid, DbError> {
+    ) -> Result<StoredPaper, DbError> {
         let canonical = canonical_document_key(doi);
         let spellings = document_key_spellings(doi);
         // Runtime-checked, not `query!`: CI's migration runner is built
         // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
         // before the schema it is checked against exists.
-        let id: Uuid = sqlx::query_scalar(
+        let (id, title): (Uuid, Option<String>) = sqlx::query_as(
             r#"
             WITH found AS (
                 SELECT id FROM papers
@@ -76,29 +136,76 @@ impl PaperRepository {
                     journal = COALESCE(p.journal, $4::text)
                 FROM found
                 WHERE p.id = found.id
-                RETURNING p.id
+                RETURNING p.id, p.title
             ),
             inserted AS (
-                INSERT INTO papers (doi, title, journal)
-                SELECT $2::text, $3::text, $4::text
+                INSERT INTO papers (id, doi, title, journal)
+                SELECT $5::uuid, $2::text, $3::text, $4::text
                 WHERE NOT EXISTS (SELECT 1 FROM found)
                 ON CONFLICT (doi) DO UPDATE SET
                     title = COALESCE(papers.title, EXCLUDED.title),
                     journal = COALESCE(papers.journal, EXCLUDED.journal)
-                RETURNING id
+                RETURNING id, title
             )
-            SELECT id FROM updated
+            SELECT id, title FROM updated
             UNION ALL
-            SELECT id FROM inserted
+            SELECT id, title FROM inserted
             "#,
         )
         .bind(&spellings)
         .bind(&canonical)
         .bind(title)
         .bind(journal)
-        .fetch_one(pool)
+        .bind(new_paper_id(doi))
+        .fetch_one(executor)
         .await?;
-        Ok(id)
+        Ok(StoredPaper { id, title })
+    }
+
+    /// What [`Self::get_or_create_stored`] WOULD return for these arguments,
+    /// read without writing anything: the existing row's id and its title
+    /// filled the way the upsert fills it, or, when no spelling of the key
+    /// exists, [`new_paper_id`] and the title given.
+    ///
+    /// For the detached ingest handlers, which answer the caller before the
+    /// walk that writes the row has run (backlog b995f117). The prediction
+    /// holds unless another writer creates the row in between with a
+    /// different id: the REST `POST /papers` route (random ids) or a binary
+    /// older than [`new_paper_id`].
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor))]
+    pub async fn planned<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+        title: Option<&str>,
+    ) -> Result<PlannedPaper, DbError> {
+        let spellings = document_key_spellings(doi);
+        // Runtime-checked, not `query!`: see `get_or_create_stored`.
+        let found: Option<(Uuid, Option<String>)> = sqlx::query_as(
+            r#"
+            SELECT id, title FROM papers
+            WHERE doi = ANY($1::text[])
+            ORDER BY array_position($1::text[], doi)
+            LIMIT 1
+            "#,
+        )
+        .bind(&spellings)
+        .fetch_optional(executor)
+        .await?;
+        Ok(match found {
+            Some((id, stored)) => PlannedPaper {
+                id,
+                title: stored.or_else(|| title.map(str::to_string)),
+                exists: true,
+            },
+            None => PlannedPaper {
+                id: new_paper_id(doi),
+                title: title.map(str::to_string),
+                exists: false,
+            },
+        })
     }
 
     /// Find a paper by DOI. Returns `None` if no paper has this DOI.

@@ -169,10 +169,19 @@ async fn an_inline_ingest_relationship_of_supersedes_is_refused_before_the_paper
     .expect("CONTROL: a supports relationship is accepted");
     let ok_json = common::first_text(&ok);
     assert_eq!(ok_json["status"], "queued", "CONTROL: {ok_json}");
+    // The row is written by the detached walk, on its own transaction
+    // (backlog b995f117), so wait for the walk before counting it.
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "CONTROL: the detached walk did not finish"
+    );
     assert_eq!(
         papers_with_doi(&pool, &doi("inline-control")).await,
         1,
-        "CONTROL: the handler wrote its papers row"
+        "CONTROL: the walk wrote its papers row"
     );
 
     for (i, spelling) in SPELLINGS.iter().enumerate() {
@@ -245,10 +254,19 @@ async fn a_file_path_ingest_relationship_of_supersedes_is_refused_before_the_pap
         .await
         .expect("CONTROL: a supports relationship is accepted from a file");
     assert_eq!(common::first_text(&ok)["status"], "queued", "CONTROL");
+    // The row is written by the detached walk, on its own transaction
+    // (backlog b995f117), so wait for the walk before counting it.
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "CONTROL: the detached walk did not finish"
+    );
     assert_eq!(
         papers_with_doi(&pool, &doi("file-control")).await,
         1,
-        "CONTROL: the handler wrote its papers row"
+        "CONTROL: the walk wrote its papers row"
     );
 
     let bad_file = CwdFixture::write(&document("file-refused", "SUPERSEDES"));

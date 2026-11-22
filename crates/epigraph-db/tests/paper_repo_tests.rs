@@ -192,7 +192,8 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
 // =============================================================================
 //
 // `get_or_create` is the writer every MCP ingest path uses
-// (`ensure_paper_node`, `do_ingest_document`, `do_ingest_document_spine`). Its
+// (`do_ingest_document`, `do_ingest_document_spine`, on the walk's
+// transaction since backlog b995f117). Its
 // old `INSERT ... ON CONFLICT (doi)` only matched the exact spelling, so a DOI
 // whose only row was keyed on a resolver URL (written before keys were
 // canonicalized) got a bare-keyed twin beside it on the next ingest.
@@ -474,4 +475,64 @@ async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(
         .await
         .expect("list_asserted_claims");
     assert_eq!(claims.len(), 1, "a claim listed twice");
+}
+
+// =============================================================================
+// The read-only prediction a detached ingest answers with (backlog b995f117)
+// =============================================================================
+
+/// `planned` must predict exactly what `get_or_create_stored` then stores, in
+/// all three cases a detached ingest meets: no row yet (the deterministic new
+/// id and the caller's title), a row with a title (its id and its title, not
+/// the caller's), and a row with a NULL title (its id, filled with the
+/// caller's). A drift here is a detached handler announcing an id or a title
+/// the walk then does not write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn planned_predicts_what_get_or_create_stored_stores(pool: PgPool) {
+    use epigraph_db::repos::paper::new_paper_id;
+
+    let titled = "10.1234/planned-titled";
+    let untitled = "10.1234/planned-untitled";
+    let absent = "https://doi.org/10.1234/planned-absent";
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, 'Kept'), ($2, NULL)")
+        .bind(titled)
+        .bind(untitled)
+        .execute(&pool)
+        .await
+        .expect("seed rows");
+
+    for (doi, exists) in [(titled, true), (untitled, true), (absent, false)] {
+        let planned = PaperRepository::planned(&pool, doi, Some("Caller"))
+            .await
+            .expect("planned");
+        assert_eq!(planned.exists, exists, "{doi}");
+        let stored = PaperRepository::get_or_create_stored(&pool, doi, Some("Caller"), None)
+            .await
+            .expect("get_or_create_stored");
+        assert_eq!(
+            planned.id, stored.id,
+            "{doi}: the announced id is the stored id"
+        );
+        assert_eq!(
+            planned.title, stored.title,
+            "{doi}: the announced title is stored"
+        );
+    }
+
+    let kept = PaperRepository::planned(&pool, titled, Some("Caller"))
+        .await
+        .expect("planned");
+    assert_eq!(
+        kept.title.as_deref(),
+        Some("Kept"),
+        "fill-only keeps a title"
+    );
+    // A new row is keyed on the canonical key and takes the id derived from it,
+    // whichever spelling the caller used.
+    let created = PaperRepository::find_by_doi(&pool, "10.1234/planned-absent")
+        .await
+        .expect("find_by_doi")
+        .expect("the new row is stored under the canonical key");
+    assert_eq!(created.id, new_paper_id(absent));
+    assert_eq!(created.id, new_paper_id("10.1234/planned-absent"));
 }

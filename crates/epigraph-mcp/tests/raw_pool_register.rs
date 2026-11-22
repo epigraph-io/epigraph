@@ -487,21 +487,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_reporting",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "ensure_paper_node",
+        "planned_paper_node",
         1,
-        REGISTERED_WRITE,
+        NO_ROW_SECURITY,
     ),
     (
         "epigraph-mcp/src/tools/perspectives.rs",
@@ -601,8 +589,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. Backlog
+/// b995f117 moved both ingest walks' `papers` write onto their stamped
+/// transaction (`do_ingest_document_reporting`, `do_ingest_document_spine`,
+/// two sites each): 82 -> 78.
+const HIGH_WATER: usize = 78;
 
 // ===========================================================================
 // The scanner.

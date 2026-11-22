@@ -65,7 +65,7 @@ Added to:
 
   * the `papers` row: title, DOI (or synthesized document key) and journal. `papers` has no
     row-level security in any migration (127: "papers and workflows carry no tenancy"), and
-    `ensure_paper_node` writes it on the pool before the walk, with no `VisibilityChoice`;
+    the walk writes it on its own transaction (since backlog b995f117), with no `VisibilityChoice`;
   * the author agents (`agents` rows named after the paper's authors) and their `authored`
     edges to the paper;
   * the paper's `processed_by` edge, which is what `check_already_ingested` reports;

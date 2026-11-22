@@ -229,19 +229,10 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
          stamp is the step's AUTHOR (the caller), so a parent owned by a group the caller does \
          not write is still refused by row security there.",
     ),
-    (
-        "tools/ingestion.rs",
-        "PaperRepository::get_or_create",
-        3,
-        "The `papers` upsert, three times: `ensure_paper_node` (synchronous, before the detached \
-         task is spawned), and the walk-opening call in `do_ingest_document` and \
-         `do_ingest_document_spine` (the last two reached through `let pool = &server.pool`, which \
-         this scan now follows). `papers` has NO row-level security \
-         (`relrowsecurity = false`, measured at head 101), so these are admitted unstamped by \
-         construction, and `ensure_paper_node` has already created the row before the walk's \
-         call runs. The rest of both walks runs on ONE transaction stamped from the ingesting \
-         agent (Unit E); reverting any of those statements to `pool` adds an entry here.",
-    ),
+    // `tools/ingestion.rs` / `PaperRepository::get_or_create` (3) left in backlog
+    // b995f117: both walks write the `papers` row on their stamped transaction,
+    // first, and the detached handlers only read it (`planned_paper_node`), so a
+    // failed walk leaves no `papers` row with 0 claims.
     (
         "tools/ingestion.rs",
         "server.pool.begin",

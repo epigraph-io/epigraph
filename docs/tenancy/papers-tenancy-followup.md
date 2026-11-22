@@ -13,7 +13,7 @@ visibility:
 
 | Row | Written by | Why it is world-readable |
 |---|---|---|
-| `papers` (id, `doi` or synthesized `urn:epigraph:doc:*` key, `title`, `journal`) | `ensure_paper_node` → `PaperRepository::get_or_create`, on the pool, before the walk, with no `VisibilityChoice` | `papers` has no row-level security in any migration (127: "papers and workflows carry no tenancy") |
+| `papers` (id, `doi` or synthesized `urn:epigraph:doc:*` key, `title`, `journal`) | `PaperRepository::get_or_create_stored`, on the walk's stamped transaction (since backlog b995f117), with no `VisibilityChoice` | `papers` has no row-level security in any migration (127: "papers and workflows carry no tenancy") |
 | author agents (`agents`, one per paper author, `did_key_for_author`) | the walk's step 3 | `agents` is readable by every session (its policy is `true`) |
 | `authored` edges, author agent → paper | the walk's step 3 | a paper or agent endpoint contributes `public` to the meet; 120's `epigraph_edges_tenancy` keeps such structural edges `('public', world)` |
 | `processed_by` edge, paper → ingesting agent, `properties.pipeline` | `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn` | same as `authored` |
@@ -69,8 +69,8 @@ operator should choose before any migration is written.
   `get_or_create` take the `TenancyDecl` the ingest resolved.
 * Apply the existing guards to the new columns: 074 `*_block_widening` (group → public only
   through `epigraph_publicize_claims`, extended to the paper row), 115 `*_owner_immutable`.
-* Move `ensure_paper_node` into the ingest's stamped transaction, so the paper row is written
-  with the same viewer and declaration as the claims.
+* The paper row is already written on the ingest's stamped transaction (backlog b995f117); pass
+  it the same declaration as the claims.
 * Edges: give `paper` an entry in `epigraph_node_tenancy`, so `authored`, `processed_by` and
   `asserts` take the meet with the paper row instead of `('public', world)`. That also scopes
   an `asserts` edge onto a converged public claim: its meet becomes the paper's tenancy.

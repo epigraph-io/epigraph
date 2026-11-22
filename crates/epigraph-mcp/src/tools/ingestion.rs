@@ -177,8 +177,8 @@ pub async fn ingest_document(
     let title = extraction.source.title.clone();
     // The label set is validated before ANY write, here in the handler: the walk
     // runs detached, so a refusal there would reach only the server log after
-    // the caller was told `queued` and after `ensure_paper_node` wrote the
-    // `papers` row. The core re-derives (and re-checks) the same set.
+    // the caller was told `queued`. The core re-derives (and re-checks) the
+    // same set.
     ingest_claim_labels(&extraction, &doi)?;
     refuse_lineage_relationships(&extraction)?;
     refuse_bad_author_ids(&extraction)?;
@@ -194,10 +194,10 @@ pub async fn ingest_document(
     // on its DS reads; its WRITES are authorised by the transaction it stamps
     // from the ingesting agent (`begin_author_stamped_tx`), not by this viewer.
     //
-    // ABOVE `ensure_paper_node`, not below it, which is the file's own stated
-    // convention two guards up in `do_ingest_document`: fail closed BEFORE any
-    // DB write. On the refusal arm nothing has been written, so no `papers` row
-    // survives an ingest that was refused. `request_viewer` resolves an
+    // Before any DB read or write, which is the file's own stated convention
+    // two guards up in `do_ingest_document`: fail closed first. On the refusal
+    // arm nothing has been written, so no `papers` row survives an ingest that
+    // was refused. `request_viewer` resolves an
     // `agents.id` on both transports, so the arm is not reachable today — it is
     // written as a refusal rather than an `expect` because the state it would
     // represent is a widening, and those fail closed. `invalid_request` rather
@@ -233,7 +233,7 @@ pub async fn ingest_document(
             .await
             .map(|r| with_atomicity(r, atomicity));
     }
-    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    let paper = planned_paper_node(server, &extraction, &doi).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
     // exact state the preflight above was run against.
@@ -263,11 +263,11 @@ pub async fn ingest_document(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id, atomicity))
+    success_json(&queued_response(&doi, &title, paper.id, atomicity))
 }
 
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
-/// points, run before `ensure_paper_node` writes anything.
+/// points, run before the walk writes anything.
 ///
 /// `do_ingest_document` runs in a spawned task, so a refusal inside it
 /// reaches no caller — the caller has already been told `queued`. The walk is
@@ -316,8 +316,8 @@ async fn preflight_write_authority(
     tx.owner_decl(agent_id, tool_name, &resolution).await?;
     // Every explicit `source.authors[].agent_id` names an agent that may
     // author (backlog 94cc12db), on the same connection the walk will use, so
-    // an unknown or system id is refused to the caller BEFORE the eager
-    // `papers` row, not in the detached task's log. On a re-ingest (the row
+    // an unknown or system id is refused to the caller, not in the detached
+    // task's log. On a re-ingest (the row
     // exists) the name-derived authors an `agent_id` replaces are retracted
     // here too, inside this transaction, so an author this caller cannot
     // retract is refused now rather than in the task.
@@ -386,7 +386,7 @@ pub async fn ingest_document_inline(
             .await
             .map(|r| with_atomicity(r, atomicity));
     }
-    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    let paper = planned_paper_node(server, &extraction, &doi).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
     // memberships.
@@ -408,7 +408,7 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id, atomicity))
+    success_json(&queued_response(&doi, &title, paper.id, atomicity))
 }
 
 /// The `wait: true` arm of the two detached ingest handlers: run the walk IN
@@ -422,11 +422,9 @@ pub async fn ingest_document_inline(
 ///
 /// Called AFTER the same `refuse_elevated` / `detach_scoped` / preflight the
 /// detached arm runs, so both modes author under exactly the same authority.
-/// It skips `ensure_paper_node`: `do_ingest_document` gets-or-creates the row
-/// itself, after its verbatim and axis guards, so a guard refusal here leaves
-/// no `papers` row at all. A failure later in the walk can still leave that
-/// row (it is written on the pool, outside the walk's transaction), and the
-/// error says so.
+/// `do_ingest_document` gets-or-creates the `papers` row on the walk's own
+/// transaction, so a walk that fails at any point leaves no `papers` row
+/// (backlog b995f117), and the error says so.
 async fn ingest_in_request(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -440,9 +438,9 @@ async fn ingest_in_request(
         .map_err(|e| McpError {
             code: e.code,
             message: std::borrow::Cow::from(format!(
-                "{}. The ingest walk is one transaction, so no claims or edges were written \
-                 for document_key {doi:?}; its papers row may exist with 0 claims. Fix the \
-                 cause and retry: a retry is safe and converges on existing nodes.",
+                "{}. The ingest walk is one transaction, so no papers row, claims or edges \
+                 were written for document_key {doi:?}. Fix the cause and retry: a retry is \
+                 safe and converges on existing nodes.",
                 e.message
             )),
             data: e.data,
@@ -466,28 +464,24 @@ fn refuse_bad_author_ids(extraction: &DocumentExtraction) -> Result<(), McpError
     crate::tools::ingest_authors::parse_explicit_author_ids(&extraction.source.authors).map(|_| ())
 }
 
-/// Create (or fetch) the document's `papers` row **synchronously**, before the
-/// ingest is handed to a detached task, so the caller gets an id it can address
-/// what it just wrote by. Idempotent on the identity key, and the background
-/// `do_ingest_document` calls the same get-or-create, so this only moves the
-/// node creation earlier — it does not create a second row.
+/// The document's `papers` node as the detached walk WILL leave it, read
+/// without writing, so the caller gets an id it can address what it is
+/// ingesting by (issue #356).
 ///
-/// Previously both ingest entry points returned `{doi, status, title, note}`
-/// with no id at all (issue #356): a caller could not reference, verify, or
-/// link the document it had just created.
-async fn ensure_paper_node(
+/// Read-only (backlog b995f117): the row is written by the walk, on its own
+/// transaction, so a walk that fails leaves no `papers` row with 0 claims
+/// behind. Until the walk commits a new document has no row, which is what
+/// `query_paper` reports. The id is the existing row's, or
+/// [`epigraph_db::repos::paper::new_paper_id`], which the walk's insert
+/// uses.
+async fn planned_paper_node(
     server: &EpiGraphMcpFull,
     extraction: &DocumentExtraction,
     doi: &str,
-) -> Result<Uuid, McpError> {
-    PaperRepository::get_or_create(
-        &server.pool,
-        doi,
-        Some(&extraction.source.title),
-        extraction.source.journal.as_deref(),
-    )
-    .await
-    .map_err(internal_error)
+) -> Result<epigraph_db::repos::paper::PlannedPaper, McpError> {
+    PaperRepository::planned(&server.pool, doi, Some(&extraction.source.title))
+        .await
+        .map_err(internal_error)
 }
 
 /// Shared response body for the two queued ingest entry points.
@@ -576,10 +570,12 @@ fn queued_response(
     atomicity: Option<serde_json::Value>,
 ) -> serde_json::Value {
     let mut note = String::from(
-        "DB writes are running as a detached background task; confirm they landed by \
-         query_paper(`document_key`)'s claim_count rising, not with check_already_ingested, \
-         which is already true after ingest_document_spine or any earlier ingest of this \
-         document.",
+        "DB writes are running as a detached background task, as ONE transaction that also \
+         writes the papers row: for a new document, query_paper(`document_key`) finds nothing \
+         until the walk commits, and a document that never appears means the walk failed \
+         (see the server log); resubmit with wait=true to see the error. Confirm the writes \
+         landed by query_paper's claim_count rising, not with check_already_ingested, which is \
+         already true after ingest_document_spine or any earlier ingest of this document.",
     );
     if is_synthetic_key(doi) {
         note.push_str(
@@ -1468,7 +1464,6 @@ pub async fn do_ingest_document_reporting(
     refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
-    let pool = &server.pool;
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -1497,22 +1492,7 @@ pub async fn do_ingest_document_reporting(
     // write nothing" contract the rest of this branch establishes.
     let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
-    // ── 1. Get-or-create paper node ──
-    // (Pipeline-version gate removed: deterministic node ids handle idempotency
-    //  so re-ingesting an abstract then the full paper is safe — structural nodes
-    //  by document-scoped id, atoms by content hash.
-    //  Use ingest_document_spine → ingest_document_inline for the two-phase
-    //  flow that avoids redundant LLM atomization.)
-    let paper_id = PaperRepository::get_or_create(
-        pool,
-        &doi,
-        Some(&paper_title),
-        extraction.source.journal.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
-
-    // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
+    // ── 1. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
     // Every claim below is authored by the write identity and owned by `decl`
     // (that agent's personal group, or its operator's when it is
@@ -1531,11 +1511,33 @@ pub async fn do_ingest_document_reporting(
     // the fresh-UUID trace/evidence rows are written only for a claim that was
     // new in THIS transaction, so a rolled-back attempt leaves none behind.
     //
-    // `papers` stays on the pool: it has no row-level security, and
-    // `ensure_paper_node` already created the row synchronously before this
-    // task was spawned, so the call above is an idempotent read of it.
+    // The `papers` row is written on it too, FIRST (backlog b995f117): it used
+    // to be written on the pool before the transaction opened, so a walk that
+    // failed later rolled back every claim and edge but left a committed
+    // `papers` row with 0 claims, which `check_already_ingested` and
+    // `query_paper` then reported as an ingested document. `papers` has no
+    // row-level security, so the stamped transaction writes it as the pool
+    // did. First, so that its row lock (a fill-only UPDATE on a hit, the
+    // insert on a miss) is the first lock the walk takes: two concurrent
+    // ingests of one document serialise on it rather than interleave.
     let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
     let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
+
+    // ── 2. Get-or-create paper node ──
+    // (Pipeline-version gate removed: deterministic node ids handle idempotency
+    //  so re-ingesting an abstract then the full paper is safe — structural nodes
+    //  by document-scoped id, atoms by content hash.
+    //  Use ingest_document_spine → ingest_document_inline for the two-phase
+    //  flow that avoids redundant LLM atomization.)
+    let paper = PaperRepository::get_or_create_stored(
+        &mut *tx,
+        &doi,
+        Some(&paper_title),
+        extraction.source.journal.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let paper_id = paper.id;
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -2207,9 +2209,9 @@ fn is_synthetic_key(key: &str) -> bool {
 /// entry for a resolved row another agent authored.
 ///
 /// Validated HERE so every entry point fails closed before any write: the two
-/// detached handlers call it before `ensure_paper_node` writes the `papers`
-/// row (a refusal inside the spawned walk would reach only the server log,
-/// after the caller was told `queued`), and both cores call it again before
+/// detached handlers call it before the walk is spawned (a refusal inside the
+/// spawned walk would reach only the server log, after the caller was told
+/// `queued`), and both cores call it again before
 /// their first write, for the callers that reach a core directly (the spine
 /// handler, the operator `ingest_document` CLI).
 fn ingest_claim_labels(
@@ -2499,7 +2501,6 @@ pub async fn do_ingest_document_spine(
     refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
-    let pool = &server.pool;
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -2545,26 +2546,28 @@ pub async fn do_ingest_document_spine(
         map
     };
 
-    // ── 1. Get-or-create paper node ──
-    let paper_id = PaperRepository::get_or_create(
-        pool,
-        &doi,
-        Some(&paper_title),
-        extraction.source.journal.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
-
     // ONE transaction for the spine walk, stamped from the ingesting agent —
     // the same conversion, for the same reasons, as `do_ingest_document`'s
     // (see the comment there): on the unstamped pool the first claim INSERT was
     // refused on a cleanly-migrated schema after the author agents and their
     // edges had committed, and the owner-group read was blind and minted on
     // every call. This path is synchronous, so the refusal now reaches the
-    // caller, and it leaves nothing behind.
+    // caller, and it leaves nothing behind, the `papers` row included.
     let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
     let mut tx =
         begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
+
+    // ── 1. Get-or-create paper node, on the walk's transaction and first ──
+    // (backlog b995f117; see `do_ingest_document`).
+    let paper = PaperRepository::get_or_create_stored(
+        &mut *tx,
+        &doi,
+        Some(&paper_title),
+        extraction.source.journal.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let paper_id = paper.id;
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.

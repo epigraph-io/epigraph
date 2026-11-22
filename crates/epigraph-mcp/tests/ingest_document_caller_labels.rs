@@ -244,6 +244,15 @@ async fn an_unexpanded_caller_label_is_refused_before_the_paper_node_is_written(
         ok_json["status"], "queued",
         "control must be queued: {ok_json}"
     );
+    // The row is written by the detached walk, on its own transaction
+    // (backlog b995f117), so wait for the walk before counting it.
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "the control's detached walk did not finish"
+    );
     assert_eq!(
         papers_with_doi(&pool, ok_doi).await,
         1,
@@ -349,6 +358,15 @@ async fn file_path_ingest_refuses_an_unexpanded_caller_label_before_the_paper_no
     assert_eq!(
         ok_json["status"], "queued",
         "control must be queued: {ok_json}"
+    );
+    // The row is written by the detached walk, on its own transaction
+    // (backlog b995f117), so wait for the walk before counting it.
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "the control's detached walk did not finish"
     );
     assert_eq!(
         papers_with_doi(&pool, ok_doi).await,
