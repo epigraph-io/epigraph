@@ -22,10 +22,11 @@
 //!         afterwards plans nothing, so a second apply mints nothing.
 //!
 //!     r131_factor_mint --undo <undo.jsonl> [--apply]
-//!         Deletes each recorded factor only where the row still equals what
-//!         the mint wrote (compare-and-set); reports deleted / absent /
-//!         changed_since and the `bp_messages` rows removed with them. Without
-//!         `--apply` it runs the deletes and rolls back.
+//!         Under the apply's mint lock (refused while another apply or undo
+//!         holds it), deletes each recorded factor only where the row still
+//!         equals what the mint wrote (compare-and-set); reports deleted /
+//!         absent / changed_since and the `bp_messages` rows removed with
+//!         them. Without `--apply` it runs the deletes and rolls back.
 //!
 //! Output files are created new: an existing file is refused before any
 //! connection. They name claim and edge ids: keep them in the operator's

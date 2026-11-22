@@ -20,8 +20,9 @@
 //! Guards pinned here, each with nothing written: no configured
 //! `MAINTENANCE_DATABASE_URL` (every mode); an application login as the
 //! maintenance DSN; an existing output file; a plan the live set no longer
-//! equals (including re-applying an applied plan); a held mint lock; and the
-//! undo's compare-and-set (a factor changed or removed since the mint is kept
+//! equals (including re-applying an applied plan); a held mint lock (apply
+//! and undo); and the undo's compare-and-set, with an exact count of the BP
+//! messages it removes (a factor changed or removed since the mint is kept
 //! or reported, and nothing it did not mint is deleted, while a column added
 //! to `factors` since, or a record rendered in another time zone, does not
 //! block it). The
@@ -1101,6 +1102,162 @@ async fn undo_deletes_by_compare_and_set_only_what_the_mint_wrote(pool: PgPool) 
     );
     assert_eq!(factor_rows(&pool).await, end);
     logins.drop(&pool).await;
+}
+
+/// Backlog 1097d3c2: the undo takes the mint lock an apply takes. While
+/// another run holds it, `--undo` (dry run and commit alike) is refused with
+/// nothing deleted; once it is released the same undo runs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn undo_refuses_while_another_run_holds_the_mint_lock(pool: PgPool) {
+    let logins = Logins::new(&pool).await;
+    let _w = world(&pool).await;
+    let dir = Dir::new();
+    let (r, plan_file) = dry_run(&dir, &logins, "plan.json");
+    r.ok();
+    let record = dir.path("record.jsonl");
+    run(
+        &dir.0,
+        &["--apply", "--plan", &plan_file, "--record", &record],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    )
+    .ok();
+    let minted = factor_rows(&pool).await;
+
+    let mut holder = pool.acquire().await.expect("acquire");
+    sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        .bind(MINT_LOCK_NAME)
+        .execute(&mut *holder)
+        .await
+        .expect("hold the lock");
+    for args in [vec!["--undo", &record], vec!["--undo", &record, "--apply"]] {
+        let r = run(&dir.0, &args, &logins.app.1, Some(&logins.maint.1));
+        assert_eq!(
+            r.code,
+            Some(1),
+            "{args:?} ran under a held lock: {}",
+            r.stdout
+        );
+        assert!(r.stderr.contains("holds the mint lock"), "{}", r.stderr);
+        assert_eq!(
+            factor_rows(&pool).await,
+            minted,
+            "{args:?} deleted under a held lock"
+        );
+    }
+    sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+        .bind(MINT_LOCK_NAME)
+        .execute(&mut *holder)
+        .await
+        .expect("release");
+    drop(holder);
+
+    let r = run(
+        &dir.0,
+        &["--undo", &record, "--apply"],
+        &logins.app.1,
+        Some(&logins.maint.1),
+    )
+    .ok();
+    assert!(r.stdout.contains("r131 undo: deleted="), "{}", r.stdout);
+    assert_ne!(factor_rows(&pool).await, minted, "the released undo ran");
+    logins.drop(&pool).await;
+}
+
+/// Backlog 1097d3c2: `bp_messages_removed` is exactly what the undo removed
+/// while belief propagation writes. A BP writer has inserted, not yet
+/// committed, a message on a minted factor when the undo starts. The undo
+/// waits on the writer's lock; once the writer commits, the message is
+/// removed with its factor AND counted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn undo_counts_a_bp_message_written_while_it_runs(pool: PgPool) {
+    use std::time::{Duration, Instant};
+
+    let w = world(&pool).await;
+    let dir = Dir::new();
+    let mut conn = pool.acquire().await.expect("acquire");
+    let plan = r131_factor_mint::dry_run(&mut conn, None)
+        .await
+        .expect("plan");
+    let path = dir.path("record.jsonl");
+    let mut file = std::fs::File::create(&path).expect("record file");
+    r131_factor_mint::apply(&mut conn, &plan, &mut file, None)
+        .await
+        .expect("mint");
+    drop(conn);
+    let record = read_record(std::io::BufReader::new(
+        std::fs::File::open(&path).expect("open"),
+    ))
+    .expect("record");
+    let factor = record
+        .factors
+        .iter()
+        .find(|f| f.source_edge_id == w.refutes)
+        .map(|f| f.factor_id)
+        .expect("PREMISE: the refutes slot was minted");
+
+    // The BP writer: its message is inserted, not committed.
+    let mut writer = pool.begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO bp_messages (direction, factor_id, variable_id, message) \
+         VALUES ('factor_to_var', $1, $2, '{}')",
+    )
+    .bind(factor)
+    .bind(w.refutes_ends.0)
+    .execute(&mut *writer)
+    .await
+    .expect("the writer's message");
+
+    let mut undo_conn = pool.acquire().await.expect("acquire");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *undo_conn)
+        .await
+        .expect("pid");
+    let rec = record.clone();
+    let undo = tokio::spawn(async move {
+        let r = r131_factor_mint::undo(&mut undo_conn, &rec, false).await;
+        drop(undo_conn);
+        r
+    });
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE pid = $1 AND wait_event_type = 'Lock')",
+        )
+        .bind(pid)
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting {
+            break;
+        }
+        if undo.is_finished() {
+            panic!(
+                "PREMISE: the undo finished without waiting on the writer: {:?}",
+                undo.await
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "PREMISE: the undo never waited on the writer's lock"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    writer.commit().await.expect("the writer commits");
+    let report = undo.await.expect("join").expect("undo");
+
+    assert!(report.deleted.contains(&factor), "{report:?}");
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM bp_messages WHERE factor_id = $1")
+        .bind(factor)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(left, 0, "PREMISE: the message went with its factor");
+    assert_eq!(
+        report.bp_messages_removed, 1,
+        "the undo removed one message and must report it: {report:?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
