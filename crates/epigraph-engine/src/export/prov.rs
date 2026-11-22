@@ -132,7 +132,7 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 ///
 /// # What the walk follows
 ///
-/// [`epigraph_db::LineageRepository::get_ancestor_ids`] walks incoming
+/// [`epigraph_db::LineageRepository::get_ancestor_ids_probed`] walks incoming
 /// claim-to-claim edges whose relationship is in
 /// [`epigraph_db::ANCESTOR_ID_RELATIONSHIPS`]: the `derived_from` family this
 /// module maps, plus the lineage relationships `get_provenance` walks
@@ -157,12 +157,15 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 /// supersede a claim already reached via a supersedes edge) are a follow-up;
 /// see the module's PR description.
 ///
-/// # `truncated`
+/// # `truncated` and `depth_truncated`
 ///
-/// The document's `truncated` is true iff `limits.max_nodes` cut the claim
-/// set. It does NOT report a `max_depth` cutoff: the ancestor walk returns no
-/// signal for one, so a depth-limited export can be incomplete with
-/// `truncated: false`.
+/// The document's `truncated` is true iff the export is known to be
+/// incomplete: `limits.max_nodes` cut the claim set, OR the walk stopped at
+/// `max_depth` with a readable ancestor one layer past it. `depth_truncated`
+/// is true iff the second cause holds (backlog 4caad789). Both count only
+/// claims the viewer can READ, reached over edges it can read: the depth
+/// probe runs through the walk's own predicates, so neither flag can reveal a
+/// hidden claim. The probe layer's claims are never emitted.
 ///
 /// This is **read-only**: it issues only `SELECT`s (via
 /// `LineageRepository`, `EdgeRepository`, `ClaimRepository`,
@@ -224,8 +227,11 @@ pub async fn export_provenance_prov_o(
     // in the lineage — the direction is inverted relative to what the CTE
     // looks for. So we add supersedes targets explicitly, one hop per claim
     // already in the set.
-    let mut claim_ids =
-        LineageRepository::get_ancestor_ids(&mut *conn, viewer, root_claim_id, max_depth).await?;
+    let walk =
+        LineageRepository::get_ancestor_ids_probed(&mut *conn, viewer, root_claim_id, max_depth)
+            .await?;
+    let depth_truncated = walk.truncated_by_depth;
+    let mut claim_ids = walk.ids;
     claim_ids.reverse();
     claim_ids.retain(|id| *id != root_claim_id);
     claim_ids.insert(0, root_claim_id);
@@ -233,7 +239,7 @@ pub async fn export_provenance_prov_o(
     // The node cap, BEFORE any per-claim statement, nearest-first. Every id
     // the walk returned is readable (it filters claims and edges for the
     // viewer), so this cut counts readable claims only.
-    let mut truncated = false;
+    let mut truncated = depth_truncated;
     if let Some(n) = limits.max_nodes {
         if claim_ids.len() > n {
             claim_ids.truncate(n);
@@ -372,6 +378,7 @@ pub async fn export_provenance_prov_o(
         "@context": "https://www.w3.org/ns/prov#",
         "root_claim": format!("claim:{root_claim_id}"),
         "truncated": truncated,
+        "depth_truncated": depth_truncated,
         "entities": entities,
         "agents": agent_entities,
         "relations": relations,

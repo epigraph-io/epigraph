@@ -319,3 +319,71 @@ async fn the_walk_follows_derivation_edges_only(pool: PgPool) {
         "a supports ancestor is still walked: {with_support}"
     );
 }
+
+/// `truncated` reports a depth cutoff: a readable ancestor one layer past
+/// `max_depth` sets it (and `depth_truncated`); a lineage that ends exactly at
+/// `max_depth` does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_depth_cutoff_is_reported(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-depth").await;
+    let root = fixture::seed_public_claim(&pool, agent, "depth root").await;
+    let a = fixture::seed_public_claim(&pool, agent, "depth 1").await;
+    let b = fixture::seed_public_claim(&pool, agent, "depth 2").await;
+    let c = fixture::seed_public_claim(&pool, agent, "depth 3").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, b, a, "derived_from").await;
+    public_edge(&pool, c, b, "derived_from").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let cut = export_as(&pool, &viewer, root, 2, None).await;
+    assert_eq!(entity_set(&cut), claim_set(&[root, a, b]));
+    assert_eq!(
+        cut["truncated"], true,
+        "depth 3 lies past max_depth 2: {cut}"
+    );
+    assert_eq!(cut["depth_truncated"], true, "{cut}");
+    assert!(
+        !cut.to_string().contains(&c.to_string()),
+        "the probe layer is named nowhere: {cut}"
+    );
+
+    let exact = export_as(&pool, &viewer, root, 3, None).await;
+    assert_eq!(entity_set(&exact), claim_set(&[root, a, b, c]));
+    assert_eq!(exact["truncated"], false, "complete at depth 3: {exact}");
+    assert_eq!(exact["depth_truncated"], false, "{exact}");
+}
+
+/// The depth probe counts READABLE ancestors only: a group-private ancestor
+/// past `max_depth` sets the flag for a member and leaves it false for a
+/// stranger, so the flag cannot reveal a hidden claim. The edges are forced
+/// public, so only the claim predicate decides.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_ancestor_past_the_depth_sets_no_flag(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "prov-depth-member").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "prov-depth-stranger").await;
+    let root = fixture::seed_public_claim(&pool, member, "hidden-depth root").await;
+    let a = fixture::seed_public_claim(&pool, member, "hidden-depth parent").await;
+    let hidden = fixture::seed_group_claim(&pool, member, group, "hidden-depth private").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, hidden, a, "derived_from").await;
+
+    let member_viewer = epigraph_db::visibility::Viewer::resolve(&pool, member)
+        .await
+        .expect("member");
+    let doc = export_as(&pool, &member_viewer, root, 1, None).await;
+    assert_eq!(
+        doc["truncated"], true,
+        "CALIBRATION: the member can read the ancestor past the cut: {doc}"
+    );
+
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("stranger");
+    let doc = export_as(&pool, &stranger_viewer, root, 1, None).await;
+    assert_eq!(entity_set(&doc), claim_set(&[root, a]));
+    assert_eq!(
+        doc["truncated"], false,
+        "the flag must not reveal a hidden ancestor past the cut: {doc}"
+    );
+    assert_eq!(doc["depth_truncated"], false, "{doc}");
+}
