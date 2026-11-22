@@ -18,6 +18,8 @@
 //! * An agent that assessed while bound to no human, then was linked to one,
 //!   leaves that human ONE assessment when it assesses again (backlog
 //!   840bc5ed): its own pre-link row is retracted (audited) and reported.
+//!   When that retraction is refused, the assessment still lands and the old
+//!   row is kept and not reported.
 //! * A member who may only READ a group-private claim is answered 403 with
 //!   nothing written, not the opaque 500 the row-security refusal used to
 //!   surface as.
@@ -430,3 +432,80 @@ async fn a_read_only_member_is_refused_a_group_claims_assessment(pool: PgPool) {
     assert_eq!(assessed_events(&pool, private).await, 0, "{text}");
 }
 
+/// Backlog 840bc5ed, the refused arm: when the agent may no longer write the
+/// group that owns its pre-link row, the retraction is refused under its
+/// savepoint. The assessment must still land (200, the human's row written),
+/// the pre-link row stays live, and it is NOT reported as retired. Without the
+/// savepoint the refusal aborts the transaction and the call fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_refused_pre_link_retraction_still_lands_the_assessment(pool: PgPool) {
+    let (agent, _mine) = fixture::seed_agent_with_group(&pool, "840bc5ed-r-agent").await;
+    let (human, human_group) = delegation::human_operator(&pool, "840bc5ed-r-human").await;
+    let (delegator_client, delegator) =
+        delegation::delegator(&pool, human, human_group, Some("writer"), true).await;
+    let (author, theirs) = fixture::seed_agent_with_group(&pool, "840bc5ed-r-author").await;
+    let target = claim(&pool, author, theirs, "public", "refused retraction").await;
+    let (addr, _shutdown, jwt) = spawn_app_with(&pool, RunTokens::On).await;
+    let delegated = jwt
+        .issue_access_token(
+            delegator_client,
+            vec!["claims:write".to_string()],
+            "agent",
+            None,
+            Some(agent),
+            chrono::Duration::minutes(15),
+            epigraph_auth::AccessTokenBinding {
+                delegated_by: Some(delegator),
+                ..epigraph_auth::AccessTokenBinding::NONE
+            },
+        )
+        .expect("mint the delegated run token")
+        .0;
+
+    let before = assess(addr, agent, target).await;
+    let old_row: Uuid =
+        serde_json::from_value(before["mass_function_id"].clone()).expect("the pre-link row");
+
+    // The pre-link row now belongs to a group the agent cannot write (the
+    // claim author's), on the superuser harness, as a re-own would leave it.
+    sqlx::query("UPDATE mass_functions SET owner_group_id = $2 WHERE id = $1")
+        .bind(old_row)
+        .bind(theirs)
+        .execute(&pool)
+        .await
+        .expect("re-own the pre-link row");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let out = epigraph_db::AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("link the agent to its human");
+    assert!(out.link_live, "{out:?}");
+    drop(conn);
+
+    let after = assess_with(addr, &delegated, target).await;
+    assert_eq!(after["owner_agent_id"], serde_json::json!(human), "{after}");
+    let mut live = rows(&pool, target).await;
+    live.sort();
+    let mut expected = vec![Some(agent), Some(human)];
+    expected.sort();
+    assert_eq!(
+        live, expected,
+        "the refused retraction keeps the pre-link row beside the human's: {after}"
+    );
+    let replaced = after["replaced_assessments"]
+        .as_array()
+        .expect("replaced_assessments");
+    assert!(
+        replaced
+            .iter()
+            .all(|r| r["retired"] != serde_json::json!(true)),
+        "a refused retraction is not reported as retired: {after}"
+    );
+    let retracted: bool =
+        sqlx::query_scalar("SELECT retracted_at IS NOT NULL FROM mass_functions WHERE id = $1")
+            .bind(old_row)
+            .fetch_one(&pool)
+            .await
+            .expect("read the pre-link row");
+    assert!(!retracted, "the pre-link row stays live");
+}
