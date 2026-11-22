@@ -15,10 +15,12 @@
 -- `bug_report_intake_marks` with its rows.
 --
 -- WHAT IT LEAVES: every report claim, trace, evidence row and edge, every
--- `bug_report.*` security_events row (265's backfill source, so re-applying
--- 265 rebuilds the markers of reports filed before AND after this undo), and
--- 265's `_sqlx_migrations` row. Re-introducing the marker is a NEW migration,
--- never a re-run of 265. Idempotent.
+-- `bug_report.*` security_events row (the source a later migration that
+-- re-introduces the marker can backfill from, reports filed after this undo
+-- included), and 265's `_sqlx_migrations` row, so the migrator never runs 265
+-- again: re-introducing the marker is a NEW migration, never a re-run of 265.
+-- `docs/runbooks/265-marker-backfill.sql` fails (42P01) once this has run.
+-- Idempotent.
 -- ===================================================================
 BEGIN;
 SET LOCAL lock_timeout = '3s';
