@@ -39,13 +39,30 @@
 --       an agent under another name (an attested signing row, or another
 --       agent's public key), which (a) misses, and any MCP server that signed
 --       an edge but no claim. Its group expression is section 8's, verbatim.
+--   (d) it holds an attested `signing` key row (`agent_keys`, any status: a
+--       rotated key's edges remain), has signed an edge, and has authored no
+--       claim. This is the separate-signing-key shape (`edge_signer` step 1,
+--       the MCP separate-key mode): a server agent provisioned with its own
+--       signing row signs but never authors. It names the API's signer when
+--       (a) and (c) cannot: a step-1 signer under another name whose HTTP
+--       edges all recorded a NULL writer or the signer's own group. `signing`
+--       rows are attested state (161's guard refuses them to the application
+--       role), so no client can place an agent in this arm.
+--
+-- RESIDUE: an API that signs with ANOTHER agent's bare `agents.public_key`
+-- (`edge_signer` step 2, which boot WARNS about) is named only through that
+-- agent's history: by (b) once it has signed a claim another agent authored
+-- (the MCP server's key, the case step 2 exists for), or by (c). An author's
+-- key reused that way, with no such history, is not named; pass it in
+-- `p_exclude_signers`.
 --
 -- Wrongly excluding a signer is safe: its edges stay world-owned and
 -- administrative, which is what every legacy edge already is. Missing a
--- server signer is the defect. So the three arms are a union, and (b) and
--- (c) also exclude a genuine author whose history shows it signing another
+-- server signer is the defect. So the four arms are a union, and (b), (c)
+-- and (d) also exclude a genuine author whose history shows it signing another
 -- author's row (for example an agent re-linked to a different operator
--- since it wrote): its legacy edges are left for the maintenance path.
+-- since it wrote, or a spawned agent with a signing row that wrote edges but
+-- no claim): its legacy edges are left for the maintenance path.
 --
 -- `p_exclude_signers` stays MANDATORY (RLE01 on NULL): 120's legacy bulk
 -- attestation keys sign no new rows, so no lookup can name them, and the
@@ -55,7 +72,8 @@
 -- 3. COST
 --
 -- Arms (b) and (c) read `claims` and `edges` once per call (the partial
--- `signer_id` indexes from 001 serve both). A run batched with `p_limit` pays
+-- `signer_id` indexes from 001 serve both); (d) probes `idx_claims_agent_id`
+-- and `idx_edges_signer_id` per signing-key agent. A run batched with `p_limit` pays
 -- that per batch; size the batch accordingly. The function is maintenance
 -- only and never on a request path.
 --
@@ -104,8 +122,9 @@ BEGIN
 END $$;
 
 -- -------------------------------------------------------------------
--- 120's body; delta = `v_auto` (section 2), its exclusion, and the audit
--- row's `auto_excluded_signers` / `migration`.
+-- 120's body; delta = the per-arm lookups and their union `v_auto`
+-- (section 2), its exclusion, and the audit row's `auto_excluded_signers`
+-- and `migration`.
 -- -------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.epigraph_reown_legacy_edges_to_signer(
     p_limit integer, p_exclude_signers uuid[])
@@ -114,6 +133,10 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
     v_n bigint;
+    v_named uuid[];
+    v_claim uuid[];
+    v_edge uuid[];
+    v_key uuid[];
     v_auto uuid[];
 BEGIN
     IF p_exclude_signers IS NULL THEN
@@ -121,34 +144,43 @@ BEGIN
             'key (an empty array only when there is none); nothing was re-owned'
             USING ERRCODE = '22004';
     END IF;
-    -- 253: the server signers, looked up (header section 2).
-    SELECT COALESCE(array_agg(DISTINCT s.id), '{}'::uuid[]) INTO v_auto
-      FROM (
-        -- (a) the API's registered edge signer.
-        SELECT a.id FROM public.agents a
-         WHERE a.display_name = 'epigraph-api-signer'
-        UNION
-        -- (b) signed a claim another agent authored.
-        SELECT c.signer_id FROM public.claims c
-         WHERE c.signer_id IS NOT NULL
-           AND c.signer_id <> c.agent_id
-        UNION
-        -- (c) signed an edge another writer recorded.
-        SELECT x.signer_id
-          FROM (SELECT DISTINCT e.signer_id, e.writer_group_id
-                  FROM public.edges e
-                 WHERE e.signer_id IS NOT NULL
-                   AND e.writer_group_id IS NOT NULL
-                   AND e.writer_group_id <> '00000000-0000-0000-0000-000000000000'::uuid) x
-         WHERE x.writer_group_id IS DISTINCT FROM COALESCE(
-                 (SELECT o.operator_group_id
-                    FROM public.epigraph_operator_of_author(x.signer_id) o
-                   ORDER BY o.retired, o.operator_id LIMIT 1),
-                 (SELECT g.id FROM public.groups g
-                   WHERE g.did_key = 'did:epigraph:personal:' || x.signer_id::text
-                     AND g.kind = 'personal'
-                     AND g.created_by_agent_id = x.signer_id))
-      ) s(id);
+    -- 253: the server signers, looked up (header section 2), arm by arm.
+    -- (a) the API's registered edge signer.
+    SELECT COALESCE(array_agg(a.id ORDER BY a.id), '{}'::uuid[]) INTO v_named
+      FROM public.agents a
+     WHERE a.display_name = 'epigraph-api-signer';
+    -- (b) signed a claim another agent authored.
+    SELECT COALESCE(array_agg(DISTINCT c.signer_id ORDER BY c.signer_id), '{}'::uuid[])
+      INTO v_claim
+      FROM public.claims c
+     WHERE c.signer_id IS NOT NULL
+       AND c.signer_id <> c.agent_id;
+    -- (c) signed an edge another writer recorded.
+    SELECT COALESCE(array_agg(DISTINCT x.signer_id ORDER BY x.signer_id), '{}'::uuid[])
+      INTO v_edge
+      FROM (SELECT DISTINCT e.signer_id, e.writer_group_id
+              FROM public.edges e
+             WHERE e.signer_id IS NOT NULL
+               AND e.writer_group_id IS NOT NULL
+               AND e.writer_group_id <> '00000000-0000-0000-0000-000000000000'::uuid) x
+     WHERE x.writer_group_id IS DISTINCT FROM COALESCE(
+             (SELECT o.operator_group_id
+                FROM public.epigraph_operator_of_author(x.signer_id) o
+               ORDER BY o.retired, o.operator_id LIMIT 1),
+             (SELECT g.id FROM public.groups g
+               WHERE g.did_key = 'did:epigraph:personal:' || x.signer_id::text
+                 AND g.kind = 'personal'
+                 AND g.created_by_agent_id = x.signer_id));
+    -- (d) a signing-key agent that signs edges and authors no claim.
+    SELECT COALESCE(array_agg(DISTINCT k.agent_id ORDER BY k.agent_id), '{}'::uuid[])
+      INTO v_key
+      FROM public.agent_keys k
+     WHERE lower(btrim(k.key_type)) = 'signing'
+       AND EXISTS (SELECT 1 FROM public.edges e WHERE e.signer_id = k.agent_id)
+       AND NOT EXISTS (SELECT 1 FROM public.claims c WHERE c.agent_id = k.agent_id);
+    v_auto := ARRAY(SELECT DISTINCT u.id
+                      FROM unnest(v_named || v_claim || v_edge || v_key) u(id)
+                     ORDER BY u.id);
     WITH base AS (
         SELECT e.id,
                COALESCE(

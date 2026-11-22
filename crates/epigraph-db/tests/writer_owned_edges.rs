@@ -1324,14 +1324,19 @@ async fn the_legacy_reown_follows_an_attributable_signer_only(pool: PgPool) {
 /// author, and a run that forgets one in `p_exclude_signers` must not re-own
 /// that server's edges to the server agent's group.
 ///
-/// Three server-signer shapes, each signing a legacy-shaped world edge:
+/// Four server-signer shapes, each signing a legacy-shaped world edge:
 ///   * `api_named`: the agent `epigraph-api` registers for its key (display
 ///     name `epigraph-api-signer`), with no other history;
 ///   * `api_unnamed`: an API key that resolved to an agent under another name
 ///     (an attested signing row), recognised because it signed an edge a
 ///     stamped caller W wrote (`writer_group_id` = W's group, not its own);
 ///   * `mcp`: the MCP server's agent, recognised because it signed a claim
-///     another agent authored (D1: the caller authors, the server signs).
+///     another agent authored (D1: the caller authors, the server signs);
+///   * `api_keyed`: an API key provisioned as an attested `signing` row of an
+///     agent under another name (`edge_signer` step 1), whose HTTP edges all
+///     recorded a NULL writer, so neither its name nor a foreign writer group
+///     gives it away: recognised because it holds a signing row, signs, and
+///     authors no claim. Its row is ROTATED: a rotated key's edges remain.
 ///
 /// Both identifying rows are the caller's PRIVATE rows, as an agent's writes
 /// are by default: the lookup reads every row, not the public ones only.
@@ -1348,6 +1353,16 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
     let (api_named, _) = fixture::seed_agent_with_group(&pool, "api-named").await;
     let (api_unnamed, _) = fixture::seed_agent_with_group(&pool, "api-unnamed").await;
     let (mcp, _) = fixture::seed_agent_with_group(&pool, "mcp-server").await;
+    let (api_keyed, _) = fixture::seed_agent_with_group(&pool, "api-keyed").await;
+    // Attested state: written privileged, as a maintenance session would.
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_until) \
+         VALUES ($1, decode(repeat('cd', 32), 'hex'), 'signing', 'rotated', now())",
+    )
+    .bind(api_keyed)
+    .execute(&pool)
+    .await
+    .expect("the API agent's signing row (privileged)");
     sqlx::query("UPDATE agents SET display_name = 'epigraph-api-signer' WHERE id = $1")
         .bind(api_named)
         .execute(&pool)
@@ -1404,11 +1419,13 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
     let by_api_named = fixture::seed_edge(&pool, a, b).await;
     let by_api_unnamed = fixture::seed_edge(&pool, a, b).await;
     let by_mcp = fixture::seed_edge(&pool, a, b).await;
+    let by_api_keyed = fixture::seed_edge(&pool, a, b).await;
     for (edge, signer) in [
         (by_genuine, genuine),
         (by_api_named, api_named),
         (by_api_unnamed, api_unnamed),
         (by_mcp, mcp),
+        (by_api_keyed, api_keyed),
     ] {
         sign_as(&pool, edge, signer).await;
         assert_eq!(
@@ -1437,6 +1454,7 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
         (by_api_named, "the API's registered signer"),
         (by_api_unnamed, "a signer that signed another writer's edge"),
         (by_mcp, "a signer that signed another author's claim"),
+        (by_api_keyed, "a signing-key agent that never authors"),
     ] {
         assert_eq!(
             tuple(&pool, edge).await,
@@ -1453,8 +1471,8 @@ async fn the_legacy_reown_never_follows_a_server_signer_whatever_the_list(pool: 
     .expect("events");
     assert_eq!(
         auto,
-        vec![3],
-        "one event, counting the three server signers the function excluded itself"
+        vec![4],
+        "one event, counting the four server signers the function excluded itself"
     );
 }
 
@@ -1813,6 +1831,8 @@ async fn the_trigger_and_the_reown_carry_the_writer_rule_and_the_one_scope(pool:
         "a.display_name = 'epigraph-api-signer'",
         "c.signer_id <> c.agent_id",
         "x.writer_group_id IS DISTINCT FROM COALESCE(",
+        "lower(btrim(k.key_type)) = 'signing'",
+        "NOT EXISTS (SELECT 1 FROM public.claims c WHERE c.agent_id = k.agent_id)",
     ] {
         assert!(
             reown.contains(needle),
