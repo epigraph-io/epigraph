@@ -200,6 +200,16 @@ path = "src/bin/calibrate_matcher.rs"
 required-features = ["db"]
 
 [[bin]]
+name = "contamination_split"
+path = "src/bin/contamination_split.rs"
+required-features = ["db"]
+
+[[test]]
+name = "contamination_split_bin"
+path = "tests/contamination_split_bin.rs"
+required-features = ["db"]
+
+[[bin]]
 name = "export_provenance"
 path = "src/bin/export_provenance.rs"
 required-features = ["db"]
