@@ -2322,6 +2322,26 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 263, the person-facing team groups and invitations. The four writes
+    // read and write the FORCEd `groups`, `group_memberships` and
+    // `group_invitations` and the `group.` audit family through
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner every
+    // create, invite, accept and decline is refused by those policies (42501,
+    // loud) with nothing written. The two reads go through the same arm:
+    // under a non-member owner `epigraph_my_group_invitations` sees no row
+    // (quiet, the invitee is shown nothing to accept) and `epigraph_my_groups`
+    // reads `groups` filtered to the caller's stamp (fewer groups, never
+    // more). The roster grant check reads `team_group_roster_grants`, whose
+    // privileges only the maintenance role holds: under a non-member owner it
+    // fails 42501 inside both 164 guards, so every person act fails CLOSED
+    // (loud) and every other path through the guards is unchanged.
+    ("epigraph_person_create_team_group", 263),
+    ("epigraph_invite_to_team_group", 263),
+    ("epigraph_accept_group_invitation", 263),
+    ("epigraph_decline_group_invitation", 263),
+    ("epigraph_my_groups", 263),
+    ("epigraph_my_group_invitations", 263),
+    ("epigraph_team_group_roster_granted", 263),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3224,6 +3244,46 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_step_lineage_executors",
             "public.epigraph_step_lineage_executors(uuid)",
+            true,
+        ),
+        // 263: the person-facing team-group surface (REST and MCP) calls the
+        // six on the request DSN as the caller; without a grant each answers
+        // 42501. The roster grant check is called by 164's INVOKER group-row
+        // guard on every application INSERT into `groups` that it selects;
+        // without the grant those inserts fail 42501 instead of GRM06.
+        (
+            "epigraph_person_create_team_group",
+            "public.epigraph_person_create_team_group(text, text)",
+            true,
+        ),
+        (
+            "epigraph_invite_to_team_group",
+            "public.epigraph_invite_to_team_group(uuid, uuid, text, text)",
+            true,
+        ),
+        (
+            "epigraph_accept_group_invitation",
+            "public.epigraph_accept_group_invitation(uuid)",
+            true,
+        ),
+        (
+            "epigraph_decline_group_invitation",
+            "public.epigraph_decline_group_invitation(uuid)",
+            true,
+        ),
+        (
+            "epigraph_my_groups",
+            "public.epigraph_my_groups()",
+            true,
+        ),
+        (
+            "epigraph_my_group_invitations",
+            "public.epigraph_my_group_invitations()",
+            true,
+        ),
+        (
+            "epigraph_team_group_roster_granted",
+            "public.epigraph_team_group_roster_granted(uuid, uuid)",
             true,
         ),
     ];
