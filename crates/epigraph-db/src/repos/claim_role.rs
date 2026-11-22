@@ -46,9 +46,10 @@
 //!   edges finds no compound. The cached-belief owner lookup
 //!   (`MassFunctionRepository::cache_owner_frame_for_claim`) closes that gap
 //!   with migration 193's definer-rights `epigraph_claim_is_compound`, which
-//!   decides [`IS_COMPOUND_SQL`] on the whole graph (backlog 0dc20fad). The
-//!   templates here, and [`roles_batch`], still read on the caller's
-//!   connection.
+//!   decides [`IS_COMPOUND_SQL`] on the whole graph (backlog 0dc20fad), and
+//!   so does BP apply's compound guard (`factor::compound_ids_among_sql`,
+//!   backlog 77b605ce). The templates here, and [`roles_batch`], still read
+//!   on the caller's connection.
 //! * **The leaf closure is spliced** on both `edges` (`EDGE_VISIBILITY`) and
 //!   `claims` (`VISIBILITY`), because a compound's derived value served to a
 //!   viewer may use only the leaves that viewer can read (§8 T1). A leaf is

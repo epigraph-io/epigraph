@@ -8,8 +8,9 @@ use crate::repos::edge::EDGE_IN_FORCE;
 
 // ── BP under atom-level belief (SPEC §6.2, D3/D4) ──────────────────────────
 //
-// A COMPOUND is a claim with an in-force `decomposes_to` out-edge to a claim:
-// a query over its atoms, with no belief cache of its own for BP to write.
+// A COMPOUND (`claim_role::IS_COMPOUND_SQL`: in short, a claim with an
+// in-force `decomposes_to` out-edge to a current claim) is a query over its
+// atoms, with no belief cache of its own for BP to write.
 
 /// SQL predicate over a `factors` row aliased `f`: TRUE when belief
 /// propagation may read the row, FALSE for a `decomposes_to` factor (D3).
@@ -71,31 +72,31 @@ pub fn bp_readable_factor_sql() -> String {
     )
 }
 
-/// SQL: of the claim ids bound as `$1` (`uuid[]`), the COMPOUNDS — those with
-/// an in-force `decomposes_to` out-edge to a claim. Used by BP apply, which
-/// writes atoms only (D4).
+/// SQL: of the claim ids bound as `$1` (`uuid[]`), the COMPOUNDS. Used by BP
+/// apply, which writes atoms only (D4).
 ///
-/// # Decided over the edges the session can see
+/// # Decided structurally, with definer rights
 ///
-/// The intent is structural (SPEC §2.1: "role is structural, not secret"),
-/// and the claim cache it guards is shared by every viewer. But `edges` is
-/// under row security, and BP apply runs this on the caller's stamped write
-/// transaction, so a decomposition the CALLER cannot see (one co-owned with a
-/// group the caller is not in, say) does not make its source a compound
-/// here, and apply would write that compound's cache. A structural read needs
-/// either a connection past row security, which a request-serving process
-/// does not hold, or a definer function, which is a migration this stage
-/// does not take. BP apply is refused unless `EPIGRAPH_BP_APPLY=on` and is
-/// run by hand only, so the residual is recorded here rather than closed.
+/// The role is structure, not secret (SPEC §2.1), and the claim cache this
+/// guards is shared by every viewer. BP apply runs on the caller's stamped
+/// write transaction, where `edges` and `claims` are under row security, so
+/// an inline read there found no compound when every child of the compound
+/// was private to a group the caller is not in, and apply wrote that
+/// compound's cache (backlog 77b605ce). Each id is therefore decided by
+/// migration 193's definer ([`super::mass_function::IS_COMPOUND_DEFINER_CALL`],
+/// whose body is [`super::claim_role::IS_COMPOUND_SQL`]), which reads the
+/// whole graph on any connection: the same test the cached-belief owner
+/// lookup uses (backlog 0dc20fad).
+///
+/// The canonical predicate is narrower than "has an in-force `decomposes_to`
+/// out-edge": a child must be current, and a procedural root (a workflow
+/// plan) and a rule are not compounds. Those claims own a cache of their own
+/// under the same predicate everywhere else, so BP apply now treats them the
+/// same way.
 #[must_use]
 pub fn compound_ids_among_sql() -> String {
-    format!(
-        "SELECT DISTINCT e.source_id FROM edges e \
-          WHERE e.source_id = ANY($1) \
-            AND e.source_type = 'claim' AND e.target_type = 'claim' \
-            AND e.relationship = 'decomposes_to' \
-            AND {EDGE_IN_FORCE}"
-    )
+    let call = super::mass_function::IS_COMPOUND_DEFINER_CALL.replace("$1", "cand.id");
+    format!("SELECT cand.id FROM unnest($1::uuid[]) AS cand(id) WHERE {call}")
 }
 
 /// A factor row from the database.

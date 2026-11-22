@@ -595,14 +595,14 @@ type BpUpdate = (Uuid, f64, Option<(f64, f64)>);
 ///
 /// # A COMPOUND is never written (SPEC §1.3 D4)
 ///
-/// Under atom-level belief a compound (a claim with an in-force
-/// `decomposes_to` out-edge, `compound_ids_among_sql`) is a query over its
-/// atoms and has no cache of its own; BP may still compute a value for one
-/// (read-only diagnostics keep the `evidential_support` / `mutual_exclusion`
-/// factors that name compounds), but apply skips it and counts it in
-/// `skipped_compounds`. The role is read on the same stamped transaction, so
-/// it is decided over the edges the caller can see, not structurally; see
-/// `compound_ids_among_sql` for the residual that leaves.
+/// Under atom-level belief a compound (`claim_role::IS_COMPOUND_SQL`; in
+/// short a claim with an in-force `decomposes_to` out-edge) is a query over
+/// its atoms and has no cache of its own; BP may still compute a value for
+/// one (read-only diagnostics keep the `evidential_support` /
+/// `mutual_exclusion` factors that name compounds), but apply skips it and
+/// counts it in `skipped_compounds`. The role is decided structurally, by
+/// migration 193's definer (`compound_ids_among_sql`), so a compound whose
+/// decomposition the caller cannot see is still skipped (backlog 77b605ce).
 ///
 /// # A claim BP could have informed from a LESS READABLE one is SKIPPED
 ///

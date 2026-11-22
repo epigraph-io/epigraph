@@ -979,6 +979,136 @@ async fn apply_skips_compounds_case(pool: &PgPool, mode: &str) {
     }
 }
 
+// ── (5b) the compound guard holds when the decomposition is hidden ─────────
+
+/// BP apply ON, with BOTH pools on the application role: the raw `db_pool`
+/// downgraded to `epigraph_app` and `scoped` a `ScopedPool` downgraded the
+/// same way, so `write_as`'s transaction is held to row security as it is in
+/// production. `state_app_role` above keeps the superuser `scoped` pool,
+/// whose transactions bypass row security, and a guard that only works
+/// because it sees every edge passes there.
+async fn state_app_role_apply_on(pool: &PgPool) -> AppState {
+    let raw = downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default())
+        .with_bp_apply(epigraph_api::state::BpApply::On);
+    let url = database_url_for(pool).await;
+    state.scoped = Some(
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("an app-role ScopedPool"),
+    );
+    state
+        .load_entity_type_cache()
+        .await
+        .expect("load the entity-type cache");
+    state
+}
+
+/// Backlog 77b605ce. A compound whose ONLY child is private to a group the
+/// caller is not in is still a compound (SPEC §2.1: role is structure, not
+/// secret), so BP apply must not write it, on a transaction row security
+/// filters exactly as on one that bypasses it. The apply guard used to read
+/// the role inline on the caller's stamped transaction, where the hidden
+/// `decomposes_to` edge does not exist, and wrote the compound's cache.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bp_apply_skips_a_compound_whose_only_child_is_hidden(pool: PgPool) {
+    for mode in ["cdst", "scalar"] {
+        sqlx::query("DELETE FROM factors")
+            .execute(&pool)
+            .await
+            .expect("clear the factor graph");
+        let (agent, group) =
+            seed_agent_with_group(&pool, &format!("bp-hidden-child-{mode}")).await;
+        let (stranger, other) =
+            seed_agent_with_group(&pool, &format!("bp-hidden-child-other-{mode}")).await;
+        let frame = binary_frame(&pool).await;
+        let k = claim(&pool, agent, group, "compound with a hidden child", 0.5).await;
+        let a = claim(&pool, agent, group, "evidenced atom", 0.85).await;
+        bba(&pool, a, frame, agent, 0.85).await;
+        let hidden = claim(&pool, stranger, other, "the only child, private", 0.5).await;
+        let edge = private_decomposes_to(&pool, k, hidden, other).await;
+        evidential_factor(&pool, k, a, None).await;
+
+        let state = state_app_role_apply_on(&pool).await;
+        let viewer = Viewer::resolve(&pool, agent).await.expect("resolve viewer");
+
+        // CALIBRATION: under the caller's stamp the decomposition does not
+        // exist, so any role read over the caller's visible edges finds no
+        // compound; with definer rights `k` IS one.
+        {
+            let mut read = state.read_as(&viewer).await.expect("a stamped read");
+            let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM edges WHERE id = $1")
+                .bind(edge)
+                .fetch_one(&mut *read)
+                .await
+                .expect("count the edge under the caller's stamp");
+            assert_eq!(
+                seen, 0,
+                "CALIBRATION: the caller's stamped session cannot see the decomposition"
+            );
+        }
+        let structural: bool =
+            sqlx::query_scalar("SELECT public.epigraph_claim_is_compound($1)")
+                .bind(k)
+                .fetch_one(&state.db_pool)
+                .await
+                .expect("the migration 193 definer, on the app role");
+        assert!(
+            structural,
+            "CALIBRATION: with definer rights k is a compound"
+        );
+
+        let before_k = stored(&pool, k).await;
+        let body = propagate(
+            &pool,
+            &state,
+            agent,
+            json!({"mode": mode, "apply_updates": true, "max_iterations": 30}),
+        )
+        .await
+        .unwrap_or_else(|s| panic!("{mode}: with BP apply on the apply runs, got {s}"));
+        let result = betps(&body);
+
+        // Precondition: BP computed a new value for k, so a write is visible.
+        let k_betp = *result
+            .get(&k)
+            .unwrap_or_else(|| panic!("{mode}: k is a BP variable: {body}"));
+        assert!(
+            (k_betp - before_k.2.unwrap()).abs() > 1e-4,
+            "{mode} precondition: BP computed a new value for k: {body}"
+        );
+        // The R-22 guard must not be what skips k: the decomposition's own
+        // factor is keyed `decomposes_to` and never loaded, so k's component
+        // holds only the caller's own group's claims.
+        assert_eq!(
+            body["skipped_less_readable_inputs"].as_u64(),
+            Some(0),
+            "{mode}: nothing in this run is less readable than its claims: {body}"
+        );
+        assert_eq!(
+            body["skipped_compounds"].as_u64(),
+            Some(1),
+            "{mode}: k is a compound whatever the caller can see of its decomposition: {body}"
+        );
+        assert_eq!(
+            stored(&pool, k).await,
+            before_k,
+            "{mode}: BP apply wrote the compound k, whose only child is hidden (D4)"
+        );
+
+        // Control: the atom in the same run IS written, with BP's value.
+        let a_after = stored(&pool, a)
+            .await
+            .2
+            .unwrap_or_else(|| panic!("{mode}: a has a stored BetP"));
+        assert!(
+            (a_after - result[&a]).abs() < 1e-12,
+            "{mode} control: a's stored BetP is the value BP computed ({a_after} vs {})",
+            result[&a]
+        );
+    }
+}
+
 /// The bearer's `AuthContext` extension `propagate_beliefs` takes (backlog
 /// f00d75ab: `apply_updates: true` needs `claims:write`).
 fn bearer(
