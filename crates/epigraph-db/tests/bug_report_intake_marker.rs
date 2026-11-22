@@ -5,14 +5,14 @@
 //! filed under a replaced intake group stay in the reporter's list). This file
 //! pins what only a database that ran 207-211 BEFORE 265 can show:
 //!
-//! * [`the_265_backfill_keeps_every_earlier_report_listed`]: reports filed on
+//! * `the_265_backfill_keeps_every_earlier_report_listed`: reports filed on
 //!   the pre-265 body (no marker written) get one marker each from their
 //!   `bug_report.submitted` audit row, so every report its reporter listed
 //!   before the upgrade it still lists after it, a report triage had already
 //!   moved out of the intake group included (which 207's list had lost). A
 //!   claim the reporter authored by another path gets no marker, and neither
 //!   does an audit row whose claim is gone or is no longer the reporter's.
-//! * [`the_265_undo_returns_the_catalog_below_265`]: `docs/runbooks/265-undo.sql`
+//! * `the_265_undo_returns_the_catalog_below_265`: `docs/runbooks/265-undo.sql`
 //!   leaves the `public` catalog exactly as it was below 265 (function bodies
 //!   compared by `pg_get_functiondef` md5, so 211's write and 207's list are
 //!   restored byte for byte), and a second run changes nothing.
