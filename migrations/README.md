@@ -3403,6 +3403,27 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **241**: `unauthenticated_reader_reserved` (backlogs 37844e1d, 14a38166). Creates the
+  `--allow-unauthenticated-http` reader agent's row (`mcp-unauthenticated-reader`, public key
+  the ASCII bytes `epigraph-mcp:unauthenticated-rdr`) if no row holds the key, adopting an
+  existing one as it is. Two INVOKER triggers with no bypass or definer escape:
+  `agents_reserve_unauthenticated_reader_key` refuses the key to every other INSERT and key
+  UPDATE (42501 `RDR01`), and `group_memberships_refuse_unauthenticated_reader` refuses every
+  INSERT of a live row of the reader and every revival of a revoked one (42501 `RDR02`), so a
+  `groups:admin` holder can no longer close the read-only listeners by adding the reader to a
+  group. Revoking a legacy live row, and updating one that is already live (key rotation),
+  stay open. The listener now only looks the row up, and refuses a row that holds a live
+  membership or is the principal of an un-revoked OAuth client (only a row from before 241
+  can). Pinned by `epigraph-db/tests/unauthenticated_reader_reserved.rs` (the app-role admin
+  refusal with calibration, the superuser and definer refusals, the key reservation, the
+  adoption of a pre-existing row, the undo) and
+  `epigraph-mcp/tests/unauthenticated_listener_public_only.rs`. Undo:
+  `docs/runbooks/241-undo.sql`. **Before deploying**, measure the reader row on the target
+  (241's header section 3 has the query); expected no row, or one with no live membership and
+  no un-revoked client. **Deploy order (binding):** migrate before rolling out a 241
+  `epigraph-mcp` binary: it no longer creates the reader, so on an unmigrated database the
+  read-only listener refuses every content call. **Applied to throwaway databases only, NOT
+  to any deployed database.**
 
 ## `-- no-transaction` migrations
 
