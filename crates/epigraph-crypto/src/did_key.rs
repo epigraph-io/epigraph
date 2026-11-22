@@ -226,11 +226,20 @@ pub fn keypair_from_llm_agent_keyed(
     model_id: &str,
     prompt_hash_hex: &str,
 ) -> AgentSigner {
+    use zeroize::Zeroize;
+
     let model_id = model_id.trim();
     let seed_input = format!("llm-agent:{model_id}:{prompt_hash_hex}");
-    let hash = blake3::keyed_hash(secret, seed_input.as_bytes());
+    // `blake3::keyed_hash`, spelled out so the secret-bearing state can be
+    // wiped (backlog 8bd859e5): the output IS the identity private key, and
+    // the keyed hasher holds the secret's key words. The signer keeps its own
+    // copy, which `ed25519_dalek::SigningKey` wipes on drop.
+    let mut hasher = blake3::Hasher::new_keyed(secret);
+    hasher.update(seed_input.as_bytes());
+    let seed = zeroize::Zeroizing::new(hasher.finalize());
+    hasher.zeroize();
     // Any 32 bytes are a valid Ed25519 secret key.
-    AgentSigner::from_bytes(hash.as_bytes()).expect("BLAKE3 output is always 32 bytes")
+    AgentSigner::from_bytes(seed.as_bytes()).expect("BLAKE3 output is always 32 bytes")
 }
 
 /// Generate a `did:key` for an LLM-driven agent.

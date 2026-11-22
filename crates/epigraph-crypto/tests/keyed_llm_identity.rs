@@ -102,3 +102,34 @@ fn keyed_derivation_changes_with_model_or_prompt_hash() {
     assert_ne!(base.public_key(), other_model.public_key());
     assert_ne!(base.public_key(), other_files.public_key());
 }
+
+/// Backlog 8bd859e5: the keyed hash IS the identity private key, so
+/// `keypair_from_llm_agent_keyed` holds the hash output in a `Zeroizing`
+/// wrapper and wipes the keyed hasher (whose state carries the secret's key
+/// words) before it returns. That needs blake3's `zeroize` feature: without
+/// it `blake3::Hash` and `blake3::Hasher` have no `Zeroize`, and this target
+/// does not compile. The assertions check that the wipe the derivation relies
+/// on really clears the bytes, rather than being a no-op impl.
+#[test]
+fn the_keyed_hash_and_hasher_are_wiped_by_zeroize() {
+    use zeroize::Zeroize;
+
+    let mut hash = blake3::keyed_hash(&SECRET_A, b"llm-agent:test-model-7:x");
+    assert_ne!(hash.as_bytes(), &[0u8; 32]);
+    hash.zeroize();
+    assert_eq!(
+        hash.as_bytes(),
+        &[0u8; 32],
+        "a zeroized Hash holds no secret bytes"
+    );
+
+    let mut hasher = blake3::Hasher::new_keyed(&SECRET_A);
+    hasher.update(b"llm-agent:test-model-7:x");
+    let before = hasher.finalize();
+    hasher.zeroize();
+    assert_ne!(
+        hasher.finalize(),
+        before,
+        "a zeroized keyed Hasher no longer carries the secret's key words"
+    );
+}

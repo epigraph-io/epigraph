@@ -7,7 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-blake3 = { workspace = true }
+# `zeroize`: `keypair_from_llm_agent_keyed` wipes the keyed hash (the identity
+# private key) and the keyed hasher (backlog 8bd859e5). The feature adds only
+# `Zeroize` impls; it does not change any hash output.
+blake3 = { workspace = true, features = ["zeroize"] }
 bs58 = { workspace = true }  # Base58 encoding for did:key identifiers
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
@@ -23,6 +26,9 @@ uuid = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Wipes the keyed identity hash (see `blake3` above). Already in the lock
+# through ed25519-dalek; no new crate.
+zeroize = "1"
 
 [dev-dependencies]
 criterion = { workspace = true }
