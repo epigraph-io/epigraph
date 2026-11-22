@@ -2,9 +2,12 @@
 //! lists, and what a federated `tools/call` answers, against a controllable
 //! stub downstream (`support/federation_stub.rs`).
 //!
-//! No database: the server runs on a lazy pool that points at a port nothing
-//! listens on, as in `http_auth_test.rs`. Nothing asserted here reads it;
-//! `emit_tool_invoked` is best-effort and only logs when it cannot publish.
+//! No database, except the delegated-run-token case: the server runs on a
+//! lazy pool that points at a port nothing listens on, as in
+//! `http_auth_test.rs`. Nothing asserted there reads it; `emit_tool_invoked`
+//! is best-effort and only logs when it cannot publish. A delegated token is
+//! checked for a LIVE delegation before any other gate, which is a database
+//! read, so that one case is a `#[sqlx::test]` on a fresh database.
 
 #[path = "support/federation_stub.rs"]
 mod stub;
@@ -159,11 +162,19 @@ fn mint_token(scopes: &[&str]) -> String {
 
 /// The gateway behind the bearer layer, serving `federation`. Returns its URL.
 async fn spawn_gateway(federation: SharedFederation) -> String {
+    spawn_gateway_on(federation, dead_pool(), epigraph_db::RunTokens::Off).await
+}
+
+/// [`spawn_gateway`] on `pool`, with the delegated-run-token switch as given.
+async fn spawn_gateway_on(
+    federation: SharedFederation,
+    pool: sqlx::PgPool,
+    run_tokens: epigraph_db::RunTokens,
+) -> String {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
     };
-    let pool = dead_pool();
     let signer = Arc::new(epigraph_crypto::AgentSigner::generate());
     let embedder = Arc::new(epigraph_mcp::embed::McpEmbedder::new(pool.clone(), None));
     let service = StreamableHttpService::new(
@@ -175,7 +186,8 @@ async fn spawn_gateway(federation: SharedFederation) -> String {
                 false,
                 federation.clone(),
                 None,
-            ))
+            )
+            .with_run_tokens(run_tokens))
         },
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
@@ -269,20 +281,25 @@ async fn handshake(client: &reqwest::Client, url: &str, token: &str) -> String {
     session
 }
 
-/// Call `tool` through the gateway as a caller holding `ext:tools`, and return
-/// the JSON-RPC `error` object of the answer (panics if there is none).
-async fn call_for_error(url: &str, tool: &str, within: std::time::Duration) -> serde_json::Value {
+/// Call `tool` with `arguments` through the gateway as the bearer of
+/// `token`, on a fresh session; the JSON-RPC answer.
+async fn call_as(
+    url: &str,
+    token: &str,
+    tool: &str,
+    arguments: serde_json::Value,
+    within: std::time::Duration,
+) -> serde_json::Value {
     let client = reqwest::Client::new();
-    let token = mint_token(&["ext:tools"]);
-    let session = handshake(&client, url, &token).await;
+    let session = handshake(&client, url, token).await;
     let mut resp = post(
         &client,
         url,
-        &token,
+        token,
         Some(&session),
         serde_json::json!({
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-            "params": {"name": tool, "arguments": {}}
+            "params": {"name": tool, "arguments": arguments}
         }),
     )
     .await;
@@ -293,7 +310,14 @@ async fn call_for_error(url: &str, tool: &str, within: std::time::Duration) -> s
         .map(str::trim)
         .find(|l| !l.is_empty())
         .unwrap_or_else(|| panic!("no JSON-RPC answer within {within:?}:\n{body}"));
-    let answer: serde_json::Value = serde_json::from_str(data).expect("JSON-RPC answer");
+    serde_json::from_str(data).expect("JSON-RPC answer")
+}
+
+/// Call `tool` through the gateway as a caller holding `ext:tools`, and return
+/// the JSON-RPC `error` object of the answer (panics if there is none).
+async fn call_for_error(url: &str, tool: &str, within: std::time::Duration) -> serde_json::Value {
+    let token = mint_token(&["ext:tools"]);
+    let answer = call_as(url, &token, tool, serde_json::json!({}), within).await;
     answer
         .get("error")
         .cloned()
@@ -487,6 +511,256 @@ async fn the_gateways_own_bearer_layer_refuses_an_extension_audience_token() {
         401,
         "an extension-audience token must not be admitted on a kernel route"
     );
+}
+
+// ── Backlog 19159ac2: the federation branch of `call_tool`, end to end ──────
+//
+// An allowed call, a scope refusal and a delegated-token refusal, through
+// the bearer layer and the real `call_tool` against the recording stub. Each
+// asserts what reached the downstream (the stub's `calls`) and the kernel's
+// token endpoint (`subjects`), not only what the caller was answered.
+
+/// An allowed federated call reaches the extension with the caller's
+/// arguments exactly as sent, under an exchanged extension-audience token
+/// (never the caller's own bearer), and the extension's result comes back to
+/// the caller unchanged.
+///
+/// Mutation: pass `None` for the arguments to `federation.invoke` in
+/// `call_tool` -> the stub records no arguments and echoes `{}`, and this
+/// fails.
+#[tokio::test]
+async fn an_allowed_federated_call_forwards_the_arguments_and_returns_the_result() {
+    let (addr, control) = stub::spawn_controlled_stub(&[stub::ECHO_TOOL]).await;
+    let endpoint = tx::spawn_token_endpoint(SECRET, &["ext"]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub")
+        .with_token_exchange(endpoint.exchange());
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let caller = mint_token(&["ext:tools"]);
+    let arguments = serde_json::json!({
+        "widget": 42,
+        "label": "forwarded as sent",
+        "nested": {"ids": [1, 2, 3], "flag": true}
+    });
+    let answer = call_as(
+        &url,
+        &caller,
+        stub::ECHO_TOOL,
+        arguments.clone(),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+
+    let result = answer
+        .get("result")
+        .unwrap_or_else(|| panic!("an allowed call is answered with a result: {answer}"));
+    assert_ne!(result["isError"], serde_json::json!(true), "{answer}");
+    let echoed: serde_json::Value = serde_json::from_str(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the stub's text block: {answer}")),
+    )
+    .expect("the stub echoes JSON");
+    assert_eq!(
+        echoed, arguments,
+        "the caller gets the extension's result, which echoes what it was sent: {answer}"
+    );
+
+    let calls = control.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one call reached the stub: {calls:?}"
+    );
+    assert_eq!(calls[0].name, stub::ECHO_TOOL);
+    assert_eq!(
+        calls[0].arguments.clone().map(serde_json::Value::Object),
+        Some(arguments),
+        "the extension received the caller's arguments unchanged"
+    );
+    let forwarded = calls[0]
+        .bearer
+        .as_deref()
+        .expect("the call carried a bearer");
+    assert_ne!(
+        forwarded, caller,
+        "the caller's own bearer must never reach an extension"
+    );
+    epigraph_auth::JwtConfig::from_secret(SECRET)
+        .validate_token_for_audience(forwarded, "ext")
+        .expect("the extension receives a token whose audience is its own name");
+    assert_eq!(
+        *endpoint.subjects.lock().unwrap(),
+        vec![caller],
+        "the caller's bearer went to the kernel's exchange, once"
+    );
+}
+
+/// A caller without the extension's scope is refused by name and scope, and
+/// nothing reaches the extension or the token endpoint: the caller's bearer
+/// never leaves the gateway. The same gateway admits a caller WITH the scope
+/// (calibration: the refusal is the scope, not an unreachable stub).
+///
+/// Mutation: remove the `enforce_federated_scope` call in `call_tool`'s
+/// federation branch -> the scopeless call is exchanged and reaches the stub,
+/// and this fails.
+#[tokio::test]
+async fn a_caller_without_the_extensions_scope_is_refused_and_nothing_is_forwarded() {
+    let (addr, control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
+    let endpoint = tx::spawn_token_endpoint(SECRET, &["ext"]).await;
+    let registry = FederationRegistry::build(vec![cfg("ext", &addr)], "discovery-tok")
+        .await
+        .expect("build against a reachable stub")
+        .with_token_exchange(endpoint.exchange());
+    let url = spawn_gateway(SharedFederation::new(registry)).await;
+
+    let answer = call_as(
+        &url,
+        &mint_token(&["claims:read"]),
+        "federated_probe",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("federated tool 'federated_probe' requires scope 'ext:tools'"),
+        "refused for the extension's scope: {answer}"
+    );
+    assert!(
+        control.calls().is_empty(),
+        "nothing reached the extension: {:?}",
+        control.calls()
+    );
+    assert!(
+        endpoint.subjects.lock().unwrap().is_empty(),
+        "the refused caller's bearer was not sent to the exchange either"
+    );
+
+    let admitted = call_as(
+        &url,
+        &mint_token(&["ext:tools"]),
+        "federated_probe",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        admitted.get("result").is_some(),
+        "CALIBRATION: a caller with the scope reaches the extension: {admitted}"
+    );
+    assert_eq!(control.calls().len(), 1, "CALIBRATION: one call reached it");
+}
+
+#[path = "../../epigraph-db/tests/support/delegation_fixture.rs"]
+mod delegation;
+
+/// A signed `agent` token for `principal` (`sub` = `client`) carrying
+/// `scopes`, delegated by `delegated_by` when given.
+fn agent_token(
+    client: uuid::Uuid,
+    principal: uuid::Uuid,
+    delegated_by: Option<uuid::Uuid>,
+    scopes: &[&str],
+) -> String {
+    epigraph_auth::JwtConfig::from_secret(SECRET)
+        .issue_access_token(
+            client,
+            scopes.iter().map(|s| (*s).to_string()).collect(),
+            "agent",
+            None,
+            Some(principal),
+            chrono::Duration::minutes(15),
+            epigraph_auth::AccessTokenBinding {
+                delegated_by,
+                ..epigraph_auth::AccessTokenBinding::NONE
+            },
+        )
+        .expect("mint")
+        .0
+}
+
+/// A DELEGATED run token is refused at a federated tool even when its
+/// delegation is live and it holds the extension's scope, and its bearer
+/// reaches neither the extension nor the token endpoint. The extension's
+/// scope is inside the delegated ceiling and the run-token switch is on, so
+/// the dispatch check admits the token and the federation branch is what
+/// refuses it. The same principal's token without `dlg` reaches the extension
+/// (calibration).
+///
+/// Mutation: remove the `delegated_by.is_some()` arm of
+/// `enforce_federated_scope` -> the token passes the scope check and is sent
+/// to the exchange, and this fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_delegated_run_token_is_refused_at_a_federated_tool_and_nothing_is_forwarded(
+    pool: sqlx::PgPool,
+) {
+    let d = delegation::live_delegation(&pool, "federated-dlg").await;
+    let (addr, control) = stub::spawn_controlled_stub(&["federated_probe"]).await;
+    let endpoint = tx::spawn_token_endpoint(SECRET, &["ext"]).await;
+    let config = epigraph_mcp::federation::config::parse_extensions(Some(&format!(
+        "ext=tcp:{addr};scope=claims:read"
+    )))
+    .expect("a well-formed test entry")
+    .remove(0);
+    let registry = FederationRegistry::build(vec![config], "discovery-tok")
+        .await
+        .expect("build against a reachable stub")
+        .with_token_exchange(endpoint.exchange());
+    let url = spawn_gateway_on(
+        SharedFederation::new(registry),
+        pool.clone(),
+        epigraph_db::RunTokens::On,
+    )
+    .await;
+
+    let dlg = agent_token(
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read"],
+    );
+    let answer = call_as(
+        &url,
+        &dlg,
+        "federated_probe",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    let message = answer["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message
+            .contains("federated tool 'federated_probe' is unavailable to a delegated run token"),
+        "refused by the federation branch as a delegated token (not as a dead \
+         delegation or an out-of-ceiling scope): {answer}"
+    );
+    assert!(
+        control.calls().is_empty(),
+        "nothing reached the extension: {:?}",
+        control.calls()
+    );
+    assert!(
+        endpoint.subjects.lock().unwrap().is_empty(),
+        "the delegated bearer was not sent to the exchange"
+    );
+
+    let plain = agent_token(d.delegator_client, d.principal, None, &["claims:read"]);
+    let admitted = call_as(
+        &url,
+        &plain,
+        "federated_probe",
+        serde_json::json!({}),
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        admitted.get("result").is_some(),
+        "CALIBRATION: the same principal without `dlg` reaches the extension: {admitted}"
+    );
+    assert_eq!(control.calls().len(), 1, "CALIBRATION: one call reached it");
 }
 
 // ── Backlog e3614de6: a relayed result answers in the CALLER's revision ──────
