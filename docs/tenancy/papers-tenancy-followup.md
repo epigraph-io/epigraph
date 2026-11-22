@@ -4,8 +4,9 @@ Status: option 2 (section 3) chosen by the 2026-11-16 design decision (backlog 3
 implemented for the `papers` row by migration 246 (section 6). Still open: the author agents'
 own tenancy, widening and merging a paper on publicize/share, the narrowing guard and the `doi:`
 label on converged public claims (section 7). Until those land, an ingest's author NAMES stay
-readable by every agent whatever `visibility` you pass, so do not ingest a document whose author
-list is itself confidential.
+readable by every agent whatever `visibility` you pass, and so does an author's `asserts`
+attribution edge onto an already-public claim the ingest converges onto, so do not ingest a
+document whose author list is itself confidential.
 
 The sections below are the original design note (operator ruling, 2026-11-11: document the gap
 in the claim visibility work and close it in a follow-up), kept as written.
@@ -136,7 +137,11 @@ On the app role (`ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 ## 7. What remains (backlog 34864fb5, items 2, 3, 6, 7 and part of 8)
 
 * Author agents (non-principal, name-derived identity nodes) carry no tenancy yet: an author's
-  name is world-readable, though the `authored` edge onto a group paper is not. Their
+  name is world-readable, though the `authored` edge onto a group paper is not. The walk's
+  `author -asserts-> claim` attribution edge onto a claim it CONVERGES onto (an already-public
+  atom) declares no tenancy, so with both endpoints public the meet leaves it public, and
+  `get_neighborhood` / `traverse` from that claim tie the name to it. Private author agents
+  close this; until then it is part of "do not ingest a confidential author list". Their
   deterministic name-derived key and `agents.public_key` uniqueness must become tenant-scoped
   before they can be private; principals stay public. `find_agent` / `get_agent` and the agents
   routes then need the viewer.

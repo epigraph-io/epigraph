@@ -77,8 +77,11 @@ Added to:
   Still world-readable whatever `visibility` says (backlog 34864fb5, follow-ups):
 
   * the author agents themselves (`agents` rows named after the paper's authors): an author's
-    NAME stays readable, though not which document it wrote. Do not ingest a document whose
-    author list is itself confidential;
+    NAME stays readable. Which document it wrote does not (the `authored` edge onto a group
+    paper is the group's), but an author's `asserts` attribution edge onto an already-public
+    claim the ingest converges onto is public (both endpoints are), so `get_neighborhood` or
+    `traverse` from that claim ties the name to it. Do not ingest a document whose author list
+    is itself confidential;
   * the `doi:<doi>` label a non-public ingest adds to a converged public claim it may write.
 
   Publicizing or sharing the claims does not yet widen or merge the paper row: a publicized
