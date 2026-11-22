@@ -23,7 +23,9 @@
 //! an error value by the receiver names `e`, `err`, `error`, `source` and
 //! `db_err`. A per-item `error` built in a helper the constructing function
 //! calls is out of reach, unless that helper also builds the type, as
-//! `belief.rs::pair_conflict` does.
+//! `belief.rs::pair_conflict` does. The JSON `"error"` rule covers 5xx bodies
+//! only: its one allowed file, `routes/submit.rs`, is allowed whole, so a 4xx
+//! body there is not checked.
 //!
 //! Comments are stripped by this file's own [`strip_comments`], not the shared
 //! `lint_text` one, which drops the byte that follows a backslash inside a
@@ -34,14 +36,16 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// 502/503 sites whose text is not a literal or a const, keyed on
-/// `(path under src/, enclosing fn)`, with the sentinel that keeps the reason
-/// true. Each entry must still be found.
-const DYNAMIC_502_503: &[(&str, &str, &str)] = &[(
+/// 502/503 sites whose text is not a literal or a const:
+/// `(path under src/, enclosing fn, the exact expression, whitespace
+/// normalized, sentinel)`. A reviewed function whose expression changes is
+/// unreviewed again, and each entry must still be found.
+const DYNAMIC_502_503: &[(&str, &str, &str, &str)] = &[(
     "routes/analyze.rs",
     "llm_unavailable",
     // Interpolates only `stage`, a `&'static str` chosen by the caller site;
     // the provider error is logged, never formatted into the text.
+    "format!(\"LLM {stage} failed; the detail is in the server log\")",
     "fn llm_unavailable(stage: &'static str",
 )];
 
@@ -451,7 +455,7 @@ fn every_502_503_text_is_a_literal_a_const_or_a_reviewed_dynamic_site() {
             Text::Dynamic(expr) => {
                 if DYNAMIC_502_503
                     .iter()
-                    .any(|(f, n, _)| f == file && n == func)
+                    .any(|(f, n, x, _)| f == file && n == func && x == expr)
                 {
                     dynamic.insert((file.clone(), func.clone()));
                 } else {
@@ -478,7 +482,7 @@ fn every_502_503_text_is_a_literal_a_const_or_a_reviewed_dynamic_site() {
          const (log the detail server-side), or a reviewed entry in DYNAMIC_502_503:\n{}",
         unreviewed.join("\n")
     );
-    for (file, func, sentinel) in DYNAMIC_502_503 {
+    for (file, func, _, sentinel) in DYNAMIC_502_503 {
         assert!(
             dynamic.contains(&(file.to_string(), func.to_string())),
             "stale DYNAMIC_502_503 entry {file}::{func}: no such site any more"
