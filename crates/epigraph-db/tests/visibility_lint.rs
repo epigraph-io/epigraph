@@ -3173,6 +3173,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          authority rule for an agent-sourced asserts/authored edge). Identity data, not \
          tenant content.",
     ),
+    // ── Backlog 6492de67: an admin's key change shares a transaction with its
+    // admin audit row.
+    (
+        "agent_key.rs",
+        "store",
+        "WRITE of one `agent_keys` row (INSERT .. RETURNING the row written). `agent_keys` \
+         has no row security and no owner group: a public key is identity data, not tenant \
+         content (`GET /api/v1/agents/:id/keys` lists them to any `agents:read` holder), and \
+         161's attested-type guard decides who may write a signing row. Generic only so the \
+         key handlers run it on the transaction that also writes the admin audit row.",
+    ),
+    (
+        "agent_key.rs",
+        "update_status",
+        "WRITE through migration 118's definer `epigraph_agent_key_set_status` (re-stated by \
+         161-163): one key's status change, returning that row. `agent_keys` has no row \
+         security and no owner group (identity data, not tenant content). Generic only so \
+         the key handlers run it on the transaction that also writes the admin audit row.",
+    ),
     (
         "derivation_scope.rs",
         "cache_admissible",
