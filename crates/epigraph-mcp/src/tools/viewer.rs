@@ -263,9 +263,11 @@ pub async fn request_viewer(
 
 /// The refusal on the `--allow-unauthenticated-http` listener when its
 /// injected principal has not resolved (`unauthenticated_reader::listener_principal`
-/// logs why). On the read-only listener the usual cause is a group membership
-/// someone granted the reader agent, which `UnauthenticatedReader::resolve`
-/// refuses to read with (fail-closed, backlog fe514fc3).
+/// logs why). On the read-only listener the causes are a reader row that holds
+/// a group membership or is an OAuth client's principal (only a row that
+/// predates migration 241 can; `UnauthenticatedReader::resolve` refuses to
+/// read as it, fail-closed, backlogs fe514fc3 / 14a38166), or a database
+/// without migration 241's reserved row.
 fn unresolved_listener_principal() -> McpError {
     McpError::invalid_request(
         concat!(
@@ -273,7 +275,8 @@ fn unresolved_listener_principal() -> McpError {
             "has no read authority; the server log says why. On the read-only listener ",
             "the usual cause is a group membership held by the reader agent ",
             "(mcp-unauthenticated-reader), which reads public rows only: revoke that ",
-            "agent's group memberships."
+            "agent's group memberships, and any OAuth client bound to it. If no such ",
+            "agent exists, apply migration 241."
         )
         .to_string(),
         None,

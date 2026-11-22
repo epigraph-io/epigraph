@@ -572,13 +572,15 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
-        "find_or_create",
+        "find_reserved",
         2,
-        "NO_ROW_SECURITY: finds or creates the `--allow-unauthenticated-http` reader agent by its \
-         public key (AgentRepository::get_by_public_key / create, twice for the lost-race \
-         lookup); `agents` carries no tenancy row security, and there is no caller to stamp \
-         from because this IS the identity the listener reads as. Registered under the \
-         operator's 2026-11-16 approval, the one HIGH_WATER raise.",
+        "NO_ROW_SECURITY: finds migration 241's reserved `--allow-unauthenticated-http` reader \
+         agent by its public key (AgentRepository::get_by_public_key) and counts the un-revoked \
+         OAuth clients naming it (OAuthClientRepository::count_unrevoked_for_agent, backlog \
+         14a38166); neither `agents` nor `oauth_clients` carries tenancy row security, and \
+         there is no caller to stamp from because this IS the identity the listener reads as. \
+         Registered under the operator's 2026-11-16 approval, the one HIGH_WATER raise (was \
+         find_or_create's get_by_public_key / create pair; same count).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
