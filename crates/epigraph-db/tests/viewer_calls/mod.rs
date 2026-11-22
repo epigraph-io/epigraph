@@ -911,6 +911,8 @@ const NON_DB_METHODS: &[&str] = &[
     "unwrap",
     "expect",
     "map",
+    "is_some",
+    "is_none",
 ];
 
 /// Calls that run no statement of their own and so are not registered:

@@ -710,7 +710,11 @@ use viewer_calls::{Measured, Population, Surface};
 /// The MCP tools' database handles, for the per-call scanner.
 const TOOLS: Surface = Surface {
     state_types: &["EpiGraphMcpFull"],
-    pool_fields: &["pool"],
+    // `scoped` is the server's `ScopedPool`: it runs nothing without a viewer
+    // or a maintenance lease, but a helper handed it can resolve another
+    // principal's viewer (`write_recall_audit`), so a call handed it is a
+    // database call like one handed `pool`.
+    pool_fields: &["pool", "scoped"],
     state_db_methods: &["read_as"],
     viewer_ctors: &[
         "request_viewer(",
@@ -719,7 +723,14 @@ const TOOLS: Surface = Surface {
         "Viewer::resolve(",
         "Viewer::resolve_elevated(",
     ],
-    conn_ctors: &["admin_cascade_session(", "maintenance_tool_session("],
+    // The maintenance session a cascade runs on, opened directly or through
+    // the supersede helpers that return it beside a deferral status.
+    conn_ctors: &[
+        "admin_cascade_session(",
+        "maintenance_tool_session(",
+        "admin_session_or_deferral(",
+        "supersede_session_or_deferral(",
+    ],
     marker_spend: spends_viewer,
 };
 
@@ -780,6 +791,8 @@ const TOOLS: Surface = Surface {
 ///   a workflow-write record, a cascade deferral).
 /// * **maintenance** — opens the admin cascade session, or records its
 ///   deferral, after the act's gate; the cascade runs there by design.
+///   "maintenance (counts only)" is a cascade run on that session without the
+///   caller's viewer whose result reaches the response only as counts.
 /// * **resolves** — `Viewer::resolve`, the membership read that builds the
 ///   viewer itself.
 /// * **no SQL** — handed the server for something that is not a tenancy read:
@@ -970,13 +983,17 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // write: `ClaimRepository::consolidate_act_conn`; opener:
     // `claim_helper::begin_author_stamped_tx`; maintenance:
-    // `supersede::admin_session_or_deferral`; no SQL:
+    // `supersede::admin_session_or_deferral`; maintenance (counts only):
+    // `admin_cascade::apply_after_consolidate` migrates the retired sources'
+    // edges on the admin session and returns only `edges_migrated` /
+    // `edges_deduped` counts (the ids stay in the audit row); no SQL:
     // `claim_helper::embed_claim_author_stamped`.
     (
         "consolidate.rs",
         "consolidate_claims",
         &[
             "ClaimRepository::consolidate_act_conn",
+            "admin_cascade::apply_after_consolidate",
             "claim_helper::begin_author_stamped_tx",
             "claim_helper::embed_claim_author_stamped",
             "supersede::admin_session_or_deferral",
@@ -1417,6 +1434,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::resolve_claim_visibility",
         ],
     ),
+    // audit: `recall::write_recall_audit`, handed `server.scoped`: the
+    // caller's own recall event, written on a transaction stamped as the
+    // caller (`principal`), which resolves only the caller's owner group.
+    ("memory.rs", "recall_post_embed", &["recall::write_recall_audit"]),
     // untenanted: `ingestion::find_paper_by_document_key`. Raw pool:
     // `find_paper_by_document_key` reads `papers` on `server.pool`; every claim-derived read
     // runs on the stamped read.
@@ -1927,7 +1948,7 @@ fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
     );
     assert!(
         calls >= 650,
-        "found {calls} database calls in them; measured 785 on 2026-11-22"
+        "found {calls} database calls in them; measured 789 on 2026-11-22"
     );
 }
 
@@ -2089,6 +2110,55 @@ async fn renamed(ctx: &Ctx<'_>, id: Uuid) -> R {
         vec!["Repo::get"],
         "a field bound under another name (`server: s`, `viewer: v`) is classified \
          by the field's declared type"
+    );
+}
+
+/// `server.scoped` is a database handle (a helper handed it runs SQL), an
+/// `Option` test on it is not a call, and a maintenance session returned by
+/// the supersede helpers beside a deferral status is a connection.
+#[test]
+fn the_per_call_scanner_reads_the_scoped_pool_and_returned_maintenance_sessions() {
+    let src = r##"
+pub async fn audit_on_scoped(server: &EpiGraphMcpFull, viewer: &Viewer, principal: Option<Uuid>) -> R {
+    let rows = Repo::list_as(&server.pool, viewer).await?;
+    if server.scoped.is_some() {
+        tracing::debug!("stamped");
+    }
+    let scoped = server.scoped.clone();
+    write_audit(scoped.as_ref(), principal).await?;
+    Ok(rows)
+}
+
+pub async fn cascade_after_gate(server: &EpiGraphMcpFull, viewer: &Viewer, id: Uuid) -> R {
+    let mut tx = begin_claim_write(server, viewer).await?;
+    let (mut session, deferred) = if id.is_nil() {
+        (None, None)
+    } else {
+        let (session, status) =
+            crate::tools::supersede::admin_session_or_deferral(server, &mut tx, &id).await?;
+        (session, Some(status))
+    };
+    let report = match (session.as_mut(), deferred) {
+        (Some(session), _) => Some(admin_cascade::apply_after(session.conn(), &id).await),
+        (None, _) => None,
+    };
+    Ok(report)
+}
+"##;
+    let m = tool_unviewed(src);
+    assert_eq!(
+        tool_labels(&m, "audit_on_scoped"),
+        vec!["write_audit"],
+        "a helper handed `server.scoped` is a database call; `scoped.is_some()` is not"
+    );
+    assert_eq!(
+        tool_labels(&m, "cascade_after_gate"),
+        vec![
+            "admin_cascade::apply_after",
+            "supersede::admin_session_or_deferral"
+        ],
+        "the session `admin_session_or_deferral` returns is a connection, so the \
+         cascade run on it without the viewer is reported"
     );
 }
 
