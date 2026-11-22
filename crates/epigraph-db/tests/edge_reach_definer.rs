@@ -22,7 +22,10 @@
 //!   EXECUTE, EXECUTE for the application role;
 //! * the check-then-insert serialization: two sessions checking the two
 //!   directions of one 2-cycle. The second blocks on the advisory lock until
-//!   the first commits its edge, then its walk sees that edge.
+//!   the first commits its edge, then its walk sees that edge. Run on the
+//!   `depends_on` key between two harness sessions, and on the `invokes` /
+//!   `executes` key with the waiting writer on a stamped `epigraph_app`
+//!   transaction, the path `link_hierarchical` runs.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -319,6 +322,29 @@ async fn waits_on_advisory_lock(pool: &PgPool, pid: i32) -> bool {
     .expect("read pg_locks")
 }
 
+/// The barrier: returns once backend `pid` (writer 2, running in `second`) is
+/// waiting on an ungranted advisory lock. Fails if `second` finishes first:
+/// writer 2 then answered without waiting for writer 1.
+async fn wait_until_blocked(pool: &PgPool, pid: i32, second: &tokio::task::JoinHandle<bool>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if waits_on_advisory_lock(pool, pid).await {
+            break;
+        }
+        assert!(
+            !second.is_finished(),
+            "writer 2 finished its check without waiting for writer 1's lock: the \
+             check-then-insert is not serialized"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "writer 2 never waited on an advisory lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!second.is_finished(), "writer 2 is still blocked");
+}
+
 /// The race the advisory lock closes. Writer 1 is about to add `a -> b` and
 /// writer 2 `b -> a` (both `depends_on`); each first asks whether its target
 /// reaches its source. Writer 1 checks (no path) and holds the lock. Writer 2's
@@ -356,23 +382,7 @@ async fn a_concurrent_check_waits_for_the_first_writer_and_sees_its_edge(pool: P
     });
 
     // Barrier: writer 2 is blocked on the lock writer 1 holds.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if waits_on_advisory_lock(&pool, pid2).await {
-            break;
-        }
-        assert!(
-            !second.is_finished(),
-            "writer 2 finished its check without waiting for writer 1's lock: the \
-             check-then-insert is not serialized"
-        );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "writer 2 never waited on an advisory lock"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(!second.is_finished(), "writer 2 is still blocked");
+    wait_until_blocked(&pool, pid2, &second).await;
 
     edge(&mut *writer1, a, b, "depends_on").await;
     writer1.commit().await.expect("writer 1 commits a -> b");
@@ -384,5 +394,66 @@ async fn a_concurrent_check_waits_for_the_first_writer_and_sees_its_edge(pool: P
     assert!(
         reached,
         "writer 2's walk runs after writer 1's commit and sees a -> b, so b -> a is refused"
+    );
+}
+
+/// The same race on the path `link_hierarchical` actually runs: writer 2 is a
+/// STAMPED `epigraph_app` transaction (`begin_as`), and the key is the
+/// `invokes` / `executes` walk rather than `depends_on`. Writer 1 checks and
+/// adds `a -invokes-> b`; writer 2's check for `b -invokes-> a` must wait for
+/// writer 1's commit and then, on its stamped session, see `a -invokes-> b`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stamped_app_check_on_the_invokes_walk_waits_and_sees_the_edge(pool: PgPool) {
+    let (agent, group) = fixture::seed_agent_with_group(&pool, "7149132e-race-app").await;
+    let a = node(&pool, agent, group, "public", "race app a").await;
+    let b = node(&pool, agent, group, "public", "race app b").await;
+
+    let mut writer1 = pool.begin().await.expect("writer 1");
+    assert!(
+        !EdgeRepository::reaches_in_force_conn(&mut writer1, b, a, INVOKES_WALK)
+            .await
+            .expect("writer 1 checks"),
+        "no path yet: writer 1 may add a -invokes-> b"
+    );
+
+    let viewer = Viewer::resolve(&pool, agent).await.expect("resolve agent");
+    let scoped = app_scoped_pool(&pool).await;
+    let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<i32>();
+    let second = tokio::spawn(async move {
+        let mut writer2 = scoped.begin_as(&viewer).await.expect("stamped writer 2");
+        let (who, pid): (String, i32) =
+            sqlx::query_as("SELECT session_user::text, pg_backend_pid()")
+                .fetch_one(&mut *writer2)
+                .await
+                .expect("writer 2 session");
+        assert_eq!(who, "epigraph_app", "writer 2 is the application role");
+        pid_tx.send(pid).expect("send writer 2 pid");
+        let reached = EdgeRepository::reaches_in_force_conn(&mut writer2, a, b, INVOKES_WALK)
+            .await
+            .expect("writer 2 checks");
+        writer2.rollback().await.expect("rollback writer 2");
+        reached
+    });
+    let pid2 = tokio::time::timeout(Duration::from_secs(15), pid_rx)
+        .await
+        .expect("writer 2 starts")
+        .expect("writer 2 pid");
+
+    wait_until_blocked(&pool, pid2, &second).await;
+
+    edge(&mut *writer1, a, b, "invokes").await;
+    writer1
+        .commit()
+        .await
+        .expect("writer 1 commits a -invokes-> b");
+
+    let reached = tokio::time::timeout(Duration::from_secs(15), second)
+        .await
+        .expect("writer 2 resumes once writer 1 commits")
+        .expect("writer 2 task");
+    assert!(
+        reached,
+        "writer 2's stamped walk runs after writer 1's commit and sees a -invokes-> b, \
+         so b -invokes-> a is refused"
     );
 }
