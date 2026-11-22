@@ -328,13 +328,12 @@ pub async fn create_paper(
     let doi = epigraph_db::repos::paper::canonical_document_key(&request.doi);
     let spellings = epigraph_db::repos::paper::document_key_spellings(&request.doi);
 
-    // Check for existing paper first, under any stored spelling, including a
-    // legacy key whose resolver prefix differs only in letter case (backlog
-    // f3a3ca54); exact spellings rank first.
-    let existing: Option<_> = sqlx::query(&format!(
-        "SELECT id, doi, title, journal, created_at FROM papers \
-         WHERE {matches} ORDER BY array_position($1::text[], doi), doi LIMIT 1",
-        matches = epigraph_db::repos::paper::document_key_match_sql("doi", 1),
+    // Check for existing paper first, under any stored spelling, canonical
+    // first, else a legacy key whose resolver prefix differs only in letter
+    // case (backlog f3a3ca54). The shared lookup keeps a hit on the index.
+    let existing: Option<_> = sqlx::query(&epigraph_db::repos::paper::document_key_first_sql(
+        "id, doi, title, journal, created_at",
+        1,
     ))
     .bind(&spellings)
     .fetch_optional(&state.db_pool)
@@ -460,13 +459,17 @@ pub async fn list_papers(
 
     let (rows, total): (Vec<sqlx::postgres::PgRow>, i64) = if let Some(ref doi) = params.doi {
         // DOI lookup under every spelling of the document key (the same
-        // normalizer and predicate the writer and the MCP tools use),
-        // canonical first.
+        // normalizer and lookup the writer and the MCP tools use), canonical
+        // first; a case-variant legacy key only when no exact spelling is
+        // stored (backlog f3a3ca54).
         let spellings = epigraph_db::repos::paper::document_key_spellings(doi);
-        let matches = epigraph_db::repos::paper::document_key_match_sql("doi", 1);
+        let matched = epigraph_db::repos::paper::document_key_rows_sql(
+            "id, doi, title, journal, created_at",
+            1,
+        );
         let rows = sqlx::query(&format!(
-            "SELECT id, doi, title, journal, created_at FROM papers \
-             WHERE {matches} ORDER BY array_position($1::text[], doi), doi \
+            "SELECT id, doi, title, journal, created_at FROM ({matched}) AS m \
+             ORDER BY array_position($1::text[], m.doi), m.doi \
              LIMIT $2 OFFSET $3"
         ))
         .bind(&spellings)
@@ -478,14 +481,13 @@ pub async fn list_papers(
             message: format!("Failed to query papers: {e}"),
         })?;
 
-        let total: i64 =
-            sqlx::query_scalar(&format!("SELECT COUNT(*) FROM papers WHERE {matches}"))
-                .bind(&spellings)
-                .fetch_one(&mut *read)
-                .await
-                .map_err(|e| ApiError::DatabaseError {
-                    message: format!("Failed to count papers: {e}"),
-                })?;
+        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM ({matched}) AS m"))
+            .bind(&spellings)
+            .fetch_one(&mut *read)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to count papers: {e}"),
+            })?;
         (rows, total)
     } else {
         // Full list
