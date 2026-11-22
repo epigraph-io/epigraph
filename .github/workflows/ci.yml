@@ -928,7 +928,8 @@ jobs:
           "$RUNNER_TEMP/pyenv/bin/pip" install --quiet \
             $(grep -E '^(fastapi|starlette|pydantic)==' services/nli/requirements.txt)
           python3 -m pytest -rs scripts/lib/test_nli_stance.py \
-            services/nli/test_app.py services/nli/test_requirements_floor.py
+            services/nli/test_app.py services/nli/test_requirements_floor.py \
+            services/nli/test_dockerfile.py
       - name: SciFact conformal calibration check
         # The 1,189 gold-labelled SciFact fixtures: held-out split-conformal
         # coverage and efficiency, plus --check, which fails when the shipped
