@@ -791,6 +791,8 @@ pub async fn supersede_claim(
 ///   cannot read it (the two are indistinguishable)
 /// - 409 Conflict: the duplicate is already superseded, or the canonical is
 ///   not current (operator ruling R-55: a state refusal, with its reason)
+/// - 500: the database failed (a lock timeout, a lost connection); nothing was
+///   written, and the detail is in the server log
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -948,15 +950,15 @@ pub async fn mark_duplicate(
             entity: "Claim".into(),
             id: id.to_string(),
         },
-        // The act's own refusals by kind (operator ruling R-55): FA04/FA07
-        // are 403, a retired canonical or an already-superseded duplicate 409.
-        e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
-        epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
-            reason: "claim already superseded or invalid input".into(),
-        },
-        other => ApiError::DatabaseError {
-            message: other.to_string(),
-        },
+        // Everything else by `From<DbError>`: the act's own refusals by kind
+        // (FA04/FA07 are 403, a retired canonical or an already-superseded
+        // duplicate 409), a reviewed coded refusal with its code, the operator
+        // binding's and role's denials as coded 403s, and a database failure
+        // (a lock timeout, a lost connection) as the redacted 500. A failure
+        // used to be answered 409 "claim already superseded or invalid input",
+        // from before the act's refusals had their own variant (backlog
+        // dca9ed56).
+        other => ApiError::from(other),
     })?;
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Dedup,
