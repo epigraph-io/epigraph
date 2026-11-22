@@ -518,7 +518,8 @@ impl AgentRepository {
     /// A find-hit returns the existing row UNCHANGED, whatever its kind: the
     /// application role may not update `key_kind` (migration 118), and a
     /// caller's declaration must not demote, or promote, a row someone else
-    /// registered. Re-marking an existing row is an operator task.
+    /// registered. Re-marking an existing row is an operator task; a
+    /// declaration that finds a row of another kind logs a warning naming it.
     ///
     /// # Errors
     /// As [`Self::create_or_get`].
@@ -531,6 +532,18 @@ impl AgentRepository {
             return Self::create_or_get(pool, agent).await;
         }
         if let Some(existing) = Self::get_by_public_key(pool, &agent.public_key).await? {
+            // Ignored, but never silently: an author registered before
+            // `seed-derived` existed is still a live signer, and only the
+            // operator repair (re-mark, revoke its client) closes it.
+            let kind = Self::key_kind_of_public_key(pool, &agent.public_key).await?;
+            if kind.as_deref() != Some(KEY_KIND_SEED_DERIVED) {
+                tracing::warn!(
+                    agent_id = %existing.id.as_uuid(),
+                    stored_key_kind = kind.as_deref().unwrap_or("?"),
+                    "seed-derived declaration NOT applied: the key is already registered under \
+                     another key_kind; re-marking it is an operator task (backlog 57943a39)"
+                );
+            }
             return Ok((existing, false));
         }
         let mut conn = pool.acquire().await?;
