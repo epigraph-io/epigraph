@@ -1014,3 +1014,116 @@ async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool:
         "the ids row names the head: {ids}"
     );
 }
+
+/// Whether `claim` carries an embedding.
+async fn embedded(pool: &PgPool, claim: Uuid) -> bool {
+    sqlx::query_scalar("SELECT embedding IS NOT NULL FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("claim")
+}
+
+/// Backlog 5fd3e2b4: the custodial supersede embeds the successor it
+/// committed, on the maintenance session's bypass viewer, so the revised claim
+/// stays recallable (the retirement nulled the predecessor's vector). With an
+/// embedder, the applied run's successor has an embedding and the report says
+/// so; a dry run embeds nothing (there is no successor); with no embedder
+/// configured the act still commits and reports `embedded: false`, leaving the
+/// row to the backfill.
+///
+/// Verified to fail on the base: the verb never embedded, so the applied run's
+/// successor kept `embedding IS NULL`; and with the post-commit store removed
+/// from `custodial_supersede`, `embedded` is false and the vector NULL.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodial_supersede_embeds_its_successor(pool: PgPool) {
+    use epigraph_cli::operator::custodian;
+    use epigraph_embeddings::{EmbeddingConfig, EmbeddingService, MockProvider};
+
+    let (a, _) = fixture::seed_human_operator(&pool, "embed-custodian").await;
+    let (legacy, _) = fixture::seed_agent_with_group(&pool, "embed-legacy").await;
+    let with = insert_claim(&pool, legacy, WORLD).await;
+    let without = insert_claim(&pool, legacy, WORLD).await;
+    let ia = fixture::make_custodian(&pool, a).await;
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT * FROM public.epigraph_arm_operator_binding()")
+            .execute(&mut *conn)
+            .await
+            .expect("arm");
+        (conn, ())
+    })
+    .await;
+
+    let scoped = fixture::scoped_pool(&pool).await;
+    let mut session = scoped
+        .maintenance_session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+        .await
+        .expect("a maintenance session");
+    let (conn, viewer) = session.split();
+    let mock = MockProvider::new(EmbeddingConfig::openai(1536));
+    let request = |claim: Uuid, apply: bool| custodian::SupersedeRequest {
+        claim,
+        content: format!("the custodian's revision of {claim}"),
+        truth: 0.7,
+        assignment: ia,
+        actor: a,
+        reason: "custodial embedding test".to_string(),
+        allow_owned: false,
+        act: None,
+        apply,
+    };
+    let done = |o: custodian::SupersedeOutcome| match o {
+        custodian::SupersedeOutcome::Done(r) => r,
+        other => panic!("the supersede did not complete: {other:?}"),
+    };
+
+    // A dry run: rolled back, nothing to embed.
+    let dry = done(
+        custodian::custodial_supersede(
+            &mut *conn,
+            viewer,
+            Some(&mock as &dyn EmbeddingService),
+            &request(with, false),
+        )
+        .await
+        .expect("dry run"),
+    );
+    assert!(!dry.applied && !dry.embedded, "a dry run embeds nothing");
+    assert!(current(&pool, with).await, "a dry run retires nothing");
+
+    // Applied, with an embedder: the successor is embedded.
+    let r = done(
+        custodian::custodial_supersede(
+            &mut *conn,
+            viewer,
+            Some(&mock as &dyn EmbeddingService),
+            &request(with, true),
+        )
+        .await
+        .expect("applied run"),
+    );
+    assert!(r.applied, "{r:?}");
+    assert!(!current(&pool, with).await, "the predecessor is retired");
+    assert!(
+        r.embedded,
+        "the report says the successor was embedded: {r:?}"
+    );
+    assert!(
+        embedded(&pool, r.new).await,
+        "the committed successor carries an embedding"
+    );
+
+    // Applied, with no embedder: the act stands, the successor waits for the
+    // backfill.
+    let r = done(
+        custodian::custodial_supersede(&mut *conn, viewer, None, &request(without, true))
+            .await
+            .expect("applied run without an embedder"),
+    );
+    assert!(r.applied && !r.embedded, "{r:?}");
+    assert!(!current(&pool, without).await, "the act committed");
+    assert!(
+        !embedded(&pool, r.new).await,
+        "no embedder: no vector (the control)"
+    );
+}

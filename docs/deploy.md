@@ -2249,7 +2249,10 @@ role").
      next `replay_deferred_cascades` run, as for any deferred supersede. The
      replay moves the edges onto the current head of the successor's
      supersedes chain, should the successor have been superseded since.
-   - The successor has no embedding until the next embedding backfill.
+   - Once the act commits, the successor is embedded on the same session
+     (`embedded=true` in the output) when `OPENAI_API_KEY` is set. Without
+     it, or when the provider fails, the output says `embedded=false` and the
+     successor has no embedding until the next embedding backfill.
 
 `end-role-assignment` ends an assignment. Once migration 130 is applied and
 the acting person holds a live passkey, `grant-role`, `end-role-assignment`
