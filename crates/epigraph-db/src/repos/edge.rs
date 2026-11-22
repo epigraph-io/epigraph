@@ -70,8 +70,9 @@ pub const WEAKENING_RELATIONSHIPS: &[&str] = &["contradicts", "refutes"];
 ///
 /// `edges` is bitemporal via `valid_from` / `valid_to` (migration 001), but until
 /// this predicate existed the column was decorative: exactly ONE query in the
-/// workspace filtered on it (`get_current_edges`), and 6 of 987,857 production
-/// rows carried a value. Every belief-bearing read saw retracted edges as live.
+/// workspace filtered on it (`EdgeRepository::get_current_edges`, since removed:
+/// it had no caller, and it was also the last byte-exact relationship filter,
+/// backlog 5ff9c9d9), and 6 of 987,857 production rows carried a value. Every belief-bearing read saw retracted edges as live.
 ///
 /// That absence is why `MatchCandidateRepo::retire` hard-DELETEs edges rather
 /// than retracting them — a soft retraction that nothing honours retracts
@@ -2679,60 +2680,6 @@ impl EdgeRepository {
             LIMIT $1
             "#,
             limit,
-            viewer.bypass_bind(),
-            viewer.group_bind().unwrap_or(&[]),
-        )
-        .fetch_all(executor)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|row| EdgeRow {
-                id: row.id,
-                source_id: row.source_id,
-                source_type: row.source_type,
-                target_id: row.target_id,
-                target_type: row.target_type,
-                relationship: row.relationship,
-                properties: row.properties,
-                valid_from: row.valid_from,
-                valid_to: row.valid_to,
-            })
-            .collect())
-    }
-
-    /// Get currently-valid edges for an entity with a specific relationship.
-    /// Returns edges where valid_to IS NULL (ongoing or atemporal).
-    #[instrument(skip(executor, viewer))]
-    pub async fn get_current_edges<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        entity_id: Uuid,
-        relationship: &str,
-    ) -> Result<Vec<EdgeRow>, DbError> {
-        // MACRO SITE — static bypass-bool spelling; `sqlx::query!` cannot be
-        // spliced. This is the STATIC TRANSCRIPTION of
-        // `Viewer::edge_predicate_fragment` (PR-13): the co-ownership
-        // INTERSECTION, not the plain predicate. Same arity and the SAME two
-        // binds as before — `co_owner_group_id` (migration 072) reads the group
-        // array a second time. A cross-group edge is visible only to a
-        // principal in BOTH groups; `co_owner_group_id IS NULL` is the
-        // single-owner case and short-circuits.
-        let rows = sqlx::query!(
-            r#"
-            SELECT id, source_id, source_type, target_id, target_type, relationship, properties, valid_from, valid_to
-            FROM edges
-            WHERE (source_id = $1 OR target_id = $1)
-              AND relationship = $2
-              AND valid_to IS NULL
-              AND ($3::bool OR visibility = 'public'
-                   OR (owner_group_id = ANY($4::uuid[])
-                       AND (co_owner_group_id IS NULL
-                            OR co_owner_group_id = ANY($4::uuid[]))))
-            ORDER BY valid_from DESC NULLS LAST
-            "#,
-            entity_id,
-            relationship,
             viewer.bypass_bind(),
             viewer.group_bind().unwrap_or(&[]),
         )
