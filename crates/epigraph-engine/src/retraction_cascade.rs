@@ -166,6 +166,13 @@ pub struct CascadeReport {
     /// row, whatever its key; the re-wire is skipped only for an edge where
     /// one of them sits at the key the re-wire would write (SPEC §11 K4a
     /// item 8), so those skips are a subset of this count.
+    ///
+    /// Both walks count: the re-wire walk over every edge it enumerates, and
+    /// the stayed-edge arm (K10(2), and the retroactive sweep) over every edge
+    /// it visits. The stayed-edge selection names LIVE rows only, so a stayed
+    /// edge holding nothing but retracted rows is never visited and is not
+    /// counted here (the dry-run delta's `K10RetroReport::retracted_key_kept`
+    /// is the wider count that includes it).
     pub retracted_key_kept: u64,
 }
 
@@ -651,10 +658,12 @@ async fn invalidate_and_rewire(
 ///
 /// Per edge, like [`invalidate_and_rewire`]: one savepoint, the delete
 /// ([`MassFunctionRepository::delete_for_perspective`], whose privileged arm
-/// keeps retracted rows once K4a lands; the selection already names live
-/// rows only), and a repair probe of every holder before the savepoint
-/// commits, so a holder this connection cannot write keeps both its BBA and a
-/// belief consistent with it, and is reported.
+/// keeps retracted rows; the selection already names live rows only), the
+/// count of the retracted rows left on the edge (added to
+/// [`CascadeReport::retracted_key_kept`] once the edge's savepoint commits),
+/// and a repair probe of every holder before the savepoint commits, so a
+/// holder this connection cannot write keeps both its BBA and a belief
+/// consistent with it, and is reported.
 ///
 /// Returns the newly queued holders (deduplicated against `visited`).
 ///
@@ -716,8 +725,27 @@ async fn invalidate_only(
                 continue;
             }
         };
+        // The retracted rows the delete left on this edge, counted as
+        // `invalidate_and_rewire` counts them (backlog 7c1bdeec (1)): kept for
+        // audit, never deleted, and reported in `retracted_key_kept`.
+        let kept = match MassFunctionRepository::count_retracted_for_perspective(
+            &mut *sp, viewer, *edge_id,
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                report.note_error(
+                    &format!("count retracted BBAs for stayed edge {edge_id}"),
+                    e,
+                );
+                let _ = sp.rollback().await;
+                continue;
+            }
+        };
         if deleted == 0 {
             let _ = sp.rollback().await;
+            report.retracted_key_kept += kept;
             continue;
         }
         for holder in holders {
@@ -738,6 +766,7 @@ async fn invalidate_only(
             continue;
         }
         report.invalidated_bbas += deleted;
+        report.retracted_key_kept += kept;
         if let InertDelete::ExactRows(out) = &mut delete {
             out.extend(images);
         }
