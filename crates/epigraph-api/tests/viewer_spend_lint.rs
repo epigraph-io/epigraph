@@ -1176,6 +1176,28 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query_scalar(SELECT).fetch_one",
         ],
     ),
+    // agents are untenanted: the binding read is migration 149's SECURITY
+    // DEFINER `epigraph_human_of`, which answers on authority (a live binding),
+    // not on what the viewer may read. Run on the caller's stamped connection
+    // (backlog 1dea9589).
+    (
+        "spans.rs",
+        "attributed_agent",
+        &["AgentRepository::speaks_for"],
+    ),
+    // stamped / write (backlog 1dea9589): the span (`agent_spans` has no
+    // tenancy columns) and a root span's best-effort `attributed_to` edge run
+    // on ONE `AppState::write_as` transaction, so the edge records the
+    // caller's writer group. The attributed agent is the caller or one it
+    // speaks for (`attributed_agent`).
+    (
+        "spans.rs",
+        "create_span",
+        &[
+            "SpanRepository::insert",
+            "belief::create_edge_under_savepoint",
+        ],
+    ),
     // no SQL: `validate_packet` runs no tenancy read. `propagate_from` left
     // this list with the in-memory orchestrator registration it ran on
     // (backlog 7b3722b5).

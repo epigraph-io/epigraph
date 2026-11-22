@@ -435,12 +435,6 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-api/src/routes/spans.rs",
-        "create_span",
-        1,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/spans.rs",
         "close_span",
         2,
         Signed,

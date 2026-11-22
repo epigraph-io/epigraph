@@ -3313,6 +3313,15 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "UPDATE claims SET theme_id. A WRITE governed by claims_tenancy's WITH CHECK against the \
          connection's stamp; widened so the assignment and the theme row commit together.",
     ),
+    (
+        "span.rs",
+        "insert",
+        "INSERT INTO `agent_spans` (no visibility or owner_group_id column, so there is no \
+         in-query viewer predicate to splice). Widened so `POST /api/v1/spans` writes the span \
+         and its `agent -attributed_to-> span` edge on ONE transaction stamped with the caller's \
+         viewer (backlog 1dea9589): the edge's writer group is the caller's, and the span is \
+         written on the authority that wrote its edge. SCOPE: executor only; the SQL is unchanged.",
+    ),
     // ── THE THREE WRITES. Every other entry in this register is a READ with
     // nothing to filter; these are the first writes, and the argument is a
     // different one, so it is stated in full rather than borrowed.

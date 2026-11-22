@@ -104,7 +104,10 @@ const REGISTER: &[(&str, usize)] = &[
     ("gaps.rs", 1),
     ("perspective.rs", 1),
     ("reasoning.rs", 3),
-    ("spans.rs", 3),
+    // 3 -> 2 (backlog 1dea9589): `create_span`'s `let _ =` attributed_to edge
+    // moved onto the caller-stamped transaction, best-effort through a
+    // savepoint. `close_span`'s two remain.
+    ("spans.rs", 2),
     // The two `events` INSERTs after `store_workflow` and `deprecate_workflow`
     // commit. `events` has no row security; best-effort by design.
     ("workflows.rs", 2),

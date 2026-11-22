@@ -48,7 +48,6 @@
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
-//! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
 //! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
@@ -161,7 +160,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
     ("perspective.rs", 1),
-    ("spans.rs", 3),
+    // 3 -> 2 (backlog 1dea9589): `create_span`'s attributed_to edge is written
+    // on the caller's stamped transaction. `close_span`'s two remain.
+    ("spans.rs", 2),
 ];
 
 /// The total the register may never exceed. 28 before U012 (`cross_source.rs`
@@ -183,7 +184,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// `evidence -> claim` `supports` edges, written inside
 /// `EvidenceRepository::create`, are stamped by the same change; this scanner
 /// never counted them.
-const HIGH_WATER: usize = 24;
+/// 24 -> 23 (backlog 1dea9589): `create_span`'s `attributed_to` edge is
+/// written on the caller's stamped transaction (`spans.rs` 3 -> 2).
+const HIGH_WATER: usize = 23;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

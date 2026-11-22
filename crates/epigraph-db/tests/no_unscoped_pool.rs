@@ -820,7 +820,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// provenance append stays on the pool. `learn_convention`'s evidence moved
 /// onto a stamped transaction too, but its `pool` alias still serves the
 /// system-authored claim, so `routes/conventions.rs` keeps its count.
-const HIGH_WATER: usize = 184;
+/// 184 -> 182 (backlog 1dea9589): `create_span` writes the span and its
+/// `attributed_to` edge on the caller's `AppState::write_as` transaction
+/// (`routes/spans.rs` 6 -> 4; `close_span` and `list_spans` keep theirs).
+const HIGH_WATER: usize = 182;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1180,7 +1183,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // rather than repo calls; both kept their SQL where it was and changed only
     // the executor, so `viewer_route_table_lint.rs::UNCOMPENSATED_INLINE_READS`
     // still records `("search.rs", 1)` and must not be lowered.
-    ("routes/spans.rs", 6),
+    // 6 -> 4 (backlog 1dea9589): `create_span`'s span INSERT and its
+    // `attributed_to` edge run on the caller's `AppState::write_as`
+    // transaction. `close_span` (3) and `list_spans` (1) remain.
+    ("routes/spans.rs", 4),
     // `routes/structural.rs` was 1 and is GONE, not zeroed: conversion shard 5
     // moved `get_structural_features`'s single alias -- which fanned into NINE
     // sequential `StructuralRepository` round-trips -- onto `AppState::read_as`.
