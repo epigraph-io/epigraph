@@ -29,7 +29,10 @@ pub use did_key::{
     did_key_for_llm_agent, keypair_from_llm_agent, keypair_from_llm_agent_keyed,
     keypair_from_llm_agent_prehashed, DidKey,
 };
-pub use domain::{signing_message, SignatureScheme, SignedEntity, SIGNING_DOMAIN_V1};
+pub use domain::{
+    key_kind_declaration_message, signing_message, SignatureScheme, SignedEntity,
+    KEY_KIND_DECLARATION_V1, SIGNING_DOMAIN_V1,
+};
 pub use encryption::{decrypt, encrypt, EncryptedPayload};
 pub use epoch::derive_epoch_key;
 pub use errors::CryptoError;

@@ -96,6 +96,14 @@ pub struct CreateAgentRequest {
     /// no OAuth client. Declaring it on an existing key changes nothing.
     #[serde(default)]
     pub key_kind: Option<String>,
+    /// Required with `key_kind: "seed-derived"`: the hex Ed25519 signature,
+    /// under `public_key`, of
+    /// `epigraph_crypto::key_kind_declaration_message("seed-derived", key)`.
+    /// The declaration is permanent, so the caller must prove it holds the
+    /// key: otherwise anyone with `agents:write` could declare another
+    /// party's not yet registered key and lock its holder out.
+    #[serde(default)]
+    pub key_kind_proof: Option<String>,
 }
 
 /// Agent response structure
@@ -179,6 +187,37 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
 #[cfg(feature = "db")]
 const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES;
 
+/// Refuse a `key_kind` declaration whose proof of possession is missing or
+/// does not verify under `public_key` (backlog 57943a39). See
+/// [`CreateAgentRequest::key_kind_proof`].
+#[cfg(feature = "db")]
+fn check_key_kind_proof(
+    public_key: &[u8; 32],
+    kind: &str,
+    proof_hex: Option<&str>,
+) -> Result<(), ApiError> {
+    let refuse = |reason: &str| ApiError::ValidationError {
+        field: "key_kind_proof".to_string(),
+        reason: format!(
+            "{reason}: declaring key_kind {kind:?} requires the hex Ed25519 signature, under \
+             public_key, of key_kind_declaration_message({kind:?}, public_key)"
+        ),
+    };
+    let Some(proof_hex) = proof_hex else {
+        return Err(refuse("missing proof of possession"));
+    };
+    let proof: [u8; 64] = hex::decode(proof_hex)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| refuse("the proof is not a hex-encoded 64-byte signature"))?;
+    let message = epigraph_crypto::key_kind_declaration_message(kind, public_key);
+    if epigraph_crypto::SignatureVerifier::verify(public_key, &message, &proof).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(refuse("the proof does not verify under public_key"))
+    }
+}
+
 /// Create a new agent
 ///
 /// POST /agents
@@ -228,6 +267,14 @@ pub async fn create_agent(
             });
         }
     };
+
+    if seed_derived {
+        check_key_kind_proof(
+            &public_key,
+            epigraph_db::KEY_KIND_SEED_DERIVED,
+            request.key_kind_proof.as_deref(),
+        )?;
+    }
 
     let mut agent = Agent::new(public_key, request.display_name);
     if let Some(labels) = request.labels {

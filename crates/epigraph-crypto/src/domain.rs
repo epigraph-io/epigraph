@@ -104,6 +104,33 @@ pub fn signing_message(kind: SignedEntity, digest: &[u8; HASH_SIZE]) -> Vec<u8> 
     message
 }
 
+/// Prefix of a key-kind declaration's proof of possession (backlog
+/// 57943a39). Distinct from [`SIGNING_DOMAIN_V1`] (neither is a prefix of the
+/// other) and longer than a bare digest, so a declaration proof never verifies
+/// as a v1 or legacy entity signature, and no entity signature verifies as a
+/// declaration proof.
+pub const KEY_KIND_DECLARATION_V1: &[u8] = b"epigraph-key-kind-v1:";
+
+/// The message whose signature under `public_key` proves that the caller of
+/// `POST /api/v1/agents` holds the private half of the key it declares as
+/// `kind` (`seed-derived`): `b"epigraph-key-kind-v1:<kind>:" || public_key`.
+///
+/// Declaring a key `seed-derived` makes it a non-verifier for good (the
+/// application role cannot rewrite `key_kind`), so without a proof anyone
+/// holding `agents:write` could declare SOMEONE ELSE'S not yet registered key
+/// and lock its holder out. Whoever really derived the key from its seed can
+/// always sign this; a squatter cannot for a key they do not hold.
+#[must_use]
+pub fn key_kind_declaration_message(kind: &str, public_key: &[u8; 32]) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(KEY_KIND_DECLARATION_V1.len() + kind.len() + 1 + public_key.len());
+    message.extend_from_slice(KEY_KIND_DECLARATION_V1);
+    message.extend_from_slice(kind.as_bytes());
+    message.push(b':');
+    message.extend_from_slice(public_key);
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +276,33 @@ mod tests {
             serde_json::json!("v1")
         );
         assert_eq!(SignatureScheme::V1.as_str(), "v1");
+    }
+
+    /// A key-kind declaration proof is its own domain: it is not an entity
+    /// signature under either rung, and an entity signature is not a proof.
+    #[test]
+    fn a_key_kind_declaration_proof_is_no_entity_signature() {
+        let s = signer();
+        let key = s.public_key();
+        let message = key_kind_declaration_message("seed-derived", &key);
+        assert!(!message.starts_with(SIGNING_DOMAIN_V1));
+        assert!(!SIGNING_DOMAIN_V1.starts_with(KEY_KIND_DECLARATION_V1));
+        assert_ne!(message.len(), HASH_SIZE, "would collide with a legacy bare digest");
+        let proof = s.sign(&message);
+        assert!(SignatureVerifier::verify(&key, &message, &proof).unwrap());
+
+        // The proof over the declaration, read as a claim signature over the
+        // key bytes taken as a digest: neither rung verifies.
+        for kind in [SignedEntity::Claim, SignedEntity::Edge, SignedEntity::Evidence] {
+            assert!(
+                SignatureVerifier::verify_entity(&key, kind, &key, &proof)
+                    .unwrap()
+                    .is_none(),
+                "{kind:?}"
+            );
+        }
+        // And a v1 claim signature over the key bytes is no proof.
+        let claim_sig = s.sign_entity(SignedEntity::Claim, &key);
+        assert!(!SignatureVerifier::verify(&key, &message, &claim_sig).unwrap());
     }
 }

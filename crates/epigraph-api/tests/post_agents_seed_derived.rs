@@ -97,13 +97,38 @@ async fn stored(pool: &PgPool, key_hex: &str) -> (String, i64) {
     (kind, clients)
 }
 
+fn signing_key_of(seed: &str) -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(blake3::hash(seed.as_bytes()).as_bytes())
+}
+
 fn key_of(seed: &str) -> String {
-    let secret = blake3::hash(seed.as_bytes());
+    hex::encode(signing_key_of(seed).verifying_key().to_bytes())
+}
+
+/// The proof of possession for declaring `public_key` seed-derived, signed by
+/// `signer` (the key's holder, or, to forge, someone else).
+fn proof_by(signer: &ed25519_dalek::SigningKey, public_key_hex: &str) -> String {
+    use ed25519_dalek::Signer;
+    let key: [u8; 32] = hex::decode(public_key_hex).unwrap().try_into().unwrap();
     hex::encode(
-        ed25519_dalek::SigningKey::from_bytes(secret.as_bytes())
-            .verifying_key()
+        signer
+            .sign(&epigraph_crypto::key_kind_declaration_message(
+                "seed-derived",
+                &key,
+            ))
             .to_bytes(),
     )
+}
+
+/// The declaration body for the author key of `seed`, with its valid proof.
+fn declared(seed: &str, display_name: &str) -> serde_json::Value {
+    let key = key_of(seed);
+    serde_json::json!({
+        "public_key": key,
+        "display_name": display_name,
+        "key_kind": "seed-derived",
+        "key_kind_proof": proof_by(&signing_key_of(seed), &key),
+    })
 }
 
 /// The declared author key is stored `seed-derived` with no OAuth client.
@@ -113,15 +138,9 @@ fn key_of(seed: &str) -> String {
 async fn a_declared_seed_derived_key_is_no_signer_and_gets_no_client(pool: PgPool) {
     let auth = caller(&pool).await;
 
-    let author = key_of("10.0000/example.0001:Ada Example");
-    let (status, body) = post(
-        &pool,
-        &auth,
-        serde_json::json!({
-            "public_key": author, "display_name": "Ada Example", "key_kind": "seed-derived"
-        }),
-    )
-    .await;
+    let seed = "10.0000/example.0001:Ada Example";
+    let author = key_of(seed);
+    let (status, body) = post(&pool, &auth, declared(seed, "Ada Example")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         stored(&pool, &author).await,
@@ -157,7 +176,8 @@ async fn a_key_kind_declaration_is_checked_and_never_rewrites_a_row(pool: PgPool
         .fetch_one(&pool)
         .await
         .unwrap();
-    let key = key_of("10.0000/example.0002:Bo Example");
+    let seed = "10.0000/example.0002:Bo Example";
+    let key = key_of(seed);
     for bad in ["derived", "Seed-Derived", ""] {
         let (status, body) = post(
             &pool,
@@ -178,12 +198,7 @@ async fn a_key_kind_declaration_is_checked_and_never_rewrites_a_row(pool: PgPool
     // declared: the find-hit returns the row as it is.
     let (status, _) = post(&pool, &auth, serde_json::json!({ "public_key": key })).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, body) = post(
-        &pool,
-        &auth,
-        serde_json::json!({ "public_key": key, "key_kind": "seed-derived" }),
-    )
-    .await;
+    let (status, body) = post(&pool, &auth, declared(seed, "Bo Example")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(stored(&pool, &key).await, ("ed25519".to_string(), 1));
 }
@@ -198,18 +213,69 @@ async fn a_seed_derived_declaration_is_stored_on_the_application_role(pool: PgPo
     let auth = caller(&pool).await;
     let app_pool = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
     let state = AppState::with_db(app_pool, ApiConfig::default());
-    let author = key_of("10.0000/example.0003:Cy Example");
-    let (status, body) = post_on(
-        state,
-        &auth,
-        serde_json::json!({
-            "public_key": author, "display_name": "Cy Example", "key_kind": "seed-derived"
-        }),
-    )
-    .await;
+    let seed = "10.0000/example.0003:Cy Example";
+    let author = key_of(seed);
+    let (status, body) = post_on(state, &auth, declared(seed, "Cy Example")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         stored(&pool, &author).await,
         ("seed-derived".to_string(), 0)
     );
+}
+
+/// The declaration is permanent (the application role cannot rewrite
+/// `key_kind`), so it needs a proof of possession: without one, any
+/// `agents:write` caller could declare another party's not yet registered key
+/// (an `/oauth/register` agent client's key has no agents row) and lock its
+/// holder out of every verifier for good. A missing, malformed or wrong-key
+/// proof is refused (400, `key_kind_proof`) before any insert; the holder's
+/// own proof is accepted for the same key afterwards, so the refusals are a
+/// function of the proof.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_declaration_needs_the_keys_own_proof(pool: PgPool) {
+    let auth = caller(&pool).await;
+    // A victim's random key, and a squatter who does not hold it.
+    let victim = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let squatter = ed25519_dalek::SigningKey::from_bytes(&rand::random());
+    let key = hex::encode(victim.verifying_key().to_bytes());
+
+    for (label, proof) in [
+        ("missing", serde_json::Value::Null),
+        ("malformed", serde_json::Value::from("not-hex")),
+        ("short", serde_json::Value::from("00".repeat(63))),
+        ("squatter's", serde_json::Value::from(proof_by(&squatter, &key))),
+    ] {
+        let (status, body) = post(
+            &pool,
+            &auth,
+            serde_json::json!({
+                "public_key": key, "key_kind": "seed-derived", "key_kind_proof": proof
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} proof: {body}");
+        assert!(
+            body.to_string().contains("key_kind_proof"),
+            "{label} proof: {body}"
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM agents WHERE public_key = decode($1, 'hex')")
+                .bind(&key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "a {label} proof registered the key");
+    }
+
+    let (status, body) = post(
+        &pool,
+        &auth,
+        serde_json::json!({
+            "public_key": key, "key_kind": "seed-derived",
+            "key_kind_proof": proof_by(&victim, &key)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the holder's own proof: {body}");
+    assert_eq!(stored(&pool, &key).await, ("seed-derived".to_string(), 0));
 }
