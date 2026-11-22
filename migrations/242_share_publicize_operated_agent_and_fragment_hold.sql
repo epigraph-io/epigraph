@@ -48,9 +48,10 @@
 --
 -- WHAT IT IS NOT. It is not R1's whole human gate (`refused_not_human`, every
 -- caller must satisfy `epigraph_is_human_operator`): an agent that belongs to
--- no human (no link, no allowance), including a role-attached agent (166), is
--- still judged by its own memberships, and a human's delegated run token is a
--- transport question. Those wait on the spec's phase P1.
+-- no human (no operator link, no client allowance; for example a
+-- role-attached agent, 166, that has neither) is still judged by its own
+-- memberships, and a human's delegated run token is a transport question.
+-- Those wait on the spec's phase P1.
 --
 -- ===================================================================
 -- 2. A FRAGMENT A CLAIM THAT STAYS ALSO CITES IS HELD (fc33ef1a)

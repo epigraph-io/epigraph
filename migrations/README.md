@@ -3412,7 +3412,8 @@ restart.
   (403 / INVALID_REQUEST), whatever memberships it holds itself; before, an operated agent that
   was itself a writer of the target team (share) or an admin of the owning team (publicize)
   acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole
-  human gate: an agent that belongs to no human is still judged by its own memberships.
+  human gate: an agent with no operator link and no client allowance (for example a
+  role-attached agent that has neither) is still judged by its own memberships.
   (2) A harvester fragment that a moved claim cites and a claim outside the call also cites is
   held on its pair (its audit reports with it, 173), counted in the audit row as
   `harvester_fragments_held`; 215's source rule then runs on the post-hold fragments. 218's
@@ -3423,12 +3424,24 @@ restart.
   `epigraph-db/tests/share_publicize_operated_fragment_undo.rs` (the undo, run twice; the md5
   precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
   was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a
-  binary without the new refusal text answers the generic "refused". Before migrating,
-  measure how many recorded acts were an operated agent's own (they will now be refused):
-  `SELECT event_type, count(*) FROM security_events s WHERE event_type IN
-  ('claim.shared_with_team', 'claim.publicized') AND public.epigraph_human_of(s.agent_id,
-  false) IS DISTINCT FROM s.agent_id AND public.epigraph_human_of(s.agent_id, false) IS NOT
-  NULL GROUP BY 1`. **Applied to throwaway databases only, NOT to any deployed database.**
+  binary without the new refusal text answers the generic "refused". Operated agents that
+  share or publicize today start being refused. Before migrating, measure (plain tables, no
+  definer; link and membership state is read NOW, not as of each act; the client-allowance
+  arm is not counted): shares by an agent with a live operator link that is itself a member
+  of the target team, `SELECT count(*) FROM security_events s WHERE s.event_type =
+  'claim.shared_with_team' AND EXISTS (SELECT 1 FROM operator_links l WHERE l.agent_id =
+  s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM group_memberships m WHERE
+  m.agent_id = s.agent_id AND m.group_id = (s.details->>'to_group_id')::uuid AND m.revoked_at
+  IS NULL)`; publicizes by such an agent that is itself an admin of an owning group,
+  `SELECT count(*) FROM security_events s WHERE s.event_type = 'claim.publicized' AND EXISTS
+  (SELECT 1 FROM operator_links l WHERE l.agent_id = s.agent_id AND NOT l.retired) AND EXISTS
+  (SELECT 1 FROM group_memberships m JOIN jsonb_array_elements_text(s.details->
+  'owner_group_ids') g(id) ON m.group_id = g.id::uuid WHERE m.agent_id = s.agent_id AND
+  m.role = 'admin' AND m.revoked_at IS NULL)`; and every act 242 would now refuse, `SELECT
+  s.event_type, count(*) FROM security_events s WHERE s.event_type IN
+  ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM operator_links l
+  WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway databases only, NOT to
+  any deployed database.**
 
 ## `-- no-transaction` migrations
 
