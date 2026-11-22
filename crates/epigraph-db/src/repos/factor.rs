@@ -483,7 +483,7 @@ impl FactorRepository {
         if rows.len() > cap {
             return Ok(BpScopeLoad::OverCap { cap });
         }
-        rows.sort_by(|a, b| (a.created_at, a.id).cmp(&(b.created_at, b.id)));
+        rows.sort_by_key(|r| (r.created_at, r.id));
         Ok(BpScopeLoad::Loaded(rows))
     }
 
