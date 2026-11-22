@@ -129,7 +129,12 @@
 //! # What this cannot restore
 //!
 //! `claims.updated_at` (migration 001's unconditional trigger), as for a
-//! re-own.
+//! re-own. It is OUTSIDE the reversal contract: stamped `now()` on the apply
+//! and again on the reverse, never recorded in the manifest, never restored.
+//! Restoring it would need the trigger disabled around the claims UPDATE (an
+//! `ACCESS EXCLUSIVE` lock on `claims`) or a migration teaching the trigger to
+//! skip tenancy-only updates; this tool does neither (docs/deploy.md, the
+//! `restrict-claims` section).
 
 use super::manifest::{self, Record, Sink, Writer};
 use super::reown::{counter_delta, counter_violations, BatchError};

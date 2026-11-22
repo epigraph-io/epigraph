@@ -2570,8 +2570,15 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   the move; it can no longer commit public on a restricted claim. Every write
   to those tables on the instance waits for the batch; keep `--batch-size`
   small on a busy instance.
-- **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
-  on reverse.
+- **Not covered (outside the reversal contract)**: `claims.updated_at`. Its
+  trigger (migration 001, unconditional `BEFORE UPDATE`) stamps `now()` on the
+  apply and again on the reverse, so a reversal does not restore it, and both
+  acts look like content updates to a reader that sorts or filters on it. The
+  manifest does not record it and `reown-reverse` does not claim to restore
+  it. Putting it back would need the trigger disabled around the claims
+  UPDATE (an `ACCESS EXCLUSIVE` lock on `claims`) or a migration that makes
+  the trigger skip tenancy-only updates; neither is part of this tool. Read
+  `updated_at` as "last written", not "last edited", on restricted claims.
 
 ### `epigraph-operator regroup-claims` — move group-private claims between groups (no migration)
 
