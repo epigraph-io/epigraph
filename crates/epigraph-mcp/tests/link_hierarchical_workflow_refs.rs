@@ -630,8 +630,9 @@ async fn plan_claim_at_level(pool: &PgPool, workflow: Uuid, level: &str) -> (Uui
 /// lineage), even one the caller wrote. Plan readers and the outcome reports
 /// take every level-2 `executes` target as a step, and `evolve_step` and a
 /// step-claim `invokes` gate on the workflows executing a step's lineage, so
-/// an ordinary claim (or a level-2 document paragraph, which has no step
-/// lineage) is not a step to adopt. Refused with nothing written.
+/// an ordinary claim, a level-2 document paragraph (no step lineage) or a
+/// level-3 operation (a step lineage, but not level 2) is not a step to
+/// adopt. Refused with nothing written.
 ///
 /// CONTROLS: the caller's own step of another plan is still admitted, and the
 /// in-lineage repair still restores a dropped edge to a NON-step plan claim
@@ -650,9 +651,21 @@ async fn executes_refuses_an_own_claim_that_is_not_a_step(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("a level-2 claim with no step lineage");
+    // A level-3 operation of another plan: the ingest executor gives level-3
+    // plan claims a step lineage too, so only the LEVEL tells it from a step.
+    let operation = fixture::seed_public_claim(&pool, me, "my own level-3 operation").await;
+    sqlx::query(
+        "UPDATE claims SET properties = '{\"level\": 3}'::jsonb, \
+                step_lineage_id = gen_random_uuid() WHERE id = $1",
+    )
+    .bind(operation)
+    .execute(&pool)
+    .await
+    .expect("a level-3 claim with a step lineage");
     for (what, target) in [
         ("an ordinary claim", plain),
         ("a level-2 paragraph", paragraph),
+        ("a level-3 operation", operation),
     ] {
         let err = do_link_hierarchical(
             &server,

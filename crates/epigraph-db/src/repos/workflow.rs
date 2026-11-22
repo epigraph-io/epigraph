@@ -715,9 +715,13 @@ impl WorkflowRepository {
     /// the plan-order readers apply to `executes` targets) that carries a
     /// `step_lineage_id`. Only the workflow writers set that column (the
     /// ingest executor for level-2 and level-3 plan claims, `add_step`,
-    /// `evolve_step`); no generic claim writer takes it from a caller, so it is
-    /// what tells a step from a level-2 document paragraph or a claim whose
-    /// `properties.level` a caller set.
+    /// `evolve_step`), so it tells a step from a level-2 document paragraph or
+    /// a claim whose `properties.level` a caller set. It checks SHAPE, not
+    /// provenance: `evolve_step` (`revises`, level 2) on a caller's own claim
+    /// that no workflow executes needs no workflow authority and back-fills a
+    /// lineage onto it, so a caller can make its own claim step-shaped. That
+    /// grants nothing new: the `executes` adopter already needs authority over
+    /// the workflow and could write the same step with `add_step`.
     ///
     /// Exists for MCP `link_hierarchical`'s `executes` gate (backlog
     /// 298317a7): outside the plan's own lineage it adopts only a step-shaped
