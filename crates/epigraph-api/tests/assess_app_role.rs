@@ -18,6 +18,9 @@
 //! * An agent that assessed while bound to no human, then was linked to one,
 //!   leaves that human ONE assessment when it assesses again (backlog
 //!   840bc5ed): its own pre-link row is retracted (audited) and reported.
+//! * A member who may only READ a group-private claim is answered 403 with
+//!   nothing written, not the opaque 500 the row-security refusal used to
+//!   surface as.
 //!
 //! Expected cache values are sentinels no fold produces.
 #![cfg(feature = "db")]
@@ -172,6 +175,13 @@ async fn assess(addr: SocketAddr, agent: Uuid, claim: Uuid) -> Value {
 
 /// POST an assessment of `claim` with bearer `token`; insist on 200.
 async fn assess_with(addr: SocketAddr, token: &str, claim: Uuid) -> Value {
+    let (status, text) = assess_status(addr, token, claim).await;
+    assert_eq!(status, 200, "POST assess must be 200: {text}");
+    serde_json::from_str(&text).expect("json body")
+}
+
+/// POST an assessment of `claim` with bearer `token`; the status and body.
+async fn assess_status(addr: SocketAddr, token: &str, claim: Uuid) -> (u16, String) {
     let resp = reqwest::Client::new()
         .post(format!("http://{addr}/api/v1/claims/{claim}/assess"))
         .bearer_auth(token)
@@ -184,10 +194,9 @@ async fn assess_with(addr: SocketAddr, token: &str, claim: Uuid) -> Value {
         .send()
         .await
         .expect("request");
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let text = resp.text().await.expect("body");
-    assert_eq!(status, 200, "POST assess must be 200: {text}");
-    serde_json::from_str(&text).expect("json body")
+    (status, text)
 }
 
 /// Live assessment rows on (claim, canonical frame), by source agent.
@@ -379,3 +388,45 @@ async fn a_linked_agent_retires_its_pre_link_assessment(pool: PgPool) {
     assert_eq!(replaced[0]["retired"], serde_json::json!(false), "{again}");
     assert_eq!(rows(&pool, target).await, vec![Some(human)]);
 }
+
+/// A member who may only READ a group-private claim's group can see the claim
+/// but not write its assessment: row security refuses the slot row (its owner
+/// is the claim's group), and the call answers 403 with nothing written, not
+/// the opaque 500 DatabaseError that refusal surfaced as (backlog 74feb76b's
+/// error class). CALIBRATION: the same caller assesses a public claim of the
+/// same group with 200, so the refusal is the group-private write, not the
+/// caller or the route.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_read_only_member_is_refused_a_group_claims_assessment(pool: PgPool) {
+    let (reader, _mine) = fixture::seed_agent_with_group(&pool, "74feb76b-r-reader").await;
+    let (owner, theirs) = fixture::seed_agent_with_group(&pool, "74feb76b-r-owner").await;
+    let private = claim(&pool, owner, theirs, "group", "group-private").await;
+    let public = claim(&pool, owner, theirs, "public", "public calibration").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(theirs)
+    .bind(reader)
+    .execute(&pool)
+    .await
+    .expect("seed the read-only membership");
+    let (addr, _shutdown) = spawn_app(&pool).await;
+    let token = common::mint_token_with_agent(&["claims:write"], reader);
+
+    let ok = assess_with(addr, &token, public).await;
+    assert_eq!(rows(&pool, public).await, vec![Some(reader)], "{ok}");
+
+    let (status, text) = assess_status(addr, &token, private).await;
+    assert_eq!(
+        status, 403,
+        "a refused assessment write must answer 403, not 500: {text}"
+    );
+    assert!(
+        text.contains("nothing was written"),
+        "the body says nothing was written: {text}"
+    );
+    assert!(rows(&pool, private).await.is_empty(), "{text}");
+    assert_eq!(assessed_events(&pool, private).await, 0, "{text}");
+}
+

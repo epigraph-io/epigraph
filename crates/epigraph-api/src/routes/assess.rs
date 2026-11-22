@@ -483,7 +483,21 @@ pub async fn assess_claim(
         "unknown", // assess endpoint lacks the source/target paper context (issue #197)
         None,      // assess endpoint has no evidence row in scope (issue #197 Phase 3)
     )
-    .await?;
+    .await
+    // Row security refuses the slot row (42501) when its stamped owner is a
+    // group the caller cannot write: a non-public claim's row belongs to the
+    // claim's group, so a member who may only READ that group is refused
+    // here. The transaction is aborted and nothing commits, so answer 403
+    // rather than an opaque 500. Mapped at the write rather than checked up
+    // front: on a public claim the row is the writer's own, so a check of the
+    // claim's group would refuse a legitimate cross-group assessment.
+    .map_err(|e| {
+        if crate::errors::db_is_insufficient_privilege(&e) {
+            crate::errors::write_refused("claim's assessment")
+        } else {
+            ApiError::from(e)
+        }
+    })?;
     // The durable record of who wrote this assessment, and whether it replaced
     // and contested the owner's earlier one (backlog 4a7f90f8): in the
     // assessment's transaction, so it commits exactly when the write does, and strict (a
