@@ -3230,6 +3230,21 @@ async fn start_revoke(
     i32,
     tokio::task::JoinHandle<Result<Vec<(Uuid, i32, bool)>, sqlx::Error>>,
 ) {
+    start_revoke_with(pool, isolation, None, passkey, reason).await
+}
+
+/// `start_revoke`, with `epigraph.compromised_revoke_max_passes` set to
+/// `max_passes` for the revoke's transaction only (`SET LOCAL`) when given.
+async fn start_revoke_with(
+    pool: &PgPool,
+    isolation: &'static str,
+    max_passes: Option<&'static str>,
+    passkey: Uuid,
+    reason: &'static str,
+) -> (
+    i32,
+    tokio::task::JoinHandle<Result<Vec<(Uuid, i32, bool)>, sqlx::Error>>,
+) {
     use sqlx::Executor;
     let mut m = pool.acquire().await.expect("acquire");
     m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
@@ -3240,6 +3255,15 @@ async fn start_revoke(
         m.execute(format!("BEGIN ISOLATION LEVEL {isolation}").as_str())
             .await
             .expect("begin");
+        if let Some(cap) = max_passes {
+            sqlx::query(
+                "SELECT pg_catalog.set_config('epigraph.compromised_revoke_max_passes', $1, true)",
+            )
+            .bind(cap)
+            .execute(&mut *m)
+            .await
+            .expect("the pass cap, for this transaction");
+        }
         let r = sqlx::query_as(
             "SELECT revoked_id, lineage_depth, revoked_now \
                FROM public.epigraph_revoke_passkey_compromised($1, $2)",
@@ -3635,6 +3659,177 @@ async fn the_compromised_revoke_locks_and_walks_until_no_walked_passkey_is_unloc
     );
 }
 
+// =====================================================================
+// 266: THE COMPROMISED REVOKE'S PASS CAP, LOWERED FOR ONE TRANSACTION
+// =====================================================================
+
+/// The compromised revoke's safety exit: when a walk reaches a passkey its
+/// locks do not hold and the pass cap is spent, it refuses `40001` and
+/// revokes nothing (no passkey revoked, no `platform.passkey_revoked` audit
+/// row), to be run again. 214's cap is 32 passes, which no deterministic
+/// arrangement reaches; 266 lets a transaction LOWER it with
+/// `epigraph.compromised_revoke_max_passes`, which this test sets to 1 and 2
+/// on fresh fixtures each.
+///
+/// Arranged deterministically: C share-locks the phone and its backup, so
+/// the first pass's lock waits. Meanwhile N enrolls (attested) on an act the
+/// backup confirmed and commits; C commits. The first walk, a later
+/// statement than the first lock, reaches N, which that lock does not hold:
+/// the first pass does not end the loop. With the cap at 1 the revoke is
+/// refused there (`40001`, "(1 passes)"), and the phone, the backup and N
+/// stay live, unaudited. With the cap at 2 the second pass locks N (nothing
+/// holds it), walks the same three, ends the loop and revokes all three:
+/// the cap bites exactly when it is spent, not a pass early. Verified to
+/// fail without 266 (the setting is ignored, so the cap-1 revoke runs a
+/// second pass and revokes all three), and with the cap check removed, its
+/// `RAISE` replaced by `EXIT`, or its `>=` turned into `>`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compromised_revoke_refuses_40001_once_its_pass_cap_is_spent(pool: PgPool) {
+    use sqlx::Executor;
+    for (round, cap) in ["1", "2"].into_iter().enumerate() {
+        let base = 10 * (u8::try_from(round).unwrap() + 1);
+        let p = elevated_custodian(&pool, &format!("phone owner {round}"), base).await;
+        let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+        let backup = try_complete(&pool, e_backup, base + 1, "packed")
+            .await
+            .unwrap();
+        let via_backup = Elevated {
+            passkey: backup,
+            cred: credential(base + 1),
+            ..p.clone()
+        };
+        let (_, e_n) = anchored_enrollment(&pool, &via_backup).await;
+
+        // C: a share lock on every passkey the person holds now.
+        let mut c = pool.acquire().await.unwrap();
+        let c_pid = backend_pid(&mut c).await;
+        c.execute("BEGIN").await.unwrap();
+        let held: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM person_authenticators WHERE person_agent_id = $1 \
+              ORDER BY id FOR SHARE",
+        )
+        .bind(p.person)
+        .fetch_all(&mut *c)
+        .await
+        .unwrap();
+        let mut want_held = vec![p.passkey, backup];
+        want_held.sort();
+        assert_eq!(
+            held, want_held,
+            "CALIBRATION (cap {cap}): C holds the phone and the backup"
+        );
+
+        let (r_pid, revoke) = start_revoke_with(
+            &pool,
+            "READ COMMITTED",
+            Some(cap),
+            p.passkey,
+            "phone stolen",
+        )
+        .await;
+        assert!(
+            blocked_by(&pool, r_pid, c_pid, &revoke).await,
+            "CALIBRATION (cap {cap}): the first pass waits for C"
+        );
+        // N enrolls under the backup during the first pass's wait.
+        let n = within(
+            "N's completion",
+            try_complete(&pool, e_n, base + 2, "packed"),
+        )
+        .await
+        .expect("N completes while the first pass waits");
+        assert!(
+            !revoke.is_finished(),
+            "CALIBRATION (cap {cap}): the first pass still waits for C"
+        );
+        c.execute("COMMIT").await.unwrap();
+        drop(c);
+
+        let got = within("the revoke", revoke).await.unwrap();
+        let lineage = [p.passkey, backup, n];
+        if cap == "1" {
+            assert_code(&got, "40001", "a walk past its locks with the cap spent");
+            let message = got
+                .as_ref()
+                .unwrap_err()
+                .as_database_error()
+                .map(|e| e.message().to_string())
+                .unwrap_or_default();
+            assert!(
+                message.contains("(1 passes)") && message.contains("nothing was revoked"),
+                "refused after the first pass: {message}"
+            );
+            for live in lineage {
+                assert!(
+                    revoked(&pool, live).await.is_none(),
+                    "cap 1: nothing revoked ({live})"
+                );
+            }
+            assert_eq!(
+                revoke_modes(&pool, &lineage).await,
+                vec![],
+                "cap 1: no revoke audit row"
+            );
+        } else {
+            let mut got = got.expect("the compromised revoke with the cap at 2");
+            got.sort();
+            let mut want = vec![(p.passkey, 0, true), (backup, 1, true), (n, 2, true)];
+            want.sort();
+            assert_eq!(
+                got, want,
+                "cap 2: the second pass locks N, ends the loop and revokes the lineage"
+            );
+            let modes = revoke_modes(&pool, &lineage).await;
+            assert_eq!(modes.len(), 3, "cap 2: one audit row each: {modes:?}");
+            assert!(
+                modes
+                    .iter()
+                    .all(|(_, m)| m.as_deref() == Some("compromised")),
+                "{modes:?}"
+            );
+        }
+    }
+}
+
+/// The pass-cap setting only ever bites when a pass does not end the loop,
+/// and a value that is not a cap below 214's 32 is ignored, never an error:
+/// with no lineage growing during the revoke, a cap of 1 revokes the phone
+/// and its backup in one pass, and so do an empty, a non-numeric, a zero, a
+/// negative and an out-of-range value (a typo in the setting must not turn
+/// a security revoke into a cast error). Mutations: the value cast without
+/// the digits check -> "abc" raises 22P02 and "99999999999" 22003; the cap
+/// checked before the fixpoint exit -> cap 1 refuses this ordinary revoke.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_pass_cap_setting_never_refuses_an_ordinary_revoke(pool: PgPool) {
+    for (round, cap) in ["1", "", "abc", "0", "-1", "99999999999"]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 10 * (u8::try_from(round).unwrap() + 1);
+        let p = elevated_custodian(&pool, &format!("phone owner {round}"), base).await;
+        let (_, e_backup) = anchored_enrollment(&pool, &p).await;
+        let backup = try_complete(&pool, e_backup, base + 1, "packed")
+            .await
+            .unwrap();
+        let (_, revoke) = start_revoke_with(
+            &pool,
+            "READ COMMITTED",
+            Some(cap),
+            p.passkey,
+            "phone stolen",
+        )
+        .await;
+        let mut got = within("the revoke", revoke)
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("the setting {cap:?} refused an ordinary revoke: {e}"));
+        got.sort();
+        let mut want = vec![(p.passkey, 0, true), (backup, 1, true)];
+        want.sort();
+        assert_eq!(got, want, "the setting {cap:?}");
+    }
+}
+
 fn repo_text(rel: &str) -> String {
     std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3705,6 +3900,75 @@ async fn the_214_undo_restores_200s_compromised_revoke(pool: PgPool) {
     assert_ne!(foreign, body_200, "CALIBRATION: a foreign body");
     let r = sqlx::raw_sql(&migration).execute(&pool).await;
     assert_code(&r, "55000", "214 over a foreign body");
+    // The undo opens its own transaction: end it on the same connection.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
+    assert_code(&r, "55000", "the undo over a foreign body");
+    sqlx::raw_sql("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the undo's transaction");
+    drop(conn);
+    assert_eq!(
+        compromised_revoke_md5(&pool).await,
+        foreign,
+        "neither replaced the foreign body"
+    );
+}
+
+/// `docs/runbooks/266-undo.sql` returns the catalog to 265's (214's body of
+/// the compromised revoke byte for byte, its owner unchanged); a second run
+/// changes nothing. Both 266 and its undo refuse (55000, nothing changed)
+/// over a body that is not the one they expect. Mutations: the undo's body
+/// edited by one character -> the catalog differs; either md5 check dropped
+/// -> the foreign body is replaced.
+#[sqlx::test(migrations = false)]
+async fn the_266_undo_restores_214s_compromised_revoke(pool: PgPool) {
+    let undo = repo_text("docs/runbooks/266-undo.sql");
+    let migration = repo_text("migrations/266_compromised_revoke_pass_cap.sql");
+    migrate(&pool, &up_to(265)).await;
+    let before = catalog(&pool).await;
+    let body_214 = compromised_revoke_md5(&pool).await;
+    assert_eq!(
+        body_214, "645f997359d64646702e3db2f86ed7ca",
+        "CALIBRATION: 214's body is in place at 265"
+    );
+    migrate(&pool, &up_to(266)).await;
+    assert_ne!(
+        catalog(&pool).await,
+        before,
+        "CALIBRATION: 266 changed the catalog"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("the undo script applies");
+    assert_eq!(
+        catalog(&pool).await,
+        before,
+        "the catalog is 265's after the undo"
+    );
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("a second run applies");
+    assert_eq!(catalog(&pool).await, before, "idempotent");
+
+    // A foreign body: both refuse and leave it.
+    sqlx::raw_sql(
+        "CREATE OR REPLACE FUNCTION public.epigraph_revoke_passkey_compromised(p_id uuid, \
+                                                                          p_reason text) \
+         RETURNS TABLE (revoked_id uuid, lineage_depth integer, revoked_now boolean) \
+         LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, pg_temp \
+         AS $$ BEGIN RETURN; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("re-body the function");
+    let foreign = compromised_revoke_md5(&pool).await;
+    assert_ne!(foreign, body_214, "CALIBRATION: a foreign body");
+    let r = sqlx::raw_sql(&migration).execute(&pool).await;
+    assert_code(&r, "55000", "266 over a foreign body");
     // The undo opens its own transaction: end it on the same connection.
     let mut conn = pool.acquire().await.expect("acquire");
     let r = sqlx::raw_sql(&undo).execute(&mut *conn).await;
