@@ -714,7 +714,13 @@ async fn a_claim_without_a_live_mirror_writer_row_is_left_untouched(pool: PgPool
     let (_scoped, viewer) = fixture::bypass(&pool).await;
     let control = mirror_claim(&pool, author, 0.731_37).await;
     let no_writer = mirror_claim(&pool, author, 0.682_91).await;
-    let records = wave(&pool, &[control, no_writer], "L1").await;
+    let retracted = mirror_claim(&pool, author, 0.655_13).await;
+    let records = wave(&pool, &[control, no_writer, retracted], "L1").await;
+    // `retracted`'s auto_wire rows are all retracted, through the retraction
+    // definer (the real path): it has auto_wire rows, none live.
+    retract_all_mass_rows(&pool, retracted, author).await;
+    let tr = truth_of(&pool, retracted).await;
+    let vr = row_version(&pool, retracted).await;
     // Hand-set: its rows were written by another method (the cache and the
     // fold are unchanged, so only this rule fails).
     sqlx::query("UPDATE mass_functions SET combination_method = 'conjunctive' WHERE claim_id = $1")
@@ -730,6 +736,37 @@ async fn a_claim_without_a_live_mirror_writer_row_is_left_untouched(pool: PgPool
     assert_refreshed(&pool, control, &report).await;
     assert_eq!(report.bucket_of(no_writer), Some(Bucket::NoMirrorWriter));
     assert_untouched(&pool, no_writer, t, v, "no mirror writer").await;
+    assert_eq!(report.bucket_of(retracted), Some(Bucket::NoMirrorWriter));
+    assert_untouched(&pool, retracted, tr, vr, "only retracted auto_wire rows").await;
+}
+
+/// Every mass function of `claim` marked retracted, by `principal`.
+/// Hand-set on the privileged test session (the retraction guard admits a
+/// bypass session): `epigraph_retract_mass_function` needs a writer of the
+/// row's owning group, which this fixture does not build. Checks none is
+/// live while at least one is still an `auto_wire` row.
+async fn retract_all_mass_rows(pool: &PgPool, claim: Uuid, principal: Uuid) {
+    sqlx::query(
+        "UPDATE mass_functions \
+            SET retracted_at = now(), retracted_by = $2, retract_reason = 'refresh test' \
+          WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .bind(principal)
+    .execute(pool)
+    .await
+    .expect("retract");
+    let (live, auto_wire): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE retracted_at IS NULL), \
+                count(*) FILTER (WHERE combination_method = 'auto_wire') \
+           FROM mass_functions WHERE claim_id = $1",
+    )
+    .bind(claim)
+    .fetch_one(pool)
+    .await
+    .expect("count");
+    assert_eq!(live, 0, "precondition: no live row");
+    assert!(auto_wire > 0, "precondition: an auto_wire row, retracted");
 }
 
 // ── (10) the dry run writes nothing ────────────────────────────────────────
@@ -1434,6 +1471,215 @@ async fn a_claim_superseded_after_the_refresh_is_restored_and_reported_not_curre
 
     let again = restore(&pool, &written, 1, false).await.unwrap();
     assert_eq!(again.already_restored, vec![retired, live]);
+}
+
+// ── (18) a mirror superseded after the wave, through apply ─────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mirror_superseded_after_the_wave_is_not_current_through_apply(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let retired = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[control, retired], "L1").await;
+    supersede(&pool, retired, author).await;
+    // Still a mirror of the old cache, with the wave's cache: only the
+    // currency rule fails.
+    let c = plan_candidates(&records)
+        .into_iter()
+        .find(|c| c.claim_id == retired)
+        .unwrap();
+    assert_eq!(Some(truth_of(&pool, retired).await), c.old);
+    assert_eq!(cache_of(&pool, retired).await, c.written);
+    let t = truth_of(&pool, retired).await;
+    let v = row_version(&pool, retired).await;
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, control, &report).await;
+    assert_eq!(report.bucket_of(retired), Some(Bucket::NotCurrent));
+    assert!(written.iter().all(|r| r.claim_id != retired));
+    assert_untouched(&pool, retired, t, v, "not current").await;
+}
+
+// ── (19) a missing claim, through apply and through the restore ────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_missing_claim_is_reported_missing_by_apply_and_by_the_restore(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let mut records = wave(&pool, &[control], "L1").await;
+    // A wave record for a claim that does not exist (deleted since, or a
+    // record file from another database).
+    let ghost = Uuid::new_v4();
+    let mut ghost_rec = records[0].clone();
+    ghost_rec.claim_id = ghost;
+    records.push(ghost_rec);
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+    assert_refreshed(&pool, control, &report).await;
+    assert_eq!(report.bucket_of(ghost), Some(Bucket::Missing));
+    assert_eq!(
+        written.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![control]
+    );
+
+    let mut with_ghost = written.clone();
+    let mut g = written[0].clone();
+    g.claim_id = ghost;
+    with_ghost.push(g);
+    let out = restore(&pool, &with_ghost, 1, false).await.unwrap();
+    assert_eq!(out.missing, vec![ghost]);
+    assert_eq!(out.restored, vec![control]);
+    assert!(out.already_restored.is_empty() && out.superseded_since_refresh.is_empty());
+}
+
+// ── (20) a non-BetP cache column moved since the wave ──────────────────────
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cache_moved_since_the_wave_in_a_column_other_than_betp_is_left_untouched(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let belief_moved = mirror_claim(&pool, author, 0.682_91).await;
+    let empty_moved = mirror_claim(&pool, author, 0.655_13).await;
+    let records = wave(&pool, &[control, belief_moved, empty_moved], "L1").await;
+    // Hand-set (no writer moves one cache column alone): BetP, and so the
+    // mirror and the CAS's cache test, stay exactly as the wave left them.
+    for (id, col) in [(belief_moved, "belief"), (empty_moved, "mass_on_empty")] {
+        sqlx::query(&format!(
+            "UPDATE claims SET {col} = COALESCE({col}, 0) + 1e-6 WHERE id = $1"
+        ))
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let snaps = [
+        (
+            belief_moved,
+            truth_of(&pool, belief_moved).await,
+            row_version(&pool, belief_moved).await,
+        ),
+        (
+            empty_moved,
+            truth_of(&pool, empty_moved).await,
+            row_version(&pool, empty_moved).await,
+        ),
+    ];
+    for (id, _, _) in &snaps {
+        let c = plan_candidates(&records)
+            .into_iter()
+            .find(|c| c.claim_id == *id)
+            .unwrap();
+        assert_eq!(
+            cache_of(&pool, *id).await.pignistic_prob,
+            c.written.pignistic_prob,
+            "precondition: BetP unmoved"
+        );
+    }
+
+    let (report, _) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, control, &report).await;
+    for (id, t, v) in snaps {
+        assert_eq!(report.bucket_of(id), Some(Bucket::SupersededSinceWave));
+        assert_untouched(&pool, id, t, v, "a non-BetP cache column moved").await;
+    }
+}
+
+// ── (21) end to end through a real cache-only wave writer ──────────────────
+
+/// The wave is `recompute_betp`'s own writer (`write_wave_claim`, a
+/// standalone wave under the AEF), which rewrites the cache, never
+/// `truth_value`, and records through `WaveLog` into a real wave file.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mirror_is_refreshed_from_a_recompute_betp_wave_file(pool: PgPool) {
+    use epigraph_cli::recompute_betp::{write_wave_claim, WaveLog, WaveRole};
+    use epigraph_engine::atom_items::{AtomFoldMode, CompoundSourceEdges};
+    use epigraph_engine::edge_factor::AtomCacheSettings;
+
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    // A second BBA, from another source, stored WITHOUT a fold
+    // (`MassFunctionRepository::store`, the writer that stores a row and
+    // leaves the cache): the cache, and so the mirror, still reflect the
+    // first row only, and the wave's fold of both moves BetP.
+    let frame: Uuid = sqlx::query_scalar("SELECT frame_id FROM mass_functions WHERE claim_id = $1")
+        .bind(a)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let other = seed_agent(&pool).await;
+    epigraph_db::MassFunctionRepository::store(
+        &pool,
+        a,
+        frame,
+        Some(other),
+        &serde_json::json!({ "1": 0.4, "0,1": 0.6 }),
+        Some(0.0),
+        Some("auto_wire"),
+        Some("empirical"),
+        "unknown",
+        None,
+    )
+    .await
+    .expect("store a second BBA");
+    let old = truth_of(&pool, a).await;
+    let cache_before = cache_of(&pool, a).await;
+    assert_eq!(
+        cache_before.pignistic_prob.map(f64::to_bits),
+        Some(old.to_bits()),
+        "precondition: still a mirror after the unfolded store"
+    );
+
+    let wave_file = dir.join("standalone-wave.jsonl");
+    let at: DateTime<Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let log = WaveLog::open(&wave_file, "standalone-aef", at).expect("open the wave log");
+    let o = write_wave_claim(
+        &pool,
+        &viewer,
+        a,
+        WaveRole::Standalone,
+        AtomCacheSettings {
+            fold: AtomFoldMode::Aef,
+            compound_source_edges: CompoundSourceEdges::Frozen,
+            vacate_on_evidence_removal: true,
+        },
+        &log,
+    )
+    .await
+    .expect("write_wave_claim");
+    assert!(o.changed, "precondition: the wave moved the cache: {o:?}");
+    assert_ne!(
+        cache_of(&pool, a).await.pignistic_prob,
+        cache_before.pignistic_prob,
+        "precondition: the wave moved BetP"
+    );
+    assert_eq!(
+        truth_of(&pool, a).await.to_bits(),
+        old.to_bits(),
+        "precondition: the wave writer left truth_value"
+    );
+    let records = read_wave(std::io::BufReader::new(
+        std::fs::File::open(&wave_file).unwrap(),
+    ))
+    .expect("read the wave file");
+    assert_eq!(records.len(), 1);
+
+    let (report, written) = run_apply(&pool, &viewer, &records, false).await;
+
+    assert_refreshed(&pool, a, &report).await;
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].truth_before.to_bits(), old.to_bits());
+    assert_eq!(written[0].waves, vec!["standalone-aef".to_string()]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ── (22) the binary: argument refusals write nothing ───────────────────────

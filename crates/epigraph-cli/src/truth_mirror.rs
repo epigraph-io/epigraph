@@ -988,6 +988,43 @@ mod tests {
     }
 
     #[test]
+    fn the_sentinel_tolerance_is_one_e_minus_nine_on_either_side() {
+        // Inside the tolerance: the sentinel, on the truth side and on the
+        // new-value side. Values chosen not round (1000 v is 5e-6 or more
+        // from an integer outside, 1e-6 or less inside), so only the
+        // sentinel rule can hold the "inside" ones.
+        for inside in [SENTINEL_005 + 0.9e-9, SENTINEL_005 - 0.9e-9] {
+            let c = cand(inside, 0.613_789_1);
+            assert_eq!(
+                classify(&c, Some(&state(inside, &c)), true),
+                Bucket::Sentinel005,
+                "truth {inside:e}"
+            );
+            let c = cand(0.613_789_1, inside);
+            assert_eq!(
+                classify(&c, Some(&state(0.613_789_1, &c)), true),
+                Bucket::Sentinel005,
+                "new {inside:e}"
+            );
+        }
+        // Just outside it: refreshed like any mirror.
+        for outside in [SENTINEL_005 + 5e-9, SENTINEL_005 - 5e-9] {
+            let c = cand(outside, 0.613_789_1);
+            assert_eq!(
+                classify(&c, Some(&state(outside, &c)), true),
+                Bucket::Refresh,
+                "truth {outside:e}"
+            );
+            let c = cand(0.613_789_1, outside);
+            assert_eq!(
+                classify(&c, Some(&state(0.613_789_1, &c)), true),
+                Bucket::Refresh,
+                "new {outside:e}"
+            );
+        }
+    }
+
+    #[test]
     fn a_candidates_waves_are_in_chain_order_not_name_order() {
         let id = Uuid::new_v4();
         let t0 = Utc::now();
