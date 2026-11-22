@@ -1344,6 +1344,19 @@ pub async fn create_hierarchical_edge(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    // The reserved keys (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the act
+    // marker, the dedup identity, the ingest record) are written only by the
+    // act or the ingest, as on `POST /api/v1/edges` (backlog 3676c459).
+    if let Some(reason) = request
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: reason.to_string(),
+        });
+    }
 
     // Tight relationship allow-list — narrower than VALID_RELATIONSHIPS by design.
     if !is_hierarchical_relationship(&request.relationship) {
@@ -1684,6 +1697,19 @@ pub async fn relate_claims(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["edges:write"])?;
+    // The reserved keys (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the act
+    // marker, the dedup identity, the ingest record) are written only by the
+    // act or the ingest, as on `POST /api/v1/edges` (backlog 3676c459).
+    if let Some(reason) = request
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(ApiError::ValidationError {
+            field: "properties".to_string(),
+            reason: reason.to_string(),
+        });
+    }
 
     if source_id == request.target_claim_id {
         return Err(ApiError::ValidationError {
