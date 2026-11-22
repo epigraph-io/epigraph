@@ -21,8 +21,12 @@
 --   * Restores, byte for byte with `CREATE OR REPLACE` (never DROP, which
 --     would drop the triggers that call the guards and reset the definers'
 --     owners and ACLs), the five bodies 251 re-stated, each on its path at
---     250: 184's `epigraph_mass_function_retract_guard()` (`pg_catalog,
---     public`), 194's `mass_functions_retracted_delete_guard()`,
+--     250 but one: 184's `epigraph_mass_function_retract_guard()` goes back
+--     on `pg_catalog, public, pg_temp`, NOT 184's `pg_catalog, public`. That
+--     is the safer path (pg_temp searched last), the one backlog eff4aaf5's
+--     interim mitigation sets, and one 251's precondition accepts; restoring
+--     184's path would undo that mitigation. 194's
+--     `mass_functions_retracted_delete_guard()`,
 --     `epigraph_mf_purge_granted(uuid)` and `epigraph_purge_mass_functions(
 --     uuid[], text)` (`pg_catalog, pg_temp`), and 184's
 --     `epigraph_unretract_mass_function(uuid, text, uuid, uuid)` (190's
@@ -48,11 +52,12 @@
 BEGIN;
 SET LOCAL lock_timeout = '3s';
 
--- Migration 184's body, verbatim.
+-- Migration 184's body, verbatim; its path lists pg_temp last (see WHAT IT
+-- DOES), so the md5 is 184's and the proconfig is the interim mitigation's.
 CREATE OR REPLACE FUNCTION public.epigraph_mass_function_retract_guard()
 RETURNS trigger
 LANGUAGE plpgsql
-SET search_path = pg_catalog, public AS $$
+SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
     -- R-103: no session or frame re-writes a retracted row's assessment.
     IF TG_ARGV[0] = 'rewrite' THEN

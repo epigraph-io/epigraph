@@ -3437,7 +3437,8 @@ restart.
   `55000` unless it is `{}` at the end, and `epigraph-tenancy-backfill verify` reports every
   fault. Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the five bodies
   it re-states are those at 250 (retract guard, delete guard, helper, purge and un-retract
-  definers), and `epigraph_maintenance` exists. A login that may not create the role or
+  definers; the retract guard may also be on `pg_catalog, public, pg_temp`, the interim
+  mitigation of backlog eff4aaf5), and `epigraph_maintenance` exists. A login that may not create the role or
   re-own to it is refused `42501`. An existing owner role holding the maintenance role (an
   earlier draft of this change) has that membership revoked. What a maintenance login can
   still do: call `epigraph_mf_guard_grant` itself (the definers its role owns must) and then
@@ -3452,8 +3453,9 @@ restart.
   and the ledger row of a real un-retract), `mass_function_purge_guard.rs` (d, d2, d3, d4,
   e, f, g), `schema_contract.rs`, `epigraph-cli`'s register test and
   `verify_reports_a_ledger_another_role_can_write`, and `operator_delete_frames.rs` (the
-  census). Undo: `docs/runbooks/251-undo.sql` (restores the five bodies and 194's table
-  shape; keep the ledger first; leaves the role and names the statement that drops it).
+  census). Undo: `docs/runbooks/251-undo.sql` (restores the five bodies, the retract guard
+  on `pg_catalog, public, pg_temp` rather than 184's path, and 194's table shape; keep the
+  ledger first; leaves the role and names the statement that drops it).
   Slot assigned by the 2026-11-22 backlog triage; checked before claiming: no migration on
   main or any origin branch carries a `251`. **Deploy order:** install the `delete-frames`
   built with 251 together with it (an older one refuses its purge over 251, rolled back);

@@ -208,6 +208,13 @@ async fn the_bodies_before_251_are_the_ones_it_restates(pool: PgPool) {
 /// through the ledger function.
 #[sqlx::test(migrations = "../../migrations")]
 async fn at_head_only_the_ledger_functions_run_as_the_owner(pool: PgPool) {
+    assert_at_head(&pool).await;
+}
+
+/// The assertions of [`at_head_only_the_ledger_functions_run_as_the_owner`],
+/// shared with the tests that reach head by another route.
+async fn assert_at_head(pool: &PgPool) {
+    let pool = pool.clone();
     assert_eq!(faults(&pool).await, Vec::<String>::new(), "no fault");
 
     let role: (bool, bool, bool, bool, bool, bool) = sqlx::query_as(
@@ -586,8 +593,81 @@ async fn migration_251_refuses_to_apply_over_another_body(pool: PgPool) {
     assert_eq!(faults(&pool).await, Vec::<String>::new());
 }
 
+/// The search_path an operator may set on 184's retract guard ahead of 251
+/// (backlog eff4aaf5's interim mitigation: `proconfig` only, `prosrc`
+/// unchanged). 251 accepts it besides 184's own path.
+const RETRACT_GUARD_INTERIM_PATH: &str = "search_path=pg_catalog, public, pg_temp";
+
+/// 251 applies over a database at 250 whose retract guard carries the interim
+/// path, and the database it leaves is the one every other route reaches.
+#[sqlx::test(migrations = false)]
+async fn migration_251_applies_over_the_interim_retract_guard_path(pool: PgPool) {
+    migrate_below_251(&pool).await;
+    pool.execute(
+        format!("ALTER FUNCTION {RETRACT_GUARD} SET search_path = pg_catalog, public, pg_temp")
+            .as_str(),
+    )
+    .await
+    .expect("the interim mitigation, as a superuser");
+    let (got_md5, got_config, _, _, _) = facts(&pool, RETRACT_GUARD).await;
+    assert_eq!(
+        got_md5, BEFORE_251[0].1,
+        "the mitigation leaves 184's body unchanged"
+    );
+    assert_eq!(got_config, vec![RETRACT_GUARD_INTERIM_PATH.to_string()]);
+
+    migrate_rest(&pool)
+        .await
+        .expect("251 applies over the interim retract guard path");
+    assert!(applied(&pool, 251).await);
+    assert_at_head(&pool).await;
+}
+
+/// The interim path does not excuse another body: over it, a re-bodied
+/// retract guard is still refused (55000, nothing changed).
+#[sqlx::test(migrations = false)]
+async fn migration_251_refuses_another_retract_guard_body_on_the_interim_path(pool: PgPool) {
+    migrate_below_251(&pool).await;
+    pool.execute(
+        format!("ALTER FUNCTION {RETRACT_GUARD} SET search_path = pg_catalog, public, pg_temp")
+            .as_str(),
+    )
+    .await
+    .unwrap();
+    let original: String = sqlx::query_scalar("SELECT pg_get_functiondef($1::regprocedure)")
+        .bind(RETRACT_GUARD)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let edited = original.replacen("BEGIN", "BEGIN\n    -- another migration's edit", 1);
+    assert_ne!(edited, original);
+    pool.execute(edited.as_str()).await.expect("re-body");
+    let (_, got_config, _, _, _) = facts(&pool, RETRACT_GUARD).await;
+    assert_eq!(
+        got_config,
+        vec![RETRACT_GUARD_INTERIM_PATH.to_string()],
+        "the re-body keeps the interim path"
+    );
+
+    let e = migrate_rest(&pool)
+        .await
+        .expect_err("251 must refuse another body on the interim path");
+    let code = match &e {
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::Database(db))
+        | sqlx::migrate::MigrateError::ExecuteMigration(sqlx::Error::Database(db), _) => {
+            db.code().map(|c| c.to_string())
+        }
+        _ => None,
+    };
+    assert_eq!(code.as_deref(), Some("55000"), "{e}");
+    assert!(format!("{e}").contains("251:"), "{e}");
+    assert!(!applied(&pool, 251).await);
+    assert!(!ledger_has_kind(&pool).await, "nothing was changed");
+}
+
 /// `docs/runbooks/251-undo.sql` puts back the five bodies at 250 (their md5
-/// and paths), 194's ledger shape, key and grants (so a maintenance login
+/// and paths, but the retract guard's path is the interim one, pg_temp last),
+/// 194's ledger shape, key and grants (so a maintenance login
 /// writes a grant again: the residual is back, which is what undoing means),
 /// the helper's maintenance ownership, and drops 251's three new functions;
 /// it runs twice, over a ledger holding rows 194's key could not hold; and
@@ -623,7 +703,14 @@ async fn the_251_undo_restores_the_bodies_and_the_grant_table(pool: PgPool) {
     for (sig, md5, config) in BEFORE_251 {
         let (got_md5, got_config, _, owner, _) = facts(&pool, sig).await;
         assert_eq!(&got_md5, md5, "{sig} is restored");
-        assert_eq!(got_config, *config, "{sig} path");
+        // The retract guard goes back on the interim path (pg_temp last), not
+        // 184's; every other body on its path at 250.
+        let config: &[&str] = if *sig == RETRACT_GUARD {
+            &[RETRACT_GUARD_INTERIM_PATH]
+        } else {
+            config
+        };
+        assert_eq!(got_config, config, "{sig} path");
         if [PURGE, UNRETRACT, GRANTED].contains(sig) {
             assert_eq!(owner, "epigraph_maintenance", "{sig}");
         }

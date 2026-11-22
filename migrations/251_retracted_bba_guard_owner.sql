@@ -125,8 +125,10 @@
 -- without that is refused 42501 with nothing changed, as 231 refuses.
 --
 -- PRECONDITIONS (55000, nothing changed unless all hold): `md5(prosrc)` and
--- `proconfig` of the five bodies it re-states are those of a database at 250:
+-- `proconfig` of the five bodies it re-states are those of a database at 250,
+-- except that the retract guard may also be on `pg_catalog, public, pg_temp`:
 --   epigraph_mass_function_retract_guard()          be48455cec9bc897f0f13473129c52ff  {search_path=pg_catalog, public}
+--                                                                                     or {"search_path=pg_catalog, public, pg_temp"}
 --   mass_functions_retracted_delete_guard()         baf4285cd182aed1493a90a5eefef454  {search_path=pg_catalog, pg_temp}
 --   epigraph_mf_purge_granted(uuid)                 2ac6c54699fcbb785e624a377997247b  {search_path=pg_catalog, pg_temp}
 --   epigraph_purge_mass_functions(uuid[], text)     85e75b8d2da5a4a1a97496c7303d0c83  {search_path=pg_catalog, pg_temp}
@@ -134,6 +136,13 @@
 --                                                   3f0369e03257d9be2c1d62644c334c60  {"search_path=pg_catalog, public, pg_temp",epigraph.mf_unretract_id=}
 -- Predeploy check: `SELECT p.oid::regprocedure, md5(p.prosrc), p.proconfig
 -- FROM pg_proc p WHERE p.proname IN (...)`.
+-- The retract guard's second path is the interim mitigation an operator may
+-- apply before 251 deploys (backlog eff4aaf5: `ALTER FUNCTION
+-- epigraph_mass_function_retract_guard() SET search_path = pg_catalog, public,
+-- pg_temp`, `proconfig` only, so the md5 is the same either way), and the
+-- path 251-undo.sql restores. 251 re-states the guard on that path anyway, so
+-- either one leaves the same function. As 194 accepts 117's and 190's paths
+-- for the cascade definer; every other body and path must match exactly.
 --
 -- An existing `epigraph_bba_guard_owner` is reused. A membership of
 -- `epigraph_maintenance` it holds (an earlier draft of this change granted
@@ -177,30 +186,40 @@ DECLARE
     r record;
 BEGIN
     FOR r IN
-        SELECT e.sig, e.md5, e.cfg, p.prosrc IS NOT NULL AS present,
+        SELECT e.sig, e.md5, e.cfg, e.alt_cfg, p.prosrc IS NOT NULL AS present,
                pg_catalog.md5(p.prosrc) AS got_md5, p.proconfig AS got_cfg
           FROM (VALUES
                 ('public.epigraph_mass_function_retract_guard()',
                  'be48455cec9bc897f0f13473129c52ff',
-                 ARRAY['search_path=pg_catalog, public']::text[]),
+                 ARRAY['search_path=pg_catalog, public']::text[],
+                 ARRAY['search_path=pg_catalog, public, pg_temp']::text[]),
                 ('public.mass_functions_retracted_delete_guard()',
                  'baf4285cd182aed1493a90a5eefef454',
-                 ARRAY['search_path=pg_catalog, pg_temp']::text[]),
+                 ARRAY['search_path=pg_catalog, pg_temp']::text[],
+                 NULL::text[]),
                 ('public.epigraph_mf_purge_granted(uuid)',
                  '2ac6c54699fcbb785e624a377997247b',
-                 ARRAY['search_path=pg_catalog, pg_temp']::text[]),
+                 ARRAY['search_path=pg_catalog, pg_temp']::text[],
+                 NULL::text[]),
                 ('public.epigraph_purge_mass_functions(uuid[], text)',
                  '85e75b8d2da5a4a1a97496c7303d0c83',
-                 ARRAY['search_path=pg_catalog, pg_temp']::text[]),
+                 ARRAY['search_path=pg_catalog, pg_temp']::text[],
+                 NULL::text[]),
                 ('public.epigraph_unretract_mass_function(uuid, text, uuid, uuid)',
                  '3f0369e03257d9be2c1d62644c334c60',
                  ARRAY['search_path=pg_catalog, public, pg_temp',
-                       'epigraph.mf_unretract_id=']::text[])
-               ) AS e(sig, md5, cfg)
+                       'epigraph.mf_unretract_id=']::text[],
+                 NULL::text[])
+               ) AS e(sig, md5, cfg, alt_cfg)
           LEFT JOIN pg_catalog.pg_proc p
             ON p.oid = pg_catalog.to_regprocedure(e.sig)
     LOOP
-        IF r.got_md5 IS DISTINCT FROM r.md5 OR r.got_cfg IS DISTINCT FROM r.cfg THEN
+        -- alt_cfg is the retract guard's second accepted path (NULL for the
+        -- other four, which must match cfg exactly; an absent proconfig
+        -- matches neither).
+        IF r.got_md5 IS DISTINCT FROM r.md5
+           OR (r.got_cfg IS DISTINCT FROM r.cfg
+               AND (r.alt_cfg IS NULL OR r.got_cfg IS DISTINCT FROM r.alt_cfg)) THEN
             v_bad := v_bad || pg_catalog.format('%s: md5 %s, proconfig %s', r.sig,
                                                 COALESCE(r.got_md5, '(absent)'),
                                                 COALESCE(r.got_cfg::text, '(none)'));
@@ -211,8 +230,10 @@ BEGIN
                         '%; another migration re-bodied them, or 184/190/194 are not applied; '
                         'nothing was changed', v_bad
             USING ERRCODE = '55000',
-                  HINT = 'Apply a reconciling migration that re-states each body with every '
-                         'delta instead of this one.';
+                  HINT = 'Each body''s md5 and path must be the ones in 251''s header (the '
+                         'retract guard may be on pg_catalog, public or on pg_catalog, public, '
+                         'pg_temp). Otherwise apply a reconciling migration that re-states each '
+                         'body with every delta instead of this one.';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         RAISE EXCEPTION '251: role epigraph_maintenance does not exist; the ledger''s grants '
