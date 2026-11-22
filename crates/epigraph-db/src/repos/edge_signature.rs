@@ -351,8 +351,8 @@ pub struct EdgeSignatureCheck {
     /// The kind of key that verified: `signing` / `identity-legacy` (an
     /// attested `agent_keys` row whose status and window admit the edge's
     /// `created_at`) or `unattested` (the signer's `agents.public_key`, only
-    /// when no attested `agent_keys` row carries it). `None` when nothing
-    /// verifies.
+    /// when no attested `agent_keys` row carries it and its `key_kind` is
+    /// `ed25519`). `None` when nothing verifies.
     pub key_kind: Option<&'static str>,
     /// The row recomputes to its stored `content_hash`; `None` when no digest
     /// is stored, or when the edge is `pre_attestation` (its stored digest is
@@ -554,17 +554,31 @@ impl EdgeSignatureRepository {
                 .bind(signer)
                 .fetch_all(&mut *conn)
                 .await?;
-                let agent_key: Option<Vec<u8>> =
-                    sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+                let agent: Option<(Vec<u8>, String)> =
+                    sqlx::query_as("SELECT public_key, key_kind::text FROM agents WHERE id = $1")
                         .bind(signer)
                         .fetch_optional(&mut *conn)
                         .await?;
+                // The bare agent key is ADMITTED only when it is a signature
+                // verifier (`key_kind = 'ed25519'`, as
+                // `AgentRepository::public_key_if_signer` decides). A
+                // `seed-derived` key's private half is computable from its
+                // public seed, and a `derived` placeholder has none, so a
+                // signature under either attests nothing (backlog 57943a39).
+                // The raw key still feeds `attests` below: a v1 signature
+                // under it is a real attestation by an unadmitted key, not a
+                // pre-attestation one.
+                let (agent_key, agent_key_is_verifier) = match agent {
+                    Some((key, kind)) => (Some(key), kind == "ed25519"),
+                    None => (None, false),
+                };
                 // v1 ONLY: the edge-tagged message, never the bare digest.
                 let message = signing_message(SignedEntity::Edge, &h);
                 let v1 = |key: &[u8; 32]| {
                     SignatureVerifier::verify(key, &message, &sig).unwrap_or(false)
                 };
-                verified = admitted_keys(&rows, agent_key.clone(), created_at)
+                let admitted_agent_key = agent_key.clone().filter(|_| agent_key_is_verifier);
+                verified = admitted_keys(&rows, admitted_agent_key, created_at)
                     .iter()
                     .find(|(key, _)| v1(key))
                     .map(|(_, kind)| *kind);
