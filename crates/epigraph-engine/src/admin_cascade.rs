@@ -995,10 +995,66 @@ pub async fn apply_unmark_authorized(
     expected_canonical: Uuid,
     authorized_chain: Option<&[Uuid]>,
 ) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
+    apply_unmark_checked(
+        admin,
+        admin_viewer,
+        caller,
+        trigger,
+        dup_id,
+        expected_canonical,
+        authorized_chain,
+        None,
+    )
+    .await
+}
+
+/// A check of the caller's authority that must hold on the un-mark's OWN
+/// transaction, not only on the request's earlier, rolled-back one: run by
+/// [`apply_unmark_checked`] first, before the act, on the transaction the
+/// un-mark commits on. A refusal (`Err` with its text) rolls back with nothing
+/// changed and is answered as [`UnmarkRefusal::Act`].
+///
+/// What it is for (backlog 9a5bc055): a request path that admitted the caller
+/// through an operator link re-decides that admission here, under the link
+/// lock, so a retire of the link cannot commit between the request's gate and
+/// this commit.
+#[allow(clippy::double_must_use)] // async_trait's generated #[must_use] on an already-must-use boxed future
+#[async_trait::async_trait]
+pub trait UnmarkPrecondition: Send + Sync {
+    /// Decide on `tx`, the un-mark's own transaction.
+    async fn check(&self, tx: &mut sqlx::PgConnection) -> Result<(), String>;
+}
+
+/// [`apply_unmark_authorized`] with `precondition` run first on the un-mark's
+/// own transaction (see [`UnmarkPrecondition`]). `None` is
+/// [`apply_unmark_authorized`].
+///
+/// # Errors
+/// As [`apply_unmark`], and [`UnmarkRefusal::Act`] with the precondition's
+/// text when it refuses.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_unmark_checked(
+    admin: &mut sqlx::PgConnection,
+    admin_viewer: &Viewer,
+    caller: &Viewer,
+    trigger: &CascadeTrigger,
+    dup_id: Uuid,
+    expected_canonical: Uuid,
+    authorized_chain: Option<&[Uuid]>,
+    precondition: Option<&dyn UnmarkPrecondition>,
+) -> Result<(UnmarkOutcome, CascadeReport), UnmarkRefusal> {
     use epigraph_core::ClaimId;
     let mut tx = sqlx::Acquire::begin(&mut *admin)
         .await
         .map_err(|e| UnmarkRefusal::Failed(e.to_string()))?;
+    // Before the act takes any row lock, so a precondition that waits on a
+    // lock (the link lock) holds none a link writer could be waiting on.
+    if let Some(precondition) = precondition {
+        precondition
+            .check(&mut tx)
+            .await
+            .map_err(UnmarkRefusal::Act)?;
+    }
     // The act re-reads the canonical's chain and refuses one other than
     // `authorized_chain` (the canonical was replaced again since the caller
     // was checked) without naming what it read under the admin viewer.
