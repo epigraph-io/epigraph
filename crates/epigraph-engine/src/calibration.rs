@@ -1074,6 +1074,7 @@ mod tests {
             format!("{err:#}").contains(&without.display().to_string()),
             "the error names the file: {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An explicit calibration whose vocabulary is empty is the one way left

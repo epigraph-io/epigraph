@@ -86,4 +86,9 @@ fn load_default_serves_the_resolved_calibration_not_the_cwd_file() {
         got.fan_out.max_per_claim, shipped.fan_out.max_per_claim,
         "load_default took [matcher] from the working directory's calibration.toml"
     );
+
+    // Leave both scratch directories (best effort; the test has passed).
+    std::env::set_current_dir(env!("CARGO_MANIFEST_DIR")).expect("leave the scratch directory");
+    let _ = std::fs::remove_dir_all(&empty);
+    let _ = std::fs::remove_dir_all(&other);
 }

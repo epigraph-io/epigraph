@@ -103,7 +103,7 @@ fn serve_the_variant() -> &'static Path {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn memorize_weighs_testimony_from_the_served_calibration(pool: PgPool) {
-    serve_the_variant();
+    let variant = serve_the_variant();
     let viewer = fixture::public_viewer(&pool).await;
     let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
     let content = format!("26a12f41 memorize weight {}", Uuid::new_v4());
@@ -159,4 +159,10 @@ async fn memorize_weighs_testimony_from_the_served_calibration(pool: PgPool) {
         "memorize stored source_strength {got}, want the served testimonial weight \
          {VARIANT_TESTIMONIAL} ({OLD_LITERAL} is the removed literal)"
     );
+
+    // Last statement: CALIBRATION_PATH still names the variant file, so it is
+    // removed only after every read above (best effort; the test has passed).
+    if let Some(dir) = variant.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
