@@ -1256,10 +1256,16 @@ Those refusals emit the structured tracing event
 upgrade a database whose clients predate that, see
 [section 13](#before-the-router-allowlist-every-active-client-needs-an-agent_id).
 
-**Known gap.** `GET /api/v1/openapi.json` under-reports authentication.
-utoipa's `security(...)` annotations are per-operation, and many read
-operations carry none, so the schema advertises them as requiring nothing.
-The document itself is anonymous, which is correct.
+**Authentication in `GET /api/v1/openapi.json`.** The document (itself
+anonymous, which is correct) declares a default security requirement,
+`ed25519_signature`, so an operation with no `security(...)` of its own is
+advertised as needing a token. An operation the router serves anonymously
+(`/health`) says so with an explicit empty requirement. The unit test
+`openapi::tests::every_documented_operation_declares_its_authentication`
+holds every documented operation to the anonymous routes `routes/mod.rs`
+registers. The document still lists only a subset of the routes (path
+coverage is a separate open item), so a route missing from it is
+undocumented, not anonymous.
 
 ### Routes that need more than a token
 
