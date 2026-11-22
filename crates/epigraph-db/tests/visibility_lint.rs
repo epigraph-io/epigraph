@@ -3942,6 +3942,25 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `deprecate_workflow` runs it on the ingest system agent's stamp, after the workflow \
          authority rule admitted the caller), exactly as for `deprecate_claim` above.",
     ),
+    // Backlog 1767f2ae: the hierarchical deprecation MARKS what it retires, and a
+    // later generation or `add_step` that reuses the claim revives it.
+    (
+        "claim.rs",
+        "retire_for_workflow_deprecation",
+        "UPDATE `claims` with `deprecate_claim_if_current`'s SET list plus a properties marker \
+         recording the row's own prior truth value. A write by primary key on the caller's \
+         stamped transaction: the control is `claims_tenancy`'s `WITH CHECK`, as for \
+         `deprecate_claim_if_current` above, which it replaces on the hierarchical path.",
+    ),
+    (
+        "claim.rs",
+        "revive_workflow_deprecation_retired",
+        "UPDATE `claims` by primary key that undoes a MARKED retirement (current again, the \
+         recorded truth value back), for a claim the caller's walk or `add_step` already reads \
+         and links on its stamp. Its one subquery (`NOT EXISTS ... supersedes = c.id`) projects \
+         nothing. The control is `claims_tenancy`'s `WITH CHECK`; the callers run it in a \
+         savepoint, so a refusal leaves the claim as it was.",
+    ),
     (
         "workflow.rs",
         "set_truth_value_if_changed",
