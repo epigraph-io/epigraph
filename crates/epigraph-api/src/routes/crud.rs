@@ -392,14 +392,21 @@ pub async fn create_evidence(
         });
     }
 
-    // Resolve public key for the agent
-    let public_key =
-        epigraph_db::AgentRepository::get_by_id(&mut *tx, AgentId::from_uuid(request.agent_id))
-            .await
-            .ok()
-            .flatten()
-            .map(|a| a.public_key)
-            .unwrap_or([0u8; 32]);
+    // Resolve public key for the agent. An unknown agent, or a stored key
+    // of the wrong length (a Rust-side error that leaves the transaction
+    // intact), degrades to the zero key as before. A failed QUERY aborts the
+    // transaction, so it is returned here rather than resurfacing as a
+    // confusing "current transaction is aborted" at the evidence INSERT.
+    let public_key = match epigraph_db::AgentRepository::get_by_id(
+        &mut *tx,
+        AgentId::from_uuid(request.agent_id),
+    )
+    .await
+    {
+        Ok(agent) => agent.map_or([0u8; 32], |a| a.public_key),
+        Err(epigraph_db::DbError::InvalidData { .. }) => [0u8; 32],
+        Err(e) => return Err(ApiError::from(e)),
+    };
 
     let evidence = Evidence::new(
         AgentId::from_uuid(request.agent_id),
