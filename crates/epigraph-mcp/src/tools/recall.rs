@@ -210,8 +210,9 @@ impl CentroidPopulationCache {
 /// PR-09: three of the four counts are viewer-scoped. `papers` and
 /// `claim_themes` are NOT in migration 062's `tier_a` array and have no
 /// `owner_group_id`, so there is nothing to filter on; `claim_themes` is the
-/// table plan §2.4 registers as `tenancy_exempt` with theme clustering as its
-/// control. Both are annotated in the SQL rather than left silent.
+/// table plan §2.4 registers as `tenancy_exempt`, naming viewer-scoped theme
+/// clustering as its control, which is not yet in the tree. Both are annotated
+/// in the SQL rather than left silent.
 async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     viewer: &epigraph_db::visibility::Viewer,
@@ -237,18 +238,21 @@ async fn compute_corpus_scope<'e, E: sqlx::PgExecutor<'e>>(
           -- can be written here.
           --
           -- §2.4's stated control for that residual is viewer-scoped
-          -- clustering, and PR-09 DID NOT SHIP IT. `theme_cluster` still calls
-          -- `epigraph_engine::theme_kmeans::run_theme_kmeans`, which takes no
-          -- Viewer. An earlier revision of this comment asserted the control as
-          -- if it existed; an exemption whose written reason is false is worse
+          -- clustering, and it is still not in the tree. The k-means
+          -- prototype an earlier revision named here is retired (backlog
+          -- a0ed0180); themes are now built by the UMAP theme pipeline through
+          -- the `/api/v1/themes/*` routes. Its centroids are averaged only over
+          -- claims the calling viewer reads
+          -- (`ClaimThemeRepository::set_centroid_from_claims`), but theme
+          -- membership (`assign_unthemed_batch`) and the stored labels are
+          -- still derived corpus-wide, so the table stays exempt rather than
+          -- controlled. An exemption whose written reason is false is worse
           -- than an unannotated one, because `visibility_lint.rs` trains
           -- reviewers to read exactly these lines.
           --
-          -- Owner of the residual: the PR that threads a Viewer through
-          -- `theme_kmeans::run_theme_kmeans` must land BOTH callers together —
-          -- this tool and `epigraph-api/src/routes/crud.rs::build_themes_from_corpus`
-          -- — or MCP hardens while HTTP stays corpus-wide. Ledgered as
-          -- D-PR16-theme-cluster-viewer-scope in docs/tenancy/progress.json.
+          -- What this line returns is a count of theme rows, a scalar that
+          -- names no claim. Ledgered as D-PR16-theme-cluster-viewer-scope in
+          -- docs/tenancy/progress.json.
           (SELECT COUNT(*) FROM claim_themes) AS themes_total
         "#,
         viewer.bypass_bind(),
