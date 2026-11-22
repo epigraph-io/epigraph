@@ -2649,7 +2649,9 @@ impl AppState {
     }
 
     /// Whether this process's embedding provider may write the stored vector
-    /// columns (`claims.embedding`, `evidence.embedding`): the rule
+    /// columns (`claims.embedding`, `evidence.embedding`,
+    /// `workflows.goal_embedding`, `behavioral_executions.goal_embedding`,
+    /// `methods.embedding`; backlog 21b7319a): the rule
     /// [`EmbeddingProviderKind::may_restore_claim_embeddings`] states for the
     /// job handler, applied to the request-serving write paths too (backlog
     /// 211bd623). `true` when no provider was declared.
@@ -2662,9 +2664,9 @@ impl AppState {
         )
     }
 
-    /// The embedding service for a vector that will be STORED on a claim or
-    /// evidence row, or `None` when there is no service or its provider does
-    /// not own those columns.
+    /// The embedding service for a vector that will be STORED (on a claim,
+    /// evidence, workflow, behavioral-execution or method row), or `None` when
+    /// there is no service or its provider does not own those columns.
     ///
     /// `embedding_service_from_env` falls through OpenAI, Jina and a mock, and
     /// only the job handler was told which one it got. An API process started

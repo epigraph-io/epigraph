@@ -341,7 +341,10 @@ pub async fn add_method(
         request.name.clone()
     };
 
-    let embedding = if let Some(embedder) = state.embedding_service() {
+    // Stored in `methods.embedding`, which method search ranks on: only the
+    // provider that owns the stored vector columns may fill it (backlog
+    // 21b7319a). Query embedding (`find_methods`) keeps `embedding_service`.
+    let embedding = if let Some(embedder) = state.storing_embedding_service() {
         embedder.generate(&embed_text).await.ok()
     } else {
         None
