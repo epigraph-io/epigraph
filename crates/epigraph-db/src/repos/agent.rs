@@ -2378,6 +2378,31 @@ impl AgentRepository {
                 .await?;
         Ok(row.map(|r| r.0))
     }
+
+    /// The `key_kind` of the agent whose `public_key` is `public_key`, or
+    /// `None` when no agent holds those bytes (`agents_public_key_unique`
+    /// makes the holder unique).
+    ///
+    /// For a verifier that holds KEY BYTES rather than an agent id (the
+    /// signer key `verify_claim` resolves through `claims.signer_id`, the
+    /// `client_id` of an agent OAuth client): only `Some("ed25519")` is a
+    /// signature verifier. `derived` and [`KEY_KIND_SEED_DERIVED`] are not,
+    /// exactly as [`Self::public_key_if_signer`] decides for an id.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, public_key))]
+    pub async fn key_kind_of_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        public_key: &[u8],
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT key_kind::text FROM agents WHERE public_key = $1")
+                .bind(public_key)
+                .fetch_optional(executor)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
 }
 
 #[cfg(test)]

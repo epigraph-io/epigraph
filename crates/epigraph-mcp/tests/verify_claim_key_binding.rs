@@ -935,3 +935,74 @@ async fn a_non_attested_row_carrying_the_bare_key_gives_one_verdict_for_claims_a
          carrying the bare key: {edge_check:?}"
     );
 }
+
+/// An agent whose `agents.public_key` is `public_key`, stored with `key_kind`.
+async fn seed_agent_of_kind(pool: &PgPool, public_key: &[u8; 32], key_kind: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, agent_type, key_kind) VALUES ($1, $2, 'human', $3)",
+    )
+    .bind(id)
+    .bind(public_key.as_slice())
+    .bind(key_kind)
+    .execute(pool)
+    .await
+    .expect("seed agent of kind");
+    id
+}
+
+/// Backlog 57943a39: a `seed-derived` key (migration 230) is the Ed25519 key
+/// of `BLAKE3(<public seed>)`, here an ingested author's name key, so anyone
+/// who knows the name signs under it. `verify_claim`'s bare-key fallback used
+/// to read `agents.public_key` with no `key_kind` filter and reported such a
+/// forgery `signature_valid: true` (kind `unattested`).
+///
+/// Paired: the SAME shape with the agent stored as `ed25519` (a real verifier)
+/// still verifies through the bare key, so the refusal is a function of
+/// `key_kind`, not of the bare-key path being switched off.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_seed_derived_signer_key_verifies_no_claim(pool: PgPool) {
+    let t0 = Utc::now() - Duration::days(10);
+
+    // Anyone can compute this private key from the author's name.
+    let forged = epigraph_crypto::did_key::keypair_from_name("Ada Example");
+    let author = seed_agent_of_kind(&pool, &forged.public_key(), "seed-derived").await;
+    let claim = seed_signed_claim(
+        &pool,
+        author,
+        author,
+        &forged,
+        "57943a39: signed under a key computable from the author's name",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, claim).await;
+    assert_eq!(resp["signed"], Value::Bool(true), "{resp}");
+    assert_eq!(
+        bound(&resp),
+        (Value::Bool(false), Value::Bool(false), Value::Null),
+        "a seed-derived signer key verified a claim: {resp}"
+    );
+
+    let real = signer(0xD1);
+    let agent = seed_agent_of_kind(&pool, &real.public_key(), "ed25519").await;
+    let control = seed_signed_claim(
+        &pool,
+        agent,
+        agent,
+        &real,
+        "57943a39: the same shape under a real ed25519 verifier",
+        t0 + Duration::days(1),
+    )
+    .await;
+    let resp = verify(&pool, control).await;
+    assert_eq!(
+        bound(&resp),
+        (
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::from("unattested")
+        ),
+        "the ed25519 control must still verify through the bare key: {resp}"
+    );
+}
