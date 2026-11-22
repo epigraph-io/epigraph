@@ -1201,6 +1201,18 @@ impl GraphViewRepository {
     /// Both endpoints must be in the set for an edge to be returned, so an edge
     /// survives exactly when both of its endpoints did.
     ///
+    /// # One row per fact
+    ///
+    /// One `(source, target, relationship)` fact can be stored as several rows:
+    /// the document ingest keeps one marked row of an `agent -asserts-> claim`
+    /// (or `paper -asserts-> claim`, `agent -authored-> paper`) fact per ingest
+    /// principal (`crate::ingest_written`), and nothing else enforces triple
+    /// uniqueness since migrations 017/018/053. A graph view draws a fact once,
+    /// so this returns one row per fact (backlog 11402482): the oldest visible
+    /// row, by `created_at` then `id`. The visibility predicate sits in the
+    /// `WHERE`, before `DISTINCT ON` picks, so the representative is always a
+    /// row the viewer can read.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, node_ids))]
@@ -1210,11 +1222,13 @@ impl GraphViewRepository {
         node_ids: &[Uuid],
     ) -> Result<Vec<SubgraphEdgeRow>, DbError> {
         let sql = viewer.splice(
-            "SELECT id, source_id, target_id, source_type, target_type, \
+            "SELECT DISTINCT ON (source_id, target_id, relationship) \
+                    id, source_id, target_id, source_type, target_type, \
                     relationship, properties \
              FROM edges \
              WHERE source_id = ANY($1) AND target_id = ANY($1) \
-               /* {EDGE_VISIBILITY:edges} */",
+               /* {EDGE_VISIBILITY:edges} */ \
+             ORDER BY source_id, target_id, relationship, created_at, id",
             2,
         );
         let mut q = sqlx::query_as::<_, SubgraphEdgeRow>(&sql).bind(node_ids);

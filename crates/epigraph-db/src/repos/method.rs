@@ -426,21 +426,32 @@ impl MethodRepository {
         viewer: &crate::visibility::Viewer,
         method_id: Uuid,
     ) -> Result<MethodEvidenceStrength, sqlx::Error> {
-        // The `edges` marker sits in the LEFT JOIN's ON clause, not the WHERE.
-        // In a WHERE it would null-filter the outer side and silently turn the
-        // LEFT JOIN into an inner join, dropping claims that simply have no
-        // visible asserting paper.
+        // One row per CLAIM, then the papers counted on their own. Joining the
+        // asserting edges onto the claims and aggregating the product counted
+        // and averaged each claim once per asserting row (backlog 11402482):
+        // a claim two papers assert, or one paper two ingest principals each
+        // hold a marked row of (`crate::ingest_written`), weighed twice.
+        //
+        // `method_claims` carries the claims predicate; `source_count` is a
+        // scalar subquery so a claim with no visible asserting paper still
+        // counts toward `claim_count` and `avg_belief` (what the earlier LEFT
+        // JOIN, with its edge marker in the ON, preserved).
         let sql = viewer.splice(
-            "SELECT \
-                 AVG(COALESCE(c.pignistic_prob, c.truth_value)) AS avg_belief, \
+            "WITH method_claims AS ( \
+                 SELECT DISTINCT c.id, COALESCE(c.pignistic_prob, c.truth_value) AS belief \
+                 FROM methods m \
+                 CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
+                 JOIN claims c ON c.id = scid \
+                 WHERE m.id = $1 /* {VISIBILITY:c} */ \
+             ) \
+             SELECT \
+                 AVG(mc.belief) AS avg_belief, \
                  COUNT(*) AS claim_count, \
-                 COUNT(DISTINCT e.source_id) AS source_count \
-             FROM methods m \
-             CROSS JOIN LATERAL unnest(m.source_claim_ids) AS scid \
-             JOIN claims c ON c.id = scid \
-             LEFT JOIN edges e ON e.target_id = c.id AND e.source_type = 'paper' AND e.relationship = 'asserts' \
-                 /* {EDGE_VISIBILITY:e} */ \
-             WHERE m.id = $1 /* {VISIBILITY:c} */",
+                 (SELECT COUNT(DISTINCT e.source_id) \
+                    FROM edges e JOIN method_claims ec ON ec.id = e.target_id \
+                   WHERE e.source_type = 'paper' AND e.relationship = 'asserts' \
+                     /* {EDGE_VISIBILITY:e} */) AS source_count \
+             FROM method_claims mc",
             2,
         );
         let mut q = sqlx::query_as::<_, MethodEvidenceStrengthRow>(&sql).bind(method_id);
