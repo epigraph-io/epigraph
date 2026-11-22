@@ -733,7 +733,9 @@ const TOOLS: Surface = Surface {
 /// The population is every fn under `src/tools/`, and in the crate-root files
 /// a tool hands its viewer to (`claim_helper.rs`, `maintenance.rs`, ..; see
 /// [`root_files`]), that takes a `Viewer` or binds one (`request_viewer`,
-/// `Viewer::resolve`, a `unwrap_or(viewer)` fallback). The `#[tool]` methods
+/// `Viewer::resolve`, a `unwrap_or(viewer)` fallback, or a field destructured
+/// from a viewer-carrier struct such as `label_dedup.rs::UnitContext`; see
+/// [`viewer_carrier_structs_are_reviewed`]). The `#[tool]` methods
 /// in `server.rs` are not in it: each resolves the viewer and hands it to a fn
 /// here, and none touches a pool, a connection or a repository itself
 /// (measured 2026-11-22). Viewer-taking fns in other crates a tool calls
@@ -1254,6 +1256,26 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // no SQL: `prepare`.
     ("label_dedup.rs", "apply_label_dedup", &["prepare"]),
+    // The viewer arrives inside `UnitContext` and is destructured. write:
+    // `ClaimRepository::mark_duplicate_act_attributed_conn`, on the
+    // author-stamped transaction, after `cross_owner`, `member_not_owned` and
+    // `canonical_refusal` read every member and canonical through the viewer;
+    // it returns the identity edge's id. opener:
+    // `claim_helper::begin_author_stamped_tx`. maintenance:
+    // `maintenance::admin_cascade_session`; audit:
+    // `admin_cascade::record_deferral` (the deferral row on the act's own
+    // transaction). The cascade itself (`apply_after_dedup`) is handed the
+    // viewer and filters its report to the caller.
+    (
+        "label_dedup.rs",
+        "apply_unit",
+        &[
+            "ClaimRepository::mark_duplicate_act_attributed_conn",
+            "admin_cascade::record_deferral",
+            "claim_helper::begin_author_stamped_tx",
+            "maintenance::admin_cascade_session",
+        ],
+    ),
     // authority: `owner_of`.
     ("label_dedup.rs", "cross_owner", &["owner_of"]),
     // authority: `is_foreign_duplicate`.
@@ -1876,6 +1898,9 @@ fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
         // A viewer resolved in the body (`Viewer::resolve`), not a parameter.
         ("recall.rs", "recall_audit_owner_group"),
         ("workflow_authority.rs", "stdio_workflow_authority"),
+        // A viewer destructured from a struct (`let UnitContext { server,
+        // viewer, .. } = *ctx;`), not a parameter.
+        ("label_dedup.rs", "apply_unit"),
     ] {
         assert!(
             pop.contains(&(file.to_string(), f.to_string())),
@@ -1897,12 +1922,12 @@ fn the_per_call_scanner_sees_the_whole_tool_viewer_surface() {
     );
     assert!(
         fns >= 180,
-        "found {fns} viewer-holding tool fns; measured 210 on 2026-11-22 (198 under \
+        "found {fns} viewer-holding tool fns; measured 211 on 2026-11-22 (199 under \
          src/tools/, 12 in the crate-root helpers)"
     );
     assert!(
         calls >= 650,
-        "found {calls} database calls in them; measured 775 on 2026-11-22"
+        "found {calls} database calls in them; measured 785 on 2026-11-22"
     );
 }
 
@@ -2014,5 +2039,103 @@ pub async fn holds_no_viewer(server: &EpiGraphMcpFull, id: Uuid) -> R {
     assert!(
         !m.contains_key(&("fixture.rs".to_string(), "holds_no_viewer".to_string())),
         "a fn that holds no viewer is not in the population"
+    );
+}
+
+/// A viewer that arrives inside a struct and is destructured (`let Ctx {
+/// server, viewer, .. } = *ctx;`) is held: the fn is in the population and the
+/// destructured server's pool is a database handle. `label_dedup.rs::apply_unit`
+/// has this shape.
+#[test]
+fn the_per_call_scanner_reads_a_viewer_destructured_from_a_struct() {
+    let src = r##"
+struct Ctx<'a> {
+    server: &'a EpiGraphMcpFull,
+    viewer: &'a epigraph_db::visibility::Viewer,
+    #[allow(dead_code)]
+    pub(crate) run_tag: &'a str,
+}
+
+async fn apply(ctx: &Ctx<'_>, id: Uuid) -> R {
+    let Ctx { server, viewer, .. } = *ctx;
+    let n = Repo::count_as(&server.pool, viewer).await?;
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(&server.pool)
+        .await?;
+    Ok((n, content))
+}
+
+async fn renamed(ctx: &Ctx<'_>, id: Uuid) -> R {
+    let Ctx {
+        server: s,
+        viewer: v,
+        ..
+    } = *ctx;
+    let c = Repo::get(&s.pool, id).await?;
+    let d = Repo::get_as(&s.pool, v, id).await?;
+    Ok((c, d))
+}
+"##;
+    let m = tool_unviewed(src);
+    assert_eq!(
+        tool_labels(&m, "apply"),
+        vec!["sqlx::query_scalar(SELECT).fetch_one"],
+        "a destructured viewer is held, and the unviewed content read on the \
+         destructured server's pool is reported"
+    );
+    assert_eq!(
+        tool_labels(&m, "renamed"),
+        vec!["Repo::get"],
+        "a field bound under another name (`server: s`, `viewer: v`) is classified \
+         by the field's declared type"
+    );
+}
+
+/// Viewer-carrier structs (a struct with a `Viewer` field) are an exact,
+/// reviewed set, and every fn that takes one as a parameter is in the
+/// population. A carrier read through field access (`ctx.viewer`) rather than
+/// destructured would not be: adding one fails here first.
+#[test]
+fn viewer_carrier_structs_are_reviewed() {
+    let files: Vec<(String, String)> = tool_files().into_iter().chain(root_files()).collect();
+    let mut carriers = Vec::new();
+    for (file, src) in &files {
+        let (code, _) = viewer_calls::views(src);
+        for name in viewer_calls::viewer_carriers(&viewer_calls::struct_fields(&code)) {
+            carriers.push((file.clone(), name));
+        }
+    }
+    assert_eq!(
+        carriers,
+        vec![("label_dedup.rs".to_string(), "UnitContext".to_string())],
+        "the structs that carry a viewer into a tool fn changed; check that every fn \
+         receiving one is measured (destructure it, or teach the scanner its access \
+         shape), then update this list"
+    );
+    let (_, _, _, pop) = measure_tools();
+    let mut takers = Vec::new();
+    for (file, src) in &files {
+        let (code, sql) = viewer_calls::views(src);
+        for h in viewer_calls::fn_headers(&code, &sql) {
+            let takes = h.params.iter().any(|(_, ty)| {
+                carriers
+                    .iter()
+                    .any(|(_, c)| ty.trim_start_matches('&').starts_with(c.as_str()))
+            });
+            if takes {
+                takers.push((file.clone(), h.name.clone()));
+                assert!(
+                    pop.contains(&(file.clone(), h.name.clone())),
+                    "{file}::{} takes a viewer-carrier struct but is not in the measured \
+                     population",
+                    h.name
+                );
+            }
+        }
+    }
+    assert!(
+        takers.contains(&("label_dedup.rs".to_string(), "apply_unit".to_string())),
+        "the carrier check found no taker: {takers:?}"
     );
 }

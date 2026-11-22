@@ -297,16 +297,20 @@ fn excluded_spans(code: &str, sql: &str) -> Vec<(usize, usize)> {
 /// One viewer-holding fn.
 pub struct Holder {
     pub name: String,
-    /// The viewer variables: its viewer parameter, and every `let` binding of
-    /// a viewer constructor or of an `unwrap_or(<viewer>)` fallback.
+    /// The viewer variables: its viewer parameter, a viewer field bound by a
+    /// struct-pattern `let` (`let Ctx { viewer, .. } = *ctx;`), and every
+    /// `let` binding of a viewer constructor or of an `unwrap_or(<viewer>)`
+    /// fallback.
     pub viewers: Vec<String>,
     pub body: (usize, usize),
-    /// Parameters typed as a pool (`&PgPool`, `&ScopedPool`).
+    /// Parameters (or destructured struct fields) typed as a pool (`&PgPool`,
+    /// `&ScopedPool`).
     pub pools: Vec<String>,
-    /// Parameters typed as a connection or executor: any use inside a call is
-    /// a database call.
+    /// Parameters (or destructured struct fields) typed as a connection or
+    /// executor: any use inside a call is a database call.
     pub conns: Vec<String>,
-    /// Parameters typed as the application handle.
+    /// Parameters (or destructured struct fields) typed as the application
+    /// handle.
     pub states: Vec<String>,
 }
 
@@ -408,8 +412,184 @@ fn executor_generics(generics: &str, where_clause: &str) -> Vec<String> {
     out
 }
 
-/// Every viewer-holding `fn` in `code`.
-pub fn holders(code: &str, sql: &str, surface: &Surface) -> Vec<Holder> {
+/// The kind of database-relevant value a parameter or field type names.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Viewer,
+    Pool,
+    Conn,
+    State,
+    Other,
+}
+
+/// Classify a flattened parameter or field type. `exec` holds the fn's
+/// executor-bounded generic parameters.
+fn classify(ty: &str, surface: &Surface, exec: &[String]) -> Kind {
+    if is_viewer_type(ty) {
+        return Kind::Viewer;
+    }
+    if ty.contains("PgPool") || ty.contains("ScopedPool") {
+        return Kind::Pool;
+    }
+    let conn = [
+        "PgConnection",
+        "ScopedRead",
+        "ScopedTx",
+        "Transaction<",
+        "PgExecutor",
+        "Executor<",
+        "Acquire<",
+    ]
+    .iter()
+    .any(|t| ty.contains(t))
+        || exec.iter().any(|e| {
+            let bare = ty.trim_start_matches('&').trim_start_matches("mut");
+            bare == e
+        });
+    if conn {
+        return Kind::Conn;
+    }
+    if surface.state_types.iter().any(|t| ty.contains(t)) {
+        return Kind::State;
+    }
+    Kind::Other
+}
+
+/// `struct name -> [(field, flattened type)]` for every braced struct in
+/// `code` (the code view). A fn can receive its viewer inside one of these and
+/// destructure it (`let UnitContext { server, viewer, .. } = *ctx;`), which a
+/// scan of parameter types alone does not see.
+pub type Structs = BTreeMap<String, Vec<(String, String)>>;
+
+/// Every braced `struct` in `code` with its named fields.
+pub fn struct_fields(code: &str) -> Structs {
+    let s = code.as_bytes();
+    let mut out = Structs::new();
+    for at in words(code, "struct", 0, s.len()) {
+        let mut j = skip_ws(s, at + "struct".len());
+        let name = ident_at(s, j).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        j = skip_ws(s, j + name.len());
+        if j < s.len() && s[j] == b'<' {
+            j = skip_ws(s, close_of(s, j) + 1);
+        }
+        // A `where` clause before the body.
+        if s[j..].starts_with(b"where") {
+            match find(s, b"{", j) {
+                Some(b) if !matches!(find(s, b";", j), Some(semi) if semi < b) => j = b,
+                _ => continue,
+            }
+        }
+        if j >= s.len() || s[j] != b'{' {
+            continue;
+        }
+        let close = close_of(s, j);
+        let mut fields = Vec::new();
+        for part in split_top(&s[j + 1..close]) {
+            let mut part = std::str::from_utf8(part).expect("ASCII struct body").trim();
+            // Attributes on the field (`#[serde(default)]`).
+            while part.starts_with("#[") {
+                let pb = part.as_bytes();
+                let end = close_of(pb, 1);
+                part = part[end + 1..].trim_start();
+            }
+            if let Some(rest) = part.strip_prefix("pub") {
+                let rest = rest.trim_start();
+                part = if rest.starts_with('(') {
+                    rest[close_of(rest.as_bytes(), 0) + 1..].trim_start()
+                } else {
+                    rest
+                };
+            }
+            let Some(colon) = part.find(':') else {
+                continue;
+            };
+            let fname = part[..colon].trim();
+            if fname.is_empty() || !fname.bytes().all(is_ident) || part[colon..].starts_with("::")
+            {
+                continue;
+            }
+            fields.push((fname.to_string(), flat_type(&part[colon + 1..])));
+        }
+        out.insert(name, fields);
+    }
+    out
+}
+
+/// Every struct in `structs` with a field typed as a `Viewer`: a value that
+/// carries a viewer into a fn.
+pub fn viewer_carriers(structs: &Structs) -> Vec<String> {
+    structs
+        .iter()
+        .filter(|(_, fields)| fields.iter().any(|(_, ty)| is_viewer_type(ty)))
+        .map(|(n, _)| n.clone())
+        .collect()
+}
+
+/// `let <Path> { f, g: alias, mut h, .. } = <rhs>;` struct-pattern bindings in
+/// `[a, b)`, as `(struct name, field, bound name)`.
+fn struct_lets(code: &str, a: usize, b: usize) -> Vec<(String, String, String)> {
+    let s = code.as_bytes();
+    let mut out = Vec::new();
+    for at in words(code, "let", a, b) {
+        let start = skip_ws(s, at + 3);
+        let mut j = start;
+        while j < b && (is_ident(s[j]) || s[j] == b':') {
+            j += 1;
+        }
+        let path = &code[start..j];
+        let name = path.rsplit("::").next().unwrap_or(path);
+        if !name.as_bytes().first().is_some_and(u8::is_ascii_uppercase) {
+            continue;
+        }
+        // Generic arguments on the pattern's path (`Ctx::<'_> { .. }`).
+        if j < b && s[j] == b'<' {
+            j = close_of(s, j) + 1;
+        }
+        j = skip_ws(s, j);
+        if j >= b || s[j] != b'{' {
+            continue;
+        }
+        let close = close_of(s, j);
+        for part in split_top(&s[j + 1..close]) {
+            let part = std::str::from_utf8(part).expect("ASCII pattern").trim();
+            if part.is_empty() || part == ".." {
+                continue;
+            }
+            let (field, bound) = match part.split_once(':') {
+                Some((f, alias)) => (f.trim(), alias.trim()),
+                None => (part, part),
+            };
+            let field = field
+                .trim_start_matches("ref ")
+                .trim_start_matches("mut ")
+                .trim();
+            let bound = bound
+                .trim_start_matches("ref ")
+                .trim_start_matches("mut ")
+                .trim();
+            if field.bytes().all(is_ident) && !bound.is_empty() && bound.bytes().all(is_ident) {
+                out.push((name.to_string(), field.to_string(), bound.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// One `fn` item with a body: its name, its typed parameters, its
+/// executor-bounded generics and its body span.
+pub struct FnHeader {
+    pub name: String,
+    /// `(name, flattened type)` of each typed parameter.
+    pub params: Vec<(String, String)>,
+    exec: Vec<String>,
+    pub body: (usize, usize),
+}
+
+/// Every `fn` with a body in `code`, outside the [`excluded_spans`].
+pub fn fn_headers(code: &str, sql: &str) -> Vec<FnHeader> {
     let s = code.as_bytes();
     let excluded = excluded_spans(code, sql);
     let mut out = Vec::new();
@@ -444,14 +624,54 @@ pub fn holders(code: &str, sql: &str, surface: &Surface) -> Vec<Holder> {
         let where_clause = sig_tail
             .find("where")
             .map_or("", |w| &sig_tail[w + "where".len()..]);
-        let typed = typed_params(params);
-        let body = (brace, close_of(s, brace));
+        out.push(FnHeader {
+            name,
+            params: typed_params(params),
+            exec: executor_generics(generics, where_clause),
+            body: (brace, close_of(s, brace)),
+        });
+    }
+    out
+}
 
-        let mut viewers: Vec<String> = typed
-            .iter()
-            .filter(|(_, ty)| is_viewer_type(ty))
-            .map(|(n, _)| n.clone())
+/// Every viewer-holding `fn` in `code`. `structs` are the struct definitions
+/// in scope (see [`struct_fields`]); a struct-pattern `let` of one binds each
+/// named field by its declared type.
+pub fn holders(code: &str, sql: &str, surface: &Surface, structs: &Structs) -> Vec<Holder> {
+    let mut out = Vec::new();
+    for FnHeader {
+        name,
+        params,
+        exec,
+        body,
+    } in fn_headers(code, sql)
+    {
+        // Parameters, then the fields a struct-pattern `let` binds, each
+        // classified by its declared type.
+        let mut typed: Vec<(String, Kind)> = params
+            .into_iter()
+            .map(|(n, ty)| {
+                let k = classify(&ty, surface, &exec);
+                (n, k)
+            })
             .collect();
+        for (st, field, bound) in struct_lets(code, body.0, body.1) {
+            let Some(fields) = structs.get(&st) else {
+                continue;
+            };
+            if let Some((_, ty)) = fields.iter().find(|(f, _)| *f == field) {
+                typed.push((bound, classify(ty, surface, &exec)));
+            }
+        }
+        let of = |k: Kind| -> Vec<String> {
+            typed
+                .iter()
+                .filter(|(_, kind)| *kind == k)
+                .map(|(n, _)| n.clone())
+                .collect()
+        };
+
+        let mut viewers = of(Kind::Viewer);
         for (v, _, at, ra, rb) in lets(code, body.0, body.1) {
             let rhs = &code[ra..rb];
             let flat: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
@@ -470,46 +690,13 @@ pub fn holders(code: &str, sql: &str, surface: &Surface) -> Vec<Holder> {
         if viewers.is_empty() {
             continue;
         }
-
-        let exec = executor_generics(generics, where_clause);
-        let pools = typed
-            .iter()
-            .filter(|(_, ty)| ty.contains("PgPool") || ty.contains("ScopedPool"))
-            .map(|(n, _)| n.clone())
-            .collect();
-        let conns = typed
-            .iter()
-            .filter(|(_, ty)| {
-                [
-                    "PgConnection",
-                    "ScopedRead",
-                    "ScopedTx",
-                    "Transaction<",
-                    "PgExecutor",
-                    "Executor<",
-                    "Acquire<",
-                ]
-                .iter()
-                .any(|t| ty.contains(t))
-                    || exec.iter().any(|e| {
-                        let bare = ty.trim_start_matches('&').trim_start_matches("mut");
-                        bare == e
-                    })
-            })
-            .map(|(n, _)| n.clone())
-            .collect();
-        let states = typed
-            .iter()
-            .filter(|(_, ty)| surface.state_types.iter().any(|t| ty.contains(t)))
-            .map(|(n, _)| n.clone())
-            .collect();
         out.push(Holder {
             name,
             viewers,
             body,
-            pools,
-            conns,
-            states,
+            pools: of(Kind::Pool),
+            conns: of(Kind::Conn),
+            states: of(Kind::State),
         });
     }
     out
@@ -1219,7 +1406,7 @@ pub fn measure_source(
     pop: &mut Population,
 ) -> (usize, usize) {
     let (code, sql) = views(src);
-    let hs = holders(&code, &sql, surface);
+    let hs = holders(&code, &sql, surface, &struct_fields(&code));
     let mut n_calls = 0;
     for h in &hs {
         pop.insert((file.to_string(), h.name.clone()));
