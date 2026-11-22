@@ -10,10 +10,12 @@
 //! otherwise read as a restore that "worked"). Restored values are compared
 //! with what the database held before the run, never with a value this file
 //! computes. The sentinel sits on a frame with no BBA, so the recompute also
-//! moves `belief_frame_id` and the restore has to put it back;
-//! `classification` does not move in these fixtures (the recompute leaves
-//! the seeded value), so its restore is not exercised here; the other six
-//! cache columns move and are put back.
+//! moves `belief_frame_id` and the restore has to put it back. The recompute
+//! writes `classification` only when the owner frame is `binary_truth`, so
+//! the fresh-frame fixtures leave it as seeded; one test
+//! (`a_classification_the_recompute_moves_is_recorded_and_restored`, backlog
+//! 1ea4f6bf) owns its claim's cache from `binary_truth`, so all seven cache
+//! columns move and are put back.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -848,6 +850,98 @@ async fn a_run_without_snapshot_still_writes_and_records_nothing(pool: PgPool) {
         files,
         vec![std::ffi::OsString::from("ids.txt")],
         "a file was written"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── classification (backlog 1ea4f6bf) ────────────────────────────────────────
+
+/// The canonical `binary_truth` frame, created as the engine creates it when
+/// the migrated database does not already hold it.
+async fn binary_frame(pool: &PgPool) -> Uuid {
+    if let Some(id) = sqlx::query_scalar("SELECT id FROM frames WHERE name = 'binary_truth'")
+        .fetch_optional(pool)
+        .await
+        .expect("look up binary_truth")
+    {
+        return id;
+    }
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, description, hypotheses) \
+         VALUES ('binary_truth', 'Canonical binary frame: {TRUE, FALSE}', \
+                 ARRAY['TRUE', 'FALSE']) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("create binary_truth")
+}
+
+/// `classification` is the one cache column the fresh-frame fixtures never
+/// move: the recompute writes it only on `binary_truth`. Here the claim's
+/// only input is on `binary_truth`, so the recompute replaces the sentinel
+/// label with the classifier's verdict, the record carries both labels, and
+/// the restore puts the sentinel label back (with the other six columns).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_classification_the_recompute_moves_is_recorded_and_restored(pool: PgPool) {
+    let db = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let owner = agent(&pool).await;
+    let binary = binary_frame(&pool).await;
+    let sentinel_frame = frame(&pool).await;
+    let id = claim(&pool, owner).await;
+    bba(&pool, id, binary, owner, 0.9).await;
+    let sentinel = set_sentinel(&pool, id, sentinel_frame, 0.0).await;
+    assert_eq!(sentinel.classification.as_deref(), Some("sentinel"));
+
+    let wave = dir.join("wave.jsonl");
+    let list = write_ids(&dir, &[id]);
+    run(
+        RECOMPUTE,
+        &dir,
+        &db,
+        &["--input", s(&list), "--snapshot", s(&wave)],
+    )
+    .ok("recompute --snapshot on binary_truth");
+
+    let written = cache(&pool, id).await;
+    assert_eq!(
+        written.belief_frame_id,
+        Some(binary),
+        "the cache is not owned from binary_truth, so the classification test proves nothing"
+    );
+    let label = written
+        .classification
+        .clone()
+        .expect("a binary_truth recompute writes a classification");
+    assert_ne!(
+        label, "sentinel",
+        "the recompute did not move the classification"
+    );
+    let records = wave_records(&wave);
+    assert_eq!(records.len(), 1, "one record: {records:?}");
+    assert_eq!(
+        records[0].before.classification.as_deref(),
+        Some("sentinel"),
+        "the record's `before` lost the prior classification"
+    );
+    assert_eq!(
+        records[0].written.classification.as_deref(),
+        Some(label.as_str()),
+        "the record's `written` is not the classification the run left"
+    );
+
+    let r = run(RESTORE, &dir, &db, &["--from", s(&wave)]);
+    r.ok("restore --from");
+    assert_eq!(r.count("restored"), 1);
+    let restored = cache(&pool, id).await;
+    assert_eq!(
+        restored.classification.as_deref(),
+        Some("sentinel"),
+        "the restore did not put back the moved classification"
+    );
+    assert_eq!(
+        restored, sentinel,
+        "the restore did not put back the exact prior cache"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
