@@ -17,8 +17,13 @@
 --   * drops the trigger `events_assessment_guard` and its function
 --     `epigraph_events_assessment_guard()`. An application session can then
 --     again insert a `claim.assessed` row naming any slot row; the API and
---     MCP layers still refuse the type on their caller-typed surfaces.
---   No binary depends on section 2.
+--     MCP layers still refuse the type on their caller-typed surfaces;
+--   * drops the masses-write triggers `mass_functions_masses_written_ins` and
+--     `mass_functions_masses_written_upd`, their function
+--     `epigraph_mass_function_masses_written()`, the table
+--     `mass_function_masses_writes` and `epigraph_event_type_norm(text)`.
+--   No binary reads the table or calls the functions; the binary that skips
+--   the record for an identical re-assessment runs unchanged without them.
 --
 -- WHAT IT LEAVES: 250's `_sqlx_migrations` row. Re-introducing any of this is
 -- a NEW migration, never a re-run of 250.
@@ -34,6 +39,11 @@ DO $$ BEGIN
 END $$;
 DROP TRIGGER IF EXISTS events_assessment_guard ON public.events;
 DROP FUNCTION IF EXISTS public.epigraph_events_assessment_guard();
+DROP TRIGGER IF EXISTS mass_functions_masses_written_ins ON public.mass_functions;
+DROP TRIGGER IF EXISTS mass_functions_masses_written_upd ON public.mass_functions;
+DROP FUNCTION IF EXISTS public.epigraph_mass_function_masses_written();
+DROP TABLE IF EXISTS public.mass_function_masses_writes;
+DROP FUNCTION IF EXISTS public.epigraph_event_type_norm(text);
 DROP FUNCTION IF EXISTS public.epigraph_prune_telemetry_events(integer);
 DROP FUNCTION IF EXISTS public.epigraph_prunable_event_types();
 

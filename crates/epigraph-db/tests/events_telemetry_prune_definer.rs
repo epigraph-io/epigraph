@@ -286,7 +286,8 @@ async fn the_definers_type_list_is_prunable_event_types(pool: PgPool) {
 
 /// `docs/runbooks/250-undo.sql` restores the posture before 250 (the
 /// maintenance role's UPDATE and DELETE on `events`, no prune definer, no
-/// `claim.assessed` guard), and can be run twice.
+/// `claim.assessed` guard, no masses-write table, triggers or function), and
+/// can be run twice.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_250_undo_restores_the_maintenance_grants(pool: PgPool) {
     let undo = std::fs::read_to_string(concat!(
@@ -318,5 +319,21 @@ async fn the_250_undo_restores_the_maintenance_grants(pool: PgPool) {
         (true, true, true, true, true, true),
         "(maintenance DELETE, maintenance UPDATE, prune definer gone, type list gone, \
          assessment guard function gone, its trigger gone)"
+    );
+    let stamp: (bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT to_regprocedure('public.epigraph_mass_function_masses_written()') IS NULL, \
+                to_regprocedure('public.epigraph_event_type_norm(text)') IS NULL, \
+                NOT EXISTS (SELECT 1 FROM pg_trigger \
+                             WHERE tgrelid = 'public.mass_functions'::regclass \
+                               AND tgname LIKE 'mass_functions_masses_written_%'), \
+                to_regclass('public.mass_function_masses_writes') IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("catalog");
+    assert_eq!(
+        stamp,
+        (true, true, true, true),
+        "(stamp function gone, type normaliser gone, stamp triggers gone, table gone)"
     );
 }

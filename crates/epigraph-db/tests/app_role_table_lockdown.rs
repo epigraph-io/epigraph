@@ -123,6 +123,10 @@ const CLOSED: &[&str] = &[
     // Migration 165: an authority table (which role confers which group),
     // written only by maintenance definers or a guarded maintenance statement.
     "group_role_bindings",
+    // Migration 250: which transaction last wrote each mass function's masses,
+    // the `claim.assessed` guard's authority; written only by the masses-write
+    // trigger definer, and the application role holds no privilege on it.
+    "mass_function_masses_writes",
     // Migration 194 (H10): the retracted-BBA purge grants, written and cleared
     // only by `epigraph_purge_mass_functions`; the application role holds no
     // privilege on it.
@@ -169,6 +173,9 @@ const NO_WRITE: &[&str] = &[
     "harvester_audit_reports",
     "harvester_enriched_concepts",
     "harvester_sources",
+    // Migration 250: written only by the masses-write trigger definer; the
+    // application role holds no privilege at all, SELECT included.
+    "mass_function_masses_writes",
     // Migration 194: written only by the maintenance purge definer; the
     // application role holds no privilege at all, SELECT included.
     "mass_function_purge_grants",

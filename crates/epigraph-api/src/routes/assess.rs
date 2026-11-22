@@ -40,15 +40,22 @@ use uuid::Uuid;
 /// `publish_event` tool, refuse it, so through the API only this route's
 /// slot transaction writes it. The database holds the same line (migration
 /// 250's `events_assessment_guard`): outside a maintenance session a row of
-/// this type is admitted only when it records a slot row written for its
-/// claim, frame and owner in the SAME transaction, with `actor_id` equal to
-/// `assessed_by`. That is why the record is written inside `slot_tx` (and
-/// must stay outside any savepoint there). It binds the record to a write,
-/// not to an identity: a session that may write the slot row can still name
-/// a false `assessed_by` for its own write, so the record is the server's
-/// account of a write, not a cryptographic proof of authorship. Before the
-/// reservation the REST path accepted this type, so a row of it older than
-/// the reservation may have been filed by a caller rather than by this route.
+/// this type is admitted only when the SAME transaction wrote the masses of
+/// the slot row it names (`mass_function_masses_writes`, written only by a
+/// trigger and only when `masses` changes), for its claim, frame and
+/// owner, with `actor_id` equal to `assessed_by`. That is why the record is
+/// written inside `slot_tx` (a savepoint there is fine: the stamp is the
+/// top-level transaction's), and why a call that re-writes the masses the
+/// slot already holds files no record: it wrote no masses, and the slot's
+/// last record still names the writer of the masses it holds.
+///
+/// It binds the record to a write of the masses, not to an identity. The
+/// tenancy GUCs are session-settable, so any holder of an application DSN can
+/// genuinely rewrite a slot row's masses and hold a true record of that
+/// write; the record is the server's account of a write, not a cryptographic
+/// proof of authorship. Before the reservation the REST path accepted this
+/// type, so a row of it older than the reservation may have been filed by a
+/// caller rather than by this route.
 pub const ASSESSMENT_EVENT_TYPE: &str = epigraph_db::EventRepository::ASSESSMENT_EVENT_TYPE;
 
 // =============================================================================
@@ -413,6 +420,27 @@ pub async fn assess_claim(
             }
         })
         .collect();
+    // Whether the slot already holds exactly these masses (the row is locked
+    // until `slot_tx` ends). An upsert of identical masses writes no masses,
+    // so migration 250's `events_assessment_guard` refuses a record of it:
+    // the record is filed only for a write that changes the slot's masses,
+    // and the slot's last record keeps naming the writer of the masses it
+    // holds. A plain jsonb comparison, so it answers the same before 250.
+    let masses_unchanged = match owner {
+        Some(o) => {
+            epigraph_db::MassFunctionRepository::slot_holds_masses(
+                &mut *slot_tx,
+                &viewer,
+                claim_id,
+                frame_id,
+                o,
+                slot,
+                &bba_json,
+            )
+            .await?
+        }
+        None => false,
+    };
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
         &mut *slot_tx,
         claim_id,
@@ -437,25 +465,28 @@ pub async fn assess_claim(
     // failed insert refuses the call) because a record that can silently go
     // missing leaves the write untraced, the defect it exists to close. The
     // challenge event's savepoint-wrapped `publish_or_log_conn` is the wrong
-    // contract here for that reason.
-    epigraph_db::EventRepository::insert_on(
-        &mut *slot_tx,
-        ASSESSMENT_EVENT_TYPE,
-        caller,
-        &serde_json::json!({
-            "claim_id": claim_id,
-            "frame_id": frame_id,
-            "mass_function_id": mf_id,
-            "owner_agent_id": owner,
-            "assessed_by": caller,
-            "replaced": !replaced_assessments.is_empty(),
-            "contested": replaced_assessments.iter().any(|r| r.contested),
-        }),
-    )
-    .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("record the assessment's writer: {e}"),
-    })?;
+    // contract here for that reason. None when the call re-wrote the masses
+    // the slot already held (above).
+    if !masses_unchanged {
+        epigraph_db::EventRepository::insert_on(
+            &mut *slot_tx,
+            ASSESSMENT_EVENT_TYPE,
+            caller,
+            &serde_json::json!({
+                "claim_id": claim_id,
+                "frame_id": frame_id,
+                "mass_function_id": mf_id,
+                "owner_agent_id": owner,
+                "assessed_by": caller,
+                "replaced": !replaced_assessments.is_empty(),
+                "contested": replaced_assessments.iter().any(|r| r.contested),
+            }),
+        )
+        .await
+        .map_err(|e| ApiError::InternalError {
+            message: format!("record the assessment's writer: {e}"),
+        })?;
+    }
     slot_tx
         .commit()
         .await

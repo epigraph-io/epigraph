@@ -2,9 +2,9 @@
 --   1. The maintenance role prunes telemetry only through a type-restricted
 --      definer and loses its table-wide DELETE and UPDATE on `events`
 --      (backlog 062d7767).
---   2. A `claim.assessed` row is refused unless it records a slot write made
---      in the same transaction, or comes from a maintenance session (backlog
---      a278f16d).
+--   2. A `claim.assessed` row is refused unless it records a write of a slot
+--      row's masses made in the same transaction, or comes from a maintenance
+--      session (backlog a278f16d).
 --
 -- ===================================================================
 -- 1. TELEMETRY-ONLY PRUNE (backlog 062d7767)
@@ -104,52 +104,129 @@
 -- real slot row's `mass_function_id` and be credited, by that rule, as the
 -- writer of its masses.
 --
--- WHAT IT DOES. A BEFORE INSERT OR UPDATE row trigger on `events`,
--- `events_assessment_guard`, runs `epigraph_events_assessment_guard()` for
--- any row whose lower-cased type contains `claim.assessed` (the trigger's
--- WHEN clause, so every other event pays nothing beyond that test). The body:
---   * admits a row whose type, trimmed and lower-cased, is not exactly
---     `claim.assessed` (e.g. `claim.assessed.v2` is another type);
---   * admits any session `epigraph_bypass()` admits (maintenance logins, the
---     migration / superuser DSN): repair and backfill stay possible;
---   * refuses (42501) any spelling other than the exact `claim.assessed`
---     (padded or re-cased), as the API layer does;
---   * otherwise requires the payload to name, as uuids, `mass_function_id`,
---     `claim_id`, `frame_id`, `owner_agent_id` and `assessed_by`, the row's
---     `actor_id` to equal `assessed_by`, and a `mass_functions` row with that
---     id, claim, frame and `source_agent_id = owner_agent_id` whose `xmin` is
---     THIS transaction: the slot write the record describes must have been
---     made in the same transaction, which is exactly what the assess route
---     does (slot upsert and record in one `slot_tx`; the upsert's
---     ON CONFLICT DO UPDATE writes a new row version, so a replacement counts).
+-- WHAT IT DOES.
+--   * `mass_function_masses_writes (mass_function_id, written_xact xid8)`: per
+--     mass function, the top-level transaction that last wrote its masses.
+--     Written only by the SECURITY DEFINER trigger function
+--     `epigraph_mass_function_masses_written()`, which two AFTER row triggers
+--     on `mass_functions` run: `mass_functions_masses_written_ins` on every
+--     INSERT and `mass_functions_masses_written_upd` on an UPDATE `WHEN
+--     (OLD.masses IS DISTINCT FROM NEW.masses)` (jsonb equality). It upserts
+--     `pg_current_xact_id()` for the row. The application role holds no
+--     privilege on the table (SELECT included), so no caller sets a stamp;
+--     the maintenance role holds SELECT / INSERT / UPDATE (the two definers
+--     it owns need them). No FK and no row per existing mass function: a
+--     missing row matches no transaction, a stale row (its mass function
+--     deleted) names a transaction that is over, and xid8 values are never
+--     reused, so neither can match a later transaction.
+--   * `epigraph_event_type_norm(text)`: the type as `is_reserved_type` reads
+--     it: Unicode whitespace trimmed at both ends (the White_Space set Rust's
+--     `str::trim` strips, NBSP and the U+2000 block included), lower-cased.
+--     IMMUTABLE; the guard and the README's classification query both use it.
+--   * The BEFORE INSERT OR UPDATE row trigger `events_assessment_guard` on
+--     `events` runs `epigraph_events_assessment_guard()` for any row whose
+--     lower-cased type contains `claim.assessed` (its WHEN clause, so every
+--     other event pays nothing beyond that test). The body:
+--       - admits a row whose normalised type is not exactly `claim.assessed`
+--         (e.g. `claim.assessed.v2` is another type);
+--       - admits any session `epigraph_bypass()` admits (maintenance logins,
+--         the migration / superuser DSN): repair and backfill stay possible;
+--       - refuses (42501) any spelling other than the exact `claim.assessed`
+--         (padded, Unicode-padded or re-cased), as the API layer does;
+--       - otherwise requires the payload to name, as uuids,
+--         `mass_function_id`, `claim_id`, `frame_id`, `owner_agent_id` and
+--         `assessed_by`, the row's `actor_id` to equal `assessed_by`, a
+--         `mass_functions` row with that id, claim, frame and
+--         `source_agent_id = owner_agent_id`, and a `mass_function_masses_writes`
+--         row for it whose `written_xact` EQUALS `pg_current_xact_id()` (xid8
+--         equality): this transaction wrote that row's masses. That is exactly
+--         what the assess route does (slot upsert and record in one `slot_tx`).
 --     Anything else is refused with 42501, never 22P02.
+--
+-- WHY xid8, AND WHY ONLY A MASSES WRITE COUNTS, NOT `xmin`. An earlier draft
+-- compared `mf.xmin` with the current xid modulo 2^32. `xmin` is the raw
+-- 32-bit xid (freezing keeps it), so after an epoch wrap an OLD row whose
+-- xmin equals the current xid modulo 2^32 would satisfy the bind; and a row
+-- written under a SAVEPOINT carries the subtransaction's xid, so a genuine
+-- write there was refused. `pg_current_xact_id()` is the 64-bit, epoch-aware
+-- id of the TOP-level transaction, also inside a subtransaction (a write
+-- rolled back to its savepoint takes its stamp with it). And `xmin` changes
+-- on ANY update: a stranger's stamped session (the tenancy GUCs are
+-- session-settable, so an application-DSN holder can stamp itself into the
+-- row's writable group) could run `UPDATE mass_functions SET masses = masses`
+-- on someone else's row and then file a record naming it. The stamp moves
+-- only when the masses change, so a no-op or tenancy-only update (unretract,
+-- the 114/115 BBA moves, the reown sweep) credits no one. A transaction-local
+-- GUC marker was rejected (the attacker's session can set it), as was a write
+-- counter bumped by every upsert (the trigger cannot tell the route's upsert
+-- from the stranger's no-op one).
+--
+-- WHY A SIDE TABLE, NOT A COLUMN ON `mass_functions`. A stamp column would
+-- change every `mass_functions` row image (`to_jsonb(mf.*)`), which the
+-- restore tools store and compare byte for byte: the K10 sweep's undo
+-- re-inserts a row from its image and its re-run probe reads "already
+-- restored" only when the live row equals the image, so a restored row whose
+-- stamp is the restore's transaction would read as superseded. The side
+-- table keeps the row shape, and "no caller sets the stamp" is a privilege
+-- (no grant), not a trigger that overrides what a statement supplied.
+--
+-- RE-ASSESSING IDENTICAL MASSES. A call whose upsert writes exactly the masses
+-- the slot already holds changes no masses, so its record would be refused.
+-- The route (`assess_claim`) therefore asks, under the slot lock and before
+-- the upsert, whether the slot already holds those masses
+-- (`MassFunctionRepository::slot_holds_masses`, which locks the row), and
+-- files no record when it does: the slot's writer record stays the one that
+-- wrote those masses.
 --
 -- WHY A VALIDATING TRIGGER, NOT A DEFINER THE ROUTE CALLS. The fix sketch
 -- named "the assess path's definer". A definer the application role may call
 -- with a caller-built payload would admit the same forgery the table did; what
--- closes it is the binding to the slot row written in the same transaction,
--- and a trigger enforces that on every path, the shipped route included. It
--- also needs no binary change: the shipped route already writes the record
--- this way, so the migration may be applied before or after the binary.
+-- closes it is the binding to the masses written in the same transaction, and
+-- a trigger enforces that on every path, the shipped route included.
 --
--- THE BODY. SECURITY DEFINER owned by `epigraph_maintenance` on 172's path
--- (`pg_catalog, pg_temp`, every public name qualified), so its read of
--- `mass_functions` is not filtered by row security (`epigraph_definer_bypass()`
--- admits the owner), and `epigraph_bypass()` still reads `session_user`, the
--- caller. EXECUTE revoked from PUBLIC (a trigger function is not checked at
--- fire time). The `xmin` comparison is against the top-level transaction id,
--- so the slot write must not be inside a SAVEPOINT; the route takes none.
+-- THE BODIES. Both SECURITY DEFINER, owned by `epigraph_maintenance` (as 194's
+-- purge-grant definers are), on 172's path (`pg_catalog, pg_temp`, every
+-- public name qualified), so the guard's read of `mass_functions` is not
+-- filtered by row security (`epigraph_definer_bypass()` admits the owner),
+-- and `epigraph_bypass()` still reads `session_user`, the caller. EXECUTE
+-- revoked from PUBLIC (a trigger function is not checked at fire time).
 --
--- RESIDUAL. A session that can write the slot row itself (row security admits
--- the owner's writers) can still record a false `assessed_by` for its own
--- write: the database binds the record to a write, not to an identity it
--- cannot authenticate (the tenancy GUCs are session-settable). Rows written
--- before this migration are not checked: a `claim.assessed` row older than the
--- reservation may have been filed by a caller. Classifying them is an
--- operator data-repair step (README entry for 250 has the query); this file
--- changes no row.
+-- EVERY WRITER OF `mass_functions.masses`, RE-ENUMERATED (crates/*/src and
+-- every migration function body), each stamped as a write of the masses:
+--   * INSERT: the slot upsert (`MassFunctionRepository::store_with_perspective`,
+--     whose ON CONFLICT DO UPDATE is stamped only when the masses differ),
+--     plain inserts (dekg and the other ingestion paths), the K10 sweep's
+--     undo (`k10_retro::RESTORE_ROW_SQL`) and the dedup revert's restore
+--     (`ClaimRepository`, `jsonb_populate_recordset`), both re-inserting a
+--     deleted row by id on the maintenance connection;
+--   * UPDATE: `edge_rewire::restore_edge_rows` (a compare-and-swap that puts
+--     a rewired edge factor's masses back), on its operator connection.
+--   No migration-defined function sets `masses`; the other UPDATE writers
+--   (114/115 BBA moves, 184 retract / unretract, the dedup repair's moves,
+--   `backfill_evidence_type`, backfill_factors) change tenancy or bookkeeping
+--   columns only and are not stamped. None of the restore paths files a
+--   `claim.assessed` record, so being stamped changes nothing for them.
 --
--- DEPLOY ORDER for section 2: none against the binaries.
+-- RESIDUAL. The database binds the record to a write of the masses, not to an
+-- identity it cannot authenticate: because the tenancy GUCs are
+-- session-settable, any application-DSN holder can genuinely rewrite a slot
+-- row's masses (or write them away and back in one transaction) and then
+-- holds a TRUE record of that write, naming itself or any `assessed_by` equal
+-- to its `actor_id`. Closing that needs an unforgeable session identity, not
+-- an events guard. Each masses write now costs one upsert into the side
+-- table; the side table keeps one row per mass function ever written after
+-- this migration (rows of deleted mass functions are not removed). Rows of
+-- `events` written before this migration are not checked: a `claim.assessed`
+-- row older than the reservation may have been filed by a caller. Classifying
+-- them is an operator data-repair step (README entry for 250 has the
+-- procedure); this file changes no `events` row.
+--
+-- DEPLOY ORDER for section 2 (one way): deploy the binary whose
+-- `assess_claim` skips the record for identical masses BEFORE or WITH this
+-- migration. That binary runs on either side of it (its check is a plain
+-- jsonb comparison). The shipped binary on top of this migration answers 500
+-- to a re-assessment with identical masses (its slot transaction rolls back;
+-- no data changes); every other call works.
 --
 -- UNDO: docs/runbooks/250-undo.sql (both sections).
 -- Checked before claiming: slot 250 was assigned to this batch; no origin
@@ -218,6 +295,70 @@ END $$;
 -- Section 2: the `claim.assessed` guard.
 -- ===================================================================
 
+-- The type as `EventRepository::is_reserved_type` reads it: the White_Space
+-- characters Rust's `str::trim` strips (U+0009..U+000D, U+0020, U+0085,
+-- U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, U+3000),
+-- trimmed at both ends, then lower-cased.
+CREATE OR REPLACE FUNCTION public.epigraph_event_type_norm(p_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+SET search_path = pg_catalog, pg_temp AS $$
+    SELECT pg_catalog.lower(pg_catalog.regexp_replace(
+        p_type,
+        '^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+'
+        '|[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$',
+        '', 'g'))
+$$;
+
+CREATE TABLE IF NOT EXISTS public.mass_function_masses_writes (
+    mass_function_id uuid PRIMARY KEY,
+    written_xact     xid8 NOT NULL
+);
+COMMENT ON TABLE public.mass_function_masses_writes IS
+    'Migration 250 (backlog a278f16d): per mass_functions id, the top-level transaction (xid8) '
+    'that last wrote its masses. Written only by epigraph_mass_function_masses_written (AFTER '
+    'INSERT, and AFTER UPDATE when masses change); read by epigraph_events_assessment_guard. '
+    'The application role holds no privilege on it.';
+
+REVOKE ALL ON public.mass_function_masses_writes FROM PUBLIC;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE ALL ON public.mass_function_masses_writes FROM epigraph_app';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE ON public.mass_function_masses_writes '
+                'TO epigraph_maintenance';
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_mass_function_masses_written()
+RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+BEGIN
+    INSERT INTO public.mass_function_masses_writes AS w (mass_function_id, written_xact)
+    VALUES (NEW.id, pg_catalog.pg_current_xact_id())
+    ON CONFLICT (mass_function_id) DO UPDATE
+       SET written_xact = EXCLUDED.written_xact
+     WHERE w.written_xact IS DISTINCT FROM EXCLUDED.written_xact;
+    RETURN NULL;
+END $$;
+
+REVOKE EXECUTE ON FUNCTION public.epigraph_mass_function_masses_written() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS mass_functions_masses_written_ins ON public.mass_functions;
+CREATE TRIGGER mass_functions_masses_written_ins
+    AFTER INSERT ON public.mass_functions
+    FOR EACH ROW
+    EXECUTE FUNCTION public.epigraph_mass_function_masses_written();
+
+DROP TRIGGER IF EXISTS mass_functions_masses_written_upd ON public.mass_functions;
+CREATE TRIGGER mass_functions_masses_written_upd
+    AFTER UPDATE ON public.mass_functions
+    FOR EACH ROW
+    WHEN (OLD.masses IS DISTINCT FROM NEW.masses)
+    EXECUTE FUNCTION public.epigraph_mass_function_masses_written();
+
 CREATE OR REPLACE FUNCTION public.epigraph_events_assessment_guard()
 RETURNS trigger
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
@@ -232,9 +373,7 @@ DECLARE
     v_by uuid;
     v_found boolean;
 BEGIN
-    IF pg_catalog.lower(pg_catalog.regexp_replace(NEW.event_type,
-                                                  '^[[:space:]]+|[[:space:]]+$', '', 'g'))
-       IS DISTINCT FROM 'claim.assessed' THEN
+    IF public.epigraph_event_type_norm(NEW.event_type) IS DISTINCT FROM 'claim.assessed' THEN
         RETURN NEW;
     END IF;
     IF public.epigraph_bypass() THEN
@@ -266,12 +405,13 @@ BEGIN
            AND mf.claim_id = (NEW.payload ->> 'claim_id')::uuid
            AND mf.frame_id = (NEW.payload ->> 'frame_id')::uuid
            AND mf.source_agent_id = (NEW.payload ->> 'owner_agent_id')::uuid
-           AND mf.xmin::text
-               = (pg_catalog.pg_current_xact_id()::text::numeric % 4294967296)::text
+           AND EXISTS (SELECT 1 FROM public.mass_function_masses_writes w
+                        WHERE w.mass_function_id = mf.id
+                          AND w.written_xact = pg_catalog.pg_current_xact_id())
     ) INTO v_found;
     IF NOT v_found THEN
-        RAISE EXCEPTION 'claim.assessed is reserved for the assess path: mass function % was not '
-                        'written for this claim, frame and owner in this transaction', v_mf
+        RAISE EXCEPTION 'claim.assessed is reserved for the assess path: this transaction wrote '
+                        'no masses of mass function % for this claim, frame and owner', v_mf
             USING ERRCODE = '42501';
     END IF;
     RETURN NEW;
@@ -282,6 +422,8 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_events_assessment_guard() FROM PUBLIC
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'epigraph_maintenance') THEN
         EXECUTE 'ALTER FUNCTION public.epigraph_events_assessment_guard() '
+                'OWNER TO epigraph_maintenance';
+        EXECUTE 'ALTER FUNCTION public.epigraph_mass_function_masses_written() '
                 'OWNER TO epigraph_maintenance';
     END IF;
 END $$;

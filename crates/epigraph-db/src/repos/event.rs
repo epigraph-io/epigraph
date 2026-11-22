@@ -54,10 +54,13 @@ impl EventRepository {
     ///
     /// The database enforces `claim.assessed` too (migration 250's
     /// `events_assessment_guard`): outside a maintenance session it admits the
-    /// row only when it records a `mass_functions` row written for the named
-    /// claim, frame and owner in the same transaction, with `actor_id` equal
-    /// to `assessed_by`, and refuses every other spelling. A new reserved type
-    /// needs its own database guard; this list does not create one.
+    /// row only when the same transaction wrote the masses of the
+    /// `mass_functions` row it names (`mass_function_masses_writes`), for the named
+    /// claim, frame and owner, with `actor_id` equal to `assessed_by`, and
+    /// refuses every other spelling, read as this function reads it
+    /// (`epigraph_event_type_norm`: Unicode whitespace trimmed, lower-cased).
+    /// A new reserved type needs its own database guard; this list does not
+    /// create one.
     pub const RESERVED_EVENT_TYPES: &'static [&'static str] = &[Self::ASSESSMENT_EVENT_TYPE];
 
     /// Whether a caller-supplied `event_type` names a reserved type.

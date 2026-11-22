@@ -3438,41 +3438,75 @@ restart.
   Before migrating, measure who owns `public.events` and whether that role is
   a member of `epigraph_maintenance` (the migration refuses if so).
   **Section 2** (backlog a278f16d): `claim.assessed` is reserved in the
-  database, not only at the REST and MCP publish surfaces. The BEFORE INSERT
+  database, not only at the REST and MCP publish surfaces. New table
+  `mass_function_masses_writes (mass_function_id PK, written_xact xid8)`: the
+  top-level transaction that last wrote each mass function's masses, upserted
+  by the maintenance-owned definer `epigraph_mass_function_masses_written()`
+  from two AFTER row triggers on `mass_functions` (`..._ins` on INSERT,
+  `..._upd` WHEN `OLD.masses IS DISTINCT FROM NEW.masses`). The application
+  role holds no privilege on it; maintenance holds SELECT, INSERT, UPDATE. A
+  side table rather than a column so `mass_functions` row images (stored and
+  compared byte for byte by the K10 undo and other restore tools) keep their
+  shape. The BEFORE INSERT
   OR UPDATE row trigger `events_assessment_guard` (WHEN the lower-cased type
   contains `claim.assessed`) runs the maintenance-owned definer
   `epigraph_events_assessment_guard()` (172's path, EXECUTE revoked from
   PUBLIC): a maintenance or superuser session (`epigraph_bypass()`) is
-  admitted; any other session is refused 42501 for a padded or re-cased
-  spelling, and for the exact type unless the payload's `mass_function_id`,
-  `claim_id`, `frame_id`, `owner_agent_id` name a `mass_functions` row written
-  IN THIS TRANSACTION (`xmin`, top-level) for that claim, frame and
-  `source_agent_id`, and `actor_id = assessed_by`. That is the assess route's
-  own shape (slot upsert and record in one transaction), so no binary change
-  is needed; it closes the forgery of a record naming another writer's slot
-  row. A validating trigger rather than a route-called definer: a definer the
-  application role calls with its own payload would admit the same forgery.
-  Residual: a session that may write the slot row can still name a false
-  `assessed_by` for its own write. Pinned by
+  admitted; any other session is refused 42501 for a padded (Unicode
+  whitespace included, `epigraph_event_type_norm(text)` mirrors Rust's
+  `str::trim`) or re-cased spelling, and for the exact type unless the
+  payload's `mass_function_id`, `claim_id`, `frame_id`, `owner_agent_id` name a
+  `mass_functions` row for that claim, frame and `source_agent_id` whose
+  `mass_function_masses_writes.written_xact = pg_current_xact_id()`, and
+  `actor_id = assessed_by`.
+  So a record needs a masses write in the same transaction: a stranger's
+  self-stamped no-op UPDATE (`SET masses = masses`), a caller-written stamp, a
+  tenancy-only update, a savepoint rolled back, or a 32-bit xid match from
+  another epoch is refused; a write under a savepoint is admitted. A validating
+  trigger rather than a route-called definer: a definer the application role
+  calls with its own payload would admit the same forgery. `assess_claim` asks
+  `MassFunctionRepository::slot_holds_masses` (row locked) before its upsert
+  and files no record when the slot already holds those masses (that upsert
+  writes no masses, so its record would be refused). Residual: the tenancy
+  GUCs are session-settable, so any application-DSN holder can genuinely
+  rewrite a slot row's masses (or write them away and back) and hold a true
+  record of that write; the database binds the record to a masses write, not
+  to an authenticated identity. Pinned by
   `epigraph-db/tests/assessment_event_reservation.rs` (forgeries, spellings
-  and malformed ids refused on a stamped `epigraph_app` session, the route's
-  shape admitted and each binding field mutated, a row from an earlier
-  transaction refused, maintenance admitted) and
-  `epigraph-api/tests/assess_writer_recorded.rs` (the route, unchanged).
-  **Deploy order for section 2:** none. **Operator data repair (not done by
-  the migration):** rows of the type written before 250 are unchecked; after
-  migrating, classify them with
-  `SELECT e.id, e.created_at, e.actor_id, CASE WHEN mf.id IS NULL THEN
-  'no_slot_row' WHEN mf.claim_id::text IS DISTINCT FROM e.payload->>'claim_id'
-  OR mf.frame_id::text IS DISTINCT FROM e.payload->>'frame_id' OR
+  and malformed ids refused on a stamped `epigraph_app` session; the route's
+  shape admitted and each binding field mutated; the stranger's touch and
+  stamp write refused, a real rewrite admitted; savepoint and nested
+  writes admitted, a rolled-back one refused; the epoch-aware bind; identical
+  masses not recordable and detected; maintenance admitted, a pin) and
+  `epigraph-api/tests/assess_writer_recorded.rs` (the route; an identical
+  re-assessment on an application-role pool answers 200 with no second
+  record). Undo: `docs/runbooks/250-undo.sql` (drops the table and its
+  triggers too). Every masses write now costs one side-table upsert; rows of
+  deleted mass functions are not removed (they name finished transactions).
+  **Deploy order for section 2 (one way):** deploy the binary whose
+  `assess_claim` skips the record for identical masses before or with 250;
+  it runs on either side of it. The older binary on top of 250 answers 500 to
+  an identical re-assessment (rolled back, nothing changes).
+  **Operator data repair (not done by the migration):** rows of the type
+  written before 250 are unchecked. `events.created_at` and
+  `events.graph_version` are both caller-supplied, so neither is a trustworthy
+  cut-off: IMMEDIATELY BEFORE applying 250, snapshot the ids, on the owner
+  DSN, e.g. `CREATE TABLE ops_pre250_assessed AS SELECT id FROM events WHERE
+  strpos(lower(event_type), 'claim.assessed') > 0` (deliberately broad: the
+  guard's own WHEN test), then after migrating classify
+  exactly those ids with `SELECT e.id, e.event_type, e.created_at, e.actor_id,
+  CASE WHEN epigraph_event_type_norm(e.event_type) <> 'claim.assessed' THEN
+  'other_type' WHEN mf.id IS NULL THEN 'no_slot_row' WHEN
+  mf.claim_id::text IS DISTINCT FROM e.payload->>'claim_id' OR
+  mf.frame_id::text IS DISTINCT FROM e.payload->>'frame_id' OR
   mf.source_agent_id::text IS DISTINCT FROM e.payload->>'owner_agent_id' THEN
   'fields_mismatch' WHEN e.actor_id::text IS DISTINCT FROM
-  e.payload->>'assessed_by' THEN 'actor_not_assessed_by' ELSE 'consistent' END
-  FROM events e LEFT JOIN mass_functions mf ON mf.id::text =
-  e.payload->>'mass_function_id' WHERE lower(btrim(e.event_type)) =
-  'claim.assessed' AND e.created_at < (SELECT installed_on FROM
-  _sqlx_migrations WHERE version = 250)` (on the owner DSN; `consistent` is
-  necessary, not sufficient, for a genuine record).
+  e.payload->>'assessed_by' THEN 'actor_not_assessed_by' ELSE 'consistent'
+  END FROM events e JOIN ops_pre250_assessed p ON p.id = e.id LEFT JOIN
+  mass_functions mf ON mf.id::text = e.payload->>'mass_function_id'`
+  (`consistent` is necessary, not sufficient, for a genuine record). Rows
+  outside the snapshot passed the guard, so the procedure can only
+  over-classify. Drop the snapshot table afterwards.
 
 ## `-- no-transaction` migrations
 

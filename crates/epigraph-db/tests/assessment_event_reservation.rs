@@ -15,15 +15,28 @@
 //! # What is pinned
 //!
 //! * an application session cannot insert a `claim.assessed` row naming a
-//!   mass function it did not write in the same transaction, nor any
-//!   near-miss spelling of the type, nor one with a malformed id (42501,
-//!   never 22P02); its other events still land (red on the base: every
-//!   forged insert lands);
+//!   mass function whose masses it did not write in the same transaction,
+//!   nor any near-miss spelling of the type (Unicode padding included), nor
+//!   one with a malformed id (42501, never 22P02); its other events still
+//!   land (red on the base: every forged insert lands);
 //! * the assess route's shape still lands on an application session: the
 //!   slot upsert and the record in ONE transaction, the record's
 //!   `claim_id` / `frame_id` / `owner_agent_id` naming that row and its
 //!   `actor_id` equal to `assessed_by`; each mismatch is refused;
-//! * a maintenance session may still write one.
+//! * a stranger that stamps itself into the slot row's writable group (the
+//!   tenancy GUCs are session-settable) and runs a no-op UPDATE of the row,
+//!   or writes the `mass_function_masses_writes` stamp itself (no privilege:
+//!   42501), still cannot file a record naming it; one that really rewrites
+//!   the masses can (the documented residual);
+//! * a slot write made under a SAVEPOINT (or a sqlx nested transaction) is
+//!   recorded, and one rolled back to its savepoint is not;
+//! * the bind is a 64-bit (epoch-aware) comparison: a stamp equal to this
+//!   transaction's id modulo 2^32 but from another epoch is refused;
+//! * an upsert of identical masses writes no masses, so it cannot be
+//!   recorded, and `MassFunctionRepository::slot_holds_masses` says so
+//!   before the upsert (the route then files no record);
+//! * a maintenance session may still write one (a PIN: it passes on the base
+//!   too, where nothing guarded the type).
 //!
 //! Every app-role check runs on a real `epigraph_app` session stamped as
 //! `ScopedPool::begin_as` would stamp it: the superuser fixture pool would be
@@ -172,7 +185,7 @@ async fn store<'e, E: sqlx::PgExecutor<'e>>(ex: E, w: &World, owner: Uuid) -> Uu
 async fn assessed_rows(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM events \
-          WHERE lower(btrim(event_type, E' \\t\\n\\r')) = 'claim.assessed'",
+          WHERE epigraph_event_type_norm(event_type) = 'claim.assessed'",
     )
     .fetch_one(pool)
     .await
@@ -207,7 +220,17 @@ async fn an_application_session_cannot_forge_an_assessment_record(pool: PgPool) 
     assert_eq!(code(raw), Err("42501".to_string()), "raw INSERT");
     // Near-miss spellings are refused outright: no reader has a reason to
     // accept one, and the API layer refuses them too.
-    for spelling in ["  claim.assessed\t", "Claim.Assessed", "CLAIM.ASSESSED\n"] {
+    // Unicode padding included: `is_reserved_type` trims with Rust's
+    // `str::trim`, which strips NBSP and the U+2000 block, and so must the
+    // database (a POSIX `[[:space:]]` trim under a C ctype does not).
+    for spelling in [
+        "  claim.assessed\t",
+        "Claim.Assessed",
+        "CLAIM.ASSESSED\n",
+        "claim.assessed\u{a0}",
+        "\u{2003}claim.assessed",
+        "claim.assessed\u{3000}",
+    ] {
         assert_eq!(
             code(EventRepository::insert(&app, spelling, Some(w.other), &forged).await),
             Err("42501".to_string()),
@@ -306,7 +329,9 @@ async fn an_application_session_records_an_assessment_of_its_own_slot_write(pool
     assert_eq!(assessed_rows(&pool).await, 1, "only the genuine record");
 }
 
-/// The maintenance role is trusted to write one (repair and backfill).
+/// The maintenance role is trusted to write one (repair and backfill). A
+/// PIN, not a proving test: it passes on the base too, where nothing guarded
+/// the type.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_maintenance_session_may_record_an_assessment(pool: PgPool) {
     let w = world(&pool, "t62-maint").await;
@@ -322,4 +347,357 @@ async fn a_maintenance_session_may_record_an_assessment(pool: PgPool) {
     .expect("a maintenance session writes an assessment record");
     maint.close().await;
     assert_eq!(assessed_rows(&pool).await, 1);
+}
+
+/// The record the route writes for `mf`, on `w.claim` / `w.frame`.
+async fn file_record<'e, E: sqlx::PgExecutor<'e>>(
+    ex: E,
+    w: &World,
+    mf: Uuid,
+    owner: Uuid,
+    by: Uuid,
+) -> Result<Uuid, String> {
+    code(
+        EventRepository::insert_on(ex, "claim.assessed", Some(by), &record(w, mf, owner, by)).await,
+    )
+}
+
+/// The slot row's owning group, read on the harness connection.
+async fn owner_group_of(pool: &PgPool, mf: Uuid) -> Uuid {
+    sqlx::query_scalar("SELECT owner_group_id FROM mass_functions WHERE id = $1")
+        .bind(mf)
+        .fetch_one(pool)
+        .await
+        .expect("slot row's owning group")
+}
+
+/// The stranger's recipe from the review of the first draft (which bound the
+/// record to `xmin`): an application-DSN holder stamps itself into the slot
+/// row's writable group, touches the row without changing its masses, and
+/// files a record naming it. Red on that draft: the no-op UPDATE gave the row
+/// this transaction's `xmin`, and the forged record landed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stranger_cannot_claim_a_slot_row_by_touching_it(pool: PgPool) {
+    let w = world(&pool, "t62-touch").await;
+    // The victim writes its slot row and its record, as the route does.
+    let victim = app_pool_for(&pool, w.agent).await;
+    let mut tx = victim.begin().await.expect("begin");
+    let real = store(&mut *tx, &w, w.agent).await;
+    file_record(&mut *tx, &w, real, w.agent, w.agent)
+        .await
+        .expect("the victim's genuine record");
+    tx.commit().await.expect("commit");
+    victim.close().await;
+    let group = owner_group_of(&pool, real).await;
+
+    let stranger = app_pool_for(&pool, w.other).await;
+    let self_stamp = "SELECT set_config('epigraph.writable_group_ids', $1, true), \
+                             set_config('epigraph.group_ids', $1, true)";
+
+    // (1) A no-op UPDATE of the masses.
+    let mut tx = stranger.begin().await.expect("begin");
+    sqlx::query(self_stamp)
+        .bind(group.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("self-stamp");
+    let touched = sqlx::query("UPDATE mass_functions SET masses = masses WHERE id = $1")
+        .bind(real)
+        .execute(&mut *tx)
+        .await
+        .expect("PREMISE: the self-stamped stranger may update the row")
+        .rows_affected();
+    assert_eq!(
+        touched, 1,
+        "PREMISE: the stranger's no-op UPDATE hit the row"
+    );
+    assert_eq!(
+        file_record(&mut *tx, &w, real, w.agent, w.other).await,
+        Err("42501".to_string()),
+        "a record of a row whose masses this transaction did not change"
+    );
+    tx.rollback().await.expect("rollback");
+
+    // (2) The stamp written by the caller itself: the application role holds
+    // no privilege on `mass_function_masses_writes`, so neither an INSERT nor
+    // an UPDATE of it lands (each in its own transaction: a refused statement
+    // aborts the transaction).
+    for plant in [
+        "INSERT INTO mass_function_masses_writes (mass_function_id, written_xact) \
+         VALUES ($1, pg_current_xact_id()) \
+         ON CONFLICT (mass_function_id) DO UPDATE SET written_xact = EXCLUDED.written_xact",
+        "UPDATE mass_function_masses_writes SET written_xact = pg_current_xact_id() \
+          WHERE mass_function_id = $1",
+    ] {
+        let mut tx = stranger.begin().await.expect("begin");
+        sqlx::query(self_stamp)
+            .bind(group.to_string())
+            .execute(&mut *tx)
+            .await
+            .expect("self-stamp");
+        let planted = sqlx::query(plant)
+            .bind(real)
+            .execute(&mut *tx)
+            .await
+            .map(|_| Uuid::nil());
+        assert_eq!(
+            code(planted),
+            Err("42501".to_string()),
+            "a caller-written stamp: {plant}"
+        );
+        tx.rollback().await.expect("rollback");
+    }
+    assert_eq!(assessed_rows(&pool).await, 1, "only the victim's record");
+
+    // (3) CONTROL, and the documented residual: a stranger that really
+    // rewrites the masses holds a true record of that write. Without this
+    // the refusals above could be the self-stamp failing, not the bind.
+    let mut tx = stranger.begin().await.expect("begin");
+    sqlx::query(self_stamp)
+        .bind(group.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("self-stamp");
+    sqlx::query(
+        "UPDATE mass_functions SET masses = '{\"0\": 0.9, \"0,1\": 0.1}'::jsonb WHERE id = $1",
+    )
+    .bind(real)
+    .execute(&mut *tx)
+    .await
+    .expect("the stranger rewrites the masses");
+    file_record(&mut *tx, &w, real, w.agent, w.other)
+        .await
+        .expect("a record of a masses write this transaction made");
+    tx.commit().await.expect("commit");
+    stranger.close().await;
+    assert_eq!(assessed_rows(&pool).await, 2);
+}
+
+/// The stamp is the TOP-level transaction's id, so a slot write made under a
+/// savepoint (an explicit SAVEPOINT, or a sqlx nested transaction) is
+/// recorded. Red on the first draft's `xmin` bind: the row carried the
+/// subtransaction's xid and the genuine record was refused.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_slot_write_made_under_a_savepoint_is_recorded(pool: PgPool) {
+    let w = world(&pool, "t62-savepoint").await;
+    let app = app_pool_for(&pool, w.agent).await;
+
+    // An explicit savepoint, released before the record.
+    let mut tx = app.begin().await.expect("begin");
+    sqlx::query("SAVEPOINT slot_write")
+        .execute(&mut *tx)
+        .await
+        .expect("savepoint");
+    let mf = store(&mut *tx, &w, w.agent).await;
+    sqlx::query("RELEASE SAVEPOINT slot_write")
+        .execute(&mut *tx)
+        .await
+        .expect("release");
+    file_record(&mut *tx, &w, mf, w.agent, w.agent)
+        .await
+        .expect("a slot write made under a released savepoint is recorded");
+    tx.commit().await.expect("commit");
+
+    // A sqlx nested transaction (a savepoint), new masses, recorded outside
+    // it; then a second nested write whose savepoint is rolled back is not
+    // this transaction's write any more.
+    let mut tx = app.begin().await.expect("begin");
+    {
+        let mut inner = sqlx::Acquire::begin(&mut *tx).await.expect("nested begin");
+        sqlx::query(
+            "UPDATE mass_functions SET masses = '{\"0\": 0.7, \"0,1\": 0.3}' WHERE id = $1",
+        )
+        .bind(mf)
+        .execute(&mut *inner)
+        .await
+        .expect("nested slot write");
+        inner
+            .commit()
+            .await
+            .expect("release the nested transaction");
+    }
+    file_record(&mut *tx, &w, mf, w.agent, w.agent)
+        .await
+        .expect("a slot write made in a nested transaction is recorded");
+    tx.commit().await.expect("commit");
+
+    let mut tx = app.begin().await.expect("begin");
+    {
+        let mut inner = sqlx::Acquire::begin(&mut *tx).await.expect("nested begin");
+        sqlx::query(
+            "UPDATE mass_functions SET masses = '{\"0\": 0.2, \"0,1\": 0.8}' WHERE id = $1",
+        )
+        .bind(mf)
+        .execute(&mut *inner)
+        .await
+        .expect("nested slot write");
+        inner.rollback().await.expect("roll the nested write back");
+    }
+    assert_eq!(
+        file_record(&mut *tx, &w, mf, w.agent, w.agent).await,
+        Err("42501".to_string()),
+        "a slot write rolled back to its savepoint is not this transaction's"
+    );
+    tx.rollback().await.expect("rollback");
+    app.close().await;
+    assert_eq!(assessed_rows(&pool).await, 2);
+}
+
+/// The bind compares full 64-bit, epoch-aware transaction ids. The first
+/// draft compared `xmin` (a raw 32-bit xid, which freezing keeps) with the
+/// current id modulo 2^32, so after a wrap an old row could match. A wrap
+/// cannot be produced in a test, so the stamp is planted directly in
+/// `mass_function_masses_writes` (superuser) and the record is then filed in
+/// the SAME transaction as an application session.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_bind_compares_epoch_aware_transaction_ids(pool: PgPool) {
+    let w = world(&pool, "t62-epoch").await;
+    let mf = store(&pool, &w, w.agent).await;
+    let v = Viewer::resolve(&pool, w.agent)
+        .await
+        .expect("resolve viewer");
+    let groups = csv(v.group_bind().expect("scoped viewer"));
+    let writable = csv(v.writable_groups());
+
+    // `offset` is added to this transaction's id to make the planted stamp:
+    // 2^32 is the same 32-bit xid in the next epoch.
+    for (offset, admitted) in [("0", true), ("4294967296", false)] {
+        let mut tx = pool.begin().await.expect("begin");
+        let planted = sqlx::query(
+            "UPDATE mass_function_masses_writes \
+                SET written_xact = \
+                    ((pg_current_xact_id()::text::numeric + $2::numeric)::text)::xid8 \
+              WHERE mass_function_id = $1",
+        )
+        .bind(mf)
+        .bind(offset)
+        .execute(&mut *tx)
+        .await
+        .expect("plant the stamp");
+        assert_eq!(
+            planted.rows_affected(),
+            1,
+            "PREMISE: the slot insert left a stamp row to plant over"
+        );
+        sqlx::query("SET LOCAL SESSION AUTHORIZATION epigraph_app")
+            .execute(&mut *tx)
+            .await
+            .expect("become the application role");
+        sqlx::query(
+            "SELECT set_config('epigraph.group_ids', $1, true), \
+                    set_config('epigraph.writable_group_ids', $2, true), \
+                    set_config('epigraph.principal_id', $3, true)",
+        )
+        .bind(&groups)
+        .bind(&writable)
+        .bind(w.agent.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("stamp the application session");
+        let r = file_record(&mut *tx, &w, mf, w.agent, w.agent).await;
+        if admitted {
+            r.expect("CONTROL: a stamp equal to this transaction's id is admitted");
+        } else {
+            assert_eq!(
+                r,
+                Err("42501".to_string()),
+                "a stamp from another epoch with the same 32-bit xid"
+            );
+        }
+        tx.rollback().await.expect("rollback");
+    }
+}
+
+/// The route's slot upsert: `w.agent`'s assessment slot on `w.claim` / `w.frame`.
+async fn store_slot(
+    conn: &mut sqlx::PgConnection,
+    w: &World,
+    slot: Uuid,
+    masses: &serde_json::Value,
+) -> Uuid {
+    MassFunctionRepository::store_with_perspective(
+        conn,
+        w.claim,
+        w.frame,
+        Some(w.agent),
+        Some(slot),
+        masses,
+        None,
+        Some("discount"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("the slot write")
+}
+
+/// An upsert of the masses the slot already holds writes no masses, so it is
+/// not recordable, and `slot_holds_masses` (which the route asks before the
+/// upsert, to file no record then) answers true for it and false for new
+/// masses or a slot with no row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identical_reassessment_writes_no_masses_and_is_detected(pool: PgPool) {
+    let w = world(&pool, "t62-same").await;
+    let app = app_pool_for(&pool, w.agent).await;
+    let viewer = Viewer::resolve(&pool, w.agent)
+        .await
+        .expect("resolve viewer");
+    let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(w.agent));
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, slot, Some(w.agent))
+        .await
+        .expect("the slot's perspective, as the route ensures it");
+    let same: serde_json::Value = serde_json::from_str(MASSES).expect("masses");
+    let other: serde_json::Value =
+        serde_json::from_str(r#"{"0": 0.3, "0,1": 0.7}"#).expect("masses");
+    let mut tx = app.begin().await.expect("begin");
+    assert!(
+        !MassFunctionRepository::slot_holds_masses(
+            &mut *tx, &viewer, w.claim, w.frame, w.agent, slot, &same
+        )
+        .await
+        .expect("ask"),
+        "no row yet"
+    );
+    let mf = store_slot(&mut tx, &w, slot, &same).await;
+    file_record(&mut *tx, &w, mf, w.agent, w.agent)
+        .await
+        .expect("the first write is recorded");
+    tx.commit().await.expect("commit");
+
+    let mut tx = app.begin().await.expect("begin");
+    assert!(
+        MassFunctionRepository::slot_holds_masses(
+            &mut *tx, &viewer, w.claim, w.frame, w.agent, slot, &same
+        )
+        .await
+        .expect("ask"),
+        "the slot already holds these masses"
+    );
+    let again = store_slot(&mut tx, &w, slot, &same).await;
+    assert_eq!(again, mf, "PREMISE: the upsert hit the same slot row");
+    assert_eq!(
+        file_record(&mut *tx, &w, mf, w.agent, w.agent).await,
+        Err("42501".to_string()),
+        "an upsert of identical masses wrote no masses"
+    );
+    tx.rollback().await.expect("rollback");
+
+    let mut tx = app.begin().await.expect("begin");
+    assert!(
+        !MassFunctionRepository::slot_holds_masses(
+            &mut *tx, &viewer, w.claim, w.frame, w.agent, slot, &other
+        )
+        .await
+        .expect("ask"),
+        "new masses"
+    );
+    store_slot(&mut tx, &w, slot, &other).await;
+    file_record(&mut *tx, &w, mf, w.agent, w.agent)
+        .await
+        .expect("a write of new masses is recorded");
+    tx.commit().await.expect("commit");
+    app.close().await;
+    assert_eq!(assessed_rows(&pool).await, 2);
 }

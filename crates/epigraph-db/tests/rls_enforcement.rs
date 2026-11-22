@@ -2072,11 +2072,19 @@ const COLUMN_RESTRICTED_SELECT: &[(&str, &str, &str)] = &[(
 /// Tables the application role must NOT read at all, by design: `(table,
 /// why)`. Exact in both directions: each must exist and grant `epigraph_app`
 /// no SELECT, table- or column-level.
-const NO_APP_SELECT: &[(&str, &str)] = &[(
-    "mass_function_purge_grants",
-    "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
-     (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
-)];
+const NO_APP_SELECT: &[(&str, &str)] = &[
+    (
+        "mass_function_masses_writes",
+        "migration 250 (backlog a278f16d): which transaction last wrote each mass function's \
+         masses; REVOKE ALL from epigraph_app, written by the masses-write trigger definer and \
+         read by the claim.assessed guard definer only",
+    ),
+    (
+        "mass_function_purge_grants",
+        "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
+         (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
+    ),
+];
 
 /// Every relation in `public` is reachable by `epigraph_app` on a FRESH migrate.
 ///
