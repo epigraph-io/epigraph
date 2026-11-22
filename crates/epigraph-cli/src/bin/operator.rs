@@ -621,7 +621,9 @@ enum Command {
         #[arg(long)]
         role: String,
         /// The identity the operator attached by name (and detached), whose
-        /// row the successor's stale copy chains through.
+        /// row the successor's stale copy chains through. It must have held
+        /// a row made by name for the role (refused ROL04 otherwise): a
+        /// middle identity that only ever held copies is not a root.
         #[arg(long)]
         root: Uuid,
         /// The identity the job runs now.

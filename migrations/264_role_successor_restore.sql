@@ -40,7 +40,11 @@
 --       is kept (`root_already_attached`; a `valid_to` other than NULL or
 --       that row's end is refused 22023). Otherwise `root` is attached by
 --       name now, until `valid_to` (`root_attached`), and 166's follow copies
---       into its successors' gaps as for any attach.
+--       into its successors' gaps as for any attach; but only when `root`
+--       has EVER held a row made by name for the role (any state), else
+--       ROL04, nothing written. An identity that only ever held copies is a
+--       middle identity: re-attaching it by name would undo its own sticky
+--       detach, or step around the detach of the root above it.
 --   (2) NOTHING TO DO. A successor that already holds a live row made by name
 --       is reported `successor_already_attached`; one whose copies covering
 --       the window all chain through LIVE rows (the root's follow just filled
@@ -189,6 +193,21 @@ BEGIN
         END IF;
         out_step := 'root_already_attached';
     ELSE
+        -- Only an identity the operator once attached BY NAME is a root this
+        -- verb re-attaches. An identity that only ever held succession copies
+        -- (a middle identity, its own detach sticky under 195) is not: naming
+        -- it would undo that detach, or step around the real root's detach.
+        IF NOT EXISTS (SELECT 1 FROM public.role_agents n
+                        WHERE n.agent_id = p_root AND n.role = p_role
+                          AND n.inherited_from IS NULL) THEN
+            RAISE EXCEPTION 'ROL04: % was never attached by name to %, so it is not a root this '
+                            'verb re-attaches: attaching it now would undo its own detach or step '
+                            'around the detach of the root it descends from', p_root, p_role
+                USING ERRCODE = 'ROL04',
+                      HINT = 'Nothing was written. Name the identity the operator attached by '
+                             'name, or attach this one with epigraph_attach_agent_to_role if '
+                             'that is meant.';
+        END IF;
         INSERT INTO public.role_agents (role, agent_id, valid_from, valid_to, reason)
         VALUES (p_role, p_root, v_now, p_valid_to, p_reason)
         RETURNING id INTO v_root_row;

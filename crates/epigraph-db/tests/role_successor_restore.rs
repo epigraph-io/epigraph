@@ -789,3 +789,80 @@ async fn a_successor_that_was_never_cut_off_is_left_as_it_is(pool: PgPool) {
         "a member"
     );
 }
+
+/// THE NAMED ROOT MUST HAVE BEEN ATTACHED BY NAME (review of 264). Naming a
+/// MIDDLE identity, one that only ever held succession copies, as `--root`
+/// would attach it by name and so:
+///
+/// * (a) undo the operator's own sticky detach of that middle identity (the
+///   real root still attached); or
+/// * (b) step around the detach of the real root above it.
+///
+/// Both are refused `ROL04` with nothing written: the middle identity gets no
+/// row made by name, and it and the successor stay out. CONTROL: in (b),
+/// naming the real root restores the successor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_root_never_attached_by_name_is_not_reattached(pool: PgPool) {
+    let (h, group) = attached_group_held(&pool, "Synthetic Restore Middle Root Team").await;
+
+    // (a) the root attached and live; the operator detached the mid.
+    let [root, mid, newest] = lineage(&pool, h, group, "g-job-1").await;
+    assert_eq!(detach_from_role(&pool, mid).await, 1, "mid detached");
+    assert_eq!(resolves(&pool, mid, group).await, (false, false), "PREMISE");
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (false, false),
+        "PREMISE"
+    );
+    assert_eq!(live_by_name(&pool, root).await, 1, "PREMISE: root live");
+    let before = footprint(&pool).await;
+    assert_refused(
+        &restore(&pool, mid, newest).await,
+        ROL04,
+        "never attached by name",
+        "(a) a sticky-detached middle identity named as the root",
+    );
+    assert_eq!(footprint(&pool).await, before, "(a) nothing written");
+    assert_eq!(
+        live_by_name(&pool, mid).await,
+        0,
+        "(a) the mid not attached"
+    );
+    assert_eq!(resolves(&pool, mid, group).await, (false, false), "(a) mid");
+    assert_eq!(
+        resolves(&pool, newest, group).await,
+        (false, false),
+        "(a) newest"
+    );
+
+    // (b) the real root detached; the mid never was.
+    let [root2, mid2, newest2] = lineage(&pool, h, group, "g-job-2").await;
+    assert_eq!(detach_from_role(&pool, root2).await, 1, "root2 detached");
+    let before = footprint(&pool).await;
+    assert_refused(
+        &restore(&pool, mid2, newest2).await,
+        ROL04,
+        "never attached by name",
+        "(b) a middle identity named in place of the detached root",
+    );
+    assert_eq!(footprint(&pool).await, before, "(b) nothing written");
+    assert_eq!(
+        live_by_name(&pool, mid2).await,
+        0,
+        "(b) the mid not attached"
+    );
+    assert_eq!(
+        resolves(&pool, newest2, group).await,
+        (false, false),
+        "(b) newest"
+    );
+
+    restore(&pool, root2, newest2)
+        .await
+        .expect("CONTROL: the real root named");
+    assert_eq!(
+        resolves(&pool, newest2, group).await,
+        (true, true),
+        "CONTROL"
+    );
+}
