@@ -12,7 +12,7 @@
 -- caller's row security. A step the caller cannot read is absent from that
 -- read, and the reader could only cut its list where the absence LEFT A
 -- TRACE: a gap in the `plan_index` ordinals it reads. `add_step` writes no
--- ordinal for a middle insert (ruling R-38) and rewires the `step_follows`
+-- ordinal for a middle insert and rewires the `step_follows`
 -- chain around it, so a step another group owns inside a plan's chain left
 -- none: its `executes` edge and both of its `step_follows` edges are its
 -- group's, the caller read `a, b, c` with contiguous ordinals, and listed `b`
@@ -46,10 +46,13 @@
 --   successors  the tokens this claim has a `step_follows` edge to, among the
 --               plan's own targets.
 --
--- The server runs the reader's own ordering code over the tokens, so a
--- caller's list is the PREFIX of the list an unrestricted reader gets that
--- ends at the first step the caller cannot read. No hidden claim id, content
--- or tenancy leaves the database.
+-- The server runs the reader's own ordering code over the tokens, so it
+-- learns the order an unrestricted reader gets, up to the first step the
+-- caller cannot read. It masks CLAIMS, not edges: a hidden edge whose ends the
+-- caller reads is returned like any other. The server therefore lists only
+-- the slots on which this order AGREES with the order the caller's own rows
+-- give (the order it is shown), so a hidden edge can refuse a slot but never
+-- move one. No hidden claim id, content or tenancy leaves the database.
 --
 -- What it DOES disclose, to whoever can EXECUTE it: the plan's shape for any
 -- workflow id named (how many `executes` edges, their levels and ordinals, and

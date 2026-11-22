@@ -1173,8 +1173,9 @@ impl WorkflowRepository {
     /// establish, in plan order: the lookup an outcome report maps each
     /// `step_index` through, shared by the MCP tool and the HTTP route so step
     /// N is one step on both transports. Element N is step N of the plan as a
-    /// reader of EVERY row orders it, and the list stops at the first step
-    /// `viewer` cannot read (or whose position the rule below cannot prove).
+    /// reader of EVERY row orders it AND the step `viewer` is shown at slot N;
+    /// the list stops at the first slot where the two differ, or that `viewer`
+    /// cannot read, or whose position the rule below cannot prove.
     ///
     /// Same order as [`Self::resolve_steps_to_heads`] (the `step_follows`
     /// chain, over the `plan_index` order, `created_at` only for edges that
@@ -1187,7 +1188,7 @@ impl WorkflowRepository {
     /// session row security admits only public rows, so a group's own member
     /// would get none of its group-private steps back, without an error.
     ///
-    /// # Only a prefix of the unrestricted order is returned
+    /// # Only the common prefix of two orders is returned
     ///
     /// A step the viewer cannot read is absent from what it reads, so counting
     /// the visible steps would shift every visible step after a hidden one
@@ -1200,12 +1201,20 @@ impl WorkflowRepository {
     /// over the whole plan, through migration 259's definer
     /// `epigraph_plan_step_skeleton`, which reads the plan's `executes` edges
     /// and `step_follows` pairs unfiltered and returns them with every claim
-    /// the viewer did not read masked to an opaque token; this function then
-    /// lists the steps in that order up to the first masked one. No hidden
-    /// claim id reaches the server or the caller.
+    /// the viewer did not read masked to an opaque token. No hidden claim id
+    /// reaches the server or the caller.
     ///
-    /// On the whole plan, a step's position is provable when
-    /// (`provable_plan_steps`):
+    /// The definer masks CLAIMS, not edges: a hidden `step_follows` edge (or a
+    /// hidden second `executes` edge) between steps the viewer reads comes
+    /// back unmasked and can reorder the whole-plan chain, while the viewer is
+    /// shown the order its OWN edges give (`resolve_steps_to_heads*`). So the
+    /// caller's own order is computed too, exactly as those readers compute it
+    /// (`viewer_plan_order`), and only the slots on which the two orders agree
+    /// are listed (`common_plan_prefix`): every listed slot is both the true
+    /// step and the step the caller sees there.
+    ///
+    /// On each order's edges (the whole plan's, and the viewer's), a step's
+    /// position is provable when (`provable_plan_steps`):
     ///
     /// * The ingest executor numbers EVERY plan claim's `executes` edge
     ///   `0..n` (`plan_index`, phases included, so `plan_index` is not the step
@@ -1232,31 +1241,44 @@ impl WorkflowRepository {
         viewer: &crate::visibility::Viewer,
         workflow_id: Uuid,
     ) -> Result<Vec<Uuid>, DbError> {
-        // The level-2 steps the viewer reads, through the same two predicates
-        // as every plan-order reader.
+        // Every level, not only steps: the phases' ordinals are part of the
+        // sequence a gap is detected in. The same two predicates, and the same
+        // order key, as every plan-order reader.
         let sql = viewer.splice(
-            "SELECT c.id, c.properties->>'level' \
+            "SELECT c.id, c.properties->>'level', \
+                    CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                         THEN (e.properties->>'plan_index')::int END \
              FROM edges e \
              JOIN claims c ON c.id = e.target_id \
              WHERE e.source_id = $1 AND e.relationship = 'executes' \
-               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */",
+               /* {EDGE_VISIBILITY:e} */ /* {VISIBILITY:c} */ \
+             ORDER BY CASE WHEN e.properties->>'plan_index' ~ '^[0-9]{1,9}$' \
+                           THEN (e.properties->>'plan_index')::int \
+                           ELSE 2147483647 END, \
+                      e.created_at ASC, c.id ASC",
             2,
         );
-        let mut q = sqlx::query_as::<_, (Uuid, Option<String>)>(&sql).bind(workflow_id);
+        let mut q =
+            sqlx::query_as::<_, (Uuid, Option<String>, Option<i32>)>(&sql).bind(workflow_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
-        let rows: Vec<(Uuid, Option<String>)> = q.fetch_all(&mut *conn).await?;
+        let rows: Vec<(Uuid, Option<String>, Option<i32>)> = q.fetch_all(&mut *conn).await?;
         let visible: Vec<Uuid> = rows
-            .into_iter()
-            .filter(|(_, lvl)| plan_level(lvl.as_deref()) == Some(2))
-            .map(|(id, _)| id)
+            .iter()
+            .filter(|(_, lvl, _)| plan_level(lvl.as_deref()) == Some(2))
+            .map(|(id, _, _)| *id)
             .collect();
         if visible.is_empty() {
             return Ok(Vec::new());
         }
+        // The caller's own order: what `resolve_steps_to_heads*` shows it.
+        let follows = step_follows_among(&mut *conn, viewer, &visible).await?;
+        let shown = viewer_plan_order(&rows, &visible, &follows);
+        // The whole plan's order, masked to the caller's steps.
         let skeleton = Self::plan_step_skeleton(&mut *conn, workflow_id, &visible).await?;
-        Ok(visible_plan_prefix(&skeleton, &visible))
+        let whole = visible_plan_prefix(&skeleton, &visible);
+        Ok(common_plan_prefix(&whole, &shown))
     }
 
     /// Migration 259's `epigraph_plan_step_skeleton(workflow, visible)`: the
@@ -3027,6 +3049,40 @@ fn visible_plan_prefix(skeleton: &[SkeletonRow], visible: &[Uuid]) -> Vec<Uuid> 
         .collect()
 }
 
+/// The plan order `viewer` is shown, cut at the first step whose position
+/// its own rows do not prove: `rows` are the `executes` targets it reads
+/// (`(claim id, level text, plan_index)`, every level, in plan-index order),
+/// `steps` their level-2 ids in that order, `follows` the `step_follows`
+/// pairs among them it reads. The chain is
+/// [`WorkflowRepository::order_by_step_follows`], as in
+/// `resolve_steps_to_heads*`, so element N is the step shown at slot N.
+#[must_use]
+fn viewer_plan_order(
+    rows: &[(Uuid, Option<String>, Option<i32>)],
+    steps: &[Uuid],
+    follows: &[(Uuid, Uuid)],
+) -> Vec<Uuid> {
+    let provable: std::collections::HashSet<Uuid> = provable_plan_steps(rows).into_iter().collect();
+    WorkflowRepository::order_by_step_follows(steps, follows)
+        .into_iter()
+        .take_while(|id| provable.contains(id))
+        .collect()
+}
+
+/// The longest common prefix of the whole plan's order (`whole`, from
+/// [`visible_plan_prefix`]) and the order the caller is shown (`shown`, from
+/// [`viewer_plan_order`]): the slots on which the true step and the shown step
+/// are the same claim. See [`WorkflowRepository::plan_step_claim_ids`].
+#[must_use]
+fn common_plan_prefix(whole: &[Uuid], shown: &[Uuid]) -> Vec<Uuid> {
+    whole
+        .iter()
+        .zip(shown)
+        .take_while(|(w, v)| w == v)
+        .map(|(w, _)| *w)
+        .collect()
+}
+
 /// The `step_follows` pairs `(source, target)` with BOTH ends in `ids` that
 /// `viewer` can see, retracted rows included: the edge set
 /// [`WorkflowRepository::order_by_step_follows`] walks. Retracted rows count
@@ -3338,6 +3394,98 @@ mod tests {
             sk(2, Some(v[1]), 2, Some(1), &[]),
         ];
         assert_eq!(visible_plan_prefix(&skeleton, &v[..1]), vec![v[0]]);
+    }
+
+    /// `(id, level, plan_index)` rows for [`viewer_plan_order`].
+    fn vrow(id: Uuid, level: i64, plan_index: Option<i32>) -> (Uuid, Option<String>, Option<i32>) {
+        (id, Some(level.to_string()), plan_index)
+    }
+
+    /// A hidden `step_follows` edge `c -> a` between steps the caller reads
+    /// closes the whole plan's chain `a -> y -> b -> c` into a cycle, so the
+    /// whole order falls back to plan-index order `a, b, c, y`; the caller is
+    /// shown `a, y, b, c`. Only slot 0 agrees.
+    #[test]
+    fn a_hidden_cycle_edge_between_visible_steps_keeps_only_agreeing_slots() {
+        let v = ids(4);
+        let (a, b, c, y) = (v[0], v[1], v[2], v[3]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[4]),
+            sk(2, Some(b), 2, Some(1), &[3]),
+            sk(3, Some(c), 2, Some(2), &[1]),
+            sk(4, Some(y), 2, None, &[2]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        assert_eq!(whole, vec![a, b, c, y]);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+            vrow(y, 2, None),
+        ];
+        let shown = viewer_plan_order(&rows, &[a, b, c, y], &[(a, y), (y, b), (b, c)]);
+        assert_eq!(shown, vec![a, y, b, c]);
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a]);
+    }
+
+    /// A hidden FORK edge `a -> c` gives `a` two successors on the whole
+    /// plan, so its order falls back to plan-index order, while the caller's
+    /// chain puts the unindexed `y` second.
+    #[test]
+    fn a_hidden_fork_edge_between_visible_steps_keeps_only_agreeing_slots() {
+        let v = ids(4);
+        let (a, b, c, y) = (v[0], v[1], v[2], v[3]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[3, 4]),
+            sk(2, Some(b), 2, Some(1), &[3]),
+            sk(3, Some(c), 2, Some(2), &[]),
+            sk(4, Some(y), 2, None, &[2]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+            vrow(y, 2, None),
+        ];
+        let shown = viewer_plan_order(&rows, &[a, b, c, y], &[(a, y), (y, b), (b, c)]);
+        assert_eq!(shown, vec![a, y, b, c]);
+        assert_eq!(whole, vec![a, b, c, y]);
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a]);
+    }
+
+    /// A hidden second `executes` edge onto `b` (ordinal 3) makes the whole
+    /// plan number `a, b, c, b`; the caller reads `a, b, c`. Its index 3 must
+    /// not resolve.
+    #[test]
+    fn a_hidden_duplicate_executes_edge_adds_no_slot() {
+        let v = ids(3);
+        let (a, b, c) = (v[0], v[1], v[2]);
+        let skeleton = [
+            sk(1, Some(a), 2, Some(0), &[]),
+            sk(2, Some(b), 2, Some(1), &[]),
+            sk(3, Some(c), 2, Some(2), &[]),
+            sk(2, Some(b), 2, Some(3), &[]),
+        ];
+        let whole = visible_plan_prefix(&skeleton, &v);
+        assert_eq!(whole, vec![a, b, c, b]);
+        let rows = [
+            vrow(a, 2, Some(0)),
+            vrow(b, 2, Some(1)),
+            vrow(c, 2, Some(2)),
+        ];
+        let shown = viewer_plan_order(&rows, &v, &[]);
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a, b, c]);
+    }
+
+    /// The caller's own order still stops at the first step its own rows do
+    /// not prove (an ordinal gap), so the common prefix does too.
+    #[test]
+    fn the_callers_own_gap_still_cuts_the_common_prefix() {
+        let v = ids(2);
+        let rows = [vrow(v[0], 2, Some(0)), vrow(v[1], 2, Some(2))];
+        assert_eq!(viewer_plan_order(&rows, &v, &[]), vec![v[0]]);
+        assert_eq!(common_plan_prefix(&v, &[v[0]]), vec![v[0]]);
     }
 
     /// `add_step(position = 1)` into `[a, b, c]`: the insert `x` is unindexed,

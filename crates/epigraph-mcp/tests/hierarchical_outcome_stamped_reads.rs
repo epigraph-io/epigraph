@@ -860,6 +860,184 @@ async fn a_hidden_trailing_ordinal_does_not_shift_a_visible_unindexed_step(pool:
     assert_eq!(unresolved(&json), vec![1], "{json}");
 }
 
+// ── A hidden EDGE between steps the reporter reads ──────────────────────────
+//
+// Migration 259's definer masks claims, not edges. A group-private
+// `step_follows` edge, or a group-private second `executes` edge, whose ends
+// are all steps the reporter reads comes back unmasked and changes the
+// whole-plan order, while the reporter is shown the order its OWN edges give.
+// Only the slots on which the two orders agree may resolve: anything else
+// credits a report to a step other than the one the reporter sees there.
+
+/// A public plan `a, b, c` (indexed) with a public unindexed step `y` inserted
+/// after `a` (chain `a -> y -> b -> c`), and one group-private `step_follows`
+/// edge `c -> a` that closes the chain into a cycle for a reader of every row
+/// (whose order then falls back to plan-index order `a, b, c, y`). A stranger
+/// is shown `a, y, b, c`. The orders agree on slot 0 only, so slots 1..3 are
+/// refused.
+///
+/// RED on the whole-plan-only reader (it credited slot 1 to `b`, 2 to `c`
+/// and 3 to `y`, with no unresolved index).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_step_follows_edge_between_visible_steps_resolves_only_agreeing_slots(
+    pool: PgPool,
+) {
+    let server = app_role_server(&pool).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "stamped-outcome-fork-a").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-fork-s").await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-fork",
+        0,
+        "A public plan with a group-private chain edge between public steps.",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+    let mut s = Vec::new();
+    for i in 0..3 {
+        let c = fixture::seed_public_claim(&pool, author, &format!("fork step {i} {workflow_id}"))
+            .await;
+        set_level(&pool, c, 2).await;
+        executes(&pool, workflow_id, c, Some(i)).await;
+        s.push(c);
+    }
+    let (a, b, c) = (s[0], s[1], s[2]);
+    let y =
+        fixture::seed_public_claim(&pool, author, &format!("fork inserted {workflow_id}")).await;
+    set_level(&pool, y, 2).await;
+    executes(&pool, workflow_id, y, None).await;
+    step_follows(&pool, a, y).await;
+    step_follows(&pool, y, b).await;
+    step_follows(&pool, b, c).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, visibility, owner_group_id) \
+         VALUES ($1, 'claim', $2, 'claim', 'step_follows', '{}'::jsonb, 'group', $3)",
+    )
+    .bind(c)
+    .bind(a)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("group-private c -> a");
+    assert_eq!(step_follows_visibility(&pool, c, a).await, "group");
+    assert_eq!(step_follows_visibility(&pool, a, y).await, "public");
+
+    let stranger = Viewer::resolve(&pool, stranger).await.expect("stranger");
+    let mut conn = pool.acquire().await.expect("acquire");
+    let shown = epigraph_db::WorkflowRepository::resolve_steps_to_heads_conn(
+        &mut conn,
+        &stranger,
+        workflow_id,
+    )
+    .await
+    .expect("shown steps");
+    drop(conn);
+    assert_eq!(
+        shown.iter().map(|r| r.frozen_claim_id).collect::<Vec<_>>(),
+        vec![a, y, b, c],
+        "fixture: the stranger is shown its own chain"
+    );
+
+    let json = report(&server, &stranger, workflow_id, &[0, 1, 2, 3]).await;
+
+    assert_eq!(
+        rows(&pool, workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(a)),
+            ("planned 1".to_string(), None),
+            ("planned 2".to_string(), None),
+            ("planned 3".to_string(), None),
+        ],
+        "a slot where the true step and the shown step differ must not resolve: {json}"
+    );
+    assert_eq!(unresolved(&json), vec![1, 2, 3], "{json}");
+}
+
+/// A public plan `a, b, c` (ordinals 0..2) plus a group-private second
+/// `executes` edge onto `b` with ordinal 3. A reader of every row numbers four
+/// steps `a, b, c, b`; the stranger reads three. Index 3 is out of range for
+/// the stranger and must stay unresolved.
+///
+/// RED on the whole-plan-only reader (index 3 resolved to `b`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_second_executes_edge_onto_a_visible_step_adds_no_slot(pool: PgPool) {
+    let server = app_role_server(&pool).await;
+    let (author, group) = fixture::seed_agent_with_group(&pool, "stamped-outcome-dup-a").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "stamped-outcome-dup-s").await;
+    let workflow_id = Uuid::new_v4();
+    epigraph_db::WorkflowRepository::insert_root(
+        &pool,
+        workflow_id,
+        "stamped-outcome-dup",
+        0,
+        "A public plan with a group-private second executes edge.",
+        None,
+        serde_json::json!({}),
+        epigraph_core::TenancyDecl::inherited(),
+    )
+    .await
+    .expect("insert workflow root");
+    let mut s = Vec::new();
+    for i in 0..3 {
+        let c =
+            fixture::seed_public_claim(&pool, author, &format!("dup step {i} {workflow_id}")).await;
+        set_level(&pool, c, 2).await;
+        executes(&pool, workflow_id, c, Some(i)).await;
+        s.push(c);
+    }
+    let (a, b, c) = (s[0], s[1], s[2]);
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, visibility, owner_group_id) \
+         VALUES ($1, 'workflow', $2, 'claim', 'executes', \
+                 jsonb_build_object('plan_index', 3), 'group', $3)",
+    )
+    .bind(workflow_id)
+    .bind(b)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("group-private second executes edge");
+    let shapes: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT visibility::text, properties->>'plan_index' FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'executes' \
+         ORDER BY properties->>'plan_index'",
+    )
+    .bind(workflow_id)
+    .bind(b)
+    .fetch_all(&pool)
+    .await
+    .expect("executes shapes");
+    assert_eq!(
+        shapes,
+        vec![
+            ("public".to_string(), Some("1".to_string())),
+            ("group".to_string(), Some("3".to_string())),
+        ]
+    );
+
+    let stranger = Viewer::resolve(&pool, stranger).await.expect("stranger");
+    let json = report(&server, &stranger, workflow_id, &[0, 1, 2, 3]).await;
+
+    assert_eq!(
+        rows(&pool, workflow_id).await,
+        vec![
+            ("planned 0".to_string(), Some(a)),
+            ("planned 1".to_string(), Some(b)),
+            ("planned 2".to_string(), Some(c)),
+            ("planned 3".to_string(), None),
+        ],
+        "an index past the stranger's steps must not resolve through a hidden edge: {json}"
+    );
+    assert_eq!(unresolved(&json), vec![3], "{json}");
+}
+
 // ── Through the transports ──────────────────────────────────────────────────
 //
 // The tests above call the tool functions with a viewer the test resolved. The

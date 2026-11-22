@@ -3409,13 +3409,16 @@ restart.
   `step_follows` pairs among their targets, read UNFILTERED, with every claim not in
   `visible` masked to a per-result token. `WorkflowRepository::plan_step_claim_ids` (the
   outcome reports' `step_index` lookup) now orders the WHOLE plan through it and lists the
-  caller's steps only up to the first one it cannot read, so a hidden unindexed step inside
-  a plan's chain (an `add_step` insert another group owns) no longer shifts the visible steps
-  after it onto its slot. Owned by `epigraph_maintenance` (registered in
+  caller's steps only up to the first one it cannot read, AND only on the slots where that
+  order agrees with the order the caller's own rows give (the definer masks claims, not
+  edges, so a hidden edge between visible steps may refuse a slot but never move one). A
+  hidden unindexed step inside a plan's chain (an `add_step` insert another group owns) no
+  longer shifts the visible steps after it onto its slot. Owned by `epigraph_maintenance` (registered in
   `epigraph-tenancy-backfill verify`: fails OPEN under another owner), EXECUTE revoked from
   PUBLIC, granted to `epigraph_app`. Pinned by
   `epigraph-mcp/tests/hierarchical_outcome_stamped_reads.rs` (app role: the hidden chain
-  member, the member control, a hidden step of another plan, a hidden trailing ordinal) and
+  member, the member control, a hidden step of another plan, a hidden trailing ordinal, a
+  hidden `step_follows` edge and a hidden second `executes` edge between visible steps) and
   `epigraph-db/tests/plan_step_skeleton_definer.rs` (owner, grants, masking, the undo). Undo:
   `docs/runbooks/259-undo.sql`. **Deploy order:** migrate BEFORE the binary; a 259 binary
   calls the definer on every outcome report that names a step.
