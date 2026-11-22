@@ -9,7 +9,12 @@
 //!   calls `epigraph_register_agent_identity`, which only the
 //!   `epigraph_identity_attestor` role may execute. The connection's ROLE is
 //!   the authorisation: the session principal is a variable any login can set,
-//!   so it is never consulted.
+//!   so it is never consulted. Before the call it decompresses each frame it
+//!   is about to send and re-checks size and hash
+//!   ([`AgentIdentityRepository::verify_snapshot_document`]): the definer
+//!   checks only the shape, and drops a frame under an already-stored hash
+//!   without comparing it, so the writer is the one place a frame that is not
+//!   its key's text can be stopped before it reaches the append-only table.
 //! * [`AgentIdentityRepository::prompt_history`] calls
 //!   `epigraph_agent_prompt_history`, which reads the session principal
 //!   (operator or admin, else `AID06`), then decompresses every returned file
@@ -54,6 +59,14 @@ const ZSTD_LEVEL: i32 = 19;
 /// The largest raw file the table accepts (`agent_prompt_blobs_raw_size`). Also
 /// the decompression bound, so a stored frame cannot expand past it.
 pub const MAX_PROMPT_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The snapshot document's file keys, in the definer's order.
+const PROMPT_FILES: [&str; 4] = [
+    "identity_md",
+    "global_claude_md",
+    "group_claude_md",
+    "learned_md",
+];
 
 /// One prompt file at registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,6 +340,62 @@ impl AgentIdentityRepository {
         }))
     }
 
+    /// Check a snapshot document's stored files before they are sent: each
+    /// file's `content` must decompress (under the reader's bound) to exactly
+    /// `raw_size` bytes whose BLAKE3 is `blob_hash`. `null` and
+    /// `{"refused": true}` entries pass; any other shape is left to the
+    /// definer, which refuses it.
+    ///
+    /// The definer cannot run zstd or BLAKE3, so it checks only the shape and,
+    /// when the hash is already stored, the size: a frame under an existing
+    /// hash is then dropped (`ON CONFLICT DO NOTHING`) without its content
+    /// being compared, and a new frame is stored without being checked. Blobs
+    /// are append-only, so a frame that does not decode to its key would
+    /// withhold that file from every later snapshot naming the hash. This is
+    /// the write-side half of the reader's check: with it, an equal hash
+    /// means equal content whatever encoder or level produced the frame.
+    ///
+    /// # Errors
+    /// [`DbError::InvalidData`] naming the first file whose frame does not
+    /// decompress, or decompresses to the wrong size or to bytes that do not
+    /// hash to its `blob_hash`.
+    pub fn verify_snapshot_document(snapshot: &Value) -> Result<(), DbError> {
+        for file in PROMPT_FILES {
+            let Some(entry) = snapshot.get(file).and_then(Value::as_object) else {
+                continue;
+            };
+            if entry.contains_key("refused") {
+                continue;
+            }
+            let invalid = |why: String| DbError::InvalidData {
+                reason: format!("snapshot.{file}: {why}; refusing to record it"),
+            };
+            let decode = |key: &str| -> Result<Vec<u8>, DbError> {
+                entry
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|h| hex::decode(h).ok())
+                    .ok_or_else(|| invalid(format!("`{key}` is not a hex string")))
+            };
+            let hash = decode("blob_hash")?;
+            let content = decode("content")?;
+            let raw_size = entry
+                .get("raw_size")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid("`raw_size` is not a non-negative integer".into()))?;
+            let blob = verified_blob(file, Some(hash), Some(content))
+                .map_err(invalid)?
+                .ok_or_else(|| invalid("no blob".into()))?;
+            if blob.bytes.len() as u64 != raw_size {
+                return Err(invalid(format!(
+                    "the frame decompresses to {} bytes, not the declared raw_size {raw_size}",
+                    blob.bytes.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Register (or re-register) a host-attested identity through migration
     /// 161's `epigraph_register_agent_identity`. Idempotent: the same identity,
     /// parent, group and files again only bumps the snapshot's `last_seen`.
@@ -339,12 +408,14 @@ impl AgentIdentityRepository {
     /// [`NOT_ADOPTABLE`], [`OPERATOR_CONFLICT`] or [`SIGNING_KEY_CONFLICT`] for
     /// the refusals, 22023 for malformed input (or a signing key already bound
     /// elsewhere), 42501 for a connection that is not the attestor; each writes
-    /// nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`].
+    /// nothing. [`DbError::InvalidData`] from [`Self::snapshot_document`] or
+    /// [`Self::verify_snapshot_document`], before anything is sent.
     pub async fn register(
         conn: &mut sqlx::PgConnection,
         reg: &IdentityRegistration,
     ) -> Result<IdentityRegistered, DbError> {
         let snapshot = Self::snapshot_document(reg)?;
+        Self::verify_snapshot_document(&snapshot)?;
         Ok(sqlx::query_as::<_, IdentityRegistered>(
             "SELECT agent_id, agent_created, succession_created, snapshot_id, snapshot_created, \
                     signing_key_registered, operator_id, inherited, link_live, inherit_reason \
@@ -676,6 +747,123 @@ mod tests {
         )
         .expect_err("mismatch");
         assert!(reason.contains("does not hash to its key"), "{reason}");
+    }
+
+    /// A stored-file entry as the definer takes it, with `content` supplied
+    /// by the caller rather than derived from `raw`.
+    fn entry(raw: &[u8], content: &[u8]) -> Value {
+        json!({
+            "blob_hash": blake3::hash(raw).to_hex().to_string(),
+            "raw_size": raw.len(),
+            "codec": "zstd",
+            "content": hex::encode(content),
+        })
+    }
+
+    fn document_with_learned(learned: Value) -> Value {
+        let mut doc =
+            AgentIdentityRepository::snapshot_document(&reg(PromptFile::Absent)).expect("document");
+        doc["learned_md"] = learned;
+        doc
+    }
+
+    /// Backlog 510d3fe3: a re-sent frame under an EXISTING hash, whose text
+    /// differs from the text that hash names, must be refused before it is
+    /// sent. The two texts have the SAME length, so the definer's only
+    /// conflict check (the stored raw_size) cannot tell them apart; only the
+    /// decompress-and-rehash check can.
+    #[test]
+    fn a_frame_whose_text_does_not_hash_to_its_key_is_refused_before_sending() {
+        let stored = b"lesson: prefer the repository API\n".to_vec();
+        let resent = b"lesson: prefer raw SQL everywhere\n".to_vec();
+        // CALIBRATION: the lengths match, so the size check is blind here.
+        assert_eq!(stored.len(), resent.len());
+        assert_ne!(stored, resent);
+        let frame = zstd::bulk::compress(&resent, ZSTD_LEVEL).expect("compress");
+        let err = AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &stored, &frame,
+        )))
+        .expect_err("a frame that is not the hashed text must be refused");
+        match err {
+            DbError::InvalidData { reason } => {
+                assert!(reason.contains("snapshot.learned_md"), "{reason}");
+                assert!(reason.contains("does not hash to its key"), "{reason}");
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// The same text compressed differently (another level, so another frame)
+    /// is the same file: zstd frames are not canonical, so a check that
+    /// compared frames would refuse a correct re-registration.
+    #[test]
+    fn the_same_text_compressed_differently_is_accepted() {
+        let raw: Vec<u8> = (0..400u32)
+            .flat_map(|i| format!("- lesson {i}: weight {}\n", (i * 7919) % 1013).into_bytes())
+            .collect();
+        let fast = zstd::bulk::compress(&raw, 1).expect("compress");
+        let slow = zstd::bulk::compress(&raw, ZSTD_LEVEL).expect("compress");
+        let streamed = zstd::stream::encode_all(raw.as_slice(), 3).expect("compress");
+        // CALIBRATION: the frames really differ, so this is not one frame twice.
+        assert_ne!(fast, slow);
+        assert_ne!(slow, streamed);
+        for frame in [fast, slow, streamed] {
+            AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+                &raw, &frame,
+            )))
+            .expect("any frame of the hashed text is accepted");
+        }
+    }
+
+    /// The other ways a frame can disagree with its entry are refused too, and
+    /// entries with no content pass.
+    #[test]
+    fn a_wrong_size_or_undecodable_frame_is_refused_and_contentless_entries_pass() {
+        let raw = b"the true lesson\n".to_vec();
+        let frame = zstd::bulk::compress(&raw, ZSTD_LEVEL).expect("compress");
+
+        let mut wrong_size = entry(&raw, &frame);
+        wrong_size["raw_size"] = json!(raw.len() + 1);
+        let err =
+            AgentIdentityRepository::verify_snapshot_document(&document_with_learned(wrong_size))
+                .expect_err("a raw_size the frame does not decompress to");
+        assert!(format!("{err:?}").contains("raw_size"), "{err:?}");
+
+        let mut corrupt = frame.clone();
+        let at = corrupt.len() - 2;
+        corrupt[at] ^= 0x5a;
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &raw, &corrupt,
+        )))
+        .expect_err("a corrupted frame");
+
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(json!({
+            "blob_hash": "zz",
+            "raw_size": 1,
+            "codec": "zstd",
+            "content": hex::encode(&frame),
+        })))
+        .expect_err("a blob_hash that is not hex");
+
+        // CALIBRATION: the untouched entry, refused and absent files, and a
+        // document built by `snapshot_document` itself all pass.
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(entry(
+            &raw, &frame,
+        )))
+        .expect("the matching entry");
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(
+            json!({"refused": true}),
+        ))
+        .expect("a refused file");
+        AgentIdentityRepository::verify_snapshot_document(&document_with_learned(Value::Null))
+            .expect("an absent file");
+        let built = AgentIdentityRepository::snapshot_document(&IdentityRegistration {
+            identity_md: PromptFile::Stored(b"identity\n".to_vec()),
+            group_claude_md: PromptFile::Refused,
+            ..reg(PromptFile::Stored(raw))
+        })
+        .expect("document");
+        AgentIdentityRepository::verify_snapshot_document(&built).expect("a built document");
     }
 
     /// A frame written by the PREVIOUS zstd binding (0.13.3 / zstd-safe 7.3.0,
