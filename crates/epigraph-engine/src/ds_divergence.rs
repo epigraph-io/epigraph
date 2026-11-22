@@ -303,6 +303,66 @@ pub async fn record_divergence(
     }
 }
 
+/// One counted BBA write, as [`track_counted_bba`] takes it.
+#[derive(Debug, Clone, Copy)]
+pub struct CountedBba<'a> {
+    /// The claim the BBA was stored on.
+    pub claim_id: Uuid,
+    /// The frame the BBA was stored on, which the divergence row names.
+    pub frame_id: Uuid,
+    /// The BBA as stored (undiscounted), whose [`beta_increments`] are added.
+    pub bba: &'a MassFunction,
+    /// The claim's hypothesis index on `frame_id` (its `claim_frames` index).
+    pub hypothesis_index: Option<i32>,
+    /// The claim's pignistic probability after the write, when the writer has
+    /// it: the value it wrote to the claim's cache. `None` keeps the Beta
+    /// track and records no divergence row.
+    pub pignistic_prob: Option<f64>,
+}
+
+/// The two derived records of one BBA write the writer has decided to count:
+/// [`apply_beta_update`] with [`beta_increments`]`(bba, hypothesis_index)`,
+/// then, when the writer passes the claim's BetP after the write,
+/// [`record_divergence`] on the BBA's frame at the version the viewer reads.
+/// Returns whether a divergence row was stored (never on a cold start).
+///
+/// For the writers whose BBA is always counted and that need nothing back
+/// from the Beta update: the seed wire, the batch ingest wire, the edge wire
+/// and `report_workflow_outcome`. Deciding WHETHER the BBA is counted (a
+/// re-wire or an identical resubmission is not) stays the caller's.
+///
+/// # Errors
+/// Only when a savepoint cannot be opened or closed (see the module docs).
+pub async fn track_counted_bba(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    write: CountedBba<'_>,
+    context: &str,
+) -> Result<bool, sqlx::Error> {
+    let beta = apply_beta_update(
+        &mut *conn,
+        viewer,
+        write.claim_id,
+        Some(beta_increments(write.bba, write.hypothesis_index)),
+        context,
+    )
+    .await?;
+    let Some(pignistic_prob) = write.pignistic_prob else {
+        return Ok(false);
+    };
+    let version = frame_version(&mut *conn, viewer, write.frame_id, context).await?;
+    record_divergence(
+        conn,
+        write.claim_id,
+        write.frame_id,
+        pignistic_prob,
+        beta,
+        version,
+        context,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -126,7 +126,7 @@ use uuid::Uuid;
 use epigraph_db::{ClaimRepository, DedupRepair, EdgeRepository, MassFunctionRepository};
 
 use crate::edge_factor::{
-    auto_wire_edge_if_epistemic, ensure_binary_frame, recompute_claim_belief_on_frame,
+    ensure_binary_frame, recompute_claim_belief_on_frame, rederive_edge_if_epistemic,
 };
 
 /// What a cascade actually did, so the caller can report it instead of telling
@@ -572,7 +572,7 @@ async fn invalidate_and_rewire(
             }
         };
         if !key_held
-            && auto_wire_edge_if_epistemic(
+            && rederive_edge_if_epistemic(
                 &mut sp,
                 viewer,
                 // Past the wake-up gate when retracted rows of OTHER keys remain
