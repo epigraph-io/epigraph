@@ -896,13 +896,18 @@ async fn the_admin_deprecation_needs_the_session_principal(pool: PgPool) {
         .await
         .map_err(|e| {
             e.as_database_error()
-                .and_then(|d| d.code().map(|c| c.to_string()))
+                .map(|d| (d.code().map(|c| c.to_string()), d.message().to_string()))
                 .unwrap_or_default()
         });
         (conn, r)
     })
     .await;
-    assert_eq!(r, Err("42501".into()));
+    let (code, message) = r.expect_err("no principal, no deprecation");
+    assert_eq!(code.as_deref(), Some("42501"));
+    assert!(
+        message.contains("ADM01"),
+        "refused for the missing principal, not the grant: {message}"
+    );
     assert!(
         (row(&pool, w.public).await.1 - 1.0).abs() < 1e-12,
         "row untouched"
