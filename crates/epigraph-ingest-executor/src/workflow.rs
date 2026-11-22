@@ -331,7 +331,14 @@ impl WorkflowIngestExecutionResult {
 /// the session does not write, where `claims_tenancy`'s `WITH CHECK` refuses
 /// the UPDATE (42501). That refusal must not abort the caller's transaction:
 /// the claim is then reused as it is, which is what every walk did before.
-pub(crate) async fn revive_deprecation_retired(
+///
+/// `pub` so the savepoint's isolation can be tested on a non-bypassing role
+/// (`epigraph-mcp/tests/deprecated_step_revival.rs`); callers outside this
+/// crate reach it only through the executor and `add_step`.
+///
+/// # Errors
+/// Only a failure to open, release or roll back the savepoint itself.
+pub async fn revive_deprecation_retired(
     conn: &mut sqlx::PgConnection,
     claim_id: Uuid,
 ) -> Result<bool, sqlx::Error> {

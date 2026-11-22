@@ -27,7 +27,7 @@ mod common;
 use common::{first_text, seed_caller};
 use epigraph_core::ClaimId;
 use epigraph_crypto::AgentSigner;
-use epigraph_db::ClaimRepository;
+use epigraph_db::{ClaimRepository, DbError};
 use epigraph_ingest::common::schema::ThesisDerivation;
 use epigraph_ingest::workflow::schema::{Phase, Step, WorkflowSource};
 use epigraph_ingest::workflow::WorkflowExtraction;
@@ -479,5 +479,69 @@ async fn a_marked_step_with_a_successor_is_not_revived(pool: PgPool) {
         w.state(dropped).await,
         (false, 0.05, false, true),
         "a marked step with a successor stays retired, unembedded and marked"
+    );
+}
+
+/// The revival runs in a SAVEPOINT on the caller's transaction. On a session
+/// whose row security refuses the UPDATE (a public claim of a group the session
+/// does not write: `claims_tenancy`'s USING admits it, its WITH CHECK refuses
+/// it, 42501), the refusal must roll back only the revival: the caller's
+/// transaction stays usable and commits, and the claim is left as it was.
+///
+/// Run on the non-bypassing `epigraph_app` role, UNSTAMPED (no writable
+/// group), so the policies actually apply; `#[sqlx::test]`'s own pool is a
+/// superuser and bypasses them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revival_row_security_refuses_leaves_the_callers_transaction_usable(pool: PgPool) {
+    let w = World::new(pool, "revive-refused").await;
+    let gen0 = w.ingest(&[KEEP, DROP]).await;
+    let keep = w.step(gen0, KEEP).await;
+    w.deprecate(gen0).await;
+    let retired = w.state(keep).await;
+    assert_eq!(
+        retired,
+        (false, 0.05, false, true),
+        "PRECONDITION: retired, unembedded and marked"
+    );
+    let visibility: String = sqlx::query_scalar("SELECT visibility FROM claims WHERE id = $1")
+        .bind(keep)
+        .fetch_one(&w.pool)
+        .await
+        .expect("visibility");
+    assert_eq!(visibility, "public", "PRECONDITION: USING admits the row");
+
+    let app = fixture::downgraded_pool(&w.pool, "epigraph_app").await;
+
+    // PRECONDITION: on this session the bare UPDATE is REFUSED (an error), not
+    // silently filtered to zero rows; otherwise the savepoint is never used.
+    let mut probe = app.begin().await.expect("probe tx");
+    match ClaimRepository::revive_workflow_deprecation_retired(&mut *probe, keep).await {
+        Err(DbError::QueryFailed {
+            source: sqlx::Error::Database(db),
+        }) => assert_eq!(
+            db.code().as_deref(),
+            Some("42501"),
+            "PRECONDITION: a row-security refusal, got {db:?}"
+        ),
+        other => panic!("PRECONDITION: the bare revival must be refused here, got {other:?}"),
+    }
+    probe.rollback().await.expect("probe rollback");
+
+    let mut tx = app.begin().await.expect("caller tx");
+    let revived = epigraph_ingest_executor::workflow::revive_deprecation_retired(&mut tx, keep)
+        .await
+        .expect("a refused revival is not an error to the caller");
+    assert!(!revived, "nothing was revived");
+    let after: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("the caller's transaction is still usable after the refused revival");
+    assert_eq!(after, 1);
+    tx.commit().await.expect("the caller's transaction commits");
+
+    assert_eq!(
+        w.state(keep).await,
+        retired,
+        "the refused revival changed nothing"
     );
 }
