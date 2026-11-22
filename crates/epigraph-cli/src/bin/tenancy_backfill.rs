@@ -2322,6 +2322,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 259 (backlog a1474e22), the outcome reports' unfiltered plan skeleton:
+    // a plan's `executes` edges and `step_follows` pairs with every claim the
+    // caller does not read masked. Fails OPEN and SILENT under a non-member
+    // owner: its reads of the FORCEd `edges` and `claims` are then filtered to
+    // what the calling session reads, so a hidden unindexed step inside a
+    // plan's chain is invisible to it too, and a report's `step_index` is
+    // attributed to the step one slot further on with no signal. That is the
+    // stake this entry reports.
+    ("epigraph_plan_step_skeleton", 259),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3224,6 +3233,13 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_step_lineage_executors",
             "public.epigraph_step_lineage_executors(uuid)",
+            true,
+        ),
+        // 259: every outcome report that names a step calls it on the request
+        // DSN (MCP and REST); without the grant those reports are 42501.
+        (
+            "epigraph_plan_step_skeleton",
+            "public.epigraph_plan_step_skeleton(uuid, uuid[])",
             true,
         ),
     ];

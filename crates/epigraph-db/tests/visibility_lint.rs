@@ -2073,6 +2073,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          own read did not return as a missing parent. Returns workflow ids only, never content.",
     ),
     (
+        "workflow.rs",
+        "plan_step_skeleton",
+        "ORDER READ through migration 259's definer `epigraph_plan_step_skeleton(workflow, \
+         visible)`: the plan's `executes` edges and `step_follows` pairs read UNFILTERED, with \
+         every claim not in `visible` masked to a per-result token, so `plan_step_claim_ids` \
+         can order the whole plan and list the caller's steps only up to the first one it \
+         cannot read (backlog a1474e22). A spliced viewer predicate would hide exactly the \
+         steps whose absence shifts the caller's slots. Its only caller passes the step ids it \
+         read under the viewer's own predicates as `visible`; no hidden claim id is returned.",
+    ),
+    (
         "agent_lookup.rs",
         "author_nodes",
         "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \

@@ -3403,6 +3403,22 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **259**: public `plan_step_skeleton` (backlog a1474e22). Adds the definer
+  `epigraph_plan_step_skeleton(workflow uuid, visible uuid[])`: a plan's `executes` edges
+  (every level, in the plan-order readers' key: ordinal, `created_at`, claim id) and the
+  `step_follows` pairs among their targets, read UNFILTERED, with every claim not in
+  `visible` masked to a per-result token. `WorkflowRepository::plan_step_claim_ids` (the
+  outcome reports' `step_index` lookup) now orders the WHOLE plan through it and lists the
+  caller's steps only up to the first one it cannot read, so a hidden unindexed step inside
+  a plan's chain (an `add_step` insert another group owns) no longer shifts the visible steps
+  after it onto its slot. Owned by `epigraph_maintenance` (registered in
+  `epigraph-tenancy-backfill verify`: fails OPEN under another owner), EXECUTE revoked from
+  PUBLIC, granted to `epigraph_app`. Pinned by
+  `epigraph-mcp/tests/hierarchical_outcome_stamped_reads.rs` (app role: the hidden chain
+  member, the member control, a hidden step of another plan, a hidden trailing ordinal) and
+  `epigraph-db/tests/plan_step_skeleton_definer.rs` (owner, grants, masking, the undo). Undo:
+  `docs/runbooks/259-undo.sql`. **Deploy order:** migrate BEFORE the binary; a 259 binary
+  calls the definer on every outcome report that names a step.
 
 ## `-- no-transaction` migrations
 
