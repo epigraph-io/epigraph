@@ -37,6 +37,7 @@ use epigraph_mcp::tools::evolve_step::EvolveStepParams;
 use epigraph_mcp::tools::step_ops::{AddStepParams, DeleteStepParams};
 use epigraph_mcp::types::{
     DeprecateWorkflowParams, ImproveWorkflowHierarchyParams, IngestWorkflowParams,
+    LinkHierarchicalParams,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -793,13 +794,21 @@ async fn one_connection_server(pool: &PgPool, seed: u8) -> EpiGraphMcpFull {
 /// the row, the caller's viewer, the submitter's operator) while the write's
 /// transaction held the only one, so each tool waited out the acquire timeout
 /// and failed; with N concurrent stdio writes on an N-connection pool every
-/// one of them waited the same way.
+/// one of them waited the same way. `link_hierarchical` from a workflow
+/// source takes the same check inside its own write transaction, so it is
+/// driven here too (a `depends_on` between two PUBLIC lineages of the member).
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_stdio_mutation_tool_completes_on_a_one_connection_pool(pool: PgPool) {
     let seeding = app_role_server(&pool, MEMBER_SEED).await;
     let (seeding_viewer, member) = stdio(&pool, &seeding, MEMBER_SEED).await;
     let name = "stdio-auth-one-connection";
     ingest(&seeding, &seeding_viewer, name, None).await;
+    let (dependent, prerequisite) = (
+        "stdio-auth-one-connection-dependent",
+        "stdio-auth-one-connection-prerequisite",
+    );
+    ingest_public(&pool, &seeding, &seeding_viewer, dependent).await;
+    ingest_public(&pool, &seeding, &seeding_viewer, prerequisite).await;
     let submitter: Option<String> = sqlx::query_scalar(
         "SELECT metadata->>'epigraph_submitted_by' FROM workflows WHERE canonical_name = $1",
     )
@@ -822,7 +831,33 @@ async fn every_stdio_mutation_tool_completes_on_a_one_connection_pool(pool: PgPo
         Some(member),
         "PREMISE: the same stdio agent"
     );
-    let outcomes = every_tool(&pool, &server, &viewer, name, "one-connection", None).await;
+    let (source, target) = (
+        head(&pool, dependent).await,
+        head(&pool, prerequisite).await,
+    );
+    let linked = tools::link_hierarchical::do_link_hierarchical(
+        &server,
+        &viewer,
+        LinkHierarchicalParams {
+            source_claim_id: source.to_string(),
+            target_claim_id: target.to_string(),
+            relationship: "depends_on".to_string(),
+            source_type: Some("workflow".to_string()),
+            target_type: Some("workflow".to_string()),
+            ..Default::default()
+        },
+        None,
+    )
+    .await;
+    let mut outcomes = vec![(
+        "link_hierarchical",
+        match linked {
+            Ok(out) if out.is_error == Some(true) => Some(format!("{out:?}")),
+            Ok(_) => None,
+            Err(e) => Some(e.message.to_string()),
+        },
+    )];
+    outcomes.extend(every_tool(&pool, &server, &viewer, name, "one-connection", None).await);
     let refused: Vec<&(&str, Option<String>)> =
         outcomes.iter().filter(|(_, o)| o.is_some()).collect();
     assert!(
@@ -838,5 +873,15 @@ async fn every_stdio_mutation_tool_completes_on_a_one_connection_pool(pool: PgPo
     .fetch_one(&pool)
     .await
     .expect("stdio provenance rows");
-    assert!(rows >= 5, "each admitted stdio write is recorded: {rows}");
+    assert!(rows >= 6, "each admitted stdio write is recorded: {rows}");
+    let linked_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE source_id = $1 AND target_id = $2 \
+            AND relationship = 'depends_on' AND valid_to IS NULL",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("the depends_on edge");
+    assert_eq!(linked_edges, 1, "link_hierarchical wrote its edge");
 }
