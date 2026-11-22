@@ -1285,6 +1285,72 @@ async fn the_dry_run_transaction_is_read_only_and_repeatable_read(pool: PgPool) 
     assert_untouched(&pool, a, t, v, "read-only tx").await;
 }
 
+// ── (16) the compare-and-set re-checks every workflow/step arm ─────────────
+
+/// The four arms of the workflow-or-step rule, each on its own claim, each
+/// present on the row the CAS writes: the CAS refuses all four on the exact
+/// values (an arm committed after the locked read is caught by the write),
+/// and writes the control.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_compare_and_set_refuses_every_workflow_or_step_arm(pool: PgPool) {
+    let author = seed_agent(&pool).await;
+    let control = mirror_claim(&pool, author, 0.731_37).await;
+    let step_by_edge = mirror_claim(&pool, author, 0.682_91).await;
+    let step_by_lineage = mirror_claim(&pool, author, 0.655_13).await;
+    let workflow_row_claim = mirror_claim(&pool, author, 0.701_77).await;
+    let workflow_label = mirror_claim(&pool, author, 0.718_23).await;
+    // Hand-set structure, one arm per claim, as test (4) builds it.
+    let workflow_root = Uuid::new_v4();
+    workflow_row(&pool, workflow_root, control).await;
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES (gen_random_uuid(), $1, 'workflow', $2, 'claim', 'executes')",
+    )
+    .bind(workflow_root)
+    .bind(step_by_edge)
+    .execute(&pool)
+    .await
+    .expect("executes edge");
+    sqlx::query("UPDATE claims SET step_lineage_id = gen_random_uuid() WHERE id = $1")
+        .bind(step_by_lineage)
+        .execute(&pool)
+        .await
+        .unwrap();
+    workflow_row(&pool, workflow_row_claim, workflow_row_claim).await;
+    sqlx::query("UPDATE claims SET labels = array_append(labels, 'workflow') WHERE id = $1")
+        .bind(workflow_label)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut conn = pool.acquire().await.unwrap();
+    let mut wrote = Vec::new();
+    for (id, arm) in [
+        (step_by_edge, "executes in-edge"),
+        (step_by_lineage, "step_lineage_id"),
+        (workflow_row_claim, "workflows row"),
+        (workflow_label, "workflow label"),
+    ] {
+        let t = truth_of(&pool, id).await;
+        let p = cache_of(&pool, id).await.pignistic_prob.unwrap();
+        let v = row_version(&pool, id).await;
+        if cas_refresh(&mut conn, id, t, p, 0.612_3).await.unwrap() {
+            wrote.push(arm);
+        } else {
+            assert_untouched(&pool, id, t, v, arm).await;
+        }
+    }
+    assert!(wrote.is_empty(), "the CAS wrote a claim with: {wrote:?}");
+    let t = truth_of(&pool, control).await;
+    let p = cache_of(&pool, control).await.pignistic_prob.unwrap();
+    assert!(
+        cas_refresh(&mut conn, control, t, p, 0.612_3)
+            .await
+            .unwrap(),
+        "control: the exact values on a plain claim match"
+    );
+}
+
 // ── (17) a claim superseded after the refresh, then restored ───────────────
 
 /// `actor` supersedes `old` through the real act (the privileged test pool);

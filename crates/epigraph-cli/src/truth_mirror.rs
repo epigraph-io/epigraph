@@ -48,8 +48,11 @@
 //! (`FOR UPDATE`, in id order), re-evaluates every rule on the locked values,
 //! and writes each eligible claim with [`cas_refresh`]: an `UPDATE` that
 //! matches only while `truth_value` and `pignistic_prob` still hold the exact
-//! values just read, the claim is current, and its role is still neither
-//! compound nor procedural. A write that matches no row is `raced`. Each
+//! values just read, the claim is current, its role is still neither
+//! compound nor procedural, and it is still not a workflow or step claim (all
+//! four arms, [`workflow_or_step_sql`]: an `executes` edge or a `workflows`
+//! row committed after the locked read is caught by the write itself). A
+//! write that matches no row is `raced`. Each
 //! write's [`TruthRecord`] is handed to the caller BEFORE the batch commits,
 //! so every committed write has a record. It writes `claims.truth_value` and
 //! nothing else: no cache column, no `mass_functions` row, no `workflows` row
@@ -304,6 +307,22 @@ pub fn classify(c: &Candidate, state: Option<&ClaimState>, include_round: bool) 
     Bucket::Refresh
 }
 
+/// The workflow-or-step rule's four arms over the claim aliased `c`, as one
+/// boolean SQL expression: a `workflows` row with the claim's id, a
+/// `step_lineage_id`, an `executes` in-edge, or a `workflow` label. The ONE
+/// spelling: [`read_states`] reads it and [`cas_refresh`] re-checks its
+/// negation in the write, so the two cannot drift.
+#[must_use]
+pub fn workflow_or_step_sql(c: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM workflows w WHERE w.id = {c}.id) \
+          OR {c}.step_lineage_id IS NOT NULL \
+          OR EXISTS (SELECT 1 FROM edges e \
+                      WHERE e.target_id = {c}.id AND e.relationship = 'executes') \
+          OR COALESCE('workflow' = ANY ({c}.labels), false))"
+    )
+}
+
 /// `(id, truth_value, belief, plausibility, pignistic_prob, mass_on_empty,
 /// mass_on_missing, belief_frame_id, classification, is_current,
 /// workflow_or_step, mirror_writer)`.
@@ -341,18 +360,15 @@ pub async fn read_states(
         "SELECT c.id, c.truth_value, c.belief, c.plausibility, c.pignistic_prob, \
                 c.mass_on_empty, c.mass_on_missing, c.belief_frame_id, c.classification, \
                 c.is_current, \
-                (EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
-                 OR c.step_lineage_id IS NOT NULL \
-                 OR EXISTS (SELECT 1 FROM edges e \
-                             WHERE e.target_id = c.id AND e.relationship = 'executes') \
-                 OR COALESCE('workflow' = ANY (c.labels), false)) AS workflow_or_step, \
+                {wf} AS workflow_or_step, \
                 EXISTS (SELECT 1 FROM mass_functions mf \
                          WHERE mf.claim_id = c.id AND mf.retracted_at IS NULL \
                            AND mf.combination_method = $2) AS mirror_writer \
            FROM claims c \
           WHERE c.id = ANY($1) \
-          ORDER BY c.id{}",
-        if lock { " FOR UPDATE OF c" } else { "" }
+          ORDER BY c.id{lock}",
+        wf = workflow_or_step_sql("c"),
+        lock = if lock { " FOR UPDATE OF c" } else { "" }
     );
     let rows: Vec<StateTuple> = sqlx::query_as(&sql)
         .bind(ids)
@@ -387,8 +403,9 @@ pub async fn read_states(
 }
 
 /// The one write: set `truth_value` to `new` only while the row still holds
-/// `read_truth` and `read_cache` exactly, is current, and its role is still
-/// neither compound nor procedural. Returns whether a row matched.
+/// `read_truth` and `read_cache` exactly, is current, its role is still
+/// neither compound nor procedural, and it is still not a workflow or step
+/// claim ([`workflow_or_step_sql`], every arm). Returns whether a row matched.
 ///
 /// # Errors
 /// Any database error.
@@ -404,8 +421,10 @@ pub async fn cas_refresh(
           WHERE c.id = $1 AND c.is_current \
             AND c.truth_value = $2 AND c.pignistic_prob = $3 \
             AND {role} NOT IN ('compound', 'procedural') \
+            AND NOT {wf} \
          RETURNING c.id",
         role = claim_role::claim_role_sql("c"),
+        wf = workflow_or_step_sql("c"),
     );
     let hit: Option<Uuid> = sqlx::query_scalar(&sql)
         .bind(claim_id)
