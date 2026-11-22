@@ -226,15 +226,34 @@ pub async fn apply_beta_update(
     let outcome: Result<(f64, f64), epigraph_db::DbError> = async {
         if let Some((d_alpha, d_beta)) = increments {
             let (w_alpha, w_beta) = withdrawn.unwrap_or((0.0, 0.0));
-            if let Some(stored) = ClaimRepository::add_beta_increments(
-                &mut sp,
-                viewer,
-                claim_id,
-                d_alpha - w_alpha,
-                d_beta - w_beta,
-            )
-            .await?
+            let delta = (d_alpha - w_alpha, d_beta - w_beta);
+            // Only a withdrawal can take a parameter below the prior, where
+            // the repo's floor holds it. Read the track first on that path
+            // alone, so a floored withdrawal is reported, never silent: it
+            // means the replaced row was withdrawn at more than the track
+            // counted of it.
+            let before = match withdrawn {
+                Some(_) => ClaimRepository::get_beta_params(&mut sp, viewer, claim_id).await?,
+                None => None,
+            };
+            if let Some(stored) =
+                ClaimRepository::add_beta_increments(&mut sp, viewer, claim_id, delta.0, delta.1)
+                    .await?
             {
+                if let Some((short_alpha, short_beta)) =
+                    before.and_then(|before| floor_shortfall(before, delta))
+                {
+                    tracing::warn!(
+                        %claim_id,
+                        short_alpha,
+                        short_beta,
+                        "{context}: withdrawing a replaced BBA's Beta increment would take the \
+                         track below the Beta(1, 1) prior; held at 1.0. The replaced BBA was \
+                         counted with less than it was withdrawn at (stored before its writer \
+                         kept the track, or counted at another hypothesis index), so the track \
+                         now undercounts by up to the shortfall"
+                    );
+                }
                 return Ok(stored);
             }
         }
@@ -269,6 +288,17 @@ pub async fn apply_beta_update(
 
 /// `params` with the positive parts of `increments` added. The arithmetic the
 /// stored update performs, for a posterior that is reported but not stored.
+/// How far below the prior's `1.0` each parameter of `before` moved by
+/// `delta` would land, when either does by more than rounding: the amount
+/// `ClaimRepository::add_beta_increments`'s floor absorbs. `None` when the
+/// floor does not engage.
+fn floor_shortfall((alpha, beta): (f64, f64), (d_alpha, d_beta): (f64, f64)) -> Option<(f64, f64)> {
+    let short_alpha = (1.0 - (alpha + d_alpha)).max(0.0);
+    let short_beta = (1.0 - (beta + d_beta)).max(0.0);
+    (short_alpha > PRIOR_TOLERANCE || short_beta > PRIOR_TOLERANCE)
+        .then_some((short_alpha, short_beta))
+}
+
 fn with_increments((alpha, beta): (f64, f64), increments: Option<(f64, f64)>) -> (f64, f64) {
     match increments {
         Some((d_alpha, d_beta)) => (alpha + d_alpha.max(0.0), beta + d_beta.max(0.0)),
@@ -433,6 +463,20 @@ mod tests {
         assert!(!at_prior((1.0, 1.05)));
         assert!(!at_prior((0.7, 1.05)));
         assert!(!at_prior((1.8, 1.2)));
+    }
+
+    /// The floor the withdrawal can hit is reported, not silent: a track
+    /// moved below the prior reports how far, by parameter; a track that stays
+    /// at or above it (rounding included) reports nothing.
+    #[test]
+    fn floor_shortfall_reports_only_what_the_floor_absorbs() {
+        let (a, b) = floor_shortfall((1.5, 1.5), (-1.3, 0.3)).expect("alpha floored");
+        assert!((a - 0.8).abs() < 1e-12 && b == 0.0, "{a} {b}");
+        let (a, b) = floor_shortfall((1.0, 1.2), (0.0, -0.5)).expect("beta floored");
+        assert!(a == 0.0 && (b - 0.3).abs() < 1e-12, "{a} {b}");
+        assert_eq!(floor_shortfall((1.5, 1.5), (-0.5, -0.5)), None);
+        assert_eq!(floor_shortfall((1.56, 1.44), (-0.56, -0.44)), None);
+        assert_eq!(floor_shortfall((2.0, 2.0), (0.7, 0.3)), None);
     }
 
     fn row(method: Option<&str>, masses: serde_json::Value) -> MassFunctionRow {
