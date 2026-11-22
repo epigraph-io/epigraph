@@ -263,7 +263,12 @@ pub async fn ingest_document(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper.id, atomicity))
+    success_json(&queued_response(
+        &doi,
+        paper.title.as_deref().unwrap_or(&title),
+        paper.id,
+        atomicity,
+    ))
 }
 
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
@@ -408,7 +413,12 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper.id, atomicity))
+    success_json(&queued_response(
+        &doi,
+        paper.title.as_deref().unwrap_or(&title),
+        paper.id,
+        atomicity,
+    ))
 }
 
 /// The `wait: true` arm of the two detached ingest handlers: run the walk IN
@@ -466,14 +476,15 @@ fn refuse_bad_author_ids(extraction: &DocumentExtraction) -> Result<(), McpError
 
 /// The document's `papers` node as the detached walk WILL leave it, read
 /// without writing, so the caller gets an id it can address what it is
-/// ingesting by (issue #356).
+/// ingesting by (issue #356) and the title the row will hold.
 ///
 /// Read-only (backlog b995f117): the row is written by the walk, on its own
 /// transaction, so a walk that fails leaves no `papers` row with 0 claims
 /// behind. Until the walk commits a new document has no row, which is what
 /// `query_paper` reports. The id is the existing row's, or
 /// [`epigraph_db::repos::paper::new_paper_id`], which the walk's insert
-/// uses.
+/// uses. The title is the STORED one (backlog 288801f8): the upsert is
+/// fill-only, so a re-ingest under a different title keeps the stored title.
 async fn planned_paper_node(
     server: &EpiGraphMcpFull,
     extraction: &DocumentExtraction,
@@ -575,7 +586,8 @@ fn queued_response(
          until the walk commits, and a document that never appears means the walk failed \
          (see the server log); resubmit with wait=true to see the error. Confirm the writes \
          landed by query_paper's claim_count rising, not with check_already_ingested, which is \
-         already true after ingest_document_spine or any earlier ingest of this document.",
+         already true after ingest_document_spine or any earlier ingest of this document. \
+         `title` is the title the papers row holds, which an earlier ingest may have set.",
     );
     if is_synthetic_key(doi) {
         note.push_str(
@@ -1538,6 +1550,10 @@ pub async fn do_ingest_document_reporting(
     .await
     .map_err(internal_error)?;
     let paper_id = paper.id;
+    // The title the row HOLDS, for the response only (backlog 288801f8): the
+    // upsert is fill-only, so a re-ingest under another title keeps the stored
+    // one. Everything else (evidence text, node seeds) keeps the extraction's.
+    let stored_title = paper.title.unwrap_or_else(|| paper_title.clone());
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -2095,7 +2111,7 @@ pub async fn do_ingest_document_reporting(
     };
     let result = success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
-        paper_title,
+        paper_title: stored_title,
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
@@ -2568,6 +2584,8 @@ pub async fn do_ingest_document_spine(
     .await
     .map_err(internal_error)?;
     let paper_id = paper.id;
+    // The stored title, for the response only (backlog 288801f8).
+    let stored_title = paper.title.unwrap_or_else(|| paper_title.clone());
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -2981,7 +2999,7 @@ pub async fn do_ingest_document_spine(
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
-        paper_title,
+        paper_title: stored_title,
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
