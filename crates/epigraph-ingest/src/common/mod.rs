@@ -5,6 +5,7 @@
 pub mod edges;
 pub mod evidence_type;
 pub mod ids;
+pub mod licence;
 pub mod paths;
 pub mod plan;
 pub mod schema;
