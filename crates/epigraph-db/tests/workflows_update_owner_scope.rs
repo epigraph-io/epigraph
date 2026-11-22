@@ -548,3 +548,65 @@ async fn the_recorded_submitter_is_write_once(pool: PgPool) {
         serde_json::json!("corrected")
     );
 }
+
+// ===================================================================
+// The undo (`docs/runbooks/237-undo.sql`).
+// ===================================================================
+
+/// `(policy, trigger, guard, lock definer, counter definer)` present.
+async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool) {
+    sqlx::query_as(
+        "SELECT \
+           EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' \
+                     AND tablename = 'workflows' AND policyname = 'workflows_update_owner'), \
+           EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'public.workflows'::regclass \
+                     AND tgname = 'workflows_submitter_immutable'), \
+           to_regprocedure('public.epigraph_workflows_submitter_guard()') IS NOT NULL, \
+           to_regprocedure('public.epigraph_workflow_outcome_lock(uuid)') IS NOT NULL, \
+           to_regprocedure('public.epigraph_workflow_record_outcome(uuid, boolean, \
+                                                                    double precision)') \
+             IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("catalog")
+}
+
+/// The undo removes exactly 237's objects, twice without error, and a
+/// non-member's direct UPDATE of a public row reaches it again (the rule 237
+/// replaced), while 183's policies stay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_237_undo_returns_the_table_to_below_237(pool: PgPool) {
+    let w = world(&pool).await;
+    assert_eq!(objects_237(&pool).await, (true, true, true, true, true));
+    let undo = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/runbooks/237-undo.sql"
+    ))
+    .expect("read the undo");
+    for run in 1..=2 {
+        sqlx::raw_sql(&undo)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("undo run {run}: {e}"));
+        assert_eq!(
+            objects_237(&pool).await,
+            (false, false, false, false, false),
+            "after undo run {run}"
+        );
+    }
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_policies WHERE schemaname = 'public' AND tablename = 'workflows' \
+           AND policyname IN ('workflows_read', 'workflows_insert', 'workflows_update', \
+                              'workflows_delete_owner')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("183's policies");
+    assert_eq!(kept, 4, "183's policies are untouched");
+    assert_eq!(
+        write(&w, &w.stranger, DEPRECATE, w.public).await,
+        Ok(1),
+        "below 237 a non-member's UPDATE reaches a public row"
+    );
+}

@@ -3403,6 +3403,48 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
+  `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
+  group rows to readers), so any application-role session could rewrite a public
+  workflow's `truth_value`, counters or `metadata.epigraph_submitted_by` (the key the
+  workflow authority gate's submitter arm trusts) by a direct statement. Three parts:
+  (1) two SECURITY DEFINER functions for the hierarchical outcome report, which any
+  reader of the plan may make: `epigraph_workflow_outcome_lock(uuid)` locks a row the
+  session reads (183's read predicate restated) and `epigraph_workflow_record_outcome(uuid,
+  boolean, double precision)` computes the four counters in SQL
+  (`HierarchicalOutcomeCounters::after_report`'s rule) and writes only those keys; both
+  refuse an elevated session, sit on 172's pinned path, are owned by
+  `epigraph_maintenance` and granted to `epigraph_app` only, and are registered in
+  `epigraph-tenancy-backfill`. `WorkflowRepository::record_hierarchical_outcome` now calls
+  them. (2) A RESTRICTIVE `workflows_update_owner` FOR UPDATE policy (117's shape): 077's
+  bypass arms OR `owner_group_id = ANY (epigraph_writable_groups())`, so a direct UPDATE or
+  row lock reaches a row only for a writer of its owner group (public rows included), a
+  maintenance session or a maintenance-owned body. (3) `workflows_submitter_immutable`, a
+  BEFORE UPDATE OF metadata trigger: an ordinary session may not change or remove a
+  recorded submitter (recording a first one is unchanged). NOT backed by the database: the
+  entry points' submitter, operator, delegate and admin arms for a caller that does not
+  write the row's owner group; such a caller's `truth_value` UPDATE (deprecation) and
+  `FOR UPDATE` locks now match no row. Measured on 235's tree as `epigraph_app`: the admin
+  arm's hierarchical `deprecate_workflow` of another group's public plan already failed,
+  at `claims_tenancy` (42501 retiring the plan's claims). Pinned by
+  `epigraph-db/tests/workflows_update_owner_scope.rs` (as `epigraph_app`: counter parity
+  on odd stored shapes, unreadable rows, the variance bound, non-writer UPDATEs and locks
+  refused, writer and maintenance admitted, the submitter guard, the undo; each part
+  mutation- or removal-tested), `workflows_tenancy.rs` and
+  `epigraph-api/tests/workflow_pin_read_contract.rs` (h). Undo:
+  `docs/runbooks/237-undo.sql` (tested: run twice). Slot 237 was assigned by the
+  2026-11-22 backlog triage; checked before claiming: no origin branch carries a 236 or
+  higher. **Deploy order (binding): migrate and roll out the binary TOGETHER.** A
+  pre-237 binary on a 237 database answers every outcome report from a caller that does
+  not write the plan's owner group 404 (its `FOR UPDATE` sees no row); a 237 binary on a
+  pre-237 database fails every outcome report 42883 (no definer). Before migrating,
+  measure the rows whose recorded submitter does not write the owner group (they lose the
+  identity arms' database writes): `SELECT w.visibility, count(*) FROM workflows w WHERE
+  w.metadata ? 'epigraph_submitted_by' AND NOT EXISTS (SELECT 1 FROM
+  epigraph_live_memberships((w.metadata->>'epigraph_submitted_by')::uuid) m WHERE
+  m.group_id = w.owner_group_id AND m.role IN ('writer','admin')) GROUP BY 1`, and the
+  rows with no recorded submitter. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 
 ## `-- no-transaction` migrations
 
