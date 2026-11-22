@@ -18,6 +18,17 @@
 //!    register, [`PER_ITEM_TYPES`]. A function that builds one of them must not
 //!    render an error with `to_string()` or `{e}` outside a `tracing::` call.
 //!    It takes an `ApiError`'s text from `ApiError::caller_message()`.
+//! 3. **Error collections built outside the routes.** The engine's
+//!    `CascadeReport` (`errors: Vec<String>`) is served as `belief_cascade` in
+//!    2xx answers over HTTP and MCP. Its entries are built with the error's
+//!    text on purpose (the server log and the agent-less audit row keep it), so
+//!    the rule above does not fit. It is in [`BOUNDARY_REDACTED_TYPES`]
+//!    instead: its boundary must still withhold the text, and no route or MCP
+//!    tool may call an engine function that hands back an unfiltered report.
+//!
+//! The register scan in (2) covers `epigraph-api/src` and
+//! `epigraph-engine/src`, and matches both `error: Option<String>` and
+//! `errors: Vec<String>` on a `Serialize` type.
 //!
 //! The scan is TEXTUAL, so what it does not see is stated here. It recognizes
 //! an error value by the receiver names `e`, `err`, `error`, `source` and
@@ -56,6 +67,30 @@ const PER_ITEM_TYPES: &[(&str, &str)] = &[
     ("routes/belief.rs", "ConflictBatchResult"),
 ];
 
+/// Serializable types outside the routes that carry error text and are served
+/// in 2xx bodies, each redacted at ONE boundary every caller-facing copy goes
+/// through: `(path under crates/, type, boundary file under crates/, sentinel
+/// in the boundary file, whitespace-insensitive)`.
+const BOUNDARY_REDACTED_TYPES: &[(&str, &str, &str, &str)] = &[(
+    "epigraph-engine/src/retraction_cascade.rs",
+    "CascadeReport",
+    "epigraph-engine/src/admin_cascade.rs",
+    // `report_for_caller` keeps each entry's context and replaces its error
+    // text with a fixed tail; every `apply_*` returns through it.
+    "errors: report.errors.iter().map(|e| caller_error_line(e, |id| visible.contains(id))).collect(),",
+)];
+
+/// Engine functions that return an unfiltered `CascadeReport`. A route or an
+/// MCP tool takes its report from `admin_cascade::apply_*`, which filters it
+/// for the caller; calling one of these from either crate bypasses that.
+const UNFILTERED_REPORT_FNS: &[&str] = &[
+    "cascade_after_supersede",
+    "cascade_after_edge_withdrawal",
+    "cascade_after_dedup",
+    "sweep_retired_source_bbas",
+    "mark_duplicate_with_cascade",
+];
+
 /// A JSON `"error": e.to_string()` is allowed only where the body is a 5xx that
 /// a choke point redacts: `(path under src/, sentinel in that file)`.
 const JSON_ERROR_FIELD_REDACTED_AT: &[(&str, &str)] = &[(
@@ -68,6 +103,14 @@ const ERROR_RECEIVERS: &[&str] = &["e", "err", "error", "source", "db_err"];
 
 fn src_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+/// `crates/`, the parent of this crate's directory.
+fn crates_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crate sits under crates/")
+        .to_path_buf()
 }
 
 fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -84,7 +127,12 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// `(path under src/ with '/' separators, comment-stripped non-test source,
 /// raw source)` for every file.
 fn sources() -> Vec<(String, String, String)> {
-    let root = src_root();
+    sources_under(&src_root())
+}
+
+/// [`sources`] for any source tree, paths relative to `root`.
+fn sources_under(root: &Path) -> Vec<(String, String, String)> {
+    let root = root.to_path_buf();
     let mut files = Vec::new();
     rs_files(&root, &mut files);
     files.sort();
@@ -500,10 +548,12 @@ fn every_502_503_text_is_a_literal_a_const_or_a_reviewed_dynamic_site() {
     }
 }
 
-#[test]
-fn the_per_item_error_types_are_an_exact_register() {
+/// `(path under crates/, type)` for every `Serialize` struct in `src` that
+/// carries `error: Option<String>` or `errors: Vec<String>`.
+fn error_carrying_types(crate_src: &str) -> BTreeSet<(String, String)> {
     let mut found: BTreeSet<(String, String)> = BTreeSet::new();
-    for (rel, src, _) in sources() {
+    for (rel, src, _) in sources_under(&crates_root().join(crate_src)) {
+        let rel = format!("{crate_src}/{rel}");
         let mut from = 0;
         while let Some(rel_at) = src[from..].find("struct ") {
             let at = from + rel_at;
@@ -528,22 +578,81 @@ fn the_per_item_error_types_are_an_exact_register() {
             let prev_end = src[..at].rfind(['}', ';']).map_or(0, |p| p + 1);
             let attrs = &src[prev_end..at];
             let tokens: Vec<&str> = body.split_whitespace().collect();
-            let carries_error = tokens
-                .windows(2)
-                .any(|w| w[0] == "error:" && w[1].trim_end_matches(',') == "Option<String>");
+            let carries_error = tokens.windows(2).any(|w| {
+                let ty = w[1].trim_end_matches(',');
+                (w[0] == "error:" && ty == "Option<String>")
+                    || (w[0] == "errors:" && ty == "Vec<String>")
+            });
             if attrs.contains("Serialize") && carries_error {
                 found.insert((rel.clone(), name));
             }
         }
     }
+    found
+}
+
+#[test]
+fn the_per_item_error_types_are_an_exact_register() {
+    let mut found = error_carrying_types("epigraph-api/src");
+    found.extend(error_carrying_types("epigraph-engine/src"));
     let expected: BTreeSet<(String, String)> = PER_ITEM_TYPES
         .iter()
-        .map(|(f, t)| (f.to_string(), t.to_string()))
+        .map(|(f, t)| (format!("epigraph-api/src/{f}"), t.to_string()))
+        .chain(
+            BOUNDARY_REDACTED_TYPES
+                .iter()
+                .map(|(f, t, _, _)| (f.to_string(), t.to_string())),
+        )
         .collect();
     assert_eq!(
         found, expected,
-        "the serializable types carrying a per-item `error: Option<String>` changed; a new one \
-         goes in PER_ITEM_TYPES so the rendering rule below covers it"
+        "the serializable types carrying error text (`error: Option<String>` or \
+         `errors: Vec<String>`) changed; a route's per-item type goes in PER_ITEM_TYPES so the \
+         rendering rule below covers it, and a type redacted at one boundary goes in \
+         BOUNDARY_REDACTED_TYPES"
+    );
+}
+
+#[test]
+fn a_boundary_redacted_type_reaches_callers_only_through_its_boundary() {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    for (file, ty, boundary, sentinel) in BOUNDARY_REDACTED_TYPES {
+        let (crate_src, rel) = boundary
+            .split_at(boundary.find("/src/").expect("a path under <crate>/src/") + "/src".len());
+        let src = sources_under(&crates_root().join(crate_src))
+            .into_iter()
+            .find(|(r, _, _)| format!("/{r}") == rel)
+            .unwrap_or_else(|| panic!("{boundary} is gone"))
+            .1;
+        assert!(
+            squash(&src).contains(&squash(sentinel)),
+            "{file}::{ty}: its boundary {boundary} no longer withholds the error text \
+             (missing `{sentinel}`)"
+        );
+    }
+    // Every caller-facing copy goes through that boundary: neither the routes
+    // nor the MCP tools call an engine function that returns a raw report.
+    let mut offenders = Vec::new();
+    let mut scanned = 0;
+    for crate_src in ["epigraph-api/src", "epigraph-mcp/src"] {
+        for (rel, src, _) in sources_under(&crates_root().join(crate_src)) {
+            scanned += 1;
+            for f in UNFILTERED_REPORT_FNS {
+                if src.contains(f) {
+                    offenders.push(format!("{crate_src}/{rel}: {f}"));
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 100,
+        "scanned only {scanned} files; the scan is not seeing the tree"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a route or MCP tool takes a belief report that was never filtered for its caller; \
+         use admin_cascade::apply_*:\n{}",
+        offenders.join("\n")
     );
 }
 
