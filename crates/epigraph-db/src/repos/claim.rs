@@ -13275,8 +13275,16 @@ async fn repair_marked_duplicate(
     // Agents' authorship of the duplicate and act-marked edges stay on it
     // (ruling R-133, as in `migrate_superseded_edges`), and so do the
     // document ingest's own edges (`INGEST_WRITTEN_FROZEN`). Both point AT the
-    // claim they record, so the incoming re-point tests them; the collision
-    // guards never meet an agent-sourced edge (they act on claim-sourced ones).
+    // claim they record, so the incoming re-point tests them. The incoming
+    // collision guards test the act marker too: an edge the re-point leaves on
+    // the duplicate never moves, so it cannot collide, and retracting it would
+    // drop exactly the record K1 keeps (a claim-sourced edge can carry the
+    // marker: MCP `link_epistemic` / `link_hierarchical` do not refuse it).
+    // They never meet an agent-sourced edge (they act on claim-sourced ones),
+    // nor an ingest-marked one (every `INGEST_WRITTEN_SHAPES` source is an
+    // agent or a paper, and migrations 198 / 208 reserve the marker). The
+    // outgoing re-point moves act-marked edges, so the outgoing guard still
+    // retracts a colliding one.
     let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -13322,6 +13330,7 @@ async fn repair_marked_duplicate(
          AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
          AND NOT (e.relationship = ANY($3))
          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+         AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
          AND e.source_type = 'claim' AND e.source_id != $1
          AND e.valid_to IS NULL
          AND EXISTS (
@@ -13338,6 +13347,8 @@ async fn repair_marked_duplicate(
     .bind(canon_uuid)
     .bind(dup_uuid)
     .bind(&frozen)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -13389,7 +13400,10 @@ async fn repair_marked_duplicate(
     // Pre-delete the redundant dup-side `alternative_of` edge whenever
     // `canonical` already shares a symmetric `alternative_of` edge with the
     // same third claim.  Edges where `canonical` is itself an endpoint are
-    // left for the self-loop guards in the migration UPDATEs below.
+    // left for the self-loop guards in the migration UPDATEs below. An
+    // INCOMING (`T→dup`) edge carrying the act marker is left alone: the
+    // incoming re-point keeps it on the duplicate, so it cannot collide (as
+    // in the incoming guard above).
     deleted_edges.extend(
         sqlx::query_as::<_, (Uuid, Uuid)>(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -13399,6 +13413,7 @@ async fn repair_marked_duplicate(
              AND e.source_type = 'claim' AND e.target_type = 'claim'
              AND (e.source_id = $2 OR e.target_id = $2)
              AND e.source_id != $1 AND e.target_id != $1
+             AND NOT (e.target_id = $2 AND COALESCE(e.properties->>$4 = ANY($3), false))
              AND EXISTS (
              SELECT 1 FROM edges e2
              WHERE e2.relationship = 'alternative_of'
@@ -13414,6 +13429,8 @@ async fn repair_marked_duplicate(
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
+        .bind(&act_tools)
+        .bind(SUPERSEDE_ACT_PROPERTY)
         .fetch_all(&mut *conn)
         .await?,
     );

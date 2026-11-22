@@ -459,6 +459,106 @@ async fn dedup_repair_leaves_agent_authorship_and_act_edges_on_the_duplicate(poo
     );
 }
 
+/// The dedup repair's collision guards (backlog 89a1d071 part 1). A
+/// claim-sourced edge carrying the act marker stays on the duplicate (the
+/// incoming re-point skips it), so it never collides with the canonical's
+/// copy of its triple, and no guard may retract it. Before the fix, the
+/// incoming guard (same source, same relationship into the canonical) and the
+/// `alternative_of` symmetric guard (the canonical already pairs with the
+/// same third claim, in the opposite orientation) both retracted it, which is
+/// the very record K1 keeps.
+///
+/// The controls are the same two collisions without the marker: they are
+/// retracted, which proves each guard ran. A claim-sourced marked edge is
+/// harness-written (MCP `link_epistemic` / `link_hierarchical` do not refuse
+/// the marker, so a caller can write one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dedup_collision_guards_leave_act_marked_edges_on_the_duplicate(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "k1-collide").await;
+    let dup = claim_of(&pool, author, group, "k1 colliding duplicate").await;
+    let canonical = claim_of(&pool, author, group, "k1 colliding canonical").await;
+    let z = claim_of(&pool, author, group, "k1 a marked supporter of both").await;
+    let y = claim_of(&pool, author, group, "k1 a plain supporter of both").await;
+    let t = claim_of(&pool, author, group, "k1 a marked alternative").await;
+    let u = claim_of(&pool, author, group, "k1 a plain alternative").await;
+
+    // The incoming guard: z supports both, its edge into the duplicate marked.
+    let marked_in = edge(
+        &pool,
+        (z, "claim"),
+        (dup, "claim"),
+        "supports",
+        Some(act_marker()),
+    )
+    .await;
+    edge(&pool, (z, "claim"), (canonical, "claim"), "supports", None).await;
+    let plain_in = edge(&pool, (y, "claim"), (dup, "claim"), "supports", None).await;
+    edge(&pool, (y, "claim"), (canonical, "claim"), "supports", None).await;
+    // The symmetric guard: t -> dup (marked) and canonical -> t, so only the
+    // direction-agnostic `alternative_of` key collides.
+    let marked_alt = edge(
+        &pool,
+        (t, "claim"),
+        (dup, "claim"),
+        "alternative_of",
+        Some(act_marker_of(
+            epigraph_db::SupersedeTool::CustodialSupersede.as_str(),
+        )),
+    )
+    .await;
+    edge(
+        &pool,
+        (canonical, "claim"),
+        (t, "claim"),
+        "alternative_of",
+        None,
+    )
+    .await;
+    let plain_alt = edge(&pool, (u, "claim"), (dup, "claim"), "alternative_of", None).await;
+    edge(
+        &pool,
+        (canonical, "claim"),
+        (u, "claim"),
+        "alternative_of",
+        None,
+    )
+    .await;
+    let before = ends(&pool, &[marked_in, marked_alt]).await;
+    assert_eq!(
+        before,
+        vec![(z, dup, true), (t, dup, true)],
+        "CALIBRATION: both marked edges are in force on the duplicate"
+    );
+
+    dedup_act(&pool, author, group, dup, canonical).await;
+    let first = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = ClaimRepository::repair_marked_duplicate_conn(
+            &mut conn,
+            ClaimId::from_uuid(dup),
+            ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("dedup repair on the maintenance role");
+        (conn, r)
+    })
+    .await;
+    replay_dedup(&pool, dup, canonical).await;
+
+    let mut retracted = first.retracted_edges.clone();
+    retracted.sort();
+    let mut want = vec![plain_in, plain_alt];
+    want.sort();
+    assert_eq!(
+        retracted, want,
+        "the guards retracted the two unmarked colliding copies, and only them"
+    );
+    assert_eq!(
+        ends(&pool, &[marked_in, marked_alt]).await,
+        before,
+        "the act-marked edges stay in force on the duplicate"
+    );
+}
+
 /// The merge cascade. Each source carries its own authorship set; nothing of
 /// either moves onto the merged claim. A merge source cannot be a supersession
 /// successor either (`consolidate_act_conn` refuses `supersedes` set), so the
