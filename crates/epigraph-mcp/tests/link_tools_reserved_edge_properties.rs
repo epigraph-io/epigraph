@@ -7,9 +7,9 @@
 //! on the claim it records), the ingest's own record keys and the authorship
 //! replacement key. `link_epistemic` and `link_hierarchical` passed the
 //! caller's `properties` straight to the edge writer, so any MCP writer could
-//! forge an act edge. The database guards only some of these keys (`dedup`,
-//! `ingest_written`); `supersede_act` and the ingest-record keys had no guard
-//! at all.
+//! forge an act edge. No database guard covers `supersede_act` or the
+//! ingest-record keys, and on the old code every key here, `dedup` included,
+//! was written through both tools.
 //!
 //! Each tool must answer every reserved key with exactly the HTTP route's
 //! refusal text (`epigraph_db::reserved_edge_property_refusal`) and write
@@ -95,7 +95,11 @@ async fn link_epistemic_refuses_every_reserved_edge_property(pool: PgPool) {
             http_refusal(&properties),
             "{key}: the HTTP route's refusal text"
         );
-        assert_eq!(edges_between(&pool, a, b).await, 0, "{key}: nothing written");
+        assert_eq!(
+            edges_between(&pool, a, b).await,
+            0,
+            "{key}: nothing written"
+        );
     }
 }
 
@@ -142,6 +146,10 @@ async fn link_hierarchical_refuses_every_reserved_edge_property(pool: PgPool) {
             http_refusal(&properties),
             "{key}: the HTTP route's refusal text"
         );
-        assert_eq!(edges_between(&pool, a, b).await, 0, "{key}: nothing written");
+        assert_eq!(
+            edges_between(&pool, a, b).await,
+            0,
+            "{key}: nothing written"
+        );
     }
 }

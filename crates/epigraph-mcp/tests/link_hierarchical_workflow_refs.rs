@@ -650,7 +650,10 @@ async fn executes_refuses_an_own_claim_that_is_not_a_step(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("a level-2 claim with no step lineage");
-    for (what, target) in [("an ordinary claim", plain), ("a level-2 paragraph", paragraph)] {
+    for (what, target) in [
+        ("an ordinary claim", plain),
+        ("a level-2 paragraph", paragraph),
+    ] {
         let err = do_link_hierarchical(
             &server,
             &viewer,
