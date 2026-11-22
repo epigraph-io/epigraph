@@ -123,8 +123,9 @@
 //!   ([`record_caller_workflow_write`]) naming the `arm`, the `acting_agent`,
 //!   the human it acted for (`operator`: the caller itself on the operator
 //!   arm, the principal its live link names on the delegate arm), the
-//!   `submitter`, the tool (`action`), the `workflow_id`, the token
-//!   (`client_id`, `token_jti`) and the tool's own facts (`write`). The row is
+//!   `submitter`, the tool (`action`), the `workflow_id`, the `transport`, the
+//!   token (`client_id`, `token_jti`, and `delegated_by`, a delegated run
+//!   token's delegator) and the tool's own facts (`write`). The row is
 //!   attributed to the session principal (077's `security_events_append`
 //!   admits no other attribution), which is now the caller itself; the actor
 //!   is `acting_agent`. A new generation records one row per anchor it
@@ -752,6 +753,7 @@ pub(crate) async fn audit_admin_workflow_write(
         "workflow_id": workflow_id,
         "submitter": submitter,
         "transport": "http",
+        "delegated_by": token.delegated_by,
         "write": details,
     });
     // Migration 112's definer, not an INSERT: the audit row is written with
@@ -842,9 +844,14 @@ pub(crate) async fn record_caller_workflow_write(
         WorkflowArm::OwnerGroupWriter { group } => ("owner_group_writer", None, Some(group)),
         WorkflowArm::StdioUndeclaredSigner => ("undeclared_signer", None, None),
     };
-    let (transport, client_id, token_jti) = match auth {
-        Some(token) => ("http", Some(token.client_id), Some(token.jti)),
-        None => ("stdio", None, None),
+    let (transport, client_id, token_jti, delegated_by) = match auth {
+        Some(token) => (
+            "http",
+            Some(token.client_id),
+            Some(token.jti),
+            token.delegated_by,
+        ),
+        None => ("stdio", None, None, None),
     };
     if auth.is_some() && matches!(grant.arm, WorkflowArm::StdioUndeclaredSigner) {
         return Err(internal_error_text(format!(
@@ -862,6 +869,9 @@ pub(crate) async fn record_caller_workflow_write(
         "transport": transport,
         "client_id": client_id,
         "token_jti": token_jti,
+        // A delegated run token's delegator (`dlg`), the credential whose
+        // authority a delegate exercised (backlog 7d95803e); null otherwise.
+        "delegated_by": delegated_by,
         "write": details,
     });
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)

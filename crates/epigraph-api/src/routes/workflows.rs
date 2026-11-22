@@ -397,11 +397,16 @@ pub async fn store_workflow(
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows").await?;
-    let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
+    // The request's token reaches the gate, as on `ingest_workflow` (backlog
+    // 7d95803e): the provenance rows name it (client, token id, delegator),
+    // the delegate arm asks it for a live delegation, and the audited admin
+    // arm is reachable, exactly as on every other workflow write route.
+    let auth = Some(&auth);
+    let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
         state.edge_signing_key(),
-        None,
+        auth,
         &viewer,
         &plan,
         &extraction,
@@ -420,7 +425,7 @@ pub async fn store_workflow(
     .await?;
     record_workflow_submitter(
         &mut tx,
-        None,
+        auth,
         &viewer,
         &extraction,
         result.workflow_id,
@@ -3226,8 +3231,10 @@ async fn api_owner_group_arm(
 /// (the MCP twin's `record_caller_workflow_write`, the same
 /// `workflows.caller_write` row and fields), on the write's own transaction.
 /// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
-/// The token fields are null on a route that carries no token
-/// (`store_workflow`, which names its caller through the viewer).
+/// Every row states `"transport": "http"` and the request's token: its
+/// client, its id and, for a delegated run token, its delegator
+/// (`delegated_by`). Every workflow write route passes its token; the token
+/// fields are null only for a call without one.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn record_api_caller_workflow_write(
@@ -3259,6 +3266,9 @@ async fn record_api_caller_workflow_write(
         "transport": "http",
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
+        // A delegated run token's delegator (`dlg`), the credential whose
+        // authority a delegate exercised (backlog 7d95803e); null otherwise.
+        "delegated_by": auth.and_then(|a| a.delegated_by),
         "write": details,
     });
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
@@ -3330,6 +3340,7 @@ async fn audit_api_admin_workflow_write(
         "workflow_id": workflow_id,
         "submitter": submitter,
         "transport": "http",
+        "delegated_by": auth.delegated_by,
         "write": details,
     });
     // Migration 112's definer: this transaction is stamped from the system

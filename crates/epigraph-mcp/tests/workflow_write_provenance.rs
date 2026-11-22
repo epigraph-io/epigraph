@@ -311,6 +311,17 @@ fn assert_provenance(
     assert_eq!(d["transport"], "http", "{d}");
     assert_eq!(d["client_id"], auth.client_id.to_string(), "{d}");
     assert_eq!(d["token_jti"], auth.jti.to_string(), "{d}");
+    // Backlog 7d95803e: the token's delegator is always stated, null for an
+    // undelegated token.
+    assert_eq!(
+        d.get("delegated_by"),
+        Some(
+            &auth
+                .delegated_by
+                .map_or(serde_json::Value::Null, |x| x.to_string().into())
+        ),
+        "{d}"
+    );
 }
 
 /// Shared shape of every refusal: `add_step` refused with the workflow named,
@@ -623,6 +634,11 @@ async fn stdio_writes_are_gated_and_record_provenance(pool: PgPool) {
     assert_eq!(d["transport"], "stdio", "{d}");
     assert_eq!(d["acting_agent"], pinned.to_string(), "{d}");
     assert!(d["client_id"].is_null() && d["token_jti"].is_null(), "{d}");
+    assert_eq!(
+        d.get("delegated_by"),
+        Some(&serde_json::Value::Null),
+        "a stdio row states no delegator: {d}"
+    );
 }
 
 /// Row security admits the provenance INSERT on the system-stamped
