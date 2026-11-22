@@ -3,7 +3,10 @@
 # Edit THIS file, then recompile the hash-locked tests/requirements-ci.txt that
 # CI installs (tests/ci/test_requirements_locked.py fails until you do):
 #   uv pip compile tests/requirements-ci.in -o tests/requirements-ci.txt \
-#     --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_39
+#     --generate-hashes --python-version 3.12 --universal
+# --universal resolves for every OS (platform-only dependencies such as
+# pytest's colorama on Windows are listed behind their markers), so the
+# hash-locked install below works off Linux too, not just on the CI image.
 # Install into a venv:
 #   python3 -m venv .venv && .venv/bin/pip install --require-hashes \
 #     --only-binary :all: -r tests/requirements-ci.txt

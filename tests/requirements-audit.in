@@ -2,5 +2,7 @@
 # tests/requirements-ci.txt. Edit THIS file, then recompile the hash-locked
 # tests/requirements-audit.txt that CI installs:
 #   uv pip compile tests/requirements-audit.in -o tests/requirements-audit.txt \
-#     --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_39
+#     --generate-hashes --python-version 3.12 --universal
+# --universal resolves for every OS (platform-only dependencies are listed
+# behind their markers), so the hash-locked install works off Linux too.
 pip-audit==2.10.1
