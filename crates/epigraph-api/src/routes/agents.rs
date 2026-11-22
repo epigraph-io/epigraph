@@ -259,7 +259,8 @@ pub async fn create_agent(
         // never asked to log in. Only `claims:admin` approves one here; any
         // other caller gets a PENDING client with nothing granted, exactly
         // what `/oauth/register`'s agent arm writes, for an admin to approve.
-        let (status, granted): (&str, Vec<String>) = if auth.has_scope("claims:admin") {
+        let admin = auth.has_scope(epigraph_core::canonical_scopes::CLAIMS_ADMIN);
+        let (status, granted): (&str, Vec<String>) = if admin {
             ("active", scopes.clone())
         } else {
             ("pending", Vec::new())
