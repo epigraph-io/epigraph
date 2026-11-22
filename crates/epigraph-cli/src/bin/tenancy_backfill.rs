@@ -4906,3 +4906,102 @@ mod definer_register_tests {
         }
     }
 }
+
+/// [`MET_ENDPOINTS`] and [`REGISTRY_ENDPOINTS`] are hand copies of the arms of
+/// `epigraph_node_tenancy`. Pin them against the latest migration that
+/// re-states the oracle, so a new arm (or a dropped one) cannot leave
+/// `settle_world_edges_with_private_endpoints` and `verify`'s registry check
+/// meeting an endpoint as public that the database meets with its own row.
+#[cfg(test)]
+mod met_endpoints_tests {
+    use super::{MET_ENDPOINTS, REGISTRY_ENDPOINTS};
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// The body of the LAST `CREATE [OR REPLACE] FUNCTION
+    /// public.epigraph_node_tenancy` among the migrations (by version), with
+    /// `--` comments removed, and that migration's file name.
+    fn latest_oracle_body() -> (String, String) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let mut latest: Option<(i64, String, String)> = None;
+        for entry in std::fs::read_dir(&dir).expect("read migrations/") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            let digits: String = file.chars().take_while(char::is_ascii_digit).collect();
+            let Ok(version) = digits.parse::<i64>() else {
+                continue;
+            };
+            let sql: String = std::fs::read_to_string(&path)
+                .expect("read migration")
+                .lines()
+                .map(|l| l.find("--").map_or(l, |i| &l[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // The definition, not a REVOKE / ALTER naming the function.
+            let Some(at) = ["CREATE OR REPLACE FUNCTION", "CREATE FUNCTION"]
+                .iter()
+                .find_map(|c| sql.find(&format!("{c} public.epigraph_node_tenancy(")))
+            else {
+                continue;
+            };
+            let rest = &sql[at..];
+            let open = rest.find("$$").expect("oracle body opens with $$");
+            let close = rest[open + 2..]
+                .find("$$")
+                .expect("oracle body closes with $$");
+            let body = rest[open + 2..open + 2 + close].to_string();
+            if latest.as_ref().is_none_or(|(v, _, _)| version > *v) {
+                latest = Some((version, file, body));
+            }
+        }
+        let (_, file, body) = latest.expect("some migration defines epigraph_node_tenancy");
+        (file, body)
+    }
+
+    /// Every `p_type = '<type>'` arm of `body`.
+    fn arms(body: &str) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut rest = body;
+        while let Some(i) = rest.find("p_type = '") {
+            rest = &rest[i + "p_type = '".len()..];
+            let end = rest.find('\'').expect("arm literal closes");
+            out.insert(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        out
+    }
+
+    #[test]
+    fn met_endpoints_match_the_oracle_arms() {
+        let (file, body) = latest_oracle_body();
+        let oracle = arms(&body);
+        assert!(
+            oracle.contains("claim") && oracle.contains("evidence"),
+            "CALIBRATION: the arm scan reads {file}'s oracle body; got {oracle:?}"
+        );
+        let met: BTreeSet<String> = MET_ENDPOINTS
+            .iter()
+            .map(|(ty, _, _)| (*ty).to_string())
+            .collect();
+        assert_eq!(
+            met, oracle,
+            "MET_ENDPOINTS must list exactly the endpoint types {file}'s \
+             epigraph_node_tenancy meets with their own row"
+        );
+    }
+
+    #[test]
+    fn registry_endpoints_are_met_endpoints() {
+        for (ty, table) in REGISTRY_ENDPOINTS {
+            assert!(
+                MET_ENDPOINTS
+                    .iter()
+                    .any(|(t, tb, _)| t == ty && tb == table),
+                "REGISTRY_ENDPOINTS' ({ty}, {table}) is not in MET_ENDPOINTS"
+            );
+        }
+    }
+}
