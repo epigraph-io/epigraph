@@ -75,9 +75,11 @@
 --     active Person-made keyless team group, and the inviter is still a live
 --     `admin` of it and still a registered human operator: an admin removed
 --     or demoted since, or whose registration lapsed, no longer vouches for
---     the invitation. Refused TGP04 if the invitee became a live member some
---     other way meanwhile. Otherwise ONE new membership row at the next epoch
---     for the pair (164 section 3: the roster is a ledger) with the invited
+--     the invitation. The invitee's own registration is re-read under the
+--     same `epigraph.operator_links` lock, so a revoke serialises with it.
+--     Refused TGP04 if the invitee became a live member some other way
+--     meanwhile. Otherwise ONE new membership row at the next epoch for the
+--     pair (164 section 3: the roster is a ledger) with the invited
 --     role, and the invitation becomes `accepted` naming that row.
 --   * DECLINE (`epigraph_decline_group_invitation(invitation)`): only the
 --     invitee; `pending` -> `declined` (TGP05 otherwise).
@@ -622,6 +624,13 @@ BEGIN
     -- Serialised with every link write and registration lookup the 164
     -- verbs serialise with (107 section 10).
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('epigraph.operator_links'));
+    -- The invitee's own registration, re-read under the lock (the check at
+    -- the top ran before it, so a revoke could have landed in between).
+    IF NOT public.epigraph_is_human_operator(v_principal) THEN
+        RAISE EXCEPTION 'TGP01: only the invited Person, signed in as themselves, may accept an '
+                        'invitation; an agent acting for them may not; nothing was changed'
+            USING ERRCODE = 'TGP01';
+    END IF;
     IF NOT public.epigraph_is_human_operator(v_inviter)
        OR NOT EXISTS (SELECT 1 FROM public.group_memberships m
                        WHERE m.group_id = v_group AND m.agent_id = v_inviter
