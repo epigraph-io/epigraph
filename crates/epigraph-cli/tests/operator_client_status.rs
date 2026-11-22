@@ -397,3 +397,50 @@ async fn suspending_a_humans_recorded_client_says_it_unregisters_the_human(pool:
     assert_eq!(applied.code, 0, "{}", applied.show());
     assert!(!applied_human, "the human is no longer registered");
 }
+
+/// Backlog 452a1330 part 1: `--reason` is capped at 1000 characters, the cap
+/// migration 191's retire definer applies to its reason, so an audit row's
+/// reason is bounded on every operator verb. 1001 characters are refused
+/// with nothing written (no status change, no chain revoked, no audit row);
+/// exactly 1000 (multi-byte characters, so the count is in characters, not
+/// bytes) are accepted and recorded whole.
+///
+/// Verified to fail: without the cap (the code before this change) the
+/// 1001-character reason suspends the client and is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reason_over_1000_characters_is_refused(pool: PgPool) {
+    let (id, _, _) = service_client(&pool).await;
+    let (role, dsn) = maintenance_login(&pool).await;
+    let c = id.to_string();
+    let too_long = "x".repeat(1001);
+    let at_cap = "é".repeat(1000);
+
+    let refused = run_dsn(
+        &as_args(&verb("suspend-client", &c, &too_long, &["--apply"])),
+        &dsn,
+    );
+    let refused_state = state(&pool, id).await;
+    let accepted = run_dsn(
+        &as_args(&verb("suspend-client", &c, &at_cap, &["--apply"])),
+        &dsn,
+    );
+    let accepted_state = state(&pool, id).await;
+    let rows = audit(&pool, id).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("1000 characters"),
+        "the refusal names the cap: {}",
+        refused.show()
+    );
+    assert_eq!(
+        refused_state,
+        ("active".to_string(), 0, 0, 0),
+        "the refusal writes nothing"
+    );
+    assert_eq!(accepted.code, 0, "{}", accepted.show());
+    assert_eq!(accepted_state, ("suspended".to_string(), 0, 0, 1));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["reason"], serde_json::json!(at_cap));
+}
