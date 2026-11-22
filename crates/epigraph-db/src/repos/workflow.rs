@@ -152,6 +152,13 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
 /// `workflows.metadata` (`use_count`, `success_count`, `failure_count`,
 /// `avg_variance`), as [`WorkflowRepository::record_hierarchical_outcome`]
 /// leaves them.
+///
+/// The WRITE is computed in SQL by migration 237's
+/// `epigraph_workflow_record_outcome` (a reader may not UPDATE the row, so it
+/// moves the counters through that definer); [`Self::after_report`] and
+/// [`Self::write_into`] are the rule it follows, and
+/// `epigraph-db/tests/workflows_update_owner_scope.rs` pins the two equal on
+/// every stored shape the rule treats specially. Change both together.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalOutcomeCounters {
     pub use_count: i64,
@@ -1379,12 +1386,15 @@ impl WorkflowRepository {
     ///
     /// # Visibility
     ///
-    /// Run it on the caller's STAMPED transaction. The lock read carries the
-    /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
-    /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
-    /// requires a readable STEP. The `UPDATE` is by primary key on the row the
-    /// predicate just admitted, and the report rows are admitted by migration
-    /// 221's policies only through that same row.
+    /// Run it on the caller's STAMPED transaction. A reader of the plan may
+    /// report, but since migration 237 only a writer of the row's owner group
+    /// may UPDATE (or row-lock) a `workflows` row, so the lock and the counter
+    /// write go through 237's two definers, which admit the row exactly when
+    /// the session READS it (183's `workflows_read`, restated in the body).
+    /// [`Self::viewer_reads_plan_structure`] then requires a readable STEP, on
+    /// the stamp. The counter definer writes only the four counter keys, and
+    /// the report rows are admitted by migration 221's policies only through
+    /// that same row.
     ///
     /// # Errors
     /// Returns `DbError` if a query fails, and `DbError::InvalidData` for a
@@ -1397,19 +1407,17 @@ impl WorkflowRepository {
         variance: f64,
         idempotency_key: Option<&str>,
     ) -> Result<HierarchicalOutcomeRecord, DbError> {
-        let sql = viewer.splice(
-            "SELECT w.metadata FROM workflows w \
-             WHERE w.id = $1 /* {VISIBILITY:w} */ \
-             FOR UPDATE OF w",
-            2,
-        );
-        let mut q = sqlx::query_scalar::<_, serde_json::Value>(&sql).bind(workflow_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
+        // Migration 237's lock definer: the UPDATE policy admits only a writer
+        // of the row's owner group, and a row lock is checked against it, so a
+        // reader's `FOR UPDATE` on the stamp would see no row. The definer
+        // restates the READ predicate (183's `workflows_read`).
+        let locked: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_outcome_lock($1)")
+            .bind(workflow_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !locked {
             return Ok(HierarchicalOutcomeRecord::NotFound);
-        };
+        }
         if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
             return Ok(HierarchicalOutcomeRecord::NotFound);
         }
@@ -1443,13 +1451,22 @@ impl WorkflowRepository {
             }
         }
 
-        let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
-        counters.write_into(&mut metadata);
-        sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-            .bind(&metadata)
-            .bind(workflow_id)
-            .execute(&mut *conn)
-            .await?;
+        // Migration 237's counter definer computes the four counters from the
+        // stored ones (`HierarchicalOutcomeCounters::after_report`'s rules) and
+        // writes only those keys, so a reader moves no other part of the row.
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT public.epigraph_workflow_record_outcome($1, $2, $3)")
+                .bind(workflow_id)
+                .bind(success)
+                .bind(variance)
+                .fetch_one(&mut *conn)
+                .await?;
+        let counters: HierarchicalOutcomeCounters = serde_json::from_value(stored.clone())
+            .map_err(|e| DbError::InvalidData {
+                reason: format!(
+                    "workflow {workflow_id}: the recorded counters {stored} do not decode: {e}"
+                ),
+            })?;
         Ok(HierarchicalOutcomeRecord::Recorded(counters))
     }
 
