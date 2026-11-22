@@ -1834,14 +1834,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // and the gate admits an evolve of a step a hidden plan runs. That is the
     // stake this entry reports.
     ("epigraph_step_lineage_executors", 219),
-    // 237, a hierarchical outcome report's row lock and counter write on a
-    // `workflows` row the reporter READS (237 narrows the row's UPDATE policy
-    // to writers of its owner group). Both fail CLOSED under a non-member
-    // owner: the bodies' reads and UPDATE are then row-security filtered as
-    // the caller's would be, so the lock answers "no row" (every reader's
-    // report is answered not-found) and the counter write raises WFO04
-    // (loud). The owner is load-bearing.
-    ("epigraph_workflow_outcome_lock", 237),
+    // 237, the row lock (a hierarchical outcome report's and `add_step`'s plan
+    // lock) and the outcome counter write on a `workflows` row the caller
+    // READS (237 narrows the row's UPDATE policy to writers of its owner
+    // group). Both fail CLOSED under a non-member owner: the bodies' reads and
+    // UPDATE are then row-security filtered as the caller's would be, so the
+    // lock answers "no row" for a caller that does not write the owner group
+    // (every such reader's report is answered not-found, and such a caller's
+    // `add_step` runs unlocked) and the counter write raises WFO04 (loud).
+    // The owner is load-bearing.
+    ("epigraph_workflow_lock_readable", 237),
     ("epigraph_workflow_record_outcome", 237),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
@@ -3236,10 +3238,11 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             true,
         ),
         // 237: every hierarchical outcome report (REST and MCP) calls both on
-        // the request DSN; without the grants every report is 42501.
+        // the request DSN, and every `add_step` the lock; without the grants
+        // each of those is 42501.
         (
-            "epigraph_workflow_outcome_lock",
-            "public.epigraph_workflow_outcome_lock(uuid)",
+            "epigraph_workflow_lock_readable",
+            "public.epigraph_workflow_lock_readable(uuid)",
             true,
         ),
         (

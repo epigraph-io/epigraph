@@ -2,7 +2,7 @@
 //! outcome report moves a `workflows` row's counters through two definers, an
 //! UPDATE is owner-scoped, and the recorded submitter is write-once.
 //!
-//! * `epigraph_workflow_outcome_lock` locks a row the session READS (183's
+//! * `epigraph_workflow_lock_readable` locks a row the session READS (183's
 //!   `workflows_read`) and answers whether it did; a row it cannot read is
 //!   answered `false` and stays unlocked.
 //! * `epigraph_workflow_record_outcome` computes the four counters from the
@@ -144,7 +144,7 @@ async fn lock(w: &World, viewer: &Viewer, id: Uuid) -> Result<bool, String> {
     scalar(
         w,
         viewer,
-        "SELECT public.epigraph_workflow_outcome_lock($1)",
+        "SELECT public.epigraph_workflow_lock_readable($1)",
         Binds {
             id,
             success: None,
@@ -550,6 +550,46 @@ async fn the_recorded_submitter_is_write_once(pool: PgPool) {
 }
 
 // ===================================================================
+// add_step's plan lock (`WorkflowRepository::lock_for_plan_edit`).
+// ===================================================================
+
+/// `add_step` serializes concurrent appends to one plan by locking its
+/// `workflows` row, and the entry points admit callers that do not write the
+/// row's owner group (the submitter, its operator, a delegate, the audited
+/// admin) to a PUBLIC plan. Such a caller's lock still takes the row: it is
+/// held (a second locker gets 55P03 under NOWAIT) until the caller's
+/// transaction ends. A row the caller cannot read is answered `false`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_plan_edit_lock_holds_a_readable_row_the_caller_does_not_write(pool: PgPool) {
+    let w = world(&pool).await;
+    let mut tx = w.scoped.begin_as(&w.stranger).await.expect("stamped tx");
+    let locked = epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *tx, w.public)
+        .await
+        .expect("lock_for_plan_edit");
+    assert!(locked, "a reader of the public row locks it");
+    let held = sqlx::query("SELECT 1 FROM workflows WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(w.public)
+        .execute(&pool)
+        .await
+        .map_err(|e| {
+            e.as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+                .unwrap_or_default()
+        });
+    assert_eq!(held.map(|_| ()), Err("55P03".into()), "the row is held");
+    let unreadable = epigraph_db::WorkflowRepository::lock_for_plan_edit(&mut *tx, w.private)
+        .await
+        .expect("lock_for_plan_edit");
+    assert!(!unreadable, "a row the caller cannot read is not locked");
+    tx.rollback().await.expect("rollback");
+    sqlx::query("SELECT 1 FROM workflows WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(w.public)
+        .execute(&pool)
+        .await
+        .expect("released with the transaction");
+}
+
+// ===================================================================
 // The undo (`docs/runbooks/237-undo.sql`).
 // ===================================================================
 
@@ -562,7 +602,7 @@ async fn objects_237(pool: &PgPool) -> (bool, bool, bool, bool, bool) {
            EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = 'public.workflows'::regclass \
                      AND tgname = 'workflows_submitter_immutable'), \
            to_regprocedure('public.epigraph_workflows_submitter_guard()') IS NOT NULL, \
-           to_regprocedure('public.epigraph_workflow_outcome_lock(uuid)') IS NOT NULL, \
+           to_regprocedure('public.epigraph_workflow_lock_readable(uuid)') IS NOT NULL, \
            to_regprocedure('public.epigraph_workflow_record_outcome(uuid, boolean, \
                                                                     double precision)') \
              IS NOT NULL",

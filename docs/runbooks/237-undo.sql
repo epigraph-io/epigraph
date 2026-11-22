@@ -6,9 +6,10 @@
 --
 -- ROLL THE BINARY BACK FIRST. A binary built with 237 moves every
 -- hierarchical outcome report's counters through
--- `epigraph_workflow_outcome_lock` and `epigraph_workflow_record_outcome`;
--- with them dropped, every report (REST and MCP) fails 42883. A binary built
--- without 237 needs neither, and works below 237 as before.
+-- `epigraph_workflow_lock_readable` and `epigraph_workflow_record_outcome`,
+-- and takes every `add_step`'s plan lock through the first; with them
+-- dropped, each of those (REST and MCP) fails 42883. A binary built without
+-- 237 needs neither, and works below 237 as before.
 --
 -- WHAT IT DOES:
 --   * drops `workflows_submitter_immutable` and its function
@@ -39,6 +40,6 @@ DROP FUNCTION IF EXISTS public.epigraph_workflows_submitter_guard();
 DROP POLICY IF EXISTS workflows_update_owner ON public.workflows;
 
 DROP FUNCTION IF EXISTS public.epigraph_workflow_record_outcome(uuid, boolean, double precision);
-DROP FUNCTION IF EXISTS public.epigraph_workflow_outcome_lock(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_workflow_lock_readable(uuid);
 
 COMMIT;

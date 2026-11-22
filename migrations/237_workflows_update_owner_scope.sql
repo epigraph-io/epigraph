@@ -36,8 +36,12 @@
 -- lock is checked against UPDATE's USING too. So the reader's path moves into
 -- two SECURITY DEFINER functions before the policy is narrowed:
 --
---   * `epigraph_workflow_outcome_lock(workflow)` locks the row (`FOR UPDATE`)
---     when the session reads it, and answers whether it did;
+--   * `epigraph_workflow_lock_readable(workflow)` locks the row (`FOR UPDATE`)
+--     when the session reads it, and answers whether it did. `add_step`'s
+--     plan lock (`WorkflowRepository::lock_for_plan_edit`) uses it too: it
+--     serializes concurrent appends to one plan, and the entry points admit
+--     callers that do not write a PUBLIC plan's owner group (section 3), whose
+--     lock on the stamp would otherwise take nothing;
 --   * `epigraph_workflow_record_outcome(workflow, success, variance)` locks
 --     it again (a no-op inside the same transaction), computes the four
 --     counters IN SQL from the stored ones and writes exactly those four keys.
@@ -107,12 +111,15 @@
 -- the owner-group writer, the recorded SUBMITTER, its OPERATOR and a DELEGATE
 -- (operator ruling R-183) by identity, and the audited admin arm. A caller
 -- admitted by one of those arms that does not write the row's owner group now
--- writes nothing to the row itself (its `truth_value` UPDATE and its
--- `FOR UPDATE` locks match no row). For a row written since workflow writes
--- are made as the caller, the submitter wrote it into a group it writes; the
--- rows at stake are older ones whose recorded submitter does not write the
--- owner group. Retiring their claims is refused to such a caller already,
--- by the same `claims_tenancy` rule as the admin's (above).
+-- writes nothing to the row itself: its `truth_value` UPDATE (deprecation)
+-- and the deprecation's lineage lock match no row. `add_step` keeps its plan
+-- lock through the definer (section 1) and writes no `workflows` row. The
+-- callers at stake: a legacy row's recorded submitter that does not write its
+-- owner group, a delegate or operator acting on a plan in a team its
+-- principal writes and it does not, and the admin. Retiring the plan's claims
+-- is refused to every one of them already, by the same `claims_tenancy` rule
+-- as the admin's (above; for the delegate, pinned by
+-- `workflow_delegate_authority.rs::a_delegate_deprecates_its_operators_workflow`).
 --
 -- 126's elevated census is unaffected: the policy's name has no `_elevated_`
 -- and it names no elevation helper.
@@ -146,7 +153,7 @@ SET LOCAL lock_timeout = '3s';
 -- ===================================================================
 -- 2. THE OUTCOME DEFINERS
 -- ===================================================================
-CREATE OR REPLACE FUNCTION public.epigraph_workflow_outcome_lock(p_workflow uuid)
+CREATE OR REPLACE FUNCTION public.epigraph_workflow_lock_readable(p_workflow uuid)
 RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp AS $$
@@ -164,7 +171,7 @@ BEGIN
         FOR UPDATE OF w;
     RETURN FOUND;
 END $$;
-REVOKE EXECUTE ON FUNCTION public.epigraph_workflow_outcome_lock(uuid) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.epigraph_workflow_lock_readable(uuid) FROM PUBLIC;
 
 CREATE OR REPLACE FUNCTION public.epigraph_workflow_record_outcome(
     p_workflow uuid,
@@ -259,7 +266,7 @@ REVOKE EXECUTE ON FUNCTION public.epigraph_workflow_record_outcome(uuid, boolean
 -- re-own scan reads these statements).
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
-        EXECUTE 'ALTER FUNCTION public.epigraph_workflow_outcome_lock(uuid) '
+        EXECUTE 'ALTER FUNCTION public.epigraph_workflow_lock_readable(uuid) '
                 'OWNER TO epigraph_maintenance';
         EXECUTE 'ALTER FUNCTION public.epigraph_workflow_record_outcome(uuid, boolean, double precision) '
                 'OWNER TO epigraph_maintenance';
@@ -268,7 +275,7 @@ DO $$ BEGIN
                      'bodies stay owned by the migration runner.';
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
-        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_workflow_outcome_lock(uuid) '
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_workflow_lock_readable(uuid) '
                 'TO epigraph_app';
         EXECUTE 'GRANT EXECUTE ON FUNCTION '
                 'public.epigraph_workflow_record_outcome(uuid, boolean, double precision) '

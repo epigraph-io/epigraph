@@ -3409,7 +3409,7 @@ restart.
   workflow's `truth_value`, counters or `metadata.epigraph_submitted_by` (the key the
   workflow authority gate's submitter arm trusts) by a direct statement. Three parts:
   (1) two SECURITY DEFINER functions for the hierarchical outcome report, which any
-  reader of the plan may make: `epigraph_workflow_outcome_lock(uuid)` locks a row the
+  reader of the plan may make: `epigraph_workflow_lock_readable(uuid)` locks a row the
   session reads (183's read predicate restated) and `epigraph_workflow_record_outcome(uuid,
   boolean, double precision)` computes the four counters in SQL
   (`HierarchicalOutcomeCounters::after_report`'s rule) and writes only those keys; both
@@ -3423,8 +3423,9 @@ restart.
   BEFORE UPDATE OF metadata trigger: an ordinary session may not change or remove a
   recorded submitter (recording a first one is unchanged). NOT backed by the database: the
   entry points' submitter, operator, delegate and admin arms for a caller that does not
-  write the row's owner group; such a caller's `truth_value` UPDATE (deprecation) and
-  `FOR UPDATE` locks now match no row. Measured on 235's tree as `epigraph_app`: the admin
+  write the row's owner group; such a caller's `truth_value` UPDATE (deprecation) and the
+  deprecation's lineage lock now match no row (`add_step`'s plan lock goes through
+  `epigraph_workflow_lock_readable` and still holds). Measured on 235's tree as `epigraph_app`: the admin
   arm's hierarchical `deprecate_workflow` of another group's public plan already failed,
   at `claims_tenancy` (42501 retiring the plan's claims). Pinned by
   `epigraph-db/tests/workflows_update_owner_scope.rs` (as `epigraph_app`: counter parity
@@ -3436,8 +3437,11 @@ restart.
   2026-11-22 backlog triage; checked before claiming: no origin branch carries a 236 or
   higher. **Deploy order (binding): migrate and roll out the binary TOGETHER.** A
   pre-237 binary on a 237 database answers every outcome report from a caller that does
-  not write the plan's owner group 404 (its `FOR UPDATE` sees no row); a 237 binary on a
-  pre-237 database fails every outcome report 42883 (no definer). Before migrating,
+  not write the plan's owner group 404 (its `FOR UPDATE` sees no row) and runs such a
+  caller's `add_step` without its plan lock; a 237 binary on a pre-237 database fails
+  every outcome report and every `add_step` 42883 (no definer). `embed_backfill` writes
+  `goal_embedding` on its maintenance connection (`MaintenancePool` refuses an
+  unprivileged one), so 237 does not narrow it. Before migrating,
   measure the rows whose recorded submitter does not write the owner group (they lose the
   identity arms' database writes): `SELECT w.visibility, count(*) FROM workflows w WHERE
   w.metadata ? 'epigraph_submitted_by' AND NOT EXISTS (SELECT 1 FROM

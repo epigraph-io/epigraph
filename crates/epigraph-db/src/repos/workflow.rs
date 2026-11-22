@@ -462,9 +462,15 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction,
-    /// which `workflows`' row security (migration 183) bounds to the rows that
-    /// stamp reads.
+    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction
+    /// and locks a row that stamp READS (183's `workflows_read`).
+    ///
+    /// Through migration 237's `epigraph_workflow_lock_readable`, not a
+    /// `SELECT ... FOR UPDATE` on the stamp: since 237 a row lock on the stamp
+    /// reaches only a row whose owner group the session WRITES, and the entry
+    /// points admit callers that do not (the submitter, its operator, a
+    /// delegate, the audited admin) to a public plan. On the stamp their lock
+    /// would take nothing and two such appends could take the same index.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -472,12 +478,10 @@ impl WorkflowRepository {
         executor: E,
         workflow_id: Uuid,
     ) -> Result<bool, sqlx::Error> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
-                .bind(workflow_id)
-                .fetch_optional(executor)
-                .await?;
-        Ok(row.is_some())
+        sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+            .bind(workflow_id)
+            .fetch_one(executor)
+            .await
     }
 
     /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
@@ -1407,11 +1411,12 @@ impl WorkflowRepository {
         variance: f64,
         idempotency_key: Option<&str>,
     ) -> Result<HierarchicalOutcomeRecord, DbError> {
-        // Migration 237's lock definer: the UPDATE policy admits only a writer
-        // of the row's owner group, and a row lock is checked against it, so a
-        // reader's `FOR UPDATE` on the stamp would see no row. The definer
-        // restates the READ predicate (183's `workflows_read`).
-        let locked: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_outcome_lock($1)")
+        // Migration 237's lock definer (`lock_for_plan_edit`'s too): the UPDATE
+        // policy admits only a writer of the row's owner group, and a row lock
+        // is checked against it, so a reader's `FOR UPDATE` on the stamp would
+        // see no row. The definer restates the READ predicate (183's
+        // `workflows_read`).
+        let locked: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
             .bind(workflow_id)
             .fetch_one(&mut *conn)
             .await?;
