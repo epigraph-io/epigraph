@@ -78,6 +78,13 @@
 -- columns and re-creates `edges_owner_immutable` with 120's column list.
 -- Export `(id, declared_owner_group_id, declared_co_owner_group_id)` of the
 -- non-NULL rows first if the declarations may be wanted again.
+--
+-- LOCKS. The ADD COLUMN is catalog-only but takes ACCESS EXCLUSIVE on
+-- `edges`, and section 3's backfill runs in the same transaction, so every
+-- read and write of `edges` waits for the scan of the `group` edges (a
+-- set-based join, no per-row function call). Apply in a maintenance window;
+-- measure `SELECT count(*) FROM edges WHERE visibility = 'group'` first. A
+-- lock-timeout failure means re-run, never force.
 
 SET LOCAL lock_timeout = '3s';
 
@@ -154,23 +161,35 @@ END $$;
 -- ===================================================================
 -- 3. THE EXISTING DECLARATIONS
 -- ===================================================================
--- Before the guard below watches the columns. Only rows whose endpoints
--- exist are written (`edges_validate_refs` fires on every UPDATE and would
--- abort the migration on a dangling one, which `epigraph_node_tenancy`
--- reads as public); the count of skipped rows is reported.
+-- Before the guard below watches the columns. Set-based: each endpoint's
+-- tenancy is read by a LEFT JOIN on the three tables `epigraph_node_tenancy`
+-- reads (claim, evidence, workflow; any other type, or a missing row, is
+-- public), 219's shape, instead of two function calls per group edge: the
+-- ADD COLUMN above holds ACCESS EXCLUSIVE on `edges` until commit. Only rows
+-- whose endpoints exist are written (`edges_validate_refs` fires on every
+-- UPDATE and would abort the migration on a dangling one); the count of
+-- skipped rows is reported.
 DO $$
 DECLARE v_marked bigint; v_dangling bigint;
 BEGIN
-    WITH cand AS (
-        SELECT e.id,
-               (public.validate_edge_reference(e.source_id, e.source_type)
-                AND public.validate_edge_reference(e.target_id, e.target_type)) AS refs_ok
+    WITH both_public AS (
+        SELECT e.id, e.source_id, e.source_type, e.target_id, e.target_type
           FROM public.edges e
-          CROSS JOIN LATERAL public.epigraph_node_tenancy(e.source_id, e.source_type) s
-          CROSS JOIN LATERAL public.epigraph_node_tenancy(e.target_id, e.target_type) t
+          LEFT JOIN public.claims    sc ON e.source_type = 'claim'    AND sc.id = e.source_id
+          LEFT JOIN public.evidence  se ON e.source_type = 'evidence' AND se.id = e.source_id
+          LEFT JOIN public.workflows sw ON e.source_type = 'workflow' AND sw.id = e.source_id
+          LEFT JOIN public.claims    tc ON e.target_type = 'claim'    AND tc.id = e.target_id
+          LEFT JOIN public.evidence  te ON e.target_type = 'evidence' AND te.id = e.target_id
+          LEFT JOIN public.workflows tw ON e.target_type = 'workflow' AND tw.id = e.target_id
          WHERE e.visibility = 'group'
            AND e.declared_owner_group_id IS NULL
-           AND s.v = 'public' AND t.v = 'public'
+           AND COALESCE(sc.visibility, se.visibility, sw.visibility, 'public') = 'public'
+           AND COALESCE(tc.visibility, te.visibility, tw.visibility, 'public') = 'public'
+    ), cand AS (
+        SELECT b.id,
+               (public.validate_edge_reference(b.source_id, b.source_type)
+                AND public.validate_edge_reference(b.target_id, b.target_type)) AS refs_ok
+          FROM both_public b
     ), upd AS (
         UPDATE public.edges e
            SET declared_owner_group_id = e.owner_group_id,

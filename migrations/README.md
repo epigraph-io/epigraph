@@ -3424,7 +3424,11 @@ restart.
   inexpressible hold, the backfill, the undo) and
   `epigraph-api/tests/privatization_declared_edges.rs` (the apply and revert jobs). Undo:
   `docs/runbooks/260-undo.sql`. **Deploy order:** migrate BEFORE rolling out the 260 binary
-  (its re-meet reads the new columns); undo only after rolling it back. **Applied to throwaway
+  (its re-meet reads the new columns; on an unmigrated database it fails with 42703, moot while
+  the privatization lifecycle answers 501 under D9); undo only after rolling it back. The ADD
+  COLUMN's ACCESS EXCLUSIVE lock on `edges` is held through the backfill's scan of the `group`
+  edges: apply in a maintenance window after measuring
+  `SELECT count(*) FROM edges WHERE visibility = 'group'`. **Applied to throwaway
   databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

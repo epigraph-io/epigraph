@@ -554,15 +554,39 @@ async fn the_260_backfill_records_the_existing_declarations_only(pool: PgPool) {
     let a = fixture::seed_public_claim(&pool, author, "public A").await;
     let b = fixture::seed_public_claim(&pool, author, "public B").await;
     let private = fixture::seed_group_claim(&pool, author, h, "private C").await;
+    let mut wf = Vec::new();
+    for (name, vis, owner) in [("public-plan", "public", WORLD), ("group-plan", "group", h)] {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO workflows (id, canonical_name, goal, generation, metadata, visibility, \
+                                    owner_group_id) \
+             VALUES ($1, $2, 'a plan', 0, '{}'::jsonb, $3, $4)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(vis)
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .expect("seed a workflow below 260");
+        wf.push(id);
+    }
     let mut ids = Vec::new();
-    for (s, tg, vis) in [(a, b, "group"), (private, a, "group"), (b, a, "public")] {
+    for (s, tg, tg_type, vis) in [
+        (a, b, "claim", "group"),
+        (private, a, "claim", "group"),
+        (b, a, "claim", "public"),
+        (a, wf[0], "workflow", "group"),
+        (a, wf[1], "workflow", "group"),
+    ] {
         let id: Uuid = sqlx::query_scalar(
             "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
                                 visibility, owner_group_id) \
-             VALUES ($1, 'claim', $2, 'claim', 'supports', $3, $4) RETURNING id",
+             VALUES ($1, 'claim', $2, $3, 'supports', $4, $5) RETURNING id",
         )
         .bind(s)
         .bind(tg)
+        .bind(tg_type)
         .bind(vis)
         .bind(if vis == "group" { h } else { WORLD })
         .fetch_one(&pool)
@@ -582,6 +606,16 @@ async fn the_260_backfill_records_the_existing_declarations_only(pool: PgPool) {
         "derived (mixed)"
     );
     assert_eq!(declaration(&pool, ids[2]).await, (None, None), "public");
+    assert_eq!(
+        declaration(&pool, ids[3]).await,
+        (Some(h), None),
+        "declared onto a public workflow"
+    );
+    assert_eq!(
+        declaration(&pool, ids[4]).await,
+        (None, None),
+        "derived from a group workflow (219's endpoint)"
+    );
 }
 
 async fn catalog(pool: &PgPool) -> std::collections::BTreeSet<String> {
