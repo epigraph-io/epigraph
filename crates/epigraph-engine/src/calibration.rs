@@ -788,6 +788,18 @@ mod tests {
                 < f64::EPSILON,
             "dataset → empirical"
         );
+        // A stored `figure` row likewise weighs as the engine maps it
+        // (`map_evidence_type`: Figure → Empirical), not at the 0.5 fallback.
+        assert!(
+            cfg.evidence_type_weight_present("figure"),
+            "figure must resolve through the alias table"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("figure") - cfg.get_evidence_type_weight("empirical"))
+                .abs()
+                < f64::EPSILON,
+            "figure → empirical"
+        );
     }
 
     #[test]
