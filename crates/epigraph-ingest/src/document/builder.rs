@@ -325,7 +325,10 @@ pub fn build_ingest_plan(extraction: &DocumentExtraction) -> IngestPlan {
             supporting_locator: Some(passage_locator(
                 &section_path,
                 Some(&section.title),
-                locate_passage(extraction, &section.title, None).as_ref(),
+                // The validated heading span, when it reproduces the title,
+                // places the locator at the real heading rather than at the
+                // first occurrence of a short title such as "Results".
+                locate_passage(extraction, &section.title, section.heading_span.as_ref()).as_ref(),
             )),
             enrichment: serde_json::json!({}),
         });
@@ -761,6 +764,41 @@ mod passage_locator_tests {
         assert_eq!(
             span_of(para.supporting_locator.as_deref().unwrap()),
             Some((2, 2 + PARA.len()))
+        );
+        assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
+    }
+
+    /// Review finding 5: a short section title also occurring earlier in the
+    /// source (here inside the abstract) is located at its validated heading
+    /// span, not at the first match.
+    #[test]
+    fn a_section_locator_uses_the_heading_span() {
+        let src = format!("Abstract. Results are reported below.\n\nResults\n\n{PARA}");
+        let heading = src.rfind("Results\n").unwrap();
+        let para = src.find(PARA).unwrap();
+        let json = serde_json::json!({
+            "source": {"title": "Heading Paper", "source_type": "Paper", "authors": []},
+            "source_text": src,
+            "thesis_derivation": "TopDown",
+            "sections": [{
+                "title": "Results",
+                "heading_span": {"start": heading, "end": heading + "Results".len()},
+                "paragraphs": [{
+                    "text": PARA,
+                    "span": {"start": para, "end": para + PARA.len()},
+                    "atoms": ["The measured value was 4.2"],
+                    "generality": [1],
+                    "confidence": 0.8
+                }]
+            }],
+            "relationships": []
+        });
+        let ex: DocumentExtraction = serde_json::from_value(json).expect("fixture parses");
+        let plan = build_ingest_plan(&ex);
+        let section = plan.claims.iter().find(|c| c.level == 1).unwrap();
+        assert_eq!(
+            span_of(section.supporting_locator.as_deref().unwrap()),
+            Some((heading, heading + "Results".len()))
         );
         assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
     }
