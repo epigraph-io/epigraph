@@ -103,15 +103,21 @@ fn keyed_derivation_changes_with_model_or_prompt_hash() {
     assert_ne!(base.public_key(), other_files.public_key());
 }
 
-/// Backlog 8bd859e5: the keyed hash IS the identity private key, so
-/// `keypair_from_llm_agent_keyed` holds the hash output in a `Zeroizing`
-/// wrapper and wipes the keyed hasher (whose state carries the secret's key
-/// words) before it returns. That needs blake3's `zeroize` feature: without
-/// it `blake3::Hash` and `blake3::Hasher` have no `Zeroize`, and this target
-/// does not compile. The assertions check that the wipe the derivation relies
-/// on really clears the bytes, rather than being a no-op impl.
+/// Backlog 8bd859e5 (part 2, epigraph-crypto only): `keypair_from_llm_agent_keyed`
+/// holds the keyed hash (the identity private key) in a `Zeroizing` wrapper
+/// and wipes the keyed hasher (whose state carries the secret's key words).
+/// Both need blake3's `zeroize` feature on this crate: without it
+/// `blake3::Hash` and `blake3::Hasher` have no `Zeroize`, and this target does
+/// not compile.
+///
+/// What this test proves, and what it does not: it proves the feature is
+/// enabled and that blake3's `Zeroize` really clears the bytes (not a no-op
+/// impl). It does NOT observe the derivation's own memory; no safe test can,
+/// and `keypair_from_llm_agent_keyed`'s wipe is best-effort (blake3's
+/// internal temporaries and compiler stack copies are out of reach). The
+/// derivation's output is pinned unchanged by the literal-vector tests above.
 #[test]
-fn the_keyed_hash_and_hasher_are_wiped_by_zeroize() {
+fn blake3_zeroize_is_enabled_and_clears_the_hash_and_hasher() {
     use zeroize::Zeroize;
 
     let mut hash = blake3::keyed_hash(&SECRET_A, b"llm-agent:test-model-7:x");
