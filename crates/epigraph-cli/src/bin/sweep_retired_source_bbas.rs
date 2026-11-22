@@ -40,7 +40,9 @@
 //!   a row could not be re-inserted, the cache step failed, or the audit row
 //!   of a caches-only undo could not be written (the report then names the
 //!   rows' errors, or carries `caches_error` or `caches_audit_error`); the
-//!   rows and caches it did restore stay committed.
+//!   rows and caches it did restore stay committed. A caches-only audit row
+//!   that failed is not retried by a re-run (its caches then read as already
+//!   restored), so that run's report is its only record.
 //!
 //! # Authority
 //!
@@ -387,7 +389,9 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         if let Some(e) = cache_audit_error {
             bail!(
                 "write the audit row of an undo that restored only caches: {e}; the caches it \
-                 restored stay restored, and the report names them"
+                 restored stay restored and the report names them. A re-run will NOT write this \
+                 row (those caches now read as already restored), so keep the report: it is \
+                 the only record of this cache restore"
             );
         }
         if let Some(e) = cache_error {
