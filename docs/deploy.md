@@ -2428,7 +2428,8 @@ a handover: grant the role back to its human, or detach the agent and attach
 an identity linked to the new holder. `epigraph-mcp-full` asks the same question
 at boot, on every transport, and refuses to start on `may_run = false`.
 Attachments are written by a maintenance session
-(`epigraph_attach_agent_to_role` / `epigraph_detach_agent_from_role`, or a
+(`epigraph-operator role-attach` / `role-detach`, dry run by default, over
+`epigraph_attach_agent_to_role` / `epigraph_detach_agent_from_role`; or a
 direct statement that meets the same guards) and by the identity
 registration. Order: REGISTER, THEN ATTACH. Attaching an identity before the
 host first registers it makes that registration abort `AID09`, and the
@@ -2474,9 +2475,17 @@ epigraph-operator define-group-role --key role:<key> --description <text> --grou
 epigraph-operator bind-group-role --role <key> --group <id> --member-role reader|writer [--agent-mode ...] --reason <text> [--apply]
 epigraph-operator end-group-role-binding --binding <id> --reason <text> [--apply]
 epigraph-operator group-roster --group <id> [--at <RFC3339>]
+epigraph-operator role-attach --role <key> --agent <id> [--valid-from <RFC3339>] [--valid-to <RFC3339>] --reason <text> [--apply]
+epigraph-operator role-detach --role <key> --agent <id> --reason <text> [--apply]
 ```
 
 Without `--apply`, each verb's writes and audit row roll back.
+`role-attach` and `role-detach` attach an agent identity to a role
+(migration 166) or detach it, for the `attached_agents` mode (179). They
+print the rows the act writes or ends (`COPY` for each succession copy an
+attach follows onto, `DETACHED` for each row a detach ends) and the
+role-derived memberships of every identity the act can change, before vs
+after (`MEMBERSHIP GAINED|LOST|KEPT`).
 `group-roster` prints a `MEMBER` line per binding-derived member and a
 `DIRECT` line per live row of the group's own roster (what `group-member add`
 writes, and the admin a team group is created with); the last line counts both
@@ -2895,7 +2904,7 @@ the flags.
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
 | Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
-| Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
+| Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede`, `role-attach`, `role-detach` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |
 | OAuth clients and scopes | `approve-client`, `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |
