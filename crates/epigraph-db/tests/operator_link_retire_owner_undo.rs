@@ -92,7 +92,10 @@ fn repo_file(rel: &str) -> String {
 async fn the_257_undo_returns_the_catalog_below_257(pool: PgPool) {
     migrate(&pool, &up_to(256)).await;
     let before = catalog(&pool).await;
-    migrate(&pool, &MIGRATOR).await;
+    // Through 257 only, not the whole migrator: a later migration that adds a
+    // public function, policy or trigger would otherwise show up in the
+    // post-undo diff and fail this test for a reason that is not 257's.
+    migrate(&pool, &up_to(257)).await;
     let through = catalog(&pool).await;
     let added: Vec<&String> = through.difference(&before).collect();
     assert!(
