@@ -476,3 +476,50 @@ async fn the_address_limiter_exempts_only_the_real_probe_route() {
         "the real liveness route is still exempt"
     );
 }
+
+/// Behind a trusted proxy the per-address limiter keys on the right-most
+/// untrusted `X-Forwarded-For` hop, not on the proxy: two clients behind one
+/// trusted reverse proxy have two buckets, and a client cannot buy a fresh
+/// one by prepending hops.
+///
+/// Fails when the middleware ignores the limiter's trusted proxies (every
+/// client is then keyed to the proxy and shares its bucket, so client B's
+/// first request is refused).
+#[tokio::test]
+async fn the_address_limiter_keys_on_the_client_behind_a_trusted_proxy() {
+    let trusted = TrustedProxies::parse("192.0.2.1").unwrap();
+    let (router, _) = address_only_router(limiter().with_trusted_proxies(trusted));
+    let proxy = "192.0.2.1:443";
+    let via = |xff: &'static str| {
+        let router = router.clone();
+        async move {
+            let peer: SocketAddr = proxy.parse().unwrap();
+            let mut req = Request::builder()
+                .method("GET")
+                .uri("/no/such/route")
+                .header("X-Forwarded-For", xff)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            router.oneshot(req).await.unwrap().status()
+        }
+    };
+    for _ in 0..LIMIT {
+        assert_eq!(via("203.0.113.90").await, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        via("203.0.113.90").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "client A has spent its bucket"
+    );
+    assert_eq!(
+        via("198.51.100.1, 203.0.113.90").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "client A cannot buy a fresh bucket by prepending a hop"
+    );
+    assert_eq!(
+        via("203.0.113.91").await,
+        StatusCode::NOT_FOUND,
+        "client B behind the same proxy has its own bucket"
+    );
+}
