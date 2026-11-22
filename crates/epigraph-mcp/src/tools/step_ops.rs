@@ -79,16 +79,19 @@ fn map_step_err(e: epigraph_ingest_executor::StepOpError) -> McpError {
                 data: None,
             }
         }
-        // Migration 105's personal-group refusal (the step claim's owner
-        // declaration): a denial, as on every other write tool.
-        E::Repo(db) if db.is_write_authority_refusal() => crate::errors::db_caller_error(db),
         E::Executor(x) => crate::errors::executor_caller_error("executor error", x),
         // The TYPED error, never its `to_string()` (backlog 0bc4636e): a
         // designed refusal (`DbError::Refused`, a coded database message) is
         // recognised by its type and sent as written; anything else is
         // redacted and logged. Stringified, a refusal was redacted too.
         E::Db(e) => internal_error(e),
-        E::Repo(e) => internal_error(e),
+        // A repository error is classified as on every other write tool
+        // (`db_caller_error`): migration 105's personal-group refusals, a
+        // row-security `WriteRefused`, an operator-link or elevation denial
+        // and a supersede refusal are INVALID_REQUEST, `InvalidData` is
+        // INVALID_PARAMS, and everything else goes to `internal_error` (a
+        // `DbError::Refused` sent as written, driver text redacted).
+        E::Repo(e) => crate::errors::db_caller_error(e),
     }
 }
 
@@ -330,6 +333,33 @@ mod tests {
             mapped.message, MESSAGE,
             "the refusal was not sent as written"
         );
+    }
+
+    /// A repository denial reaches the caller classified as on every other
+    /// write tool (`db_caller_error`), not as the redacted internal error: a
+    /// row-security `WriteRefused` is INVALID_REQUEST with its text and an
+    /// `InvalidData` rejection is INVALID_PARAMS with its reason. The old
+    /// mapper sent both to `internal_error`, which redacts them.
+    #[test]
+    fn a_repo_denial_is_classified_as_on_every_write_tool() {
+        let denied = map_step_err(E::Repo(epigraph_db::DbError::WriteRefused {
+            entity: "claim".to_string(),
+            id: uuid::Uuid::nil(),
+            action: "update".to_string(),
+        }));
+        assert_eq!(denied.code, rmcp::model::ErrorCode::INVALID_REQUEST);
+        assert!(
+            denied.message.contains("may read it but not update it"),
+            "{}",
+            denied.message
+        );
+
+        const REASON: &str = "step text carries unexpanded shell syntax";
+        let invalid = map_step_err(E::Repo(epigraph_db::DbError::InvalidData {
+            reason: REASON.to_string(),
+        }));
+        assert_eq!(invalid.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(invalid.message.contains(REASON), "{}", invalid.message);
     }
 
     /// The other half: a driver or protocol error, bare or converted into a
