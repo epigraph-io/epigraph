@@ -1519,14 +1519,22 @@ impl ClaimThemeRepository {
 
     /// Find themes with high intra-cluster variance (candidates for splitting).
     ///
-    /// Everything is computed over the current members `viewer` can read
-    /// (backlog 06f5c5b2): `claim_count` and the `min_claims` floor count them,
-    /// and the distances average over those with an embedding (a member with
-    /// no embedding contributes a NULL distance, which `avg` / `max` skip). A
-    /// theme with no readable member never appears. The stored
-    /// `claim_themes.claim_count` is neither filtered on nor returned: it is
-    /// corpus-wide, so it disclosed the size of themes the caller cannot read,
-    /// and it is stale besides (see [`ThemeSummaryRow`]).
+    /// Everything is computed over the current, EMBEDDED members `viewer` can
+    /// read (backlog 06f5c5b2): `claim_count`, the `min_claims` floor and both
+    /// distances count the same set. A theme with no such member never
+    /// appears. Embedded-only is deliberate: the stored count this replaces
+    /// was written as a count of embedded members (`recompute_centroid_for_theme`,
+    /// `recompute_all_centroids`, `scripts/split_theme.py`), and a member with
+    /// no embedding has no distance, so counting it would let a theme with a
+    /// few far embedded members clear the floor that gates
+    /// `scripts/maintain_themes.py`'s auto-split. This number can therefore be
+    /// lower than `list_summaries`' `member_count`, which counts every current
+    /// readable member. `c.is_current` is implied by `c.embedding IS NOT NULL`
+    /// (migration 052's `chk_deprecated_no_embedding`) and is kept only to
+    /// state the intent. The stored `claim_themes.claim_count` is neither
+    /// filtered on nor returned: it is corpus-wide, so it disclosed the size
+    /// of themes the caller cannot read, and it is stale besides (see
+    /// [`ThemeSummaryRow`]).
     pub async fn find_split_candidates<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
@@ -1540,6 +1548,7 @@ impl ClaimThemeRepository {
                     max(ct.centroid <=> c.embedding)::float8 AS max_distance \
              FROM claim_themes ct \
              JOIN claims c ON c.theme_id = ct.id AND c.is_current \
+                          AND c.embedding IS NOT NULL \
              WHERE ct.centroid IS NOT NULL \
                /* {VISIBILITY:c} */ \
              GROUP BY ct.id, ct.label \

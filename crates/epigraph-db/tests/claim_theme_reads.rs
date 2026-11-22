@@ -959,6 +959,12 @@ async fn split_candidates_count_and_filter_on_readable_members(pool: PgPool) {
     for th in [t.public, t.private_only, t.mixed] {
         embed_members(&pool, th).await;
     }
+    // A current public member with NO embedding, added after embedding so it
+    // stays unembedded. It has no distance, so it must not count toward
+    // claim_count or the min_claims floor: public stays at 1 for everyone,
+    // and a COUNT over every current member (2) fails both asserts below.
+    let (agent, _group) = viewer_fixture::seed_agent_with_group(&pool, "scoped-split-extra").await;
+    seed_member(&pool, agent, t.public, "scoped-split unembedded", true).await;
     let stranger = viewer_fixture::public_viewer(&pool).await;
     let member = Viewer::resolve(&pool, t.member).await.expect("resolve");
     let (_scoped, bypass) = viewer_fixture::bypass(&pool).await;
@@ -976,14 +982,15 @@ async fn split_candidates_count_and_filter_on_readable_members(pool: PgPool) {
     assert_eq!(
         split(&pool, &stranger, 1).await,
         want,
-        "the stranger's claim_count is its readable member count: 1 for mixed, never the \
-         stored 9999; public (stored 0) passes a min_claims of 1 on its live count"
+        "the stranger's claim_count is its readable embedded member count: 1 for mixed, \
+         never the stored 9999; public (stored 0) passes a min_claims of 1 on its live count \
+         and its unembedded member does not lift it to 2"
     );
     assert_eq!(
         split(&pool, &stranger, 2).await,
         vec![],
-        "min_claims filters on the readable count: mixed's stored 9999 must not lift it \
-         over 2 for a viewer who reads one member"
+        "min_claims filters on the readable embedded count: mixed's stored 9999 must not \
+         lift it over 2 for a viewer who reads one member, nor public's unembedded member"
     );
 
     let mut want = vec![(t.private_only, 2), (t.mixed, 3)];
