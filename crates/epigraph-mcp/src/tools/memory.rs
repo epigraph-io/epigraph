@@ -1070,7 +1070,9 @@ async fn recall_post_embed(
             "diversity_radius": params.diversity_radius,
         });
         let scoped = server.scoped.clone();
-        tokio::spawn(async move {
+        // Tracked, like `recall_with_context`'s (backlog 8a23217d): the stdio
+        // entry point drains the server's background set before it exits.
+        server.background.spawn(async move {
             // Unresolvable ⇒ DROP, never widen, and never mint (#493). The row
             // is written on the principal-stamped transaction that resolved its
             // owner; see `recall::write_recall_audit`.

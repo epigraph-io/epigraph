@@ -576,3 +576,119 @@ async fn the_audit_row_is_not_written_on_the_unstamped_pool(pool: PgPool) {
          epigraph_app pool recall_events_tenancy refuses it"
     );
 }
+
+// ── Tracked for the stdio drain (backlog 8a23217d) ──────────────────────────
+//
+// The audit write is detached so it never delays a recall, but a stdio
+// session exits once its client closes and the runtime then drops every task
+// still running on it: a session that recalls and closes at once lost its
+// last `recall_events` row. The stdio entry point waits for the server's
+// `BackgroundTasks` before it exits (pinned by `stdio_drains_background_tasks.rs`,
+// which also pins that `main` drains that set); these pin that both audit
+// writes run ON that set, so the drain covers them.
+//
+// Scheduler-independent: an EXCLUSIVE lock on `recall_events` (it conflicts
+// with an INSERT's ROW EXCLUSIVE, not with reads) holds the audit write open
+// while the test looks at the set. Before the fix the write was a bare
+// `tokio::spawn`, so the set read 0 while the write was still pending, and
+// the drain had nothing to wait for.
+
+/// Hold an EXCLUSIVE lock on `recall_events` until the returned transaction
+/// ends, so an audit INSERT blocks.
+async fn block_audit_inserts(pool: &PgPool) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("begin the lock holder");
+    sqlx::query("LOCK TABLE recall_events IN EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .expect("lock recall_events");
+    tx
+}
+
+async fn audit_rows(pool: &PgPool, tool: &str, query: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM recall_events WHERE tool = $1 AND query_text = $2")
+        .bind(tool)
+        .bind(query)
+        .fetch_one(pool)
+        .await
+        .expect("count audit rows")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_recall_audit_write_is_tracked_for_the_stdio_drain(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    seed_claim(&pool, agent, "draintrack recall fixture").await;
+    let server = build_test_server(pool.clone()).await;
+    let background = server.background_tasks();
+
+    let lock = block_audit_inserts(&pool).await;
+    recall(&server, &viewer, params("draintrack"))
+        .await
+        .expect("recall ok");
+    assert_eq!(
+        background.active(),
+        1,
+        "the pending audit write must be on the server's tracked set, or the stdio drain \
+         exits without it"
+    );
+
+    lock.commit().await.expect("release the lock");
+    assert!(
+        background
+            .wait_idle(std::time::Duration::from_secs(10))
+            .await,
+        "the audit write finishes once the lock is released"
+    );
+    // No polling: when the drain returns, the row is there.
+    assert_eq!(audit_rows(&pool, "recall", "draintrack").await, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_recall_with_context_audit_write_is_tracked_for_the_stdio_drain(pool: PgPool) {
+    let viewer = principal_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
+    let pgvec = pgvec_bucket0();
+    seed_paragraph(&pool, agent, "draintrack context fixture", &pgvec).await;
+    let server = build_test_server(pool.clone()).await;
+    let background = server.background_tasks();
+    let params: RecallWithContextParams = serde_json::from_value(serde_json::json!({
+        "query": "draintrack-context",
+        "min_truth": 0.0,
+        "limit": 10,
+        "centroid_dim": 1536,
+    }))
+    .expect("RecallWithContextParams");
+
+    let lock = block_audit_inserts(&pool).await;
+    let out = recall_with_context_with_pgvec(&server, &viewer, params, 1536, &pgvec)
+        .await
+        .expect("recall_with_context ok");
+    let text = out
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .unwrap();
+    let env: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        !env["results"].as_array().unwrap().is_empty(),
+        "fixture precondition: the page path, not the empty early return"
+    );
+    assert_eq!(
+        background.active(),
+        1,
+        "the pending audit write must be on the server's tracked set, or the stdio drain \
+         exits without it"
+    );
+
+    lock.commit().await.expect("release the lock");
+    assert!(
+        background
+            .wait_idle(std::time::Duration::from_secs(10))
+            .await,
+        "the audit write finishes once the lock is released"
+    );
+    assert_eq!(
+        audit_rows(&pool, "recall_with_context", "draintrack-context").await,
+        1
+    );
+}

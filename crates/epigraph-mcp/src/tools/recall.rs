@@ -626,7 +626,9 @@ pub(crate) async fn write_recall_audit(
 /// to be able to settle.
 ///
 /// The id is minted by the caller rather than read back from the insert,
-/// because the write is not awaited.
+/// because the write is not awaited. It is tracked, though: it runs on the
+/// server's [`crate::background::BackgroundTasks`], which the stdio entry point
+/// drains before the process exits.
 fn spawn_recall_audit(
     server: &EpiGraphMcpFull,
     event_id: Uuid,
@@ -639,7 +641,10 @@ fn spawn_recall_audit(
     let query = query.to_string();
     let pgvec = pgvec.to_string();
     let scoped = server.scoped.clone();
-    tokio::spawn(async move {
+    // On the server's tracked set, not a bare `tokio::spawn` (backlog
+    // 8a23217d): the stdio entry point waits for that set before it exits, so
+    // a session that recalls and closes at once still leaves its audit row.
+    server.background.spawn(async move {
         // Resolved inside the spawn: everything this needs is owned, so nothing
         // here borrows the request. The group lookup (a viewer resolve and one
         // stamped SELECT, never a mint, #493) and the insert on that same
