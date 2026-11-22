@@ -2083,7 +2083,8 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE-PATH LOCK (backlog bf2e9aa6), not a disclosure: an `executes` writer's share-mode \
          advisory lock on the target claim's step lineage, taken on the writer's own \
          transaction before its INSERT. It reads the target's `step_lineage_id` only to key the \
-         lock, under that connection's row security, and returns nothing.",
+         lock, under that connection's row security, and returns nothing; a target the session \
+         cannot read is refused as not found, exactly as a missing one.",
     ),
     (
         "workflow.rs",

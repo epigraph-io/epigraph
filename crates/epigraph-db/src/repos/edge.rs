@@ -271,7 +271,8 @@ pub struct ClaimLinkRow {
 /// lineage lock in SHARE mode (`WorkflowRepository::lock_step_lineage_shared`,
 /// backlog bf2e9aa6), held to the end of the writer's transaction, so the
 /// edge serializes against an `evolve_step` of the lineage, whose authority
-/// gate must see it. Any other edge takes no lock. On a connection only: a
+/// gate must see it; a target this session cannot read is refused as not
+/// found. Any other edge takes no lock. On a connection only: a
 /// transaction-scoped lock taken on a pool executor would end with its own
 /// statement, so [`EdgeRepository::create`] on a pool takes none (no
 /// `executes` writer uses that form; every one writes on its transaction).

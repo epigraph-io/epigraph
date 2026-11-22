@@ -808,26 +808,43 @@ impl WorkflowRepository {
     /// Called by `EdgeRepository`'s connection writers, so every workflow
     /// write path (`ingest`, `add_step`, `link_hierarchical`) takes it.
     ///
-    /// The lineage is read under the writer's own row security. A writer that
-    /// cannot read `claim_id` keys on the claim id itself, which matches the
-    /// evolve's key only when the claim has no lineage yet.
+    /// The key is read under the writer's own row security, which returns a
+    /// visible row's true `step_lineage_id`. A writer that cannot read
+    /// `claim_id` is REFUSED (`DbError::NotFound`, the answer a missing claim
+    /// gets, so a hidden one is not told apart), never keyed on the claim id:
+    /// such a key would differ from the lineage key an evolve of that lineage
+    /// holds, and the two would not serialize (security review of bf2e9aa6).
+    /// No workflow path writes an `executes` edge onto a claim its stamp
+    /// cannot read anyway: the ingest refuses such a reused claim by name
+    /// (`ReusedClaimOutsideCallerGroups`) and `link_hierarchical` reads its
+    /// target first, so the refusal costs no legitimate writer anything.
     ///
     /// # Errors
-    /// Returns `sqlx::Error` if the query fails.
+    /// `DbError::NotFound` when this session cannot read `claim_id`; a
+    /// database error if a query fails.
     pub async fn lock_step_lineage_shared(
         conn: &mut sqlx::PgConnection,
         claim_id: Uuid,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<(), DbError> {
+        let key: Option<Uuid> = sqlx::query_scalar(
             "-- VISIBILITY-EXEMPT: WRITE path. The lineage key of the claim an executes edge is \
-             about to target, for the writer's advisory lock; nothing is returned.\n\
-             SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext(COALESCE( \
-                 (SELECT c.step_lineage_id FROM claims c WHERE c.id = $2), $2)::text))",
+             about to target, for the writer's advisory lock; never returned to a caller.\n\
+             SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1",
         )
-        .bind(STEP_LINEAGE_LOCK)
         .bind(claim_id)
-        .execute(&mut *conn)
+        .fetch_optional(&mut *conn)
         .await?;
+        let Some(key) = key else {
+            return Err(DbError::NotFound {
+                entity: "Claim".to_string(),
+                id: claim_id,
+            });
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2::uuid::text))")
+            .bind(STEP_LINEAGE_LOCK)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
         Ok(())
     }
 
