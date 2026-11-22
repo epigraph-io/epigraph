@@ -2,7 +2,7 @@
 -- report moves its counters through two definers (backlog 524f89c1).
 --
 -- Sections: 0 why; 1 the outcome definers (why); 2 their bodies; 3 the
--- policy (why); 4 the policy.
+-- policy (why); 4 the policy; 5 the recorded submitter is write-once.
 --
 -- ===================================================================
 -- 0. WHY
@@ -116,6 +116,25 @@
 --
 -- 126's elevated census is unaffected: the policy's name has no `_elevated_`
 -- and it names no elevation helper.
+--
+-- ===================================================================
+-- 5. THE RECORDED SUBMITTER IS WRITE-ONCE TO AN ORDINARY SESSION
+-- ===================================================================
+--
+-- `metadata.epigraph_submitted_by` is what the entry points' submitter arm
+-- (and, through it, the operator and delegate arms) trusts.
+-- `WorkflowRepository::record_submitter` writes it once, only when the key is
+-- absent. Section 4 leaves `metadata` writable to a writer of the owner
+-- group, who could then rewrite the key and name ANY agent as the row's
+-- submitter, handing that agent the identity arms over the row. So a BEFORE
+-- UPDATE OF metadata trigger, `workflows_submitter_immutable`, refuses (42501)
+-- an UPDATE that changes or removes a key that is already present, unless the
+-- session is a privileged writer (115/183's
+-- `epigraph_session_is_privileged_writer()`: a maintenance session, or a body
+-- running as `epigraph_maintenance`). Setting the key where it is absent stays
+-- admitted (`record_submitter`), and so does any write that leaves it as it
+-- is, the outcome definer's included. `set-workflow-submitter` and the
+-- re-own verb run on the maintenance connection and are admitted.
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/237-undo.sql`.
@@ -270,3 +289,26 @@ CREATE POLICY workflows_update_owner ON public.workflows AS RESTRICTIVE FOR UPDA
         (SELECT public.epigraph_bypass())
         OR (SELECT public.epigraph_definer_bypass())
         OR owner_group_id = ANY ((SELECT public.epigraph_writable_groups())::uuid[]));
+
+-- ===================================================================
+-- 5. THE RECORDED SUBMITTER IS WRITE-ONCE (section 5 above)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_workflows_submitter_guard() RETURNS trigger
+LANGUAGE plpgsql SECURITY INVOKER
+SET search_path = public, pg_temp AS $$
+BEGIN
+    IF public.epigraph_session_is_privileged_writer() THEN RETURN NEW; END IF;
+    RAISE EXCEPTION 'epigraph tenancy: an UPDATE of workflows % changes its recorded '
+                    'submitter; only a maintenance session corrects one', OLD.id
+        USING ERRCODE = '42501';
+END $$;
+REVOKE EXECUTE ON FUNCTION public.epigraph_workflows_submitter_guard() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS workflows_submitter_immutable ON public.workflows;
+CREATE TRIGGER workflows_submitter_immutable BEFORE UPDATE OF metadata ON public.workflows
+    FOR EACH ROW
+    WHEN (pg_catalog.jsonb_typeof(OLD.metadata) = 'object'
+          AND OLD.metadata ? 'epigraph_submitted_by'
+          AND (NEW.metadata -> 'epigraph_submitted_by')
+              IS DISTINCT FROM (OLD.metadata -> 'epigraph_submitted_by'))
+    EXECUTE FUNCTION public.epigraph_workflows_submitter_guard();

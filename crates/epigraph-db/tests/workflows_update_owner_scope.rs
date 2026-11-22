@@ -1,5 +1,6 @@
-//! Migration 237 (backlog 524f89c1): a hierarchical outcome report moves a
-//! `workflows` row's counters through two definers, as the application role.
+//! Migration 237 (backlog 524f89c1), as the application role: a hierarchical
+//! outcome report moves a `workflows` row's counters through two definers, an
+//! UPDATE is owner-scoped, and the recorded submitter is write-once.
 //!
 //! * `epigraph_workflow_outcome_lock` locks a row the session READS (183's
 //!   `workflows_read`) and answers whether it did; a row it cannot read is
@@ -8,6 +9,13 @@
 //!   stored ones exactly as `HierarchicalOutcomeCounters::after_report` does
 //!   (pinned on odd stored shapes), writes only those four keys, and refuses a
 //!   row the session cannot read (42501) and a variance outside [0, 1] (22023).
+//!
+//! * `workflows_update_owner`: a direct UPDATE (or row lock) reaches a row
+//!   only for a writer of its owner group or a maintenance session; a
+//!   non-member of a public row and a reader of a group row reach none.
+//! * `workflows_submitter_immutable`: a writer may not change or remove the
+//!   recorded submitter; recording a first one, and a maintenance
+//!   correction, are admitted.
 //!
 //! Every write runs on `epigraph_app` under a real stamp
 //! (`ScopedPool::connect_downgraded_for_tests`); fixtures are seeded and read
@@ -454,4 +462,89 @@ async fn a_maintenance_session_still_updates_any_row(pool: PgPool) {
     assert_eq!(r, Ok(2));
     assert_eq!(row(&pool, w.public).await.1, 0.05);
     assert_eq!(row(&pool, w.private).await.1, 0.05);
+}
+
+// ===================================================================
+// The recorded submitter is write-once to an ordinary session (237 section 5).
+// ===================================================================
+
+/// A WRITER of the owner group may update the row, but not re-name its
+/// recorded submitter (which would hand another agent the entry points'
+/// submitter arm over the row): changing, removing or wiping the key is
+/// refused 42501. Editing another key, and recording a submitter on a row
+/// that has none (`record_submitter`), are admitted; a maintenance session
+/// corrects one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_recorded_submitter_is_write_once(pool: PgPool) {
+    let w = world(&pool).await;
+    let (before, _) = row(&pool, w.private).await;
+    for (what, sql) in [
+        ("re-name", TAKE_OVER),
+        (
+            "remove",
+            "UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' \
+             WHERE id = $1 AND $2::text IS NOT NULL",
+        ),
+        (
+            "wipe",
+            "UPDATE workflows SET metadata = '{}'::jsonb WHERE id = $1 AND $2::text IS NOT NULL",
+        ),
+        (
+            "non-object",
+            "UPDATE workflows SET metadata = 'null'::jsonb WHERE id = $1 AND $2::text IS NOT NULL",
+        ),
+    ] {
+        assert_eq!(
+            write(&w, &w.member, sql, w.private).await,
+            Err("42501".into()),
+            "a writer may not {what} the recorded submitter"
+        );
+    }
+    assert_eq!(row(&pool, w.private).await.0, before, "nothing written");
+    assert_eq!(
+        write(&w, &w.member, COUNTERS, w.private).await,
+        Ok(1),
+        "another key is still the writer's to edit"
+    );
+
+    // A row with no recorded submitter: recording one is admitted, once.
+    sqlx::query("UPDATE workflows SET metadata = metadata - 'epigraph_submitted_by' WHERE id = $1")
+        .bind(w.public)
+        .execute(&pool)
+        .await
+        .expect("forget the submitter (harness)");
+    let me = w.member.principal().expect("member principal");
+    let mut tx = w.scoped.begin_as(&w.member).await.expect("stamped tx");
+    let recorded = epigraph_db::WorkflowRepository::record_submitter(&mut *tx, w.public, me)
+        .await
+        .expect("record_submitter");
+    tx.commit().await.expect("commit");
+    assert!(recorded, "a writer records the first submitter");
+    assert_eq!(
+        row(&pool, w.public).await.0["epigraph_submitted_by"],
+        serde_json::json!(me.to_string())
+    );
+
+    // The maintenance correction (`set-workflow-submitter`).
+    let id = w.private;
+    let r: Result<u64, String> =
+        fixture::as_role(&pool, "epigraph_maintenance", move |mut conn| async move {
+            let r = sqlx::query(
+                "UPDATE workflows \
+                 SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', '\"corrected\"') \
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *conn)
+            .await
+            .map(|r| r.rows_affected())
+            .map_err(|e| e.to_string());
+            (conn, r)
+        })
+        .await;
+    assert_eq!(r, Ok(1));
+    assert_eq!(
+        row(&pool, w.private).await.0["epigraph_submitted_by"],
+        serde_json::json!("corrected")
+    );
 }
