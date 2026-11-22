@@ -1731,8 +1731,8 @@ async fn typed_edge(pool: &PgPool, a: Uuid, a_ty: &str, b: Uuid, b_ty: &str) -> 
 }
 
 /// A fresh SRC claim C linked to a SRC-private node of type `ty` (the node is
-/// the edge's source end when `node_first`). The trigger counts the node as
-/// public, so the edge starts on C's tuple. Regrouping C writes the EXACT meet
+/// the edge's source end when `node_first`). The node is in C's group, so the
+/// edge starts on C's tuple. Regrouping C writes the EXACT meet
 /// (co-owned by SRC through the node), reports it as a SOURCE-NODE-EDGE, and
 /// neither a SRC-only nor a DST-only reader reads it; reversing puts every
 /// row back byte for byte.
@@ -1749,7 +1749,7 @@ async fn a_source_node_edge_is_co_owned_and_reported(pool: PgPool, ty: &str, nod
     assert_eq!(
         edge(&pool, e).await,
         (fx.src, "group".to_string(), None),
-        "the trigger counts the {ty} as public"
+        "the {ty} and C are both SRC's"
     );
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -2191,20 +2191,43 @@ async fn an_edge_to_a_public_node_goes_to_the_target(pool: PgPool) {
     assert!(r.stdout.contains("source-node edges: 0"), "{}", r.show());
 }
 
+/// Put edge `e` back on `(owner, group)` with no co-owner: the claim's tuple
+/// alone, which is how a database stamped an edge onto a group-private frame,
+/// context, perspective or community before migration 258 met such a node with
+/// its own row. No writer produces this row any more; legacy databases hold it.
+async fn stamp_before_258(pool: &PgPool, e: Uuid, owner: Uuid) {
+    sqlx::query(
+        "UPDATE edges SET owner_group_id = $2, visibility = 'group', co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("restore the pre-258 stamp");
+}
+
 /// An edge to a node of a THIRD group is met with that group (it keeps
 /// requiring it) and reported. Its recorded prior, the claim's tuple alone,
 /// was already wider than the node: the reversal will not write it back and
 /// holds the claim instead, which the dry run and the apply both report
-/// (IRREVERSIBLE-EDGE and its count). The node is a CONTEXT, which the trigger
-/// still meets as public; since migration 219 a workflow endpoint is met with
-/// its own row, so an edge from a workflow is stamped exactly at insert and
-/// never has this stale prior.
+/// (IRREVERSIBLE-EDGE and its count). Since migrations 219 (workflow) and 258
+/// (frame, context, perspective, community) the trigger meets such a node with
+/// its own row, so a NEW edge is stamped exactly at insert and never has this
+/// stale prior; an edge stamped before 258 still does, and that is the row
+/// this test rebuilds ([`stamp_before_258`]).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
     let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in H's context").await;
     let node = seed_node(&pool, "context", fx.h_group, "group").await;
     let e = typed_edge(&pool, node, "context", c, "claim").await;
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.h_group, "group".to_string(), Some(fx.src)),
+        "CALIBRATION: since 258 the trigger meets the context with its own row"
+    );
+    stamp_before_258(&pool, e, fx.src).await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
@@ -2276,14 +2299,20 @@ async fn an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds(pool: 
 /// than the node (a SOURCE-only reader read an edge naming a TARGET-private
 /// node), so the reversal will not write it back and holds the claim
 /// instead. The dry run and the apply both say so up front (IRREVERSIBLE-EDGE
-/// and its count). A context, not a workflow: see
-/// [`an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds`].
+/// and its count). The stale prior is an edge stamped before migration 258:
+/// see [`an_edge_to_a_third_group_node_is_reported_and_its_reversal_holds`].
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds(pool: PgPool) {
     let fx = seed(&pool).await;
     let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
     let node = seed_node(&pool, "context", fx.dst, "group").await;
     let e = typed_edge(&pool, node, "context", c, "claim").await;
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.dst, "group".to_string(), Some(fx.src)),
+        "CALIBRATION: since 258 the trigger meets the context with its own row"
+    );
+    stamp_before_258(&pool, e, fx.src).await;
     assert_eq!(edge(&pool, e).await, (fx.src, "group".to_string(), None));
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c]);
