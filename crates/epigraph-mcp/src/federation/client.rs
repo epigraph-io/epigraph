@@ -100,16 +100,20 @@ impl TokenExchange {
     /// A client for the token endpoint at `endpoint` (the kernel's absolute
     /// `/oauth/token` URL). The caller's bearer is sent there on every
     /// federated call, so the URL must be `https`, or `http` to a loopback
-    /// host (`127.0.0.0/8`, `[::1]`, `localhost`).
+    /// host (`127.0.0.0/8`, `[::1]`, `localhost`). An `http` URL naming
+    /// `localhost` is dialled at `127.0.0.1`, never by resolving the name
+    /// (backlog b0d05192); an `https` one keeps its name, which the
+    /// certificate check needs.
     ///
     /// # Errors
     /// A description of why `endpoint` is refused.
     pub fn new(endpoint: &str) -> Result<Self, String> {
-        let url = reqwest::Url::parse(endpoint)
+        let mut url = reqwest::Url::parse(endpoint)
             .map_err(|e| format!("token exchange URL `{endpoint}` does not parse: {e}"))?;
         let host = url.host_str().unwrap_or_default();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
+        let localhost = super::config::is_localhost_name(host);
+        let loopback = localhost
             || bare
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback());
@@ -123,6 +127,10 @@ impl TokenExchange {
                     url.host_str().unwrap_or_default()
                 ))
             }
+        }
+        if localhost && url.scheme() == "http" {
+            url.set_host(Some(super::config::LOCALHOST_LITERAL))
+                .map_err(|e| format!("token exchange URL `{endpoint}`: {e}"))?;
         }
         let http = reqwest::Client::builder()
             .timeout(EXCHANGE_TIMEOUT)
@@ -462,6 +470,44 @@ mod tests {
                 TokenExchange::new(refused).is_err(),
                 "{refused} must be refused"
             );
+        }
+    }
+
+    /// Cleartext to `localhost` is accepted as loopback, but the name is
+    /// never what the exchange dials: the stored endpoint is the `127.0.0.1`
+    /// literal, so where every caller's bearer is sent does not depend on how
+    /// this host resolves `localhost` (backlog b0d05192). `https` keeps its
+    /// name, which its certificate check needs, and protects the bearer
+    /// whatever the name resolves to.
+    ///
+    /// Mutation: store the URL as given -> the `localhost` endpoints are kept
+    /// and this fails.
+    #[test]
+    fn a_cleartext_localhost_exchange_url_is_dialled_as_the_loopback_literal() {
+        for (given, dialled) in [
+            (
+                "http://localhost:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+            (
+                "http://LOCALHOST:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+            (
+                "http://localhost/oauth/token",
+                "http://127.0.0.1/oauth/token",
+            ),
+            (
+                "https://localhost:8443/oauth/token",
+                "https://localhost:8443/oauth/token",
+            ),
+            (
+                "http://127.0.0.1:8080/oauth/token",
+                "http://127.0.0.1:8080/oauth/token",
+            ),
+        ] {
+            let exchange = TokenExchange::new(given).unwrap_or_else(|e| panic!("{given}: {e}"));
+            assert_eq!(exchange.endpoint, dialled, "{given}");
         }
     }
 }

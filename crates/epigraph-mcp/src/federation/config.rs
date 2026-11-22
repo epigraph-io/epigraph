@@ -23,7 +23,11 @@
 //!   avoid collisions with kernel tools or other extensions.
 //! - **`insecure_remote=1`** — OPTIONAL, and the only accepted value is `1`.
 //!   Without it the host MUST be loopback: an IPv4 address in `127.0.0.0/8`,
-//!   `[::1]`, or `localhost` (any case). The gateway dials `http://{addr}/mcp`
+//!   `[::1]`, or `localhost` (any case), which is parsed to the `127.0.0.1`
+//!   literal and dialled as that, never resolved (backlog b0d05192): an
+//!   edited hosts file or resolver cannot move the dial off this machine
+//!   while the boot check reports loopback. An extension listening only on
+//!   `[::1]` is configured as `[::1]`. The gateway dials `http://{addr}/mcp`
 //!   in cleartext and sends a bearer for the caller on every call (an
 //!   exchanged, extension-audience token since backlog c9b82fae, still good
 //!   at the extension for up to five minutes), so a non-loopback host would
@@ -59,7 +63,8 @@ pub struct ExtensionConfig {
     pub name: String,
     /// Bare `host:port` the extension serves streamable-HTTP on (scheme
     /// stripped). Loopback unless the entry set `insecure_remote=1`; the
-    /// gateway dials `http://{addr}/mcp`.
+    /// gateway dials `http://{addr}/mcp`. A configured `localhost` is stored
+    /// as `127.0.0.1`, so the dial never resolves the name.
     pub addr: String,
     /// OAuth scope a caller must hold for the gateway to forward this
     /// extension's tools.
@@ -126,6 +131,16 @@ pub fn parse_extensions(raw: Option<&str>) -> Result<Vec<ExtensionConfig>, Confi
     Ok(configs)
 }
 
+/// The address a configured `localhost` is dialled at, for the federation
+/// extension dial and the token-exchange URL alike. IPv4, because a
+/// dual-stack listener and an IPv4-only one both answer it.
+pub(crate) const LOCALHOST_LITERAL: &str = "127.0.0.1";
+
+/// Is `host` the name `localhost` (any case)?
+pub(crate) fn is_localhost_name(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+}
+
 /// Whether `host` (the part of `host:port` before the port, IPv6 still in
 /// brackets) names this machine's loopback interface.
 ///
@@ -133,9 +148,11 @@ pub fn parse_extensions(raw: Option<&str>) -> Result<Vec<ExtensionConfig>, Confi
 /// the name `localhost` in any case. Nothing else: not `0.0.0.0` or `[::]`
 /// (which a listener binds but a dialer reaches as "any"), not an
 /// IPv4-mapped `[::ffff:127.0.0.1]`, and not any other name, since resolving a
-/// name at parse time would prove nothing about where a later dial goes.
+/// name at parse time would prove nothing about where a later dial goes. For
+/// the same reason `localhost` is accepted only because [`parse_entry`]
+/// replaces it with [`LOCALHOST_LITERAL`] before anything dials it.
 fn is_loopback_host(host: &str) -> bool {
-    if host.eq_ignore_ascii_case("localhost") {
+    if is_localhost_name(host) {
         return true;
     }
     if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
@@ -180,11 +197,11 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
     // boot rather than let a portless address slip through to the dial. The
     // check is deliberately syntactic (last segment after ':' is all digits) —
     // full socket-addr validation belongs to the Stage-2 dialer.
-    let host = match addr.rsplit_once(':') {
+    let (host, port) = match addr.rsplit_once(':') {
         Some((host, port))
             if !host.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
         {
-            host
+            (host, port)
         }
         _ => {
             return Err(err(
@@ -274,9 +291,17 @@ fn parse_entry(entry: &str) -> Result<ExtensionConfig, ConfigError> {
         );
     }
 
+    // `localhost` is a claim of loopback, not a loopback address: dial the
+    // literal so no resolver decides where the bearer goes (backlog b0d05192).
+    let addr = if is_localhost_name(host) {
+        format!("{LOCALHOST_LITERAL}:{port}")
+    } else {
+        addr.to_string()
+    };
+
     Ok(ExtensionConfig {
         name: name.to_string(),
-        addr: addr.to_string(),
+        addr,
         scope,
         prefix,
     })
@@ -472,17 +497,39 @@ mod tests {
 
     #[test]
     fn loopback_forms_are_accepted() {
-        for addr in [
-            "127.0.0.1:8093",
-            "127.0.0.53:8093",
-            "127.255.255.254:8093",
-            "localhost:8093",
-            "LOCALHOST:8093",
-            "[::1]:8093",
+        for (addr, dialled) in [
+            ("127.0.0.1:8093", "127.0.0.1:8093"),
+            ("127.0.0.53:8093", "127.0.0.53:8093"),
+            ("127.255.255.254:8093", "127.255.255.254:8093"),
+            ("localhost:8093", "127.0.0.1:8093"),
+            ("LOCALHOST:8093", "127.0.0.1:8093"),
+            ("[::1]:8093", "[::1]:8093"),
         ] {
             let cfgs = parse_extensions(Some(&format!("ext=tcp:{addr};scope=x")))
                 .unwrap_or_else(|e| panic!("{addr} is loopback: {e}"));
-            assert_eq!(cfgs[0].addr, addr);
+            assert_eq!(cfgs[0].addr, dialled, "{addr}");
+        }
+    }
+
+    /// The name `localhost` is accepted as loopback but never DIALLED as a
+    /// name: the parsed address is the `127.0.0.1` literal, so where the
+    /// gateway sends each call's bearer does not depend on how this host
+    /// resolves `localhost` (backlog b0d05192).
+    ///
+    /// Mutation: keep `addr` as written -> `localhost:8093` reaches the dial
+    /// URI and this fails.
+    #[test]
+    fn localhost_is_dialled_as_the_loopback_literal() {
+        for host in ["localhost", "LOCALHOST", "LocalHost"] {
+            let cfg = parse_extensions(Some(&format!("ext=tcp:{host}:8093;scope=x")))
+                .unwrap_or_else(|e| panic!("{host} is loopback: {e}"))
+                .remove(0);
+            assert_eq!(cfg.addr, "127.0.0.1:8093", "{host}");
+            assert_eq!(
+                crate::federation::client::extension_uri(&cfg.addr),
+                "http://127.0.0.1:8093/mcp",
+                "{host}: the gateway dials the literal"
+            );
         }
     }
 
