@@ -179,12 +179,14 @@ async fn a_private_profiles_orcid_and_ror_id_reach_only_those_who_may_see_it(poo
             "{uri}: CALIBRATION: a public profile keeps its ORCID in the list"
         );
 
-        let (status, body) = get(&state, private, uri).await;
-        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
-        assert_eq!(
-            item(&body, private)["orcid"],
-            "0000-0002-1825-0097",
-            "{uri}: CALIBRATION: the agent sees its own ORCID in the list"
-        );
+        // The agent itself, and a colleague (the shared-live-group arm, which
+        // only a viewer-stamped read can see), keep the detail in the list.
+        for (who, caller) in [("self", private), ("colleague", colleague)] {
+            let (status, body) = get(&state, caller, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} {who}: {body}");
+            let p = item(&body, private);
+            assert_eq!(p["orcid"], "0000-0002-1825-0097", "{uri} {who}: {p}");
+            assert_eq!(p["ror_id"], "03yrm5c26", "{uri} {who}: {p}");
+        }
     }
 }
