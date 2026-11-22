@@ -74,6 +74,30 @@ pub async fn introspect_endpoint(
         return Ok(Json(inactive()));
     }
 
+    // A DELEGATED run token (`dlg`) is active only while its delegation is
+    // live (backlog 8d6c886f): the scope ceiling, a named principal, and the
+    // live-delegation read (operator link acting, delegator's allowance,
+    // client and writer membership live, `EPIGRAPH_RUN_TOKENS=on`). The SAME
+    // check the bearer middleware runs on every request that carries one, so
+    // introspection never answers `active: true` for a token the API refuses.
+    // A check that cannot answer is a 503, never `active: true`.
+    if claims.dlg.is_some() {
+        let auth: epigraph_auth::AuthContext = claims.clone().into();
+        let mut scratch = axum::http::Extensions::new();
+        match crate::middleware::bearer::admit_delegated(
+            &state,
+            &auth,
+            &mut scratch,
+            "/oauth/introspect",
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e @ ApiError::ServiceUnavailable { .. }) => return Err(e),
+            Err(_) => return Ok(Json(inactive())),
+        }
+    }
+
     Ok(Json(IntrospectResponse {
         active: true,
         sub: Some(claims.sub.to_string()),

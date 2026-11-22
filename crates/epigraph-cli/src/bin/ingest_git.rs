@@ -1184,10 +1184,11 @@ struct CreateAgentRequest {
 ///
 /// The key for an author is `blake3::keyed_hash(secret, "epigraph-git-author-v2:" +
 /// normalized email)`. Without the secret, that key would be a function of the
-/// email alone, which is public in `git log`. The server gives a newly
-/// registered agent an active OAuth client when the caller is authenticated,
-/// and the client accepts any assertion that verifies under the agent's key, so
-/// a key anyone can compute is a login anyone can use. The secret makes the key
+/// email alone, which is public in `git log`. An agent client accepts any
+/// assertion that verifies under its agent's key, so once such a key has a
+/// login (servers before backlog 2f87eb08 gave every newly registered agent an
+/// active client; current ones only on an admin-approved `login` request) a key
+/// anyone can compute is a login anyone can use. The secret makes the key
 /// stable on the host that holds it and unguessable everywhere else, the same
 /// pattern as the keyed LLM-agent identity (`keypair_from_llm_agent_keyed`).
 struct GitAuthorKeys {
@@ -1270,7 +1271,7 @@ fn author_keys_for_run(
         None => Err(
             "a live run needs --author-key-file (or EPIGRAPH_GIT_AUTHOR_KEY_FILE): \
              without the host secret every author key is computable from the public \
-             git log, and the server provisions a login for each registered agent"
+             git log, so any login that key ever holds is usable by anyone"
                 .to_string(),
         ),
     }
@@ -2963,8 +2964,8 @@ mod tests {
     }
 
     // Review of backlog 7d9e60c6: a key derived from the email alone is
-    // computable from the public git log, and the server provisions an OAuth
-    // client for a newly registered key, so such a key is a login anyone can
+    // computable from the public git log, and an agent client for such a key
+    // (which older servers provisioned on registration) is a login anyone can
     // use. The key must depend on the host secret, and must not be the old
     // public formula.
     #[test]

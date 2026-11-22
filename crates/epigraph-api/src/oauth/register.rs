@@ -246,10 +246,10 @@ pub async fn register_endpoint(
                 // `OAuthClientRepository::get_by_client_id` filters
                 // status='active'.
                 //
-                // NOTE the asymmetry with routes/agents.rs, which DOES
-                // auto-activate: that path requires an authenticated caller
-                // holding `agents:write`, which is the admin approval this one
-                // lacks.
+                // routes/agents.rs (POST /api/v1/agents) provisions a client
+                // only on an explicit `login: true`, and ACTIVE only for a
+                // `claims:admin` caller; otherwise it writes this same pending
+                // shape (backlog 2f87eb08: `agents:write` is not an approval).
                 (
                     "pending",
                     epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES

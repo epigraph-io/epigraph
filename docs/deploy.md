@@ -515,7 +515,7 @@ For the others, anything else is off.
 | `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding, and with either setting above (exit 1). |
 | `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT` | on | `off` is the emergency valve for operator binding: it relieves `OPL01` only (section 9). |
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
-| `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. |
+| `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. `POST /oauth/introspect` applies the same check: a delegated run token reads `active: false` while the switch is off, once its delegation has ended (operator link retired, delegator's allowance, client or writer membership revoked), or when it carries a scope outside the delegated ceiling, and the endpoint answers 503 when the check cannot be made. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for. Empty refuses every mint. |
 | `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` | empty | The federation extensions (by their `EPIGRAPH_MCP_EXTENSIONS` name) the RFC 8693 token-exchange grant at `/oauth/token` may mint for. Empty refuses every exchange, so a gateway with mounted extensions can call none of them. The kernel's own audience is never accepted here. See `crates/epigraph-api/src/oauth/token_exchange.rs`. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
@@ -1275,9 +1275,19 @@ The document itself is anonymous, which is correct.
 `clients:admin`, `entity-types:write` and `instance:admin`). Admin-only
 scopes are never in `read_only_scopes()`, the read-write role,
 `AGENT_PROVISION_SCOPES` or `PUBLIC_CLIENT_READ_SCOPES`. So every
-`epigraph-ro` token, every `epigraph-wo` token, every agent auto-provisioned
-by `POST /api/v1/agents` and every dynamically registered public client gets
-**403** on these routes. Point dashboards and monitoring at an
+`epigraph-ro` token, every `epigraph-wo` token, every agent client
+provisioned by `POST /api/v1/agents` and every dynamically registered public
+client gets **403** on these routes.
+
+`POST /api/v1/agents` registers an identity and provisions no login by
+default. A client is created only when the request body sets `"login": true`:
+ACTIVE with `AGENT_PROVISION_SCOPES` when the caller holds `claims:admin`,
+otherwise PENDING with nothing granted, awaiting the same approval as a
+`/oauth/register` agent client. Earlier servers gave every newly registered
+agent an active client; those clients stay active after an upgrade until an
+admin suspends them. On a find-hit (the key is already registered) the
+response carries the existing agent's `orcid` and `ror_id` only for the agent
+itself or a `claims:admin` caller. Point dashboards and monitoring at an
 `epigraph-admin` token, or mint a dedicated client with exactly
 `["claims:admin"]`. `groups:write` is in the read-write role, so `epigraph-wo`
 can create a community or group.

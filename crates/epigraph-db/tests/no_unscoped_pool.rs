@@ -823,7 +823,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 184 -> 182 (backlog 1dea9589): `create_span` writes the span and its
 /// `attributed_to` edge on the caller's `AppState::write_as` transaction
 /// (`routes/spans.rs` 6 -> 4; `close_span` and `list_spans` keep theirs).
-const HIGH_WATER: usize = 182;
+/// 187 -> 186 (backlog 761c2b05): `get_agent` holds a `Viewer` and reads its
+/// row and the profile-visibility check on the caller's stamped connection
+/// (`routes/agents.rs` 10 -> 9). No file reached zero.
+/// Staging merge 2026-11-22: the two reductions above landed on separate PRs
+/// from the same base (187): -5 (`crud.rs`, `spans.rs`) and -1 (`agents.rs`),
+/// so the combined tree's ceiling is 187 - 5 - 1.
+const HIGH_WATER: usize = 181;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -906,7 +912,7 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
     ("routes/admin.rs", 4),
     ("routes/agent_keys.rs", 6),
-    ("routes/agents.rs", 10),
+    ("routes/agents.rs", 9),
     ("routes/assess.rs", 1),
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
     // `query_security_events` reads on `AppState::read_as` with the caller's
