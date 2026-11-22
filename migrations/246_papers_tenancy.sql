@@ -77,6 +77,12 @@
 -- key has more than one row (001's `UNIQUE (doi)` cannot be restored over
 -- them), and unless both re-stated functions still hold 246's bodies.
 --
+-- Pre-flight (prod): `SELECT doi FROM papers GROUP BY doi HAVING count(*) > 1`
+-- must be empty (the new unique index fails on a duplicate, and the whole
+-- file rolls back), and section 3 refuses to apply while a unique index over
+-- `doi` that its two DROPs do not name survives them (one would leave every
+-- group copy of a document with a public row refused with 23505).
+--
 -- Re-stating a shared body: 219 re-stated `epigraph_node_tenancy` and
 -- `epigraph_propagate_tenancy` last. The GUARD below refuses to apply unless
 -- both still hold 219's bodies (md5 of `prosrc`), so a re-statement that
@@ -165,6 +171,30 @@ CREATE UNIQUE INDEX papers_document_key_scope_key ON public.papers (
           ELSE owner_group_id END));
 -- The lookup by key alone (`WHERE doi = ANY(...)`) keeps an index.
 CREATE INDEX papers_doi_idx ON public.papers (doi);
+
+-- The two DROPs above name 001's constraints. A unique index over `doi` under
+-- any other name (hand-made, or 001's under a renamed constraint) would
+-- survive them, and every group ingest of a document that already has a
+-- public row would then fail with 23505. Refuse instead of shipping that.
+DO $$
+DECLARE r record;
+BEGIN
+    FOR r IN SELECT ic.relname AS idx, pg_get_indexdef(i.indexrelid) AS def
+               FROM pg_index i
+               JOIN pg_class ic ON ic.oid = i.indexrelid
+              WHERE i.indrelid = 'public.papers'::regclass
+                AND i.indisunique
+                AND ic.relname <> 'papers_document_key_scope_key'
+                AND pg_get_indexdef(i.indexrelid) ~ '\mdoi\M'
+    LOOP
+        RAISE EXCEPTION
+            'public.papers still has a unique index over doi (%: %), which forbids a '
+            'group row beside the public row of one document. Drop it by hand after '
+            'checking nothing else relies on it, then re-run.',
+            r.idx, r.def
+          USING ERRCODE = '55000';
+    END LOOP;
+END $$;
 
 -- ===================================================================
 -- 4. Declared, never defaulted; immutable to an ordinary session

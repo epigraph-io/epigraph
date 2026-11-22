@@ -2,7 +2,8 @@
 //! ingest that wrote it.
 //!
 //! * The backfill makes every existing row ('public', world): what every reader
-//!   saw before. Two rows of one document cannot exist before 246.
+//!   saw before. Two rows of one document cannot exist before 246, and 246
+//!   refuses to apply while a unique key over `doi` it does not drop survives.
 //! * The columns have 062's tier-A shape, the row security is ENABLEd and
 //!   FORCEd, a write must declare its tenancy, and nobody but a maintenance
 //!   session re-tenants a row.
@@ -85,6 +86,43 @@ async fn migration_246_backfills_every_paper_public(pool: PgPool) {
 
     assert_eq!(tenancy(&pool, a).await, ("public".into(), WORLD));
     assert_eq!(tenancy(&pool, b).await, ("public".into(), WORLD));
+}
+
+/// 246 drops 001's two `UNIQUE (doi)` constraints by name. A unique key over
+/// `doi` under any other name would survive those DROPs and refuse every group
+/// copy of a document that already has a public row (23505), so 246 refuses to
+/// apply over one; with it gone, 246 applies.
+#[sqlx::test(migrations = false)]
+async fn migration_246_refuses_a_surviving_unique_doi_key(pool: PgPool) {
+    migrate(&pool, &up_to(245)).await;
+    sqlx::query("ALTER TABLE papers ADD CONSTRAINT papers_doi_renamed UNIQUE (doi)")
+        .execute(&pool)
+        .await
+        .expect("a unique key under a name 246 does not drop");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = MIGRATOR
+        .run(&mut *conn)
+        .await
+        .expect_err("246 must refuse while a unique key over doi survives its DROPs");
+    drop(conn);
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("still has a unique index over doi") && msg.contains("papers_doi_renamed"),
+        "refused for the surviving key, naming it: {msg}"
+    );
+    let applied: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 246)")
+            .fetch_one(&pool)
+            .await
+            .expect("ledger");
+    assert!(!applied, "the refused 246 left nothing behind");
+
+    sqlx::query("ALTER TABLE papers DROP CONSTRAINT papers_doi_renamed")
+        .execute(&pool)
+        .await
+        .expect("drop the surviving key");
+    migrate(&pool, &MIGRATOR).await;
 }
 
 /// 062's tier-A shape, FORCEd row security, the three triggers, and the
