@@ -86,7 +86,10 @@ fn paragraph_hash() -> String {
 }
 
 /// The shape every body shares: digest = BLAKE3(body), and paragraph-backed
-/// rows (the paragraph and its atom) carry the locator and passage hash.
+/// rows (the paragraph and its atom) carry the locator and passage hash. The
+/// fixture is a Tier-2 extraction (no `source_text`), so the paragraph's
+/// extractor-supplied span was never checked against the source and the
+/// locator says so instead of printing `bytes 40..118` (backlog c083c1c9).
 fn assert_citation_locator_hash(rows: &[(String, Vec<u8>)], expect_rows_with_passage: usize) {
     for (body, hash) in rows {
         assert_eq!(
@@ -100,8 +103,9 @@ fn assert_citation_locator_hash(rows: &[(String, Vec<u8>)], expect_rows_with_pas
         .iter()
         .map(|(b, _)| b)
         .filter(|b| {
-            b.contains(r#"Locator: sections[0].paragraphs[0] ("Results"), bytes 40..118."#)
-                && b.contains(&format!("Passage BLAKE3: {}.", paragraph_hash()))
+            b.contains(
+                r#"Locator: sections[0].paragraphs[0] ("Results"), source_verifiable: false."#,
+            ) && b.contains(&format!("Passage BLAKE3: {}.", paragraph_hash()))
         })
         .collect();
     assert_eq!(
@@ -140,14 +144,18 @@ async fn document_ingest_drops_passage_when_licence_unknown(pool: PgPool) {
         );
     }
     assert_citation_locator_hash(&rows, 2);
-    // Backlog c083c1c9: the fixture carries no `source_text`, so the thesis and
-    // section rows (no extractor span) say their hash is not checkable against
-    // the source instead of presenting a bare locator.
+    // Backlog c083c1c9: the fixture carries no `source_text`, so no row's hash
+    // is checkable against the source. Every row says so, including the
+    // paragraph and atom whose extractor span nothing verified.
     let flagged = rows
         .iter()
         .filter(|(b, _)| b.contains(", source_verifiable: false. Passage BLAKE3: "))
         .count();
-    assert_eq!(flagged, 2, "thesis and section rows are flagged: {rows:#?}");
+    assert_eq!(flagged, 4, "every Tier-2 row is flagged: {rows:#?}");
+    assert!(
+        rows.iter().all(|(b, _)| !b.contains(", bytes ")),
+        "no unverified byte span is published: {rows:#?}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

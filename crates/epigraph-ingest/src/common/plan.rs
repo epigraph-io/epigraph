@@ -43,9 +43,10 @@ pub struct PlannedClaim {
     /// the passage itself unless the source's licence permits retention
     /// (backlog 8709d128). A document locator ends in exactly one of two ways
     /// (backlog c083c1c9): a byte span into `source_text` whose bytes ARE the
-    /// hashed passage (the extractor's span, or the passage found verbatim in
-    /// `source_text`), so a reader who holds the source can re-derive the
-    /// quote and check the hash; or
+    /// hashed passage (the extractor's span when its source bytes are the
+    /// passage, else the passage found verbatim in `source_text`), so a
+    /// reader who holds the source can re-derive the quote and check the
+    /// hash; or
     /// [`NOT_SOURCE_VERIFIABLE`](crate::document::builder::NOT_SOURCE_VERIFIABLE)
     /// when there is no `source_text` (Tier 2) or the passage does not occur
     /// in it, where the hash pins only what the extractor emitted. `None` for

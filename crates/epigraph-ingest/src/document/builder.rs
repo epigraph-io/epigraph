@@ -183,23 +183,29 @@ fn enrichment_from_paragraph(paragraph: &Paragraph) -> serde_json::Value {
 pub const NOT_SOURCE_VERIFIABLE: &str = "source_verifiable: false";
 
 /// Where `passage` sits in the extraction's `source_text`: the span the
-/// extractor supplied when there is one, else the first byte-exact occurrence
-/// of `passage` in `source_text`. `None` when there is no `source_text` (Tier
-/// 2) or the passage does not occur in it verbatim. A found span always
-/// satisfies `source_text[start..end] == passage`, so a reader who holds the
-/// source re-derives exactly the bytes the evidence hash covers.
+/// extractor supplied when `source_text[start..end]` is exactly `passage`,
+/// else the first byte-exact occurrence of `passage` in `source_text`. `None`
+/// when there is no `source_text` (Tier 2), even if the extractor supplied a
+/// span: nothing has checked that span against the publication
+/// (`verify_extraction_verbatim` is a no-op without `source_text`), so it may
+/// index the extractor's own text. Also `None` when the passage does not
+/// occur in `source_text` verbatim. A returned span always satisfies
+/// `source_text[start..end] == passage`, so a reader who holds the source
+/// re-derives exactly the bytes the evidence hash covers.
 #[must_use]
 pub fn locate_passage(
     extraction: &DocumentExtraction,
     passage: &str,
     supplied: Option<&ByteSpan>,
 ) -> Option<ByteSpan> {
-    if let Some(span) = supplied {
-        return Some(span.clone());
-    }
     let source = extraction.source_text.as_deref()?;
     if passage.is_empty() {
         return None;
+    }
+    if let Some(span) = supplied {
+        if source.get(span.start..span.end) == Some(passage) {
+            return Some(span.clone());
+        }
     }
     source.find(passage).map(|start| ByteSpan {
         start,
@@ -646,13 +652,14 @@ mod passage_locator_tests {
                 .expect("document claims carry a locator");
             match (span_of(loc), loc.ends_with(FLAG)) {
                 (Some((a, b)), false) => {
-                    if let Some(src) = source {
-                        assert_eq!(
-                            src.get(a..b),
-                            Some(passage(c)),
-                            "span must reproduce the hashed passage: {loc}"
-                        );
-                    }
+                    let src = source.unwrap_or_else(|| {
+                        panic!("a span with no source_text is not verifiable: {loc}")
+                    });
+                    assert_eq!(
+                        src.get(a..b),
+                        Some(passage(c)),
+                        "span must reproduce the hashed passage: {loc}"
+                    );
                 }
                 (None, true) => {}
                 other => panic!("locator neither spanned nor flagged ({other:?}): {loc}"),
@@ -726,6 +733,34 @@ mod passage_locator_tests {
                 )
                 .as_str()
             )
+        );
+        assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
+    }
+
+    /// Review finding on c083c1c9: a Tier-2 extractor may emit offsets into
+    /// its own (e.g. HTML-stripped) text, and with no `source_text` no writer
+    /// checks them. Such a span must not make the locator look re-derivable.
+    #[test]
+    fn a_supplied_span_without_source_text_is_flagged() {
+        let plan = build_ingest_plan(&extraction(None, Some((40, 40 + PARA.len()))));
+        for c in plan.claims.iter().filter(|c| c.level >= 2) {
+            let loc = c.supporting_locator.as_deref().unwrap();
+            assert!(loc.ends_with(FLAG), "unchecked span must be flagged: {loc}");
+            assert!(span_of(loc).is_none(), "no unchecked span: {loc}");
+        }
+        assert_every_locator_verifiable_or_flagged(&plan.claims, None);
+    }
+
+    /// A supplied span whose source bytes are not the passage is not trusted:
+    /// the passage is located by search instead.
+    #[test]
+    fn a_supplied_span_that_misses_the_passage_is_replaced() {
+        let src = format!("xx{PARA}yy");
+        let plan = build_ingest_plan(&extraction(Some(&src), Some((0, PARA.len()))));
+        let para = plan.claims.iter().find(|c| c.level == 2).unwrap();
+        assert_eq!(
+            span_of(para.supporting_locator.as_deref().unwrap()),
+            Some((2, 2 + PARA.len()))
         );
         assert_every_locator_verifiable_or_flagged(&plan.claims, Some(&src));
     }
