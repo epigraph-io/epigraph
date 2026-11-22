@@ -3,7 +3,10 @@
 //! and deferred-then-replayed), `mark_duplicate` (its repair and its re-wire
 //! of re-sourced edges), `unmark_duplicate` and `delete_edge` with its
 //! maintenance replay; each act completes, and the cascades count what they
-//! kept.
+//! kept. Also: `patch_edge` retiring an edge (and its replay), a deferred
+//! `mark_duplicate` and its replay, a retracted duplicate copy with no
+//! canonical holder of its key and one whose holder is retracted too, and a
+//! full mark / un-mark round trip that returns every retracted row exactly.
 //!
 //! The server's pools are the application role (`epigraph_app`); the inline
 //! cascade and the replay run on a NOSUPERUSER `epigraph_maintenance`
@@ -23,10 +26,11 @@ use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
 use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::edge_mutation::do_delete_edge;
+use epigraph_mcp::tools::edge_mutation::{do_delete_edge, do_patch_edge};
 use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim, unmark_duplicate};
 use epigraph_mcp::types::{
-    DeleteEdgeParams, MarkDuplicateParams, SupersedeClaimParams, UnmarkDuplicateParams,
+    DeleteEdgeParams, MarkDuplicateParams, PatchEdgeParams, SupersedeClaimParams,
+    UnmarkDuplicateParams,
 };
 use retracted::{retract_through_definer, row_state};
 use sqlx::PgPool;
@@ -654,13 +658,21 @@ async fn app_bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspecti
     .await
 }
 
-/// Sites 4 and 5 through `delete_edge` and its replay: the edge's owner
-/// retracts it. In the act (the application-session caller arm) the owner's
-/// live edge BBA goes and its retracted one stays; the maintenance replay
-/// removes the other writer's live one and keeps its retracted one. Neither
-/// half fails.
-#[sqlx::test(migrations = "../../migrations")]
-async fn delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
+/// An edge `a -> b` its owner `w1` wrote on the application role, with four
+/// edge-keyed BBAs on `b`: the owner's live one and its retracted one, and
+/// another writer's (`w2`) live one and retracted one.
+struct EdgeWithdrawalWorld {
+    w1: Side,
+    b: Uuid,
+    e: Uuid,
+    own_live: Uuid,
+    own_retracted: Uuid,
+    foreign_live: Uuid,
+    foreign_retracted: Uuid,
+}
+
+async fn edge_withdrawal_world(pool: &PgPool) -> EdgeWithdrawalWorld {
+    let pool = pool.clone();
     let url = fixture::database_url_for(&pool).await;
     let scoped =
         ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
@@ -725,6 +737,33 @@ async fn delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
     retract_through_definer(&pool, own_retracted).await;
     retract_through_definer(&pool, foreign_retracted).await;
 
+    EdgeWithdrawalWorld {
+        w1,
+        b,
+        e,
+        own_live,
+        own_retracted,
+        foreign_live,
+        foreign_retracted,
+    }
+}
+
+/// Sites 4 and 5 through `delete_edge` and its replay: the edge's owner
+/// retracts it. In the act (the application-session caller arm) the owner's
+/// live edge BBA goes and its retracted one stays; the maintenance replay
+/// removes the other writer's live one and keeps its retracted one. Neither
+/// half fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
+    let EdgeWithdrawalWorld {
+        w1,
+        b,
+        e,
+        own_live,
+        own_retracted,
+        foreign_live,
+        foreign_retracted,
+    } = edge_withdrawal_world(&pool).await;
     let out = do_delete_edge(
         &w1.server,
         &w1.viewer,
@@ -760,4 +799,331 @@ async fn delete_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
         None,
         "and removes its live one"
     );
+}
+
+/// Site 4's twin through `patch_edge`: the owner retires its edge by closing
+/// its lifecycle window (a past `valid_to`), which reaches the same caller
+/// arm of `withdraw_edge_bbas_conn` as `delete_edge`. The owner's live edge
+/// BBA goes and its retracted one stays; the maintenance replay removes the
+/// other writer's live one and keeps its retracted one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn patch_edge_retiring_an_edge_and_its_replay_keep_retracted_edge_bbas(pool: PgPool) {
+    let w = edge_withdrawal_world(&pool).await;
+    let out = do_patch_edge(
+        &w.w1.server,
+        &w.w1.viewer,
+        PatchEdgeParams {
+            edge_id: w.e.to_string(),
+            // A minute in the past, so the edge is out of force on any
+            // clock the database's `now()` reads.
+            valid_to: Some((chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()),
+            properties: None,
+        },
+        None,
+    )
+    .await
+    .expect("the owner retires its edge");
+    let out = first_text(&out);
+    assert_eq!(out["retired"], true, "{out}");
+    assert_eq!(
+        row_state(&pool, w.own_retracted).await,
+        Some((w.b, true)),
+        "the patch keeps the owner's retracted edge BBA"
+    );
+    assert_eq!(
+        row_state(&pool, w.own_live).await,
+        None,
+        "and deletes its live one"
+    );
+    assert_eq!(out["bba_cleanup"]["deleted"], 1, "{out}");
+    assert_eq!(
+        row_state(&pool, w.foreign_live).await,
+        Some((w.b, false)),
+        "calibration: another writer's live row waits for the replay"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert_eq!(
+        row_state(&pool, w.foreign_retracted).await,
+        Some((w.b, true)),
+        "the replay keeps another writer's retracted edge BBA"
+    );
+    assert_eq!(
+        row_state(&pool, w.foreign_live).await,
+        None,
+        "and removes its live one"
+    );
+}
+
+/// The dedup world of the inline test: another writer's edge onto the
+/// duplicate carries a live copy whose canonical holder is retracted (key
+/// `f1`) and a retracted copy whose canonical holder is live (key `f2`).
+struct DedupWorld {
+    h: Uuid,
+    dup: Uuid,
+    canonical: Uuid,
+    live_copy: Uuid,
+    retracted_holder: Uuid,
+    retracted_copy: Uuid,
+    live_holder: Uuid,
+}
+
+async fn dedup_world(pool: &PgPool, tag: &str) -> DedupWorld {
+    let (h, hg) = fixture::seed_agent_with_group(pool, &format!("k4a-mcp-{tag}-h")).await;
+    let (x, xg) = fixture::seed_agent_with_group(pool, &format!("k4a-mcp-{tag}-x")).await;
+    let dup = claim_of(pool, h, hg, "k4a mcp duplicate").await;
+    let canonical = claim_of(pool, h, hg, "k4a mcp canonical").await;
+    let xc = claim_of(pool, x, xg, "k4a mcp citer").await;
+    let e = edge(pool, xc, dup).await;
+    let (f1, f2) = (frame(pool, "d1").await, frame(pool, "d2").await);
+    let live_copy = harness_bba(pool, dup, f1, x, e).await;
+    let retracted_holder = harness_bba(pool, canonical, f1, x, e).await;
+    let retracted_copy = harness_bba(pool, dup, f2, x, e).await;
+    let live_holder = harness_bba(pool, canonical, f2, x, e).await;
+    retract_through_definer(pool, retracted_holder).await;
+    retract_through_definer(pool, retracted_copy).await;
+    DedupWorld {
+        h,
+        dup,
+        canonical,
+        live_copy,
+        retracted_holder,
+        retracted_copy,
+        live_holder,
+    }
+}
+
+/// Site 2 through `mark_duplicate` with NO maintenance connection: the repair
+/// is deferred, and the maintenance replay (the production path) keeps both
+/// retracted rows where they are and the live copy a retracted holder blocks
+/// on the duplicate, without failing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_deferred_replay_keeps_retracted_rows_and_the_live_copy_they_block(
+    pool: PgPool,
+) {
+    let server = app_role_server(&pool, false).await;
+    let w = dedup_world(&pool, "deferred").await;
+    let r = mark_duplicate(
+        &server,
+        &viewer(&pool, w.h).await,
+        MarkDuplicateParams {
+            claim_id: w.dup.to_string(),
+            canonical_id: w.canonical.to_string(),
+            reason: None,
+        },
+        Some(&human(w.h)),
+    )
+    .await
+    .expect("the author's dedup");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "PREMISE: {body}");
+    assert_eq!(
+        row_state(&pool, w.retracted_copy).await,
+        Some((w.dup, true)),
+        "calibration: nothing moved before the replay"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert_eq!(
+        row_state(&pool, w.retracted_copy).await,
+        Some((w.dup, true)),
+        "the replay keeps the retracted copy where it is"
+    );
+    assert_eq!(
+        row_state(&pool, w.retracted_holder).await,
+        Some((w.canonical, true)),
+        "and the retracted holder"
+    );
+    assert_eq!(
+        row_state(&pool, w.live_copy).await,
+        Some((w.dup, false)),
+        "the live copy a retracted holder blocks stays on the duplicate"
+    );
+    assert_eq!(
+        row_state(&pool, w.live_holder).await,
+        Some((w.canonical, false))
+    );
+    assert!(
+        !is_current(&pool, w.dup).await,
+        "calibration: the mark landed"
+    );
+}
+
+/// The full retraction triple of a row, read on the harness.
+async fn retraction(pool: &PgPool, id: Uuid) -> (Option<String>, Option<Uuid>, Option<String>) {
+    sqlx::query_as(
+        "SELECT retracted_at::text, retracted_by, retract_reason FROM mass_functions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read the retraction")
+}
+
+/// SPEC §11 K4a item 2's two remaining cases, through `mark_duplicate` with
+/// the cascade inline. Key `f3`: a RETRACTED duplicate copy the canonical
+/// holds no row of moves with its edge onto the canonical, its retraction
+/// intact (it holds no key the canonical holds, and nothing deletes it). Key
+/// `f4`: copy AND holder both retracted: neither is dropped, moved or counted
+/// as a live copy kept by a retracted holder.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_keeps_a_retracted_copy_with_no_holder_or_a_retracted_holder(pool: PgPool) {
+    let server = app_role_server(&pool, true).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "k4a-mcp-i2-h").await;
+    let (x, xg) = fixture::seed_agent_with_group(&pool, "k4a-mcp-i2-x").await;
+    let dup = claim_of(&pool, h, hg, "k4a mcp i2 duplicate").await;
+    let canonical = claim_of(&pool, h, hg, "k4a mcp i2 canonical").await;
+    let xc = claim_of(&pool, x, xg, "k4a mcp i2 citer").await;
+    let e = edge(&pool, xc, dup).await;
+    let (f3, f4) = (frame(&pool, "i2a").await, frame(&pool, "i2b").await);
+    let lone_copy = harness_bba(&pool, dup, f3, x, e).await;
+    let both_copy = harness_bba(&pool, dup, f4, x, e).await;
+    let both_holder = harness_bba(&pool, canonical, f4, x, e).await;
+    for id in [lone_copy, both_copy, both_holder] {
+        retract_through_definer(&pool, id).await;
+    }
+    let lone_before = retraction(&pool, lone_copy).await;
+    assert!(lone_before.0.is_some(), "PREMISE: retracted");
+
+    let r = mark_duplicate(
+        &server,
+        &viewer(&pool, h).await,
+        MarkDuplicateParams {
+            claim_id: dup.to_string(),
+            canonical_id: canonical.to_string(),
+            reason: None,
+        },
+        Some(&human(h)),
+    )
+    .await
+    .expect("the author's dedup");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(
+        row_state(&pool, lone_copy).await,
+        Some((canonical, true)),
+        "a retracted copy the canonical holds no row of moves with its edge, still retracted"
+    );
+    assert_eq!(
+        retraction(&pool, lone_copy).await,
+        lone_before,
+        "the move keeps its retraction exactly"
+    );
+    assert_eq!(
+        row_state(&pool, both_copy).await,
+        Some((dup, true)),
+        "a retracted copy whose holder is retracted stays on the duplicate"
+    );
+    assert_eq!(
+        row_state(&pool, both_holder).await,
+        Some((canonical, true)),
+        "and the retracted holder stays on the canonical"
+    );
+    let touched = &body["cascade"]["touched"];
+    assert_eq!(
+        (
+            &touched["bbas_kept_on_duplicate_by_retracted_holder"],
+            &touched["duplicate_copies_dropped"]
+        ),
+        (&serde_json::json!(0), &serde_json::json!(0)),
+        "a retracted copy is neither a live copy kept by a retracted holder nor a dropped \
+         copy: {touched}"
+    );
+}
+
+/// Every column of a row, as text, read on the harness.
+async fn image(pool: &PgPool, id: Uuid) -> Option<String> {
+    sqlx::query_scalar("SELECT to_jsonb(m.*)::text FROM mass_functions m WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .expect("read the row")
+}
+
+/// A full mark / un-mark round trip over the K4a dedup world plus item 2's
+/// two other cases: every RETRACTED row ends exactly as it began (same claim,
+/// every column), whether the mark left it in place or moved it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_mark_and_unmark_round_trip_returns_every_retracted_row_unchanged(pool: PgPool) {
+    let server = app_role_server(&pool, true).await;
+    let w = dedup_world(&pool, "round").await;
+    let x: Uuid = sqlx::query_scalar("SELECT source_agent_id FROM mass_functions WHERE id = $1")
+        .bind(w.live_copy)
+        .fetch_one(&pool)
+        .await
+        .expect("the citer");
+    let e: Uuid = sqlx::query_scalar("SELECT perspective_id FROM mass_functions WHERE id = $1")
+        .bind(w.live_copy)
+        .fetch_one(&pool)
+        .await
+        .expect("the edge");
+    let (f3, f4) = (frame(&pool, "r3").await, frame(&pool, "r4").await);
+    let lone_copy = harness_bba(&pool, w.dup, f3, x, e).await;
+    let both_copy = harness_bba(&pool, w.dup, f4, x, e).await;
+    let both_holder = harness_bba(&pool, w.canonical, f4, x, e).await;
+    for id in [lone_copy, both_copy, both_holder] {
+        retract_through_definer(&pool, id).await;
+    }
+    let retracted = [
+        w.retracted_copy,
+        w.retracted_holder,
+        lone_copy,
+        both_copy,
+        both_holder,
+    ];
+    let mut before = Vec::new();
+    for id in retracted {
+        let img = image(&pool, id).await.expect("PREMISE: the row exists");
+        assert_eq!(
+            row_state(&pool, id).await.map(|(_, r)| r),
+            Some(true),
+            "PREMISE: {id} is retracted"
+        );
+        before.push(img);
+    }
+
+    let v = viewer(&pool, w.h).await;
+    let r = mark_duplicate(
+        &server,
+        &v,
+        MarkDuplicateParams {
+            claim_id: w.dup.to_string(),
+            canonical_id: w.canonical.to_string(),
+            reason: None,
+        },
+        Some(&human(w.h)),
+    )
+    .await
+    .expect("the author's dedup");
+    assert_eq!(first_text(&r)["cascade"]["status"], "applied");
+    assert_eq!(
+        row_state(&pool, lone_copy).await,
+        Some((w.canonical, true)),
+        "calibration: the mark moved a retracted row"
+    );
+
+    let r = unmark_duplicate(
+        &server,
+        &v,
+        UnmarkDuplicateParams {
+            claim_id: w.dup.to_string(),
+        },
+        Some(&human(w.h)),
+    )
+    .await
+    .expect("the author's un-mark");
+    let body = first_text(&r);
+    assert!(
+        is_current(&pool, w.dup).await,
+        "calibration: the un-mark landed: {body}"
+    );
+    for (id, img) in retracted.iter().zip(&before) {
+        assert_eq!(
+            image(&pool, *id).await.as_ref(),
+            Some(img),
+            "retracted row {id} did not come back unchanged: {body}"
+        );
+    }
 }
