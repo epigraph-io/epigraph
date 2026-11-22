@@ -259,6 +259,12 @@ fn sets_a_literal_weight(body: &str) -> bool {
 /// `weight`. The weight is the evidence type's reliability, which the served
 /// calibration owns; `memorize` passed `weight: 0.6`, which matched the
 /// shipped `testimonial` weight but ignored a `CALIBRATION_PATH` retune.
+///
+/// Scope: a source-text scan of `DsAutoInput { .. }` struct literals whose
+/// `weight:` field is a numeric literal. It does NOT see a literal routed
+/// through a named constant (`weight: TESTIMONY_W`) or a weight passed
+/// positionally to a `ds_auto` helper; review those by hand. When added, no
+/// production call site did either.
 #[test]
 fn no_ds_auto_input_hardcodes_its_evidence_type_weight() {
     let root = workspace_root();
