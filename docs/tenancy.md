@@ -632,8 +632,9 @@ since an acting link does not read the human registry), then an acting link's
 operator group or else the author's own personal group, then the trigger's
 writer scope on that group (`OPL02` for a link that is not acting, and for an
 author bound only through the client allowlist). The detached ingests run
-that check before they write the paper row, so a refusal reaches the caller
-instead of the background task.
+that check synchronously, before they spawn the walk (which writes the paper
+row inside its own transaction), so a refusal reaches the caller instead of
+the background task.
 Workflow ingest authors every row as ONE shared system agent under that agent's
 own stamp, so the database sees only it; its request paths therefore bind their
 real CALLER before writing (`OPL01` for an unbound caller, `OPL02` for a caller

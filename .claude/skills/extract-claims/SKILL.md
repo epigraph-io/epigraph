@@ -141,9 +141,10 @@ all-or-nothing walk in the request and return its own result:
 
 The result's `doi` is the document_key. If the walk fails (verbatim-guard
 mismatch, malformed axis, a rejected row, an owner-group refusal) the call
-returns an **error** naming the cause and the document_key; no claims or edges
-were written (the papers row may exist with 0 claims), so fix the cause and
-retry: a retry is safe and converges on existing nodes.
+returns an **error** naming the cause and the document_key; nothing was
+written (the papers row is written by the same transaction, so a failed walk
+leaves none), so fix the cause and retry: a retry is safe and converges on
+existing nodes.
 
 **Without `wait`** (the default) the call returns immediately after spawning a
 detached task:
@@ -153,8 +154,12 @@ detached task:
 ```
 
 The write may still be in flight, and if it fails the error reaches only the
-server log. Confirm a detached ingest only by `query_paper(document_key)`'s
-`claim_count` rising: the paper row exists as soon as the call returns, and
+server log. The papers row is written by that same background transaction, so
+for a NEW document `query_paper(document_key)` finds nothing until the write
+commits, and a document that never appears means the write failed (resubmit
+with `wait: true` to see the error). Confirm a detached ingest only by
+`query_paper(document_key)`'s `claim_count` rising: a document ingested before
+(a spine call included) already has its paper row, and
 `check_already_ingested` can already be true from an earlier spine or ingest
 of the same document, so neither proves the write landed. Do not fire a second
 ingest call based on a timeout — the background task may still be running.
