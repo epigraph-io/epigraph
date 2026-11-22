@@ -3403,6 +3403,27 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **236**: `live_memberships_principal_bound` (backlog fad5a6c4). `epigraph_live_memberships(agent)`
+  answers only for the session principal (`epigraph_principal_id()`), a maintenance session
+  (`epigraph_bypass()`) or a superuser session, and no rows for anyone else: an application
+  session no longer lists another agent's memberships (direct and role-derived) by naming its
+  id. 235's body moves verbatim into the NEW `epigraph_live_memberships_unbound(agent)`, owned
+  by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and never granted to `epigraph_app`;
+  206's `epigraph_writable_teams` and 234's `epigraph_readable_teams` are re-stated with their
+  one call re-pointed at it (they answer exactly as before). An md5 precondition refuses to
+  apply over any other body of the three. Both definers are on 172's `pg_catalog, pg_temp`
+  path (the register of definers resolving through `public` shrinks by one). The binaries stamp
+  the principal they ask about for the one statement (`list_live_for_agent`: the agent;
+  `delegated_principal_pool`: the delegator). The stamp is a transport, not an authority
+  boundary: the change removes the ambient answer, not what a holder of the application DSN
+  can stamp. Pinned by `epigraph-db/tests/live_memberships_principal_bound.rs` (the unstamped
+  and the stamped-as-another refusals, the maintenance answer, the viewer resolve on an
+  unstamped app pool and that its stamp ends with the statement, the team lists, the catalog
+  and the caller list, the undo) and `schema_contract.rs::migration_165_derived_arms_survive_at_head`.
+  Undo: `docs/runbooks/236-undo.sql`. **Deploy order: BINARIES FIRST.** A binary that
+  predates 236 resolves every viewer to public-only and refuses every delegated run token on a
+  database with 236. That includes every service linking an older `epigraph-db` (bump its
+  pin first). **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

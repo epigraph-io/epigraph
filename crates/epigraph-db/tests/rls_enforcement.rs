@@ -736,12 +736,19 @@ async fn viewer_resolve_still_sees_memberships_on_an_unstamped_connection(pool: 
 
     let (via_function, direct) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         set_gucs(&mut conn, "", "", "").await;
-        let via_function: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM public.epigraph_live_memberships($1)")
-                .bind(agent)
-                .fetch_one(&mut *conn)
-                .await
-                .expect("definer read");
+        // Since migration 236 the definer answers only for the session
+        // principal, so this reads it the way `list_live_for_agent` does: the
+        // statement stamps the agent as its own principal for itself, and
+        // the connection is otherwise unstamped (the direct read below).
+        let via_function: i64 = sqlx::query_scalar(
+            "SELECT count(*) \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid AS p) s \
+              CROSS JOIN LATERAL public.epigraph_live_memberships(s.p)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("definer read");
         let direct: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM group_memberships WHERE group_id = $1 AND revoked_at IS NULL",
         )
