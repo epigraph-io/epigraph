@@ -11214,7 +11214,10 @@ impl ClaimRepository {
     /// nulled in the same statement, CLAUDE.md "Cleanup paths"), restricted to
     /// a row that is still current, so `rows_affected` means "this call retired
     /// it". `deprecate_workflow` reports only claims whose state changed
-    /// (U017; backlog fe874d2a): a re-run must report nothing.
+    /// (U017; backlog fe874d2a): a re-run must report nothing. Its flat
+    /// (claim-id) path calls this; the hierarchical path calls
+    /// [`Self::retire_for_workflow_deprecation`], which also marks the
+    /// retirement for a later revival.
     ///
     /// # Errors
     /// Returns `DbError` if the statement fails, including a `42501` refusal

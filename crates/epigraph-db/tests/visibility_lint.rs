@@ -3938,9 +3938,10 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "deprecate_claim_if_current",
         "UPDATE `claims` with `deprecate_claim`'s SET list plus `AND is_current`, so \
          `rows_affected` means the call retired the row. A write by primary key: the control is \
-         `claims_tenancy`'s `WITH CHECK` against the connection's GUCs (the hierarchical \
-         `deprecate_workflow` runs it on the ingest system agent's stamp, after the workflow \
-         authority rule admitted the caller), exactly as for `deprecate_claim` above.",
+         `claims_tenancy`'s `WITH CHECK` against the connection's GUCs (the flat \
+         `deprecate_workflow` path runs it on the caller's stamped transaction; the \
+         hierarchical path uses `retire_for_workflow_deprecation` below), exactly as for \
+         `deprecate_claim` above.",
     ),
     // Backlog 1767f2ae: the hierarchical deprecation MARKS what it retires, and a
     // later generation or `add_step` that reuses the claim revives it.
