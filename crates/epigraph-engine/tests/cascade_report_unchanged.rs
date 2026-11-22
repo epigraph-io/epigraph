@@ -16,6 +16,17 @@
 //!   claim's cache, which is recorded on another frame, so migration 114 turns
 //!   the write into a no-op.
 //!
+//! And a claim with no BBA left whose cache CLEAR the database declined, which
+//! the clear's 0-row answer used to make indistinguishable from "there was no
+//! cache" (review of backlog 541d7104):
+//!
+//! * CLEAR DECLINED (definer): a public claim with a cache recording no frame,
+//!   cleared by a non-owner session; migration 114's definer refuses it.
+//!
+//! A clear that row-level security refuses (a group claim the session reads as
+//! a `reader` member) raises an error rather than answering 0 rows, so that
+//! claim is pinned in `errors`, again in exactly one bucket.
+//!
 //! A BBA-free, cache-free candidate (every `mark_duplicate` endpoint pair)
 //! stays absent from every field.
 
@@ -227,5 +238,143 @@ async fn a_write_migration_114_declines_is_reported_unchanged(pool: PgPool) {
         cache(&pool, claim).await.3,
         Some(binary),
         "re-pointed by the control"
+    );
+}
+
+/// Run `cascade_after_edge_withdrawal` over `ids` on an application-role
+/// session stamped as `agent`, committing it.
+async fn cascade_as(pool: &PgPool, agent: Uuid, ids: &[Uuid]) -> CascadeReport {
+    let url = fixture::database_url_for(pool).await;
+    let app =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let viewer = Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve the agent");
+    let mut tx = app.begin_as(&viewer).await.expect("stamped app session");
+    let report = cascade_after_edge_withdrawal(&mut tx, &viewer, ids, 0).await;
+    tx.commit().await.expect("commit");
+    report
+}
+
+/// Plant a filled cache that records NO frame.
+async fn plant_frameless(pool: &PgPool, id: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET belief = 0.7, plausibility = 0.9, pignistic_prob = 0.8, \
+                           belief_frame_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("plant a frameless cache");
+}
+
+/// CLEAR DECLINED (definer): a public, BBA-free claim with a cache recording
+/// no frame. On a non-owner app-role session the clear goes through migration
+/// 114's definer, which refuses a cache with no recorded frame and answers 0
+/// rows. The claim is listed under `unchanged` with its cache kept, beside a
+/// BBA-free, cache-free candidate that stays absent. The privileged control
+/// clears the same cache and reports it `unbacked`, so the decline is the
+/// session's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cache_clear_migration_114_declines_is_reported_unchanged(pool: PgPool) {
+    let (_scoped, bypass) = fixture::bypass(&pool).await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "declined-clear-author").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "declined-clear-stranger").await;
+
+    let claim = fixture::seed_public_claim(&pool, author, "frameless cache, no BBA").await;
+    plant_frameless(&pool, claim).await;
+    let bare = fixture::seed_public_claim(&pool, author, "no BBA, no cache").await;
+    let before = cache(&pool, claim).await;
+    assert!(before.0.is_some(), "PREMISE: the claim holds a cache");
+
+    let report = cascade_as(&pool, stranger, &[claim, bare]).await;
+
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(
+        report.unchanged,
+        vec![claim],
+        "a cache whose clear the database declined is reported, not silently dropped: \
+         {report:?}"
+    );
+    assert!(
+        report.unbacked.is_empty() && report.recomputed.is_empty() && report.targets.is_empty(),
+        "{report:?}"
+    );
+    assert!(
+        !report.unchanged.contains(&bare),
+        "a BBA-free, cache-free candidate stays absent: {report:?}"
+    );
+    assert_partition(&report);
+    assert_eq!(
+        cache(&pool, claim).await,
+        before,
+        "the declined clear leaves the cache as it was"
+    );
+
+    // Control: the privileged connection clears it.
+    let mut conn = pool.acquire().await.expect("acquire");
+    let control = cascade_after_edge_withdrawal(&mut conn, &bypass, &[claim, bare], 0).await;
+    assert_eq!(
+        control.unbacked,
+        vec![claim],
+        "CALIBRATION: the owner-class session clears the same cache: {control:?}"
+    );
+    assert!(control.unchanged.is_empty(), "{control:?}");
+    assert_eq!(cache(&pool, claim).await, (None, None, None, None));
+}
+
+/// CLEAR REFUSED (row-level security): a BBA-free group claim with a cache,
+/// read by a `reader` member of its group. The session sees the claim but may
+/// not write it: the clear's UPDATE fails row-level security's check and
+/// raises, so the claim is reported in `errors` (and `targets`), in no other
+/// bucket, with its cache kept. Its owner's session clears it (the control).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_cache_clear_row_security_refuses_is_reported_as_an_error(pool: PgPool) {
+    let (author, group) = fixture::seed_agent_with_group(&pool, "rls-clear-author").await;
+    let (reader, _) = fixture::seed_agent_with_group(&pool, "rls-clear-reader").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'reader')",
+    )
+    .bind(group)
+    .bind(reader)
+    .execute(&pool)
+    .await
+    .expect("seed the reader membership");
+
+    let claim = fixture::seed_group_claim(&pool, author, group, "group cache, no BBA").await;
+    let (_, validity) = frames(&pool).await;
+    plant(&pool, claim, validity).await;
+    let before = cache(&pool, claim).await;
+
+    let report = cascade_as(&pool, reader, &[claim]).await;
+
+    let id = claim.to_string();
+    assert_eq!(
+        report.errors.iter().filter(|e| e.contains(&id)).count(),
+        1,
+        "a cache the session can read but not clear is reported as one error: {report:?}"
+    );
+    assert_eq!(report.targets, vec![claim], "{report:?}");
+    assert!(
+        report.unbacked.is_empty() && report.recomputed.is_empty() && report.unchanged.is_empty(),
+        "an errored candidate is in no other bucket: {report:?}"
+    );
+    assert_eq!(
+        cache(&pool, claim).await,
+        before,
+        "the refused clear leaves the cache as it was"
+    );
+
+    // Control: the owner's own session clears it.
+    let control = cascade_as(&pool, author, &[claim]).await;
+    assert!(control.errors.is_empty(), "{control:?}");
+    assert_eq!(
+        control.unbacked,
+        vec![claim],
+        "CALIBRATION: the owner clears the same cache: {control:?}"
     );
 }

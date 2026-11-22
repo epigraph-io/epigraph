@@ -865,7 +865,12 @@ but whose refold wrote nothing (no BBA on the repaired frame, a fold that admitt
 nothing to vacate, or a write migration 114 declined for a non-owner session) used to be absent
 from the whole report, so a caller could not tell that its cache may still fold the retired
 evidence. It is now listed in a fourth field, `unchanged`, outside `targets` (nothing was
-written). Every repair candidate that holds a BBA or a cache lands in exactly one of
+written). So is a candidate with no BBA the session can see that holds a cache whose clear
+migration 114's definer declined (it refuses a cache with no recorded frame, or a claim backed by
+BBAs the viewer cannot see): the cascade reads the cache back when the clear reports 0 rows. A
+clear that row-level security refuses (a claim the session can read but not write) raises an
+error, so that candidate is in `errors`.
+Every repair candidate that holds a BBA or a cache the session can read lands in exactly one of
 `recomputed`, `unbacked`, `unchanged` or `errors`; a BBA-free, cache-free endpoint is still absent
 from every field. Regression: `epigraph-engine/tests/cascade_report_unchanged.rs`.
 
