@@ -638,21 +638,23 @@ async fn assert_no_forged_purge(session: &PgPool, pool: &PgPool, w: &World, who:
 /// current transaction and then delete a retracted row outside the audited
 /// definer. Since 251 the definers' owner is `epigraph_bba_guard_owner`, a
 /// NOLOGIN role no login can act as, and the maintenance role holds nothing on
-/// the table. Checked on BOTH maintenance shapes: the role itself (`SET
-/// SESSION AUTHORIZATION epigraph_maintenance`) and a REAL NOSUPERUSER login
+/// the table. Checked on BOTH maintenance shapes: a REAL NOSUPERUSER login
 /// that is a member of it, connected with its own password (its
-/// `current_user` is the login, as in production).
+/// `current_user` is the login, as in production), and the role itself
+/// (`SET SESSION AUTHORIZATION epigraph_maintenance`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn d_a_maintenance_session_cannot_forge_a_purge_grant(pool: PgPool) {
     grant_table_exists(&pool).await;
     let w = world(&pool).await;
 
-    let m = maintenance(&pool).await;
-    assert_no_forged_purge(&m, &pool, &w, "the maintenance role").await;
-
+    // The real login first: it is the credential production hands out, so it
+    // is the shape whose refusal on the pre-251 schema must be observed.
     let (role, login) = login::maintenance_login(&pool, "t63d").await;
     assert_no_forged_purge(&login, &pool, &w, "a maintenance login").await;
     login::drop_login(&pool, &role, login).await;
+
+    let m = maintenance(&pool).await;
+    assert_no_forged_purge(&m, &pool, &w, "the maintenance role").await;
 }
 
 /// (d3) The purge definer still works for a REAL maintenance login after 251

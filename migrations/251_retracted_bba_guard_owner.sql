@@ -349,20 +349,21 @@ COMMENT ON TABLE public.mass_function_purge_grants IS
 -- ===================================================================
 -- 3. THE GUARD: ONLY THE UN-RETRACT DEFINER CLEARS
 -- ===================================================================
--- 184's body; the one delta is the `251:` line of the clear arm.
+-- 184's body; the one delta is the `251:` line of the clear arm (and two
+-- comment lines reworded).
 CREATE OR REPLACE FUNCTION public.epigraph_mass_function_retract_guard()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public AS $$
 BEGIN
-    -- R-103: no session or frame re-writes a retracted row's assessment.
+    -- No session or frame re-writes a retracted row's assessment.
     IF TG_ARGV[0] = 'rewrite' THEN
         RAISE EXCEPTION 'RT07: mass function % is retracted; a write to its key (claim, frame, '
             'source agent, perspective) is refused until it is un-retracted; nothing was written',
             OLD.id
             USING ERRCODE = '42501', DETAIL = OLD.id::text;
     END IF;
-    -- R-103: only section 2b's definer clears a retraction.
+    -- Only 184's un-retract definer (section 2b) clears a retraction.
     IF TG_ARGV[0] = 'clear' THEN
         -- 251: the un-retract definer's owner, which no login can act as.
         IF current_user = 'epigraph_bba_guard_owner'::name
