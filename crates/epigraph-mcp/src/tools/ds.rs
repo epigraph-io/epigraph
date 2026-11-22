@@ -473,6 +473,13 @@ pub async fn submit_ds_evidence(
              POST /api/v1/claims/:id/assess; choose another perspective",
         ));
     }
+    // The claim's index on the frame BEFORE this call assigns it: the index a
+    // BBA this call replaces was counted with on the Beta track, and so the
+    // one its increment is withdrawn at (backlog 862d8404).
+    let prior_index = FrameRepository::get_claim_assignment(&mut *tx, viewer, claim_id, frame_id)
+        .await
+        .map_err(internal_error)?
+        .and_then(|a| a.hypothesis_index);
     FrameRepository::assign_claim(&mut *tx, claim_id, frame_id, Some(params.hypothesis_index))
         .await
         .map_err(internal_error)?;
@@ -494,8 +501,11 @@ pub async fn submit_ds_evidence(
     let rows = MassFunctionRepository::get_for_claim_frame(&mut *tx, viewer, claim_id, frame_id)
         .await
         .map_err(internal_error)?;
-    let write_outcome = match prior_for(&rows, Some(agent_id), perspective_id) {
-        None => BbaWriteOutcome::Inserted,
+    // A replacement also yields what the replaced row was counted with on the
+    // Beta track, withdrawn below as this BBA's increment is added (backlog
+    // 862d8404); `None` for a row the track never counted.
+    let (write_outcome, withdrawn) = match prior_for(&rows, Some(agent_id), perspective_id) {
+        None => (BbaWriteOutcome::Inserted, None),
         Some(row)
             if restates_bba(
                 row,
@@ -505,9 +515,12 @@ pub async fn submit_ds_evidence(
                 stored_locality_tag,
             ) =>
         {
-            BbaWriteOutcome::Unchanged
+            (BbaWriteOutcome::Unchanged, None)
         }
-        Some(_) => BbaWriteOutcome::Replaced,
+        Some(row) => (
+            BbaWriteOutcome::Replaced,
+            epigraph_engine::ds_divergence::replaced_increments(row, &frame, prior_index),
+        ),
     };
     match write_outcome {
         BbaWriteOutcome::Unchanged => warnings.push(
@@ -518,8 +531,9 @@ pub async fn submit_ds_evidence(
         ),
         BbaWriteOutcome::Replaced => warnings.push(
             "this BBA REPLACED this agent's earlier, different BBA for this claim, frame and \
-             perspective_id (same mass_function_id); it was not added beside it. To add \
-             independent evidence, submit it under a distinct perspective_id."
+             perspective_id (same mass_function_id); it was not added beside it, and \
+             bayesian_posterior counts it in place of the replaced BBA. To add independent \
+             evidence, submit it under a distinct perspective_id."
                 .to_string(),
         ),
         BbaWriteOutcome::Inserted => {}
@@ -554,7 +568,8 @@ pub async fn submit_ds_evidence(
     // `POST /frames/:id/evidence` keeps it, by the same function: the stored
     // BBA's mass on the claim's assigned hypothesis goes to alpha, the rest of
     // its non-conflict mass to beta. An identical resubmission was counted
-    // when it was first stored and is not counted again. Best-effort, under
+    // when it was first stored and is not counted again; a replacement
+    // withdraws the replaced BBA's increment as it adds its own. Best-effort, under
     // its own savepoint: a refused statement (a non-owner of a public claim
     // does not write its row) never aborts this submission.
     let assigned_index =
@@ -568,6 +583,7 @@ pub async fn submit_ds_evidence(
         claim_id,
         (write_outcome != BbaWriteOutcome::Unchanged)
             .then(|| epigraph_engine::ds_divergence::beta_increments(&mass_fn, assigned_index)),
+        withdrawn,
         "submit_ds_evidence",
     )
     .await

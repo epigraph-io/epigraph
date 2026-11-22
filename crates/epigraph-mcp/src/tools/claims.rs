@@ -1830,6 +1830,9 @@ pub async fn update_with_evidence(
             &ds.evidence_bba,
             Some(0),
         )),
+        // Never a replacement: each call files its BBA under its own
+        // evidence's perspective.
+        None,
         "update_with_evidence",
     )
     .await
