@@ -3407,8 +3407,10 @@ restart.
   human operator, signed in as themselves) creates a keyless team group in 164's
   `did:epigraph:group:` namespace and becomes its one admin
   (`epigraph_person_create_team_group(name, reason)`; one active group per name PER CREATOR,
-  TGP06); a live admin invites another Person (`epigraph_invite_to_team_group(group,
-  invitee, role, reason)`), which writes a `pending` row in the new `group_invitations` and NO
+  TGP06), recorded in the new `person_team_groups`; only those groups are invitable (an
+  operator-made 164 team group has the same shape and its admins get TGP07, so its roster
+  stays the operator's audited verbs'). A live admin invites another Person
+  (`epigraph_invite_to_team_group(group, invitee, role, reason)`), which writes a `pending` row in the new `group_invitations` and NO
   membership; only the invitee accepts (`epigraph_accept_group_invitation`: one new roster
   row at the invited role, decided under the group row lock the 164 verbs take, refused
   TGP05 once answered or when its sender is no longer a live admin) or declines
@@ -3428,8 +3430,8 @@ restart.
   Pinned by `epigraph-db/tests/person_team_groups.rs`,
   `epigraph-db/tests/person_team_groups_undo.rs`, and the REST and MCP twins'
   app-role tests. Undo: `docs/runbooks/263-undo.sql` (tested: run twice, it returns the
-  `public` catalog to below 263, restoring 176's guards byte for byte; it LOSES every
-  invitation row and keeps the groups and memberships). Checked before claiming: slot 263
+  `public` catalog to below 263, restoring 176's guards byte for byte; it LOSES every invitation row and the
+  `person_team_groups` record, and keeps the groups and memberships). Checked before claiming: slot 263
   was assigned to this change. **Deploy order:** migrate, then roll out the binary that
   serves the routes and tools (a binary ahead of the migration answers 42883 on them); human
   OAuth clients need `groups:write` / `groups:read` granted to reach them. **Applied to

@@ -20,6 +20,15 @@
 -- 164's guards, its lapse rule (section 6 there) and the operator's verbs all
 -- still apply to them.
 --
+-- Invitations are scoped to the groups a Person made HERE: the create definer
+-- records each one in `person_team_groups`, and invite and accept require
+-- that record. A team group the operator made with 164's `create-group` has
+-- exactly the same shape (kind, namespace, empty key), so the shape alone
+-- cannot tell them apart; without the record every human admin of an
+-- operator-made group could invite anyone into it, at `admin` too, by a path
+-- 164 reserved for the operator's audited verbs. Those groups stay
+-- operator-managed: their admins get TGP07.
+--
 -- ===================================================================
 -- 2. WHO THE CALLER IS
 --
@@ -51,9 +60,11 @@
 --   * INVITE (`epigraph_invite_to_team_group(group, invitee, role, reason)`):
 --     the caller must hold a live `admin` row of the group (TGP02; a caller
 --     with no live row at all is told the group does not exist, TGP08, as
---     for a missing one). The group must be an active verb-made keyless team
---     group (TGP07). The invitee must be a registered human operator other
---     than the caller (TGP03 / TGP09), not already a live member and without
+--     for a missing one). The group must be an active keyless team group
+--     that a Person made through this file's create (`person_team_groups`;
+--     TGP07 for any other, including an operator-made team group). The
+--     invitee must be a registered human operator other than the caller
+--     (TGP03 / TGP09), not already a live member and without
 --     a pending invitation to the group (TGP04). One `pending` row; NO
 --     membership is written.
 --   * ACCEPT (`epigraph_accept_group_invitation(invitation)`): only the
@@ -61,10 +72,10 @@
 --     164 verbs take (`FOR NO KEY UPDATE`, taken first, then the invitation
 --     row), so it is serialised with them and with a second accept. Refused
 --     TGP05 unless the invitation is still `pending`, the group is still an
---     active verb-made team group, and the inviter is still a live `admin`
---     of it and still a registered human operator: an admin removed or
---     demoted since, or whose registration lapsed, no longer vouches for the
---     invitation. Refused TGP04 if the invitee became a live member some
+--     active Person-made keyless team group, and the inviter is still a live
+--     `admin` of it and still a registered human operator: an admin removed
+--     or demoted since, or whose registration lapsed, no longer vouches for
+--     the invitation. Refused TGP04 if the invitee became a live member some
 --     other way meanwhile. Otherwise ONE new membership row at the next epoch
 --     for the pair (164 section 3: the roster is a ledger) with the invited
 --     role, and the invitation becomes `accepted` naming that row.
@@ -72,8 +83,9 @@
 --     invitee; `pending` -> `declined` (TGP05 otherwise).
 --   * READS: `epigraph_my_groups()` lists the caller's live memberships
 --     (`epigraph_live_memberships`, so 164's lapse, 165's role-derived rows
---     and 235's allowance lapse all apply) with each group's name, kind and
---     status; `epigraph_my_group_invitations()` lists the invitations still
+--     and 235's allowance lapse all apply) with each group's name, kind,
+--     status and `invitable` (an active Person-made keyless team group);
+--     `epigraph_my_group_invitations()` lists the invitations still
 --     `pending` that name the caller. Neither discloses another principal's
 --     rows.
 --
@@ -136,7 +148,9 @@
 -- TGP05 the invitation was already answered, or has lapsed (the group or
 --       the inviter no longer qualifies)
 -- TGP06 the caller already has an active team group of that name
--- TGP07 the group is not an active keyless team group these verbs manage
+-- TGP07 the group is not an active keyless team group a Person made through
+--       this file (an operator-made team group, a personal, community or
+--       keyed group, or an archived one)
 -- TGP08 no such group or invitation for this caller (a missing one and one
 --       the caller may not see answer the same)
 -- TGP09 a malformed request (blank or over-long name or reason, a role
@@ -156,6 +170,9 @@
 -- role). `group_invitations` is under FORCEd row security with privileged
 -- policies only (166's `role_agents` shape): the application role holds
 -- SELECT and sees no row; it reads its own rows through the definers.
+-- `person_team_groups` and `team_group_roster_grants` grant the application
+-- role nothing (077's default privileges are revoked explicitly), so it can
+-- neither mark a group invitable nor grant itself a roster row.
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/263-undo.sql` (re-states 176's two guard bodies).
@@ -236,6 +253,31 @@ COMMENT ON FUNCTION public.epigraph_team_group_roster_granted(uuid, uuid) IS
     'row -- for the current transaction. The one admission 263 adds to 164''s two team-group '
     'guards.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_team_group_roster_granted(uuid, uuid) FROM PUBLIC;
+
+-- ===================================================================
+-- Section 1: the record of the groups a Person made here (the only
+-- invitable ones).
+-- ===================================================================
+CREATE TABLE public.person_team_groups (
+    group_id   uuid NOT NULL PRIMARY KEY REFERENCES public.groups(id),
+    created_by uuid NOT NULL REFERENCES public.agents(id),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+COMMENT ON TABLE public.person_team_groups IS
+    'Migration 263: one row per keyless team group a Person made through '
+    'epigraph_person_create_team_group. Only these groups take invitations; an operator-made '
+    'team group (164 create-group) has the same shape and stays operator-managed. Written only '
+    'by the create definer; the application role holds no privilege on it.';
+
+REVOKE ALL ON public.person_team_groups FROM PUBLIC;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'REVOKE ALL ON public.person_team_groups FROM epigraph_app';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'GRANT SELECT, INSERT ON public.person_team_groups TO epigraph_maintenance';
+    END IF;
+END $$;
 
 -- ===================================================================
 -- Section 4: 176's two guards, each with the grant admission on INSERT.
@@ -401,6 +443,7 @@ BEGIN
     INSERT INTO public.groups (id, display_name, did_key, public_key, kind, created_by_agent_id)
     VALUES (v_group, v_name, 'did:epigraph:group:' || v_group::text, ''::bytea, 'team',
             v_principal);
+    INSERT INTO public.person_team_groups (group_id, created_by) VALUES (v_group, v_principal);
     INSERT INTO public.group_memberships (group_id, agent_id, wrapped_key_share, epoch, role)
     VALUES (v_group, v_principal, ''::bytea, 0, 'admin');
     INSERT INTO public.security_events (event_type, agent_id, success, details)
@@ -474,9 +517,12 @@ BEGIN
             USING ERRCODE = 'TGP02';
     END IF;
     IF v_kind <> 'team' OR v_did NOT LIKE 'did:epigraph:group:%' OR v_key_len <> 0
-       OR v_status <> 'active' THEN
-        RAISE EXCEPTION 'TGP07: group % is not an active keyless team group, so it takes no '
-                        'invitations (its roster has its own path); nothing was changed', p_group
+       OR v_status <> 'active'
+       OR NOT EXISTS (SELECT 1 FROM public.person_team_groups ptg
+                       WHERE ptg.group_id = p_group) THEN
+        RAISE EXCEPTION 'TGP07: group % is not an active keyless team group made by a Person, so '
+                        'it takes no invitations (its roster has its own path, the operator''s '
+                        'audited verbs); nothing was changed', p_group
             USING ERRCODE = 'TGP07';
     END IF;
     IF NOT public.epigraph_is_human_operator(p_invitee) THEN
@@ -566,9 +612,11 @@ BEGIN
             USING ERRCODE = 'TGP05';
     END IF;
     IF v_kind <> 'team' OR v_did NOT LIKE 'did:epigraph:group:%' OR v_key_len <> 0
-       OR v_status <> 'active' THEN
+       OR v_status <> 'active'
+       OR NOT EXISTS (SELECT 1 FROM public.person_team_groups ptg
+                       WHERE ptg.group_id = v_group) THEN
         RAISE EXCEPTION 'TGP05: invitation % has lapsed: group % is no longer an active keyless '
-                        'team group; nothing was changed', p_invitation, v_group
+                        'team group made by a Person; nothing was changed', p_invitation, v_group
             USING ERRCODE = 'TGP05';
     END IF;
     -- Serialised with every link write and registration lookup the 164
@@ -684,7 +732,9 @@ SET search_path = pg_catalog, pg_temp AS $$
                    g.created_by_agent_id AS created_by,
                    (g.kind = 'team' AND g.did_key LIKE 'did:epigraph:group:%'
                     AND pg_catalog.octet_length(g.public_key) = 0
-                    AND g.status = 'active') AS invitable
+                    AND g.status = 'active'
+                    AND EXISTS (SELECT 1 FROM public.person_team_groups ptg
+                                 WHERE ptg.group_id = g.id)) AS invitable
               FROM public.epigraph_live_memberships(public.epigraph_principal_id()) m
               JOIN public.groups g ON g.id = m.group_id
              WHERE public.epigraph_principal_id() IS NOT NULL

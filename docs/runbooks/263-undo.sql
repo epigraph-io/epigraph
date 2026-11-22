@@ -10,7 +10,8 @@
 --     grants), so the roster and the group row of a verb-made group are
 --     again written by the maintenance verbs alone;
 --   * drops the six request-path functions and the grant check;
---   * drops `group_invitations` and `team_group_roster_grants`.
+--   * drops `group_invitations`, `person_team_groups` and
+--     `team_group_roster_grants`.
 --
 -- WHAT IT LOSES: every invitation row (pending, accepted, declined). Their
 -- `group.invitation_*` and `group.member_added` audit rows stay (082:
@@ -20,9 +21,11 @@
 --     FROM public.group_invitations WHERE status = 'pending';
 --
 -- WHAT IT LEAVES: every group a Person created and every membership an
--- acceptance wrote. They are ordinary verb-made team groups and rows; the
--- operator's 164 verbs (`group-member remove|set-role`) manage them after
--- the undo exactly as before it. 263's `_sqlx_migrations` row also stays:
+-- acceptance wrote (the record of which groups a Person made goes with
+-- `person_team_groups`; the `group.team_created` audit rows keep it). They
+-- are ordinary verb-made team groups and rows; the operator's 164 verbs
+-- (`group-member remove|set-role`) manage them after the undo exactly as
+-- before it. 263's `_sqlx_migrations` row also stays:
 -- re-introducing the surface is a NEW migration, never a re-run of 263.
 --
 -- Roll back every binary that calls the 263 functions (the REST
@@ -79,6 +82,7 @@ DROP FUNCTION IF EXISTS public.epigraph_invite_to_team_group(uuid, uuid, text, t
 DROP FUNCTION IF EXISTS public.epigraph_person_create_team_group(text, text);
 DROP FUNCTION IF EXISTS public.epigraph_team_group_roster_granted(uuid, uuid);
 DROP TABLE IF EXISTS public.group_invitations;
+DROP TABLE IF EXISTS public.person_team_groups;
 DROP TABLE IF EXISTS public.team_group_roster_grants;
 
 COMMIT;

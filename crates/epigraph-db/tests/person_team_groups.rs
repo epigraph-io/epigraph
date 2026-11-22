@@ -642,6 +642,70 @@ async fn an_invitation_lapses_with_its_sender_and_other_groups_take_none(pool: P
     assert_eq!(code_of(&r).as_deref(), Some("TGP07"), "{r:?}");
 }
 
+/// A team group the OPERATOR made with 164's `create-group` takes no
+/// invitation, even from a Person who is a live admin of it: its roster stays
+/// the operator's audited verbs' alone. Only a group a Person made through
+/// 263's create is invitable, and the application role cannot mark one so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operator_made_team_group_takes_no_invitation(pool: PgPool) {
+    let h = human(&pool, "opgroup-admin").await;
+    let b = human(&pool, "opgroup-b").await;
+    let mut m = pool.acquire().await.expect("acquire");
+    m.execute("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .await
+        .expect("maintenance");
+    let op_group: Uuid = sqlx::query_scalar("SELECT public.epigraph_create_team_group($1, $2, $3)")
+        .bind("Synthetic Operator Team")
+        .bind(h)
+        .bind("person team group test")
+        .fetch_one(&mut *m)
+        .await
+        .expect("the operator's verb makes a team group with h as its admin");
+    m.execute("RESET SESSION AUTHORIZATION")
+        .await
+        .expect("reset");
+    assert_eq!(
+        rows(&pool, op_group, h).await,
+        vec![("admin".to_string(), false)],
+        "PREMISE: h is a live admin of the operator's group"
+    );
+
+    let r = invite(&pool, h, op_group, b, "admin").await;
+    assert_eq!(code_of(&r).as_deref(), Some("TGP07"), "{r:?}");
+    assert!(rows(&pool, op_group, b).await.is_empty());
+    assert!(
+        my_groups(&pool, h)
+            .await
+            .iter()
+            .any(|g| g.0 == op_group && g.1 == "admin" && !g.2),
+        "listed, but not as invitable"
+    );
+
+    // The application role cannot mark the operator's group as Person-made.
+    let mut c = app_as(&pool, Some(h)).await;
+    let r = sqlx::query("INSERT INTO person_team_groups (group_id, created_by) VALUES ($1, $2)")
+        .bind(op_group)
+        .bind(h)
+        .execute(&mut *c)
+        .await;
+    assert_eq!(code_of(&r).as_deref(), Some("42501"), "{r:?}");
+    reset(c).await;
+    let r = invite(&pool, h, op_group, b, "reader").await;
+    assert_eq!(code_of(&r).as_deref(), Some("TGP07"), "{r:?}");
+
+    // POSITIVE CONTROL: the same Person's own group takes the same invitation.
+    let own = create(&pool, Some(h), "Synthetic Own Team")
+        .await
+        .expect("create");
+    invite(&pool, h, own, b, "admin")
+        .await
+        .expect("a Person-made group takes invitations");
+    assert!(my_groups(&pool, h)
+        .await
+        .iter()
+        .any(|g| g.0 == own && g.2));
+}
+
 /// 164's guards still refuse every direct application write to a verb-made
 /// group, with 176's exact text, including right after a person act in the
 /// same transaction; and no grant row survives the act that wrote it.

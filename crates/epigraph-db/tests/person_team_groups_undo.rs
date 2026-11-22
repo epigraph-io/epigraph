@@ -123,6 +123,7 @@ async fn the_263_undo_returns_the_catalog_below_263(pool: PgPool) {
     for new in [
         "rel group_invitations r",
         "rel team_group_roster_grants r",
+        "rel person_team_groups r",
         "fn epigraph_accept_group_invitation(p_invitation uuid)",
         "pol group_invitations.group_invitations_privileged_read",
     ] {
