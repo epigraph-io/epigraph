@@ -1019,17 +1019,29 @@ fn bp_scope_from_request(
 /// Run a BP engine on the blocking pool, off the async runtime's workers
 /// (backlog 69f52e3f): a run is CPU-bound for up to [`BP_MAX_ITERATIONS`]
 /// sweeps of the factor graph.
+///
+/// `permit` is the run's share of [`AppState::bp_runs`] (backlog b02347c6).
+/// The blocking task holds a clone until it finishes, so a request whose
+/// future is dropped mid-run (a client that disconnects) still counts
+/// against the limit while its thread computes.
 #[cfg(feature = "db")]
-async fn run_bp_blocking<T, F>(run: F) -> Result<T, ApiError>
+async fn run_bp_blocking<T, F>(
+    permit: &std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    run: F,
+) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    tokio::task::spawn_blocking(run)
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("belief propagation did not complete: {e}"),
-        })
+    let permit = std::sync::Arc::clone(permit);
+    tokio::task::spawn_blocking(move || {
+        let _held = permit;
+        run()
+    })
+    .await
+    .map_err(|e| ApiError::InternalError {
+        message: format!("belief propagation did not complete: {e}"),
+    })
 }
 
 /// POST /api/v1/bp/propagate - Run loopy belief propagation.
@@ -1086,6 +1098,21 @@ pub async fn propagate_beliefs(
             ),
         });
     }
+
+    // At most `state.bp_runs` runs at once (backlog b02347c6), refused rather
+    // than queued: a queued request would hold its connection and its caller
+    // for as long as the runs ahead of it. Taken after every 4xx check, held
+    // through the BP run (the blocking task keeps a clone) and the apply.
+    let permit = std::sync::Arc::new(state.bp_runs.clone().try_acquire_owned().map_err(|_| {
+        tracing::warn!(
+            handler = "propagate_beliefs",
+            "BP run refused: every BP run permit is in use"
+        );
+        ApiError::ServiceUnavailable {
+            service: "belief propagation (the concurrent-run limit is reached; retry later)"
+                .to_string(),
+        }
+    })?);
 
     // Load the factors in the request's scope (backlog b02347c6). This is the
     // one loader that feeds the BP engines (`run_cdst_bp`, `run_bp`; interval
@@ -1332,7 +1359,7 @@ pub async fn propagate_beliefs(
         };
 
         let factors_count = engine_factors.len();
-        let result = run_bp_blocking(move || {
+        let result = run_bp_blocking(&permit, move || {
             epigraph_engine::cdst_bp::run_cdst_bp(
                 &engine_factors,
                 &initial,
@@ -1396,7 +1423,7 @@ pub async fn propagate_beliefs(
 
     // -- Scalar BP fallback ---------------------------------------------------
     let factors_count = engine_factors.len();
-    let result = run_bp_blocking(move || {
+    let result = run_bp_blocking(&permit, move || {
         epigraph_engine::run_bp(&engine_factors, &initial_beliefs, &config)
     })
     .await?;

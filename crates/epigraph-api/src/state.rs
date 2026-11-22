@@ -340,6 +340,14 @@ pub struct AppState {
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
     #[cfg(feature = "db")]
     pub bp_apply: BpApply,
+    /// The permits that bound concurrent `POST /api/v1/bp/propagate` runs
+    /// (backlog b02347c6). A run is CPU-bound on tokio's blocking pool, whose
+    /// ceiling (512 threads by default) every other blocking user in the
+    /// process shares; a run that finds no permit is refused (503) rather
+    /// than queued. [`BP_MAX_CONCURRENT_DEFAULT`] in every constructor;
+    /// `bin/server.rs` sets it from [`BP_MAX_CONCURRENT_ENV`] at boot.
+    #[cfg(feature = "db")]
+    pub bp_runs: Arc<tokio::sync::Semaphore>,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -532,6 +540,16 @@ pub use epigraph_engine::belief_modes::BpApply;
 
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
 pub const BP_APPLY_ENV: &str = BpApply::ENV;
+
+/// How many `POST /api/v1/bp/propagate` runs may be in flight at once when
+/// [`BP_MAX_CONCURRENT_ENV`] is unset ([`AppState::bp_runs`]).
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_DEFAULT: usize = 2;
+
+/// The environment variable `bin/server.rs` reads the BP concurrency limit
+/// from: a non-negative integer, read once at boot.
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_ENV: &str = "EPIGRAPH_BP_MAX_CONCURRENT";
 
 /// The environment variable that switches the guest reads on:
 /// `EPIGRAPH_GUEST_READS`.
@@ -1325,6 +1343,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1441,6 +1460,15 @@ impl AppState {
     #[must_use]
     pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
         self.bp_apply = bp_apply;
+        self
+    }
+
+    /// Set how many `POST /api/v1/bp/propagate` runs may be in flight at
+    /// once; see [`Self::bp_runs`]. `0` refuses every run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_bp_max_concurrent(mut self, limit: usize) -> Self {
+        self.bp_runs = Arc::new(tokio::sync::Semaphore::new(limit));
         self
     }
 
@@ -1916,6 +1944,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1997,6 +2026,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,

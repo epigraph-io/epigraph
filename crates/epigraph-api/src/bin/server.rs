@@ -645,6 +645,7 @@ async fn main() {
             .with_run_token_models(epigraph_api::oauth::run_token::RunTokenModels::from_env())
             .with_token_exchange_audiences(token_exchange_audiences_from_env())
             .with_bp_apply(bp_apply_from_env())
+            .with_bp_max_concurrent(bp_max_concurrent_from_env())
             .with_guest_reads(guest_reads)
             .with_passkeys(passkeys)
             .with_edge_signer(edge_signer);
@@ -1024,6 +1025,36 @@ fn bp_apply_from_env() -> epigraph_api::state::BpApply {
         );
     }
     switch
+}
+
+/// `EPIGRAPH_BP_MAX_CONCURRENT`, read once at boot: how many
+/// `POST /api/v1/bp/propagate` runs may be in flight at once
+/// (`AppState::bp_runs`, backlog b02347c6). Unset is the default; a value
+/// that is not a non-negative integer is warned about and the default is
+/// used. `0` refuses every run.
+#[cfg(feature = "db")]
+fn bp_max_concurrent_from_env() -> usize {
+    use epigraph_api::state::{BP_MAX_CONCURRENT_DEFAULT, BP_MAX_CONCURRENT_ENV};
+    match std::env::var(BP_MAX_CONCURRENT_ENV) {
+        Err(_) => BP_MAX_CONCURRENT_DEFAULT,
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(limit) => {
+                tracing::info!(
+                    limit,
+                    "EPIGRAPH_BP_MAX_CONCURRENT: concurrent BP runs capped"
+                );
+                limit
+            }
+            Err(_) => {
+                tracing::warn!(
+                    value = %raw,
+                    default = BP_MAX_CONCURRENT_DEFAULT,
+                    "EPIGRAPH_BP_MAX_CONCURRENT is not a non-negative integer; using the default"
+                );
+                BP_MAX_CONCURRENT_DEFAULT
+            }
+        },
+    }
 }
 
 /// `EPIGRAPH_GUEST_READS`, read once at boot: whether the anonymous guest

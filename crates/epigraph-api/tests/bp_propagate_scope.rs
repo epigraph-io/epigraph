@@ -326,3 +326,37 @@ async fn a_scope_over_the_factor_cap_is_refused_not_truncated(pool: PgPool) {
         "an unfiltered frame scope over four factors refuses at a cap of three"
     );
 }
+
+/// A BP run is CPU-bound for up to `BP_MAX_ITERATIONS` sweeps on tokio's
+/// blocking pool, whose default ceiling (512 threads) is shared with every
+/// other blocking user in the process. Concurrent runs are capped by
+/// `AppState::bp_runs`; one beyond the limit is refused (503) at once, and
+/// a finished run gives its permit back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn bp_runs_beyond_the_configured_limit_are_refused(pool: PgPool) {
+    let g = graph(&pool).await;
+    let state = AppState::with_scoped_pool(scoped_pool(&pool).await, ApiConfig::default())
+        .with_bp_max_concurrent(1);
+    let body = serde_json::json!({"claim_ids": [g.s], "mode": "scalar"});
+
+    let held = state
+        .bp_runs
+        .clone()
+        .try_acquire_owned()
+        .expect("CALIBRATION: the one permit is free");
+    match run(&pool, &state, g.agent, body.clone()).await {
+        Err(ApiError::ServiceUnavailable { .. }) => {}
+        other => panic!("a run beyond the limit must be a 503, got {other:?}"),
+    }
+
+    drop(held);
+    let ok = run(&pool, &state, g.agent, body)
+        .await
+        .expect("with the permit free the same run answers 200");
+    assert_eq!(ok["factors_count"].as_u64(), Some(2), "{ok}");
+    assert_eq!(
+        state.bp_runs.available_permits(),
+        1,
+        "a finished run gives its permit back"
+    );
+}
