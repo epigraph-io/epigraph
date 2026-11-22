@@ -523,3 +523,45 @@ async fn the_address_limiter_keys_on_the_client_behind_a_trusted_proxy() {
         "client B behind the same proxy has its own bucket"
     );
 }
+
+/// A refused `/elevate/...` request carries a live single-use credential in
+/// its path. The recorded refusal must name the route, not the credential
+/// (`serving::loggable_path`), as the request log already does.
+///
+/// Fails when `refuse_if_limited` records the raw path.
+#[tokio::test]
+async fn a_refused_ceremony_path_is_recorded_without_its_credential() {
+    let (router, state) = address_only_router(limiter());
+    let peer = "203.0.113.95:1000";
+    // Spend the bucket on unknown paths, so no ceremony handler ever runs
+    // against the unconnected pool.
+    for _ in 0..LIMIT {
+        assert_eq!(
+            from_peer(&router, "GET", "/no/such/route", peer, None)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    // The first refusal is the one recorded.
+    assert_eq!(
+        from_peer(&router, "GET", "/elevate/SECRETTICKET123", peer, None)
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    let events = state
+        .audit_log
+        .query(epigraph_api::SecurityEventFilter::new().with_event_type("rate_limit_exceeded"));
+    assert_eq!(events.len(), 1, "CALIBRATION: the refusal was recorded");
+    match &events[0] {
+        epigraph_api::SecurityEvent::RateLimitExceeded { endpoint, .. } => {
+            assert_eq!(endpoint, "/elevate/:ticket");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    assert!(
+        !format!("{:?}", events[0]).contains("SECRETTICKET123"),
+        "the credential must not be recorded"
+    );
+}

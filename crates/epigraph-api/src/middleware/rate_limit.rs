@@ -386,7 +386,7 @@ const LIVENESS_ROUTE: &str = "/health";
 /// one shared bucket, so it is logged.
 fn fallback_key(path: &str) -> AgentId {
     tracing::warn!(
-        path = %path,
+        path = %crate::serving::loggable_path(path),
         "Rate limiting request without identifiable client - using fallback ID \
          (is the router served with into_make_service_with_connect_info?)"
     );
@@ -403,7 +403,10 @@ fn refuse_if_limited(
     agent_id: AgentId,
     path: &str,
 ) -> Result<(), RateLimitResponse> {
-    let path = path.to_string();
+    // A ceremony path (`/elevate/:ticket`, `/elevate/enroll/:id`,
+    // `/elevate/act/:id`) carries a live single-use credential: log and
+    // record the route, never the credential, as the request log does.
+    let path = crate::serving::loggable_path(path).into_owned();
 
     // Check rate limit
     if let Err(err) = rate_limiter.check(&agent_id) {
