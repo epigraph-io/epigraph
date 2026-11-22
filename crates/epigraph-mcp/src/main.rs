@@ -62,7 +62,9 @@ struct Cli {
     #[arg(long, env = "EPIGRAPH_MCP_AGENT_KEY", hide_env_values = true)]
     agent_key: Option<String>,
 
-    /// OpenAI API key for embedding generation. If omitted, uses mock embeddings.
+    /// OpenAI API key for embedding generation. If omitted, embedding is
+    /// disabled: claims are stored without vectors, and semantic recall over
+    /// them is unavailable (no mock vectors are generated).
     #[arg(long, env = "OPENAI_API_KEY", hide_env_values = true)]
     openai_api_key: Option<String>,
 
@@ -1247,6 +1249,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_help_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// `--openai-api-key` / `OPENAI_API_KEY` help matches what the embedder
+    /// does without a key: embedding is DISABLED (`embed.rs::key_disabled`),
+    /// with no mock-vector fallback (backlog a13bef05).
+    #[test]
+    fn the_openai_key_help_says_omitting_it_disables_embedding() {
+        let cmd = Cli::command();
+        let arg = cmd
+            .get_arguments()
+            .find(|a| a.get_id() == "openai_api_key")
+            .expect("the --openai-api-key argument");
+        let help = format!(
+            "{} {}",
+            arg.get_help().map(ToString::to_string).unwrap_or_default(),
+            arg.get_long_help()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        );
+        assert!(!help.to_lowercase().contains("uses mock"), "{help}");
+        assert!(help.contains("embedding is disabled"), "{help}");
+    }
 }
 
 #[cfg(test)]
