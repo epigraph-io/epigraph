@@ -9436,6 +9436,23 @@ impl ClaimRepository {
                 ),
             });
         }
+        // The edge arm predicts the repair's incoming re-point, so it skips
+        // every edge that re-point leaves on the duplicate (backlog 89a1d071
+        // part 2): lineage in either spelling, a non-public duplicate's frozen
+        // `executes`, a dedup identity edge, an agent's authorship, an
+        // act-marked edge and the document ingest's own edges (K1, K2). It
+        // still counts an edge the incoming collision guard will retract, and
+        // the pooling arm counts every row, so it can still refuse where the
+        // repair would carry nothing; it never admits what the repair carries.
+        let frozen = non_public_frozen_relationships(&mut tx, dup_uuid).await?;
+        let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let false_binding: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -9450,13 +9467,24 @@ impl ClaimRepository {
                AND (EXISTS (
                    SELECT 1 FROM edges e
                     WHERE e.target_id = $1 AND e.target_type = 'claim'
-                      AND e.relationship != 'supersedes' AND e.valid_to IS NULL
-                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))
+                      AND lower(e.relationship) <> 'supersedes' AND e.valid_to IS NULL
+                      AND NOT (e.source_type = 'claim' AND e.source_id = $2)
+                      AND NOT (e.relationship = ANY($3))
+                      AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                      AND NOT (e.source_type = 'agent' AND e.relationship = ANY($4))
+                      AND NOT COALESCE(e.properties->>$6 = ANY($5), false)
+                      AND NOT (e.properties ? $7 OR e.labels @> ARRAY[$8]::text[]))
                  -- The repair's pooling (part 3) copies the frame bindings too.
                  OR EXISTS (SELECT 1 FROM mass_functions m WHERE m.claim_id = $1))"#,
         )
         .bind(dup_uuid)
         .bind(canon_uuid)
+        .bind(&frozen)
+        .bind(&agent_authorship)
+        .bind(&act_tools)
+        .bind(SUPERSEDE_ACT_PROPERTY)
+        .bind(INGEST_WRITTEN_FROZEN)
+        .bind(INGEST_WRITTEN_FROZEN_LABEL)
         .fetch_one(&mut *tx)
         .await?;
         if false_binding {
