@@ -9,6 +9,10 @@
 //! ended the process mid-walk (nothing written, the `papers` row left behind)
 //! or mid-embedding (claims committed with no vector) (backlog b928ccc1).
 //!
+//! The best-effort audit row that `recall` and `recall_with_context` write
+//! after answering is the same shape: a session that recalls and closes at
+//! once lost its last `recall_events` row (backlog 8a23217d).
+//!
 //! [`BackgroundTasks`] counts such tasks so the stdio entry point can wait for
 //! them, with a bound, before it returns. It is a counter and a `Notify`
 //! rather than a `JoinSet`: the tasks are spawned from `&self` tool handlers on
