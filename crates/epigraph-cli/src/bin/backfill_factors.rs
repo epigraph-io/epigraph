@@ -33,7 +33,11 @@
 //! The predict records its options (`epsilon`, `max_passes`, `only_changed`,
 //! the accepted list's size, the wave files): the apply must reuse exactly
 //! them. A real targeted run needs the accepted list (`--edges-from`) and both
-//! snapshot files (`--snapshot`, `--edge-rows`). The fixed-point verify after
+//! snapshot files (`--snapshot`, `--edge-rows`). Before its first write the
+//! apply requires every wave claim to still hold its wave `written` value
+//! (the value the predict worked from); a claim rewritten since the predict,
+//! or put back to its `before`, refuses the run with nothing written (re-run
+//! the predict). The fixed-point verify after
 //! an apply is a predict over the L1 wave files AND the apply's `--snapshot`
 //! file (an L1 claim the rewire refolded holds neither L1 value; the E
 //! records chain onto the L1 ones), run WITH `--only-changed` (without it a

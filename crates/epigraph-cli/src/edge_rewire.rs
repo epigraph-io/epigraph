@@ -28,6 +28,13 @@
 //! * **Rollback** is LIFO: [`restore_edge_rows`] puts the rows back by
 //!   compare-and-swap, then `restore_belief_cache --from <the E wave file>`
 //!   the target caches.
+//! * **Wave-claim state.** The predict works from each wave claim's wave
+//!   `written` value (it reads a claim still at its `before` as `written`,
+//!   and refuses any other value). The apply has no overlay, so before its
+//!   first write it requires every wave claim to hold exactly `written`
+//!   ([`wave_claim_state`]): a claim rewritten since the predict
+//!   (`l1_state_unknown`) or put back to its `before` (`l1_state_before`)
+//!   refuses the whole run and nothing is written.
 //! * **Predict** ([`predict_targeted_rewire`]): the same passes, the same
 //!   per-edge decision ([`crate::backfill_factors::decide_targeted`]) and
 //!   the same pure row builder, in ONE `REPEATABLE READ, READ ONLY`
@@ -86,6 +93,91 @@ pub fn cache_moved(a: &CacheColumns, b: &CacheColumns, eps: f64) -> bool {
         _ => true,
     };
     diff(a.belief, b.belief) || diff(a.plausibility, b.plausibility)
+}
+
+/// Where a wave claim's stored cache stands against its wave records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveClaimState {
+    /// It holds the wave's `written` value: what the predict works from.
+    Written,
+    /// It holds the wave's `before` value (a restored pre-wave copy, or the
+    /// wave was rolled back).
+    Before,
+    /// Neither, or it is missing: written since the wave.
+    Unknown,
+}
+
+/// Classify wave claim `id`'s stored cache `now` against `seed`. A claim
+/// whose `before` equals its `written` (it did not move) is `Written`.
+#[must_use]
+pub fn wave_claim_state(seed: &WaveSeed, id: &Uuid, now: Option<&CacheColumns>) -> WaveClaimState {
+    let Some(now) = now else {
+        return WaveClaimState::Unknown;
+    };
+    if seed.written.get(id) == Some(now) {
+        WaveClaimState::Written
+    } else if seed.before.get(id) == Some(now) {
+        WaveClaimState::Before
+    } else {
+        WaveClaimState::Unknown
+    }
+}
+
+/// The first few ids of a refusal list, sorted.
+fn first_ids(ids: &mut [Uuid]) -> Vec<Uuid> {
+    ids.sort_unstable();
+    ids.iter().take(5).copied().collect()
+}
+
+/// The apply's state check (backlog ed2f99a8): every wave claim must hold
+/// exactly its wave `written` value, the value the accepted predict worked
+/// from, or the apply refuses before its first write. A claim rewritten since
+/// (`l1_state_unknown`) would wire its edges from a value the operator never
+/// reviewed; a claim back at its `before` (`l1_state_before`) would wire from
+/// `before`, where the predict overlaid `written`.
+///
+/// # Errors
+/// The read fails, or a wave claim does not hold its `written` value.
+pub async fn require_wave_claims_written(pool: &PgPool, seed: &WaveSeed) -> anyhow::Result<()> {
+    let ids: Vec<Uuid> = seed.written.keys().copied().collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let stored = crate::belief_cache::read_cache_columns(pool, &ids).await?;
+    let mut unknown: Vec<Uuid> = Vec::new();
+    let mut at_before: Vec<Uuid> = Vec::new();
+    for id in &ids {
+        match wave_claim_state(seed, id, stored.get(id)) {
+            WaveClaimState::Written => {}
+            WaveClaimState::Before => at_before.push(*id),
+            WaveClaimState::Unknown => unknown.push(*id),
+        }
+    }
+    let mut problems = Vec::new();
+    if !unknown.is_empty() {
+        problems.push(format!(
+            "l1_state_unknown: {} wave claim(s) hold neither the wave's before nor its written \
+             value (written since the wave or the predict), first {:?}",
+            unknown.len(),
+            first_ids(&mut unknown)
+        ));
+    }
+    if !at_before.is_empty() {
+        problems.push(format!(
+            "l1_state_before: {} wave claim(s) hold the wave's before value (the wave was \
+             restored since), first {:?}",
+            at_before.len(),
+            first_ids(&mut at_before)
+        ));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing the targeted rewire apply, nothing was written: {}. The accepted predict \
+         worked from each wave claim's written value; re-run the predict on the current state",
+        problems.join("; ")
+    )
 }
 
 /// Read the wave records into a [`WaveSeed`].
@@ -246,8 +338,16 @@ async fn db_now(pool: &PgPool) -> anyhow::Result<DateTime<Utc>> {
 /// [`WaveRecord`] to `wave_out` and its row's [`EdgeRowRecord`] to
 /// `rows_out` before it commits.
 ///
+/// Before anything else it requires every wave claim to hold its wave
+/// `written` value ([`require_wave_claims_written`]), so an apply never runs
+/// from a wave-claim state other than the one the accepted predict used. The
+/// check is taken once, before the first write: a wave claim rewritten while
+/// the run is in progress is not caught here (the post-apply verify predict
+/// is).
+///
 /// # Errors
-/// A selection or the clock read fails. Per-edge failures roll that edge back
+/// A wave claim does not hold its `written` value (nothing is written), or a
+/// selection or the clock read fails. Per-edge failures roll that edge back
 /// and are counted.
 pub async fn run_targeted_rewire(
     pool: &PgPool,
@@ -257,6 +357,7 @@ pub async fn run_targeted_rewire(
     wave_out: &mut (dyn Write + Send),
     rows_out: &mut (dyn Write + Send),
 ) -> anyhow::Result<TargetedRunReport> {
+    require_wave_claims_written(pool, seed).await?;
     let at = db_now(pool).await?;
     let mut baseline = seed.baseline.clone();
     let mut own_rows: HashMap<Uuid, StoredEdgeRow> = HashMap::new();
@@ -704,26 +805,22 @@ pub async fn predict_targeted_rewire(
     let stored = crate::belief_cache::read_cache_columns(&mut *tx, &ids).await?;
     let mut unknown: Vec<Uuid> = Vec::new();
     for id in &ids {
-        let (Some(now), Some(written)) = (stored.get(id), seed.written.get(id)) else {
-            unknown.push(*id);
-            continue;
-        };
-        if now == written {
-            continue;
-        }
-        if seed.before.get(id) == Some(now) {
-            overlay.cache.insert(*id, written.clone());
-        } else {
-            unknown.push(*id);
+        match wave_claim_state(seed, id, stored.get(id)) {
+            WaveClaimState::Written => {}
+            WaveClaimState::Before => {
+                if let Some(written) = seed.written.get(id) {
+                    overlay.cache.insert(*id, written.clone());
+                }
+            }
+            WaveClaimState::Unknown => unknown.push(*id),
         }
     }
     if !unknown.is_empty() {
-        unknown.sort_unstable();
         anyhow::bail!(
             "l1_state_unknown: {} wave claim(s) hold neither the wave's before nor its written \
              value (written since the wave), first {:?}",
             unknown.len(),
-            unknown.iter().take(5).collect::<Vec<_>>()
+            first_ids(&mut unknown)
         );
     }
     let seed_mode = if overlay.cache.is_empty() {
