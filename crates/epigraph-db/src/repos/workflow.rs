@@ -2660,22 +2660,42 @@ impl WorkflowRepository {
     /// statement takes a fresh snapshot that sees the first one's 0.05. Taking
     /// the locks in id order means two such calls cannot deadlock each other.
     ///
+    /// # Through the lock definer, one row at a time
+    ///
+    /// The rows are the ones the session READS (183's `workflows_read`), read
+    /// on the stamp with no lock, and each is then locked through migration
+    /// 237's `epigraph_workflow_lock_readable`, in id order from here (not
+    /// from a sort inside one statement, whose call order is the planner's).
+    /// A plain `SELECT ... FOR UPDATE` on the stamp would not do since 237: a
+    /// row lock is checked against the owner-scoped UPDATE policy, so it would
+    /// lock only the rows whose owner group the caller WRITES, and a PUBLIC
+    /// lineage may hold generations in different owner groups (a new
+    /// generation of a public lineage the caller does not write lands in the
+    /// caller's own group). Two deprecations of such a lineage would then each
+    /// lock only their own row, and the write skew above would be back.
+    ///
     /// # Errors
-    /// Returns `sqlx::Error` if the query fails.
-    pub async fn lock_lineages_for_deprecation<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn lock_lineages_for_deprecation(
+        conn: &mut sqlx::PgConnection,
         ids: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        sqlx::query_scalar::<_, Uuid>(
+        let rows: Vec<Uuid> = sqlx::query_scalar(
             "SELECT w.id FROM workflows w \
               WHERE w.canonical_name IN ( \
                     SELECT t.canonical_name FROM workflows t WHERE t.id = ANY($1::uuid[])) \
-              ORDER BY w.id \
-                FOR UPDATE",
+              ORDER BY w.id",
         )
         .bind(ids)
-        .fetch_all(executor)
+        .fetch_all(&mut *conn)
         .await?;
+        for row in rows {
+            // `false` is a row deleted since the read: nothing left to lock.
+            let _: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+                .bind(row)
+                .fetch_one(&mut *conn)
+                .await?;
+        }
         Ok(())
     }
 

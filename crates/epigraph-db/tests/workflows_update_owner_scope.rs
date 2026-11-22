@@ -614,6 +614,99 @@ async fn the_plan_edit_lock_holds_a_readable_row_the_caller_does_not_write(pool:
 }
 
 // ===================================================================
+// A deprecation's lineage lock
+// (`WorkflowRepository::lock_lineages_for_deprecation`).
+// ===================================================================
+
+/// Generation `generation` of lineage `name`, `visibility` in group `owner`.
+async fn lineage_row(
+    pool: &PgPool,
+    name: &str,
+    generation: i32,
+    visibility: &str,
+    owner: Uuid,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, canonical_name, generation, goal, visibility, owner_group_id) \
+         VALUES ($1, $2, $3, 'a goal', $4, $5)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(generation)
+    .bind(visibility)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("lineage row");
+    id
+}
+
+/// Whether another session finds `id` row-locked (`55P03` under NOWAIT).
+async fn held_elsewhere(pool: &PgPool, id: Uuid) -> bool {
+    match sqlx::query("SELECT 1 FROM workflows WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(id)
+        .execute(pool)
+        .await
+    {
+        Ok(_) => false,
+        Err(e) => {
+            let code = e
+                .as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()));
+            assert_eq!(code.as_deref(), Some("55P03"), "unexpected error: {e}");
+            true
+        }
+    }
+}
+
+/// Two deprecations of one lineage serialize on its rows (U017's write-skew
+/// guard), and a PUBLIC lineage may hold generations in different owner
+/// groups (a new generation of a public lineage the caller does not write
+/// lands in the caller's own group). So the lock takes EVERY generation the
+/// caller reads, including one in a group it does not write; a lock on the
+/// stamp takes only the rows the caller writes since 237 and leaves gen1 free,
+/// and then two concurrent deprecations of gen0 and gen1 would each keep the
+/// step they share. A generation the caller cannot read is not locked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_lineage_lock_holds_every_readable_generation_across_owner_groups(pool: PgPool) {
+    let w = world(&pool).await;
+    let (_, other) = fixture::seed_agent_with_group(&pool, "wf237-other-writer").await;
+    assert!(
+        !w.member.writable_groups().contains(&other),
+        "fixture: the member does not write the other group"
+    );
+    let name = format!("wf237-lineage-{}", Uuid::new_v4());
+    let gen0 = lineage_row(&pool, &name, 0, "public", w.g).await;
+    let gen1 = lineage_row(&pool, &name, 1, "public", other).await;
+    let gen2 = lineage_row(&pool, &name, 2, "group", other).await;
+    let unrelated = lineage_row(&pool, &format!("{name}-x"), 0, "public", w.g).await;
+
+    let mut tx = w.scoped.begin_as(&w.member).await.expect("stamped tx");
+    epigraph_db::WorkflowRepository::lock_lineages_for_deprecation(&mut tx, &[gen0])
+        .await
+        .expect("lock the lineage");
+    assert!(held_elsewhere(&pool, gen0).await, "the target's own row");
+    assert!(
+        held_elsewhere(&pool, gen1).await,
+        "a public generation in a group the caller does not write is locked too"
+    );
+    assert!(
+        !held_elsewhere(&pool, gen2).await,
+        "a generation the caller cannot read is not locked"
+    );
+    assert!(
+        !held_elsewhere(&pool, unrelated).await,
+        "another lineage is not locked"
+    );
+    tx.rollback().await.expect("rollback");
+    assert!(
+        !held_elsewhere(&pool, gen1).await,
+        "released with the transaction"
+    );
+}
+
+// ===================================================================
 // The undo (`docs/runbooks/237-undo.sql`).
 // ===================================================================
 

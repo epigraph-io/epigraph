@@ -41,7 +41,12 @@
 --     plan lock (`WorkflowRepository::lock_for_plan_edit`) uses it too: it
 --     serializes concurrent appends to one plan, and the entry points admit
 --     callers that do not write a PUBLIC plan's owner group (section 3), whose
---     lock on the stamp would otherwise take nothing;
+--     lock on the stamp would otherwise take nothing. So does a deprecation's
+--     lineage lock (`WorkflowRepository::lock_lineages_for_deprecation`), row
+--     by row in id order over the lineage rows the caller reads: a public
+--     lineage may hold generations in different owner groups, and a lock on
+--     the stamp would take only the rows the caller writes, so two
+--     deprecations of one lineage would no longer serialize;
 --   * `epigraph_workflow_record_outcome(workflow, success, variance)` locks
 --     it again (a no-op inside the same transaction), computes the four
 --     counters IN SQL from the stored ones and writes exactly those four keys.

@@ -2028,16 +2028,18 @@ async fn deprecate_hierarchical_workflow(
     // 2. Serialize against any other deprecation that could share a claim with
     //    this target set, BEFORE the sharing rule reads other workflows' truth
     //    (write skew; see `lock_lineages_for_deprecation`).
-    WorkflowRepository::lock_lineages_for_deprecation(&mut *tx, &targets)
+    WorkflowRepository::lock_lineages_for_deprecation(&mut tx, &targets)
         .await
         .map_err(internal_error)?;
 
     // 3. RE-CHECK under the lock (TOCTOU): the call may have waited on the lock
     //    while another transaction changed what step 1 read (a row's recorded
     //    submitter, the caller's admin grant). Only the grant decided here,
-    //    with every target row now locked against another writer and the
-    //    admin grant re-read after the wait, admits the write and drives the
-    //    per-target audit; step 1's grants are discarded.
+    //    with every lineage row the caller READS now locked against another
+    //    deprecation (through 237's lock definer, so a row of an owner group
+    //    the caller does not write is locked too) and the admin grant re-read
+    //    after the wait, admits the write and drives the per-target audit;
+    //    step 1's grants are discarded.
     let mut grants = Vec::with_capacity(targets.len());
     for &row in &targets {
         grants.push(
