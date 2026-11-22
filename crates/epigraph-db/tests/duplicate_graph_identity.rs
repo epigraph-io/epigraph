@@ -949,6 +949,15 @@ async fn writer_act(
     .await
 }
 
+/// One FA07 class: `(label, visibility, source, relationship, properties)`.
+type StayCase = (
+    &'static str,
+    &'static str,
+    (Uuid, &'static str),
+    &'static str,
+    serde_json::Value,
+);
+
 /// FA07's edge arm predicts the repair's INCOMING re-point, so an edge that
 /// re-point leaves on the duplicate carries nothing to the canonical and must
 /// not refuse the act (backlog 89a1d071 part 2). Before the fix the arm was
@@ -974,8 +983,7 @@ async fn fa07_ignores_incoming_edges_the_repair_leaves_on_the_duplicate(pool: Pg
         epigraph_db::SUPERSEDE_ACT_PROPERTY: "supersede_claim",
     });
 
-    // (label, visibility, source, relationship, properties)
-    let stays: Vec<(&str, &str, (Uuid, &str), &str, serde_json::Value)> = vec![
+    let stays: Vec<StayCase> = vec![
         (
             "agent AUTHORED",
             "public",
