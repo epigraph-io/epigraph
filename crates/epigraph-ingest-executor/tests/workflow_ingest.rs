@@ -563,3 +563,79 @@ async fn a_cross_lineage_parent_at_a_missing_generation_links_nothing_pending_q2
         0
     );
 }
+
+/// Backlog 26a436c6: a generation-0 ingest that names a parent is refused
+/// with nothing written. The parent is linked at `generation - 1`, which never
+/// exists for generation 0, so the named parent used to link nothing and the
+/// row was stored as a parentless new lineage that inherited nothing from the
+/// workflow it named. Naming another lineage and naming its own name are both
+/// refused; an existing generation-0 row re-ingested with a parent name is
+/// still answered as already ingested (nothing is written either way), and
+/// generation 1 naming the same parent still links it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_generation_zero_ingest_naming_a_parent_is_refused(pool: PgPool) {
+    let parent = exec(&pool, &generation_of("gen0-parent-target", 0)).await;
+    let rows = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM workflows WHERE canonical_name = $1")
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .expect("count rows")
+        }
+    };
+    let claims_before: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("count claims");
+
+    for named in ["gen0-parent-target", "gen0-parent-variant"] {
+        let mut variant = generation_of("gen0-parent-variant", 0);
+        variant.phases[0].steps[0].compound = format!("Invoke executor for a variant of {named}");
+        variant.source.parent_canonical_name = Some(named.to_string());
+        let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&variant);
+        let err = epigraph_ingest_executor::execute_workflow_ingest_plan(
+            &mut pool.acquire().await.expect("acquire"),
+            None,
+            &plan,
+            &variant,
+        )
+        .await
+        .expect_err("a generation-0 ingest naming a parent must be refused");
+        assert!(
+            matches!(
+                &err,
+                epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent {
+                    canonical_name,
+                    parent_canonical_name,
+                } if canonical_name == "gen0-parent-variant" && parent_canonical_name == named
+            ),
+            "naming {named}: {err}"
+        );
+        assert!(err.to_string().contains("Nothing was written"), "{err}");
+    }
+    assert_eq!(rows("gen0-parent-variant").await, 0, "no workflow row");
+    let claims_after: i64 = sqlx::query_scalar("SELECT count(*) FROM claims")
+        .fetch_one(&pool)
+        .await
+        .expect("count claims");
+    assert_eq!(claims_after, claims_before, "no claim written");
+
+    // An existing generation-0 row re-ingested with a parent name: already
+    // ingested, as before.
+    let mut again = generation_of("gen0-parent-target", 0);
+    again.source.parent_canonical_name = Some("gen0-parent-variant".to_string());
+    let replay = exec(&pool, &again).await;
+    assert!(replay.already_ingested, "a re-ingest writes nothing");
+    assert_eq!(replay.workflow_id, parent.workflow_id);
+
+    // Calibration: generation 1 naming the same parent links it.
+    let mut child = generation_of("gen0-parent-variant", 1);
+    child.source.parent_canonical_name = Some("gen0-parent-target".to_string());
+    let linked = exec(&pool, &child).await;
+    assert_eq!(
+        parent_of(&pool, linked.workflow_id).await,
+        Some(parent.workflow_id)
+    );
+}

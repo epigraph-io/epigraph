@@ -2396,7 +2396,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content; or a source.authors[].agent_id: the shared AuthorEntry schema lists it for document ingest, but workflow authors are resolved by name only and an agent_id is refused"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; GenerationZeroNamesParent: generation 0 with a parent_canonical_name (generation 0 links no parent); InvalidContent: blank thesis, phase, step or operation content; or a source.authors[].agent_id: the shared AuthorEntry schema lists it for document ingest, but workflow authors are resolved by name only and an agent_id is refused"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write, or a declared or inherited group the caller does not write, or no principal to write as"),
         (status = 500),
@@ -2885,8 +2885,9 @@ pub struct DeleteStepRequest {
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
 /// detail logged and kept out of the body. A content-less generation
-/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
-/// the caller's payload errors: 400. Everything else stays a 500.
+/// (`EmptyGeneration`, U032), blank claim content (`InvalidContent`) and a
+/// generation-0 payload naming a parent (`GenerationZeroNamesParent`) are the
+/// caller's payload errors: 400. Everything else stays a 500.
 ///
 /// These routes write as the caller: the personal-group refusals are the
 /// caller's own default declaration's (its personal group, or its
@@ -2910,6 +2911,13 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         // operation), refused by the executor's pre-flight: 400 naming the
         // field.
         e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // A generation-0 payload that names a parent it could never link
+        // (backlog 26a436c6): the caller's payload error, 400.
+        e @ epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent { .. } => {
             ApiError::BadRequest {
                 message: format!("workflow ingest: {e}"),
             }
@@ -4009,6 +4017,26 @@ mod tests {
             ApiError::BadRequest { message } => assert!(
                 message.contains("empty workflow generation")
                     && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Backlog 26a436c6: a generation-0 payload naming a parent is the
+    /// caller's payload error, 400 with the executor's reason, not a 500.
+    #[test]
+    fn a_generation_zero_parent_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent {
+                canonical_name: "weekly-capability-audit-fork".to_string(),
+                parent_canonical_name: "weekly-capability-audit".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("generation 0 starts a lineage")
+                    && message.contains("weekly-capability-audit-fork"),
                 "{message}"
             ),
             other => panic!("expected BadRequest, got {other:?}"),
