@@ -389,18 +389,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "check_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "paper_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
         "resolve_ingest_visibility",
         1,
         DEFINER_RESOLUTION,
@@ -412,13 +400,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "NO_ROW_SECURITY: the `&server.pool` argument to themes::resolve_theme_selector, for its \
          claim_themes label lookup (a registry with no tenancy); every claim-derived read of \
          the page runs on the caller's stamped read.",
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_paper",
-        1,
-        "NO_ROW_SECURITY: the `papers` lookup (find_paper_by_document_key); every claim-derived \
-         read below it runs on the caller's stamped read.",
     ),
     (
         "epigraph-mcp/src/tools/themes.rs",
@@ -580,8 +561,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// caller's stamped connection, removing four rows: 86 -> 82.
 /// Migration 246 (backlog 34864fb5) gave `papers` row security, so the ingest
 /// tools' `papers` writes moved onto the ingesting agent's stamped transaction,
-/// removing four rows (six sites): 82 -> 76.
-const HIGH_WATER: usize = 76;
+/// removing four rows (six sites): 82 -> 76. Their `papers` reads
+/// (`check_already_ingested`, `paper_already_ingested`, `query_paper`) then
+/// moved onto the caller's stamped read: 76 -> 73.
+const HIGH_WATER: usize = 73;
 
 // ===========================================================================
 // The scanner.

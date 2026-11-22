@@ -631,32 +631,39 @@ fn queued_response(
     body
 }
 
-/// Gate check: returns `Some(paper_id)` iff a paper with `doi` exists AND has
-/// a `processed_by` edge `viewer` can read whose `properties.pipeline` equals
-/// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
+/// Gate check: returns `Some(paper_id)` iff a paper of `doi` that `viewer` can
+/// read has a `processed_by` edge `viewer` can read whose
+/// `properties.pipeline` equals `pipeline_version`. Mirrors the inline gate
+/// used by `do_ingest_document`.
 ///
-/// The `papers` lookup runs on the plain pool (`papers` has no row security);
-/// the EDGE read runs on a read stamped from `viewer`
-/// (`EpiGraphMcpFull::read_as`). It used to run on the plain pool too, where
-/// FORCEd row security admits public rows only, so a group-private ingest's
-/// `processed_by` stamp was invisible to the group's own members and the gate
-/// reported "not ingested".
+/// Every read runs on ONE read stamped from `viewer`
+/// (`EpiGraphMcpFull::read_as`). The `papers` rows too, since migration 246
+/// gives them row security: a stranger asking about a document another group
+/// ingested privately finds no row and gets `None`, never the paper's id (no
+/// existence oracle). A member may read several rows of one document (its
+/// group's and the public one); any of them carrying the stamp answers.
 pub async fn paper_already_ingested(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
-    let Some(prior) = find_paper_by_document_key(&server.pool, doi).await? else {
-        return Ok(None);
-    };
     let mut read = server.read_as(viewer, "check_already_ingested").await?;
-    let stamped =
-        PaperRepository::has_processed_by_edge(&mut *read, viewer, prior.id, pipeline_version)
+    let papers = PaperRepository::visible_by_document_key(&mut read, viewer, doi)
+        .await
+        .map_err(internal_error)?;
+    let mut hit = None;
+    for p in papers {
+        if PaperRepository::has_processed_by_edge(&mut *read, viewer, p.id, pipeline_version)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+        {
+            hit = Some(p.id);
+            break;
+        }
+    }
     read.commit().await.map_err(internal_error)?;
-    Ok(stamped.then_some(prior.id))
+    Ok(hit)
 }
 
 /// Pre-flight idempotency check exposing the same `(doi, pipeline)` gate that
@@ -702,9 +709,10 @@ pub async fn check_already_ingested(
     // for every chunk only because each chunk now writes its own stamp (G8
     // review: the triple-keyed writer kept only the first chunk's).
     //
-    // The `processed_by` stamps are read as the CALLER (see
-    // `paper_already_ingested`): on the plain pool a group-private ingest read
-    // as "not ingested" to the group that ran it.
+    // The `papers` rows and their `processed_by` stamps are read as the CALLER
+    // (see `paper_already_ingested`): on the plain pool a group-private ingest
+    // read as "not ingested" to the group that ran it, and, before migration
+    // 246, any caller learned the paper id of a document only a team ingested.
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
             let paper_id = paper_already_ingested(server, viewer, &params.doi, &exact).await?;
@@ -712,24 +720,30 @@ pub async fn check_already_ingested(
             (exact, paper_id, matched)
         }
         None => {
-            let paper = find_paper_by_document_key(&server.pool, &params.doi).await?;
-            let matched = match &paper {
-                Some(p) => {
-                    let mut read = server.read_as(viewer, "check_already_ingested").await?;
-                    let matched = PaperRepository::processed_by_pipelines_in_family(
-                        &mut *read,
-                        viewer,
-                        p.id,
-                        PIPELINE_VERSION_BASE,
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                    read.commit().await.map_err(internal_error)?;
-                    matched
+            // Every row of the document the caller may read (migration 246),
+            // on one stamped read; the first that carries a stamp of the
+            // family answers.
+            let mut read = server.read_as(viewer, "check_already_ingested").await?;
+            let papers = PaperRepository::visible_by_document_key(&mut read, viewer, &params.doi)
+                .await
+                .map_err(internal_error)?;
+            let mut found = (None, Vec::new());
+            for p in papers {
+                let matched = PaperRepository::processed_by_pipelines_in_family(
+                    &mut *read,
+                    viewer,
+                    p.id,
+                    PIPELINE_VERSION_BASE,
+                )
+                .await
+                .map_err(internal_error)?;
+                if !matched.is_empty() {
+                    found = (Some(p.id), matched);
+                    break;
                 }
-                None => Vec::new(),
-            };
-            let paper_id = paper.filter(|_| !matched.is_empty()).map(|p| p.id);
+            }
+            read.commit().await.map_err(internal_error)?;
+            let (paper_id, matched) = found;
             (PIPELINE_VERSION_BASE.to_string(), paper_id, matched)
         }
     };
@@ -2259,28 +2273,6 @@ fn ingest_claim_labels(
 // (`epigraph-api` `routes/papers.rs`), so both transports key `papers.doi`
 // identically (backlog 90756d26). See `epigraph_db::repos::paper`.
 pub(crate) use epigraph_db::repos::paper::canonical_document_key;
-
-/// Find the `papers` row a caller-supplied document key names, trying each of
-/// [`epigraph_db::repos::paper::document_key_spellings`] in order: the
-/// [`canonical_document_key`] first, then the key as given (trimmed), then,
-/// for a bare DOI, each legacy resolver-prefix spelling of it. A row written
-/// under a resolver-URL spelling before keys were canonicalized is thus found
-/// by that spelling AND by the bare DOI, which is what the monitor's dedup
-/// probe asks with.
-pub(crate) async fn find_paper_by_document_key(
-    pool: &sqlx::PgPool,
-    raw: &str,
-) -> Result<Option<epigraph_db::PaperRow>, McpError> {
-    for spelling in epigraph_db::repos::paper::document_key_spellings(raw) {
-        if let Some(row) = PaperRepository::find_by_doi(pool, &spelling)
-            .await
-            .map_err(internal_error)?
-        {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
-}
 
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
