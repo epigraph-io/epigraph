@@ -308,6 +308,9 @@ struct ScopedBeliefWrite {
 /// not folded: `mass_on_empty` is its own conflict mass, `conflict_k` and
 /// `strategy` are NULL, as before. `strategy` is `Dempster`, or
 /// `cautious+Dempster` when a same-human sibling group was reduced.
+///
+/// The fold is `epigraph_engine::scoped_belief::fold_scope_rows`, which the
+/// widening acts' recompute of a moved claim's scoped rows also uses.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn scoped_belief_write(
@@ -320,58 +323,27 @@ async fn scoped_belief_write(
     scope_type: &'static str,
     scope_id: Uuid,
 ) -> Option<ScopedBeliefWrite> {
-    let mut rows = epigraph_engine::derivation_scope::retain_for_cache(conn, rows)
-        .await
-        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope rows: {e}"))
-        .ok()?;
-    rows.sort_by_key(|r| r.id);
-    let rows: Vec<(epigraph_db::MassFunctionRow, epigraph_ds::MassFunction)> = rows
-        .into_iter()
-        .filter_map(|row| {
-            epigraph_ds::MassFunction::from_json_masses(ds_frame.clone(), &row.masses)
-                .ok()
-                .map(|m| (row, m))
-        })
-        .collect();
-    if rows.is_empty() {
-        return None;
-    }
-    let stored: Vec<epigraph_db::MassFunctionRow> = rows.iter().map(|(r, _)| r.clone()).collect();
-    let sources = epigraph_engine::source_dependence::bba_sources_for_rows(conn, viewer, &stored)
-        .await
-        .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope sources: {e}"))
-        .ok()?;
-    let folded = rows.len() >= 2;
-    let cautious = epigraph_engine::source_dependence::has_same_owner_siblings(&sources);
-    let items = sources
-        .into_iter()
-        .zip(rows.into_iter().map(|(_, m)| m))
-        .collect();
-    let (combined, k) = epigraph_engine::source_dependence::combine_with_owner_dependence(
-        items,
+    let fold = epigraph_engine::scoped_belief::fold_scope_rows(
+        conn,
+        viewer,
+        ds_frame,
+        h_idx,
+        rows,
         conflict_threshold,
     )
-    .ok()?;
-    let (belief, plausibility, pignistic_prob, mass_on_missing) =
-        compute_hypothesis_belief(&combined, ds_frame, h_idx);
+    .await
+    .map_err(|e| tracing::warn!("submit_evidence: {scope_type} scope: {e}"))
+    .ok()??;
     Some(ScopedBeliefWrite {
         scope_type,
         scope_id,
-        belief,
-        plausibility,
-        mass_on_empty: k,
-        mass_on_missing,
-        conflict_k: folded.then_some(k),
-        // The rule that produced the stored fold, in the spelling `/assess`
-        // already stores for a cautious-then-Dempster fold.
-        strategy: folded.then(|| {
-            if cautious {
-                "cautious+Dempster".to_string()
-            } else {
-                "Dempster".to_string()
-            }
-        }),
-        pignistic_prob,
+        belief: fold.belief,
+        plausibility: fold.plausibility,
+        mass_on_empty: fold.mass_on_empty,
+        mass_on_missing: fold.mass_on_missing,
+        conflict_k: fold.conflict_k,
+        strategy: fold.strategy,
+        pignistic_prob: fold.pignistic_prob,
     })
 }
 
@@ -405,7 +377,7 @@ fn default_reliability() -> f64 {
 }
 
 fn default_conflict_threshold() -> f64 {
-    0.3
+    epigraph_engine::scoped_belief::DEFAULT_CONFLICT_THRESHOLD
 }
 
 /// Response from evidence submission
@@ -685,22 +657,9 @@ pub(crate) fn compute_hypothesis_belief(
     ds_frame: &epigraph_ds::FrameOfDiscernment,
     hypothesis_index: Option<i32>,
 ) -> (f64, f64, f64, f64) {
-    use epigraph_ds::{measures, FocalElement};
-
     // The shared rule (backlog 45cbaef4): a negative or out-of-range stored
-    // index reads as 0, exactly as the cache writer resolves it. This used to
-    // be `i as usize`, which wrapped a negative index to `usize::MAX`.
-    let h_idx = epigraph_engine::edge_factor::resolve_hypothesis_index(
-        hypothesis_index,
-        ds_frame.hypothesis_count(),
-    );
-    let supported = FocalElement::positive(std::collections::BTreeSet::from([h_idx]));
-    let bel = measures::belief(combined, &supported);
-    let pl = measures::plausibility(combined, &supported);
-    let betp = measures::pignistic_probability(combined, h_idx);
-    let m_missing = combined.mass_of_missing();
-
-    (bel, pl, betp, m_missing)
+    // index reads as 0, exactly as the cache writer resolves it.
+    epigraph_engine::scoped_belief::hypothesis_belief(combined, ds_frame, hypothesis_index)
 }
 
 // =============================================================================

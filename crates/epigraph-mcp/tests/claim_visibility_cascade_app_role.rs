@@ -20,6 +20,10 @@
 //!   claim that never had that BBA. Its stored scoped folds
 //!   (`ds_combined_beliefs`, `ds_bayesian_divergence`) are deleted as stale,
 //!   and another claim's are kept.
+//! * backlog 4d8df0cf: the moved claim's `ds_combined_beliefs` rows are then
+//!   written afresh at the keys it had, for the new audience (`global` and
+//!   `perspective` scopes); a scope with nothing admissible gets no row, and
+//!   the divergence row stays deleted.
 //! * backlog 31285392, the cache-owner frame: a claim whose `binary_truth`
 //!   (the frame that owns its cache) holds only inputs the new audience may
 //!   not read, while its `claim_validity` keeps an admissible one, is served
@@ -636,6 +640,31 @@ async fn scoped_rows(pool: &PgPool, claim: Uuid) {
     .expect("seed ds_bayesian_divergence");
 }
 
+/// The `(pignistic_prob, belief, plausibility)` of `claim`'s scoped row at
+/// `(scope_type, scope_id)`, as `agent` is served it on its stamped app-role
+/// connection; `None` when it reads no row.
+async fn served_scoped(
+    pool: &PgPool,
+    s: &AppRole,
+    agent: Uuid,
+    claim: Uuid,
+    scope_type: &str,
+    scope_id: Option<Uuid>,
+) -> Option<Cache> {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as(
+        "SELECT pignistic_prob, belief, plausibility FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND scope_type = $2 AND scope_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(claim)
+    .bind(scope_type)
+    .bind(scope_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("{agent} reads the claim's scoped row: {e}"))
+}
+
 async fn scoped_count(pool: &PgPool, claim: Uuid) -> (i64, i64) {
     sqlx::query_as(
         "SELECT (SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1), \
@@ -683,7 +712,17 @@ async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(po
         "a stranger is served the fold of what it may read ({served:?}), not the team's \
          fold ({stale:?}); control {expected:?}"
     );
-    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
+    // 4d8df0cf: the global row is written afresh for the new audience, and
+    // the divergence row stays deleted (its Beta track moved with the claim).
+    assert_eq!(scoped_count(&pool, c).await, (1, 0), "scoped folds afresh");
+    let row = served_scoped(&pool, &s, carol, c, "global", None)
+        .await
+        .expect("a stranger reads the moved claim's global row");
+    assert!(
+        same(&row, &expected),
+        "the global row is the fold of what the stranger may read ({row:?}), not the stale \
+         row; control {expected:?}"
+    );
     assert_eq!(
         scoped_count(&pool, control).await,
         (1, 1),
@@ -733,7 +772,17 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
         "the teammate is served the fold of what the team may read ({served:?}), not the \
          home fold ({stale:?}); control {expected:?}"
     );
-    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
+    // 4d8df0cf: the global row is written afresh for the team; the
+    // divergence row stays deleted.
+    assert_eq!(scoped_count(&pool, c).await, (1, 0), "scoped folds afresh");
+    let row = served_scoped(&pool, &s, bob, c, "global", None)
+        .await
+        .expect("the teammate reads the moved claim's global row");
+    assert!(
+        same(&row, &expected),
+        "the global row is the fold of what the team may read ({row:?}), not the stale row; \
+         control {expected:?}"
+    );
 }
 
 /// The refold fails closed. An agent its human operates writes a private
@@ -1110,5 +1159,82 @@ async fn publicize_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_be
     assert!(
         betp.is_some_and(|p| (p - served).abs() < 1e-12),
         "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4d8df0cf: the moved claim's scoped rows, written afresh
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A stale scoped row of `claim` on `frame` (values no fold produces here).
+async fn stale_scoped_row(pool: &PgPool, claim: Uuid, frame: Uuid, scope: &str, id: Option<Uuid>) {
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, scope_id, belief, \
+                                          plausibility, pignistic_prob) \
+         VALUES ($1, $2, $3, $4, 0.1, 0.2, 0.15)",
+    )
+    .bind(frame)
+    .bind(claim)
+    .bind(scope)
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("seed a scoped row");
+}
+
+/// Publicize: the team claim's `binary_truth` holds a BBA on evidence that
+/// goes public with it (perspective `open`) and one on evidence pinned in the
+/// team (perspective `hidden`), and the claim has a global row and a row per
+/// perspective. Right after the act a stranger reads the global row and the
+/// `open` perspective row folded from the public BBA alone, and no `hidden`
+/// row: nothing of it is admissible.
+///
+/// The oracle is arithmetic: one BBA with mass 0.7 on the claim's hypothesis
+/// and 0.3 on the whole frame, read undiscounted, is Bel 0.7, Pl 1, BetP 0.85.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (binary, _) = frames(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "scoped-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "scoped-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = fixture::seed_group_claim(&pool, eve, t, "a team finding, two perspectives").await;
+    let open = fixture::seed_evidence(&pool, c, "observation").await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    pin(&pool, hidden, eve).await;
+    bba_on(&pool, c, binary, eve, open, 0.7).await;
+    bba_on(&pool, c, binary, eve, hidden, 0.9).await;
+    refold(&pool, &s, eve, c).await;
+    stale_scoped_row(&pool, c, binary, "global", None).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(open)).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(hidden)).await;
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let open_only: Cache = (Some(0.85), Some(0.7), Some(1.0));
+    let global = served_scoped(&pool, &s, carol, c, "global", None).await;
+    assert!(
+        global.as_ref().is_some_and(|g| same(g, &open_only)),
+        "the stranger reads the global row folded from the public BBA alone {open_only:?}, \
+         not nothing and not the team's fold; read {global:?}"
+    );
+    let persp = served_scoped(&pool, &s, carol, c, "perspective", Some(open)).await;
+    assert!(
+        persp.as_ref().is_some_and(|p| same(p, &open_only)),
+        "the stranger reads the public perspective's row {open_only:?}; read {persp:?}"
+    );
+    let n_hidden: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1 AND scope_id = $2",
+    )
+    .bind(c)
+    .bind(hidden)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        n_hidden, 0,
+        "the pinned perspective has nothing admissible: no row"
     );
 }
