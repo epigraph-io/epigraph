@@ -962,10 +962,10 @@ type StayCase = (
 /// re-point leaves on the duplicate carries nothing to the canonical and must
 /// not refuse the act (backlog 89a1d071 part 2). Before the fix the arm was
 /// exact-case and counted every in-force incoming edge, so each of these alone
-/// refused FA07: an agent's `AUTHORED` / `asserts` and an act-marked edge (K1,
-/// ruling R-133), a legacy upper-case `SUPERSEDES` (K2), the document ingest's
+/// refused FA07: an agent's `AUTHORED` / `asserts` and an act-marked edge
+/// (K1), a legacy upper-case `SUPERSEDES` (K2), the document ingest's
 /// assertion (`ingest_written`), a dedup identity edge from an earlier mark,
-/// and a non-public duplicate's frozen `executes` (OD-32).
+/// and a non-public duplicate's frozen `executes`.
 ///
 /// Each class runs alone on a fresh FALSE-bound duplicate with no BBA (checked,
 /// so the pooling arm cannot decide), onto a world canonical the writer cannot

@@ -68,9 +68,9 @@ fn the_unmark_tool_the_description_names_is_served() {
 /// (backlog 89a1d071 part 3; supersede SPEC K9b). It used to say "the
 /// duplicate's edges move to the canonical" with no exception, while the
 /// repair leaves every edge that records the duplicate itself on it (K1,
-/// ruling R-133; K2): an agent's authorship, a supersede act edge, retracted
-/// and lineage edges, the identity edge, the ingest's own edges and a
-/// non-public duplicate's `executes`. An agent reading the old text expected
+/// K2): an agent's authorship, a supersede act edge, retracted and lineage
+/// edges, the identity edge, the ingest's own edges and a non-public
+/// duplicate's `executes`. An agent reading the old text expected
 /// its authorship to follow the canonical.
 #[test]
 fn mark_duplicate_description_names_the_edges_that_stay_on_the_duplicate() {
