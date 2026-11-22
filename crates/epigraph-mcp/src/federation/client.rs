@@ -103,7 +103,9 @@ impl TokenExchange {
     /// host (`127.0.0.0/8`, `[::1]`, `localhost`). An `http` URL naming
     /// `localhost` is dialled at `127.0.0.1`, never by resolving the name
     /// (backlog b0d05192); an `https` one keeps its name, which the
-    /// certificate check needs.
+    /// certificate check needs. A loopback endpoint is dialled directly,
+    /// whatever proxy the environment names; any other keeps the
+    /// environment's proxy settings.
     ///
     /// # Errors
     /// A description of why `endpoint` is refused.
@@ -132,8 +134,16 @@ impl TokenExchange {
             url.set_host(Some(super::config::LOCALHOST_LITERAL))
                 .map_err(|e| format!("token exchange URL `{endpoint}`: {e}"))?;
         }
-        let http = reqwest::Client::builder()
-            .timeout(EXCHANGE_TIMEOUT)
+        let mut http = reqwest::Client::builder().timeout(EXCHANGE_TIMEOUT);
+        if loopback {
+            // reqwest reads HTTP_PROXY / ALL_PROXY from the environment, and
+            // NO_PROXY matches names and IP literals separately, so
+            // `NO_PROXY=localhost` does not cover the `127.0.0.1` dialled
+            // above. A loopback endpoint is never sent through a proxy: the
+            // caller's bearer would leave the machine in cleartext.
+            http = http.no_proxy();
+        }
+        let http = http
             .build()
             .map_err(|e| format!("token exchange HTTP client: {e}"))?;
         Ok(Self {
@@ -425,11 +435,11 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
     }
     // Explicit rather than inherited, so a later rmcp default cannot move it.
     config.max_sse_event_size = MAX_RESPONSE_EVENT_BYTES;
-    // rmcp implements its client transport for the reqwest it links (0.13),
-    // not this crate's reqwest; leaving the type parameter to inference keeps
-    // that version choice inside rmcp instead of adding a second direct
-    // reqwest dependency here.
-    let transport = StreamableHttpClientTransport::from_config(config);
+    let http = extension_http_client().map_err(|e| FederationError::Connect {
+        uri: uri.clone(),
+        cause: format!("extension HTTP client: {e}"),
+    })?;
+    let transport = StreamableHttpClientTransport::with_client(http, config);
 
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, serve_client((), transport)).await {
         Ok(Ok(client)) => Ok(client),
@@ -440,6 +450,53 @@ async fn connect(addr: &str, token: Option<&str>) -> Result<ExtensionClient, Fed
         Err(_elapsed) => Err(FederationError::Timeout(HANDSHAKE_TIMEOUT, uri)),
     }
 }
+
+/// The HTTP client every extension dial uses. rmcp's `from_config` would
+/// build its default client, which reads `HTTP_PROXY` / `ALL_PROXY` from the
+/// environment: with a proxy set, every bearer this dial carries (the
+/// discovery token, each caller's exchanged token) would go through it in
+/// cleartext while the boot check reports the extension as loopback, and
+/// `NO_PROXY=localhost` does not cover the `127.0.0.1` a configured
+/// `localhost` is dialled at (backlog b0d05192). So this client never uses a
+/// proxy, for an `insecure_remote` extension too.
+///
+/// Otherwise it keeps rmcp's default settings (rmcp 3.9,
+/// `StreamableHttpClientTransport::default_http_client`): no idle pooling,
+/// and only same-origin 307 / 308 redirects followed, at most
+/// [`MAX_EXTENSION_REDIRECTS`]; any other redirect is returned as the answer.
+///
+/// It is rmcp's reqwest (`reqwest_rmcp`, 0.13), not this crate's (0.12):
+/// rmcp implements its client transport for that one only.
+fn extension_http_client() -> Result<reqwest_rmcp::Client, reqwest_rmcp::Error> {
+    use reqwest_rmcp::redirect::Policy;
+    use reqwest_rmcp::StatusCode;
+    let same_origin = Policy::custom(|attempt| {
+        let preserves_body = matches!(
+            attempt.status(),
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+        );
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|original| original.origin() == attempt.url().origin());
+        if !preserves_body || !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() > MAX_EXTENSION_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    reqwest_rmcp::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(0)
+        .redirect(same_origin)
+        .build()
+}
+
+/// Redirects [`extension_http_client`] follows for one request (rmcp's
+/// default client's limit).
+const MAX_EXTENSION_REDIRECTS: usize = 10;
 
 #[cfg(test)]
 mod tests {

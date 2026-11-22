@@ -1795,6 +1795,7 @@ dependencies = [
  "openssl",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "reqwest 0.13.5",
  "rmcp",
  "schemars 1.2.1",
  "serde",
