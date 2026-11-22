@@ -181,6 +181,16 @@ async fn main() {
         eprintln!("backfill_factors: {problem}");
         std::process::exit(2);
     }
+    // Which calibration this run weighs by, before anything else can fail, so
+    // every run is auditable (backlog 26a12f41), plus any shipped evidence type
+    // a CALIBRATION_PATH override does not resolve.
+    tracing::info!(
+        calibration = %epigraph_engine::calibration::CalibrationConfig::cached_source(),
+        "calibration loaded at startup"
+    );
+    for warning in epigraph_engine::calibration::CalibrationConfig::startup_warnings() {
+        tracing::warn!("calibration: {warning}");
+    }
     if !cli.sources_from_waves.is_empty() {
         // A calibration that did not load would weight every row under the
         // wrong vocabulary (backlog d83b998a): a targeted run refuses.

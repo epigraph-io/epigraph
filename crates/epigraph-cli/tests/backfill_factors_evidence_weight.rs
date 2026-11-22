@@ -302,3 +302,45 @@ async fn evidence_phase_honours_a_loadable_calibration_override(pool: PgPool) {
          must apply (a switch to the compiled-in copy alone would store 1.0)"
     );
 }
+
+/// Each run names the calibration it weighs by at start (backlog 26a12f41,
+/// part 3), so a run's weights can be audited after the fact. Before the
+/// database: the run here has no database at all, so whatever it does next
+/// fails, and the line must already be out. The variant path appears in the
+/// output only through that line (a loadable override is otherwise silent).
+#[test]
+fn a_run_logs_which_calibration_it_loaded_before_connecting() {
+    let dir = empty_dir();
+    let variant = write_variant(&dir, "audit-calibration.toml");
+    let mut child = Command::new(BACKFILL_FACTORS)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("RUST_LOG", "info")
+        .env("CALIBRATION_PATH", &variant)
+        .args(["--phase", "evidence", "--dry-run"])
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run backfill_factors");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("poll backfill_factors").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().expect("collect output");
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let want = format!("CALIBRATION_PATH={}", variant.display());
+    assert!(
+        text.lines()
+            .any(|l| l.contains("calibration loaded at startup") && l.contains(&want)),
+        "backfill_factors must log `calibration loaded at startup` naming {want}; output:\n{text}"
+    );
+}
