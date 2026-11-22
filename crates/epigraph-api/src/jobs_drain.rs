@@ -151,8 +151,14 @@ pub struct DrainFailure {
     pub error: String,
     /// `true`: it is now `failed`, because it used its last retry or because
     /// its error is one a retry cannot fix (see [`failure_is_terminal`]).
-    /// `false`: it is back to `pending` and the next run retries it.
+    /// `false`: it is back to `pending`, and the first run at or after
+    /// `retry_not_before` retries it.
     pub terminal: bool,
+    /// For a retryable failure, the row's stored not-before time (`jobs.run_after`,
+    /// migration 261): when this run failed it, plus the handler's
+    /// `JobHandler::backoff` for the retry. `None` for a terminal failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_not_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// What one drain run did. Printed as JSON by `drain_jobs`.
@@ -203,7 +209,8 @@ impl DrainReport {
     /// time with work pending; otherwise 0 (drained, or locked).
     ///
     /// A retryable failure is a failed run: the job is back to `pending` and
-    /// the next run retries it, but an operator hears about it the first time
+    /// a later run retries it once its backoff has passed, but an operator
+    /// hears about it the first time
     /// (the timer's `OnFailure=` alert), not only once its retries are spent.
     /// A failure outranks running out of time because the unit treats exit 3
     /// as success (`SuccessExitStatus=3`): a failure in a long run must not be
@@ -245,11 +252,23 @@ pub const fn failure_is_terminal(error: &JobError, retry_count: u32, max_retries
 /// [`STALE_AFTER`]), then claim and run the oldest pending job of a registered
 /// type, one at a time, until none is left or `max_runtime` has elapsed.
 ///
-/// Each job's final state is written back with `JobQueue::update`:
-/// `completed`; or, on a handler error, `pending` again with the retry counted
-/// (not retried in this run: the next run is the backoff), or `failed` once
-/// its retries are used up or at once when the error is not retryable
-/// ([`failure_is_terminal`]).
+/// Each job's final state is written back: `completed` (`JobQueue::update`);
+/// or, on a handler error, `failed` once its retries are used up or at once
+/// when the error is not retryable ([`failure_is_terminal`]); or else
+/// `pending` again with the retry counted and a not-before time
+/// ([`PostgresJobQueue::requeue_after`]).
+///
+/// # A retry waits out the handler's backoff
+///
+/// The not-before time is `now() + handler.backoff(retry_count - 1)`, the
+/// same attempt index the in-process `JobRunner` worker loop sleeps for, and
+/// no run claims the row before it (backlog 6cf042a9). Nor does THIS run claim
+/// it again even once it is due (it is excluded for the rest of the run, so a
+/// short backoff cannot spin a failing job through its retry budget in one
+/// run). A retry therefore waits for the later of the handler's backoff and
+/// the next timer run. Before 261 the drain wrote no such time, so a handler
+/// that backs off exponentially, for example against a rate-limited
+/// provider, was retried at the timer's cadence whatever its backoff said.
 ///
 /// # Errors
 /// A database error reading or claiming from the queue (the run stops; the
@@ -311,6 +330,7 @@ pub async fn drain_cancelling(
                 }
                 .to_string(),
                 terminal: true,
+                retry_not_before: None,
             })
             .collect(),
         registered: {
@@ -357,19 +377,29 @@ pub async fn drain_cancelling(
                 let terminal = failure_is_terminal(&e, job.retry_count, job.max_retries);
                 job.error_message = Some(e.to_string());
                 job.updated_at = chrono::Utc::now();
-                if terminal {
+                let retry_not_before = if terminal {
                     job.state = JobState::Failed;
                     job.completed_at = Some(job.updated_at);
+                    queue.update(&job).await?;
+                    None
                 } else {
+                    // `process_job` counted this attempt, so the retry about to
+                    // be scheduled is number `retry_count - 1` (0 = the first),
+                    // as in the worker loop. The handler is registered (the
+                    // claim only hands out registered types).
+                    let backoff = runner
+                        .retry_backoff(&job.job_type, job.retry_count.saturating_sub(1))
+                        .unwrap_or_default();
                     job.state = JobState::Pending;
                     job.started_at = None;
                     retry_next_run.push(job.id.into());
-                }
-                queue.update(&job).await?;
+                    Some(queue.requeue_after(&job, backoff).await?)
+                };
                 tracing::warn!(
                     job_id = %job.id,
                     job_type = %job.job_type,
                     terminal,
+                    ?retry_not_before,
                     error = %e,
                     "drain: job failed"
                 );
@@ -378,6 +408,7 @@ pub async fn drain_cancelling(
                     job_type: job.job_type.clone(),
                     error: e.to_string(),
                     terminal,
+                    retry_not_before,
                 });
             }
         }
