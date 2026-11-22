@@ -617,6 +617,30 @@ def test_the_scanner_does_not_import_modules_from_the_temp_dir(repo, tmp_path):
     assert "infra.md:1: aws-resource-id" in result.stderr
 
 
+def test_the_scanner_ignores_pythonpath(repo, tmp_path):
+    # `python3 -I` keeps PYTHON* variables off sys.path. A committer whose
+    # shell exports PYTHONPATH into a checkout (or anywhere a branch can write)
+    # must not have the trusted scanner import that directory's modules in
+    # place of the standard library. The private temp dir alone does not cover
+    # this; only -I does.
+    marker = tmp_path / "module-ran"
+    planted = tmp_path / "on-pythonpath"
+    planted.mkdir()
+    (planted / "subprocess.py").write_text(
+        "import pathlib\npathlib.Path(%r).write_text('planted module ran')\n"
+        "raise SystemExit(0)\n" % str(marker))
+    (repo / "infra.md").write_text("host " + INSTANCE_ID + "\n")
+    git(repo, "add", "infra.md")
+    before = head_count(repo)
+    result = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "add infra.md"],
+        capture_output=True, text=True, env=dict(_env(), PYTHONPATH=str(planted)),
+    )
+    assert not marker.exists(), marker.read_text()
+    assert_blocked(result, repo, before)
+    assert "infra.md:1: aws-resource-id" in result.stderr
+
+
 def test_a_configured_trusted_ref_is_honoured(repo):
     # Configured by short name, then expanded to its full refname by the
     # installer, which is what the hooks accept.
