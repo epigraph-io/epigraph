@@ -139,6 +139,13 @@ fn clip_content(content: String, max: Option<usize>) -> (String, Option<usize>) 
 /// no PROV-O predicate ([`relationship_to_prov_predicate`]) and is omitted, so
 /// such an entity carries no `prov:Relation` to the rest of the document.
 ///
+/// # One relation per fact
+///
+/// One `(source, target, relationship)` fact can be stored as several edge
+/// rows (the edges table has no triple uniqueness since migrations
+/// 017/018/053). Each fact is emitted as ONE `prov:Relation`, named after the
+/// first of its rows the export meets (backlog 11402482).
+///
 /// `supersedes` is only expanded one hop per claim (not recursively) in
 /// this first pass — deeper supersession *chains* (claims that themselves
 /// supersede a claim already reached via a supersedes edge) are a follow-up;
@@ -273,7 +280,9 @@ pub async fn export_provenance_prov_o(
     let mut agents_seen = HashSet::new();
     let mut agent_entities = Vec::new();
     let mut relations = Vec::new();
-    let mut edges_seen = HashSet::new();
+    // Keyed on the FACT, not the row: parallel rows of one
+    // `(source, target, relationship)` are one relation.
+    let mut facts_seen: HashSet<(uuid::Uuid, uuid::Uuid, String)> = HashSet::new();
 
     for (claim_id, claim) in readable {
         let (content, content_chars) = clip_content(claim.content, limits.max_content_chars);
@@ -314,10 +323,10 @@ pub async fn export_provenance_prov_o(
         // `target_id` (see doc comment on `prov_relation_endpoints`),
         // `supersedes` edges have this claim as the `source_id`. The outgoing
         // half was fetched in pass 1 for every ancestor; only a supersedes
-        // predecessor needs it fetched here. Dedup by edge id since a claim
-        // can appear on both sides across the loop (e.g. the root is both a
-        // target of its ancestor's edge and a source of its own supersedes
-        // edge).
+        // predecessor needs it fetched here. Dedup by fact (source, target,
+        // relationship): a claim can appear on both sides across the loop
+        // (e.g. the root is both a target of its ancestor's edge and a source
+        // of its own supersedes edge), and one fact can have several rows.
         let outgoing = match outgoing_by_claim.remove(&claim_id) {
             Some(edges) => edges,
             None => EdgeRepository::get_by_source(&mut *conn, viewer, claim_id, "claim").await?,
@@ -327,9 +336,6 @@ pub async fn export_provenance_prov_o(
         claim_edges.extend(outgoing);
 
         for edge in claim_edges {
-            if !edges_seen.insert(edge.id) {
-                continue;
-            }
             if edge.source_type != "claim"
                 || edge.target_type != "claim"
                 || !readable_ids.contains(&edge.source_id)
@@ -340,6 +346,9 @@ pub async fn export_provenance_prov_o(
             let Some(predicate) = relationship_to_prov_predicate(&edge.relationship) else {
                 continue;
             };
+            if !facts_seen.insert((edge.source_id, edge.target_id, edge.relationship.clone())) {
+                continue;
+            }
             let (generated, used) =
                 prov_relation_endpoints(&edge.relationship, edge.source_id, edge.target_id);
             relations.push(serde_json::json!({

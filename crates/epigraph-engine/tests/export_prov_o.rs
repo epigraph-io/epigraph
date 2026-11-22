@@ -194,3 +194,82 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
         .expect("fetch supersedes edge");
     assert_eq!(supersedes_row.0, "supersedes");
 }
+
+// ---------------------------------------------------------------------------
+// Bounds and walk set (backlog 4caad789, 19d325d5) and parallel rows (11402482)
+// ---------------------------------------------------------------------------
+
+/// A public claim-to-claim `relationship` edge `source -> target`, forced to
+/// `('public', world)` so only the CLAIM predicate can hide an endpoint.
+async fn public_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
+    let world = fixture::world_group(pool).await;
+    let id = fixture::seed_edge_owned_by(pool, source, target, "public", world).await;
+    sqlx::query("UPDATE edges SET relationship = $2 WHERE id = $1")
+        .bind(id)
+        .bind(relationship)
+        .execute(pool)
+        .await
+        .expect("set relationship");
+    id
+}
+
+async fn export_as(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    root: Uuid,
+    max_depth: i32,
+    max_nodes: Option<usize>,
+) -> serde_json::Value {
+    let mut conn = pool.acquire().await.expect("acquire");
+    export_provenance_prov_o(
+        &mut conn,
+        viewer,
+        root,
+        Some(max_depth),
+        ProvExportLimits {
+            max_nodes,
+            max_content_chars: None,
+        },
+    )
+    .await
+    .expect("export")
+}
+
+fn entity_set(doc: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    doc["entities"]
+        .as_array()
+        .expect("entities")
+        .iter()
+        .map(|e| e["@id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn claim_set(ids: &[Uuid]) -> std::collections::BTreeSet<String> {
+    ids.iter().map(|id| format!("claim:{id}")).collect()
+}
+
+/// Two parallel rows of one `derived_from` fact (the edges table has no triple
+/// uniqueness since migrations 017/018/053) are ONE `prov:Relation`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn parallel_rows_of_one_fact_are_one_relation(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-parallel").await;
+    let root = fixture::seed_public_claim(&pool, agent, "parallel root").await;
+    let anc = fixture::seed_public_claim(&pool, agent, "parallel ancestor").await;
+    public_edge(&pool, anc, root, "derived_from").await;
+    public_edge(&pool, anc, root, "derived_from").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let doc = export_as(&pool, &viewer, root, 5, None).await;
+    let derived: Vec<_> = doc["relations"]
+        .as_array()
+        .expect("relations")
+        .iter()
+        .filter(|r| r["predicate"] == "prov:wasDerivedFrom")
+        .collect();
+    assert_eq!(
+        derived.len(),
+        1,
+        "one derivation fact is one relation, whatever its row count: {doc}"
+    );
+    assert_eq!(entity_set(&doc), claim_set(&[root, anc]));
+}
