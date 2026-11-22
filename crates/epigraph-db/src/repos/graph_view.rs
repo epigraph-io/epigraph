@@ -369,6 +369,14 @@ impl GraphViewRepository {
     /// in the `LEFT JOIN`'s `ON`, not in `WHERE`: a member whose every edge is
     /// hidden keeps a degree of 0 instead of being dropped.
     ///
+    /// The degree counts FACTS, not rows: one `(source, target, relationship)`
+    /// counts once however many rows store it. The default allowlist includes
+    /// `asserts`, and the document ingest keeps one marked `agent -asserts->`
+    /// / `paper -asserts->` row per ingest principal (`crate::ingest_written`),
+    /// so counting rows would rank a claim higher each time another principal
+    /// ingests its document (backlog 11402482). The `FILTER` keeps a member
+    /// with no readable edge at 0: the LEFT JOIN's all-NULL row is not a fact.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer, degree_relationships))]
@@ -382,7 +390,9 @@ impl GraphViewRepository {
     ) -> Result<Vec<GraphNodeRow>, DbError> {
         let sql = viewer.splice(
             "WITH degree AS (
-                SELECT m.claim_id, COUNT(e.*) AS deg
+                SELECT m.claim_id,
+                       COUNT(DISTINCT (e.source_id, e.target_id, e.relationship))
+                           FILTER (WHERE e.id IS NOT NULL) AS deg
                 FROM claim_cluster_membership m
                 LEFT JOIN edges e ON (e.source_id = m.claim_id OR e.target_id = m.claim_id)
                                   AND e.relationship = ANY($3)

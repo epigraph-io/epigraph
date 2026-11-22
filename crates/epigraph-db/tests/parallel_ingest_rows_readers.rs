@@ -153,6 +153,7 @@ async fn subgraph_edges_render_a_doubly_ingested_fact_once(pool: PgPool) {
         1,
         "one fact renders as one edge, whatever the number of ingest principals: {rows:?}"
     );
+
 }
 
 /// `get_evidence_strength` over a method citing two claims, one of which two
@@ -226,4 +227,126 @@ async fn method_evidence_strength_counts_each_claim_once(pool: PgPool) {
         "the mean belief weighs each claim once, not once per asserting row: {s:?}"
     );
     assert_eq!(s.source_count, 2, "two distinct asserting papers: {s:?}");
+}
+
+/// A clustering run with one cluster holding `members` (the metadata tables
+/// carry no tenancy columns; seeded as `graph_view_edge_scope.rs` seeds them).
+async fn cluster_of(pool: &PgPool, members: &[Uuid]) -> (Uuid, Uuid) {
+    let run_id = Uuid::new_v4();
+    let cluster_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO graph_cluster_runs (run_id, cluster_count, degraded) VALUES ($1, 1, FALSE)",
+    )
+    .bind(run_id)
+    .execute(pool)
+    .await
+    .expect("seed run");
+    sqlx::query(
+        "INSERT INTO graph_clusters (id, run_id, label, size, mean_betp, dominant_type, degraded) \
+         VALUES ($1, $2, 'cluster-0', 3, 0.5, 'claim', FALSE)",
+    )
+    .bind(cluster_id)
+    .bind(run_id)
+    .execute(pool)
+    .await
+    .expect("seed cluster");
+    for m in members {
+        sqlx::query(
+            "INSERT INTO claim_cluster_membership (claim_id, cluster_id, run_id) \
+             VALUES ($1, $2, $3)",
+        )
+        .bind(m)
+        .bind(cluster_id)
+        .bind(run_id)
+        .execute(pool)
+        .await
+        .expect("seed cluster membership");
+    }
+    (cluster_id, run_id)
+}
+
+/// The cluster expansion's degree ordering counts a fact once, whatever the
+/// number of ingest principals holding a row of it.
+///
+/// `twice` has ONE fact (`author -asserts-> twice`) stored as two rows, one per
+/// ingest principal; `once` has one fact in one row and a higher pignistic
+/// probability; `bare` has no edge at all and the highest. Ordered by degree,
+/// then pignistic probability:
+///
+/// - a row count gives `twice` degree 2 and puts it first;
+/// - a fact count that also counts the LEFT JOIN's all-NULL row gives `bare`
+///   degree 1, so it ties and wins on pignistic probability;
+/// - only a fact count of readable edges gives `[once, twice, bare]`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn cluster_expansion_degree_counts_a_doubly_ingested_fact_once(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (first, _) = fixture::seed_agent_with_group(&pool, "pr-cluster-one").await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "pr-cluster-two").await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "Ottoline Brack").await;
+    let (other_author, _) = fixture::seed_agent_with_group(&pool, "Caspar Wendle").await;
+    let twice = fixture::seed_public_claim(&pool, first, "a twice-ingested cluster claim").await;
+    let once = fixture::seed_public_claim(&pool, first, "a once-ingested cluster claim").await;
+    let bare = fixture::seed_public_claim(&pool, first, "an unasserted cluster claim").await;
+    for (id, betp) in [(twice, 0.3_f64), (once, 0.6), (bare, 0.9)] {
+        sqlx::query("UPDATE claims SET pignistic_prob = $2 WHERE id = $1")
+            .bind(id)
+            .bind(betp)
+            .execute(&pool)
+            .await
+            .expect("set betp");
+    }
+
+    for by in [first, second] {
+        assert!(
+            walk_write(
+                &pool,
+                &scoped,
+                by,
+                (author, "agent"),
+                (twice, "claim"),
+                "asserts"
+            )
+            .await
+        );
+    }
+    assert!(
+        walk_write(
+            &pool,
+            &scoped,
+            first,
+            (other_author, "agent"),
+            (once, "claim"),
+            "asserts"
+        )
+        .await
+    );
+    assert_eq!(
+        rows_of_fact_public(&pool, author, twice, "asserts").await,
+        2,
+        "CALIBRATION: each ingest principal holds its own row of the fact"
+    );
+    assert_eq!(
+        rows_of_fact_public(&pool, other_author, once, "asserts").await,
+        1
+    );
+
+    let (cluster_id, run_id) = cluster_of(&pool, &[twice, once, bare]).await;
+    let viewer = fixture::public_viewer(&pool).await;
+    let rows = GraphViewRepository::expand_cluster_nodes(
+        &pool,
+        &viewer,
+        cluster_id,
+        run_id,
+        &["asserts".to_string()],
+        10,
+    )
+    .await
+    .expect("expand_cluster_nodes");
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids,
+        vec![once, twice, bare],
+        "degree = facts, not rows, and an edgeless member stays at 0 \
+         (twice = {twice}, once = {once}, bare = {bare})"
+    );
 }
