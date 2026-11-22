@@ -14,6 +14,10 @@
 //!   an audit row names it, and neither does an audit row whose claim is gone
 //!   or is no longer the reporter's. The filed labels are rebuilt from the
 //!   audit row exactly as the write composed them.
+//! * `the_265_marker_backfill_runbook_marks_a_report_filed_without_one`:
+//!   `docs/runbooks/265-marker-backfill.sql` (265's backfill, for a report a
+//!   call that started during the migration filed on the old body) marks it,
+//!   and a second run changes nothing.
 //! * `the_265_undo_returns_the_catalog_below_265`: `docs/runbooks/265-undo.sql`
 //!   leaves the `public` catalog exactly as it was below 265 (function bodies
 //!   compared by `pg_get_functiondef` md5, so 211's write and 207's list are
@@ -23,7 +27,9 @@
 //! post-upgrade list is empty; with the backfill's `properties ? 'bug_report'`
 //! condition dropped, the first test sees a marker for the claim authored by
 //! another path; with the undo's re-statement of 207's list dropped, the
-//! undo test names `epigraph_my_bug_reports` in the diff.
+//! undo test names `epigraph_my_bug_reports` in the diff. The runbook test's
+//! calibration shows the report out of the list before the run, and a
+//! runbook that drifts from 265's backfill fails its verbatim check.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -354,3 +360,89 @@ async fn the_265_undo_returns_the_catalog_below_265(pool: PgPool) {
     }
 }
 
+/// A report filed on the OLD body after 265's backfill (a write definer call
+/// that started while 265 held its lock resumes on 211's body once 265
+/// commits) has no marker; `docs/runbooks/265-marker-backfill.sql` gives it
+/// the one the backfill would have, and a second run changes nothing. The
+/// runbook is 265's own backfill statement, verbatim.
+#[sqlx::test(migrations = false)]
+async fn the_265_marker_backfill_runbook_marks_a_report_filed_without_one(pool: PgPool) {
+    let runbook = repo_file("docs/runbooks/265-marker-backfill.sql");
+    let migration = repo_file("migrations/265_bug_report_intake_marker.sql");
+    let start = runbook.find("DO $$").expect("the runbook's DO block");
+    let end = runbook[start..].find("END $$;").expect("its end") + start + "END $$;".len();
+    assert!(
+        migration.contains(&runbook[start..end]),
+        "the runbook's backfill is 265's, verbatim"
+    );
+
+    migrate(&pool, &MIGRATOR).await;
+    let (ops, _) = fixture::seed_human_operator(&pool, "brb-ops").await;
+    let intake = team_group(&pool, ops, "brb-intake").await;
+    let triaged = team_group(&pool, ops, "brb-triaged").await;
+    let (human, _) = fixture::seed_human_operator(&pool, "brb-human").await;
+    let reporter = linked_agent(&pool, human, "brb-reporter").await;
+    sqlx::query("INSERT INTO bug_report_intake_settings (intake_group_id) VALUES ($1)")
+        .bind(intake)
+        .execute(&pool)
+        .await
+        .expect("configure");
+    sqlx::query("INSERT INTO operator_binding_arming DEFAULT VALUES")
+        .execute(&pool)
+        .await
+        .expect("arm");
+
+    let raced = submit_as(&pool, reporter, "raced").await;
+    let kept = submit_as(&pool, reporter, "kept").await;
+    let written: (Uuid, Uuid, Option<String>, Vec<String>) = sqlx::query_as(
+        "SELECT reporter_id, intake_group_id, title, filed_labels \
+           FROM bug_report_intake_marks WHERE claim_id = $1",
+    )
+    .bind(raced.claim_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the write's marker");
+    // What the old body leaves: the report and its audit row, no marker.
+    sqlx::query("DELETE FROM bug_report_intake_marks WHERE claim_id = $1")
+        .bind(raced.claim_id)
+        .execute(&pool)
+        .await
+        .expect("as if filed on the old body");
+    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
+        .bind(raced.claim_id)
+        .bind(triaged)
+        .execute(&pool)
+        .await
+        .expect("triage moves it");
+    assert_eq!(
+        list_as(&pool, reporter).await,
+        vec![kept.claim_id],
+        "CALIBRATION: a moved report with no marker is out of the list"
+    );
+
+    for run in ["first", "second"] {
+        sqlx::raw_sql(&runbook)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the {run} run of the runbook applies: {e}"));
+        assert_eq!(
+            list_as(&pool, reporter).await,
+            vec![kept.claim_id, raced.claim_id],
+            "after the {run} run the moved report is listed again"
+        );
+        let rebuilt: (Uuid, Uuid, Option<String>, Vec<String>) = sqlx::query_as(
+            "SELECT reporter_id, intake_group_id, title, filed_labels \
+               FROM bug_report_intake_marks WHERE claim_id = $1",
+        )
+        .bind(raced.claim_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the rebuilt marker");
+        assert_eq!(rebuilt, written, "the marker the write would have written");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM bug_report_intake_marks")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 2, "after the {run} run: one marker per report, no more");
+    }
+}

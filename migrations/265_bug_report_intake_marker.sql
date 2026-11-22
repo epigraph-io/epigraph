@@ -53,9 +53,17 @@
 --       filter, the read fails instead of silently missing rows.
 --       `bug_report_intake_settings` is locked ACCESS EXCLUSIVE first: every
 --       write definer call reads that row before it writes anything and
---       holds its lock to commit, so a report in flight on 207's/211's body
---       commits before the backfill reads, and none starts until the new body
---       below is in place.
+--       holds its lock to commit, so a report already past that read commits
+--       before the backfill reads.
+--
+--       ONE GAP the lock does not close: a call that STARTS while this
+--       migration holds the lock has already loaded the old (211) body, waits
+--       on the settings read, and resumes on that body once 265 commits, so
+--       it files a report with NO marker, after the backfill ran. Such a
+--       report is listed while it stays in the intake group (as under 207)
+--       and drops out once moved. The operator closes it after deploying by
+--       running `docs/runbooks/265-marker-backfill.sql` (this backfill,
+--       idempotent) once, a minute or more after 265 commits.
 --   (c) `epigraph_submit_bug_report`, redefined from 211's body with two
 --       changes: the marker INSERT after the audit row, and the blank test
 --       for the repro and the evidence (backlog 64584278 part 2): an
@@ -106,8 +114,9 @@
 
 SET LOCAL lock_timeout = '3s';
 
--- (b) first: no write definer call is in flight past this point, and none
--- starts until this transaction commits.
+-- (b) first: no write definer call is past its settings read from here on,
+-- and none gets past it until this transaction commits (one that has started
+-- meanwhile resumes on the old body: the gap in section 2 (b)).
 LOCK TABLE public.bug_report_intake_settings IN ACCESS EXCLUSIVE MODE;
 
 -- ===================================================================

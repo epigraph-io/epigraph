@@ -3423,13 +3423,16 @@ restart.
   severity and component; the title from the claim, so a report moved before 265 keeps the
   title it has now), with `row_security` off (fails closed on a filtered migration login),
   after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call
-  reads it first, so none is in flight across the backfill). Not decided: the list still shows the labels intake triage writes while a
+  reads it first, so a call already past that read commits before the backfill). A call that
+  STARTS while 265 holds the lock has loaded 211's body and files its report with no marker
+  once 265 commits; `docs/runbooks/265-marker-backfill.sql` (265's backfill, idempotent)
+  closes that. Not decided: the list still shows the labels intake triage writes while a
   report is in the current intake group (the label-disclosure question, e690866c part 2, is
   open). Owners and grants re-asserted as 211 does. Pinned by
   `epigraph-db/tests/bug_report_intake.rs` (`moved_and_earlier_intake_reports_stay_in_the_list`,
   `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`,
   `the_application_role_cannot_read_or_forge_an_intake_marker`) and
-  `bug_report_intake_marker.rs` (the backfill across an upgrade from 264,
+  `bug_report_intake_marker.rs` (the backfill across an upgrade from 264, the rerun runbook,
   the undo); the intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
   this file. Undo: `docs/runbooks/265-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 265). Checked before claiming: no migration on main or an origin branch
@@ -3441,7 +3444,8 @@ restart.
   this change (they read the table: 42P01 below 265), and while NO theme run is in progress (a
   maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
   600 s statement timeout, so 265's ACCESS EXCLUSIVE lock times out after 3 s and the migration
-  fails, safely: re-run it). The backfill reads
+  fails, safely: re-run it); a minute or more after 265 commits, run
+  `docs/runbooks/265-marker-backfill.sql` once on the migration DSN. The backfill reads
   `security_events` through `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
   on a deployed database is a measurement still to make. A
   read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
