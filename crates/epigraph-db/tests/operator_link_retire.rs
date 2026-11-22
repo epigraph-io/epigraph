@@ -379,6 +379,7 @@ async fn a_maintenance_login_cannot_retire_a_link_directly(pool: PgPool) {
     assert_eq!(d["via"], serde_json::json!("epigraph_retire_operator_link"));
     assert_eq!(d["reason"], serde_json::json!("the verb's reason"));
     assert_eq!(d["recorded_by"], serde_json::json!(login));
+    assert_eq!(d["revoked_memberships"], serde_json::json!([]), "{d}");
 }
 
 /// Backlog 9cec11f7 (migration 257): the audit's `via` and reason come from
@@ -473,13 +474,27 @@ async fn a_regranted_column_does_not_reopen_the_direct_retire(pool: PgPool) {
 /// `already_retired` and writes nothing; the agent's binding is no longer a
 /// live link.
 ///
+/// Since 257 (backlog 452a1330) the audit row also names each membership the
+/// verb revoked, with its role before the revoke, so the revocation can be
+/// reviewed and reversed from the record alone.
+///
 /// Verified to fail: the membership check removed -> the first call retires
 /// with the writer row live; the `AND NOT l.retired` / early `already_retired`
-/// return removed -> a second audit row.
+/// return removed -> a second audit row; 257's verb and audit re-bodies
+/// removed -> no `revoked_memberships` in the audit row.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_maintenance_verb_retires_a_live_link_once_and_audits_it(pool: PgPool) {
     let (human, agent, group) = live_linked(&pool, "verb").await;
     assert_eq!(live_writer_rows(&pool, group, agent).await, 1, "PREMISE");
+    let (membership, role): (Uuid, String) = sqlx::query_as(
+        "SELECT id, role FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(&pool)
+    .await
+    .expect("the live writer row");
 
     let before = footprint(&pool, agent).await;
     let err = retire_as(
@@ -525,6 +540,11 @@ async fn the_maintenance_verb_retires_a_live_link_once_and_audits_it(pool: PgPoo
     assert_eq!(kind, "operator.link_retired");
     assert_eq!(d["reason"], serde_json::json!("retired: test"));
     assert_eq!(d["memberships_revoked"], serde_json::json!(1));
+    assert_eq!(
+        d["revoked_memberships"],
+        serde_json::json!([{ "membership_id": membership, "role": role }]),
+        "{d}"
+    );
     assert_eq!(d["via"], serde_json::json!("epigraph_retire_operator_link"));
     assert_eq!(d["recorded_by"], serde_json::json!("epigraph_maintenance"));
     assert_eq!(d["operator_id"], serde_json::json!(human));

@@ -61,6 +61,10 @@
 --     The rest of the body is 191's: OLR04 for a non-superuser un-retire or
 --     re-point, OLR03 while the agent holds a live writer/admin row in the
 --     operator group, a superuser outside the guard.
+-- (e) The verb and the audit are re-bodied (md5 preconditions on 191's
+--     bodies) so a `--revoke-membership` retire records each revoked
+--     membership's id and role (`revoked_memberships`), not only the count
+--     (backlog 452a1330).
 --
 -- What it does NOT change:
 --   * a SUPERUSER still retires (and un-retires) directly, unserialised; it
@@ -86,7 +90,8 @@
 --
 -- ===================================================================
 -- 3. UNDO: docs/runbooks/257-undo.sql (re-owns the verb to
--- `epigraph_maintenance`, moves the column grant back, re-states 191's guard).
+-- `epigraph_maintenance`, moves the column grant back, re-states 191's guard,
+-- audit and verb bodies).
 -- **Applied to throwaway databases only, NOT to any deployed database.**
 
 SET LOCAL lock_timeout = '3s';
@@ -179,6 +184,184 @@ BEGIN
     RETURN NEW;
 END $$;
 REVOKE EXECUTE ON FUNCTION public.epigraph_operator_links_retire_only() FROM PUBLIC;
+
+-- -------------------------------------------------------------------
+-- Precondition: the verb and the audit still carry 191's bodies, which (e)
+-- re-states (same rule, same md5-of-`prosrc` form).
+-- -------------------------------------------------------------------
+DO $$
+DECLARE
+    v_found text;
+    r       record;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('public.epigraph_retire_operator_link(uuid, text, boolean)',
+         'fec45262e52a68a4d3f1389f66e13a18'),
+        ('public.epigraph_operator_links_audit()', '0820315e8520d8ed4bf4bbfb4a8568fa'))
+        AS t(sig, md5)
+    LOOP
+        SELECT md5(p.prosrc) INTO v_found FROM pg_catalog.pg_proc p
+         WHERE p.oid = to_regprocedure(r.sig);
+        IF v_found IS DISTINCT FROM r.md5 THEN
+            RAISE EXCEPTION '257: % is not the body 257 re-states (191''s, md5 %); found md5 %. '
+                            'Another migration re-bodied it, or 191 is not applied; nothing '
+                            'was changed', r.sig, r.md5, COALESCE(v_found, '(absent)')
+                USING ERRCODE = '55000',
+                      HINT = 'Apply a reconciling migration that re-states it with every '
+                             'delta instead of this one.';
+        END IF;
+    END LOOP;
+END $$;
+
+-- ===================================================================
+-- (e) THE REVOKED MEMBERSHIPS, BY ID AND ROLE, IN THE AUDIT ROW
+-- ===================================================================
+-- 191's verb recorded only how many membership rows `revoke_membership`
+-- revoked, so a revocation could not be reviewed or reversed from its audit
+-- row (backlog 452a1330). The verb now passes each revoked row's id and its
+-- role (unchanged by the revoke, so the role it held) to the audit as
+-- `revoked_memberships` (`[]` when it revoked none), and the audit records
+-- it next to the count. Both bodies are otherwise 191's; CREATE OR REPLACE
+-- keeps each one's owner, ACL and path.
+CREATE OR REPLACE FUNCTION public.epigraph_operator_links_audit()
+RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = public, pg_temp AS $$
+DECLARE
+    v_ctx jsonb;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES ('operator.link_recorded', NEW.agent_id, true,
+                jsonb_build_object('operator_id', NEW.operator_id,
+                                   'operator_group_id', NEW.operator_group_id,
+                                   'retired', NEW.retired,
+                                   'recorded_by', session_user));
+    ELSIF OLD.retired IS DISTINCT FROM NEW.retired THEN
+        -- Set by `epigraph_retire_operator_link` for its own UPDATE only.
+        v_ctx := NULLIF(pg_catalog.current_setting('epigraph.operator_link_retire', true),
+                        '')::jsonb;
+        INSERT INTO public.security_events (event_type, agent_id, success, details)
+        VALUES (CASE WHEN NEW.retired THEN 'operator.link_retired'
+                     ELSE 'operator.link_unretired' END,
+                NEW.agent_id, true,
+                pg_catalog.jsonb_build_object(
+                    'operator_id', NEW.operator_id,
+                    'operator_group_id', NEW.operator_group_id,
+                    'retired_before', OLD.retired,
+                    'retired', NEW.retired,
+                    'reason', v_ctx ->> 'reason',
+                    'memberships_revoked', (v_ctx ->> 'memberships_revoked')::integer,
+                    'revoked_memberships', v_ctx -> 'revoked_memberships',
+                    'via', COALESCE(v_ctx ->> 'via', 'direct'),
+                    'recorded_by', session_user));
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.epigraph_retire_operator_link(
+    p_agent             uuid,
+    p_reason            text,
+    p_revoke_membership boolean DEFAULT false)
+RETURNS TABLE (outcome text, operator_id uuid, operator_group_id uuid,
+               memberships_revoked integer)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_operator uuid;
+    v_group    uuid;
+    v_retired  boolean;
+    v_revoked  integer := 0;
+    v_rows     jsonb := '[]'::jsonb;
+BEGIN
+    IF public.epigraph_is_elevated() THEN
+        RAISE EXCEPTION 'OLR02: an elevated session retires no operator link; nothing was changed'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NOT (public.epigraph_bypass()
+            OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+                        WHERE r.rolname = session_user AND r.rolsuper)) THEN
+        RAISE EXCEPTION 'OLR01: only a maintenance session retires an operator link; nothing '
+                        'was changed'
+            USING ERRCODE = '42501';
+    END IF;
+    IF p_agent IS NULL OR p_reason IS NULL OR pg_catalog.btrim(p_reason) = ''
+       OR p_revoke_membership IS NULL THEN
+        RAISE EXCEPTION 'epigraph_retire_operator_link: an agent and a reason are required'
+            USING ERRCODE = '22004';
+    END IF;
+    IF pg_catalog.length(p_reason) > 1000 THEN
+        RAISE EXCEPTION 'epigraph_retire_operator_link: the reason is at most 1000 characters'
+            USING ERRCODE = '22023';
+    END IF;
+
+    -- Every link write and every registration, one at a time (107 section 10).
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('epigraph.operator_links'));
+
+    SELECT l.operator_id, l.operator_group_id, l.retired
+      INTO v_operator, v_group, v_retired
+      FROM public.operator_links l
+     WHERE l.agent_id = p_agent
+       FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN QUERY SELECT 'no_link'::text, NULL::uuid, NULL::uuid, 0;
+        RETURN;
+    END IF;
+    IF v_retired THEN
+        RETURN QUERY SELECT 'already_retired'::text, v_operator, v_group, 0;
+        RETURN;
+    END IF;
+
+    -- ZERO write authority is a precondition (122's retire, section 7): the
+    -- agent's rows in the operator group, then the group row, locked first.
+    PERFORM 1 FROM public.group_memberships m
+     WHERE m.group_id = v_group AND m.agent_id = p_agent
+       FOR UPDATE;
+    PERFORM 1 FROM public.groups g WHERE g.id = v_group FOR UPDATE;
+    IF EXISTS (SELECT 1 FROM public.group_memberships m
+                WHERE m.group_id = v_group AND m.agent_id = p_agent
+                  AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')) THEN
+        IF NOT p_revoke_membership THEN
+            RAISE EXCEPTION 'OLR03: agent % holds a live writer/admin membership in operator '
+                            'group %, and a retired identity may hold no write authority there; '
+                            'nothing was changed', p_agent, v_group
+                USING ERRCODE = '55000',
+                      HINT = 'Revoke that membership in the same act: epigraph-operator '
+                             'retire-link --revoke-membership.';
+        END IF;
+        -- 257: each revoked row and its role, so the audit row can be
+        -- reviewed and the revocation reversed from the record alone.
+        WITH revoked AS (
+            UPDATE public.group_memberships m
+               SET revoked_at = pg_catalog.now()
+             WHERE m.group_id = v_group AND m.agent_id = p_agent
+               AND m.revoked_at IS NULL AND m.role IN ('writer', 'admin')
+            RETURNING m.id, m.role)
+        SELECT pg_catalog.count(*)::integer,
+               COALESCE(pg_catalog.jsonb_agg(
+                            pg_catalog.jsonb_build_object('membership_id', r.id,
+                                                          'role', r.role)
+                            ORDER BY r.id),
+                        '[]'::jsonb)
+          INTO v_revoked, v_rows
+          FROM revoked r;
+    END IF;
+
+    PERFORM pg_catalog.set_config(
+        'epigraph.operator_link_retire',
+        pg_catalog.jsonb_build_object('reason', p_reason,
+                                      'memberships_revoked', v_revoked,
+                                      'revoked_memberships', v_rows,
+                                      'via', 'epigraph_retire_operator_link')::text,
+        true);
+    UPDATE public.operator_links l
+       SET retired = true
+     WHERE l.agent_id = p_agent AND NOT l.retired;
+    PERFORM pg_catalog.set_config('epigraph.operator_link_retire', '', true);
+
+    RETURN QUERY SELECT 'retired'::text, v_operator, v_group, v_revoked;
+END $$;
 
 -- ===================================================================
 -- (a)-(c) THE ROLE, THE OWNER, THE COLUMN GRANT

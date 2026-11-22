@@ -3418,8 +3418,11 @@ restart.
   UPDATE outside the verb, a superuser's included, clears `epigraph.operator_link_retire`
   before the audit trigger reads it, so an audit row's `via` / reason are the verb's or
   `direct` with none. A superuser still retires directly (outside every guard), now always
-  audited `via = direct`. If the migrating login cannot create the role, grant it, or re-own
-  the verb (it must be a superuser), the file NOTICEs and keeps 191's owner and grants; the
+  audited `via = direct`. Also re-bodies 191's verb and `epigraph_operator_links_audit` (md5
+  preconditions; owners, ACLs and paths kept) so a `--revoke-membership` retire records each
+  revoked membership's id and role in the audit row (`revoked_memberships`, `[]` when none;
+  backlog 452a1330), not only the count. If the migrating login cannot create the role,
+  grant it, or re-own the verb (it must be a superuser), the file NOTICEs and keeps 191's owner and grants; the
   guard's new arms stay off, and `tenancy_backfill verify` reports it as a FAIL
   (`DEDICATED_OWNER_DEFINERS`). Pinned by `epigraph-db/tests/operator_link_retire.rs`,
   `schema_contract.rs::migration_191_retire_operator_link_is_owned_and_granted` and
