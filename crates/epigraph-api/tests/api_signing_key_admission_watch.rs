@@ -26,6 +26,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 mod common;
+mod viewer_fixture;
 
 const TICK: Duration = Duration::from_millis(50);
 
@@ -262,4 +263,78 @@ async fn a_failed_recheck_does_not_stop_the_signer() {
     let mut w = watch(&closed, &key, signer_id);
     still_watching(&mut w, "every re-read fails").await;
     w.abort();
+}
+
+/// Production runs the watch on the server's scoped pool, on the APPLICATION
+/// ROLE, not on a superuser pool where `epigraph_bypass()` is true. On that
+/// pool the watch must read the signer's keys and bare agent key the same
+/// way: a bare-key signer and an attested `signing` key both keep serving
+/// (a false "not admitted" would restart the server every interval), and
+/// both stop once retired (a read the role cannot make would only WARN, and
+/// the watch would never stop).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_watch_judges_the_key_on_the_application_role(pool: PgPool) {
+    let url = viewer_fixture::database_url_for(&pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let app = scoped.inner().clone();
+    let bypass: bool = sqlx::query_scalar("SELECT public.epigraph_bypass()")
+        .fetch_one(&app)
+        .await
+        .expect("epigraph_bypass");
+    assert!(
+        !bypass,
+        "CALIBRATION: the watch's pool must not be privileged"
+    );
+
+    // A bare key (a signer agent the first boot registered).
+    let bare = AgentSigner::generate();
+    let bare_id = edge_signer::resolve_signer_agent(&pool, &bare)
+        .await
+        .expect("signer agent");
+    let mut bare_watch = watch(&app, &bare, bare_id);
+
+    // An attested, active signing row of another agent.
+    let owner = common::seed_system_agent(&pool).await;
+    let attested = AgentSigner::generate();
+    let row = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agent_keys (id, agent_id, public_key, key_type, status, valid_from) \
+         VALUES ($1, $2, $3, 'signing', 'active', now() - interval '1 minute')",
+    )
+    .bind(row)
+    .bind(owner)
+    .bind(attested.public_key().as_slice())
+    .execute(&pool)
+    .await
+    .expect("register the signing row (test superuser)");
+    let mut attested_watch = watch(&app, &attested, owner);
+
+    still_watching(&mut bare_watch, "bare key, application role").await;
+    still_watching(&mut attested_watch, "active signing key, application role").await;
+
+    sqlx::query(
+        "INSERT INTO agent_keys (agent_id, public_key, key_type, status, valid_from, valid_until) \
+         SELECT a.id, a.public_key, 'signing', 'rotated', a.created_at, now() \
+           FROM agents a WHERE a.id = $1",
+    )
+    .bind(bare_id)
+    .execute(&pool)
+    .await
+    .expect("retire the bare key (test superuser)");
+    sqlx::query("UPDATE agent_keys SET status = 'revoked', valid_until = now() WHERE id = $1")
+        .bind(row)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stop = stopped(bare_watch, "retired bare key, application role").await;
+    assert!(stop.contains(&hex::encode(bare.public_key())), "{stop}");
+    let stop = stopped(attested_watch, "revoked key, application role").await;
+    assert!(stop.contains(&hex::encode(attested.public_key())), "{stop}");
 }
