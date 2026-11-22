@@ -1869,7 +1869,8 @@ impl AgentRepository {
     /// `None` when the agent has no attested registration.
     ///
     /// The model is the one migration 161's registration recorded in
-    /// `agent_prompt_snapshots`, a table only the attestor's definer writes
+    /// `agent_prompt_snapshots`, a table only the attestor's definer (or a
+    /// maintenance session) writes, never the application role
     /// (and whose rows never change model: the registration refuses an
     /// identity re-registered under another one). It is read through
     /// migration 199's `epigraph_agent_prompt_snapshot_at`, the one definer
