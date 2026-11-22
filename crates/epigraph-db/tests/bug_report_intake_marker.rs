@@ -10,8 +10,8 @@
 //!   `bug_report.submitted` audit row, so every report its reporter listed
 //!   before the upgrade it still lists after it, a report triage had already
 //!   moved out of the intake group included (which 207's list had lost). A
-//!   claim the reporter authored by another path gets no marker, and neither
-//!   does an audit row whose claim is gone
+//!   claim the reporter authored by another path gets no marker, even when
+//!   an audit row names it, and neither does an audit row whose claim is gone
 //!   or is no longer the reporter's. The filed labels are rebuilt from the
 //!   audit row exactly as the write composed them.
 //! * `the_265_undo_returns_the_catalog_below_265`: `docs/runbooks/265-undo.sql`
@@ -20,7 +20,9 @@
 //!   restored byte for byte), and a second run changes nothing.
 //!
 //! Verified to fail: with 265's backfill INSERT removed, the first test's
-//! post-upgrade list is empty; with the undo's re-statement of 207's list dropped, the
+//! post-upgrade list is empty; with the backfill's `properties ? 'bug_report'`
+//! condition dropped, the first test sees a marker for the claim authored by
+//! another path; with the undo's re-statement of 207's list dropped, the
 //! undo test names `epigraph_my_bug_reports` in the diff.
 
 #[path = "viewer_fixture.rs"]
@@ -186,6 +188,20 @@ async fn the_265_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
     let second_filed = labels_of(&pool, second.claim_id).await;
     let theirs = submit_as(&pool, other, "theirs").await;
     let own = fixture::seed_group_claim(&pool, reporter, home, "not a report").await;
+    // An audit row naming a claim the reporter authored by another path (only
+    // a privileged session can write one since 207; the backfill must still
+    // not take it for a report).
+    sqlx::query(
+        "INSERT INTO security_events (event_type, agent_id, success, details) \
+         VALUES ('bug_report.submitted', $1, true, \
+                 jsonb_build_object('claim_id', $2::uuid, 'intake_group_id', $3::uuid))",
+    )
+    .bind(reporter)
+    .bind(own)
+    .bind(intake)
+    .execute(&pool)
+    .await
+    .expect("an audit row naming a non-report");
     // Triage moves the first report before the upgrade: 207's list loses it.
     sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
         .bind(first.claim_id)
@@ -216,7 +232,7 @@ async fn the_265_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
             (theirs.claim_id, other, intake),
         ],
         "one marker per filed report, from its audit row (the claim authored by another path, \
-         {own}, has none)"
+         {own}, has none although an audit row names it)"
     );
     let filed: Vec<(Uuid, Option<String>, Vec<String>)> = sqlx::query_as(
         "SELECT claim_id, title, filed_labels FROM bug_report_intake_marks ORDER BY submitted_at",

@@ -3418,8 +3418,8 @@ restart.
   while the claim is owned by the CURRENT intake group (as 207), otherwise only the marker's
   filed title and labels plus `resolved`, never a label or title a later owner wrote.
   `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
-  existing `bug_report.submitted` audit row whose claim is still authored by its agent
-  (filed labels rebuilt from the audit row's
+  existing `bug_report.submitted` audit row whose claim is still authored by its agent and
+  carries the write's `properties.bug_report` (filed labels rebuilt from the audit row's
   severity and component; the title from the claim, so a report moved before 265 keeps the
   title it has now), with `row_security` off (fails closed on a filtered migration login),
   after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call

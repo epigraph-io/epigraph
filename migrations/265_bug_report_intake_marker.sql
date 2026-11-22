@@ -41,8 +41,9 @@
 --       role holds SELECT and INSERT; no role but a superuser may change or
 --       delete a marker.
 --   (b) the backfill: one marker per existing `bug_report.submitted` row
---       whose claim still exists and is still authored by the row's agent,
---       with the event's timestamp as `submitted_at`, the claim's title and the
+--       whose claim still exists, is still authored by the row's agent and
+--       is a report the write composed (`properties ? 'bug_report'`), with
+--       the event's timestamp as `submitted_at`, the claim's title and the
 --       labels the write put on it rebuilt from the audit row's severity and
 --       component, so every report a reporter sees before this migration it
 --       still sees after it. The title can only come from the claim's
@@ -188,6 +189,10 @@ BEGIN
      WHERE e.event_type = 'bug_report.submitted'
        AND e.agent_id IS NOT NULL
        AND c.agent_id = e.agent_id
+       -- A second, independent condition, as 207's owner-group filter was:
+       -- only a claim the write itself composed is a report, so an audit row
+       -- naming a claim its agent authored by another path marks nothing.
+       AND c.properties ? 'bug_report'
      ORDER BY c.id, e.created_at, e.id
     ON CONFLICT (claim_id) DO NOTHING;
     PERFORM pg_catalog.set_config('row_security', 'on', true);
