@@ -3403,6 +3403,19 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **247**: public `maintenance_delete_claim_frames` (backlog 8ca08222; 236–246 are other
+  waves' slots) — `GRANT DELETE ON public.claim_frames TO epigraph_maintenance`, role-guarded
+  like 158, and nothing else. An un-mark's reversal deletes the frame bindings its mark's
+  repair copied onto the canonical (`copied_frames`); 070 gives the maintenance role no
+  DELETE, so on a NOSUPERUSER maintenance login that statement failed with "permission
+  denied for table claim_frames" and the whole un-mark rolled back, leaving the duplicate
+  marked. A grant, not a definer: every definer here is owned by `epigraph_maintenance`, so
+  a definer would need the same privilege. **Effective reach:** none new over bindings: the
+  role already UPDATEs and INSERTs `claim_frames` (070) and can delete a whole frame, with
+  its bindings, through 158's cascade. It deletes no frame and no BBA, so it stands whatever
+  is decided about 158's frame deletion. Pinned by
+  `epigraph-engine/tests/unmark_unbinds_frame_on_maintenance.rs` (red without 247). Undo:
+  `docs/runbooks/247-undo.sql`. **Deploy order:** none required; no binary change.
 
 ## `-- no-transaction` migrations
 

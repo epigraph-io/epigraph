@@ -14213,7 +14213,8 @@ async fn reverse_marked_duplicate(
 
     // The frame bindings the repair added go, unless the canonical has since
     // gained an input on that frame (one it did not hold when it was bound and
-    // that is not on its way back to the duplicate above).
+    // that is not on its way back to the duplicate above). On a NOSUPERUSER
+    // maintenance login this DELETE needs migration 247's grant.
     if !record.copied_frames.is_empty() {
         out.unbound_frames = sqlx::query_scalar(&format!(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.

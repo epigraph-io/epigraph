@@ -515,8 +515,9 @@ async fn unmark_duplicate_keeps_a_retracted_cached_key_and_reports_drift(pool: P
     let dup = claim_of(&pool, h, hg, "k4a mcp s3 duplicate").await;
     let canonical = claim_of(&pool, h, hg, "k4a mcp s3 canonical").await;
     // Not bound to the duplicate, so the repair binds nothing onto the
-    // canonical and the un-mark removes no frame binding (the maintenance
-    // role holds no DELETE on `claim_frames`, migration 158).
+    // canonical and the un-mark removes no frame binding (that removal on a
+    // maintenance login, migration 247, is pinned in epigraph-engine's
+    // `unmark_unbinds_frame_on_maintenance.rs`).
     let f = frame(&pool, "s3").await;
     let input = harness_row(
         &pool,

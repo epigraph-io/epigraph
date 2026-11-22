@@ -233,9 +233,10 @@ async fn an_unmark_over_a_retracted_key_keeps_it_and_reports_drift(pool: PgPool)
     .expect("frame")
     .id;
     // The duplicate is NOT bound to the frame, so the repair binds none onto
-    // the canonical and the un-mark has no frame binding to remove: the
-    // maintenance role holds no DELETE on `claim_frames` (migration 158), which
-    // is outside what this test measures.
+    // the canonical and the un-mark has no frame binding to remove; removing
+    // one on a maintenance login (migration 247's DELETE on `claim_frames`) is
+    // pinned by `unmark_unbinds_frame_on_maintenance.rs`, outside what this
+    // test measures.
     let input = bba(&pool, dup, f, None, None, None).await;
 
     {
