@@ -1843,12 +1843,20 @@ impl AgentRepository {
         if run_tokens != RunTokens::On {
             return Ok(None);
         }
+        // Migration 236: the live-membership read answers only for the session
+        // principal, and this asks about the DELEGATOR's own memberships, so
+        // the statement stamps the delegator as its principal for itself
+        // (transaction-local; the statement is its own transaction on a pool
+        // connection). The read's argument is the stamped value, so the stamp
+        // precedes the call. Nothing else here reads the principal.
         let row: Option<(Uuid, Uuid)> = sqlx::query_as(
             "SELECT a.operator_id, a.operator_group_id \
-               FROM public.epigraph_operator_actor($2) a \
+               FROM (SELECT set_config('epigraph.principal_id', $1::text, true)::uuid \
+                            AS delegator) s \
+              CROSS JOIN LATERAL public.epigraph_operator_actor($2) a \
               WHERE public.epigraph_author_binding($1) = $3 \
                 AND public.epigraph_human_of($1, true) = a.operator_id \
-                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) m \
+                AND EXISTS (SELECT 1 FROM public.epigraph_live_memberships(s.delegator) m \
                              WHERE m.group_id = a.operator_group_id \
                                AND m.role IN ('writer', 'admin'))",
         )
