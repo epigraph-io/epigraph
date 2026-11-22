@@ -10,7 +10,9 @@
 //!   nothing written;
 //! * an omitted (or self-naming) agent is the caller;
 //! * a human naming the agent it operates through a live binding is admitted
-//!   (the `AgentRepository::speaks_for` rule `POST /api/v1/edges` applies);
+//!   (the `AgentRepository::speaks_for` rule `POST /api/v1/edges` applies),
+//!   but not once that link is retired, and never the other way round (an
+//!   agent does not speak for its human);
 //! * the span and its edge are written on a transaction stamped with the
 //!   caller's viewer, so the edge records the caller's writer group.
 //!
@@ -33,7 +35,7 @@ use epigraph_db::{AgentRepository, ScopedPool, SessionGucMode};
 use sqlx::PgPool;
 use uuid::Uuid;
 use viewer_fixture::{
-    database_url_for, downgraded_pool, seed_agent_with_group, seed_human_operator,
+    as_role, database_url_for, downgraded_pool, seed_agent_with_group, seed_human_operator,
 };
 
 async fn app_role_state(pool: &PgPool) -> AppState {
@@ -250,6 +252,106 @@ async fn an_operator_may_attribute_a_span_and_an_event_to_the_agent_it_operates(
     .unwrap_or_else(|e| panic!("the operator's event for its agent: {e:?}"));
     assert_eq!(event.actor_id, Some(agent));
     assert_eq!(actors_of(&pool, &event_type).await, vec![Some(agent)]);
+}
+
+/// Retire `agent`'s operator link as the maintenance role, as an operator does.
+async fn retire_link(pool: &PgPool, agent: Uuid) {
+    let outcome: String = as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r: String = sqlx::query_scalar(
+            "SELECT outcome FROM public.epigraph_retire_operator_link($1, 'span test', true)",
+        )
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("retire the link");
+        (conn, r)
+    })
+    .await;
+    assert_eq!(outcome, "retired", "CALIBRATION: the link was live");
+}
+
+/// The binding speaks one way and only while it is in force: an agent naming
+/// its own human is refused, and so is the human once the link is retired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reversed_or_retired_operator_link_speaks_for_no_one(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (human, _) = seed_human_operator(&pool, "span-reverse-human").await;
+    let (agent, _) = seed_agent_with_group(&pool, "span-reverse-agent").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    AgentRepository::link_operator(&mut conn, agent, human)
+        .await
+        .expect("live link");
+    drop(conn);
+
+    // The agent naming its human: the binding does not run that way.
+    let reversed = Uuid::new_v4().simple().to_string();
+    let res = create_span(
+        write_scope(agent),
+        viewer(&pool, agent).await,
+        State(state.clone()),
+        span_request(&reversed, Some(human), None),
+    )
+    .await
+    .map(|(s, _)| s);
+    assert_not_spoken_for(res, "an agent naming its own human");
+    assert!(
+        spans_on(&pool, &reversed).await.is_empty(),
+        "no span written"
+    );
+    let event_type = format!("test.reversed_{}", Uuid::new_v4().simple());
+    let res = create_event(
+        write_scope(agent),
+        viewer(&pool, agent).await,
+        State(state.clone()),
+        event_request(&event_type, Some(human)),
+    )
+    .await;
+    assert_not_spoken_for(res, "an agent's event naming its own human");
+    assert!(
+        actors_of(&pool, &event_type).await.is_empty(),
+        "nothing written"
+    );
+
+    // CALIBRATION: while the link is live the human speaks for the agent.
+    let live = Uuid::new_v4().simple().to_string();
+    let (status, _) = create_span(
+        write_scope(human),
+        viewer(&pool, human).await,
+        State(state.clone()),
+        span_request(&live, Some(agent), None),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("CALIBRATION: the live link admits: {e:?}"));
+    assert_eq!(status.as_u16(), 201, "CALIBRATION: the live link admits");
+
+    retire_link(&pool, agent).await;
+    let retired = Uuid::new_v4().simple().to_string();
+    let res = create_span(
+        write_scope(human),
+        viewer(&pool, human).await,
+        State(state.clone()),
+        span_request(&retired, Some(agent), None),
+    )
+    .await
+    .map(|(s, _)| s);
+    assert_not_spoken_for(res, "a human naming an agent whose link is retired");
+    assert!(
+        spans_on(&pool, &retired).await.is_empty(),
+        "no span written"
+    );
+    let event_type = format!("test.retired_{}", Uuid::new_v4().simple());
+    let res = create_event(
+        write_scope(human),
+        viewer(&pool, human).await,
+        State(state),
+        event_request(&event_type, Some(agent)),
+    )
+    .await;
+    assert_not_spoken_for(res, "an event naming an agent whose link is retired");
+    assert!(
+        actors_of(&pool, &event_type).await.is_empty(),
+        "nothing written"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
