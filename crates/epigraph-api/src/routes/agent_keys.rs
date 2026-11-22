@@ -147,9 +147,10 @@ const ADMIN_REVOKE_EVENT: &str = "agent_keys.admin_revoke";
 ///
 /// The definer re-checks the token's client record (an active
 /// `oauth_clients` row bound to `admin` that grants `claims:admin`, `ADM02`),
-/// so the override is no longer admitted on the token's scope alone; a refusal
-/// is a 403 and nothing is written. Any other failure (`ADM03` on a database
-/// without migration 252) is a 500, and nothing is written either.
+/// so the override is no longer admitted on the token's scope alone; that
+/// refusal is a 403 and nothing is written. Any other failure (`ADM03` on a
+/// database without migration 252, or any other refusal) is a 500, and
+/// nothing is written either.
 #[cfg(feature = "db")]
 async fn audit_admin_key_change(
     conn: &mut sqlx::PgConnection,
@@ -168,7 +169,10 @@ async fn audit_admin_key_change(
     )
     .await
     .map_err(|e| {
-        if crate::errors::db_is_insufficient_privilege(&e) {
+        // Only the definer's own `ADM02` is the missing grant. Any other
+        // refusal (a 42501 from row security on a misowned definer, say) is
+        // a server fault, not the caller's, and is reported as what it is.
+        if crate::errors::db_is_insufficient_privilege(&e) && e.to_string().contains("ADM02:") {
             ApiError::Forbidden {
                 reason: "the token carries claims:admin, but its client record grants no live \
                          claims:admin to this principal (ADM02); the override on another \

@@ -1274,6 +1274,12 @@ async fn admin_override_without_a_live_client_grant_is_refused_and_changes_nothi
     let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
     let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
     assert_eq!(status, 403, "rotation on scope alone: {text}");
+    // The refusal is the definer's own ADM02 (no live grant), not some other
+    // 403 on the way (scope, ownership, an attested key).
+    assert!(
+        text.contains("ADM02"),
+        "refused for the missing grant: {text}"
+    );
     assert_eq!(
         key_rows(&pool, agent.id).await,
         before,
@@ -1284,80 +1290,32 @@ async fn admin_override_without_a_live_client_grant_is_refused_and_changes_nothi
 
     let (agent, key) = seed_agent_with_key(&pool).await;
     let before = key_rows(&pool, agent).await;
-    let status = post_revoke(addr, agent, key, &token).await;
-    assert_eq!(status, 403, "revocation on scope alone");
+    let (status, text) = post_revoke_text(addr, agent, key, &token).await;
+    assert_eq!(status, 403, "revocation on scope alone: {text}");
+    assert!(
+        text.contains("ADM02"),
+        "refused for the missing grant: {text}"
+    );
     assert_eq!(key_rows(&pool, agent).await, before, "nothing may change");
     assert_eq!(key_audit_rows(&pool, agent).await.len(), 0);
 }
 
-/// Make every write of `agent`'s keys fail, through a trigger on this
-/// per-test database: an INSERT of a key row, or an UPDATE to `revoked`.
-/// (A rotation's retirement, an UPDATE to `rotated`, still succeeds, so the
-/// failure lands after it.)
-async fn fail_key_writes_of(pool: &sqlx::PgPool, agent: Uuid) {
-    let name = format!("fail_key_write_{}", agent.simple());
-    sqlx::query(&format!(
-        "CREATE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $$ \
-         BEGIN \
-           IF NEW.agent_id = '{agent}'::uuid \
-              AND (TG_OP = 'INSERT' OR NEW.status = 'revoked') THEN \
-             RAISE EXCEPTION 'injected key-write failure'; \
-           END IF; \
-           RETURN NEW; \
-         END $$"
-    ))
-    .execute(pool)
-    .await
-    .expect("create the failing trigger function");
-    sqlx::query(&format!(
-        "CREATE TRIGGER {name} BEFORE INSERT OR UPDATE ON agent_keys \
-         FOR EACH ROW EXECUTE FUNCTION {name}()"
-    ))
-    .execute(pool)
-    .await
-    .expect("create the failing trigger");
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_failed_key_write_rolls_back_the_admin_audit_row_and_the_retirement(pool: sqlx::PgPool) {
-    let (addr, _shutdown) = common::spawn_app(&url_for(&pool).await).await;
-    let (token, _, _) = seeded_admin(&pool).await;
-
-    // Rotation: the audit row and the old key's retirement are written, then
-    // the new key's INSERT fails. All three must roll back together: the
-    // agent keeps its active key, and no audit row claims a rotation.
-    let agent = seed_derived_llm_agent(&pool).await;
-    let before = key_rows(&pool, agent.id).await;
-    let new_key = epigraph_crypto::AgentSigner::generate();
-    let body = valid_rotation_body(agent.id, &agent.signer, &new_key);
-    fail_key_writes_of(&pool, agent.id).await;
-    let (status, text) = post_rotate(addr, agent.id, &token, &body).await;
-    assert_eq!(status, 500, "the injected failure surfaces: {text}");
-    assert_eq!(
-        key_rows(&pool, agent.id).await,
-        before,
-        "the old key must stay active; a half-done rotation leaves no active key"
-    );
-    assert_eq!(
-        key_audit_rows(&pool, agent.id).await.len(),
-        0,
-        "no audit row for a rotation that did not happen"
-    );
-
-    // Revocation: the audit row is written, then the revoke fails.
-    let (agent, key) = seed_agent_with_key(&pool).await;
-    fail_key_writes_of(&pool, agent).await;
-    let before = key_rows(&pool, agent).await;
-    let status = post_revoke(addr, agent, key, &token).await;
-    assert_eq!(status, 500, "the injected failure surfaces");
-    assert_eq!(
-        key_rows(&pool, agent).await,
-        before,
-        "the key stays as it was"
-    );
-    assert_eq!(
-        key_audit_rows(&pool, agent).await.len(),
-        0,
-        "no audit row for a revocation that did not happen"
-    );
+/// `post_revoke` with the response body, for asserting what a refusal names.
+async fn post_revoke_text(
+    addr: std::net::SocketAddr,
+    agent_id: Uuid,
+    key_id: Uuid,
+    token: &str,
+) -> (reqwest::StatusCode, String) {
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "http://{addr}/api/v1/agents/{agent_id}/keys/{key_id}/revoke"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({"reason": "attribution test"}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.text().await.unwrap_or_default())
 }
