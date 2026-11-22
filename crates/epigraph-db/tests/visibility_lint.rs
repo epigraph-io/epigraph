@@ -2624,9 +2624,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "READ of NO table directly: whether ONE named agent holds a live writer/admin \
          membership of ONE group, through migration 077's `epigraph_live_memberships` definer \
          (the read `Viewer::resolve` is built from). It answers a question about the CALLER of a \
-         write made on another principal's stamp (`add_step` into a group plan, on the \
-         workflow-ingest system agent's stamp, ruling R-98), so a viewer predicate would ask \
-         about the wrong principal; it returns one boolean and no row reaches a caller.",
+         write, so a viewer predicate would ask about the wrong row set; it returns one boolean \
+         and no row reaches a caller. Since migration 236 that definer answers only for the \
+         session principal, so `conn` MUST be stamped with `agent_id` as its principal: on a \
+         connection stamped as any other principal (a system agent's, say) it answers false.",
     ),
     (
         "group_membership.rs",

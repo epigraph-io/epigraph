@@ -1619,6 +1619,10 @@ fn d4_no_request_path_writes_the_instance_admin_table() {
         "epigraph_role_derived_memberships",
         "epigraph_group_role_roster",
         "FROM group_role_bindings",
+        // Migration 236: the unbound twin of `epigraph_live_memberships`
+        // answers for ANY agent (not app-executable). The request path reads
+        // memberships only through the principal-bound read.
+        "epigraph_live_memberships_unbound",
     ];
     const READ_ROOTS: usize = 2;
     // THE ROOT SET IS THE FINDING, NOT THE NEEDLE LIST. An earlier revision
