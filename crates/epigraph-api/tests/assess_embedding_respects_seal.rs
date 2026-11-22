@@ -49,9 +49,14 @@ fn request() -> AssessClaimRequest {
     .expect("AssessClaimRequest deserializes")
 }
 
-fn state(pool: &PgPool) -> AppState {
+async fn state(pool: &PgPool) -> AppState {
     let svc: Arc<dyn EmbeddingService> = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
-    AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(svc)
+    let mut state =
+        AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(svc);
+    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
+    // state carries a `ScopedPool` (the harness superuser's, stamped).
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    state
 }
 
 /// A `claim_encryption` row for a group-private claim (migration 081 refuses
@@ -90,7 +95,7 @@ async fn assess(pool: &PgPool, caller: Uuid, claim: Uuid) -> bool {
     let Json(resp) = assess_claim(
         write_scope(),
         epigraph_api::middleware::bearer::ViewerExtractor(viewer),
-        State(state(pool)),
+        State(state(pool).await),
         Path(claim),
         Json(request()),
     )

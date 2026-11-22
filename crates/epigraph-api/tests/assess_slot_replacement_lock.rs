@@ -68,7 +68,10 @@ async fn assess(
     let viewer = Viewer::resolve(&pool, caller)
         .await
         .expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
+    // state carries a `ScopedPool` (the harness superuser's, stamped).
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(&pool).await);
     let Json(resp) = assess_claim(
         write_scope(),
         epigraph_api::middleware::bearer::ViewerExtractor(viewer),

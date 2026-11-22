@@ -31,9 +31,6 @@
 //!
 //! | file | handler | endpoints -> relationship | in D8 scope | disposition |
 //! |---|---|---|---|---|
-//! | assess.rs | assess_claim | claim -> frame WITHIN_FRAME | no | structural |
-//! | assess.rs | assess_claim | evidence -> claim SUPPORTS | yes | DEAD WRITE: the source id is a `mass_functions` id typed `evidence`; `edges_validate_refs` refuses it (measured) and `let _` swallows the error, so no edge lands |
-//! | assess.rs | assess_claim | evidence -> claim CONTRADICTS | yes | DEAD WRITE, as above |
 //! | belief.rs | submit_evidence | claim -> context SCOPED_BY | no | structural |
 //! | belief.rs | submit_evidence | claim -> frame WITHIN_FRAME | no | structural |
 //! | belief.rs | submit_evidence | evidence -> claim SUPPORTS | yes | DEAD WRITE: the same `mass_functions`-id-as-evidence shape |
@@ -144,7 +141,10 @@ const ROUTES: &str = "crates/epigraph-api/src/routes";
 /// The unstamped HTTP edge writes, per file. Lower a row when a handler is
 /// stamped; delete it at zero. Never raise one.
 const UNSTAMPED: &[(&str, usize)] = &[
-    ("assess.rs", 3),
+    // `assess.rs` (3) is gone (backlog 74feb76b): `assess_claim` writes its
+    // WITHIN_FRAME edge on its stamped transaction, and its two DEAD
+    // `evidence -> claim` SUPPORTS / CONTRADICTS writes (a `mass_functions` id
+    // typed `evidence`, refused by `edges_validate_refs`) were deleted.
     // `belief.rs` (6) is gone: `submit_evidence`'s WITHIN_FRAME, SCOPED_BY
     // and CONTRIBUTES_TO edges are written on its stamped transaction (fb9cff66).
     // 3 before the claim visibility controls folded `create_claim_core`'s
@@ -181,7 +181,9 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// `crud.rs` row fell 2 -> 1.
 /// 26 -> 25 (backlog 2d60f619, merged on staging batch 4): `learn_convention`'s
 /// evidence -> claim edge moved into the evidence write (`conventions.rs` 4 -> 3).
-const HIGH_WATER: usize = 25;
+/// 25 -> 22 (backlog 74feb76b): `assess_claim` was stamped and its `assess.rs`
+/// row (3) deleted.
+const HIGH_WATER: usize = 22;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

@@ -69,9 +69,11 @@ const WRITE_CALLEES: &[&str] = &[
 /// Lower a row when a conversion propagates an error; delete it at zero. Never
 /// raise one: convert the write instead.
 const REGISTER: &[(&str, usize)] = &[
-    // 6 before U027 deleted assess's discarded "combined result" store, which
-    // sat on the input BBA's key and overwrote it.
-    ("assess.rs", 5),
+    // `assess.rs` (5, 6 before U027 deleted its discarded "combined result"
+    // store) is gone (backlog 74feb76b): `assess_claim`'s frame assignment,
+    // WITHIN_FRAME edge and global scoped belief moved onto its stamped
+    // transaction, each under a logged SAVEPOINT, and its two dead
+    // `evidence -> claim` edge writes were deleted.
     // `belief.rs` (16, then 12 after U024) is gone: `submit_evidence`'s edges,
     // perspective/community scoped beliefs and divergence record moved onto
     // stamped transactions, each under a logged SAVEPOINT (fb9cff66).

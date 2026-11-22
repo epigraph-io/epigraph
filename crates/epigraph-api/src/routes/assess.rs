@@ -155,7 +155,20 @@ pub async fn assess_claim(
     use epigraph_engine::calibration::CalibrationConfig;
     use epigraph_engine::uncertainty::parse_uncertainty;
 
-    let pool = &state.db_pool;
+    // ── 0. ONE transaction stamped with the caller's viewer ──────────────
+    //
+    // Backlog 74feb76b. Every read and write below runs on this transaction,
+    // which the caller's tenancy context stamps (`AppState::write_as`), and
+    // commits before the embedding. The handler used to run on the raw
+    // `state.db_pool`, which on a server is the application pool UNSTAMPED
+    // (`AppState::with_scoped_pool` aliases it to `ScopedPool::inner`): under
+    // FORCE row security the slot upsert was refused ("new row violates
+    // row-level security policy for table mass_functions") and the call
+    // answered an opaque 500 DatabaseError, a standalone claim's included
+    // (measured on the application-role harness, `assess_app_role.rs`). The
+    // other assess tests run on the superuser harness, which bypasses row
+    // security, so none of them could see it.
+    let mut tx = state.write_as(&viewer, "assess_claim").await?;
 
     // ── 1. Load claim ────────────────────────────────────────────────────
     //
@@ -177,7 +190,7 @@ pub async fn assess_claim(
     // `viewer.writable_bind()` (member-with-write-role, not merely
     // member-who-can-read) is PR-16's scope; the read fix belongs here because
     // the viewer was already in hand.
-    let claim = epigraph_db::ClaimRepository::get_by_id(pool, &viewer, claim_id.into())
+    let claim = epigraph_db::ClaimRepository::get_by_id(&mut *tx, &viewer, claim_id.into())
         .await?
         .ok_or(ApiError::NotFound {
             entity: "claim".to_string(),
@@ -242,7 +255,7 @@ pub async fn assess_claim(
     // before anything is written.
     let frame_id = if let Some(fid) = request.frame_id {
         // Verify it exists
-        let _ = epigraph_db::FrameRepository::get_by_id(pool, &viewer, fid)
+        let _ = epigraph_db::FrameRepository::get_by_id(&mut *tx, &viewer, fid)
             .await?
             .ok_or(ApiError::NotFound {
                 entity: "frame".to_string(),
@@ -250,16 +263,13 @@ pub async fn assess_claim(
             })?;
         fid
     } else {
-        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-            message: format!("acquire connection: {e}"),
-        })?;
-        epigraph_engine::edge_factor::resolve_claim_validity_frame(&mut conn, &viewer)
+        epigraph_engine::edge_factor::resolve_claim_validity_frame(&mut tx, &viewer)
             .await
             .map_err(|message| ApiError::InternalError { message })?
     };
 
     // Load the frame row for DS operations
-    let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
+    let frame_row = epigraph_db::FrameRepository::get_by_id(&mut *tx, &viewer, frame_id)
         .await?
         .ok_or(ApiError::NotFound {
             entity: "frame".to_string(),
@@ -315,29 +325,24 @@ pub async fn assess_claim(
     // anonymous slot.
     let caller = viewer.principal();
     let owner = match caller {
-        Some(agent) => {
-            let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-                message: format!("acquire connection: {e}"),
-            })?;
-            match epigraph_db::AgentRepository::human_of(&mut conn, agent, true).await? {
-                Some(human) => Some(human),
-                None if epigraph_db::AgentRepository::human_of(&mut conn, agent, false)
-                    .await?
-                    .is_some() =>
-                {
-                    return Err(ApiError::Forbidden {
-                        reason: "this agent's link to its human is retired, so it cannot \
+        Some(agent) => match epigraph_db::AgentRepository::human_of(&mut tx, agent, true).await? {
+            Some(human) => Some(human),
+            None if epigraph_db::AgentRepository::human_of(&mut tx, agent, false)
+                .await?
+                .is_some() =>
+            {
+                return Err(ApiError::Forbidden {
+                    reason: "this agent's link to its human is retired, so it cannot \
                                  assess on that human's behalf; nothing was written"
-                            .to_string(),
-                    });
-                }
-                None => Some(agent),
+                        .to_string(),
+                });
             }
-        }
+            None => Some(agent),
+        },
         None => None,
     };
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, slot, owner).await?;
+    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&mut *tx, slot, owner).await?;
 
     // The claim's hypothesis on this frame, read before the slot transaction:
     // whether this call contests the assessment it replaces is decided once,
@@ -346,7 +351,7 @@ pub async fn assess_claim(
     // `claim_frames` insert after the commit carries none), so reading it
     // here is the same read as after the write.
     let claim_assignment =
-        epigraph_db::FrameRepository::get_claim_assignment(pool, &viewer, claim_id, frame_id)
+        epigraph_db::FrameRepository::get_claim_assignment(&mut *tx, &viewer, claim_id, frame_id)
             .await?;
     let h_idx = claim_assignment.and_then(|ca| ca.hypothesis_index);
     // Each replaced assessment, and whether this call reverses its direction:
@@ -359,17 +364,13 @@ pub async fn assess_claim(
     let new_direction = direction(&mass_function);
 
     // The slot read and the slot upsert are ONE unit per (claim, frame, slot):
-    // a transaction holding a transaction-scoped advisory lock on that key.
-    // Unserialized, two concurrent calls by one owner could both read "no
-    // row" before either upsert landed and both report nothing replaced
-    // (backlog 4a7f90f8). The key is hashed in SQL so every server process
-    // derives the same lock. READ COMMITTED (the default) gives the read
-    // below a snapshot taken AFTER the lock is granted, so it sees the
-    // previous holder's committed row. The transaction commits before the
-    // fold below, which reads on other connections.
-    let mut slot_tx = pool.begin().await.map_err(|e| ApiError::InternalError {
-        message: format!("begin assessment slot transaction: {e}"),
-    })?;
+    // the transaction holds a transaction-scoped advisory lock on that key
+    // until it commits. Unserialized, two concurrent calls by one owner could
+    // both read "no row" before either upsert landed and both report nothing
+    // replaced (backlog 4a7f90f8). The key is hashed in SQL so every server
+    // process derives the same lock. READ COMMITTED (the default) takes each
+    // statement's snapshot when it starts, so the read below, which starts
+    // AFTER the lock is granted, sees the previous holder's committed row.
     sqlx::query(
         "SELECT pg_advisory_xact_lock(hashtextextended( \
              'epigraph/assess-slot/' || $1::text || '/' || $2::text || '/' || $3::text, 0))",
@@ -377,7 +378,7 @@ pub async fn assess_claim(
     .bind(claim_id)
     .bind(frame_id)
     .bind(slot)
-    .execute(&mut *slot_tx)
+    .execute(&mut *tx)
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("lock assessment slot: {e}"),
@@ -386,10 +387,7 @@ pub async fn assess_claim(
     // below overwrites.
     let replaced_assessments: Vec<ReplacedAssessment> =
         epigraph_db::MassFunctionRepository::get_for_claim_frame(
-            &mut *slot_tx,
-            &viewer,
-            claim_id,
-            frame_id,
+            &mut *tx, &viewer, claim_id, frame_id,
         )
         .await?
         .into_iter()
@@ -409,7 +407,7 @@ pub async fn assess_claim(
         })
         .collect();
     let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
-        &mut *slot_tx,
+        &mut *tx,
         claim_id,
         frame_id,
         owner,
@@ -427,14 +425,14 @@ pub async fn assess_claim(
     )
     .await?;
     // The durable record of who wrote this assessment, and whether it replaced
-    // and contested the owner's earlier one (backlog 4a7f90f8): in the slot
-    // transaction, so it commits exactly when the write does, and strict (a
+    // and contested the owner's earlier one (backlog 4a7f90f8): in the
+    // assessment's transaction, so it commits exactly when the write does, and strict (a
     // failed insert refuses the call) because a record that can silently go
     // missing leaves the write untraced, the defect it exists to close. The
     // challenge event's savepoint-wrapped `publish_or_log_conn` is the wrong
     // contract here for that reason.
     epigraph_db::EventRepository::insert_on(
-        &mut *slot_tx,
+        &mut *tx,
         ASSESSMENT_EVENT_TYPE,
         caller,
         &serde_json::json!({
@@ -451,23 +449,36 @@ pub async fn assess_claim(
     .map_err(|e| ApiError::InternalError {
         message: format!("record the assessment's writer: {e}"),
     })?;
-    slot_tx
-        .commit()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("commit assessment slot: {e}"),
-        })?;
 
-    // Ensure claim is assigned to frame + create WITHIN_FRAME edge
-    let _ = sqlx::query(
-        "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-    )
-    .bind(claim_id)
-    .bind(frame_id)
-    .execute(pool)
-    .await;
-    let _ = epigraph_db::EdgeRepository::create_signed(
-        pool,
+    // Ensure the claim is assigned to the frame (best-effort, under a
+    // SAVEPOINT: a non-owner's assignment is refused by row security
+    // (migration 114), and unsavepointed that refusal would abort the
+    // transaction and roll the assessment back at the COMMIT).
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let assigned = sqlx::query(
+            "INSERT INTO claim_frames (claim_id, frame_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(claim_id)
+        .bind(frame_id)
+        .execute(&mut *sp)
+        .await;
+        match assigned {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("assess_claim: claim_frames assignment refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
+    }
+    super::belief::create_edge_under_savepoint(
+        &mut tx,
         state.edge_signing_key(),
         claim_id,
         "claim",
@@ -475,10 +486,8 @@ pub async fn assess_claim(
         "frame",
         "WITHIN_FRAME",
         None,
-        None,
-        None,
     )
-    .await;
+    .await?;
 
     // Refresh the claim's cached belief under the one-frame-owns-the-cache
     // rule: `binary_truth` keeps the cache when the claim has a BBA there;
@@ -497,26 +506,24 @@ pub async fn assess_claim(
     // with the cache even for one assessment), without the edge-factor rows
     // the cache folds, and with all of a sibling group's rows in one cautious
     // reduction where the engine first folds each agent's own rows.
-    let (preview, total_sources) = {
-        let mut conn = pool.acquire().await.map_err(|e| ApiError::InternalError {
-            message: format!("acquire connection: {e}"),
-        })?;
-        epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut conn, &viewer, claim_id)
-            .await
-            .map_err(|message| ApiError::InternalError { message })?;
-        let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
-            &mut conn, &viewer, claim_id, frame_id,
-        )
+    epigraph_engine::edge_factor::recompute_claim_cached_belief(&mut tx, &viewer, claim_id)
         .await
         .map_err(|message| ApiError::InternalError { message })?;
-        // The rows that fold combined: the combine-input reader, narrowed by
-        // the derivation scope as the fold narrows it.
+    let preview = epigraph_engine::edge_factor::preview_claim_belief_on_frame(
+        &mut tx, &viewer, claim_id, frame_id,
+    )
+    .await
+    .map_err(|message| ApiError::InternalError { message })?;
+    // The rows that fold combined: the combine-input reader, narrowed by the
+    // derivation scope as the fold narrows it.
+    let total_sources = {
         let rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-            &mut *conn, &viewer, claim_id, frame_id,
+            &mut *tx, &viewer, claim_id, frame_id,
         )
         .await?;
-        let rows = epigraph_engine::derivation_scope::retain_for_cache(&mut conn, rows).await?;
-        (preview, rows.len())
+        epigraph_engine::derivation_scope::retain_for_cache(&mut tx, rows)
+            .await?
+            .len()
     };
 
     // `None`: the derivation scope admits none of the frame's rows and there
@@ -567,53 +574,53 @@ pub async fn assess_claim(
     // perspective, and nothing is stored on the (claim, frame, NULL, NULL)
     // slot.
 
-    // Store global scoped belief cache
-    let _ = epigraph_db::ScopedBeliefRepository::upsert(
-        pool,
-        frame_id,
-        claim_id,
-        "global",
-        None,
-        final_bel,
-        final_pl,
-        m_empty,
-        m_missing,
-        final_k,
-        final_method,
-        Some(final_betp),
-    )
-    .await;
-
-    // Create edges reflecting DS relationships
-    if final_bel > 0.5 {
-        let _ = epigraph_db::EdgeRepository::create_signed(
-            pool,
-            state.edge_signing_key(),
-            mf_id,
-            "evidence",
+    // Store the global scoped belief cache (best-effort, under a SAVEPOINT,
+    // as `submit_evidence` does).
+    {
+        use sqlx::Acquire as _;
+        let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to open a savepoint: {e}"),
+        })?;
+        let stored = epigraph_db::ScopedBeliefRepository::upsert(
+            &mut *sp,
+            frame_id,
             claim_id,
-            "claim",
-            "SUPPORTS",
-            Some(serde_json::json!({"belief": final_bel})),
+            "global",
             None,
-            None,
+            final_bel,
+            final_pl,
+            m_empty,
+            m_missing,
+            final_k,
+            final_method,
+            Some(final_betp),
         )
         .await;
-    } else if final_bel < 0.3 {
-        let _ = epigraph_db::EdgeRepository::create_signed(
-            pool,
-            state.edge_signing_key(),
-            mf_id,
-            "evidence",
-            claim_id,
-            "claim",
-            "CONTRADICTS",
-            Some(serde_json::json!({"belief": final_bel})),
-            None,
-            None,
-        )
-        .await;
+        match stored {
+            Ok(_) => sp.commit().await,
+            Err(e) => {
+                tracing::warn!("assess_claim: global scoped belief refused: {e}");
+                sp.rollback().await
+            }
+        }
+        .map_err(|e| ApiError::DatabaseError {
+            message: format!("Failed to close a savepoint: {e}"),
+        })?;
     }
+
+    // No `evidence -> claim` SUPPORTS / CONTRADICTS edge is written. The
+    // handler used to write one from the slot row's id typed `evidence`, which
+    // is a `mass_functions` id: `edges_validate_refs` refuses every such row,
+    // and `let _` swallowed the refusal, so no edge ever landed
+    // (`unstamped_http_edge_writes.rs` recorded both as dead writes). On this
+    // transaction each would only be a refused savepoint per call.
+
+    // Every write above commits together. The embedding below runs on its own
+    // stamped transaction and must not start before this one releases the
+    // claim row the cache refresh updated.
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the assessment: {e}"),
+    })?;
 
     // ── 9. Generate embedding ────────────────────────────────────────────
     let embedded = if let Some(ref embedding_service) = state.embedding_service {

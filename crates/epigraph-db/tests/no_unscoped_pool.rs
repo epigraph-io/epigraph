@@ -814,7 +814,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// four registry statements on the caller's stamped connection, the one its
 /// claim-derived listing already used (`routes/papers.rs` 8 -> 4). No file
 /// reached zero.
-const HIGH_WATER: usize = 187;
+/// 187 -> 186 (backlog 74feb76b): `assess_claim` runs every read and write on
+/// the caller's `AppState::write_as` transaction; `routes/assess.rs` 1 -> 0,
+/// key DELETED (`HIGH_WATER_FILES` falls by one with it).
+const HIGH_WATER: usize = 186;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -887,7 +890,8 @@ const HIGH_WATER: usize = 187;
 /// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
 /// staging after the line above).
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
-const HIGH_WATER_FILES: usize = 34;
+/// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
+const HIGH_WATER_FILES: usize = 33;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -898,7 +902,8 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/admin.rs", 4),
     ("routes/agent_keys.rs", 6),
     ("routes/agents.rs", 10),
-    ("routes/assess.rs", 1),
+    // `routes/assess.rs` was 1 and is GONE (backlog 74feb76b): `assess_claim`
+    // reads and writes on one `AppState::write_as` transaction.
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
     // `query_security_events` reads on `AppState::read_as` with the caller's
     // viewer.
