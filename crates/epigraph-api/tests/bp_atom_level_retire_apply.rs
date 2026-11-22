@@ -10,12 +10,14 @@
 //!    caches from a whole-graph BP run, compounds included. BP apply is
 //!    retired: refused (409) unless the process runs with
 //!    `EPIGRAPH_BP_APPLY=on`, and even then it never writes a compound (D4).
-//! 2. The factor load feeds BP the `directional_support` factor the
-//!    `edges_auto_factor` trigger mints for every `decomposes_to` edge, so a
-//!    compound's BP value carries its own atoms' evidence back up (an echo).
-//!    No BP run may read such a factor, whether it is keyed by
-//!    `properties.relationship` or is a legacy row with no key whose sorted
-//!    pair is an in-force `decomposes_to` edge (D3).
+//! 2. The factor load fed BP the `directional_support` factor the
+//!    `edges_auto_factor` trigger minted for every `decomposes_to` edge
+//!    before migration 262, so a compound's BP value carried its own atoms'
+//!    evidence back up (an echo). No BP run may read such a factor, whether
+//!    it is keyed by `properties.relationship` or is a legacy row with no key
+//!    whose sorted pair is an in-force `decomposes_to` edge (D3). Since 262
+//!    the trigger mints none, so the fixtures seed the row a database
+//!    migrated before 262 holds ([`trigger_factor`]).
 //! 3. `POST /api/v1/edges` inserted its own route-level factor ("P2a") beside
 //!    the trigger's, unkeyed, for `supports` / `contradicts`. It fed only BP
 //!    and is removed (W10).
@@ -163,9 +165,10 @@ async fn evidential_factor(pool: &PgPool, a: Uuid, b: Uuid, frame: Option<Uuid>)
     .expect("seed an evidential_support factor");
 }
 
-/// An in-force `decomposes_to` edge `compound -> atom`. Its INSERT fires the
-/// `edges_auto_factor` trigger, which mints the keyed `directional_support`
-/// factor (frame NULL) these tests are about.
+/// An in-force `decomposes_to` edge `compound -> atom`. Since migration 262
+/// its INSERT mints no factor; [`trigger_factor`] seeds the keyed
+/// `directional_support` row (frame NULL) 217's trigger minted, which these
+/// tests are about.
 async fn decomposes_to(pool: &PgPool, compound: Uuid, atom: Uuid) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
@@ -178,13 +181,34 @@ async fn decomposes_to(pool: &PgPool, compound: Uuid, atom: Uuid) -> Uuid {
     .expect("seed a decomposes_to edge")
 }
 
-/// The id of the factor the trigger minted for `edge`.
+/// The factor 217's trigger minted for the `decomposes_to` edge `edge`, as a
+/// database migrated before 262 holds it (262's trigger mints none): seeded
+/// with the row that trigger wrote, and its id returned.
 async fn trigger_factor(pool: &PgPool, edge: Uuid) -> Uuid {
-    sqlx::query_scalar("SELECT id FROM factors WHERE properties->>'source_edge_id' = $1")
-        .bind(edge.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("the edges_auto_factor trigger mints one factor per decomposes_to edge")
+    let (source, target): (Uuid, Uuid) =
+        sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(pool)
+            .await
+            .expect("read the edge");
+    let mut vars = [source, target];
+    vars.sort();
+    sqlx::query_scalar(
+        "INSERT INTO factors (factor_type, variable_ids, potential, description, properties) \
+         VALUES ('directional_support', $1, $2, $3, $4) RETURNING id",
+    )
+    .bind(vars.to_vec())
+    .bind(
+        json!({"forward_strength": 0.0, "reverse_strength": 0.6, "source_var": source.to_string()}),
+    )
+    .bind(format!("Auto-generated from decomposes_to edge {edge}"))
+    .bind(json!({
+        "source_edge_id": edge, "relationship": "decomposes_to",
+        "edge_source_id": source, "edge_target_id": target
+    }))
+    .fetch_one(pool)
+    .await
+    .expect("seed the pre-262 decomposes_to factor")
 }
 
 async fn set_factor_properties(pool: &PgPool, factor: Uuid, properties: Value) {
@@ -462,7 +486,8 @@ async fn bp_loaders_skip_decomposes_to(pool: PgPool) {
             "{mode}: the compound is a BP variable"
         );
 
-        // Make `k` a compound of `a`. The trigger mints a keyed factor.
+        // Make `k` a compound of `a`, with the keyed factor 217's trigger
+        // minted for it.
         let edge = decomposes_to(&pool, t.k, t.a).await;
         let factor = trigger_factor(&pool, edge).await;
 
@@ -613,10 +638,13 @@ async fn pair_factor_keys(pool: &PgPool, x: Uuid, y: Uuid) -> Vec<String> {
 }
 
 /// The plan's fixture: a compound and its atom joined by `decomposes_to` AND
-/// `supports`, created in both orders. `idx_factors_type_vars_frame` is
-/// UNIQUE on (factor_type, sorted variable_ids, frame), and the trigger
-/// inserts `ON CONFLICT DO NOTHING`, so the pair holds ONE trigger factor,
-/// keyed by whichever edge came first.
+/// `supports`, created in both orders. Since migration 262 the
+/// `decomposes_to` edge mints no factor, so in either order the pair's one
+/// trigger factor is the `supports` edge's and BP reads it.
+/// (`idx_factors_type_vars_frame` is UNIQUE on (factor_type, sorted
+/// variable_ids, frame) and the trigger inserts `ON CONFLICT DO NOTHING`: under
+/// 217's trigger the `decomposes_to` edge created first took the slot and the
+/// `supports` edge got no coupling, the gap this test pinned until 262.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn bp_parallel_supports_and_decomposes_to(pool: PgPool) {
     let state = state_default(&pool).await;
@@ -638,7 +666,7 @@ async fn bp_parallel_supports_and_decomposes_to(pool: PgPool) {
         assert_eq!(
             pair_factor_keys(&pool, t.k, t.a).await,
             vec!["supports".to_string()],
-            "{mode}: the decomposes_to edge's trigger row conflicts with the supports row"
+            "{mode}: the decomposes_to edge mints no factor; the supports row is the pair's"
         );
         let (both, n_both) = diagnose(&pool, &state, t.agent, mode).await;
         let gap = max_gap(&supports_only, &both);
@@ -649,33 +677,31 @@ async fn bp_parallel_supports_and_decomposes_to(pool: PgPool) {
              both={both:?}"
         );
 
-        // decomposes_to first: the pair's only factor is the decomposes_to
-        // one, which BP does not read, and the supports edge's trigger row is
-        // dropped by the conflict. BP is identical to the graph without the
-        // decomposes_to factor (the plan's property), which here has NO
-        // factor over the pair at all.
-        //
-        // KNOWN GAP, pinned: the supports relationship has no BP coupling in
-        // this order, unlike the order above. The trigger, not this PR, drops
-        // its row; a migration that stops the trigger minting decomposes_to
-        // factors closes it, and deleting this pair's decomposes_to row does
-        // not restore a supports factor.
+        // decomposes_to first: since 262 the decomposition takes no slot, so
+        // the supports edge created after it gets its own factor and BP reads
+        // the same coupling as in the order above (217's trigger gave the
+        // slot to the decomposes_to row, which BP skips, and the supports
+        // relationship had no coupling at all in this order).
         let t = tree(&pool).await;
         let (without, n_without) = diagnose(&pool, &state, t.agent, mode).await;
         decomposes_to(&pool, t.k, t.a).await;
+        let (dec_only, n_dec_only) = diagnose(&pool, &state, t.agent, mode).await;
+        assert!(
+            max_gap(&without, &dec_only) < SAME && n_dec_only == n_without,
+            "{mode} calibration: the decomposes_to edge alone adds nothing to BP"
+        );
         supports(&pool, t.a, t.k).await;
         assert_eq!(
             pair_factor_keys(&pool, t.k, t.a).await,
-            vec!["decomposes_to".to_string()],
-            "{mode}: the supports edge's trigger row conflicts with the decomposes_to row"
+            vec!["supports".to_string()],
+            "{mode}: with the decomposition created first, the supports edge still gets the \
+             pair's factor"
         );
         let (both, n_both) = diagnose(&pool, &state, t.agent, mode).await;
-        let gap = max_gap(&without, &both);
         assert!(
-            gap < SAME && n_both == n_without,
-            "{mode} decomposes_to first: known gap changed, BP now reads a coupling for the \
-             pair (moved by {gap}, {n_without} -> {n_both} factors); update this test and \
-             bp_readable_factor_sql's doc; without={without:?} both={both:?}"
+            max_gap(&without, &both) > 1e-4 && n_both == n_without + 1,
+            "{mode} decomposes_to first: BP must read the supports coupling \
+             ({n_without} -> {n_both} factors); without={without:?} both={both:?}"
         );
     }
 }

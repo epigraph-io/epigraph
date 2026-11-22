@@ -1308,9 +1308,10 @@ async fn unmark_leaves_the_canonicals_other_factors_as_it_found_them(pool: PgPoo
 /// `decomposes_to` factor, as a sweep of those would) stays without one, and a
 /// moved edge whose `(type, pair)` slot the canonical already holds leaves
 /// that slot's one factor as it was. A redundant copy the mark retracted gets
-/// none. A moved `decomposes_to` edge gets its trigger-shaped factor too, and
-/// BP's read of the canonical still leaves it out (`bp_readable_factor_sql`,
-/// #644): the mark must not put a decomposition back into BP.
+/// none. A moved `decomposes_to` edge gets NO factor (migration 262: the
+/// trigger mints none, and the re-mint is the trigger's body over a set), even
+/// when the duplicate held one minted before 262: the mark must not put a
+/// decomposition back into the factor graph.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_gives_the_canonical_a_factor_for_every_edge_it_inherits(pool: PgPool) {
     let (a, _) = fixture::seed_agent_with_group(&pool, "author").await;
@@ -1338,10 +1339,36 @@ async fn mark_gives_the_canonical_a_factor_for_every_edge_it_inherits(pool: PgPo
         .execute(&pool)
         .await
         .expect("remove the decomposition's factor");
+    assert!(
+        factor_rows(&pool, e_dup_dec).await.is_empty(),
+        "calibration: the trigger mints no factor for a decomposes_to edge (262)"
+    );
+    // The duplicate's decomposition as a database migrated before 262 holds
+    // it: the row 217's trigger minted, keyed to the edge.
+    let mut dup_pair = [dup, dup_atom];
+    dup_pair.sort();
+    sqlx::query(
+        "INSERT INTO factors (factor_type, variable_ids, potential, description, properties) \
+         VALUES ('directional_support', $1, $2, $3, $4)",
+    )
+    .bind(dup_pair.to_vec())
+    .bind(serde_json::json!({
+        "forward_strength": 0.0, "reverse_strength": 0.6, "source_var": dup.to_string()
+    }))
+    .bind(format!(
+        "Auto-generated from decomposes_to edge {e_dup_dec}"
+    ))
+    .bind(serde_json::json!({
+        "source_edge_id": e_dup_dec, "relationship": "decomposes_to",
+        "edge_source_id": dup, "edge_target_id": dup_atom
+    }))
+    .execute(&pool)
+    .await
+    .expect("seed the pre-262 decomposition factor");
 
     let moved = [e_in, e_out, e_con];
     let mut before = Vec::new();
-    for e in moved.iter().chain([&e_dup_dec]) {
+    for e in &moved {
         let rows = factor_rows(&pool, *e).await;
         assert_eq!(
             rows.len(),
@@ -1360,7 +1387,7 @@ async fn mark_gives_the_canonical_a_factor_for_every_edge_it_inherits(pool: PgPo
     let bp_view = epigraph_db::FactorRepository::get_for_claim(&pool, canonical)
         .await
         .expect("BP's read of the canonical");
-    for (e, old) in moved.iter().chain([&e_dup_dec]).zip(&before) {
+    for (e, old) in moved.iter().zip(&before) {
         let (source, target): (Uuid, Uuid) =
             sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
                 .bind(e)
@@ -1386,22 +1413,26 @@ async fn mark_gives_the_canonical_a_factor_for_every_edge_it_inherits(pool: PgPo
         let in_bp_view = bp_view
             .iter()
             .any(|f| f.properties["source_edge_id"] == serde_json::json!(e.to_string()));
-        if *e == e_dup_dec {
-            assert_eq!(
-                expected.4["relationship"], "decomposes_to",
-                "calibration: the inherited decomposition's factor is labelled as one"
-            );
-            assert!(
-                !in_bp_view,
-                "BP's read of the canonical leaves out the inherited decomposition's factor (#644)"
-            );
-        } else {
-            assert!(
-                in_bp_view,
-                "BP's read of the canonical sees inherited edge {e}'s factor"
-            );
-        }
+        assert!(
+            in_bp_view,
+            "BP's read of the canonical sees inherited edge {e}'s factor"
+        );
     }
+    let (dec_source, _): (Uuid, Uuid) =
+        sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+            .bind(e_dup_dec)
+            .fetch_one(&pool)
+            .await
+            .expect("edge");
+    assert_eq!(
+        dec_source, canonical,
+        "calibration: the mark moved the duplicate's decomposition onto the canonical"
+    );
+    assert!(
+        factor_rows(&pool, e_dup_dec).await.is_empty(),
+        "the mark re-minted a factor for the inherited decomposition; a decomposes_to edge \
+         gets none (262)"
+    );
     assert!(
         factor_rows(&pool, e_twin_dup).await.is_empty(),
         "the retracted redundant copy gets no factor"

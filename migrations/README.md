@@ -3403,6 +3403,24 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **262**: `stop_decomposes_to_factor_mint` (backlog 444b1f4a; atom-level belief SPEC §6.2,
+  D3). Re-states 217's `auto_create_factor_from_edge` (an md5 precondition refuses to apply
+  over any other body) with one addition: an early `RETURN NEW` for a `decomposes_to` edge, so
+  the edge trigger mints no BP factor for a decomposition. `edge_to_factor_type` is unchanged
+  (graph views, clustering and the atlas flow read it for edge weights). The dedup / supersede
+  cascades' set form of the body (`REGENERATE_EDGE_FACTORS_SQL`) skips `decomposes_to` in the
+  same change. Existing rows are NOT deleted here: the operator runs
+  `decomposes_to_factor_sweep` (epigraph-cli) on the maintenance DSN, which exports a manifest
+  of every factor `bp_readable_factor_sql` hides (keyed and legacy) and, with `--apply`,
+  deletes exactly those rows (`--restore <manifest>` re-inserts them). Owner and grants
+  unchanged. Pinned by `epigraph-db/tests/factor_repo_bp_readable.rs::trigger_mints_no_decomposes_to_factor`,
+  `unmark_duplicate.rs::mark_gives_the_canonical_a_factor_for_every_edge_it_inherits`,
+  `epigraph-api/tests/bp_atom_level_retire_apply.rs::bp_parallel_supports_and_decomposes_to`
+  and `epigraph-cli/tests/decomposes_to_factor_sweep.rs`. Undo: `docs/runbooks/262-undo.sql`
+  (re-states 217's body; swept rows come back only through `--restore`). **Deploy order:**
+  migrate; deploy the binaries (the cascade change); then `decomposes_to_factor_sweep
+  --manifest-out <file>` (dry run), review, `--manifest-out <new file> --apply`, and
+  `--remaining` must print 0.
 
 ## `-- no-transaction` migrations
 
