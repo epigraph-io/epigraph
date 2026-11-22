@@ -35,10 +35,19 @@
 //! `goal_embedding` is out: 212 does not cover it) assigned something other
 //! than `NULL` (the seal's own nulling is the admitted shape), where the line
 //! is SQL-shaped: a `SET ` precedes the assignment, or the right-hand side is a
-//! bind (`$n`) or a `::vector` cast. The enclosing function is the nearest
-//! preceding `fn` declaration; it ends at the next one. The calibration test
-//! pins that the four writers on this tree are all found, so a scanner that
-//! went blind fails rather than passes.
+//! bind (`$n`), a `::vector` cast, or a qualified column (`d.v`,
+//! `EXCLUDED.embedding`: the second assignment of a multi-row
+//! `UPDATE … FROM unnest(…)`, or an upsert's `DO UPDATE`, on which the trigger
+//! fires too) on a line that is not a Rust `let` or statement.
+//!
+//! Only writes into `claims` or `evidence` count (the tables 212 guards): the
+//! nearest `UPDATE <t>` / `INSERT INTO <t>` above the assignment names the
+//! target, and a spliced `{table}` (reembed) or no visible target at all counts
+//! conservatively. `entities.embedding` (never sealed) is therefore out.
+//!
+//! The enclosing function is the nearest preceding `fn` declaration; it ends
+//! at the next one. The calibration test pins that the four writers on this
+//! tree are all found, so a scanner that went blind fails rather than passes.
 
 use std::path::{Path, PathBuf};
 
@@ -130,13 +139,72 @@ fn writes_vector(line: &str) -> bool {
         if rhs.to_ascii_uppercase().starts_with("NULL") {
             continue;
         }
-        let sql_shaped =
-            line[..at].contains("SET ") || rhs.starts_with('$') || rhs.contains("::vector");
+        let sql_shaped = line[..at].contains("SET ")
+            || rhs.starts_with('$')
+            || rhs.contains("::vector")
+            || (qualified_column(rhs) && !line.contains("let ") && !rust_statement(line, rhs));
         if sql_shaped {
             return true;
         }
     }
     false
+}
+
+/// A Rust assignment statement (`embedding = other.field;`), not SQL text: it
+/// ends in `;` and the line holds no string delimiter.
+fn rust_statement(line: &str, rhs: &str) -> bool {
+    rhs.trim_end().ends_with(';') && !line.contains('"')
+}
+
+/// `ident.ident` at the start of `rhs` (`d.v`, `EXCLUDED.embedding`).
+fn qualified_column(rhs: &str) -> bool {
+    let ident = |s: &str| {
+        let n = s
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(s.len());
+        let first_ok = s
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        (first_ok && n > 0).then_some(n)
+    };
+    let Some(n) = ident(rhs) else { return false };
+    rhs[n..].strip_prefix('.').and_then(ident).is_some()
+}
+
+/// The table the statement around line `i` writes, from the nearest
+/// `UPDATE <t>` / `INSERT INTO <t>` at or above it within the function. An
+/// upsert's `DO UPDATE SET` names no table, so it is passed over in favour of
+/// the `INSERT INTO` above it.
+fn target_table(lines: &[&str], start: usize, i: usize) -> Option<String> {
+    for j in (start..=i).rev() {
+        let line = lines[j];
+        if is_comment(line) {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        let mut best: Option<(usize, String)> = None;
+        for kw in ["INSERT INTO ", "UPDATE "] {
+            for (pos, _) in upper.match_indices(kw) {
+                let rest = line[pos + kw.len()..].trim_start();
+                let rest = rest.strip_prefix("public.").unwrap_or(rest);
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '{' | '}')))
+                    .unwrap_or(rest.len());
+                let name = &rest[..end];
+                if name.is_empty() || name.eq_ignore_ascii_case("SET") {
+                    continue;
+                }
+                if best.as_ref().is_none_or(|(p, _)| pos > *p) {
+                    best = Some((pos, name.to_string()));
+                }
+            }
+        }
+        if let Some((_, name)) = best {
+            return Some(name);
+        }
+    }
+    None
 }
 
 fn scan_source(label: &str, text: &str) -> Vec<Writer> {
@@ -151,6 +219,16 @@ fn scan_source(label: &str, text: &str) -> Vec<Writer> {
             .and_then(|j| fn_name(lines[j]))
             .unwrap_or("<top level>");
         let start = start.unwrap_or(0);
+        let table = target_table(&lines, start, i);
+        let key = match table.as_deref() {
+            Some("claims") => Some("claim_encryption"),
+            Some("evidence") => Some("evidence_encryption"),
+            // Spliced (`{table}`) or not visible: count it, key either way.
+            Some(t) if t.starts_with('{') => None,
+            None => None,
+            // Another table (`entities`, `workflows`, …): 212 does not guard it.
+            Some(_) => continue,
+        };
         let end = (i + 1..lines.len())
             .find(|&j| fn_name(lines[j]).is_some())
             .unwrap_or(lines.len());
@@ -164,13 +242,6 @@ fn scan_source(label: &str, text: &str) -> Vec<Writer> {
         };
         let body = code(start, end);
         let before = code(start, i);
-        let key = if line.contains("UPDATE claims") {
-            Some("claim_encryption")
-        } else if line.contains("UPDATE evidence") {
-            Some("evidence_encryption")
-        } else {
-            None
-        };
         let literal = body.contains("NOT EXISTS")
             && match key {
                 Some(k) => body.contains(k),
@@ -279,11 +350,29 @@ async fn multi_row_unguarded(pool: &PgPool) {
     sqlx::query("UPDATE claims AS c SET \
                  embedding = v.vec::vector FROM unnest($1::uuid[], $2::text[]) AS v(id, vec)");
 }
+async fn multi_row_second_assignment(pool: &PgPool) {
+    sqlx::query("UPDATE claims AS c \
+                 SET labels = d.l, \
+                     embedding = d.v \
+                 FROM unnest($1::uuid[], $2::vector[], $3::text[]) AS d(id, v, l) \
+                 WHERE c.id = d.id");
+}
+async fn evidence_upsert(pool: &PgPool) {
+    sqlx::query("INSERT INTO evidence (id, embedding) VALUES ($1, $2::vector) \
+                 ON CONFLICT (id) DO UPDATE SET \
+                     embedding = EXCLUDED.embedding");
+}
+async fn entity_upsert(pool: &PgPool) {
+    sqlx::query("INSERT INTO entities (canonical_name, embedding) VALUES ($1, $2::vector) \
+                 ON CONFLICT DO UPDATE SET \
+                     embedding = EXCLUDED.embedding");
+}
 async fn not_writers(pool: &PgPool) {
     sqlx::query("UPDATE claims SET embedding = NULL, embedding_3072 = NULL WHERE id = $1");
     sqlx::query("UPDATE workflows SET goal_embedding = $1::vector WHERE id = $2");
     let embedding = provider.generate(text).await;
     row.embedding = Some(embedding);
+    embedding = other.field;
     if embedding == other {}
 }
 "#;
@@ -296,8 +385,8 @@ async fn not_writers(pool: &PgPool) {
     };
     assert_eq!(
         found.len(),
-        5,
-        "exactly the five writer fns are vector writes: {found:#?}"
+        7,
+        "exactly the seven claims/evidence writer fns are vector writes: {found:#?}"
     );
     assert!(!get("bare").has_predicate && !get("bare").locks_first);
     assert!(get("predicate_only").has_predicate && !get("predicate_only").locks_first);
@@ -307,4 +396,16 @@ async fn not_writers(pool: &PgPool) {
     );
     assert!(get("guarded").has_predicate && get("guarded").locks_first);
     assert!(!get("multi_row_unguarded").has_predicate);
+    assert!(
+        !get("multi_row_second_assignment").has_predicate,
+        "a vector that is not the first assignment of a multi-row UPDATE is found"
+    );
+    assert!(
+        !get("evidence_upsert").has_predicate && !get("evidence_upsert").locks_first,
+        "an upsert's DO UPDATE onto evidence is a vector write the trigger fires on"
+    );
+    assert!(
+        !found.iter().any(|w| w.site == "x.rs::entity_upsert"),
+        "entities are not sealed and not guarded by 212"
+    );
 }
