@@ -866,3 +866,100 @@ async fn a_root_never_attached_by_name_is_not_reattached(pool: PgPool) {
         "CONTROL"
     );
 }
+
+/// NOT "UNCHANGED" WHILE STILL OUT (review of 264). The root was never
+/// detached and the successor's copy chains through the root's live row, but
+/// the successor was also registered from a second parent the operator
+/// detached, so 195's walk keeps it out. The verb must not report
+/// `successor_unchanged` (its copies "already work"): it refuses `ROL04`
+/// naming that parent, and writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_successor_still_out_is_not_reported_unchanged(pool: PgPool) {
+    let (h, group) = attached_group_held(&pool, "Synthetic Restore Not Unchanged Team").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, root).await;
+    let s_key = identity_key();
+    let s = register_in(&pool, &s_key, Some(root), "g-job").await;
+    let p2 = register_in(&pool, &identity_key(), Some(root), "g-job").await;
+    assert_eq!(register_in(&pool, &s_key, Some(p2), "g-job").await, s);
+    assert_eq!(live_copies(&pool, s).await.len(), 1, "PREMISE: one copy");
+    assert_eq!(
+        detach_from_role(&pool, p2).await,
+        1,
+        "second parent detached"
+    );
+    assert_eq!(
+        resolves(&pool, s, group).await,
+        (false, false),
+        "PREMISE: 195's walk keeps it out"
+    );
+    assert_eq!(live_by_name(&pool, root).await, 1, "PREMISE: root live");
+
+    let before = footprint(&pool).await;
+    assert_refused(
+        &restore(&pool, root, s).await,
+        ROL04,
+        "descends from",
+        "a successor out through a detached second parent",
+    );
+    assert_eq!(footprint(&pool).await, before, "nothing written");
+    assert_eq!(resolves(&pool, s, group).await, (false, false), "still out");
+}
+
+/// THE ROOT'S RE-ATTACH IS AUDITED EVEN WHEN THE SUCCESSOR NEEDS NOTHING
+/// (review of 264). The successor was registered from the root while the
+/// root was detached (no copy then); the verb's re-attach of the root copies
+/// into its gap, so it is admitted without a restore. One
+/// `platform.role_successor_restored` row records that the verb attached the
+/// root, with outcome `successor_unchanged`; and likewise
+/// `successor_already_attached` for a successor already attached by name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_root_attached_for_a_successor_that_needs_nothing_is_audited(pool: PgPool) {
+    let (h, group) = attached_group_held(&pool, "Synthetic Restore Audit Team").await;
+    let root = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, root, h).await;
+    attach_to_role(&pool, root).await;
+    assert_eq!(detach_from_role(&pool, root).await, 1, "root detached");
+    let s = register_in(&pool, &identity_key(), Some(root), "g-job").await;
+    assert!(
+        live_copies(&pool, s).await.is_empty(),
+        "PREMISE: no copy from a detached root"
+    );
+
+    let out = restore(&pool, root, s).await.expect("the call");
+    assert_eq!(
+        steps(&out),
+        vec![("root_attached", root), ("successor_unchanged", s)],
+        "{out:?}"
+    );
+    assert_eq!(live_copies(&pool, s).await.len(), 1, "the follow's copy");
+    assert_eq!(resolves(&pool, s, group).await, (true, true), "admitted");
+    let events = restored_events(&pool, s).await;
+    assert_eq!(events.len(), 1, "the root's re-attach audited: {events:?}");
+    assert_eq!(events[0]["outcome"], "successor_unchanged");
+    assert_eq!(events[0]["root_attached_now"], true);
+    assert_eq!(
+        events[0]["root_attachment"],
+        out[0].2.expect("id").to_string()
+    );
+
+    // The same when the successor already holds a live row made by name.
+    let root2 = register_in(&pool, &identity_key(), None, "g-job-2").await;
+    link_to(&pool, root2, h).await;
+    attach_to_role(&pool, root2).await;
+    assert_eq!(detach_from_role(&pool, root2).await, 1, "root2 detached");
+    let s2 = register_in(&pool, &identity_key(), Some(root2), "g-job-2").await;
+    let s2_row = attach_to_role(&pool, s2).await;
+    let out = restore(&pool, root2, s2).await.expect("the second call");
+    assert_eq!(
+        steps(&out),
+        vec![("root_attached", root2), ("successor_already_attached", s2)],
+        "{out:?}"
+    );
+    assert_eq!(out[1].2, Some(s2_row), "its own row reported");
+    let events = restored_events(&pool, s2).await;
+    assert_eq!(events.len(), 1, "the root's re-attach audited: {events:?}");
+    assert_eq!(events[0]["outcome"], "successor_already_attached");
+    assert_eq!(events[0]["root_attached_now"], true);
+}

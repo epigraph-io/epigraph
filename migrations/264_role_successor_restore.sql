@@ -48,8 +48,12 @@
 --   (2) NOTHING TO DO. A successor that already holds a live row made by name
 --       is reported `successor_already_attached`; one whose copies covering
 --       the window all chain through LIVE rows (the root's follow just filled
---       its gap, or it was never cut off) is reported `successor_unchanged`.
---       Neither writes anything for the successor.
+--       its gap, or it was never cut off) is reported `successor_unchanged`,
+--       but only after the folder rule, the sticky rule and 195's walk of
+--       (3) found it admitted (a successor whose copy chains through live
+--       rows is still out when it descends from another detached identity:
+--       ROL04). Neither writes anything for the successor; when (1) attached
+--       the root, the audit row of (5) is written with that outcome.
 --   (3) WHO MAY BE RESTORED (refused ROL04 otherwise, nothing written). The
 --       attachment made by name skips 179's folder rule and ends 195's walk
 --       up the lineage, so the verb gives one only where a copy written
@@ -83,6 +87,8 @@
 --       restore it with its own call if it runs).
 --   (5) THE AUDIT. Each attach and detach writes 166's own security event.
 --       A restore writes one more, `platform.role_successor_restored`, naming
+--       the outcome (`restored`, or `successor_unchanged` /
+--       `successor_already_attached` when only the root was attached now),
 --       the role, the root and its row, the successor and its new row, the
 --       detached rows, the descendants left out, the reason and the login.
 --
@@ -231,6 +237,22 @@ BEGIN
         out_agent_id := p_successor;
         out_attachment_id := v_found;
         RETURN NEXT;
+        IF v_root_new THEN
+            INSERT INTO public.security_events (event_type, agent_id, success, details)
+            VALUES ('platform.role_successor_restored', p_successor, true,
+                    jsonb_build_object('outcome', 'successor_already_attached',
+                                       'role', p_role,
+                                       'root', p_root,
+                                       'root_attachment', v_root_row,
+                                       'root_attached_now', true,
+                                       'successor', p_successor,
+                                       'successor_attachment', v_found,
+                                       'detached', '[]'::jsonb,
+                                       'stale', '[]'::jsonb,
+                                       'descendants_still_out', '[]'::jsonb,
+                                       'reason', p_reason,
+                                       'recorded_by', session_user));
+        END IF;
         RETURN;
     END IF;
 
@@ -330,18 +352,11 @@ BEGIN
                   HINT = 'Nothing was written. Attach it by name with '
                          'epigraph_attach_agent_to_role if it is meant to be a member.';
     END IF;
-    IF cardinality(v_stale) = 0 THEN
-        -- Every covering copy already chains through live rows (e.g. the
-        -- root's follow just filled its gap): nothing to restore.
-        out_step := 'successor_unchanged';
-        out_agent_id := p_successor;
-        out_attachment_id := NULL;
-        RETURN NEXT;
-        RETURN;
-    END IF;
     -- 195's walk up `agent_succession`, through parents with no live row
     -- made by name (the root's row ends it): no identity reached but the
-    -- root may hold a detached row for the role.
+    -- root may hold a detached row for the role. Run BEFORE the "nothing to
+    -- do" answer below: a successor whose copy chains through live rows is
+    -- still out when it descends from another detached identity.
     WITH RECURSIVE rs_up (agent_id) AS (
         SELECT j FROM unnest(v_judged) AS j
         UNION
@@ -369,6 +384,33 @@ BEGIN
                         'undo it', p_successor, v_blocker, p_role, p_successor, p_root
             USING ERRCODE = 'ROL04',
                   HINT = 'Nothing was written.';
+    END IF;
+
+    IF cardinality(v_stale) = 0 THEN
+        -- Every covering copy already chains through live rows (e.g. the
+        -- root's follow just filled its gap) and the walk above reached no
+        -- detached identity: the successor is admitted, nothing to restore.
+        out_step := 'successor_unchanged';
+        out_agent_id := p_successor;
+        out_attachment_id := NULL;
+        RETURN NEXT;
+        IF v_root_new THEN
+            INSERT INTO public.security_events (event_type, agent_id, success, details)
+            VALUES ('platform.role_successor_restored', p_successor, true,
+                    jsonb_build_object('outcome', 'successor_unchanged',
+                                       'role', p_role,
+                                       'root', p_root,
+                                       'root_attachment', v_root_row,
+                                       'root_attached_now', true,
+                                       'successor', p_successor,
+                                       'successor_attachment', NULL,
+                                       'detached', '[]'::jsonb,
+                                       'stale', '[]'::jsonb,
+                                       'descendants_still_out', '[]'::jsonb,
+                                       'reason', p_reason,
+                                       'recorded_by', session_user));
+        END IF;
+        RETURN;
     END IF;
 
     -- (4) The act: retire the covering rows, attach the successor by name.
@@ -441,7 +483,8 @@ BEGIN
     -- (5) One audit row for the act, beside 166's per-row events.
     INSERT INTO public.security_events (event_type, agent_id, success, details)
     VALUES ('platform.role_successor_restored', p_successor, true,
-            jsonb_build_object('role', p_role,
+            jsonb_build_object('outcome', 'restored',
+                               'role', p_role,
                                'root', p_root,
                                'root_attachment', v_root_row,
                                'root_attached_now', v_root_new,
