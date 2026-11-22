@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
-    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StoredPasskey,
-    ACT_NONCE_LEN,
+    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StandingRefusal,
+    StoredPasskey, ACT_NONCE_LEN,
 };
 use support::{
     android_status, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
@@ -644,6 +644,205 @@ async fn a_certificate_listed_after_registration_stops_the_anchor() {
     assert_eq!(
         after.check_anchor(&anchor),
         Err(AnchorRefusal::AnchorNotAttested)
+    );
+}
+
+// =====================================================================
+// 16a43893: an assertion re-checks the Android key's standing
+// =====================================================================
+
+/// `path` rewritten with `list`, modified `age` ago: the operator's refresh
+/// job (or its failure) between two assertions.
+fn rewrite_status(path: &std::path::Path, list: &str, age: Duration) {
+    std::fs::write(path, list).expect("rewrite the status list");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the status list")
+        .set_modified(SystemTime::now() - age)
+        .expect("date the status list");
+}
+
+/// An Android passkey whose certificate is revoked AFTER it enrolled no
+/// longer asserts: `assertion_standing` re-reads the status list at every
+/// call. Its leaf (and, in a second passkey, its batch intermediate) listed
+/// on a fresh list is `NotInGoodStanding`; a list older than 48 hours, or
+/// missing, is `Unknown` (fail closed, as at enrollment); a fresh list that
+/// does not list it is Ok again. A row whose column says `none` over an
+/// `android-key` credential is still checked (the credential decides too),
+/// and refused as a mismatch. CALIBRATION: both register, and assert, under
+/// the empty list.
+/// Mutations: `assertion_standing` returning Ok -> every refusal passes;
+/// the status lookup given no serials -> the listed cases pass; the format
+/// decided by the row's column alone -> the mismatch case passes.
+#[tokio::test]
+async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
+    let google = TestAttestation::new("Android");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(None, Some(&google), Some(status.clone()), false);
+    let leaf = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let batch = AndroidKeyOpts {
+        intermediate: true,
+        intermediate_serial: Some(android_status::SUSPENDED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let (_, by_leaf) = android_registration(&rp, &google, &leaf).await;
+    let by_leaf = by_leaf.expect("CALIBRATION: registers under the empty list");
+    let (_, by_batch) = android_registration(&rp, &google, &batch).await;
+    let by_batch = by_batch.expect("CALIBRATION: registers under the empty list");
+    for reg in [&by_leaf, &by_batch] {
+        assert_eq!(reg.attestation_format, "android-key");
+        assert_eq!(
+            rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+            Ok(()),
+            "CALIBRATION: in good standing"
+        );
+    }
+
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    for (reg, expected) in [
+        (&by_leaf, "2c8cdddfd5e03bfc is REVOKED"),
+        (&by_batch, "c8966fcb2fbb0d7a is SUSPENDED"),
+    ] {
+        match rp.assertion_standing(&reg.passkey, &reg.attestation_format) {
+            Err(StandingRefusal::NotInGoodStanding(why)) => {
+                assert!(why.contains(expected), "{why}");
+            }
+            other => panic!("{expected}: {other:?}"),
+        }
+    }
+    // The row's column cannot opt the credential out of the check.
+    let refusal = rp.assertion_standing(&by_leaf.passkey, "none").unwrap_err();
+    assert_eq!(refusal.code(), "attestation_not_in_good_standing");
+
+    rewrite_status(
+        &status,
+        android_status::EMPTY,
+        Duration::from_secs(49 * 3600),
+    );
+    match rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format) {
+        Err(StandingRefusal::Unknown(why)) => assert!(why.contains("refresh"), "{why}"),
+        other => panic!("a stale list: {other:?}"),
+    }
+    std::fs::remove_file(&status).expect("remove the status list");
+    assert_eq!(
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format)
+            .map_err(|r| r.code()),
+        Err("attestation_status_unavailable")
+    );
+
+    rewrite_status(&status, android_status::EMPTY, Duration::ZERO);
+    assert_eq!(
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format),
+        Ok(()),
+        "a refreshed list that does not list it"
+    );
+}
+
+/// What the assertion re-check does NOT do. It does not hold an Android
+/// passkey to its certificates' validity periods (an attestation speaks for
+/// its registration; an expiry is not a revocation): a stored chain whose
+/// leaf expired yesterday is in good standing under a fresh list that does
+/// not list it, and refused under one that does. It does not touch other
+/// formats: a `packed` passkey asserts under a list naming nothing of it,
+/// and a `none` one too. And under the software policy, which trusts no
+/// attestation, an Android passkey with a listed certificate asserts.
+/// Mutations: the library's time checks left on in `android_key_serials`
+/// (or `chain_valid_at` called) -> the expired case is refused; the
+/// software-policy early return removed -> that case is `Unknown`.
+#[tokio::test]
+async fn the_assertion_recheck_is_about_standing_only() {
+    let google = TestAttestation::new("Android");
+    let att = TestAttestation::new("Allowlisted");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(
+        Some((&att, &[MODEL][..])),
+        Some(&google),
+        Some(status.clone()),
+        false,
+    );
+
+    // A registration whose response this test keeps, to splice an expired
+    // chain for the same key into its stored credential.
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let opts = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let reg = rp
+        .finish_registration(
+            &google.android_key_with(&auth, &created, true, &opts),
+            &state,
+        )
+        .expect("CALIBRATION: registers");
+    let now = now_unix();
+    let expired = with_stored_chain(
+        &reg,
+        &google.android_chain_der(
+            &auth,
+            &created,
+            &AndroidKeyOpts {
+                leaf_validity: Some((now - 30 * 86_400, now - 86_400)),
+                ..opts
+            },
+        ),
+    );
+    assert!(
+        rp.hardware_attested(&expired.passkey, "android-key", Uuid::nil(), false)
+            .is_err(),
+        "CALIBRATION: the spliced chain has expired"
+    );
+    assert_eq!(
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format),
+        Ok(())
+    );
+
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut hw = SoftAuthenticator::new(MODEL);
+    let packed = rp
+        .finish_registration(
+            &att.rewrap(&hw.register(ORIGIN, options, ClientUv::AsRequested).await),
+            &state,
+        )
+        .expect("CALIBRATION: an allowlisted packed key registers");
+    assert_eq!(packed.attestation_format, "packed");
+
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    assert_eq!(
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format)
+            .map_err(|r| r.code()),
+        Err("attestation_not_in_good_standing"),
+        "CALIBRATION: the expired chain's leaf is listed"
+    );
+    assert_eq!(
+        rp.assertion_standing(&packed.passkey, &packed.attestation_format),
+        Ok(())
+    );
+    let soft = software();
+    let (options, state) = soft.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut synced = SoftAuthenticator::new(MODEL);
+    let none = soft
+        .finish_registration(
+            &synced
+                .register(ORIGIN, options, ClientUv::AsRequested)
+                .await,
+            &state,
+        )
+        .expect("a synced passkey");
+    assert_eq!(none.attestation_format, "none");
+    assert_eq!(
+        rp.assertion_standing(&none.passkey, &none.attestation_format),
+        Ok(())
+    );
+    assert_eq!(
+        soft.assertion_standing(&reg.passkey, &reg.attestation_format),
+        Ok(()),
+        "the software policy trusts no attestation"
     );
 }
 
