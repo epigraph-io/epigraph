@@ -3403,6 +3403,29 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **257**: `operator_link_retire_owner_role` (backlog 9cec11f7). After 191 a maintenance
+  LOGIN inherited the maintenance role's UPDATE (retired) on `operator_links`, so it could
+  retire a link with a direct UPDATE that took no `epigraph.operator_links` advisory lock
+  (unserialised against the link writers and membership grants) and whose audit `via` /
+  reason came from a session-settable setting. Creates `epigraph_operator_link_retirer`
+  (NOLOGIN, a member of `epigraph_maintenance` only; an existing role with any elevated
+  attribute, LOGIN, another membership, or a non-superuser role able to act as it raises
+  55000), re-owns `epigraph_retire_operator_link` to it (EXECUTE still the maintenance role's
+  alone), and moves UPDATE (retired) from `epigraph_maintenance` to it: the verb is the only
+  non-superuser path, and a direct UPDATE is refused 42501. Re-bodies 191's
+  `epigraph_operator_links_retire_only` (md5 precondition): a non-superuser flip outside the
+  verb is refused (OLR05, 42501; the arm holds if the column is ever re-granted), and every
+  UPDATE outside the verb, a superuser's included, clears `epigraph.operator_link_retire`
+  before the audit trigger reads it, so an audit row's `via` / reason are the verb's or
+  `direct` with none. A superuser still retires directly (outside every guard), now always
+  audited `via = direct`. If the migrating login cannot create the role, grant it, or re-own
+  the verb (it must be a superuser), the file NOTICEs and keeps 191's owner and grants; the
+  guard's new arms stay off, and `tenancy_backfill verify` reports it as a FAIL
+  (`DEDICATED_OWNER_DEFINERS`). Pinned by `epigraph-db/tests/operator_link_retire.rs`,
+  `schema_contract.rs::migration_191_retire_operator_link_is_owned_and_granted` and
+  `operator_link_retire_owner_undo.rs`. Undo: `docs/runbooks/257-undo.sql`. **Deploy order:**
+  none against other migrations; apply as a superuser. **Applied to throwaway databases
+  only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

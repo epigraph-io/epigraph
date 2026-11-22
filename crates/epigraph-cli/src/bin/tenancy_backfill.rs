@@ -2324,6 +2324,80 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_oauth_assertion_nonce_consume", 213),
 ];
 
+/// Registered definers that a LATER migration re-owns from
+/// `epigraph_maintenance` to a dedicated NOLOGIN role that is itself a member
+/// of `epigraph_maintenance` (so [`verify_definer_ownership`]'s predicate
+/// still holds for them) and must be owned by EXACTLY that role at head:
+/// `(function, owner role, migration)`. [`verify_dedicated_definer_owners`]
+/// reports one that the migration could not re-own.
+const DEDICATED_OWNER_DEFINERS: &[(&str, &str, i64)] = &[
+    // 257 (backlog 9cec11f7): the retire verb runs as a role no login can act
+    // as, and only that role holds UPDATE (retired) on `operator_links`, so a
+    // maintenance login cannot retire a link directly and the table guard can
+    // tell the verb from any other statement. Left with `epigraph_maintenance`
+    // (257 could not create the role or re-own the verb; it NOTICEs and keeps
+    // 191's grants) the verb still works, but a maintenance login can retire a
+    // link directly, unserialised and with a forgeable audit `via` / reason:
+    // fail OPEN, which only this check reports.
+    (
+        "epigraph_retire_operator_link",
+        "epigraph_operator_link_retirer",
+        257,
+    ),
+];
+
+/// [`DEDICATED_OWNER_DEFINERS`] against the catalog. Returns the number of
+/// failing checks.
+///
+/// Whether the re-owning migration has run is read from the catalog, not from
+/// `_sqlx_migrations` (as [`applicable_definer_functions`]): 257 re-bodies
+/// `epigraph_operator_links_retire_only` to name its owner role, so a body
+/// that names the role is 257's. A database without it is NOTEd as unchecked.
+async fn verify_dedicated_definer_owners(pool: &PgPool) -> anyhow::Result<usize> {
+    let mut failures = 0usize;
+    for (name, role, version) in DEDICATED_OWNER_DEFINERS {
+        let applied: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_proc p
+                              JOIN pg_namespace n ON n.oid = p.pronamespace
+                             WHERE n.nspname = 'public'
+                               AND p.proname = 'epigraph_operator_links_retire_only'
+                               AND strpos(p.prosrc, $1) > 0)",
+        )
+        .bind(role)
+        .fetch_one(pool)
+        .await?;
+        if !applied {
+            eprintln!(
+                "NOTE: skipping the dedicated-owner check for public.{name}: migration \
+                 {version}, which re-owns it to {role}, has not been applied. Until it is, \
+                 this check is UNCHECKED, not passing."
+            );
+            continue;
+        }
+        let owners: Vec<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(p.proowner)::text
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'public' AND p.proname = $1
+              ORDER BY p.oid",
+        )
+        .bind(name)
+        .fetch_all(pool)
+        .await?;
+        if owners.is_empty() || owners.iter().any(|o| o != role) {
+            failures += 1;
+            eprintln!(
+                "FAIL: public.{name} is owned by {owners:?}, not '{role}'. Migration {version} \
+                 only NOTICEs when the migrating login cannot create that role, grant it \
+                 '{MAINTENANCE_ROLE}', or re-own the function (it must be a superuser), and then \
+                 keeps the previous owner and grants: the control is OFF. Provision the role \
+                 (NOLOGIN, a member of '{MAINTENANCE_ROLE}' only) and re-run migration \
+                 {version}'s last DO block as a superuser."
+            );
+        }
+    }
+    Ok(failures)
+}
+
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
 /// actually EXISTS on this database.
 ///
@@ -3538,6 +3612,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     let mut failures = 0usize;
 
     failures += verify_definer_ownership(pool).await?;
+    failures += verify_dedicated_definer_owners(pool).await?;
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
     failures += verify_role_holder_write_check_coverage(pool).await?;
@@ -3870,7 +3945,7 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 /// or an unqualified `epigraph_<f>(` (resolved on `search_path` public).
 #[cfg(test)]
 mod definer_register_tests {
-    use super::{DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS};
+    use super::{DEDICATED_OWNER_DEFINERS, DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
@@ -4336,11 +4411,39 @@ mod definer_register_tests {
         );
 
         let owned: BTreeSet<&str> = rows.iter().map(|(_, n, _)| n.as_str()).collect();
+        let dedicated: BTreeSet<&str> = DEDICATED_OWNER_DEFINERS
+            .iter()
+            .map(|(n, _, _)| *n)
+            .collect();
         let listed: BTreeSet<&str> = register()
             .into_iter()
             .chain(INVOKER_EXEMPT.iter().copied())
             .chain(PRE_REGISTER_DEFINERS.iter().copied())
+            .filter(|n| !dedicated.contains(n))
             .collect();
+        // A dedicated-owner definer is owned by EXACTLY its role at head (a
+        // silently no-opped re-own leaves it with epigraph_maintenance, which
+        // the `owned` equality below would then report as unlisted).
+        for (name, role, version) in DEDICATED_OWNER_DEFINERS {
+            assert!(
+                register().contains(name),
+                "DEDICATED_OWNER_DEFINERS names public.{name}, which is not registered"
+            );
+            let owners: Vec<String> = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = 'public' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_all(&pool)
+            .await
+            .expect("owner of a dedicated-owner definer");
+            assert!(
+                !owners.is_empty() && owners.iter().all(|o| o == role),
+                "public.{name} must be owned by {role} at head (migration {version}); found \
+                 {owners:?}"
+            );
+        }
         let unlisted: Vec<&&str> = owned.difference(&listed).collect();
         assert!(
             unlisted.is_empty(),
@@ -4421,6 +4524,38 @@ mod definer_register_tests {
                 "public.{name} is exempt as dropped by {version}, but {recreated:?} name it again"
             );
         }
+    }
+
+    /// Migration 257 (backlog 9cec11f7): `verify` reports a retire verb that
+    /// 257 could not re-own to its dedicated role (the NOTICE path: the verb
+    /// keeps working as `epigraph_maintenance`, and the direct-retire control
+    /// is silently off). CONTROL: at head it passes.
+    ///
+    /// Verified to fail: the check's owner comparison removed -> 0 failures
+    /// after the re-own back.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_retire_verb_257_could_not_reown(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_dedicated_definer_owners(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        sqlx::query(
+            "ALTER FUNCTION public.epigraph_retire_operator_link(uuid, text, boolean) \
+             OWNER TO epigraph_maintenance",
+        )
+        .execute(&pool)
+        .await
+        .expect("re-own the verb back");
+        assert_eq!(
+            super::verify_dedicated_definer_owners(&pool)
+                .await
+                .expect("check"),
+            1,
+            "a verb left with epigraph_maintenance is reported"
+        );
     }
 
     /// `verify`'s app-grant check runs as a PRE-FLIGHT, before later

@@ -14,9 +14,13 @@
 //!   agent still holds a live writer/admin row in the operator's group unless
 //!   asked to revoke it in the same act, refuses a registered system agent
 //!   (148's trigger), and reports an agent with no link without writing;
-//! * only a maintenance session may call it or flip the column, a maintenance
-//!   session can never un-retire or re-point a link, and the application role
-//!   can neither call it, write the column, nor forge its audit row.
+//! * only a maintenance session may call it, a maintenance session can never
+//!   un-retire or re-point a link, and the application role can neither call
+//!   it, write the column, nor forge its audit row;
+//! * since migration 257 (backlog 9cec11f7) the verb is the ONLY
+//!   non-superuser path: a maintenance login's direct UPDATE is refused
+//!   (the column belongs to the verb's own owner role), and an audit row's
+//!   `via` and reason come from the verb's arguments or not at all.
 //!
 //! Each test names the mutation it was verified against.
 
@@ -243,46 +247,83 @@ async fn the_verbs_audit_context_does_not_leak_to_a_later_retire(pool: PgPool) {
     assert!(rb[0].1["memberships_revoked"].is_null(), "{}", rb[0].1);
 }
 
-/// A maintenance login's DIRECT `UPDATE operator_links SET retired = true`
-/// (191 grants it the column, because the verb runs as that role) meets the
-/// verb's precondition on the table: while the agent still holds a live
-/// writer/admin row in the operator group it is refused (OLR03, 55000) and
-/// nothing changes, so a retired identity never keeps write authority there.
-/// Once that row is gone the same statement lands and is audited `via =
-/// direct`, naming the session, with no reason (the direct path carries none).
-///
-/// Verified to fail: the writer-row check removed from 191's
-/// `operator_links_retire_only` -> the first direct UPDATE lands with the
-/// writer row live.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_maintenance_direct_retire_needs_zero_write_authority(pool: PgPool) {
-    let (_, agent, group) = live_linked(&pool, "maint-direct").await;
-    assert_eq!(live_writer_rows(&pool, group, agent).await, 1, "PREMISE");
-    let direct = |pool: PgPool| async move {
-        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-            let r =
+/// A fresh NOSUPERUSER LOGIN in `epigraph_maintenance`, as operations
+/// provision one (the CLI tests' shape). Returns its name.
+async fn maintenance_login(pool: &PgPool) -> String {
+    let role = format!("olr_maint_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER IN ROLE epigraph_maintenance"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the maintenance login");
+    role
+}
+
+async fn drop_role(pool: &PgPool, role: &str) {
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(pool)
+        .await
+        .expect("drop role");
+}
+
+/// The verb's audit context, as a session would forge it before a direct
+/// UPDATE: claims the verb, with a reason the verb never saw.
+const FORGED_CONTEXT: &str =
+    r#"{"via": "epigraph_retire_operator_link", "reason": "forged", "memberships_revoked": 0}"#;
+
+/// `UPDATE operator_links SET retired = true` for `agent` as `role`, in one
+/// transaction that first forges the verb's audit context and, when
+/// `set_role` is given, `SET ROLE`s to it. Rolled back on error.
+async fn direct_retire_as(
+    pool: &PgPool,
+    role: &str,
+    set_role: Option<&'static str>,
+    agent: Uuid,
+) -> Result<u64, sqlx::Error> {
+    fixture::as_role(pool, role, |mut conn| async move {
+        let r = async {
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            sqlx::query("SELECT pg_catalog.set_config('epigraph.operator_link_retire', $1, true)")
+                .bind(FORGED_CONTEXT)
+                .execute(&mut *tx)
+                .await?;
+            if let Some(r) = set_role {
+                sqlx::query(&format!("SET LOCAL ROLE {r}"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            let n =
                 sqlx::query("UPDATE public.operator_links SET retired = true WHERE agent_id = $1")
                     .bind(agent)
-                    .execute(&mut *conn)
-                    .await;
-            (conn, r)
-        })
-        .await
-    };
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+            tx.commit().await?;
+            Ok(n)
+        }
+        .await;
+        (conn, r)
+    })
+    .await
+}
 
-    let before = footprint(&pool, agent).await;
-    let err = direct(pool.clone())
-        .await
-        .expect_err("a live writer row refuses the direct retire");
-    let db = err.as_database_error().expect("a database error");
-    assert_eq!(db.code().as_deref(), Some("55000"), "{db}");
-    assert!(db.message().starts_with("OLR03:"), "{}", db.message());
-    assert_eq!(
-        footprint(&pool, agent).await,
-        before,
-        "OLR03 changes nothing"
-    );
-
+/// Backlog 9cec11f7 (migration 257): a maintenance login can no longer retire
+/// a link with a direct UPDATE, however it is posed: as the login, after `SET
+/// ROLE epigraph_maintenance`, or as the maintenance role itself, each with
+/// the verb's audit context forged first and with the agent already holding
+/// zero write authority (so 191's OLR03 is not what refuses). Each is refused
+/// 42501 and nothing is written: no flip, no audit row. Before 257 every one
+/// of them landed, unserialised against the link writers (191 took no lock on
+/// that path), and audited `via = epigraph_retire_operator_link` with the
+/// forged reason. CONTROL: the verb on the same login still retires the link,
+/// audited with ITS reason and naming the login.
+///
+/// Verified to fail: 257 removed -> the first direct UPDATE lands (1 row) and
+/// its audit row claims the verb with the reason "forged".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_login_cannot_retire_a_link_directly(pool: PgPool) {
+    let (_, agent, group) = live_linked(&pool, "maint-direct").await;
     sqlx::query(
         "UPDATE group_memberships SET revoked_at = now() \
           WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
@@ -292,18 +333,135 @@ async fn a_maintenance_direct_retire_needs_zero_write_authority(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("the writer row is revoked first");
-    let done = direct(pool.clone())
+    assert_eq!(live_writer_rows(&pool, group, agent).await, 0, "PREMISE");
+    let login = maintenance_login(&pool).await;
+
+    let before = footprint(&pool, agent).await;
+    for (who, set_role) in [
+        (login.as_str(), None),
+        (login.as_str(), Some("epigraph_maintenance")),
+        ("epigraph_maintenance", None),
+    ] {
+        let r = direct_retire_as(&pool, who, set_role, agent).await;
+        let err = match r {
+            Ok(n) => {
+                let rows = retire_audit(&pool, agent).await;
+                drop_role(&pool, &login).await;
+                panic!(
+                    "{who} (SET ROLE {set_role:?}) retired the link directly ({n} row): {rows:?}"
+                )
+            }
+            Err(e) => e,
+        };
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("42501"),
+            "{who} (SET ROLE {set_role:?}): {err}"
+        );
+        assert_eq!(
+            footprint(&pool, agent).await,
+            before,
+            "{who}: a refused direct retire writes nothing"
+        );
+    }
+    assert_eq!(link_retired(&pool, agent).await, Some(false));
+    assert!(retire_audit(&pool, agent).await.is_empty());
+
+    let login_c = login.clone();
+    let done = retire_as(&pool, &login_c, agent, Some("the verb's reason"), false)
         .await
-        .expect("with zero write authority the direct retire lands");
-    assert_eq!(done.rows_affected(), 1);
-    assert_eq!(link_retired(&pool, agent).await, Some(true));
+        .expect("CONTROL: the verb retires the link on the same login");
+    drop_role(&pool, &login).await;
+    assert_eq!(done.0, "retired");
     let rows = retire_audit(&pool, agent).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    let (kind, d) = &rows[0];
-    assert_eq!(kind, "operator.link_retired");
-    assert_eq!(d["via"], serde_json::json!("direct"));
-    assert_eq!(d["recorded_by"], serde_json::json!("epigraph_maintenance"));
+    let d = &rows[0].1;
+    assert_eq!(d["via"], serde_json::json!("epigraph_retire_operator_link"));
+    assert_eq!(d["reason"], serde_json::json!("the verb's reason"));
+    assert_eq!(d["recorded_by"], serde_json::json!(login));
+}
+
+/// Backlog 9cec11f7 (migration 257): the audit's `via` and reason come from
+/// the verb's own arguments or not at all. A superuser (still outside every
+/// guard, and so still able to retire directly) that forges the verb's audit
+/// context before its direct UPDATE is recorded `via = direct` with no
+/// reason, never as the verb.
+///
+/// Verified to fail: 257 removed -> the row says `via =
+/// epigraph_retire_operator_link` with the reason "forged".
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_audit_context_is_recorded_as_a_direct_retire(pool: PgPool) {
+    let (_, agent, _) = live_linked(&pool, "forged").await;
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SELECT pg_catalog.set_config('epigraph.operator_link_retire', $1, true)")
+        .bind(FORGED_CONTEXT)
+        .execute(&mut *tx)
+        .await
+        .expect("forge the context");
+    sqlx::query("UPDATE operator_links SET retired = true WHERE agent_id = $1")
+        .bind(agent)
+        .execute(&mut *tx)
+        .await
+        .expect("a superuser retires the link directly");
+    tx.commit().await.expect("commit");
+
+    let rows = retire_audit(&pool, agent).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let d = &rows[0].1;
+    assert_eq!(d["via"], serde_json::json!("direct"), "{d}");
     assert!(d["reason"].is_null(), "{d}");
+    assert!(d["memberships_revoked"].is_null(), "{d}");
+}
+
+/// Backlog 9cec11f7 (migration 257), defence in depth: the table guard, not
+/// only the missing grant, keeps the direct path shut. With UPDATE (retired)
+/// re-granted to the maintenance role on this database (a later migration or
+/// a hand grant could do it), its direct retire is still refused by the guard
+/// (OLR05, 42501), and an un-retire by OLR04, with nothing written.
+///
+/// Verified to fail: 257's OLR05 arm removed from
+/// `epigraph_operator_links_retire_only` -> the re-granted direct retire lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_regranted_column_does_not_reopen_the_direct_retire(pool: PgPool) {
+    let (_, agent, group) = live_linked(&pool, "regrant").await;
+    let (_, retired, _) = live_linked(&pool, "regrant-retired").await;
+    retire_as(&pool, "epigraph_maintenance", retired, Some("x"), true)
+        .await
+        .expect("the verb retires the second link");
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(group)
+    .bind(agent)
+    .execute(&pool)
+    .await
+    .expect("the writer row is revoked first");
+    sqlx::query("GRANT UPDATE (retired) ON public.operator_links TO epigraph_maintenance")
+        .execute(&pool)
+        .await
+        .expect("re-grant the column on this database");
+
+    let before = footprint(&pool, agent).await;
+    let err = direct_retire_as(&pool, "epigraph_maintenance", None, agent)
+        .await
+        .expect_err("the guard refuses a direct retire");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+    assert!(err.to_string().contains("OLR05"), "{err}");
+    assert_eq!(footprint(&pool, agent).await, before);
+
+    let err = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query("UPDATE public.operator_links SET retired = false WHERE agent_id = $1")
+            .bind(retired)
+            .execute(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect_err("the guard refuses an un-retire");
+    assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{err}");
+    assert!(err.to_string().contains("OLR04"), "{err}");
+    assert_eq!(link_retired(&pool, retired).await, Some(true));
 }
 
 /// The verb, on a maintenance session (`session_user` = the NOSUPERUSER
@@ -491,14 +649,14 @@ async fn the_application_role_cannot_retire_or_forge_the_audit(pool: PgPool) {
 }
 
 /// A retired link is permanent and a link is never re-pointed: a maintenance
-/// session's direct UPDATE that un-retires (OLR04) or re-points (no column
-/// grant) a link is refused 42501 and changes nothing. (191 lets the same
-/// session flip `retired` to true only once the agent holds no live
-/// writer/admin row in the operator group: see
-/// `a_maintenance_direct_retire_needs_zero_write_authority`.)
+/// session's direct UPDATE that un-retires or re-points a link is refused
+/// 42501 and changes nothing. Since 257 the maintenance role holds no UPDATE
+/// on the table at all, so the privilege check refuses both before 191's
+/// guard runs; `a_regranted_column_does_not_reopen_the_direct_retire` pins
+/// the guard's own OLR04 / OLR05 arms with the column re-granted.
 ///
-/// Verified to fail: 191's `operator_links_retire_only` trigger dropped -> the
-/// un-retire lands.
+/// Verified to fail: 191's `operator_links_retire_only` trigger dropped and
+/// 257 removed -> the un-retire lands.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_maintenance_session_cannot_unretire_or_repoint_a_link(pool: PgPool) {
     let (_, agent, _) = live_linked(&pool, "permanent").await;
@@ -528,9 +686,6 @@ async fn a_maintenance_session_cannot_unretire_or_repoint_a_link(pool: PgPool) {
         .await
         .expect_err("the link row is retire-only");
         assert_eq!(sqlstate(&err).as_deref(), Some("42501"), "{what}: {err}");
-        if what == "un-retire" {
-            assert!(err.to_string().contains("OLR04"), "{err}");
-        }
     }
     assert_eq!(footprint(&pool, agent).await, before);
 }
