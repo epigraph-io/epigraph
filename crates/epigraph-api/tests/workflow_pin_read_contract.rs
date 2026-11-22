@@ -61,10 +61,13 @@
 //!   a G-private claim and its `executes` edge: the GUCs are session
 //!   settings, not credentials, so a session on the application role reads
 //!   whichever group it names.
-//! * (h) The same role can `UPDATE workflows` (truth and the submitter key) of
-//!   a row it reads: migration 183's row security admits an UPDATE of any
-//!   readable row (a public one here) and guards only the tenancy columns. A
-//!   rewritten submitter is then honoured by the workflow authority gate.
+//! * (h) Since migration 237 the same role, unstamped, can no longer `UPDATE
+//!   workflows` (truth and the submitter key) of a row it only reads: an
+//!   UPDATE reaches a row only for a writer of its owner group. Until 237,
+//!   183's row security admitted an UPDATE of any readable row, and a
+//!   rewritten submitter was then honoured by the workflow authority gate.
+//!   (A session that also names a writable group in its own GUCs, as in (g),
+//!   is not stopped by row security; that is the GUC trust, not this rule.)
 //! * Outcome report (as changed by #632, then by the visibility gate): `POST
 //!   /api/v1/workflows/hierarchical/:id/outcome` needs `claims:write`; on a
 //!   group-private plan a member's report resolves the steps, and a
@@ -1331,14 +1334,15 @@ async fn an_app_role_session_that_sets_the_group_guc_reads_the_private_plan(pool
     );
 }
 
-/// (h) CHARACTERIZATION. `workflows`' row security (migration 183) admits an
-/// UPDATE of any row the session reads: the application role rewrites a
-/// public workflow's truth and its recorded submitter, and the workflow
-/// authority gate then honours the rewritten submitter (it reads the row).
-/// The original submitter keeps its edit through the owner-group writer arm
-/// alone: it writes the row's owner group.
+/// (h) CHARACTERIZATION (as changed by migration 237, backlog 524f89c1). Until
+/// 237, `workflows`' row security (183) admitted an UPDATE of any row the
+/// session reads: the application role rewrote a public workflow's truth and
+/// its recorded submitter, and the workflow authority gate then honoured the
+/// rewritten submitter. 237 admits an UPDATE only from a writer of the row's
+/// owner group, so the application role's rewrite reaches no row, the
+/// submitter stays the curator, and the other agent is still refused.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
+async fn the_app_role_no_longer_rewrites_workflow_truth_or_submitter(pool: PgPool) {
     let (curator, curator_own) =
         fixture::seed_agent_with_group(&pool, "workflow-plan-curator").await;
     let (other, _) = fixture::seed_agent_with_group(&pool, "workflow-plan-other").await;
@@ -1362,7 +1366,7 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
                 .bind(wf)
                 .execute(&mut *conn)
                 .await
-                .expect("the app role updates workflows.truth_value")
+                .expect("the app role's truth UPDATE runs")
                 .rows_affected();
             let s = sqlx::query(
                 "UPDATE workflows SET metadata = jsonb_set(metadata, '{epigraph_submitted_by}', \
@@ -1372,12 +1376,16 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
             .bind(other.to_string())
             .execute(&mut *conn)
             .await
-            .expect("the app role rewrites the submitter")
+            .expect("the app role's submitter UPDATE runs")
             .rows_affected();
             (conn, (t, s))
         })
         .await;
-    assert_eq!((truth_rows, submitter_rows), (1, 1));
+    assert_eq!(
+        (truth_rows, submitter_rows),
+        (0, 0),
+        "the application role reaches no workflow row it does not write"
+    );
 
     let (status, body) = api
         .get(
@@ -1386,27 +1394,23 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["truth_value"].as_f64(), Some(0.05));
+    assert_ne!(body["truth_value"].as_f64(), Some(0.05), "{body}");
     assert_eq!(
         body["properties"]["epigraph_submitted_by"],
-        json!(other.to_string())
+        json!(curator.to_string())
     );
     let (s, b) = api
         .add_step(&token(other, WRITE_SCOPES), name, "other agent, after")
         .await;
     assert_eq!(
         s,
-        StatusCode::OK,
-        "the rewritten submitter passes the gate: {b}"
+        StatusCode::FORBIDDEN,
+        "the other agent is still refused: {b}"
     );
     let (s, b) = api
         .add_step(&token(curator, WRITE_SCOPES), name, "curator, after")
         .await;
-    assert_eq!(
-        s,
-        StatusCode::OK,
-        "the original submitter writes the row's owner group: {b}"
-    );
+    assert_eq!(s, StatusCode::OK, "the curator is still its submitter: {b}");
     let arm: Option<String> = sqlx::query_scalar(
         "SELECT details->>'arm' FROM security_events \
           WHERE event_type = 'workflows.caller_write' AND details->>'workflow_id' = $1::text \
@@ -1417,7 +1421,7 @@ async fn the_app_role_rewrites_workflow_truth_and_submitter(pool: PgPool) {
     .fetch_optional(&pool)
     .await
     .expect("the curator's provenance row");
-    assert_eq!(arm.as_deref(), Some("owner_group_writer"));
+    assert_eq!(arm.as_deref(), Some("submitter"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
