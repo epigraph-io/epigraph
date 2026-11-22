@@ -5732,6 +5732,362 @@ async fn at_the_present_every_committed_detach_counts(pool: PgPool) {
     );
 }
 
+// The present at every other site 249 reads a record's time. Each test opens
+// a transaction G, lets another session commit a record while G is open (its
+// timestamp is that session's start, later than G's `now()`), and asks again
+// in G at `now()`: the record counts, exactly as under 195. Each site's
+// present clause, reverted alone, fails its test here. CONTROL in each:
+// asked afterwards about G's start, now a past instant, the answer is the
+// record's.
+
+/// `(the derivation at now() admits, the viewer's group set has)` the group,
+/// asked on the open transaction `conn`.
+async fn present_in(conn: &mut sqlx::PgConnection, agent: Uuid, group: Uuid) -> (bool, bool) {
+    sqlx::query_as(
+        "SELECT EXISTS (SELECT 1 FROM public.epigraph_role_derived_memberships($1, now()) \
+                         WHERE group_id = $2), \
+                EXISTS (SELECT 1 FROM public.epigraph_live_memberships($1) \
+                         WHERE group_id = $2)",
+    )
+    .bind(agent)
+    .bind(group)
+    .fetch_one(conn)
+    .await
+    .expect("the present, in the open transaction")
+}
+
+/// The open transaction's `now()`, as text.
+async fn began_in(conn: &mut sqlx::PgConnection) -> String {
+    sqlx::query_scalar("SELECT now()::text")
+        .fetch_one(conn)
+        .await
+        .expect("now()")
+}
+
+/// Whether `agent` holds a row for ROLE detached after `at`.
+async fn detached_after(pool: &PgPool, agent: Uuid, at: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM role_agents WHERE agent_id = $1 AND role = $2 \
+                           AND detached_at > $3::timestamptz)",
+    )
+    .bind(agent)
+    .bind(ROLE)
+    .bind(at)
+    .fetch_one(pool)
+    .await
+    .expect("detached rows")
+}
+
+/// THE STICKY READ (`dd`). Q is attached by name; X and B are registered
+/// below it (copies of Q's row), and B again with X as a second parent. G
+/// opens and B holds the group. The operator detaches X's copy, which B's
+/// chain never passes: only the lineage walk reaches X. Asked in G at its
+/// own `now()`, B is out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn at_the_present_a_detach_reached_only_by_the_lineage_walk_counts(pool: PgPool) {
+    let (h, _) = human(&pool, "t249-present-dd-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Present Sticky Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let q_row = live_attachment(&pool, q).await;
+    let x = register_in(&pool, &identity_key(), Some(q), "g-job").await;
+    let b_key = identity_key();
+    let b = register_in(&pool, &b_key, Some(q), "g-job").await;
+    assert_eq!(register_in(&pool, &b_key, Some(x), "g-job").await, b);
+    assert_eq!(
+        copy_source(&pool, b).await,
+        Some(q_row),
+        "PREMISE: B's copy is chained through Q's row, not X's"
+    );
+
+    let mut g = pool.begin().await.expect("begin");
+    let began = began_in(&mut g).await;
+    assert_eq!(
+        present_in(&mut g, b, group).await,
+        (true, true),
+        "PREMISE: in G, B holds the group"
+    );
+    assert_eq!(
+        detach_from_role(&pool, ROLE, x).await,
+        1,
+        "X's copy detached"
+    );
+    assert!(
+        detached_after(&pool, x, &began).await,
+        "PREMISE: X's detach is dated after G's now()"
+    );
+    assert_eq!(
+        attachment_rows(&pool, b).await,
+        (1, 1),
+        "PREMISE: B's own copy is not detached"
+    );
+    assert_eq!(
+        present_in(&mut g, b, group).await,
+        (false, false),
+        "in G at now(), a detach committed after G began and reached only by the lineage \
+         walk cuts B off (the sticky read's present clause)"
+    );
+    g.rollback().await.expect("rollback");
+    assert_eq!(
+        derived_at(&pool, b, group, &began).await,
+        1,
+        "CONTROL: G's start, asked about later, is answered from the record"
+    );
+}
+
+/// THE SUCCESSION (`succ`). X was attached by name and detached; Q is
+/// attached by name and B registered below it. G opens and B holds the
+/// group. The host then registers B again with X as its parent. Asked in G at
+/// its own `now()`, B is out: the walk follows the succession attested after
+/// G began and reaches the detached X.
+#[sqlx::test(migrations = "../../migrations")]
+async fn at_the_present_a_succession_attested_while_the_transaction_is_open_counts(pool: PgPool) {
+    let (h, _) = human(&pool, "t249-present-succ-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Present Succession Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let x = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, x, h).await;
+    attach_to_role(&pool, ROLE, x).await;
+    assert_eq!(detach_from_role(&pool, ROLE, x).await, 1, "X detached");
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let b_key = identity_key();
+    let b = register_in(&pool, &b_key, Some(q), "g-job").await;
+    assert_eq!(attachment_rows(&pool, b).await, (1, 1), "PREMISE: B's copy");
+
+    let mut g = pool.begin().await.expect("begin");
+    let began = began_in(&mut g).await;
+    assert_eq!(
+        present_in(&mut g, b, group).await,
+        (true, true),
+        "PREMISE: in G, B holds the group"
+    );
+    assert_eq!(register_in(&pool, &b_key, Some(x), "g-job").await, b);
+    let attested_after: bool = sqlx::query_scalar(
+        "SELECT attested_at > $3::timestamptz FROM agent_succession \
+          WHERE child_agent_id = $1 AND parent_agent_id = $2",
+    )
+    .bind(b)
+    .bind(x)
+    .bind(&began)
+    .fetch_one(&pool)
+    .await
+    .expect("the succession X then B");
+    assert!(
+        attested_after,
+        "PREMISE: X then B is attested after G's now()"
+    );
+    assert_eq!(
+        present_in(&mut g, b, group).await,
+        (false, false),
+        "in G at now(), a succession attested after G began counts: B descends from the \
+         detached X"
+    );
+    g.rollback().await.expect("rollback");
+    assert_eq!(
+        derived_at(&pool, b, group, &began).await,
+        1,
+        "CONTROL: G's start, asked about later, is answered from the record"
+    );
+}
+
+/// BOTH HOP SITES (`hop`). Q is attached by name. M holds a hand-written copy
+/// of Q's row (one hop: the chain's anchor is Q's row). P holds a hand-written
+/// copy of Q's row and N one of P's copy (two hops: Q's row is reached by the
+/// recursive step). No succession joins them, so the lineage walk never
+/// reaches Q. G opens and M and N hold the group. The operator detaches Q.
+/// Asked in G at its own `now()`, M and N are out, although their own copies
+/// (and P's) are not detached.
+#[sqlx::test(migrations = "../../migrations")]
+async fn at_the_present_a_detach_of_a_hop_counts_at_both_hop_sites(pool: PgPool) {
+    let (h, _) = human(&pool, "t249-present-hop-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Present Hop Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let q_row = live_attachment(&pool, q).await;
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let id = register_in(&pool, &identity_key(), None, "g-job").await;
+        link_to(&pool, id, h).await;
+        held.push(id);
+    }
+    let (m, p, n) = (held[0], held[1], held[2]);
+    hand_copy_of(&pool, m, q_row).await;
+    let p_row = hand_copy_of(&pool, p, q_row).await;
+    hand_copy_of(&pool, n, p_row).await;
+    assert_eq!(
+        copy_source(&pool, n).await,
+        Some(p_row),
+        "PREMISE: N's copy names P's copy (Q's row two hops up)"
+    );
+
+    let mut g = pool.begin().await.expect("begin");
+    let began = began_in(&mut g).await;
+    assert_eq!(
+        [
+            present_in(&mut g, m, group).await,
+            present_in(&mut g, n, group).await,
+        ],
+        [(true, true), (true, true)],
+        "PREMISE: in G, M and N hold the group"
+    );
+    assert_eq!(detach_from_role(&pool, ROLE, q).await, 1, "Q detached");
+    assert!(
+        detached_after(&pool, q, &began).await,
+        "PREMISE: Q's detach is dated after G's now()"
+    );
+    for (id, l) in [(m, "M"), (p, "P"), (n, "N")] {
+        assert_eq!(
+            attachment_rows(&pool, id).await,
+            (1, 1),
+            "PREMISE: {l}'s copy is not detached"
+        );
+    }
+    assert_eq!(
+        present_in(&mut g, m, group).await,
+        (false, false),
+        "in G at now(), Q's detach counts at the anchor hop (M)"
+    );
+    assert_eq!(
+        present_in(&mut g, n, group).await,
+        (false, false),
+        "in G at now(), Q's detach counts at the recursive hop (N)"
+    );
+    g.rollback().await.expect("rollback");
+    assert_eq!(
+        [
+            derived_at(&pool, m, group, &began).await,
+            derived_at(&pool, n, group, &began).await,
+        ],
+        [1, 1],
+        "CONTROL: G's start, asked about later, is answered from the record"
+    );
+}
+
+/// A ROW MADE BY NAME WRITTEN WHILE THE TRANSACTION IS OPEN (`ra`'s and
+/// `dr`'s `created_at`). J holds a copy of Q's row (Q attached by name) and is
+/// also registered below R, whose parent A is detached, so the walk up from J
+/// passes R and reaches A: J is out. G opens. The operator attaches R by name,
+/// its window opening 30 seconds back (before G's `now()`), written after G
+/// began. Asked in G at its own `now()`, R is in (its own row counts) and so
+/// is J (R's row ends the walk).
+#[sqlx::test(migrations = "../../migrations")]
+async fn at_the_present_a_row_made_by_name_written_while_the_transaction_is_open_counts(
+    pool: PgPool,
+) {
+    let (h, _) = human(&pool, "t249-present-created-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Present Created Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let a = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    let r = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let j_key = identity_key();
+    let j = register_in(&pool, &j_key, Some(q), "g-job").await;
+    assert_eq!(register_in(&pool, &j_key, Some(r), "g-job").await, j);
+    assert_eq!(attachment_rows(&pool, j).await, (1, 1), "PREMISE: J's copy");
+
+    let mut g = pool.begin().await.expect("begin");
+    let began = began_in(&mut g).await;
+    assert_eq!(
+        [
+            present_in(&mut g, r, group).await,
+            present_in(&mut g, j, group).await,
+        ],
+        [(false, false), (false, false)],
+        "PREMISE: in G, R (no row) and J (below the detached A) are out"
+    );
+    attach_dated_back(&pool, r, 30).await;
+    assert!(
+        opens_before_but_written_after(&pool, r, &began).await,
+        "PREMISE: R's row made by name opens before G's now() and was written after it"
+    );
+    assert_eq!(
+        present_in(&mut g, r, group).await,
+        (true, true),
+        "in G at now(), R's own row written after G began counts"
+    );
+    assert_eq!(
+        present_in(&mut g, j, group).await,
+        (true, true),
+        "in G at now(), R's row written after G began ends the walk up from J"
+    );
+    g.rollback().await.expect("rollback");
+    assert_eq!(
+        [
+            derived_at(&pool, r, group, &began).await,
+            derived_at(&pool, j, group, &began).await,
+        ],
+        [0, 0],
+        "CONTROL: G's start, asked about later, is answered from the record"
+    );
+}
+
+/// A DETACH OF THE ROW THAT ENDS THE WALK (`dr`'s `detached_at`). A was
+/// attached by name and detached; R registered below it and was then attached
+/// by name. J holds a copy of Q's row (Q attached by name) and is also
+/// registered below R. R's row made by name ends the walk up from J, so J is
+/// in. G opens. The operator detaches R. Asked in G at its own `now()`, J is
+/// out: R's row no longer ends the walk, which reaches R's and A's detached
+/// rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn at_the_present_a_detach_of_the_row_that_ended_the_walk_counts(pool: PgPool) {
+    let (h, _) = human(&pool, "t249-present-ends-h").await;
+    let (group, _) = attached_group(&pool, "Synthetic Present Ends Walk Team", "writer").await;
+    grant(&pool, ROLE, h, 0, None).await;
+    let a = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, a, h).await;
+    attach_to_role(&pool, ROLE, a).await;
+    assert_eq!(detach_from_role(&pool, ROLE, a).await, 1, "A detached");
+    let r = register_in(&pool, &identity_key(), Some(a), "g-job").await;
+    attach_to_role(&pool, ROLE, r).await;
+    let q = register_in(&pool, &identity_key(), None, "g-job").await;
+    link_to(&pool, q, h).await;
+    attach_to_role(&pool, ROLE, q).await;
+    let q_row = live_attachment(&pool, q).await;
+    let j_key = identity_key();
+    let j = register_in(&pool, &j_key, Some(q), "g-job").await;
+    assert_eq!(register_in(&pool, &j_key, Some(r), "g-job").await, j);
+    assert_eq!(
+        (attachment_rows(&pool, j).await, copy_source(&pool, j).await),
+        ((1, 1), Some(q_row)),
+        "PREMISE: J holds one copy, chained through Q's row"
+    );
+
+    let mut g = pool.begin().await.expect("begin");
+    let began = began_in(&mut g).await;
+    assert_eq!(
+        present_in(&mut g, j, group).await,
+        (true, true),
+        "PREMISE: in G, J holds the group (R's row ends the walk)"
+    );
+    assert_eq!(detach_from_role(&pool, ROLE, r).await, 1, "R detached");
+    assert!(
+        detached_after(&pool, r, &began).await,
+        "PREMISE: R's detach is dated after G's now()"
+    );
+    assert_eq!(
+        present_in(&mut g, j, group).await,
+        (false, false),
+        "in G at now(), R's row detached after G began no longer ends the walk up from J"
+    );
+    g.rollback().await.expect("rollback");
+    assert_eq!(
+        derived_at(&pool, j, group, &began).await,
+        1,
+        "CONTROL: G's start, asked about later, is answered from the record"
+    );
+}
+
 /// THE DERIVATION STAYS CHEAP TO PLAN. 249 reads the row asked about whether
 /// or not it is detached, which 166's partial index (un-detached rows only)
 /// cannot serve. Without 249's plain `(agent_id, role)` index the planner's
