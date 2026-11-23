@@ -3680,7 +3680,10 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// keeps every fragment below (and adds its own to this list). 235 re-states
 /// `epigraph_live_memberships` (the personal-group lapse) and 164's
 /// `epigraph_team_group_add_member` (the personal-group arm); their fragments
-/// are pinned here too.
+/// are pinned here too. 236 moves the live-membership body, verbatim, into the
+/// maintenance-only `epigraph_live_memberships_unbound`, and makes
+/// `epigraph_live_memberships` the twin's rows for the session principal only;
+/// the fragments follow the body, and the bind is pinned on the bound read.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3697,6 +3700,14 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
         ),
         (
             "public.epigraph_live_memberships(uuid)",
+            &[
+                // 236: the twin's rows, for the session principal only.
+                "public.epigraph_live_memberships_unbound(p_agent)",
+                "p_agent = public.epigraph_principal_id()",
+            ][..],
+        ),
+        (
+            "public.epigraph_live_memberships_unbound(uuid)",
             &[
                 // 164's verb-made-group conjunct.
                 "did:epigraph:group:%",

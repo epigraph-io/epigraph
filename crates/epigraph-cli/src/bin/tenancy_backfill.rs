@@ -1720,6 +1720,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // CLOSED and SILENTLY the same way: no team is added to an operated
     // agent's read set. The owner is load-bearing.
     ("epigraph_readable_teams", 234),
+    // 236, the unbound live-membership read (235's body, moved out of
+    // `epigraph_live_memberships`, which now answers for the session principal
+    // only and reads through this). It reads `group_memberships` and `groups`
+    // (FORCEd) for an agent that need not be the stamped principal: under a
+    // non-member owner both reads are filtered, so every viewer resolves to
+    // public-only and the two team lists answer "no team" (loud for reads,
+    // silent for defaults, fail-closed). The owner is load-bearing.
+    ("epigraph_live_memberships_unbound", 236),
     // 206's default-team write changes only the principal's own `agents` row
     // and writes a principal-attributed audit row, both of which 077 admits
     // for any owner, and its authority check goes through the read above, so a
@@ -2924,6 +2932,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_readable_teams",
             "public.epigraph_readable_teams(uuid)",
             true,
+        ),
+        // 236: the unbound live-membership read answers for ANY agent, so the
+        // request DSN must never execute it (that is the whole of 236); only
+        // maintenance-owned definers and the maintenance DSN call it.
+        (
+            "epigraph_live_memberships_unbound",
+            "public.epigraph_live_memberships_unbound(uuid)",
+            false,
         ),
         (
             "epigraph_default_group",
