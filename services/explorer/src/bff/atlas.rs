@@ -95,7 +95,7 @@ pub const ROUTE_BUDGET_FACTOR: f64 = 1.5;
 /// Page size range of the U5 and U4 list routes.
 const PAGE_MAX: u32 = 200;
 const MAX_REL_TOKENS: usize = 12;
-const MAX_REL_CHARS: usize = 40;
+pub(crate) const MAX_REL_CHARS: usize = 40;
 /// Long enough for U5's unplaced-theme cursor `lu1.<base64url label>.<hex>`:
 /// a 200-char label of 4-byte chars is 800 bytes, 1,067 base64url chars, so
 /// the whole token is at most 1,104.
@@ -186,7 +186,7 @@ pub(crate) fn clip(s: &str, max: usize) -> (String, bool) {
     }
 }
 
-fn finite(v: Option<f64>) -> Option<f64> {
+pub(crate) fn finite(v: Option<f64>) -> Option<f64> {
     v.filter(|x| x.is_finite())
 }
 
