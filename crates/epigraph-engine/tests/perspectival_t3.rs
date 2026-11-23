@@ -1,20 +1,23 @@
 //! T3 — the engine adjudicates the adversarial loop's AGENT-GATHERED BBAs.
 //!
 //! Takes the v2 workflow's prove/refute BBAs (already lens-applied by each
-//! perspective's agents), RECORDS them into the dev DB, then combines them with the
-//! real `combine_multiple` and runs the calibrated `classify()` (SciFact thresholds:
-//! conflict 0.05 / nei 0.85). So the conflict K and the consolidate/contradict verdict
-//! become ENGINE outputs — not the agents' own estimates. The reviewers flagged that
-//! the agents' "consolidated=true / 0.5 threshold" was ungrounded; here the engine's
-//! calibrated classifier renders the real verdict. BBAs carry open-world mass.
+//! perspective's agents), RECORDS them into the database, then combines them with
+//! the real `combine_multiple` and runs the calibrated `classify()` (SciFact
+//! thresholds: conflict 0.05 / nei 0.85). So the conflict K and the
+//! consolidate/contradict verdict become ENGINE outputs — not the agents' own
+//! estimates. The reviewers flagged that the agents' "consolidated=true / 0.5
+//! threshold" was ungrounded; here the engine's calibrated classifier renders the
+//! real verdict. BBAs carry open-world mass.
 //!
-//! Run:
-//!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_demo_dev \
-//!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_t3 -- --nocapture
+//! A `#[sqlx::test]`: it creates the two frames it records against in its own
+//! database, so the recording always runs and the test runs in every gate. (It
+//! used to be `#[ignore]`d as needing a seed directory and a loaded dev database,
+//! and skipped the recording when the frames were absent; the verdicts it asserts
+//! never depended on either.)
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use epigraph_db::{MassFunctionRepository, PgPool};
+use epigraph_db::{FrameRepository, MassFunctionRepository, PgPool};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 use epigraph_engine::calibration::ClassifierThresholds;
 use epigraph_engine::classifier::{classify, CdstClassification};
@@ -67,9 +70,8 @@ type AgentBbaCase<'a> = (
     f64,
 );
 
-#[tokio::test]
-#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
-async fn t3_engine_adjudicates_agent_bbas() {
+#[sqlx::test(migrations = "../../migrations")]
+async fn t3_engine_adjudicates_agent_bbas(pool: PgPool) {
     let eff = FrameOfDiscernment::new(
         "treatment_efficacy",
         vec!["efficacious".into(), "no_effect".into()],
@@ -118,52 +120,58 @@ async fn t3_engine_adjudicates_agent_bbas() {
         ),
     ];
 
-    // Optional DB recording (records the agent-gathered evidence into the dev DB).
-    let pool = match std::env::var("DATABASE_URL") {
-        Ok(url) => PgPool::connect(&url).await.ok(),
-        Err(_) => None,
-    };
-    let mut recorded = 0;
-    if let Some(pool) = &pool {
-        let author = insert_agent(pool).await;
-        let prove_src = insert_agent(pool).await;
-        let refute_src = insert_agent(pool).await;
-        // frame UUIDs already exist in the loaded DB; look them up by name.
-        for (label, frame, p, r, _ak, _ac, _ab) in &cases {
-            let frame_name = frame.id.clone(); // FrameOfDiscernment.id == name we constructed
-            let frame_id: Option<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM frames WHERE name = $1 ORDER BY created_at LIMIT 1",
-            )
-            .bind(&frame_name)
-            .fetch_optional(pool)
+    // Record the agent-gathered evidence: one claim per case, the prove and the
+    // refute BBA each from its own source agent, on that case's frame.
+    let mut frame_ids = std::collections::HashMap::new();
+    for frame in [&eff, &saf] {
+        let row = FrameRepository::create(&pool, &frame.id, None, &frame.hypotheses)
             .await
-            .expect("frame lookup");
-            let Some(frame_id) = frame_id else { continue };
-            let claim = insert_claim(pool, author, &format!("T3 gathered: {label}")).await;
-            for (src, m) in [
-                (prove_src, bba(frame, p.0, p.1, p.2)),
-                (refute_src, bba(frame, r.0, r.1, r.2)),
-            ] {
-                MassFunctionRepository::store_with_perspective(
-                    pool,
-                    claim,
-                    frame_id,
-                    Some(src),
-                    None,
-                    &m.masses_to_json(),
-                    None,
-                    Some("discount"),
-                    Some(1.0),
-                    Some("agent_gathered"),
-                    "cross",
-                    None,
-                )
-                .await
-                .expect("record bba");
-                recorded += 1;
-            }
-        }
+            .expect("create frame");
+        frame_ids.insert(frame.id.clone(), row.id);
     }
+    let author = insert_agent(&pool).await;
+    let prove_src = insert_agent(&pool).await;
+    let refute_src = insert_agent(&pool).await;
+    let mut recorded_claims = Vec::new();
+    for (label, frame, p, r, _ak, _ac, _ab) in &cases {
+        let frame_id = frame_ids[&frame.id];
+        let claim = insert_claim(&pool, author, &format!("T3 gathered: {label}")).await;
+        for (src, m) in [
+            (prove_src, bba(frame, p.0, p.1, p.2)),
+            (refute_src, bba(frame, r.0, r.1, r.2)),
+        ] {
+            MassFunctionRepository::store_with_perspective(
+                &pool,
+                claim,
+                frame_id,
+                Some(src),
+                None,
+                &m.masses_to_json(),
+                None,
+                Some("discount"),
+                Some(1.0),
+                Some("agent_gathered"),
+                "cross",
+                None,
+            )
+            .await
+            .expect("record bba");
+        }
+        recorded_claims.push(claim);
+    }
+    let recorded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions \
+          WHERE claim_id = ANY($1) AND evidence_type = 'agent_gathered'",
+    )
+    .bind(&recorded_claims)
+    .fetch_one(&pool)
+    .await
+    .expect("count recorded bbas");
+    assert_eq!(
+        recorded,
+        2 * cases.len() as i64,
+        "every case's prove and refute BBA is recorded"
+    );
 
     let th = ClassifierThresholds::default();
     println!("\nT3 — ENGINE adjudication of agent-gathered BBAs (calibrated classify, conflict_threshold=0.05):");
@@ -192,9 +200,7 @@ async fn t3_engine_adjudicates_agent_bbas() {
             safety_verdicts.push((label.to_string(), verdict));
         }
     }
-    if recorded > 0 {
-        println!("\nRecorded {recorded} agent-gathered BBAs into the dev DB (perspective evidence, evidence_type='agent_gathered').");
-    }
+    println!("\nRecorded {recorded} agent-gathered BBAs (evidence_type='agent_gathered').");
 
     // The reviewers' core finding, now rendered by the calibrated engine: the agents stamped
     // "consolidated=true" using an ungrounded 0.5 threshold, but the SAFETY axes carry opposing
