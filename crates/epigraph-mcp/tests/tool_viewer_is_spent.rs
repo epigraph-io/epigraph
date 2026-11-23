@@ -978,7 +978,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // stamped read; it returns a key kind (is the bare key a signature verifier), never a row.
     (
         "claims.rs",
-        "verify_claim",
+        "verify_claim_report",
         &["AgentRepository::key_kind_of_public_key"],
     ),
     // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_trace_id_conn`,
@@ -1304,8 +1304,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "resolve_ingest_visibility",
         ],
     ),
-    // no SQL: `prepare`.
-    ("label_dedup.rs", "apply_label_dedup", &["prepare"]),
     // The viewer arrives inside `UnitContext` and is destructured. write:
     // `ClaimRepository::mark_duplicate_act_attributed_conn`, on the
     // author-stamped transaction, after `cross_owner`, `member_not_owned` and
@@ -1340,10 +1338,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "member_not_owned",
         &["claims::require_owner_or_admin"],
     ),
-    // no SQL: `prepare`.
-    ("label_dedup.rs", "plan_label_dedup", &["prepare"]),
-    // no SQL: `load_profile`.
-    ("label_dedup.rs", "probe_label_dedup", &["load_profile"]),
     // authority: `is_foreign_duplicate`.
     ("label_dedup.rs", "read_family", &["is_foreign_duplicate"]),
     // opener: `claim_helper::begin_author_stamped_tx`; maintenance:
