@@ -205,35 +205,33 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::list_by_label",
         ],
     ),
-    // gated (`ClaimRepository::get_by_id`) then write; `human_of` is an agents
-    // read; the SELECT is an advisory lock. narrows: `retain_for_cache` (and
-    // the `acquire` it runs on) filters the BBAs just read through the viewer
-    // (`get_for_claim_frame`). untenanted: `analyze_independence` groups those
-    // rows' source agents by owner (`AgentRepository::humans_of`, ruling R-36);
-    // it took the viewer only while it read lineage, and no longer reads any.
-    // write: `insert_on` records the `claim.assessed` writer event inside the
-    // slot transaction (ids and booleans only; the event list hides it from a
-    // reader who cannot read the claim).
+    // stamped (backlog 74feb76b): every call runs on ONE `AppState::write_as`
+    // transaction stamped from the caller's viewer, so row security decides
+    // each write against the caller's writable set. gated
+    // (`ClaimRepository::get_by_id`) then write; `human_of` is an agents read;
+    // the SELECT is an advisory lock. narrows: `retain_for_cache` filters the
+    // BBAs just read through the viewer (`get_for_claim_frame`) to count the
+    // rows the engine's viewed fold combined (backlog 735df6d7). write:
+    // `insert_on` records the `claim.assessed` writer event (ids and booleans
+    // only; the event list hides it from a reader who cannot read the claim);
+    // the `claim_frames` INSERT, the global scoped belief and the WITHIN_FRAME
+    // edge are best-effort under savepoints. write (backlog 840bc5ed):
+    // `retract_conn` retires the caller's own pre-link assessment row, read
+    // through the viewer (`get_for_claim_frame`); its definer decides on the
+    // stamped session principal and audits it.
     (
         "assess.rs",
         "assess_claim",
         &[
             "AgentRepository::human_of",
             "AgentRepository::human_of",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
-            "EdgeRepository::create_signed",
             "EventRepository::insert_on",
+            "MassFunctionRepository::retract_conn",
             "MassFunctionRepository::store_with_perspective",
             "PerspectiveRepository::ensure_evidence_perspective",
             "ScopedBeliefRepository::upsert",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.acquire",
-            "db_pool.begin",
+            "belief::create_edge_under_savepoint",
             "derivation_scope::retain_for_cache",
-            "independence::analyze_independence",
             "sqlx::query(INSERT).execute",
             "sqlx::query(SELECT).execute",
         ],

@@ -851,7 +851,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// backlog 6492de67 (migration 252; 187 -> 182 on its own branch) moved the
 /// same `routes/agent_keys.rs` sites onto the caller's stamped transaction
 /// as 54018ca1 above and adds the admin audit row on it: no further change.
-const HIGH_WATER: usize = 170;
+/// 170 -> 169 (backlog 74feb76b; 187 -> 186 on its own branch): `assess_claim`
+/// runs every read and write on the caller's `AppState::write_as`
+/// transaction; `routes/assess.rs` 1 -> 0, key DELETED (`HIGH_WATER_FILES`
+/// falls by one with it).
+const HIGH_WATER: usize = 169;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -924,7 +928,8 @@ const HIGH_WATER: usize = 170;
 /// 36 -> 35 when `routes/rag.rs` reached zero (backlog 9bef22f3, merged on
 /// staging after the line above).
 /// 35 -> 34 when `routes/embeddings.rs` reached zero (backlog batch B37).
-const HIGH_WATER_FILES: usize = 34;
+/// 34 -> 33 when `routes/assess.rs` reached zero (backlog 74feb76b).
+const HIGH_WATER_FILES: usize = 33;
 
 /// The seeded ratchet: per-file counts of sites still reaching the raw pool.
 ///
@@ -935,7 +940,8 @@ const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/admin.rs", 4),
     ("routes/agent_keys.rs", 1),
     ("routes/agents.rs", 9),
-    ("routes/assess.rs", 1),
+    // `routes/assess.rs` was 1 and is GONE (backlog 74feb76b): `assess_claim`
+    // reads and writes on one `AppState::write_as` transaction.
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
     // `query_security_events` reads on `AppState::read_as` with the caller's
     // viewer.

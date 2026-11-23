@@ -343,12 +343,10 @@ const DB_REGISTER: &[DbSite] = &[
 
 /// The inventory (backlog `dae795f8` step 1), measured.
 const REGISTER: &[Site] = &[
-    site(
-        "crates/epigraph-api/src/routes/assess.rs",
-        "assess_claim",
-        3,
-        Signed,
-    ),
+    // `routes/assess.rs::assess_claim` (3, Signed) is gone (backlog 74feb76b):
+    // its WITHIN_FRAME edge goes through `belief.rs::create_edge_under_savepoint`
+    // on its stamped transaction, and its two dead `evidence -> claim` writes
+    // were deleted.
     site(
         "crates/epigraph-api/src/routes/belief.rs",
         "create_edge_under_savepoint",

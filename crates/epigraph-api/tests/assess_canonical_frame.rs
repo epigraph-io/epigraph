@@ -35,9 +35,9 @@
 //! slot perspective records the owner, and `perspectives.owner_agent_id` is a
 //! foreign key, so the nil-principal public viewer cannot call it). That is
 //! deliberate: this file pins
-//! the handler's FRAME and CACHE semantics, not its tenancy (the stamping of
-//! `assess.rs`'s one raw-pool site is a separate change), so an RLS refusal
-//! must not be able to make an arm pass or fail.
+//! the handler's FRAME and CACHE semantics, not its tenancy (the handler's
+//! stamped transaction under row security is `assess_app_role.rs`), so an RLS
+//! refusal must not be able to make an arm pass or fail.
 
 #![cfg(feature = "db")]
 
@@ -81,7 +81,10 @@ async fn try_assess(
     req: AssessClaimRequest,
 ) -> Result<AssessClaimResponse, ApiError> {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
+    // state carries a `ScopedPool` (the harness superuser's, stamped).
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
     let Json(resp) = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
