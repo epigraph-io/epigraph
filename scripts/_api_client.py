@@ -4,8 +4,9 @@ Provides a tiny `EpiGraphClient` that wraps `requests` with bearer auth and the
 API base URL. The bearer token comes from OAuth, never from this process:
 
   1. `EPIGRAPH_TOKEN`, when set and non-empty, is used as given (an operator
-     minted it through /oauth/token). Its scopes are NOT checked here: a token
-     missing one the job needs fails with a 403 at the request that needs it;
+     minted it through /oauth/token), after the API's `/oauth/introspect`
+     confirms it is active and carries every scope the job requests
+     (`check_token_scopes`); otherwise the client exits at construction;
   2. otherwise `EPIGRAPH_SERVICE_CLIENT_ID` + `EPIGRAPH_SERVICE_SECRET` are
      exchanged at the token endpoint with the `client_credentials` grant, the
      same resolution `decompose_claims` uses;
@@ -59,6 +60,21 @@ def resolve_api_base(base: Optional[str] = None) -> str:
     return (base or _env("EPIGRAPH_API_BASE") or DEFAULT_API_BASE).rstrip("/")
 
 
+def _is_2xx(resp: requests.Response) -> bool:
+    """`resp.ok` is true for any status below 400, a 3xx included; an auth
+    endpoint that answers anything but 2xx has not answered."""
+    return 200 <= resp.status_code < 300
+
+
+def _redirect_hint(resp: requests.Response, env_var: str) -> str:
+    if 300 <= resp.status_code < 400:
+        return (
+            f" (a redirect, which this helper does not follow because the request"
+            f" body carries a credential; point {env_var} at the final URL)"
+        )
+    return ""
+
+
 def fetch_service_token(
     client_id: str,
     client_secret: str,
@@ -72,7 +88,9 @@ def fetch_service_token(
     Exits when the endpoint refuses, answers without an `access_token`, or
     grants fewer scopes than requested: the server drops ungranted scopes
     silently, and a job that needs one should stop here rather than 403
-    partway through. No message includes the secret.
+    partway through. A redirect also exits: the secret is in the request
+    body, which `requests` would re-post to the redirect's target, whatever
+    its host. No message includes the secret.
     """
     try:
         resp = requests.post(
@@ -84,12 +102,14 @@ def fetch_service_token(
                 "scope": " ".join(scopes),
             },
             timeout=timeout,
+            allow_redirects=False,
         )
     except requests.RequestException as e:
         raise SystemExit(f"token endpoint {token_url} unreachable: {type(e).__name__}")
-    if not resp.ok:
+    if not _is_2xx(resp):
         raise SystemExit(
             f"token endpoint {token_url} refused client {client_id!r}: HTTP {resp.status_code}"
+            + _redirect_hint(resp, "EPIGRAPH_OAUTH_TOKEN_URL")
         )
     try:
         body = resp.json()
@@ -108,15 +128,82 @@ def fetch_service_token(
     return token
 
 
-def resolve_bearer_token(scopes: list[str], base: Optional[str] = None) -> str:
-    """EPIGRAPH_TOKEN as given, else a client_credentials exchange, else exit.
+# The server's elevation scope. An elevated token carrying it holds the
+# non-write admin scopes (`claims:admin`, `groups:admin`, ...) whether or not
+# it carries them (epigraph_auth::AuthContext::has_scope).
+ELEVATED_SCOPE = "platform:admin"
 
-    Only the exchange checks `scopes` (fetch_service_token exits when one was
-    not granted). EPIGRAPH_TOKEN is opaque to this helper and is used without
-    a scope check.
+
+def _held(scope: str, carried: set[str]) -> bool:
+    """Whether a token carrying `carried` can hold `scope`, as far as the token
+    alone says. Errs toward yes: the server may still refuse (an armed admin
+    scope on an unelevated request, a delegated token's ceiling), which leaves
+    that job failing on its first refused call, as before."""
+    if scope in carried:
+        return True
+    return ELEVATED_SCOPE in carried and scope.endswith(":admin")
+
+
+def check_token_scopes(
+    token: str,
+    scopes: list[str],
+    introspect_url: str,
+    timeout: float = 30.0,
+) -> None:
+    """Exit unless `introspect_url` (the API's `/oauth/introspect`, which takes
+    a JSON `{"token": ...}` body) says `token` is active and carries every
+    scope in `scopes`.
+
+    Fails closed: an unreachable endpoint, a non-2xx answer (a redirect
+    included) or a body that does not say `"active": true` all exit, so a
+    wrong, expired or revoked token stops here instead of on its first
+    refused call. Redirects are not followed: the token is in the request
+    body, which `requests` would re-send to the redirect's target, whatever
+    its host. No message includes the token.
+    """
+    try:
+        resp = requests.post(
+            introspect_url, json={"token": token}, timeout=timeout, allow_redirects=False
+        )
+    except requests.RequestException as e:
+        raise SystemExit(
+            f"introspection endpoint {introspect_url} unreachable: {type(e).__name__}; "
+            "cannot check EPIGRAPH_TOKEN"
+        )
+    if not _is_2xx(resp):
+        raise SystemExit(
+            f"introspection endpoint {introspect_url} answered HTTP {resp.status_code}; "
+            "cannot check EPIGRAPH_TOKEN" + _redirect_hint(resp, "EPIGRAPH_API_BASE")
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    if not isinstance(body, dict) or body.get("active") is not True:
+        raise SystemExit(
+            f"EPIGRAPH_TOKEN is not active at {introspect_url} "
+            "(invalid, expired, revoked, or signed for another server)"
+        )
+    carried = set(str(body.get("scope") or "").split())
+    missing = [s for s in scopes if not _held(s, carried)]
+    if missing:
+        raise SystemExit(
+            f"EPIGRAPH_TOKEN lacks {' '.join(missing)} "
+            f"(carries: {' '.join(sorted(carried)) or 'none'})"
+        )
+
+
+def resolve_bearer_token(scopes: list[str], base: Optional[str] = None) -> str:
+    """EPIGRAPH_TOKEN, else a client_credentials exchange, else exit.
+
+    Both paths check `scopes`: EPIGRAPH_TOKEN through the API's
+    `/oauth/introspect` (check_token_scopes), the exchange through the scopes
+    the token endpoint granted (fetch_service_token). Either exits when one is
+    missing.
     """
     token = _env("EPIGRAPH_TOKEN")
     if token:
+        check_token_scopes(token, scopes, f"{resolve_api_base(base)}/oauth/introspect")
         return token
     client_id = _env("EPIGRAPH_SERVICE_CLIENT_ID")
     client_secret = _env("EPIGRAPH_SERVICE_SECRET")
@@ -136,8 +223,9 @@ def resolve_bearer_token(scopes: list[str], base: Optional[str] = None) -> str:
 class EpiGraphClient:
     """Thin requests wrapper with automatic bearer auth + API base URL.
 
-    The token is resolved at construction (`resolve_bearer_token`), so a job
-    without credentials exits before it does any work. Raises HTTPError on
+    The token is resolved and its scopes checked at construction
+    (`resolve_bearer_token`), so a job without usable credentials exits
+    before it does any work. Raises HTTPError on
     non-2xx responses only when the caller calls raise_for_status().
     """
 
