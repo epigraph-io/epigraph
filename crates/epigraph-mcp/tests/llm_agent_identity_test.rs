@@ -86,6 +86,35 @@ async fn count_operated_by(pool: &PgPool, source: Uuid, target: Uuid) -> i64 {
     .expect("count query")
 }
 
+/// In-force `OPERATED_BY` edges `source -> target`: the predicate the
+/// create-or-get probe `record_auth_lineage` uses counts as present
+/// (`epigraph_db::repos::edge::EDGE_IN_FORCE_UNALIASED`). A retracted row is not one.
+async fn count_in_force_operated_by(pool: &PgPool, source: Uuid, target: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COUNT(*) FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'OPERATED_BY' \
+           AND {}",
+        epigraph_db::repos::edge::EDGE_IN_FORCE_UNALIASED
+    ))
+    .bind(source)
+    .bind(target)
+    .fetch_one(pool)
+    .await
+    .expect("count in-force query")
+}
+
+async fn operated_by_edge_ids(pool: &PgPool, source: Uuid, target: Uuid) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'OPERATED_BY'",
+    )
+    .bind(source)
+    .bind(target)
+    .fetch_all(pool)
+    .await
+    .expect("edge ids")
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // IDENTITY
 // ────────────────────────────────────────────────────────────────────────────
@@ -272,6 +301,84 @@ async fn lineage_writes_exactly_one_operated_by_edge_idempotently(pool: PgPool) 
     .await
     .expect("edge row");
     assert_eq!((st.as_str(), tt.as_str()), ("agent", "agent"));
+}
+
+/// The per-process `OPERATED_BY` memo is a CACHE with a time-to-live, not a
+/// permanent "already linked" set: an edge retracted (or deleted) after a
+/// successful write is written again by the first call after the memo entry
+/// expires, in the SAME process, with no restart.
+///
+/// Two-sided, on one server instance (one memo):
+/// * inside the TTL the memo still short-circuits, so the retracted edge stays
+///   retracted (the fast path the memo exists for is kept);
+/// * past the TTL the call goes back to the database and re-asserts the edge,
+///   both after a retraction (`valid_to` closed, the real delete path) and
+///   after a hard `DELETE` of the row.
+///
+/// Mutation: make the memo hit ignore the entry's age (the pre-TTL `HashSet`
+/// behaviour) -> the post-TTL call short-circuits and the in-force count stays 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn lineage_edge_retracted_after_success_is_rewritten_once_the_memo_expires(pool: PgPool) {
+    let ttl = std::time::Duration::from_secs(3);
+    let past_ttl = ttl + std::time::Duration::from_millis(500);
+    let server = llm_server(pool.clone()).with_auth_lineage_ttl(ttl);
+    server.emit_tool_invoked("query_claims").await; // creates the mcp agent
+    let mcp_agent = resolve_mcp_agent_id(&pool).await;
+    let principal = seed_agent(&pool).await;
+
+    server.record_auth_lineage(Some(principal)).await;
+    assert_eq!(
+        count_in_force_operated_by(&pool, mcp_agent, principal).await,
+        1,
+        "first call writes the lineage edge"
+    );
+
+    // Retract it the way the edge-delete path does (valid_to closed).
+    let ids = operated_by_edge_ids(&pool, mcp_agent, principal).await;
+    epigraph_db::EdgeRepository::retract(&pool, &ids)
+        .await
+        .expect("retract the lineage edge");
+    assert_eq!(
+        count_in_force_operated_by(&pool, mcp_agent, principal).await,
+        0,
+        "precondition: the lineage edge is retracted"
+    );
+
+    // Inside the TTL: still a memo hit, nothing re-written.
+    server.record_auth_lineage(Some(principal)).await;
+    assert_eq!(
+        count_in_force_operated_by(&pool, mcp_agent, principal).await,
+        0,
+        "inside the TTL the memo short-circuits before the database"
+    );
+
+    // Past the TTL: the same process re-asserts the edge.
+    tokio::time::sleep(past_ttl).await;
+    server.record_auth_lineage(Some(principal)).await;
+    assert_eq!(
+        count_in_force_operated_by(&pool, mcp_agent, principal).await,
+        1,
+        "past the TTL a retracted lineage edge must be rewritten without a restart"
+    );
+
+    // A hard DELETE of every row of the pair is healed the same way.
+    sqlx::query(
+        "DELETE FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'OPERATED_BY'",
+    )
+    .bind(mcp_agent)
+    .bind(principal)
+    .execute(&pool)
+    .await
+    .expect("hard-delete the lineage edges");
+    assert_eq!(count_operated_by(&pool, mcp_agent, principal).await, 0);
+    tokio::time::sleep(past_ttl).await;
+    server.record_auth_lineage(Some(principal)).await;
+    assert_eq!(
+        count_in_force_operated_by(&pool, mcp_agent, principal).await,
+        1,
+        "past the TTL a deleted lineage edge must be rewritten without a restart"
+    );
 }
 
 /// `record_auth_lineage(None)` writes nothing — the stdio / unauthenticated /
