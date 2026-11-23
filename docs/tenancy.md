@@ -1615,10 +1615,19 @@ whose copy chains through the detached identity's old copy (the documented
 restore, above). Read each candidate's copy chain before relying on the
 list. The identity that runs now is among them only if every revert on the
 way was registered and every edit was registered with the identity that ran
-before it as its parent (see "What the cut-off cannot see" below). The walk
-ignores when a succession was recorded and when a detach was made, so the
-answer for a past instant also changes after a later revert or detach (the
-same "at any time" reading as the sticky detach itself).
+before it as its parent (see "What the cut-off cannot see" below). Since
+migration 249 the walk reads when each record was made: asked about a past
+instant T, it counts only the attachments written, the detaches made and the
+successions attested by T, so a later revert or detach does not change the
+answer for T (the roster's `--at` reads that answer). From the moment a
+detach is made it is sticky, as above. An instant at or after the asking
+transaction's start is the present: every record the transaction can see
+counts, so a live check never misses a detach already committed. Four
+inputs are still read as they stand now, not at T, so they can still change
+a past answer: the folder test (every snapshot, at any time), the operator
+link, the client allowance, and the group's status (suspending or
+deprovisioning a group later empties the answer, and the roster's `--at`,
+for every earlier instant).
 
 To give the group back after a detach, attach the identity that runs NOW,
 by name. Re-attaching the old root alone does not bring back a successor
@@ -1699,8 +1708,12 @@ group: the detach takes it out there too. Limits: an
 attachment made by name is not tied to a folder, so an identity attached by
 name in another group's folder whose model and prompt files are identical
 to ones this job can put back keeps the group when the job runs it, and is
-not found from this folder until it registers here; a copy written by hand
-stays the limit stated above.
+not found from this folder until it registers here (pinned by
+`group_role_membership.rs::an_identity_attached_by_name_elsewhere_is_found_from_the_folder_only_once_it_registers_there`;
+the "root of every copy" half of the list adds no identity whose copies
+count, since a copy counts only when its root runs in the holder's folder:
+`a_copy_counts_only_when_its_root_runs_in_the_holders_folder`); a copy
+written by hand stays the limit stated above.
 
 #### Recipe: a role-private group for a scheduled job
 

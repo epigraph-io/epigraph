@@ -3728,6 +3728,35 @@ restart.
   'MEMBER')` before migrating. The attach refusal is decided at attach time: a binding
   that let the attach through and is removed before the first registration still leaves
   that registration to abort `AID09`.
+- **249**: public `role_derivation_time_aware` (backlog 2b54c270, part 2). Re-states 195's
+  `epigraph_role_derived_memberships(uuid, timestamptz)` so that it answers an instant T from
+  what was recorded by T: an attachment counts from its `created_at`, a detach from its
+  `detached_at` (the row asked about, every hop of a copy chain, the row made by name that
+  ends the lineage walk, and the sticky detached-row read), a succession from its
+  `attested_at`. A later detach, revert, edit or dated-back attach no longer changes the
+  answer (or the roster's `--at`) for an earlier instant. An instant at or after the asking
+  transaction's start (`p_at >= now()`) is the present: every record the snapshot sees
+  counts, so every live gate (they ask at `now()` or `clock_timestamp()`) answers exactly as
+  under 195, a detach committed after the transaction began included. Adds the plain index
+  `idx_role_agents_agent_role (agent_id, role)`: the time-aware read of the row asked about
+  cannot use 166's partial index, and without it every call paid a JIT compile (0.55 to
+  0.8 s measured; 3 to 4 ms with it). Limits kept: the folder test still reads snapshots at
+  any time, and the operator link, the client allowance and the group's status are read as
+  they stand now (suspending a group later empties every earlier instant's answer). An md5
+  precondition refuses (`55000`, nothing changed) over any body but 195's
+  (`1c5c6925547d6aa0d0a54e718ce6bd47`); a later re-statement starts from 249's
+  (`58caa9ae65e89485b4fac1bb26959fdd`). Signature, owner, ACL and `search_path` unchanged;
+  no grant. Pinned by `epigraph-db/tests/group_role_membership.rs` (the 249 section: one
+  test per kind of record, each failing on 195's body or on its conjunct reverted alone; one
+  present-instant test per site that reads a record's time, each failing with that site's
+  present clause reverted alone; the planner-estimate test that fails without the index; and
+  two pins of the cross-folder limits of 195, part 1 of the item),
+  `schema_contract.rs::migration_179_attached_arm_survives_at_head` (249's fragments) and
+  `legacy_fleet_parent.rs` (`migration_249_refuses_to_restate_a_body_it_was_not_written_from`,
+  `the_249_undo_restores_the_catalog_below_249`). Undo: `docs/runbooks/249-undo.sql`
+  (restores 195's body byte for byte and drops the index; run it BEFORE `195-undo.sql`).
+  **Deploy order:** after 195; no binary depends on it. The index is built inside the
+  migration's transaction (writers of `role_agents` wait for it; the table is small).
 
 ## `-- no-transaction` migrations
 
