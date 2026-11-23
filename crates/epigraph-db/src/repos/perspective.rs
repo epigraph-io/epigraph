@@ -85,6 +85,27 @@ impl PerspectiveRow {
     }
 }
 
+/// The `perspective_type` values `perspectives_not_bba_slot` refuses
+/// (migration 267, backlog 1777638e): they named the internal BBA-slot rows
+/// that are now `mass_functions.slot_kind`, so no viewpoint may carry them.
+pub const RESERVED_PERSPECTIVE_TYPES: [&str; 2] = ["edge", "evidence"];
+
+/// Why `perspective_type` cannot be written, if it cannot: the callers'
+/// validation of what the database would refuse with 23514, so a caller gets
+/// a validation error naming the field instead of a failed query.
+#[must_use]
+pub fn reserved_perspective_type(perspective_type: &str) -> Option<String> {
+    RESERVED_PERSPECTIVE_TYPES
+        .contains(&perspective_type)
+        .then(|| {
+            format!(
+                "perspective_type '{perspective_type}' is reserved (it named the internal \
+                 edge and evidence BBA keys, which are no longer perspectives); choose another \
+                 type. Nothing was written."
+            )
+        })
+}
+
 /// Repository for Perspective operations
 pub struct PerspectiveRepository;
 
@@ -369,6 +390,20 @@ impl PerspectiveRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly the two types `perspectives_not_bba_slot` refuses are
+    /// reserved; every other spelling (case included, as the CHECK compares
+    /// exactly) is a caller's own type.
+    #[test]
+    fn only_the_two_bba_slot_types_are_reserved() {
+        for t in ["edge", "evidence"] {
+            let why = reserved_perspective_type(t).expect("reserved");
+            assert!(why.contains(t), "{why}");
+        }
+        for t in ["analytical", "empirical", "Edge", "evidence_grounded", ""] {
+            assert_eq!(reserved_perspective_type(t), None, "{t}");
+        }
+    }
 
     #[test]
     fn perspective_row_has_expected_fields() {

@@ -144,6 +144,14 @@ pub async fn create_perspective(
             reason: "Must be in [0, 1]".to_string(),
         });
     }
+    if let Some(reason) =
+        epigraph_db::repos::perspective::reserved_perspective_type(&request.perspective_type)
+    {
+        return Err(ApiError::ValidationError {
+            field: "perspective_type".to_string(),
+            reason,
+        });
+    }
 
     let pool = &state.db_pool;
     let row = epigraph_db::PerspectiveRepository::create(

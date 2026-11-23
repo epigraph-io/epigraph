@@ -160,3 +160,53 @@ async fn the_ds_evidence_wire_keys_each_bba_on_its_evidence_slot(pool: PgPool) {
         "one BBA per evidence row, on its slot; the second write of ev1 replaced its row"
     );
 }
+
+/// `create_perspective` refuses the two reserved types with a validation
+/// error naming the field (the database would refuse them too, as
+/// `perspectives_not_bba_slot`, but as a failed query), and writes nothing.
+/// Control: the same call with another type lands. On the code before 267 the
+/// reserved types were accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_perspective_refuses_a_reserved_type(pool: PgPool) {
+    let server = build_scoped_test_server(pool.clone(), fixture::scoped_pool(&pool).await);
+    let (_caller, token, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let params = |name: &str, kind: &str| epigraph_mcp::types::CreatePerspectiveParams {
+        name: name.to_string(),
+        description: None,
+        owner_agent_id: None,
+        perspective_type: Some(kind.to_string()),
+        frame_ids: None,
+        extraction_method: None,
+        confidence_calibration: None,
+    };
+    for kind in ["edge", "evidence"] {
+        let name = format!("1777638e reserved {kind}");
+        let err = epigraph_mcp::tools::perspectives::create_perspective(
+            &server,
+            &viewer,
+            params(&name, kind),
+            Some(&token),
+        )
+        .await
+        .expect_err("a reserved perspective_type is refused");
+        assert!(
+            err.message.contains("is reserved"),
+            "{kind}: {}",
+            err.message
+        );
+        let written: i64 = sqlx::query_scalar("SELECT count(*) FROM perspectives WHERE name = $1")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(written, 0, "{kind}: nothing was written");
+    }
+    epigraph_mcp::tools::perspectives::create_perspective(
+        &server,
+        &viewer,
+        params("1777638e control", "analytical"),
+        Some(&token),
+    )
+    .await
+    .expect("CALIBRATION: another type lands");
+}
