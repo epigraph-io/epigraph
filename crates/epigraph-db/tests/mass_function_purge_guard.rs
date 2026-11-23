@@ -19,6 +19,12 @@
 //! `fk_action_guard_ratchet.rs`; (o) is the mutation probe recorded with the
 //! batch.
 //!
+//! The test-lens follow-ups (backlog 129f99ad): T-N3, arms (c) and (d) as a
+//! real member login; T-N6, the guard's fail mode after the grant helper is
+//! re-owned; T-N7, every test that creates a cluster role removes it even
+//! when it panics ([`with_cluster_role`]). T-N9 is in
+//! `fk_action_guard_ratchet.rs`.
+//!
 //! Every retracted row is made by migration 184's definer on the application
 //! role (`support/retracted_bba_fixture.rs`). The privileged cases run on a
 //! NOSUPERUSER `epigraph_maintenance` session (SPEC §12), checked before use.
@@ -846,6 +852,103 @@ async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool
         exists(&pool, "mass_functions", w.retracted).await,
         "the retracted row survives (the residual delete was rolled back)"
     );
+}
+
+/// T-N6: the guard FAILS CLOSED after a later ownership change. Migration 194
+/// makes the grant helper `epigraph_mf_purge_granted` a definer owned by
+/// `epigraph_maintenance`. If it is later re-owned by another role (a
+/// careless `ALTER FUNCTION ... OWNER TO`, a `REASSIGN OWNED`), the old
+/// owner's privileges on it move to the new owner, so the maintenance
+/// session's guard can no longer call it (and the new owner could not read
+/// the grant table anyway). Pinned here: a maintenance delete of the
+/// retracted row is then refused with a 42501 PERMISSION error (not SR09,
+/// and never an admission), and so is the audited purge, and the row
+/// survives both; a LIVE row still deletes (the guard fires only on
+/// retracted rows). A guard that swallowed that error would fail open; this
+/// test is what catches it. The ownership change is undone with the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) {
+    proc_exists(&pool, GRANT_HELPER).await;
+    let w = world(&pool).await;
+    let role = format!("h10_reowner_{}", Uuid::new_v4().simple());
+    let (r, retracted, live) = (role.clone(), w.retracted, w.live);
+    let (direct, purge, live_deleted, helper_owner) = with_cluster_role(
+        &pool,
+        &role,
+        &format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            pool.execute(format!("ALTER FUNCTION {GRANT_HELPER} OWNER TO {r}").as_str())
+                .await
+                .expect("re-own the grant helper");
+            let helper_owner: String = sqlx::query_scalar(
+                "SELECT r.rolname::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = $1::regprocedure",
+            )
+            .bind(GRANT_HELPER)
+            .fetch_one(&pool)
+            .await
+            .expect("helper owner");
+            let m = maintenance(&pool).await;
+            let direct = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&m)
+                .await
+                .map(|d| d.rows_affected())
+                .map_err(|e| {
+                    let db = e.as_database_error().map(|d| {
+                        (
+                            d.code().map(|c| c.to_string()).unwrap_or_default(),
+                            d.message().to_string(),
+                        )
+                    });
+                    db.unwrap_or_default()
+                });
+            let purge = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 probe')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            let live_deleted = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(live)
+                .execute(&m)
+                .await
+                .expect("a live row still deletes")
+                .rows_affected();
+            m.close().await;
+            (direct, purge, live_deleted, helper_owner)
+        },
+    )
+    .await;
+
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the re-owner role is gone"
+    );
+    assert_eq!(helper_owner, role, "fixture: the helper was re-owned");
+    let (code, message) = direct.expect_err("the direct delete must not be admitted");
+    assert_eq!(code, "42501", "a privilege error, fail closed: {message}");
+    assert!(
+        message.starts_with("permission denied"),
+        "the helper's privilege failure, not SR09: {message}"
+    );
+    let (code, message) = purge.expect_err("the purge must not be admitted either");
+    assert_eq!(code, "42501", "the purge fails closed too: {message}");
+    assert!(message.starts_with("permission denied"), "{message}");
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives both"
+    );
+    assert_eq!(live_deleted, 1, "CONTROL: a live row is not guarded");
 }
 
 // ---------------------------------------------------------------------------
