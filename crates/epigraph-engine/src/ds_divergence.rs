@@ -14,23 +14,67 @@
 //! so a claim whose evidence arrived through the MCP DS tools
 //! (`submit_ds_evidence`, `update_with_evidence`) never got either one, and
 //! `get_divergence` answered "no divergence data" for it (backlog f50344c0).
-//! Those three writers now call the same functions.
 //!
-//! The other DS writers do NOT call them yet, so their claims still get no
-//! row: `submit_claim`'s seed wire (`ds_auto::auto_wire_ds_for_claim`), the
-//! batch ingest wire (`auto_wire_ds_batch`), the edge wire
-//! (`auto_wire_ds_for_edge`), `report_workflow_outcome`
-//! (`auto_wire_ds_update`) and the recompute paths. Rows older than
-//! `DivergenceRepository`'s TTL are not served either.
+//! # Which writers keep the track (backlog d3648d3c)
+//!
+//! These writers count the BBA they store on the claim's track and, unless
+//! the update is a cold start, record the divergence of the claim's BetP after
+//! the write, inside the write's own transaction:
+//!
+//! - `POST /frames/:id/evidence`, MCP `submit_ds_evidence` and MCP
+//!   `update_with_evidence`, each by [`apply_beta_update`] and
+//!   [`record_divergence`] directly;
+//! - MCP `report_workflow_outcome`: its outcome BBA, through
+//!   [`track_counted_bba`], as `update_with_evidence` counts its own after the
+//!   same `ds_auto` update.
+//!
+//! On a claim the caller does not write (a non-owner attaching evidence to a
+//! public claim), the BBA is stored and folded but the track is not moved and
+//! no row is written (see [`apply_beta_update`] and the savepoint section), so
+//! that claim's fold holds evidence its track lacks.
+//!
+//! Deliberately excluded, each with its reason:
+//!
+//! - **The seed wire** (`ds_auto::auto_wire_ds_for_claim`, run by
+//!   `submit_claim` and `memorize`) and **the batch ingest wire**
+//!   (`ds_auto::auto_wire_ds_batch`: `ingest_document` and the workflow
+//!   ingests). Their creation BBA is the claim's prior, not an observation,
+//!   and it carries a large uncommitted mass on the frame, which
+//!   [`beta_increments`] counts against the hypothesis. Counting such rows is
+//!   what made the Beta replay's posteriors fall well below BetP (commit
+//!   3309bd569, which refused `replay_beta_track --apply` for it), so the
+//!   live track does not count them either, and the replay's default leaves
+//!   `auto_wire:creation` rows out to match.
+//! - **The edge wire** (`edge_factor::auto_wire_ds_for_edge` and its gate
+//!   `auto_wire_edge_if_epistemic`: `link_epistemic`, `POST /edges`, the
+//!   ingests, `backfill_factors`, the cascades' re-derivations). An edge BBA is
+//!   a discounted copy of its source's interval with a large uncommitted mass,
+//!   so the same arithmetic would let a weak supporting edge (support below
+//!   the target's posterior) lower the Beta posterior while it raises BetP;
+//!   3309bd569 names edge wires beside the seed wire. Counting would also need to tell a
+//!   first materialization from the re-wires and wake-ups that replace or
+//!   restore the same BBA, or the track would hold one edge twice.
+//! - **The recompute paths** (`recompute_beliefs`, `recompute_claim_*`, the
+//!   retraction and dedup cascades' target repairs, the operator recompute
+//!   bins). They store no BBA, so there is nothing to count; a row from a
+//!   refold would measure a calibration or profile change, not evidence, and
+//!   a bulk recompute would write one per claim.
+//!
+//! Not covered yet (their claims' tracks miss that evidence): REST
+//! `POST /claims/:id/assess`, the REST hypothesis and experiment routes, the
+//! CLI `hypothesis` and `experiment` bins, and the `truth_value` seed
+//! `ds_auto::auto_wire_ds_update` stores before an evidence update. Rows
+//! older than `DivergenceRepository`'s TTL are not served either.
 //!
 //! # A cold start records no divergence row
 //!
 //! A claim whose evidence was all stored by writers that do not keep this
-//! track (the seed and edge wires, assess discounts, evidence older than the
-//! track) still holds the `Beta(1, 1)` prior while its DS fold, and so its
-//! BetP, may be mature. Its first live update then compares that BetP against
-//! a posterior carrying one BBA's evidence and nothing else, which registers a
-//! large divergence that says nothing about the two calculi disagreeing.
+//! track (the seed and edge wires, assess discounts, the `truth_value` seed,
+//! evidence older than the track) still holds the `Beta(1, 1)` prior while its
+//! DS fold, and so its BetP, may be mature. Its first live update then
+//! compares that BetP against a posterior carrying one BBA's evidence and
+//! nothing else, which registers a large divergence that says nothing about
+//! the two calculi disagreeing.
 //! [`apply_beta_update`] reports such an update as a cold start
 //! ([`BetaUpdate::cold_start`]), and [`record_divergence`] stores no row for
 //! it, so a cold start never reaches `get_divergence` or `GET /divergence/top`.
@@ -405,6 +449,71 @@ pub async fn record_divergence(
             Ok(false)
         }
     }
+}
+
+/// One counted BBA write, as [`track_counted_bba`] takes it.
+#[derive(Debug, Clone, Copy)]
+pub struct CountedBba<'a> {
+    /// The claim the BBA was stored on.
+    pub claim_id: Uuid,
+    /// The frame the BBA was stored on, which the divergence row names.
+    pub frame_id: Uuid,
+    /// The BBA as stored (undiscounted), whose [`beta_increments`] are added.
+    pub bba: &'a MassFunction,
+    /// The claim's hypothesis index on `frame_id` (its `claim_frames` index).
+    pub hypothesis_index: Option<i32>,
+    /// The claim's pignistic probability after the write, when the writer has
+    /// it: the value it wrote to the claim's cache. `None` keeps the Beta
+    /// track and records no divergence row.
+    pub pignistic_prob: Option<f64>,
+}
+
+/// The two derived records of one BBA write the writer has decided to count:
+/// [`apply_beta_update`] with [`beta_increments`]`(bba, hypothesis_index)`,
+/// then, when the writer passes the claim's BetP after the write,
+/// [`record_divergence`] on the BBA's frame at the version the viewer reads.
+/// Returns whether a divergence row was stored (never on a cold start).
+///
+/// For a writer whose BBA is always counted, never replaces an earlier row of
+/// its own (no withdrawal), and needs nothing back from the Beta update (today
+/// `report_workflow_outcome`; see the module docs for which writers count).
+/// Deciding WHETHER the BBA is counted (an identical resubmission is not)
+/// stays the caller's.
+///
+/// # Errors
+/// Only when a savepoint cannot be opened or closed (see the module docs).
+pub async fn track_counted_bba(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    write: CountedBba<'_>,
+    context: &str,
+) -> Result<bool, sqlx::Error> {
+    let beta = apply_beta_update(
+        &mut *conn,
+        viewer,
+        write.claim_id,
+        Some(beta_increments(write.bba, write.hypothesis_index)),
+        // Never a replacement (backlog 862d8404's withdrawal does not apply):
+        // a counted write files its BBA under its own evidence's perspective,
+        // as `update_with_evidence` does, so it replaces no earlier row.
+        None,
+        context,
+    )
+    .await?;
+    let Some(pignistic_prob) = write.pignistic_prob else {
+        return Ok(false);
+    };
+    let version = frame_version(&mut *conn, viewer, write.frame_id, context).await?;
+    record_divergence(
+        conn,
+        write.claim_id,
+        write.frame_id,
+        pignistic_prob,
+        beta,
+        version,
+        context,
+    )
+    .await
 }
 
 #[cfg(test)]
