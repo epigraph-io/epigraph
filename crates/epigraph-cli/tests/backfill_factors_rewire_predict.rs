@@ -282,6 +282,83 @@ async fn predict_seeds_from_the_wave_and_refuses_an_unknown_state(pool: PgPool) 
     let _ = (ch.bc, ch.c);
 }
 
+/// Overwrite claim `id`'s seven cache columns with `c`.
+async fn set_cache(pool: &PgPool, id: Uuid, c: &CacheColumns) {
+    sqlx::query(
+        "UPDATE claims SET belief = $2, plausibility = $3, pignistic_prob = $4, \
+                mass_on_empty = $5, mass_on_missing = $6, belief_frame_id = $7, \
+                classification = $8 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(c.belief)
+    .bind(c.plausibility)
+    .bind(c.pignistic_prob)
+    .bind(c.mass_on_empty)
+    .bind(c.mass_on_missing)
+    .bind(c.belief_frame_id)
+    .bind(&c.classification)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Backlog ed2f99a8: the apply refuses a wave claim whose state is not the
+/// one the accepted predict worked from, and writes nothing. The operator
+/// accepts a predict; then the wave claim `a` is rewritten (a value neither
+/// the wave's `before` nor its `written`): the apply refuses
+/// `l1_state_unknown`, and no edge row, cache or snapshot record is written.
+/// Put back to the wave's `before` (the predict would overlay `written`, the
+/// apply cannot): refused `l1_state_before`, nothing written. Back at the
+/// wave's `written`, the same apply runs and rewrites what the predict said.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_apply_refuses_a_wave_claim_rewritten_since_the_predict(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let accepted = predict(&pool, &viewer, &ch.wave).await;
+    assert_eq!(
+        accepted.would_rewrite(),
+        vec![ch.ab, ch.bc],
+        "PREMISE: the accepted predict rewrites the chain"
+    );
+    let o = opts();
+    let seed = seed_from_waves(&ch.wave, o.epsilon);
+
+    // Rewritten since the predict.
+    sqlx::query("UPDATE claims SET belief = 0.33 WHERE id = $1")
+        .bind(ch.a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = fingerprint(&pool).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let err = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect_err("a wave claim rewritten since the predict is refused");
+    assert!(err.to_string().contains("l1_state_unknown"), "{err}");
+    assert!(err.to_string().contains(&ch.a.to_string()), "{err}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, state, "the refused apply wrote");
+
+    // Back at the wave's `before`.
+    set_cache(&pool, ch.a, &ch.wave[0].before).await;
+    let state = fingerprint(&pool).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let err = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect_err("a wave claim back at its before is refused");
+    assert!(err.to_string().contains("l1_state_before"), "{err}");
+    assert!(w.is_empty() && r.is_empty(), "no snapshot record");
+    assert_eq!(fingerprint(&pool).await, state, "the refused apply wrote");
+
+    // At the wave's `written` again: the state the predict used. It runs.
+    set_cache(&pool, ch.a, &ch.wave[0].written).await;
+    let (mut w, mut r) = (Vec::new(), Vec::new());
+    let applied = run_targeted_rewire(&pool, &viewer, &seed, &o, &mut w, &mut r)
+        .await
+        .expect("the apply runs from the predicted state");
+    assert_eq!(applied.rewired(), 2, "{applied:?}");
+}
+
 /// The fixed-point verify after an apply (§1.5 (b)) when an L1 claim was
 /// also a rewire TARGET: `a → b` with both `a` and `b` moved by L1. After the
 /// apply, `b` holds the rewire's value, neither its L1 `before` nor its L1

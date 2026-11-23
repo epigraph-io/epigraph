@@ -37,12 +37,18 @@
 //!   back; re-measures and requires no slot left to fill; writes the undo
 //!   record (and syncs it); then commits. Any mismatch rolls the whole run
 //!   back. A second apply after a successful one finds nothing to mint.
-//! * [`undo`]: deletes only the factors the record names, and each only while
-//!   every column the mint wrote still holds the recorded value (compared in
-//!   SQL as typed values). A factor changed or removed since is reported and
-//!   left alone. The record is the authority: the undo trusts the record
-//!   file the apply wrote, so keep it where only the operator can change it.
-//!   A dry run executes the deletes and rolls back.
+//! * [`undo`]: under the same advisory lock as an apply (so an undo never
+//!   runs beside an apply or another undo), deletes only the factors the
+//!   record names, and each only while every column the mint wrote still
+//!   holds the recorded value (compared in SQL as typed values). A factor
+//!   changed or removed since is reported and left alone. The matched factors
+//!   are locked `FOR UPDATE` first, which blocks a new `bp_messages` row from
+//!   referencing them, and their messages are deleted explicitly, so
+//!   `bp_messages_removed` is exactly the rows the undo removed even while
+//!   belief propagation writes messages (backlog 1097d3c2). The record is the
+//!   authority: the undo trusts the record file the apply wrote, so keep it
+//!   where only the operator can change it. A dry run executes the deletes
+//!   and rolls back.
 //!
 //!   The undo restores the `factors` table only as far as the rows it
 //!   minted. An edge inserted on a minted pair after the apply got no factor
@@ -65,8 +71,8 @@ use epigraph_engine::supersede_delta::{
 pub const PLAN_KIND: &str = "epigraph.r131_factor_mint.plan/1";
 /// The undo record's header `kind`.
 pub const RECORD_KIND: &str = "epigraph.r131_factor_mint.record/1";
-/// The advisory lock an apply holds (`pg_try_advisory_lock(hashtextextended(
-/// MINT_LOCK_NAME, 0))`), so two applies never run at once.
+/// The advisory lock an apply and an undo hold (`pg_try_advisory_lock(
+/// hashtextextended(MINT_LOCK_NAME, 0))`), so no two of them run at once.
 pub const MINT_LOCK_NAME: &str = "epigraph.r131_factor_mint";
 
 /// Why a run stopped. Every variant except [`MintError::CommitUnknown`]
@@ -418,19 +424,31 @@ pub async fn apply(
         )));
     }
     require_privileged(&mut *conn).await?;
+    take_mint_lock(&mut *conn).await?;
+    let result = apply_locked(&mut *conn, expected, record, statement_timeout_ms).await;
+    release_mint_lock(&mut *conn).await;
+    result
+}
+
+/// Take the session-level mint lock, or refuse with [`MintError::Locked`].
+async fn take_mint_lock(conn: &mut sqlx::PgConnection) -> Result<(), MintError> {
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtextextended($1, 0))")
         .bind(MINT_LOCK_NAME)
         .fetch_one(&mut *conn)
         .await?;
-    if !locked {
-        return Err(MintError::Locked);
+    if locked {
+        Ok(())
+    } else {
+        Err(MintError::Locked)
     }
-    let result = apply_locked(&mut *conn, expected, record, statement_timeout_ms).await;
+}
+
+/// Release the mint lock (best effort: it also ends with the session).
+async fn release_mint_lock(conn: &mut sqlx::PgConnection) {
     let _ = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
         .bind(MINT_LOCK_NAME)
         .execute(&mut *conn)
         .await;
-    result
 }
 
 async fn apply_locked(
@@ -573,7 +591,10 @@ pub struct UndoReport {
     pub absent: Vec<Uuid>,
     /// A row with the recorded id exists but differs: kept.
     pub changed_since: Vec<Uuid>,
-    /// `bp_messages` rows the deletes remove through their foreign key.
+    /// `bp_messages` rows of the deleted factors the undo removed. Counted
+    /// from the undo's own `DELETE ... RETURNING` while the factors are
+    /// locked, so a message written concurrently is either counted or
+    /// refused by its foreign key, never removed uncounted.
     pub bp_messages_removed: i64,
 }
 
@@ -599,39 +620,59 @@ const UNDO_MATCH: &str = "f.id = w.want_id
             AND f.frame_id IS NOT DISTINCT FROM w.frame_id
             AND f.created_at = w.created_at";
 
-/// Undo `record` by compare-and-set: see the module doc.
+/// Undo `record` by compare-and-set, under the mint lock: see the module doc.
 ///
 /// # Errors
-/// A database error (nothing is written), or [`MintError::NotPrivileged`].
+/// A database error (nothing is written), [`MintError::NotPrivileged`], or
+/// [`MintError::Locked`] when an apply or another undo holds the mint lock.
 pub async fn undo(
     conn: &mut sqlx::PgConnection,
     record: &MintRecord,
     dry_run: bool,
 ) -> Result<UndoReport, MintError> {
     require_privileged(&mut *conn).await?;
+    take_mint_lock(&mut *conn).await?;
+    let result = undo_locked(&mut *conn, record, dry_run).await;
+    release_mint_lock(&mut *conn).await;
+    result
+}
+
+async fn undo_locked(
+    conn: &mut sqlx::PgConnection,
+    record: &MintRecord,
+    dry_run: bool,
+) -> Result<UndoReport, MintError> {
     let ids: Vec<Uuid> = record.factors.iter().map(|f| f.factor_id).collect();
     let rows: Vec<String> = record.factors.iter().map(|f| f.row.clone()).collect();
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    let bp: i64 = sqlx::query_scalar(&format!(
+    // Lock the factors that still equal the record. The row lock conflicts
+    // with the KEY SHARE lock a new `bp_messages` row's foreign-key check
+    // takes, so from here no message can be added to them; a writer already
+    // holding that lock is waited for, and its message is then counted.
+    let matched: Vec<Uuid> = sqlx::query_scalar(&format!(
         "-- VISIBILITY-EXEMPT: maintenance read; the R-131 undo runs on the privileged connection.
          {UNDO_WANT}
-         SELECT count(*) FROM bp_messages m
-           JOIN factors f ON f.id = m.factor_id
-           JOIN want w ON {UNDO_MATCH}"
+         SELECT f.id FROM factors f JOIN want w ON {UNDO_MATCH}
+          ORDER BY f.id
+            FOR UPDATE OF f"
     ))
     .bind(&ids)
     .bind(&rows)
+    .fetch_all(&mut *tx)
+    .await?;
+    let bp: i64 = sqlx::query_scalar(
+        "-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
+         WITH gone AS (DELETE FROM bp_messages WHERE factor_id = ANY($1) RETURNING 1)
+         SELECT count(*) FROM gone",
+    )
+    .bind(&matched)
     .fetch_one(&mut *tx)
     .await?;
-    let mut deleted: Vec<Uuid> = sqlx::query_scalar(&format!(
+    let mut deleted: Vec<Uuid> = sqlx::query_scalar(
         "-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
-         {UNDO_WANT}
-         DELETE FROM factors f USING want w
-          WHERE {UNDO_MATCH}
-         RETURNING f.id"
-    ))
-    .bind(&ids)
-    .bind(&rows)
+         DELETE FROM factors WHERE id = ANY($1) RETURNING id",
+    )
+    .bind(&matched)
     .fetch_all(&mut *tx)
     .await?;
     let mut present: Vec<Uuid> = sqlx::query_scalar(

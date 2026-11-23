@@ -33,7 +33,11 @@
 //! The predict records its options (`epsilon`, `max_passes`, `only_changed`,
 //! the accepted list's size, the wave files): the apply must reuse exactly
 //! them. A real targeted run needs the accepted list (`--edges-from`) and both
-//! snapshot files (`--snapshot`, `--edge-rows`). The fixed-point verify after
+//! snapshot files (`--snapshot`, `--edge-rows`). Before its first write the
+//! apply requires every wave claim to still hold its wave `written` value
+//! (the value the predict worked from); a claim rewritten since the predict,
+//! or put back to its `before`, refuses the run with nothing written (re-run
+//! the predict). The fixed-point verify after
 //! an apply is a predict over the L1 wave files AND the apply's `--snapshot`
 //! file (an L1 claim the rewire refolded holds neither L1 value; the E
 //! records chain onto the L1 ones), run WITH `--only-changed` (without it a
@@ -53,8 +57,8 @@ use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
 use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::edge_rewire::{
-    predict_targeted_rewire, run_targeted_rewire, seed_from_waves, TargetedRunOptions,
-    DEFAULT_EPSILON, DEFAULT_MAX_PASSES,
+    predict_targeted_rewire, require_wave_claims_written, run_targeted_rewire, seed_from_waves,
+    TargetedRunOptions, DEFAULT_EPSILON, DEFAULT_MAX_PASSES,
 };
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;
@@ -370,6 +374,10 @@ async fn run_targeted(
     let (Some(snapshot), Some(edge_rows)) = (&cli.snapshot, &cli.edge_rows) else {
         return Err("a real targeted rewire needs --snapshot and --edge-rows".into());
     };
+    // Refuse a wave-claim state the predict did not work from BEFORE the
+    // snapshot files exist, so a refused run leaves none behind to block the
+    // re-run under the same names (backlog ed2f99a8). The library re-checks.
+    require_wave_claims_written(pool, &seed).await?;
     let mut wave_w = create_new(snapshot)?;
     let mut rows_w = create_new(edge_rows)?;
     let report = run_targeted_rewire(pool, viewer, &seed, &opts, &mut wave_w, &mut rows_w).await?;

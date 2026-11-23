@@ -1178,6 +1178,7 @@ async fn backfill_factors_refuses_a_targeted_real_run_on_mode_skew(pool: PgPool)
 /// the real wire; then a wave moves `a`, and its record is written to
 /// `<dir>/<tag>-l1.jsonl` as `recompute_claim_belief --snapshot` writes one.
 struct TargetedChain {
+    a: Uuid,
     b: Uuid,
     c: Uuid,
     ab: Uuid,
@@ -1230,6 +1231,7 @@ async fn targeted_chain(
     let mut f = std::fs::File::create(&wave_file).expect("wave file");
     epigraph_cli::belief_cache::write_wave_record(&mut f, &rec).expect("write the wave record");
     TargetedChain {
+        a,
         b,
         c,
         ab,
@@ -1333,6 +1335,68 @@ async fn backfill_factors_targeted_dry_run_writes_its_predict_report_and_nothing
         belief_state(&pool).await,
         before,
         "a predict writes nothing"
+    );
+}
+
+/// Backlog ed2f99a8, through the binary: a wave claim rewritten after the
+/// predict refuses the real targeted run (exit 1, `l1_state_unknown`) before
+/// it creates either snapshot file, so the re-run can use the same names, and
+/// nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_apply_refuses_a_wave_claim_rewritten_since_the_predict(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "stale").await;
+    sqlx::query("UPDATE claims SET belief = 0.33 WHERE id = $1")
+        .bind(ch.a)
+        .execute(&pool)
+        .await
+        .expect("rewrite the wave claim");
+    let before = belief_state(&pool).await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let list = dir.join("stale-accepted.txt");
+    std::fs::write(&list, format!("{}\n{}\n", ch.ab, ch.bc)).unwrap();
+    let snapshot = dir.join("stale-e-wave.jsonl");
+    let rows = dir.join("stale-e-rows.jsonl");
+
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            path_str(&ch.wave_file),
+            "--edges-from",
+            path_str(&list),
+            "--snapshot",
+            path_str(&snapshot),
+            "--edge-rows",
+            path_str(&rows),
+            "--until-fixed",
+            "--only-changed",
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+
+    assert_eq!(
+        r.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(r.stderr.contains("l1_state_unknown"), "{}", r.stderr);
+    assert!(
+        !snapshot.exists() && !rows.exists(),
+        "a refused run created its snapshot files"
+    );
+    assert_eq!(
+        belief_state(&pool).await,
+        before,
+        "a refused run writes nothing"
     );
 }
 
