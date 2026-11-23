@@ -3,7 +3,7 @@
 //! * The ORACLE is the real cascade on the same throwaway database: the
 //!   delta runs first, then the fixes' own write paths run over the rows it
 //!   measured (the K10(2) arm through `cascade_after_supersede`, the edge-BBA
-//!   removal and repair through `delete_for_perspective` +
+//!   removal and repair through `delete_for_edge` +
 //!   `cascade_after_edge_withdrawal` for the `supersedes` rows, and the K3
 //!   mint `regenerate_superseded_edge_factors_conn` for the R-131 set), and
 //!   every value the delta predicted must be the value the cascade wrote.
@@ -724,8 +724,12 @@ fn the_delta_calls_no_write_path() {
         "update_claim_belief",
         "clear_claim_belief",
         "delete_for_perspective",
+        // Migration 267's slot-keyed renames and additions of the write paths.
+        "delete_for_edge",
         "auto_wire",
         "store_with_perspective",
+        "store_in_slot",
+        "store_for_evidence",
         "apply_after",
         "cascade_after",
         "replay_deferred",
