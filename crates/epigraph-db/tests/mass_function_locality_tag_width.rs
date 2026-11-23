@@ -132,10 +132,33 @@ async fn store(pool: &PgPool, tag: &str) -> Result<Uuid, epigraph_db::DbError> {
     .await
 }
 
+/// The same store on a database BELOW 267, for the tests that stop at 227 or
+/// 228. Since 267 the repository writer keys a row on its `slot_kind` /
+/// `slot_id` columns, which do not exist there (42703), so these tests issue
+/// the INSERT the repository writer issued before 267: the same columns and
+/// values as [`store`], `perspective_id` NULL.
+async fn store_below_267(pool: &PgPool, tag: &str) -> Result<Uuid, sqlx::Error> {
+    let (agent, claim, frame) = seed(pool).await;
+    sqlx::query_scalar(
+        "INSERT INTO mass_functions \
+            (claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, \
+             combination_method, source_strength, evidence_type, locality_tag, evidence_id) \
+         VALUES ($1, $2, $3, NULL, $4, NULL, 'test', NULL, 'empirical', $5, NULL) \
+         RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(json!({"0": 0.6, "0,1": 0.4}))
+    .bind(tag)
+    .fetch_one(pool)
+    .await
+}
+
 /// Whether the error is PostgreSQL's 22001 (value too long for the column).
 /// Read off the Debug form, which carries the driver's SQLSTATE whatever
-/// `DbError` variant wraps it.
-fn is_too_long(e: &epigraph_db::DbError) -> bool {
+/// error type wraps it.
+fn is_too_long(e: &impl std::fmt::Debug) -> bool {
     format!("{e:?}").contains("\"22001\"")
 }
 
@@ -166,13 +189,14 @@ async fn a_28_character_tag_stores_and_a_65_character_tag_does_not(pool: PgPool)
     assert!(is_too_long(&err), "{err:?}");
 }
 
-/// The calibration for the test above: below 228 the same store fails with
-/// 22001, so the assertion above measures 228 and not some other path.
+/// The calibration for the test above: below 228 the same store (in its
+/// pre-267 form, [`store_below_267`]) fails with 22001, so the assertion above
+/// measures 228 and not some other path.
 #[sqlx::test(migrations = false)]
 async fn below_228_the_28_character_tag_is_refused(pool: PgPool) {
     migrate(&pool, &up_to(227)).await;
     assert_eq!(column_type(&pool).await, "character varying(20)");
-    let err = store(&pool, LONG_ENGINE_TAG)
+    let err = store_below_267(&pool, LONG_ENGINE_TAG)
         .await
         .expect_err("varchar(20) cannot hold 28 characters");
     assert!(is_too_long(&err), "{err:?}");
@@ -196,7 +220,7 @@ async fn the_rewrite_guard_survives_the_widening(pool: PgPool) {
     );
 
     // And it still fires: re-tagging a retracted row is refused (RT07).
-    let id = store(&pool, "cross").await.expect("store");
+    let id = store_below_267(&pool, "cross").await.expect("store");
     sqlx::query(
         "UPDATE mass_functions \
             SET retracted_at = now(), retracted_by = source_agent_id, retract_reason = 'fixture' \
@@ -229,7 +253,9 @@ async fn the_228_undo_returns_the_column_and_refuses_over_long_rows(pool: PgPool
     let undo = repo_file("docs/runbooks/228-undo.sql");
 
     // A row the narrowed column cannot hold: the undo refuses and changes nothing.
-    let id = store(&pool, LONG_ENGINE_TAG).await.expect("store long tag");
+    let id = store_below_267(&pool, LONG_ENGINE_TAG)
+        .await
+        .expect("store long tag");
     // On its own connection: the refusal leaves that connection's explicit
     // transaction aborted, so it is rolled back before the connection is
     // returned to the pool.
