@@ -3115,6 +3115,38 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `USING (true)`), and the one column returned is what lets a signature verifier refuse \
          a key whose private half is public (`seed-derived`, migration 230).",
     ),
+    // Backlog 54018ca1 (migration 239): the agent-key repo fns take a generic
+    // executor so the HTTP key routes run them on the caller's stamped
+    // `write_as` transaction, where 239's definers gate on the principal.
+    (
+        "agent_key.rs",
+        "get_active_key",
+        "READ of `agent_keys` for one agent's active key of one type. `agent_keys` has no tenancy columns and no row security; the key \
+         routes call it after `require_self_or_admin` on the caller's stamped transaction, and \
+         a key's public half is what verifiers already resolve.",
+    ),
+    (
+        "agent_key.rs",
+        "get_by_id",
+        "READ of one `agent_keys` row by id. `agent_keys` has no tenancy columns and no row security; the revoke route calls it after \
+         `require_self_or_admin` on the caller's stamped transaction and refuses a key of \
+         another agent.",
+    ),
+    (
+        "agent_key.rs",
+        "rotate",
+        "WRITE through `epigraph_agent_key_rotate` (migration 239): retires a key and records \
+         its successor in one definer call. `agent_keys` has no tenancy columns and no row security; authority is the definer's: \
+         maintenance-only EXECUTE plus 161's attested-type guard, so an application session is \
+         refused in the database whatever viewer it carries.",
+    ),
+    (
+        "agent_key.rs",
+        "update_status",
+        "WRITE through `epigraph_agent_key_set_status`, whose 239 body admits only a \
+         privileged session, the key's own agent (the stamped principal) or an admin (AK03, \
+         42501). `agent_keys` has no tenancy columns and no row security; the gate is the stamped principal, not a viewer filter.",
+    ),
     // Atlas P3a (migration 197): untenanted layout reads. Each is ONE statement
     // over `atlas_layout_*` (no claim_id, no FK to claims, no visibility or
     // owner_group_id) and `claim_themes` (no visibility or owner_group_id
