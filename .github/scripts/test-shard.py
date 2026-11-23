@@ -136,9 +136,12 @@ WALKERS = {
     # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
     "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
-    # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
-    # renamed is only caught by a full run (main, staging, `ci:full`).
-    "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/intro/*"),
+    # README.md, docs/README.md, docs/intro/*.md and the names under docs/,
+    # docs/architecture and docs/audits (the index must link every entry under
+    # docs/; a dated audit lives in docs/audits). A link TARGET elsewhere that
+    # is deleted or renamed is only caught by a full run (main, staging,
+    # `ci:full`).
+    "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/*"),
     "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml",),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/belief_lint/mod.rs": ("crates/*/src/*", "scripts/*"),

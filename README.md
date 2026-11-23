@@ -146,11 +146,16 @@ Design:
 - [`CLAUDE.md`](CLAUDE.md): conventions for agent sessions working in this
   repository (backlog, schema, tests, workflow).
 
+Everything else under `docs/` is listed, one line per area, in
+[`docs/README.md`](docs/README.md).
+
 ## Change log
 
 Newest first. Each line gives the commit that changed this file. Where a
 commit reached `main` through a merge, the PR is given as "via #N".
 
+- 2026-11-23 (backlog 3640504e): linked the new docs index
+  `docs/README.md`.
 - 2026-11-14 (backlog 2c2b335d): listed the new `docs/intro/03-walkthroughs.md`
   and dropped the note that the numbering skips `03`.
 - 2026-11-04 (PR #764): rewrote the file for a reader new to the

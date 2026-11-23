@@ -9,13 +9,15 @@
 //! pins the other half of that defect: the numbered tree must have no gap and
 //! README must list every page, so a page cannot be dropped or left unlisted.
 //!
-//! Scope is deliberately narrow: `docs/superpowers/` holds plans and specs
-//! that name files *to be created* and absolute paths on a developer's
-//! machine, so they are not reader-facing links and are not scanned.
+//! Scope is deliberately narrow: `README.md`, `docs/intro/` and the docs index
+//! `docs/README.md`. `docs/superpowers/` holds plans and specs that name files
+//! *to be created* and absolute paths on a developer's machine, so they are
+//! not reader-facing links and are not scanned.
 //!
-//! One placement check rides along (backlog 3640504e): a dated,
-//! point-in-time audit must live under `docs/audits/` with a status line
-//! saying so, not beside the living designs in `docs/architecture/`.
+//! The index has two more checks of its own (backlog 3640504e): it must link
+//! every entry directly under `docs/`, so a new area cannot go unlisted, and
+//! a dated, point-in-time audit must live under `docs/audits/` with a status
+//! line saying so, not beside the living designs in `docs/architecture/`.
 //!
 //! The scan is std-only (no regex dev-dependency): it finds every inline
 //! `](target)` link, skips external (`http:`, `https:`, `mailto:`) and pure
@@ -23,7 +25,8 @@
 //! `"title"`, and resolves the rest against the directory of the file that
 //! contains the link.
 //!
-//! Known limits, acceptable while the scope is README + `docs/intro/` (widen
+//! Known limits, acceptable while the scope is README, `docs/intro/` and the
+//! docs index (widen
 //! the scanner before widening the scope): reference-style definitions
 //! (`[x]: path`) are not checked; `](` inside fenced blocks or inline code is
 //! scanned as a link; a target containing `)` is cut at the first `)`; a
@@ -36,10 +39,11 @@ fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The reader-facing onboarding files: `README.md` and `docs/intro/*.md`.
+/// The reader-facing onboarding files: `README.md`, the docs index
+/// `docs/README.md` and `docs/intro/*.md`.
 fn onboarding_files() -> Vec<PathBuf> {
     let root = repo_root();
-    let mut files = vec![root.join("README.md")];
+    let mut files = vec![root.join("README.md"), root.join("docs/README.md")];
     let intro = root.join("docs/intro");
     let mut intro_files: Vec<PathBuf> = std::fs::read_dir(&intro)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", intro.display()))
@@ -127,6 +131,57 @@ fn every_relative_link_in_the_onboarding_path_resolves() {
         broken.is_empty(),
         "relative links in the onboarding path point at files that do not exist:\n  {}",
         broken.join("\n  ")
+    );
+}
+
+/// The docs index must link every file and directory directly under `docs/`,
+/// so a reader can tell which directory holds what and a new area cannot be
+/// added without saying what it is for.
+#[test]
+fn the_docs_index_links_every_entry_under_docs() {
+    let root = repo_root();
+    let docs = root.join("docs");
+    let index = docs.join("README.md");
+    let text = std::fs::read_to_string(&index).unwrap_or_else(|e| {
+        panic!(
+            "read {}: {e}; docs/ needs an index that says which directory holds what",
+            index.display()
+        )
+    });
+    // `./name`, `name/` and `name/inner.md` all count as listing `name`.
+    let listed: Vec<String> = relative_link_targets(&text)
+        .into_iter()
+        .map(|t| {
+            let t = t.strip_prefix("./").unwrap_or(&t);
+            t.split('/').next().unwrap_or_default().to_string()
+        })
+        .collect();
+    let mut entries: Vec<String> = std::fs::read_dir(&docs)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", docs.display()))
+        .map(|entry| {
+            entry
+                .expect("docs entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name != "README.md" && !name.starts_with('.'))
+        .collect();
+    entries.sort();
+
+    assert!(
+        entries.len() >= 8,
+        "expected at least 8 entries directly under docs/, found {entries:?}; the \
+         directory scan is broken"
+    );
+    let unlisted: Vec<&String> = entries
+        .iter()
+        .filter(|name| !listed.iter().any(|l| l == *name))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "docs/README.md must link every entry directly under docs/; it does not \
+         link: {unlisted:?}"
     );
 }
 
