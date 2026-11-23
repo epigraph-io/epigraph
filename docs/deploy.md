@@ -335,6 +335,27 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   `security_events.agent_id` references `agents`, so a refusal keyed on a
   client address (or on an agentless token's client) is not persisted and
   logs `Failed to persist security event` instead.
+- **Per-address rate limiting** (`EPIGRAPH_RATE_LIMIT_ADDRESS_RPM`, off
+  unless set) closes the gap the limiter above leaves: it sits inside the
+  bearer layer, so the bearer layer's own work (token verification and the
+  revocation, admin-scope and delegation reads), the 401s it answers and
+  requests to unknown paths (404) are never counted by it. With this variable
+  set, EVERY request except `/health` (matched exactly: `/health/...`,
+  `/readiness` and `/liveness` are not routes, so they are counted) is first
+  charged to its client address (keyed as above, through
+  `EPIGRAPH_TRUSTED_PROXIES`), outside authentication and routing, and
+  refused 429 past the limit before any token is read. It writes no
+  `X-RateLimit-*` headers, does not turn the principal limiter on (nor does
+  that limiter turn it on), and `EPIGRAPH_RATE_LIMIT=off` turns it off too.
+  Every principal behind one address shares its bucket, so size it for the
+  busiest address you serve (an agent host, the reverse proxy when
+  `EPIGRAPH_TRUSTED_PROXIES` does not name it), well above
+  `EPIGRAPH_RATE_LIMIT_RPM`. The boot log says `per-address rate limiter ON`
+  or `OFF`.
+- **A handler that panics** is answered `500` with the body `Service
+  panicked` and the request's `x-request-id`; the panic message is logged at
+  ERROR (`Service panicked: ...`) in the request's span and never sent to the
+  client. The process keeps serving.
 - **Metrics** are served only on the internal listener
   `EPIGRAPH_METRICS_ADDR` (default `127.0.0.1:9090`), never on the
   application port. See section 7.
@@ -532,10 +553,13 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_TIMEOUT_SECS` | `300` | Seconds a request may take before the server answers it `408 Request Timeout` and drops the handler. `0` turns the timeout off (warned at boot). The bound covers the time to the response headers, not a streamed body. A timeout that fires after a handler committed answers 408 for a write that happened, so keep it above your slowest legitimate request. Not a whole number → exit 1. |
 | `EPIGRAPH_SHUTDOWN_GRACE_SECS` | `30` | After SIGTERM or SIGINT the server stops accepting connections and lets in-flight requests finish for at most this long, then exits 0. Keep it below the unit's `TimeoutStopSec` (systemd's default is 90 s). Not a whole number → exit 1. |
 | `EPIGRAPH_MAX_REQUEST_BYTES` | `10485760` (10 MiB) | The request-body limit on authenticated routes; over it the request is answered 413. The anonymous routes (`/oauth/*`, `/.well-known/*`, `/health`, `/api/v1/openapi.json`, `/elevate/*`) are held to 64 KiB whatever this says. Not a positive whole number → exit 1. |
+| `EPIGRAPH_DB_MAX_CONNECTIONS` | `10` | The most connections the request pool holds open (section 5, "Connection budget"). Not a positive whole number → exit 1. |
+| `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` | unset (the database's own `statement_timeout`) | Each request-pool connection's `statement_timeout`, in milliseconds, set once when the connection opens; a statement running longer is cancelled and fails. Time a statement spends waiting on a lock counts. This is the process's only pool, so the bound applies to everything on it, not only request handlers: the webhook dispatcher, the tenancy gauge and canary sampler, and the boot checks (webhook hydration among them) are cancelled too, and the sampler then only logs a WARN and leaves the gauge stale. `0` is the same as unset. Keep it above your slowest legitimate query (ingestion, synthesis and belief propagation walk large parts of the graph), and below `EPIGRAPH_REQUEST_TIMEOUT_SECS`, which abandons the request but not its query. A session setting, so it is not reliable behind a transaction-mode pooler (`EPIGRAPH_SESSION_GUC_MODE=transaction`). The drain timer's pool has its own (`EPIGRAPH_JOB_STATEMENT_TIMEOUT_MS`). Not a whole number → exit 1. |
 | `EPIGRAPH_METRICS_ADDR` | `127.0.0.1:9090` | The internal `/metrics` listener. A bind failure logs an error, and the API keeps serving without metrics. |
 | `EPIGRAPH_RATE_LIMIT` | unset (off unless a limit below is set) | `on` installs the rate limiter even with no limit set (at 600 a minute per bucket); `off` installs none whatever else is set. Off is logged as a warning at boot. Any other value turns it on and is warned about. |
 | `EPIGRAPH_RATE_LIMIT_RPM` | unset (no rate limit) | Setting it turns rate limiting on. Requests a minute per bucket: per principal for an authenticated request, per client address (an IPv6 client by its /64) for an anonymous one. Not a positive whole number → exit 1. |
 | `EPIGRAPH_RATE_LIMIT_GLOBAL_RPM` | unset (no global limit) | Requests a minute across all buckets; a number turns rate limiting on (at 600 a minute per bucket if `EPIGRAPH_RATE_LIMIT_RPM` is unset). A request refused by its own bucket does not count against it. `off` is the same as unset; any other value that is not a positive whole number → exit 1. |
+| `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` | unset (no per-address limit) | Requests a minute per client address, counted before authentication and routing, so 401s and unknown-path 404s are limited too (Step 8, "Per-address rate limiting"). Independent of `EPIGRAPH_RATE_LIMIT_RPM`; `EPIGRAPH_RATE_LIMIT=off` turns it off. Not a positive whole number → exit 1. |
 | `EPIGRAPH_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | Comma-separated addresses or CIDR prefixes whose `X-Forwarded-For` is believed when keying an anonymous request (Step 8, "Rate limiting"); `none` trusts no proxy. It does not turn rate limiting on. An entry that does not parse → exit 1. |
 | `EPIGRAPH_TLS_CERT`, `EPIGRAPH_TLS_KEY` | unset | Both set, in a build with the `tls` feature → HTTPS on the same port. |
 | `EPIGRAPH_SESSION_GUC_MODE` | `session` | `transaction` for a transaction-mode pooler (section 6). Any other value is `session`. |
@@ -972,7 +996,10 @@ reversed by `reown-reverse`.
 ### Connection budget
 
 The API process opens its application pool only: **10** connections per
-replica. Each `epigraph-mcp-full` process opens **10** on the application DSN.
+replica by default, `EPIGRAPH_DB_MAX_CONNECTIONS` to change it (section 3's
+`server` table; `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` bounds each statement on
+it). Keep the sum over every process below Postgres' `max_connections` minus
+its reserved slots. Each `epigraph-mcp-full` process opens **10** on the application DSN.
 The timers add, while they run, up to 11 for `replay_deferred_cascades` (the
 `MaintenancePool` cap, below) and up to 4 for `drain_jobs`, plus the one
 connection that holds its advisory lock.
@@ -4703,6 +4730,7 @@ Do not improvise it against a live database without that entry's context.
 | `Failed to load entity_types registry cache` | The database is not migrated. Run `epigraph-migrate`. |
 | `ERROR: refusing to serve: pgvector <v> is installed but 0.8.0 or newer is required ...` | Install pgvector 0.8.0 or newer on the PostgreSQL server, then `ALTER EXTENSION vector UPDATE;` in the database (Step 2), and restart. |
 | ``ERROR: refusing to serve: the pgvector extension (`vector`) is not installed in this database ...`` | The server was pointed at an unmigrated database. Run `epigraph-migrate`. |
+| `FATAL: the request pool is misconfigured: ...` | `EPIGRAPH_DB_MAX_CONNECTIONS` or `EPIGRAPH_DB_STATEMENT_TIMEOUT_MS` does not parse; the message names it (section 3). |
 | `FATAL: serving is misconfigured: ...` | `EPIGRAPH_BIND_ADDR`, `EPIGRAPH_REQUEST_TIMEOUT_SECS`, `EPIGRAPH_SHUTDOWN_GRACE_SECS` or `EPIGRAPH_MAX_REQUEST_BYTES` does not parse; the message names it (section 3). |
 | `ERROR: EPIGRAPH_MIGRATE_ON_BOOT is set and the migration database (MIGRATION_DATABASE_URL) cannot be reached: ...` | The migration DSN is wrong or its server is down. Fix it, or unset `EPIGRAPH_MIGRATE_ON_BOOT` and run `epigraph-migrate`. |
 | `refusing to serve: tenancy triggers are not armed` | A require-tenancy trigger is missing or disabled. The database is not at head, or a trigger was disabled by hand. |

@@ -188,6 +188,26 @@ async fn main() {
         );
     }
     let rate_limiter = rate_limit.build();
+    // The per-address limiter (backlog 20210eaa), outside authentication and
+    // routing; opt-in through EPIGRAPH_RATE_LIMIT_ADDRESS_RPM, independent of
+    // the principal limiter, off under EPIGRAPH_RATE_LIMIT=off.
+    let address_rate_limiter = rate_limit.build_address();
+    match (&address_rate_limiter, rate_limit.per_address_rpm) {
+        (Some(_), Some(rpm)) => tracing::info!(
+            per_address_rpm = rpm,
+            trusted_proxies = %rate_limit.trusted_proxies,
+            "per-address rate limiter ON: every request but /health, 401s and \
+             unknown paths included, is charged to its client address before authentication"
+        ),
+        (None, Some(_)) => tracing::warn!(
+            "EPIGRAPH_RATE_LIMIT_ADDRESS_RPM is set but EPIGRAPH_RATE_LIMIT=off: the \
+             per-address rate limiter is OFF"
+        ),
+        _ => tracing::info!(
+            "per-address rate limiter OFF (EPIGRAPH_RATE_LIMIT_ADDRESS_RPM unset): 401s and \
+             unknown-path 404s are not rate limited by this process"
+        ),
+    }
 
     // Guest reads (backlog `1deb9dbf`), read here, next to the rate limit,
     // because they decide whether the guest routes get a limiter of their own
@@ -219,6 +239,21 @@ async fn main() {
         shutdown_grace_secs = serve.shutdown_grace.as_secs(),
         max_request_bytes = serve.max_request_bytes,
         "serving settings"
+    );
+    // The request pool's size and statement timeout (backlog b4c4337f), read
+    // here for the same reason: a malformed value refuses before any
+    // connection.
+    let request_pool = match epigraph_api::serving::RequestPoolSettings::from_env() {
+        Ok(settings) => settings,
+        Err(reason) => {
+            eprintln!("FATAL: the request pool is misconfigured: {reason}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        db_max_connections = request_pool.max_connections,
+        db_statement_timeout_ms = ?request_pool.statement_timeout.map(|t| t.as_millis()),
+        "request pool settings"
     );
     if serve.request_timeout.is_none() {
         tracing::warn!(
@@ -455,11 +490,13 @@ async fn main() {
         // `connect_recording_elevated_access`: this binary RECORDS every
         // elevated access (the router's per-access recorder layer, elevation
         // plan EL-8), so its pool declares the recorder, migration 125's second
-        // key. Sizing is `connect`'s (`ScopedPoolOptions::default()`).
+        // key. Sizing and statement timeout are EPIGRAPH_DB_MAX_CONNECTIONS
+        // and EPIGRAPH_DB_STATEMENT_TIMEOUT_MS (read at the top of `main`;
+        // unset, `ScopedPoolOptions::default()`'s ten and none).
         let scoped = epigraph_db::ScopedPool::connect_recording_elevated_access(
             &database_url,
             guc_mode,
-            epigraph_db::ScopedPoolOptions::default(),
+            request_pool.pool_options(),
         )
         .await
         .expect("Failed to connect to PostgreSQL");
@@ -744,6 +781,11 @@ async fn main() {
         Some(limiter) => state.with_guest_rate_limiter(limiter),
         None => state,
     };
+    // And the per-address limiter, when configured (see above).
+    let state = match address_rate_limiter {
+        Some(limiter) => state.with_address_rate_limiter(limiter),
+        None => state,
+    };
 
     // Hydrate the in-process webhook store from `webhook_subscriptions`
     // (migration 085, PR-10). Before this table existed the store was empty on
@@ -968,6 +1010,17 @@ async fn main() {
         // SIGTERM or SIGINT stops accepting and drains in-flight requests
         // for at most the shutdown grace, as on the plain listener below.
         let handle = axum_server::Handle::new();
+        // The bound address, logged with the plain listener's line: with
+        // EPIGRAPH_PORT=0 the kernel picks the port, and this line is how a
+        // caller (the TLS boot test, an operator) learns it.
+        {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                if let Some(bound) = handle.listening().await {
+                    tracing::info!("Server listening on {}", bound);
+                }
+            });
+        }
         {
             let handle = handle.clone();
             let grace = serve.shutdown_grace;

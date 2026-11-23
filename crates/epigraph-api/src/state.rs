@@ -390,6 +390,13 @@ pub struct AppState {
     /// Optional: When None, rate limiting is disabled.
     /// Uses per-agent and global rate limits based on token bucket algorithm.
     pub rate_limiter: Option<AgentRateLimiter>,
+    /// The per-address limiter (backlog 20210eaa), layered OUTSIDE the bearer
+    /// layers and routing (`middleware::rate_limit::address_rate_limit_middleware`),
+    /// so a 401 and an unknown-path 404 are counted, and a refused request
+    /// costs no token verification or database read. `None` in every
+    /// constructor; `bin/server.rs` sets it from
+    /// `EPIGRAPH_RATE_LIMIT_ADDRESS_RPM` (`RateLimitSettings::build_address`).
+    pub address_rate_limiter: Option<AgentRateLimiter>,
     /// Security audit log for tracking security-relevant events
     ///
     /// This log captures authentication attempts, signature verifications,
@@ -1276,6 +1283,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1333,6 +1341,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1366,6 +1375,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1924,6 +1934,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::with_defaults(),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -1959,6 +1970,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -2005,6 +2017,7 @@ impl AppState {
             propagation_orchestrator: Arc::new(RwLock::new(PropagationOrchestrator::new())),
             propagator: DatabasePropagator::new(propagation_config),
             rate_limiter: None,
+            address_rate_limiter: None,
             audit_log: Arc::new(InMemorySecurityAuditLog::new()),
             embedding_service: None,
             embedding_provider: None,
@@ -2608,6 +2621,13 @@ impl AppState {
     #[must_use]
     pub fn with_rate_limiter(mut self, rate_limiter: AgentRateLimiter) -> Self {
         self.rate_limiter = Some(rate_limiter);
+        self
+    }
+
+    /// Set the per-address limiter; see [`Self::address_rate_limiter`].
+    #[must_use]
+    pub fn with_address_rate_limiter(mut self, limiter: AgentRateLimiter) -> Self {
+        self.address_rate_limiter = Some(limiter);
         self
     }
 
