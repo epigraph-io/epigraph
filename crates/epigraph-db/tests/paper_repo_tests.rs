@@ -764,3 +764,94 @@ async fn an_exact_key_hit_never_scans_papers(pool: PgPool) {
         "a bare-DOI miss scans papers for a case-variant prefix"
     );
 }
+
+// --- The case-variant fallback inside a declared scope (246 + f3a3ca54) -----
+//
+// Since migration 246 a `papers` row carries the tenancy of the ingest that
+// wrote it, and `get_or_create` reuses only a row of the declared scope. The
+// case-variant fallback must stay inside that scope too, gate included: a
+// group's case-variant row is not a public ingest's to reuse, and a group's
+// exact-spelling row must not switch off the fallback for the public scope.
+
+async fn seed_scoped_paper(
+    pool: &PgPool,
+    key: &str,
+    visibility: &str,
+    owner: uuid::Uuid,
+) -> uuid::Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'scoped', $2, $3) RETURNING id",
+    )
+    .bind(key)
+    .bind(visibility)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("seed scoped paper row")
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool) {
+    let (_, g) = fixture::seed_agent_with_group(&pool, "case-variant-scope").await;
+    let world = epigraph_core::TenancyDecl::instance_wide()
+        .owner_group_bind()
+        .expect("the instance-wide declaration names its owner");
+
+    // A GROUP row keyed on a case-variant prefix belongs to that group.
+    let bare = "10.5555/repo-case-scope";
+    let group_variant =
+        seed_scoped_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "group", g).await;
+    let public_id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create");
+    assert_ne!(
+        public_id, group_variant,
+        "a public ingest must not reuse a group's case-variant row"
+    );
+    let group_id = PaperRepository::get_or_create(
+        &pool,
+        bare,
+        None,
+        None,
+        epigraph_core::TenancyDecl::group(g),
+    )
+    .await
+    .expect("group get_or_create");
+    assert_eq!(
+        group_id, group_variant,
+        "the group's own ingest reuses its case-variant row instead of twinning it"
+    );
+    assert_eq!(
+        PaperRepository::find_in_scope(&pool, bare, epigraph_core::TenancyDecl::group(g))
+            .await
+            .expect("find_in_scope"),
+        Some(group_variant),
+        "find_in_scope agrees with the writer"
+    );
+
+    // The gate is scoped as well: a group row stored under the EXACT bare key
+    // does not hide the public scope's case-variant row from a public ingest.
+    let bare2 = "10.5555/repo-case-gate";
+    let public_variant = seed_scoped_paper(&pool, &format!("Doi:{bare2}"), "public", world).await;
+    let _group_exact = seed_scoped_paper(&pool, bare2, "group", g).await;
+    let id = PaperRepository::get_or_create(
+        &pool,
+        bare2,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create");
+    assert_eq!(
+        id, public_variant,
+        "another scope's exact row must not switch off this scope's case-variant match"
+    );
+}
