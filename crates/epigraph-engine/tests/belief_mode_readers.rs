@@ -11,15 +11,29 @@
 //!   literal, or reads the environment through a flag's `ENV` constant.
 //! - Backlog fcc33cb1: the table said `bp_apply`, `compound_belief` and
 //!   `compound_source_edges` were not acted on, when the code did act on them.
-//!   Code acts on a flag by reading its field of the modes the process read:
-//!   `belief_modes::current().<key>`, the atom-cache writer's
-//!   `atom_items::modes().<key>`, or `<key>` off a `let` binding of either.
-//!   [`the_acted_on_table_matches_the_flags_the_code_reads`] fails when such a
-//!   read exists while the flag's table row says "no", and when a row says it
-//!   is acted on while no production code reads it.
+//! - Backlog 9a8f3bff: that check was a text scan for a field read off
+//!   `current()` or a `let` binding of it, so a file that only forwarded the
+//!   struct was credited when it reused a binding name, and a read through a
+//!   renamed binding or a helper's parameter was missed. `BeliefModes`'s
+//!   fields are now private to `belief_modes`, so outside it the ONE way to
+//!   act on a flag is its accessor (`.atom_fold()`, ...; the compiler, not
+//!   this scan, rules out every other way). A call of the accessor is what
+//!   is measured, wherever the struct came from.
+//!   [`the_acted_on_register_and_table_match_the_accessor_calls`] fails when
+//!   a production file calls a flag's accessor without being listed for it
+//!   in [`ACTED_ON_BY`] (or is listed and no longer calls it), and when the
+//!   flag's table row says "no" while some file acts on it (or the reverse).
+//!   [`the_modes_fields_are_private`] pins the privacy the scan relies on.
 //!
 //! The scan is plain text over every `crates/*/src` file, with comments and
 //! `#[cfg(test)] mod` blocks excluded (`support/rust_sources.rs`).
+//!
+//! Known limits: a value reached through the REPORT forms (`fields()`,
+//! `skew()`, `summary()`, the serde form on `/health`) is not an accessor
+//! call and is not seen; those exist to report a mode, and acting on one
+//! through them would be a review finding. An unrelated method that shares
+//! an accessor's name (`.inference()`) would be counted, and would show as a
+//! file not listed for that flag.
 
 #[path = "support/rust_sources.rs"]
 mod rust_sources;
@@ -109,73 +123,127 @@ fn tokens(code: &str) -> Vec<String> {
     out
 }
 
-/// Whether `toks[i..]` is a call of the modes the process read:
-/// `current()` or `modes()`, bare (imported) or as `belief_modes::current()` /
-/// `atom_items::modes()`. A `Foo::current()` of some other type is not one.
-fn is_modes_call(toks: &[String], i: usize) -> bool {
-    let call = matches!(toks.get(i).map(String::as_str), Some("current" | "modes"))
-        && toks.get(i + 1).map(String::as_str) == Some("(")
-        && toks.get(i + 2).map(String::as_str) == Some(")");
-    if !call {
-        return false;
-    }
-    if i >= 1 && toks[i - 1] == "::" {
-        return i >= 2 && matches!(toks[i - 2].as_str(), "belief_modes" | "atom_items");
-    }
-    true
-}
-
-/// The names production code binds to the modes the process read:
-/// `let m = belief_modes::current();` or `let mut m = *atom_items::modes();`.
-fn modes_bindings(toks: &[String]) -> Vec<String> {
-    let mut names = Vec::new();
-    for (i, tok) in toks.iter().enumerate() {
-        if tok != "let" {
-            continue;
-        }
-        let mut j = i + 1;
-        if toks.get(j).map(String::as_str) == Some("mut") {
-            j += 1;
-        }
-        let Some(name) = toks.get(j) else { continue };
-        if toks.get(j + 1).map(String::as_str) != Some("=") {
-            continue;
-        }
-        // The right-hand side up to the `;`: `[*|&] [path ::]* current ( ) ;`.
-        let mut k = j + 2;
-        while matches!(toks.get(k).map(String::as_str), Some("*" | "&")) {
-            k += 1;
-        }
-        while toks.get(k + 1).map(String::as_str) == Some("::") {
-            k += 2;
-        }
-        if is_modes_call(toks, k) && toks.get(k + 3).map(String::as_str) == Some(";") {
-            names.push(name.clone());
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
-}
+/// Every production file that acts on each flag, by report key: exactly the
+/// files that call the flag's accessor (see [`acts_on_flag`]). A flag no file
+/// acts on has an empty list, and its table row must say "no". Sorted.
+const ACTED_ON_BY: &[(&str, &[&str])] = &[
+    (
+        "atom_fold",
+        &[
+            // The CLI wave bins' refusal of a fold their writers lack.
+            "crates/epigraph-cli/src/belief_mode_check.rs",
+            // The single atom-cache writer's settings.
+            "crates/epigraph-engine/src/edge_factor.rs",
+        ],
+    ),
+    (
+        "compound_belief",
+        &["crates/epigraph-engine/src/belief_view.rs"],
+    ),
+    ("compound_write_guard", &[]),
+    (
+        "compound_source_edges",
+        &[
+            "crates/epigraph-cli/src/shadow_report.rs",
+            "crates/epigraph-engine/src/atom_items.rs",
+            "crates/epigraph-engine/src/bba_retract.rs",
+            "crates/epigraph-engine/src/edge_factor.rs",
+        ],
+    ),
+    ("atom_cache_mode", &[]),
+    ("inference", &[]),
+    ("bp_apply", &["crates/epigraph-api/src/bin/server.rs"]),
+];
 
 /// Whether one file's production code acts on the flag reported as `key`:
-/// `<key>` read off `belief_modes::current()` / `atom_items::modes()`
-/// directly, or off a `let` binding of either.
-///
-/// A token scan: passing the whole struct to a function that reads the field
-/// is credited to that function's file, not the caller's.
-fn reads_flag(src: &str, key: &str) -> bool {
+/// it calls the flag's accessor, as a method (`<expr>.<key>()`, whatever the
+/// receiver is called or wherever it came from) or as a path
+/// (`BeliefModes::<key>`). Passing the struct on is not acting on it.
+fn acts_on_flag(src: &str, key: &str) -> bool {
     let toks = tokens(&production_code(src));
-    let field_at = |i: usize| {
-        toks.get(i).map(String::as_str) == Some(".")
-            && toks.get(i + 1).map(String::as_str) == Some(key)
-    };
-    let direct = (0..toks.len()).any(|i| is_modes_call(&toks, i) && field_at(i + 3));
-    let bindings = modes_bindings(&toks);
-    direct
-        || (0..toks.len()).any(|i| {
-            bindings.contains(&toks[i]) && field_at(i + 1) && (i == 0 || toks[i - 1] != ".")
-        })
+    let at = |i: usize| toks.get(i).map(String::as_str);
+    (0..toks.len()).any(|i| {
+        let method = at(i) == Some(".")
+            && at(i + 1) == Some(key)
+            && at(i + 2) == Some("(")
+            && at(i + 3) == Some(")");
+        let path =
+            at(i) == Some("BeliefModes") && at(i + 1) == Some("::") && at(i + 2) == Some(key);
+        method || path
+    })
+}
+
+/// The `pub` fields of `BeliefModes` in `src` (the reader's source).
+fn public_mode_fields(src: &str) -> Vec<String> {
+    let code = production_code(src);
+    let start = code
+        .find("pub struct BeliefModes {")
+        .expect("belief_modes.rs defines `pub struct BeliefModes {`");
+    let body = &code[start + "pub struct BeliefModes {".len()..];
+    let body = &body[..body.find('}').expect("the struct body closes")];
+    body.lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("pub ") || l.starts_with("pub("))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The verdict over `sources` (production files other than the reader),
+/// the `register` and the doc `table`, one line per finding.
+fn acted_on_findings(
+    sources: &[(String, String)],
+    register: &[(&str, &[&str])],
+    table: &[(String, String)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let fields = BeliefModes::default().fields();
+    for (key, _) in register {
+        if !fields.iter().any(|f| f.key == *key) {
+            out.push(format!("{key}: registered, but no flag has that key"));
+        }
+    }
+    for field in fields {
+        let acting: Vec<&str> = sources
+            .iter()
+            .filter(|(_, src)| acts_on_flag(src, field.key))
+            .map(|(file, _)| file.as_str())
+            .collect();
+        match register.iter().find(|(key, _)| *key == field.key) {
+            None => out.push(format!("{}: no ACTED_ON_BY entry", field.key)),
+            Some((_, listed)) => {
+                for file in &acting {
+                    if !listed.contains(file) {
+                        out.push(format!(
+                            "{}: {file} calls its accessor but is not listed in ACTED_ON_BY",
+                            field.key
+                        ));
+                    }
+                }
+                for file in *listed {
+                    if !acting.contains(file) {
+                        out.push(format!(
+                            "{}: {file} is listed in ACTED_ON_BY but no longer calls its accessor",
+                            field.key
+                        ));
+                    }
+                }
+            }
+        }
+        match table.iter().find(|(env, _)| env == field.env) {
+            None => out.push(format!("{}: no row in the table", field.env)),
+            Some((_, acted)) if !acting.is_empty() && says_no(acted) => out.push(format!(
+                "{}: the table says {acted:?}, but {} act on it",
+                field.env,
+                acting.join(", ")
+            )),
+            Some((_, acted)) if acting.is_empty() && !says_no(acted) => out.push(format!(
+                "{}: the table says {acted:?}, but no production code acts on it",
+                field.env
+            )),
+            Some(_) => {}
+        }
+    }
+    out
 }
 
 /// Whether a table cell says the flag is not acted on.
@@ -223,57 +291,145 @@ fn no_belief_flag_is_read_outside_belief_modes() {
     );
 }
 
-#[test]
-fn the_acted_on_table_matches_the_flags_the_code_reads() {
+/// `(path, text)` per file, or `(variable, acted-on cell)` per table row.
+type Pairs = Vec<(String, String)>;
+
+/// The live tree: production sources other than the reader, its table.
+fn live() -> (Pairs, Pairs) {
     let root = workspace_root();
     let doc = std::fs::read_to_string(root.join(READER)).expect("read belief_modes.rs");
-    let table = acted_on_table(&doc);
-    let sources: Vec<(String, String)> = production_sources(&root)
+    let sources = production_sources(&root)
         .into_iter()
         .filter(|(file, _)| file != READER)
         .collect();
+    (sources, acted_on_table(&doc))
+}
 
-    let mut stale = Vec::new();
-    for field in BeliefModes::default().fields() {
-        let Some((_, acted)) = table.iter().find(|(env, _)| env == field.env) else {
-            stale.push(format!("{}: no row in the table", field.env));
-            continue;
-        };
-        let readers: Vec<&str> = sources
-            .iter()
-            .filter(|(_, src)| reads_flag(src, field.key))
-            .map(|(file, _)| file.as_str())
-            .collect();
-        if !readers.is_empty() && says_no(acted) {
-            stale.push(format!(
-                "{}: the table says {acted:?}, but {} read it",
-                field.env,
-                readers.join(", ")
-            ));
-        }
-        if readers.is_empty() && !says_no(acted) {
-            stale.push(format!(
-                "{}: the table says {acted:?}, but no production code reads it",
-                field.env
-            ));
-        }
-    }
+#[test]
+fn the_acted_on_register_and_table_match_the_accessor_calls() {
+    let (sources, table) = live();
     assert_eq!(
         table.len(),
         BeliefModes::default().fields().len(),
         "one table row per flag: {table:?}"
     );
+    let stale = acted_on_findings(&sources, ACTED_ON_BY, &table);
     assert!(
         stale.is_empty(),
-        "the \"acted on in this build\" table in {READER} is stale:\n{}",
+        "ACTED_ON_BY or the \"acted on in this build\" table in {READER} is stale:\n{}",
         stale.join("\n")
     );
 }
 
-/// The scanners themselves, on known text: a parse and a read are hits; the
-/// same text in a comment or a `#[cfg(test)] mod` is not.
+/// The scan counts accessor calls only because nothing outside the module
+/// can read a field: a `pub` field would reopen the untracked way to act on
+/// a flag.
 #[test]
-fn the_scanners_see_parses_and_reads_and_skip_comments_and_tests() {
+fn the_modes_fields_are_private() {
+    let doc = std::fs::read_to_string(workspace_root().join(READER)).expect("read");
+    let public = public_mode_fields(&doc);
+    assert!(
+        public.is_empty(),
+        "BeliefModes has pub fields {public:?}; keep them private to {READER} and act on \
+         a flag through its accessor"
+    );
+    // MUTATION PROBE: the pin sees a field made `pub` (or `pub(crate)`).
+    for vis in ["pub", "pub(crate)"] {
+        let mutated = doc.replacen(
+            "    bp_apply: BpApply,",
+            &format!("    {vis} bp_apply: BpApply,"),
+            1,
+        );
+        assert_ne!(mutated, doc, "the probe found the field");
+        assert_eq!(public_mode_fields(&mutated).len(), 1, "{vis}");
+    }
+}
+
+/// MUTATION PROBES on the live tree plus one scratch file: a file acting on
+/// a flag it is not listed for is a finding, and so is the table row saying
+/// "no"; dropping or adding a listed file is a finding; forwarding the
+/// struct is not acting on it.
+#[test]
+fn the_register_check_is_not_vacuous() {
+    let (sources, table) = live();
+    assert!(acted_on_findings(&sources, ACTED_ON_BY, &table).is_empty());
+    let scratch = "crates/epigraph-api/src/routes/scratch_modes.rs";
+    let with = |src: &str| {
+        let mut v = sources.clone();
+        v.push((scratch.to_string(), src.to_string()));
+        v
+    };
+
+    // A helper acting on `inference` through a renamed parameter, reached
+    // only by forwarding the struct: the file is credited, as unlisted, and
+    // the table's "no" is stale.
+    let acting = with(
+        "use epigraph_engine::belief_modes::{self, BeliefModes, Inference};\n\
+         fn caller() -> bool { helper(belief_modes::current()) }\n\
+         fn helper(cfg: &BeliefModes) -> bool {\n    let renamed = cfg;\n    renamed\n        .inference()\n        == Inference::On\n}\n",
+    );
+    let f = acted_on_findings(&acting, ACTED_ON_BY, &table);
+    assert!(
+        f.iter()
+            .any(|l| l.contains(scratch) && l.contains("not listed")),
+        "{f:?}"
+    );
+    assert!(
+        f.iter()
+            .any(|l| l.starts_with("EPIGRAPH_INFERENCE: the table says")),
+        "{f:?}"
+    );
+
+    // Forwarding alone is not acting.
+    let forwarding = with(
+        "use epigraph_engine::belief_modes;\n\
+         fn caller() { report(belief_modes::current()); let m = *belief_modes::current(); report(&m); }\n",
+    );
+    assert!(acted_on_findings(&forwarding, ACTED_ON_BY, &table).is_empty());
+
+    // A listed file dropped from, or an extra file added to, a flag's list.
+    let dropped: Vec<(&str, &[&str])> = ACTED_ON_BY
+        .iter()
+        .map(|(k, files)| {
+            if *k == "bp_apply" {
+                (*k, &[][..])
+            } else {
+                (*k, *files)
+            }
+        })
+        .collect();
+    let f = acted_on_findings(&sources, &dropped, &table);
+    assert!(
+        f.iter()
+            .any(|l| l.contains("bin/server.rs calls its accessor but is not listed")),
+        "{f:?}"
+    );
+    let extra_files: &[&str] = &[
+        "crates/epigraph-api/src/bin/server.rs",
+        "crates/epigraph-api/src/routes/health.rs",
+    ];
+    let extra: Vec<(&str, &[&str])> = ACTED_ON_BY
+        .iter()
+        .map(|(k, files)| {
+            if *k == "bp_apply" {
+                (*k, extra_files)
+            } else {
+                (*k, *files)
+            }
+        })
+        .collect();
+    let f = acted_on_findings(&sources, &extra, &table);
+    assert!(
+        f.iter()
+            .any(|l| l.contains("routes/health.rs is listed in ACTED_ON_BY but no longer")),
+        "{f:?}"
+    );
+}
+
+/// The scanners themselves, on known text: a parse and an accessor call are
+/// hits; the same text in a comment or a `#[cfg(test)] mod` is not.
+#[test]
+fn the_scanners_see_parses_and_accessor_calls_and_skip_comments_and_tests() {
     let parse = r#"
 pub const ENV: &str = "EPIGRAPH_ATOM_FOLD";
 fn on() -> bool { std::env::var(BpApply::ENV).is_ok() }
@@ -287,38 +443,46 @@ fn on2() -> bool { std::env::var(crate::belief_modes::Inference::ENV).is_ok() }
 #[cfg(test)]
 mod tests {
     const X: &str = "EPIGRAPH_BP_APPLY";
-    fn f() { let _ = crate::belief_modes::current().bp_apply; }
+    fn f() { let _ = crate::belief_modes::current().bp_apply(); }
 }
 "#;
     assert!(flag_parses(quiet).is_empty());
-    assert!(!reads_flag(quiet, "bp_apply"));
+    assert!(!acts_on_flag(quiet, "bp_apply"));
 
-    let read = "fn f() -> bool {\n    crate::belief_modes::current()\n        .bp_apply\n        == On\n}\n";
-    assert!(reads_flag(read, "bp_apply"));
-    assert!(!reads_flag(read, "atom_fold"));
-    assert!(reads_flag(
-        "let m = atom_items::modes().atom_fold;",
+    // An accessor call split over lines, off `current()` directly.
+    let call =
+        "fn f() -> bool {\n    crate::belief_modes::current()\n        .bp_apply()\n        == On\n}\n";
+    assert!(acts_on_flag(call, "bp_apply"));
+    assert!(!acts_on_flag(call, "atom_fold"));
+    // Off any receiver: a renamed binding, a parameter, a copy.
+    assert!(acts_on_flag(
+        "fn g(cfg: &BeliefModes) -> bool { let c = cfg; c.atom_fold() == AtomFold::Aef }",
         "atom_fold"
     ));
-    assert!(!reads_flag("let m = current().atom_fold_x;", "atom_fold"));
-
-    // A field read off a binding of the modes, the other way code acts on a flag.
-    let bound =
-        "fn f() {\n    let m = crate::belief_modes::current();\n    if m.bp_apply == On {}\n}\n";
-    assert!(reads_flag(bound, "bp_apply"));
-    assert!(!reads_flag(bound, "atom_fold"));
-    assert!(reads_flag(
-        "let mut modes = *atom_items::modes(); let x = modes.atom_fold;",
-        "atom_fold"
-    ));
-    // Another type's `current()`, and a longer name ending in the binding's.
-    assert!(!reads_flag(
-        "let m = AtomCacheSettings::current(); let x = m.compound_source_edges;",
+    assert!(acts_on_flag(
+        "let mut modes = *atom_items::modes(); let x = modes.compound_source_edges();",
         "compound_source_edges"
     ));
-    assert!(!reads_flag(
-        "let m = belief_modes::current(); let x = item.bp_apply;",
+    // As a path.
+    assert!(acts_on_flag(
+        "let read: fn(&BeliefModes) -> BpApply = BeliefModes::bp_apply;",
         "bp_apply"
+    ));
+    // Not: forwarding the struct, a longer name, another fn of the same
+    // name taking arguments (`atom_items::atom_fold(rows)`), or a field of
+    // another type.
+    assert!(!acts_on_flag(
+        "fn f() { helper(belief_modes::current()); }",
+        "bp_apply"
+    ));
+    assert!(!acts_on_flag("let x = m.atom_fold_x();", "atom_fold"));
+    assert!(!acts_on_flag(
+        "let i = atom_items::atom_fold(&rows); let j = x.atom_fold(&rows);",
+        "atom_fold"
+    ));
+    assert!(!acts_on_flag(
+        "let x = settings.compound_source_edges;",
+        "compound_source_edges"
     ));
 
     let table = acted_on_table(

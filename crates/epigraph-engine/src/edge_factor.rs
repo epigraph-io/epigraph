@@ -1999,8 +1999,8 @@ impl AtomCacheSettings {
     #[must_use]
     pub fn current() -> Self {
         Self {
-            fold: crate::atom_items::modes().atom_fold,
-            compound_source_edges: crate::atom_items::modes().compound_source_edges,
+            fold: crate::atom_items::modes().atom_fold(),
+            compound_source_edges: crate::atom_items::modes().compound_source_edges(),
             vacate_on_evidence_removal: true,
         }
     }

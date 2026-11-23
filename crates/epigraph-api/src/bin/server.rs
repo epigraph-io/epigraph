@@ -1016,7 +1016,7 @@ async fn main() {
 #[cfg(feature = "db")]
 fn bp_apply_from_env() -> epigraph_api::state::BpApply {
     use epigraph_api::state::BpApply;
-    let switch = epigraph_engine::belief_modes::current().bp_apply;
+    let switch = epigraph_engine::belief_modes::current().bp_apply();
     if switch == BpApply::On {
         tracing::warn!(
             "EPIGRAPH_BP_APPLY=on: POST /api/v1/bp/propagate may write BP results to atom \

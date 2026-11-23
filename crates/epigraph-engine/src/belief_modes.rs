@@ -9,12 +9,15 @@
 //! This module is the one place the flags are parsed, so every process
 //! derives the same [`BeliefModes`] from the same environment, and every
 //! reader in a process acts on the same value its `/health` report shows.
-//! Code acts on a flag by reading its field of [`current`]
-//! (`belief_modes::current().<key>`, or the engine's
-//! `atom_items::modes().<key>`, which is [`current`] plus a once-only typo
-//! warning); it never parses the variable again. The
+//! Code acts on a flag by calling its accessor on [`current`]
+//! (`belief_modes::current().<key>()`, or on the engine's
+//! `atom_items::modes()`, which is [`current`] plus a once-only typo
+//! warning); it never parses the variable again. The fields are private to
+//! this module, so the accessor is the only way to the value. The
 //! `belief_mode_readers` ratchet in this crate's tests fails on a second
-//! parser, and on a flag read in code while the table below says "no".
+//! parser, on a file that calls a flag's accessor without being listed for
+//! that flag (or is listed and no longer calls it), and on a table row below
+//! that says "no" for a flag some file acts on (or the reverse).
 //!
 //! The modes are reported by:
 //!
@@ -211,14 +214,20 @@ belief_mode! {
 /// not as agreement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+///
+/// The fields are private to this module (backlog 9a8f3bff): outside it, the
+/// one way to act on a flag is its accessor ([`Self::atom_fold`] and the six
+/// beside it), so the `belief_mode_readers` ratchet can list every file that
+/// acts on each flag by its accessor calls, however the struct reached that
+/// file. A value with chosen modes is built by [`Self::from_lookup`].
 pub struct BeliefModes {
-    pub atom_fold: AtomFold,
-    pub compound_belief: CompoundBelief,
-    pub compound_write_guard: CompoundWriteGuard,
-    pub compound_source_edges: CompoundSourceEdges,
-    pub atom_cache_mode: AtomCacheMode,
-    pub inference: Inference,
-    pub bp_apply: BpApply,
+    atom_fold: AtomFold,
+    compound_belief: CompoundBelief,
+    compound_write_guard: CompoundWriteGuard,
+    compound_source_edges: CompoundSourceEdges,
+    atom_cache_mode: AtomCacheMode,
+    inference: Inference,
+    bp_apply: BpApply,
 }
 
 /// One flag's place in a [`BeliefModes`]: its report key, its environment
@@ -362,6 +371,52 @@ impl BeliefModes {
             modes,
             unrecognised,
         }
+    }
+
+    /// `EPIGRAPH_ATOM_FOLD`: which fold writes an atom's cache. Calling an
+    /// accessor is acting on its flag: the `belief_mode_readers` ratchet
+    /// lists every production file that calls each one.
+    #[must_use]
+    pub const fn atom_fold(&self) -> AtomFold {
+        self.atom_fold
+    }
+
+    /// `EPIGRAPH_COMPOUND_BELIEF`: how a compound's belief is served.
+    #[must_use]
+    pub const fn compound_belief(&self) -> CompoundBelief {
+        self.compound_belief
+    }
+
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD`: what a textless BBA write on a
+    /// compound does.
+    #[must_use]
+    pub const fn compound_write_guard(&self) -> CompoundWriteGuard {
+        self.compound_write_guard
+    }
+
+    /// `EPIGRAPH_COMPOUND_SOURCE_EDGES`: whether edge-factor rows whose source
+    /// is a compound are kept or dropped.
+    #[must_use]
+    pub const fn compound_source_edges(&self) -> CompoundSourceEdges {
+        self.compound_source_edges
+    }
+
+    /// `EPIGRAPH_ATOM_CACHE_MODE`: what an atom's cache holds.
+    #[must_use]
+    pub const fn atom_cache_mode(&self) -> AtomCacheMode {
+        self.atom_cache_mode
+    }
+
+    /// `EPIGRAPH_INFERENCE`: whether inference runs.
+    #[must_use]
+    pub const fn inference(&self) -> Inference {
+        self.inference
+    }
+
+    /// `EPIGRAPH_BP_APPLY`: whether BP results may be written.
+    #[must_use]
+    pub const fn bp_apply(&self) -> BpApply {
+        self.bp_apply
     }
 
     /// The modes the process environment describes, read now. Processes use
