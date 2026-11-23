@@ -16,16 +16,26 @@
 //!
 //! # How it holds
 //!
-//! * [`UnauthenticatedReader`] resolves (and on first use creates) one agent
-//!   row under the fixed [`READER_PUBLIC_KEY`]. Nothing gives it a group: it
-//!   is never passed to `AgentRepository::ensure_personal_group`, holds no
-//!   client, and nobody holds a private key for its public key.
-//! * Resolution REFUSES when the row holds any live membership, so the
-//!   listener's content tools refuse instead of reading with that group.
+//! * Migration 241 creates the one agent row under the fixed
+//!   [`READER_PUBLIC_KEY`] and RESERVES the key: no other row may take it, on
+//!   any role (backlog 14a38166). [`UnauthenticatedReader`] only looks the row
+//!   up; it never creates one, so it cannot adopt a row someone else made
+//!   after the migration.
+//! * Migration 241 also refuses the reader every LIVE `group_memberships` row,
+//!   on every role and every path, definers included (backlog 37844e1d), so a
+//!   `groups:admin` holder can no longer close the listener by adding the
+//!   reader to a group. Nothing gives it a group in code either: it is never
+//!   passed to `AgentRepository::ensure_personal_group`, and nobody holds a
+//!   private key for its public key.
+//! * Resolution still REFUSES a row that holds any live membership or is the
+//!   principal of any OAuth client that is not revoked. A row that existed
+//!   before migration 241 (planted ahead of the listener's first boot) is
+//!   adopted by the migration as it is, so this is where such a row is
+//!   refused: the listener's content tools refuse instead of reading as it.
 //! * `tools::viewer::request_viewer` re-checks on every call: a principal-less
-//!   read-only context whose viewer carries any group is refused. A membership
-//!   granted to the reader after boot therefore closes the listener; it never
-//!   widens it.
+//!   read-only context whose viewer carries any group is refused. A group that
+//!   reaches the reader some other way (a derived membership) therefore closes
+//!   the listener; it never widens it.
 //!
 //! # The opt-in listener is different, on purpose
 //!
@@ -53,7 +63,8 @@ pub const READER_PUBLIC_KEY: [u8; 32] = *b"epigraph-mcp:unauthenticated-rdr";
 pub const READER_DISPLAY_NAME: &str = "mcp-unauthenticated-reader";
 
 /// Resolves the dedicated zero-membership agent of the read-only
-/// `--allow-unauthenticated-http` listener. See the module doc.
+/// `--allow-unauthenticated-http` listener (migration 241's reserved row).
+/// See the module doc.
 ///
 /// Caches the id on success only, so a database that is unreachable at boot is
 /// retried by the next request (the [`UnauthenticatedPrincipal`] cooldown
@@ -82,19 +93,22 @@ impl UnauthenticatedReader {
         }
     }
 
-    /// The reader agent's id: found by [`READER_PUBLIC_KEY`], or created.
+    /// The reader agent's id: migration 241's row, found by
+    /// [`READER_PUBLIC_KEY`].
     ///
     /// # Errors
     ///
-    /// A displayable reason when the database cannot be read or written, or
-    /// when the agent holds ANY live group membership (it must hold none, and
-    /// reading with one is the widening this type exists to prevent).
+    /// A displayable reason when the database cannot be read, when no row
+    /// holds the key (migration 241 is not applied), when the row is the
+    /// principal of an OAuth client that is not revoked, or when the agent
+    /// holds ANY live group membership (it must hold none, and reading with
+    /// one is the widening this type exists to prevent).
     pub async fn resolve(&self) -> Result<Uuid, String> {
         let mut cached = self.cached.lock().await;
         if let Some(id) = *cached {
             return Ok(id);
         }
-        let id = self.find_or_create().await?;
+        let id = self.find_reserved().await?;
         let memberships =
             epigraph_db::GroupMembershipRepository::list_live_for_agent(&self.pool, id)
                 .await
@@ -113,27 +127,34 @@ impl UnauthenticatedReader {
         Ok(id)
     }
 
-    async fn find_or_create(&self) -> Result<Uuid, String> {
-        let lookup = || async {
-            epigraph_db::AgentRepository::get_by_public_key(&self.pool, &READER_PUBLIC_KEY)
-                .await
-                .map_err(|e| format!("could not look up the unauthenticated reader agent: {e}"))
-        };
-        if let Some(agent) = lookup().await? {
-            return Ok(agent.id.as_uuid());
+    /// Migration 241's reserved row, refused when it is anybody's OAuth
+    /// principal. Never creates: 241 is the row's only creator and its
+    /// trigger refuses the key to every other INSERT, so a miss means the
+    /// migration is not applied.
+    async fn find_reserved(&self) -> Result<Uuid, String> {
+        let agent = epigraph_db::AgentRepository::get_by_public_key(&self.pool, &READER_PUBLIC_KEY)
+            .await
+            .map_err(|e| format!("could not look up the unauthenticated reader agent: {e}"))?
+            .ok_or_else(|| {
+                format!(
+                    "no agent holds the --allow-unauthenticated-http reader key; migration 241 \
+                     creates it ({READER_DISPLAY_NAME}). Apply the migrations before this binary"
+                )
+            })?;
+        let id = agent.id.as_uuid();
+        let clients = epigraph_db::OAuthClientRepository::count_unrevoked_for_agent(&self.pool, id)
+            .await
+            .map_err(|e| {
+                format!("could not read the unauthenticated reader's OAuth clients: {e}")
+            })?;
+        if clients > 0 {
+            return Err(format!(
+                "the --allow-unauthenticated-http reader agent {id} is the principal of {clients} \
+                 OAuth client(s) that are not revoked; nobody may authenticate as it, so the \
+                 listener refuses to read as it. Revoke them"
+            ));
         }
-        let agent = epigraph_core::Agent::new(READER_PUBLIC_KEY, Some(READER_DISPLAY_NAME.into()));
-        match epigraph_db::AgentRepository::create(&self.pool, &agent).await {
-            Ok(created) => Ok(created.id.as_uuid()),
-            // Another process created it first: theirs is the row.
-            Err(epigraph_db::DbError::DuplicateKey { .. }) => lookup()
-                .await?
-                .map(|a| a.id.as_uuid())
-                .ok_or_else(|| "the unauthenticated reader agent vanished after a race".into()),
-            Err(e) => Err(format!(
-                "could not create the unauthenticated reader agent: {e}"
-            )),
-        }
+        Ok(id)
     }
 }
 

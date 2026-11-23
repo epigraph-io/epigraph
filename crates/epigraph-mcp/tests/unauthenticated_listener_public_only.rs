@@ -26,6 +26,12 @@
 //!   group claim is served);
 //! * deleting `UnauthenticatedReader::resolve`'s membership check fails
 //!   `a_reader_that_holds_a_membership_does_not_resolve`;
+//! * deleting `find_reserved`'s OAuth-client check fails
+//!   `a_reader_row_planted_before_241_with_an_oauth_client_is_refused`
+//!   (backlog 14a38166);
+//! * restoring the pre-241 find-or-CREATE fails
+//!   `the_listener_never_creates_the_reader_row` (the listener made its own
+//!   row, so a row someone else made first was adopted);
 //! * deleting `call_tool`'s principal-less filter on `record_auth_lineage`
 //!   fails `a_call_on_the_read_only_listener_records_no_auth_lineage` (the
 //!   edge `server --OPERATED_BY--> reader` is written).
@@ -233,16 +239,60 @@ async fn live_memberships(pool: &PgPool, agent: Uuid) -> i64 {
     .expect("membership count")
 }
 
-async fn grant_reader_role(pool: &PgPool, group: Uuid, agent: Uuid) {
-    sqlx::query(
+/// A live membership of the reader that migration 241's trigger did not judge:
+/// the shape of a row that predates 241 (or of a group that reaches the reader
+/// some other way), which the listener's own checks are the defence against.
+/// 241 refuses every new live row of the reader on every role (pinned in
+/// `epigraph-db/tests/unauthenticated_reader_reserved.rs`), so it is written
+/// here with triggers off (`session_replication_role = replica`, superuser
+/// only), on one connection that is reset before it returns to the pool.
+async fn plant_legacy_membership(pool: &PgPool, group: Uuid, agent: Uuid) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    sqlx::query("SET session_replication_role = replica")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers off");
+    let planted = sqlx::query(
         "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
          VALUES ($1, $2, ''::bytea, 0, 'reader')",
     )
     .bind(group)
     .bind(agent)
-    .execute(pool)
-    .await
-    .expect("grant a reader membership");
+    .execute(&mut *conn)
+    .await;
+    sqlx::query("RESET session_replication_role")
+        .execute(&mut *conn)
+        .await
+        .expect("triggers on");
+    planted.expect("plant a legacy reader membership");
+}
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+/// Every migration before 241, the file that reserves the reader.
+fn before_241() -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < 241)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) {
+    let mut conn = pool.acquire().await.expect("acquire");
+    migrator.run(&mut *conn).await.expect("migrate");
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
 }
 
 /// The finding's exact shape: a `group` claim owned by the SERVER agent's
@@ -328,9 +378,11 @@ async fn a_call_on_the_read_only_listener_records_no_auth_lineage(pool: PgPool) 
     assert_eq!(into_reader, 0, "nothing acts on behalf of the reader");
 }
 
-/// Fail-closed after boot: a membership granted to the reader once the
+/// Fail-closed after boot: a membership that reaches the reader once the
 /// listener is up does not widen it; the listener refuses instead, naming the
-/// rule, and still does not serve the group row.
+/// rule, and still does not serve the group row. (Since 241 no INSERT can give
+/// the reader such a row; `request_viewer`'s re-check is kept as the defence
+/// for any group that reaches it otherwise.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_membership_granted_to_the_reader_after_boot_closes_the_listener(pool: PgPool) {
     let l = spawn(pool.clone(), 0x52, UnauthenticatedWrites::Refused).await;
@@ -343,7 +395,7 @@ async fn a_membership_granted_to_the_reader_after_boot_closes_the_listener(pool:
         .await
         .expect("the reader was created at boot");
 
-    grant_reader_role(&pool, group, reader).await;
+    plant_legacy_membership(&pool, group, reader).await;
 
     let client = reqwest::Client::new();
     let session = handshake(&client, &l.url).await;
@@ -359,8 +411,9 @@ async fn a_membership_granted_to_the_reader_after_boot_closes_the_listener(pool:
     );
 }
 
-/// Fail-closed at resolution: a reader row that already holds a membership
-/// does not resolve, so the listener injects no principal at all.
+/// Fail-closed at resolution: a reader row that already holds a membership (a
+/// row from before migration 241, which 241 adopts as it is) does not
+/// resolve, so the listener injects no principal at all.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_reader_that_holds_a_membership_does_not_resolve(pool: PgPool) {
     let reader = UnauthenticatedReader::new(pool.clone());
@@ -368,7 +421,7 @@ async fn a_reader_that_holds_a_membership_does_not_resolve(pool: PgPool) {
     assert_eq!(live_memberships(&pool, id).await, 0);
 
     let (_, group) = fixture::seed_agent_with_group(&pool, "fe514fc3-other").await;
-    grant_reader_role(&pool, group, id).await;
+    plant_legacy_membership(&pool, group, id).await;
 
     let err = UnauthenticatedReader::new(pool.clone())
         .resolve()
@@ -430,4 +483,93 @@ async fn the_read_only_listener_injects_the_reader_and_the_opt_in_the_signer(poo
     )
     .await;
     assert_eq!(opt_in.agent_id().await, Some(server_agent));
+}
+
+/// Backlog 14a38166: before migration 241 anyone able to create an agent
+/// (`POST /api/v1/agents` takes any 32-byte key) could make the reader's row
+/// ahead of the listener's first boot, with an OAuth client attached, and the
+/// listener adopted it. 241 adopts such a row too (it refuses nothing it
+/// cannot judge), so the listener refuses to read as a reader that is the
+/// principal of an un-revoked client. Revoking the client reopens it, on the
+/// same row (calibration: the refusal is the client check's).
+#[sqlx::test(migrations = false)]
+async fn a_reader_row_planted_before_241_with_an_oauth_client_is_refused(pool: PgPool) {
+    migrate(&pool, &before_241()).await;
+    let planted = Uuid::new_v4();
+    sqlx::query("INSERT INTO agents (id, public_key, display_name) VALUES ($1, $2, 'planted')")
+        .bind(planted)
+        .bind(READER_PUBLIC_KEY.to_vec())
+        .execute(&pool)
+        .await
+        .expect("the row planted ahead of the listener");
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ('planted-reader-client', 'planted', 'human', ARRAY['claims:read'], 'active', $1)",
+    )
+    .bind(planted)
+    .execute(&pool)
+    .await
+    .expect("an OAuth client naming the planted row");
+    migrate(&pool, &MIGRATOR).await;
+    assert_eq!(
+        reader_agent(&pool).await,
+        Some(planted),
+        "241 adopts the row"
+    );
+
+    let err = UnauthenticatedReader::new(pool.clone())
+        .resolve()
+        .await
+        .expect_err("a reader that is an OAuth principal must not resolve");
+    assert!(err.contains("OAuth client"), "{err}");
+
+    let l = spawn(pool.clone(), 0x56, UnauthenticatedWrites::Refused).await;
+    let server_agent = l.server.server_agent_id().await.expect("server agent");
+    let public = fixture::seed_public_claim(&pool, server_agent, "14a38166 planted").await;
+    let client = reqwest::Client::new();
+    let session = handshake(&client, &l.url).await;
+    let refused = get_claim(&client, &l.url, &session, 2, public).await;
+    assert!(
+        !refused.contains("14a38166 planted") && refused.contains("principal did not resolve"),
+        "the listener must not read as a planted OAuth principal:\n{refused}"
+    );
+
+    sqlx::query(
+        "UPDATE oauth_clients SET status = 'revoked' WHERE client_id = 'planted-reader-client'",
+    )
+    .execute(&pool)
+    .await
+    .expect("revoke the planted client");
+    assert_eq!(
+        UnauthenticatedReader::new(pool.clone()).resolve().await,
+        Ok(planted),
+        "CALIBRATION: with the client revoked the same row resolves"
+    );
+}
+
+/// Backlog 14a38166: migration 241 is the reader row's only creator. On a
+/// database without it the listener does not make its own row (that is what
+/// let a row made first be adopted); it refuses, naming the migration. After
+/// 241 it resolves exactly the row 241 made under [`READER_PUBLIC_KEY`].
+#[sqlx::test(migrations = false)]
+async fn the_listener_never_creates_the_reader_row(pool: PgPool) {
+    migrate(&pool, &before_241()).await;
+    let err = UnauthenticatedReader::new(pool.clone())
+        .resolve()
+        .await
+        .expect_err("without migration 241 there is no reader to resolve");
+    assert!(err.contains("migration 241"), "{err}");
+    assert_eq!(
+        reader_agent(&pool).await,
+        None,
+        "the listener created no row"
+    );
+
+    migrate(&pool, &MIGRATOR).await;
+    let made_by_241 = reader_agent(&pool).await.expect("241 creates the row");
+    assert_eq!(
+        UnauthenticatedReader::new(pool.clone()).resolve().await,
+        Ok(made_by_241)
+    );
 }

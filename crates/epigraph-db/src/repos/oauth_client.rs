@@ -132,6 +132,31 @@ impl OAuthClientRepository {
             .map_err(|e| DbError::QueryFailed { source: e })
     }
 
+    /// How many OAuth clients whose status is not `revoked` name `agent_id`
+    /// as their principal.
+    ///
+    /// A `suspended` or `pending` client counts: a maintenance session can
+    /// still take it to `active` (migration 122's reactivation guard), so only
+    /// `revoked` is an end state. Used by the `--allow-unauthenticated-http`
+    /// reader, which must be nobody's OAuth principal (backlog 14a38166).
+    /// `oauth_clients` carries no row security.
+    ///
+    /// A runtime query, so the `.sqlx` offline cache is untouched.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(pool))]
+    pub async fn count_unrevoked_for_agent(pool: &PgPool, agent_id: Uuid) -> Result<i64, DbError> {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM public.oauth_clients \
+             WHERE agent_id = $1 AND status <> 'revoked'",
+        )
+        .bind(agent_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| DbError::QueryFailed { source: e })
+    }
+
     /// Look up a client by `client_name` (status-agnostic), oldest first.
     ///
     /// `bootstrap_canonical_clients` identifies the three canonical service
