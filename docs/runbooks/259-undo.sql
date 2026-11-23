@@ -1,0 +1,17 @@
+-- 259-undo.sql: take migration 259 (the outcome reports' unfiltered plan
+-- skeleton, backlog a1474e22) back out, on the migration (superuser) DSN.
+--
+-- READ FIRST: ROLL THE BINARIES BACK BEFORE THIS RUNS. A 259 binary calls
+-- `epigraph_plan_step_skeleton` from `WorkflowRepository::plan_step_claim_ids`
+-- on every outcome report that names a step (MCP `report_workflow_outcome`,
+-- `report_hierarchical_outcome`, REST
+-- `POST /api/v1/workflows/:id/outcome/hierarchical`); a unit left serving
+-- after this undo fails each such report with 42883. An older binary calls
+-- nothing 259 added.
+--
+-- WHAT IT DOES: drops the definer (nothing in SQL names it). Idempotent.
+-- WHAT IT LEAVES: every report row written while 259 was applied, as written.
+-- An older binary attributes `step_index` from the caller's own rows again, so
+-- a hidden unindexed step inside a plan's chain shifts the slots after it
+-- (the defect 259 closed).
+DROP FUNCTION IF EXISTS public.epigraph_plan_step_skeleton(uuid, uuid[]);
