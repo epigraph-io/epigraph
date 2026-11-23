@@ -7,6 +7,15 @@
 //!   does not exist) adds no `accepted (inert)` line; the same request on a
 //!   real frame adds exactly one. The operator reads that journal to size a
 //!   flip to `refuse`, so a line per failed request would over-count it.
+//! - **The call sites decide as the caller, under row security.** The
+//!   scoped pool is downgraded to `epigraph_app`, and the compound and its
+//!   atoms are private to the caller's group. The visibility and role tests
+//!   are definer reads, so a call site reading on an unstamped application
+//!   connection would still find the compound, but its leaf closure and atom
+//!   rows are read under row security: it would refuse (or warn) naming none
+//!   of the caller's atoms, the remedy the caller needs. `refuse` must refuse
+//!   with the caller's atoms listed. (`compound_write_guard_rest.rs` runs on
+//!   the harness superuser, where row security filters nothing.)
 //!
 //! Fixtures are seeded on the harness superuser pool, which is also the
 //! handlers' `db_pool`.
@@ -22,11 +31,12 @@ use epigraph_api::routes::assess::{assess_claim, AssessClaimRequest};
 use epigraph_api::routes::belief::{submit_evidence, SubmitEvidenceRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
+use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_engine::belief_modes::CompoundWriteGuard;
 use sqlx::PgPool;
 use tracing_test::traced_test;
 use uuid::Uuid;
-use viewer_fixture::{scoped_pool, seed_agent_with_group};
+use viewer_fixture::{database_url_for, scoped_pool, seed_agent_with_group};
 
 /// The `warn` acceptance line's message
 /// (`CompoundTarget::log_accepted`).
@@ -224,4 +234,74 @@ async fn a_warn_mode_request_that_fails_after_the_guard_adds_no_journal_line(poo
     });
     assert!(logs_contain("frames_evidence"));
     assert!(logs_contain(&caller.to_string()));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn refuse_holds_on_a_group_private_compound_under_row_security(pool: PgPool) {
+    let (caller, group) = seed_agent_with_group(&pool, "7435772c-handlers-rls").await;
+    let (compound, atoms) = compound(&pool, caller, group, "group").await;
+    let frame = frame(&pool).await;
+    let scoped = ScopedPool::connect_downgraded_for_tests(
+        &database_url_for(&pool).await,
+        SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+
+    // Calibration: on an UNSTAMPED application connection row security
+    // hides these rows, so a call site that read the atoms there would list
+    // none of them. Only the caller's stamped read finds them.
+    let seeded: Vec<Uuid> = std::iter::once(compound)
+        .chain(atoms.iter().copied())
+        .collect();
+    let unstamped: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE id = ANY($1)")
+        .bind(&seeded)
+        .fetch_one(scoped.inner())
+        .await
+        .expect("unstamped read");
+    assert_eq!(
+        unstamped, 0,
+        "CALIBRATION: row security hides the group-private claims from an unstamped \
+         application session"
+    );
+
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default())
+        .with_compound_write_guard(CompoundWriteGuard::Refuse);
+    state.scoped = Some(scoped);
+
+    let want: Vec<String> = atoms.iter().map(Uuid::to_string).collect();
+    for (route, result) in [
+        (
+            "frames evidence",
+            evidence(&state, &pool, caller, frame, compound).await,
+        ),
+        (
+            "assess",
+            assess(&state, &pool, caller, compound, None).await,
+        ),
+    ] {
+        let Err(ApiError::CompoundTarget { data, .. }) = result else {
+            panic!(
+                "{route} on the caller's group-private compound must be refused under refuse, \
+                 decided on the caller's stamped read: {result:?}"
+            );
+        };
+        assert_eq!(data["error"], "compound_target", "{route}: {data}");
+        assert_eq!(data["claim_id"], compound.to_string(), "{route}: {data}");
+        let listed: Vec<String> = data["visible_atoms"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{route}: visible_atoms is an array: {data}"))
+            .iter()
+            .map(|a| a["id"].as_str().expect("atom id").to_string())
+            .collect();
+        assert_eq!(listed, want, "{route}: the caller's own atoms are listed");
+    }
+    assert_eq!(bbas(&pool, compound).await, 0, "nothing was written");
+
+    // An atom of the same group is not guarded: the write goes ahead.
+    evidence(&state, &pool, caller, frame, atoms[0])
+        .await
+        .expect("frames evidence on the caller's atom");
+    assert_eq!(bbas(&pool, atoms[0]).await, 1);
 }
