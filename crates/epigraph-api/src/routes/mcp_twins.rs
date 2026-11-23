@@ -103,6 +103,11 @@ fn from_tool(e: McpError) -> ApiError {
 
 /// `POST /api/v1/ingest/structure-source`: MCP `structure_source`. Pure
 /// computation over the body; nothing is read or written.
+///
+/// One difference from the tool: a token carrying an elevation claim is
+/// refused 403 here, because the elevated-access layer refuses every non-GET
+/// route outside `ELEVATED_NON_GET_ALLOWLIST`. The route is deliberately not
+/// on that list (it is for writes); an elevated caller uses an ordinary token.
 pub async fn structure_source(
     auth_ctx: Option<Extension<AuthContext>>,
     Json(params): Json<StructureSourceParams>,

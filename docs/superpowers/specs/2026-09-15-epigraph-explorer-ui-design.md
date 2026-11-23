@@ -285,7 +285,7 @@ caller's viewer-stamped read, under the tool's `scope_map` scope; see
 
 | MCP tool | Status |
 |---|---|
-| `structure_source` | Routed: `POST /api/v1/ingest/structure-source` |
+| `structure_source` | Routed: `POST /api/v1/ingest/structure-source`. One difference: a token carrying an elevation claim is refused 403 here (the elevated-access layer refuses every non-GET route outside its write allowlist), while the MCP tool answers it. Nothing is read or written, so an elevated caller loses nothing by calling it with an ordinary token; the route is deliberately not on that allowlist, which is for writes |
 | `check_already_ingested` | Routed: `GET /api/v1/ingest/already-ingested?doi=&pipeline_version=` |
 | `query_undecomposed_claims` | Routed: `GET /api/v1/claims/undecomposed?limit=&offset=` |
 | `verify_claim` | Routed: `GET /api/v1/claims/:id/verify` (an unreadable or missing claim is a 404) |
