@@ -160,6 +160,8 @@ WALKERS = {
     "crates/epigraph-db/tests/unstamped_http_edge_writes.rs": (),
     # Every file of that name anywhere in the tree.
     "crates/epigraph-db/tests/viewer_fixture_single_source.rs": ("*viewer_fixture.rs",),
+    # Every Rust source under crates/ and the workspace tests/ (backlog triage T04).
+    "crates/epigraph-db/tests/visibility_act_callers_ratchet.rs": ("crates/*.rs", "tests/*.rs"),
     # One pgvector formatter and one embedding client: scans every production
     # source under crates/*/src and services/*/src.
     "crates/epigraph-embeddings/tests/embedding_stack_ratchet.rs": (

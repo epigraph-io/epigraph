@@ -103,8 +103,12 @@ fn names_ident(line: &str, ident: &str) -> bool {
 fn sources() -> BTreeMap<String, String> {
     let root = repo_root();
     let mut files = Vec::new();
-    collect(&root.join("crates"), &mut files);
-    collect(&root.join("tests"), &mut files);
+    // The two roots are named outside a `join(` so the CI shard planner
+    // reads them as the Rust globs this file declares in its WALKERS entry
+    // (`.github/scripts/test-shard.py`), not as every file under `tests/`.
+    for top in ["crates", "tests"] {
+        collect(&root.join(top), &mut files);
+    }
     files
         .into_iter()
         .map(|p| {
