@@ -36,13 +36,39 @@ const NEEDLE: &str = ".sign(";
 const PACKET_ENVELOPE: &str = "the submit_packet ENVELOPE signature over the canonical packet \
      bytes, a request signature with its own verifier, not an entity digest";
 
+const KERNEL_JWT: &str = "an access token's JWT claims set, signed by the kernel's own \
+     `JwtConfig::sign` (Ed25519 since backlog triage T12) and checked by `validate_token`; a \
+     bearer credential with its own verifier, not an entity digest";
+
 /// `(file, fn, count, what it signs)`.
-const REGISTER: &[(&str, &str, usize, &str)] = &[(
-    "crates/epigraph-cli/src/bin/ingest_git.rs",
-    "build_packet",
-    1,
-    PACKET_ENVELOPE,
-)];
+const REGISTER: &[(&str, &str, usize, &str)] = &[
+    (
+        "crates/epigraph-auth/src/lib.rs",
+        "exchange_token",
+        1,
+        KERNEL_JWT,
+    ),
+    (
+        "crates/epigraph-auth/src/lib.rs",
+        "issue_access_token",
+        1,
+        KERNEL_JWT,
+    ),
+    (
+        "crates/epigraph-cli/src/bin/ingest_git.rs",
+        "build_packet",
+        1,
+        PACKET_ENVELOPE,
+    ),
+    (
+        "crates/epigraph-cli/src/bin/ingest_literature.rs",
+        "author_agent_request",
+        1,
+        "the proof of possession for a `seed-derived` key declaration, over \
+         `epigraph_crypto::key_kind_declaration_message` (backlog 57943a39), checked once by \
+         `POST /api/v1/agents`; a registration proof, not an entity digest",
+    ),
+];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
