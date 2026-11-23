@@ -2914,6 +2914,49 @@ async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_
         dry.show()
     );
 
+    // One claim per batch: batch 1 holds C only, so every claim of it is
+    // held. Its BATCH line still reports a lock hold (its probe's: the probe
+    // takes the same locks), and the result counts the probes' transactions
+    // as well as the real batches'.
+    let single = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("single.jsonl"),
+            apply_count: None,
+            extra: &["--refuse-irreversible", "--batch-size", "1"],
+        },
+    )
+    .await;
+    assert_eq!(single.code, 0, "{}", single.show());
+    let all_held: Vec<&str> = single
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH ") && l.contains("every claim held by"))
+        .collect();
+    assert_eq!(all_held.len(), 1, "{}", single.show());
+    assert!(
+        lock_hold_of(all_held[0]).is_some(),
+        "the all-held batch reports its probe's lock hold: {}",
+        all_held[0]
+    );
+    let batch_lines = single
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH "))
+        .count();
+    let (_, transactions) = longest_lock_hold(&single.stdout)
+        .unwrap_or_else(|| panic!("no longest lock hold line\n{}", single.show()));
+    assert!(
+        transactions > batch_lines,
+        "the probes' transactions are counted too ({transactions} over {batch_lines} \
+         batch(es))\n{}",
+        single.show()
+    );
+
     let mf = dir.join("m.jsonl");
     let r = regroup(
         &pool,
@@ -2963,28 +3006,111 @@ async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_
     assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
 }
 
+/// The `locks held <ms> ms` figure of a `BATCH` line, if it has one.
+fn lock_hold_of(line: &str) -> Option<u128> {
+    line.split("locks held ")
+        .nth(1)
+        .and_then(|t| t.strip_suffix(" ms"))
+        .and_then(|t| t.parse::<u128>().ok())
+}
+
+/// `(longest, transactions)` from the result's `longest lock hold` line.
+fn longest_lock_hold(stdout: &str) -> Option<(u128, usize)> {
+    let l = stdout.lines().find(|l| l.contains("longest lock hold: "))?;
+    let rest = l.split("longest lock hold: ").nth(1)?;
+    let (ms, rest) = rest.split_once(" ms over ")?;
+    let (n, _) = rest.split_once(" transaction(s)")?;
+    Some((ms.parse().ok()?, n.parse().ok()?))
+}
+
 /// Backlog b1e2151c (2): every batch transaction reports how long it held
 /// the LOCKED-PER-BATCH locks, and the result reports the longest, with the
 /// batch size: the per-batch stall a concurrent edge or fragment writer
 /// sees. A dry run reports it too (it takes the same locks).
+///
+/// The figure is measured, not printed: a concurrent edge writer holds
+/// `ROW EXCLUSIVE` on `edges` (what an INSERT takes) until batch 1 is seen
+/// WAITING for its `LOCK TABLE` in `pg_stat_activity`, then for a known
+/// interval more. Batch 1's figure (timed from its begin, waits included)
+/// must cover that interval, the result's longest must be the largest
+/// `BATCH` figure, and it must count both transactions. A figure that is not
+/// timed, timed from after the locks, or never recorded fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_batch_reports_how_long_it_held_the_instance_wide_locks(pool: PgPool) {
+    const HELD_MS: u64 = 1000;
     let fx = seed(&pool).await;
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
-    let dry = regroup(
-        &pool,
-        Regroup {
-            ids: &ids,
-            src: fx.src,
-            dst: fx.dst,
-            operator: fx.operator,
-            manifest: &dir.join("dry.jsonl"),
-            apply_count: None,
-            extra: &["--batch-size", "1"],
-        },
-    )
-    .await;
+    let url = fixture::database_url_for(&pool).await;
+
+    let mut writer = pool.begin().await.expect("begin the concurrent writer");
+    sqlx::query("LOCK TABLE public.edges IN ROW EXCLUSIVE MODE")
+        .execute(&mut *writer)
+        .await
+        .expect("the writer's lock");
+    let (src, dst, op) = (
+        fx.src.to_string(),
+        fx.dst.to_string(),
+        fx.operator.to_string(),
+    );
+    let child = Command::new(BIN)
+        .args([
+            "regroup-claims",
+            "--claims-file",
+            ids.to_str().unwrap(),
+            "--source-group",
+            &src,
+            "--target-group",
+            &dst,
+            "--operator",
+            &op,
+            "--manifest-out",
+            dir.join("dry.jsonl").to_str().unwrap(),
+            "--batch-size",
+            "1",
+            "--lock-timeout",
+            "120s",
+        ])
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, &url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn epigraph-operator");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE datname = current_database() \
+                               AND pid <> pg_backend_pid() \
+                               AND wait_event_type = 'Lock' \
+                               AND query LIKE 'LOCK TABLE %')",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "batch 1 never waited on the concurrent writer's lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(HELD_MS));
+    writer.rollback().await.expect("release the writer's lock");
+    let out = child
+        .wait_with_output()
+        .expect("wait for epigraph-operator");
+    let dry = Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    };
+
     assert_eq!(dry.code, 0, "{}", dry.show());
     let batches: Vec<&str> = dry
         .stdout
@@ -2992,18 +3118,26 @@ async fn every_batch_reports_how_long_it_held_the_instance_wide_locks(pool: PgPo
         .filter(|l| l.starts_with("BATCH "))
         .collect();
     assert_eq!(batches.len(), 2, "{}", dry.show());
-    for l in &batches {
-        let ms = l
-            .split("locks held ")
-            .nth(1)
-            .and_then(|t| t.strip_suffix(" ms"))
-            .and_then(|t| t.parse::<u128>().ok());
-        assert!(ms.is_some(), "a BATCH line without its lock hold: {l}");
-    }
+    let figures: Vec<u128> = batches
+        .iter()
+        .map(|l| {
+            lock_hold_of(l).unwrap_or_else(|| panic!("a BATCH line without its lock hold: {l}"))
+        })
+        .collect();
     assert!(
-        dry.stdout.lines().any(|l| l.contains("longest lock hold: ")
-            && l.contains("over 2 transaction(s) at --batch-size 1")),
-        "{}",
+        figures[0] >= u128::from(HELD_MS),
+        "batch 1 waited at least {HELD_MS} ms behind the writer, and its figure includes the \
+         wait: {figures:?}\n{}",
         dry.show()
     );
+    let (longest, transactions) = longest_lock_hold(&dry.stdout)
+        .unwrap_or_else(|| panic!("no longest lock hold line\n{}", dry.show()));
+    assert_eq!(
+        longest,
+        *figures.iter().max().unwrap(),
+        "the longest is the largest BATCH figure\n{}",
+        dry.show()
+    );
+    assert_eq!(transactions, 2, "{}", dry.show());
+    assert!(dry.stdout.contains("at --batch-size 1"), "{}", dry.show());
 }

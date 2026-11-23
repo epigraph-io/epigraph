@@ -134,7 +134,10 @@
 //! edge or fragment lands on the pre-move tuple behind the batch. That blocks
 //! every write to those tables on the instance while a batch runs. Each
 //! `BATCH` line prints how long its transaction held those locks (`locks
-//! held <ms> ms`) and the result prints the longest (`longest lock hold`):
+//! held <ms> ms`; for a batch whose every claim `--refuse-irreversible`
+//! held, the longest of its probes, which take the same locks) and the
+//! result prints the longest over every transaction, probes included
+//! (`longest lock hold`):
 //! about the stall a concurrent edge or fragment writer sees, per batch (it
 //! is timed from the transaction's begin, so a wait to acquire the locks is
 //! included). A dry run takes the same locks for the same reads and writes,
@@ -1915,7 +1918,8 @@ impl LockHold {
 /// `irreversible`, with the edges). Removing a claim changes the batch's
 /// moving set and so the other verdicts, so repeat until no claim is named.
 /// A probe that fails returns the batch as it stands: the real batch then
-/// meets the same failure and reports it.
+/// meets the same failure and reports it. Also returns the longest lock hold
+/// of this batch's probes (each is recorded in `lock_hold` too).
 ///
 /// A verdict is per batch: an edge whose other end moves in a LATER batch is
 /// judged against that end as it is now, so the probe may hold a claim the
@@ -1927,8 +1931,9 @@ async fn probe_irreversible(
     mut claims: Vec<Uuid>,
     known: &Known,
     lock_hold: &mut LockHold,
-) -> anyhow::Result<(Vec<Uuid>, Vec<(Uuid, Hold)>)> {
+) -> anyhow::Result<(Vec<Uuid>, Vec<(Uuid, Hold)>, u128)> {
     let mut refused: Vec<(Uuid, Hold)> = Vec::new();
+    let mut longest: u128 = 0;
     let probe_ctx = Ctx { sample: 0, ..*ctx };
     while !claims.is_empty() {
         let started = std::time::Instant::now();
@@ -1936,7 +1941,9 @@ async fn probe_irreversible(
         let mut scratch = Sink::Memory(Default::default(), 0);
         let r = run_batch(&mut tx, &probe_ctx, &claims, &mut scratch, known, None).await;
         tx.rollback().await?;
-        lock_hold.record(started.elapsed().as_millis());
+        let held_ms = started.elapsed().as_millis();
+        lock_hold.record(held_ms);
+        longest = longest.max(held_ms);
         let Ok(b) = r else { break };
         let mut named: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
         for (edge, verdict) in &b.irreversible {
@@ -1956,7 +1963,7 @@ async fn probe_irreversible(
                 .map(|(c, edges)| (c, Hold::Irreversible { edges })),
         );
     }
-    Ok((claims, refused))
+    Ok((claims, refused, longest))
 }
 
 /// The exit code for `report` (see the module doc).
@@ -2221,17 +2228,21 @@ pub async fn run(
         // every claim an IRREVERSIBLE-EDGE names; repeat until none is named.
         // Each probe holds the batch's locks for its own duration.
         let mut claims: Vec<Uuid> = batch.to_vec();
+        let mut probe_ms: u128 = 0;
         if opts.refuse_irreversible {
-            let (kept, refused) =
+            let (kept, refused, longest) =
                 probe_irreversible(conn, &ctx, claims, &known, &mut report.lock_hold).await?;
             claims = kept;
+            probe_ms = longest;
             report.held_under_lock.extend(refused);
         }
         if claims.is_empty() {
+            // The probes held the same locks: report their longest hold, as
+            // every BATCH line does.
             writeln!(
                 out,
                 "BATCH {}/{total}\tOK\t0 claim(s) moved (every claim held by \
-                 --refuse-irreversible)",
+                 --refuse-irreversible; the figure is its probes')\tlocks held {probe_ms} ms",
                 i + 1
             )?;
             continue;
