@@ -190,3 +190,42 @@ async fn a_private_profiles_orcid_and_ror_id_reach_only_those_who_may_see_it(poo
         }
     }
 }
+
+/// The `?public_key=` lookup on `GET /api/v1/agents` (backlog 8946be59)
+/// applies the same profile redaction as the list (backlog 761c2b05): an
+/// outsider who resolves a private profile by its key gets the row with no
+/// ORCID / ROR id, while the agent itself (the positive control) reads both.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider-pk").await;
+    let (private, _) = profiled(
+        &pool,
+        "private-pk",
+        "group",
+        "0000-0002-1825-0097",
+        "03yrm5c26",
+    )
+    .await;
+    let key: String = sqlx::query_scalar("SELECT encode(public_key, 'hex') FROM agents WHERE id = $1")
+        .bind(private)
+        .fetch_one(&pool)
+        .await
+        .expect("the agent's key");
+    let uri = format!("/api/v1/agents?public_key={key}");
+
+    let (status, body) = get(&state, outsider, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1, "the key resolves one agent: {body}");
+    let row = item(&body, private);
+    assert!(
+        row["orcid"].is_null() && row["ror_id"].is_null(),
+        "an outsider read a private profile's ORCID / ROR id by key: {row}"
+    );
+
+    let (status, body) = get(&state, private, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = item(&body, private);
+    assert_eq!(row["orcid"], "0000-0002-1825-0097", "the agent itself: {row}");
+    assert_eq!(row["ror_id"], "03yrm5c26", "the agent itself: {row}");
+}
