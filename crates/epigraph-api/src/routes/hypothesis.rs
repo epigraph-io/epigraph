@@ -4,9 +4,11 @@
 //! - GET  /api/v1/hypothesis/:id/status — Belief, evidence chains, promotion readiness
 //! - POST /api/v1/hypothesis/:id/promote — Promote to research_validity
 //!
-//! # Tenancy: 6 of this file's 17 raw-pool sites are converted
+//! # Tenancy: two raw-pool sites remain, both in `create_hypothesis`
 //!
-//! Conversion shard 6. `hypothesis_status` is the only wholly-convertible
+//! Conversion shard 6 converted the six sites of `hypothesis_status`;
+//! backlog b9c4e809 then moved `promote_hypothesis` off the raw pool (below).
+//! Shard 6: `hypothesis_status` is the only wholly-convertible
 //! handler here and it is the shard's densest: all six of its sites — two
 //! viewer-spliced repo reads, one viewer-less repo read, one viewer-spliced
 //! count and two inline `sqlx` statements — now run on one viewer-stamped
@@ -591,7 +593,7 @@ pub async fn promote_hypothesis(
     .await
     .map_err(|e| {
         if crate::errors::is_insufficient_privilege(&e) {
-            crate::errors::write_refused("hypothesis")
+            status_write_refused(id)
         } else {
             ApiError::InternalError {
                 message: format!("Failed to update status: {e}"),
@@ -607,7 +609,7 @@ pub async fn promote_hypothesis(
         let now =
             epigraph_db::ClaimRepository::promotion_standing_of(&mut *tx, &viewer, id).await?;
         refuse_unless_promotable(now, id, true)?;
-        return Err(crate::errors::write_refused("hypothesis"));
+        return Err(status_write_refused(id));
     }
 
     // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
@@ -712,13 +714,9 @@ fn refuse_unless_promotable(
             entity: "hypothesis".into(),
             id: id.to_string(),
         }),
-        S::NotWritable { .. } => Err(ApiError::ClaimNotWritable {
-            claim_id: id,
-            message: format!(
-                "cannot promote: the caller holds no admin or writer membership in the \
-                 group that owns hypothesis {id}; nothing was written"
-            ),
-        }),
+        S::NotWritable { .. } => Err(crate::routes::experiment_loop::hypothesis_not_writable(
+            id, "promote",
+        )),
         S::AlreadyPromoted if concurrent => Err(ApiError::Conflict {
             reason: format!(
                 "hypothesis {id} is already promoted (a concurrent promotion committed \
@@ -728,6 +726,21 @@ fn refuse_unless_promotable(
         S::AlreadyPromoted => Err(ApiError::Conflict {
             reason: format!("hypothesis {id} is already promoted; nothing was written"),
         }),
+    }
+}
+
+/// The `403` for a status write the database refused this caller although the
+/// standing read it writable. The same `not_owner` / `not_claim_writer` shape
+/// as the standing's [`epigraph_db::PromotionStanding::NotWritable`] answer, so
+/// a client keyed on the rule reads both refusals alike.
+#[cfg(feature = "db")]
+fn status_write_refused(id: Uuid) -> ApiError {
+    ApiError::ClaimNotWritable {
+        claim_id: id,
+        message: format!(
+            "cannot promote: the database refused this caller's status write on \
+             hypothesis {id}; nothing was written"
+        ),
     }
 }
 
