@@ -873,13 +873,15 @@ async fn a_promotion_racing_a_committed_promotion_is_refused(
     );
 }
 
-/// The route reads the source BBA OUTSIDE the promotion's transaction, so the
-/// row can be retracted between that read and the retire step (SPEC §11 K4a
-/// site 6, through the REST route). Here the retraction lands inside the
-/// promotion's own transaction, right after its status flip (a trigger on
-/// that flip; the outside read, on another connection, still sees the row
-/// live). A retracted row is never retired: the promotion is refused as a
-/// caller that cannot retire its source, and nothing is written.
+/// The source BBA can be retracted between the route's read of it and the
+/// retire step (SPEC §11 K4a site 6, through the REST route): since backlog
+/// b9c4e809 the read runs on the promotion's own transaction after the status
+/// flip, and a concurrent retraction that commits after that read is seen by
+/// the retire's re-check. Here the retraction lands inside the promotion's
+/// transaction right after the read, deterministically: a trigger on the
+/// research_validity copy (`copy_to_frame`, which follows the read and
+/// precedes the retire). A retracted row is never retired: the promotion is
+/// refused as a caller that cannot retire its source, and nothing is written.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotion(
     pool_opts: PgPoolOptions,
@@ -908,9 +910,10 @@ async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotio
         "PREMISE: the source is live"
     );
 
-    // The race, made deterministic: the promotion's status flip retracts the
-    // source in the same transaction (all three retraction columns, as the
-    // retract definer writes them).
+    // The race, made deterministic: the promotion's research_validity copy
+    // (written after the source read, before the retire) retracts the source
+    // in the same transaction (all three retraction columns, as the retract
+    // definer writes them).
     for sql in [
         format!(
             "CREATE FUNCTION k4a_s6_race() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
@@ -922,11 +925,10 @@ async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotio
             source.id
         ),
         format!(
-            "CREATE TRIGGER k4a_s6_race AFTER UPDATE ON claims FOR EACH ROW \
-             WHEN (NEW.id = '{}'::uuid \
-                   AND NEW.properties->>'hypothesis_status' = 'promoted') \
+            "CREATE TRIGGER k4a_s6_race AFTER INSERT ON mass_functions FOR EACH ROW \
+             WHEN (NEW.claim_id = '{}'::uuid AND NEW.frame_id = '{}'::uuid) \
              EXECUTE FUNCTION k4a_s6_race()",
-            r.claim
+            r.claim, r.rv_frame
         ),
     ] {
         sqlx::query(&sql)
@@ -975,7 +977,7 @@ async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotio
     // CALIBRATION: without the race the same promotion lands, so the refusal
     // above was the retracted row's.
     for sql in [
-        "DROP TRIGGER k4a_s6_race ON claims",
+        "DROP TRIGGER k4a_s6_race ON mass_functions",
         "DROP FUNCTION k4a_s6_race()",
     ] {
         sqlx::query(sql).execute(&pool).await.expect(sql);
