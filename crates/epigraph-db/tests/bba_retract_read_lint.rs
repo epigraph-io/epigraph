@@ -79,6 +79,7 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ("crates/epigraph-db/src/repos/mass_function.rs", "get_by_id", 1, "one row by id, for audit and the retract target lookup; returns a retracted row as stored"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "list_claim_ids", 1, "recompute enumerator: a claim whose every BBA is retracted still enters, so its recompute reads the (filtered) empty fold"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "retracted_row_at_key", 1, "upsert-key probe for RETRACTED rows only (R-103): an automated side write skips a key a retracted row holds; no fold"),
+    ("crates/epigraph-db/src/repos/mass_function.rs", "slot_holds_masses", 1, "assess write path (migration 250): locks and compares the slot row the upsert is about to write, at its upsert key, which a retracted row holds too; answers only whether the masses are identical, so the route files no claim.assessed record for a write of no masses; no fold"),
     ("crates/epigraph-db/src/repos/mass_function.rs", "untyped_provenance_page", 2, "evidence-type backfill of a metadata tag; masses untouched and no fold"),
     // --- epigraph-engine ----------------------------------------------------
     ("crates/epigraph-engine/src/supersede_delta.rs", "const RETIRED_SOURCE_RETRACTED_BBAS_SQL", 1, "dry-run delta count of the RETRACTED rows a K10 invalidation keeps (retracted_key_kept); a count, no fold"),
