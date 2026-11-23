@@ -69,8 +69,9 @@
 //! (`restored_not_current`), so the counts say which restored rows are live.
 //!
 //! [`apply_into`] and [`restore_into`] fill a report the caller owns, so a run
-//! that stops on an error still has the outcomes of every batch it committed
-//! (the binary writes them as a partial report).
+//! that stops on an error still has the outcomes of every batch confirmed
+//! committed (the binary writes them as a partial report). The records, not
+//! that report, are the superset to reconcile from (see [`apply`]).
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statement on
@@ -723,8 +724,10 @@ pub async fn dry_run(
 ///
 /// `on_record` receives each write's record before its batch commits; an
 /// error from it rolls the batch back and stops the run, so no committed
-/// write lacks a record. A record whose commit then fails names a write that
-/// never landed, which [`restore`] reports `already_restored`.
+/// write lacks a record. The converse does not hold: a record handed out
+/// for a batch that then fails (a later statement in the batch, or the
+/// commit) names a write that never landed, which [`restore`] reports
+/// `already_restored`.
 ///
 /// # Errors
 /// Any database error, or `on_record`'s; batches already committed stay
@@ -745,9 +748,11 @@ where
     Ok(report)
 }
 
-/// [`apply`], appending each batch's outcomes to `report` as the batch
-/// commits. On an error `report` holds exactly the outcomes of the batches
-/// that committed (the failed batch rolled back and adds none).
+/// [`apply`], appending each batch's outcomes to `report` once its commit
+/// returns. On an error `report` holds the outcomes of the batches confirmed
+/// committed; the failed batch adds none, although its records were already
+/// handed out, and a batch whose commit itself errored may have landed
+/// without them. Reconcile from the records, not from `report`.
 ///
 /// # Errors
 /// As [`apply`].
@@ -860,7 +865,9 @@ pub async fn restore(
 
 /// [`restore`], appending each batch's outcomes to `report` once the batch
 /// has committed (or, for `dry_run`, rolled back). On an error `report`
-/// holds exactly the outcomes of the batches that finished.
+/// holds the outcomes of the batches confirmed finished; a batch whose
+/// commit itself errored may have landed without them (re-running the
+/// restore reconciles: what landed is `already_restored`).
 ///
 /// # Errors
 /// As [`restore`].

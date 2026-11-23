@@ -41,11 +41,18 @@
 //! Output files are never overwritten (they are created new, before the
 //! database is touched; a run refused because one exists leaves no file of
 //! its own behind). A run that stops on an error, including one that cannot
-//! connect, still writes its report,
-//! marked `"partial": true` with the error, holding the outcomes of every
-//! batch that committed (for an apply, exactly the writes in the record
-//! file). A writing run (`--apply`, or `--restore` without
-//! `--dry-run`) first checks that its belief modes match the API's
+//! connect, still writes its report, marked `"partial": true` with the
+//! error, holding the outcomes of the batches confirmed committed. The two
+//! files can differ, and the record is the one to reconcile from: it lists
+//! every committed write, and may also list writes of the batch that failed
+//! (each record is written before its batch commits, so a write recorded
+//! early in a batch that a later statement, a deadlock or a dropped
+//! connection rolls back stays listed; a restore finds it
+//! `already_restored`). A batch whose COMMIT itself errored may have landed
+//! although the report leaves it out. For a restore, re-running it is the
+//! reconcile: what landed is `already_restored`. A writing run (`--apply`,
+//! or `--restore` without `--dry-run`) first checks that its belief modes
+//! match the API's
 //! (`belief_mode_check`), as every wave bin does. It runs on the maintenance
 //! connection.
 
@@ -264,8 +271,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     write_json(report_w, &json)?;
     if let Err(e) = result {
         return Err(e.context(format!(
-            "refresh stopped; the record file lists every committed write, and the partial \
-             report {} holds their outcomes",
+            "refresh stopped; reconcile from the record file, which lists every committed \
+             write and may list writes of the failed batch that rolled back; the partial \
+             report {} holds the outcomes of the batches confirmed committed",
             report_path.display()
         )));
     }
@@ -344,7 +352,8 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
     write_json(report_w, &json)?;
     if let Err(e) = result {
         return Err(e.context(format!(
-            "restore stopped; the partial report {} lists the batches that finished",
+            "restore stopped; the partial report {} lists the batches confirmed committed \
+             (re-run the restore to reconcile: what landed is already_restored)",
             report_path.display()
         )));
     }

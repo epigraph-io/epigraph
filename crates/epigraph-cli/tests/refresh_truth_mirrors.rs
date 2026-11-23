@@ -2089,3 +2089,109 @@ async fn a_run_that_cannot_connect_still_writes_a_partial_report(pool: PgPool) {
     assert_eq!(j["buckets"]["restored"]["count"], 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ── (25) a batch that fails after a recorded write ─────────────────────────
+//
+// The record is written BEFORE its batch commits, so a write recorded early
+// in a batch that later fails (a refused statement on another claim, a
+// deadlock, a dropped connection) is in the record file although it rolled
+// back, and the partial report, which holds only committed batches, leaves
+// it out. The record is the superset to reconcile from: a restore of it
+// finds the rolled-back write `already_restored` and writes nothing.
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_batch_leaves_its_recorded_write_in_the_record_but_not_the_report(pool: PgPool) {
+    let url = fixture::database_url_for(&pool).await;
+    let dir = scratch_dir();
+    let author = seed_agent(&pool).await;
+    let a = mirror_claim(&pool, author, 0.731_37).await;
+    let b = mirror_claim(&pool, author, 0.682_91).await;
+    let records = wave(&pool, &[a, b], "L1").await;
+    // The batch runs in plan order: the first claim's write is recorded,
+    // then the second's is refused and the whole batch rolls back.
+    let order: Vec<Uuid> = plan_candidates(&records)
+        .iter()
+        .map(|c| c.claim_id)
+        .collect();
+    assert_eq!(order.len(), 2, "precondition: two candidates");
+    let (first, second) = (order[0], order[1]);
+    let (t_first, t_second) = (truth_of(&pool, first).await, truth_of(&pool, second).await);
+    let wave_file = dir.join("L1.jsonl");
+    let mut buf = Vec::new();
+    for r in &records {
+        write_wave_record(&mut buf, r).unwrap();
+    }
+    std::fs::write(&wave_file, buf).unwrap();
+
+    refuse_truth_writes_to(&pool, second).await;
+    let record = dir.join("RECORD.jsonl");
+    let report = dir.join("apply.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--waves",
+            wave_file.to_str().unwrap(),
+            "--apply",
+            "--batch",
+            "2",
+            "--record",
+            record.to_str().unwrap(),
+            "--report",
+            report.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "the run must stop");
+
+    // The record lists the first claim's write; the database does not hold it.
+    let recs = read_truth_records(std::io::BufReader::new(
+        std::fs::File::open(&record).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(
+        recs.iter().map(|r| r.claim_id).collect::<Vec<_>>(),
+        vec![first],
+        "the record lists the write recorded before the batch failed"
+    );
+    assert_eq!(
+        truth_of(&pool, first).await.to_bits(),
+        t_first.to_bits(),
+        "the recorded write rolled back with its batch"
+    );
+    assert_eq!(truth_of(&pool, second).await.to_bits(), t_second.to_bits());
+
+    // The partial report holds no outcome of the failed batch.
+    let j = report_json(&report);
+    assert_eq!(j["partial"], true);
+    assert_eq!(j["claims"], 0, "no batch committed: {j}");
+    assert_eq!(j["buckets"]["refresh"]["count"], 0, "{j}");
+
+    // Reconciling from the record: the restore writes nothing and says so.
+    sqlx::query("DROP TRIGGER refresh_test_refuse ON claims")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let rep = dir.join("restore.json");
+    let o = run_bin(
+        &dir,
+        &url,
+        &[
+            "--restore",
+            record.to_str().unwrap(),
+            "--report",
+            rep.to_str().unwrap(),
+            "--allow-mode-skew",
+        ],
+    );
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let j = report_json(&rep);
+    assert_eq!(j["partial"], false);
+    assert_eq!(
+        j["buckets"]["already_restored"]["ids"],
+        serde_json::json!([first])
+    );
+    assert_eq!(j["buckets"]["restored"]["count"], 0);
+    assert_eq!(truth_of(&pool, first).await.to_bits(), t_first.to_bits());
+    let _ = std::fs::remove_dir_all(&dir);
+}
