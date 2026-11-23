@@ -1040,6 +1040,71 @@ jobs:
         if: ${{ !cancelled() }}
         run: '"$RUNNER_TEMP/pip-audit/bin/pip-audit" --strict --progress-spinner off --disable-pip --require-hashes -r tests/requirements-ci.txt'
 
+  # Advisory: the Atlas W6 layout digests on a SECOND CPU architecture
+  # (backlog c7c6e7ce). A stored layout level is reused while its input hash
+  # matches, and that hash covers LAYOUT_ALGO and the constants, not the
+  # machine; the layout may be computed off the box. So the pinned digests in
+  # atlas_layout::force::tests::the_layout_output_is_pinned_to_the_algorithm_tag
+  # must come out the same on arm64 as on x86_64, or stored positions could be
+  # reused under a computation that does not reproduce them. This job runs
+  # exactly that one test on a GitHub-hosted arm64 runner.
+  #
+  # Advisory (continue-on-error) until its first runs are read: a failure means
+  # the digests differ on arm64, which is a finding to act on (pin the layout
+  # compute to one architecture, or make the arithmetic architecture-exact
+  # and re-pin under a new LAYOUT_ALGO), not a broken PR. To keep it off the
+  # shared runner cap, it builds only when the change touches the layout code
+  # or this file (or on a push to main that does), and otherwise ends after
+  # the diff check.
+  layout-digest-arm64:
+    name: Atlas layout digests on arm64 (advisory)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    continue-on-error: true
+    permissions:
+      contents: read
+    env:
+      SQLX_OFFLINE: "true"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # The change's base commit must be present for the diff below.
+          fetch-depth: 0
+      - name: Decide whether the layout code changed
+        id: scope
+        env:
+          # SHAs reach the script through env, never interpolated into the
+          # shell body. A push that created the branch has an all-zero
+          # `before`; then (and on any diff failure) the job runs.
+          SCAN_BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          SCAN_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if ! changed=$(git diff --name-only "$SCAN_BASE" "$SCAN_HEAD" 2>/dev/null); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif printf '%s\n' "$changed" | grep -qE '^(crates/epigraph-cli/src/atlas_layout/|\.github/workflows/ci\.yml$)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "the layout code is unchanged: nothing to check on arm64"
+          fi
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        if: steps.scope.outputs.run == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        if: steps.scope.outputs.run == 'true'
+      - name: Run the pinned layout digest test
+        if: steps.scope.outputs.run == 'true'
+        # --no-default-features: the layout module needs no database, and the
+        # test prints the four digests it got, so a mismatch is readable from
+        # the log without a second run.
+        run: |
+          uname -m
+          cargo test -p epigraph-cli --no-default-features --locked --lib \
+            atlas_layout::force::tests::the_layout_output_is_pinned_to_the_algorithm_tag \
+            -- --exact --nocapture
+
   # Secret scan, a HARD gate (no continue-on-error). epigraph is a public repo,
   # so a credential committed on a PR branch is published the moment it is
   # pushed; this job catches it before it reaches main. It scans ONLY the

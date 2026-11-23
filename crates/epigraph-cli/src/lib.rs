@@ -8,6 +8,8 @@ pub mod atlas_naming;
 #[cfg(feature = "db")]
 pub mod atlas_nightly;
 #[cfg(feature = "db")]
+pub mod atlas_undo;
+#[cfg(feature = "db")]
 pub mod atomicity_sweep;
 #[cfg(feature = "db")]
 pub mod backfill_factors;

@@ -21,7 +21,16 @@ It also owns the two files that cross the box boundary:
     cannot run code when it is read;
   * a result: JSON naming each theme's parts as lists of claim ids, and
     `id_chunk_cuts` (see split_to_cap_with_stats).
+
+`parts_digest(result)` is a result's fingerprint: what apply compares against
+the plan the operator reviewed. The split is deterministic on one host and set
+of library versions, but not promised across hosts or CPU architectures, so an
+off-box `compute` may not reproduce an on-box `plan`. Apply refuses a result
+that is not itself a plan unless it is checked against the reviewed plan
+(`--reviewed-plan` / `--expect-digest`, refusing on a mismatch) or the
+operator opts out with `--unreviewed`.
 """
+import hashlib
 import json
 import math
 import pathlib
@@ -194,6 +203,67 @@ def split_to_cap_with_stats(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED,
     return order_parts([[ids[i] for i in p] for p in parts]), stats
 
 
+def parts_digest(result):
+    """SHA-256 (hex) of the parts a result would write: its cap and seed, and
+    per theme (sorted by id) its parts IN ORDER (part 0 keeps the theme's id),
+    each part's claim ids sorted. Theme order, member order within a part and
+    any other field do not change it: `source`, a stored digest, and
+    `id_chunk_cuts` (bookkeeping apply copies into `split_id_chunk_cuts`; it
+    describes how the parts were cut, not which members they hold).
+
+    Computed from the parts themselves, never read from the file, so a result
+    cannot vouch for itself."""
+    canon = {
+        "format": result.get("format"),
+        "cap": int(result["cap"]),
+        "seed": None if result.get("seed") is None else int(result["seed"]),
+        "themes": sorted(
+            ([str(t["theme_id"]), [sorted(str(c) for c in p) for p in t["parts"]]]
+             for t in result["themes"]),
+            key=lambda t: t[0]),
+    }
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
+
+
+def unembedded_slots(part_sizes, n_unembedded, cap):
+    """Where a theme's current members WITHOUT an embedding go, by count.
+
+    The off-box split never sees them (it has no vector to place them by), so
+    apply places them on the box by this rule: in claim-id order, fill each
+    part in part order up to `cap` (part 0, the kept part, first), and put any
+    remainder in extra parts of at most `cap`. Returns (taken, extra): how
+    many each existing part takes, and the sizes of the extra parts. Every
+    resulting part is at most `cap` whenever the given parts are."""
+    if cap < 1:
+        raise ValueError("cap must be at least 1")
+    left = int(n_unembedded)
+    taken = []
+    for size in part_sizes:
+        k = min(left, max(0, cap - int(size)))
+        taken.append(k)
+        left -= k
+    extra = [min(cap, left - i) for i in range(0, left, cap)]
+    return taken, extra
+
+
+def place_unembedded(parts, unembedded, cap):
+    """`parts` with the current unembedded members placed by `unembedded_slots`:
+    returns the final parts (each existing part extended, extra parts
+    appended), members of each sorted. Pure and deterministic: the input
+    order of `unembedded` does not matter."""
+    rest = sorted(str(c) for c in unembedded)
+    taken, extra = unembedded_slots([len(p) for p in parts], len(rest), cap)
+    out, at = [], 0
+    for part, k in zip(parts, taken):
+        out.append(sorted([str(c) for c in part] + rest[at:at + k]))
+        at += k
+    for k in extra:
+        out.append(rest[at:at + k])
+        at += k
+    return out
+
+
 def validate_parts(members, parts, cap):
     """Raise ValueError unless `parts` cover `members` exactly once, each <= cap."""
     seen = set()
@@ -239,4 +309,7 @@ def compute_export_dir(export_dir, cap=None, seed=None):
         ids, x = read_theme_npz(export_dir / f"{theme_id}.npz")
         parts, stats = split_to_cap_with_stats(ids, x, cap=cap, seed=seed)
         themes.append({"theme_id": theme_id, "parts": parts, **stats})
-    return {"format": RESULT_FORMAT, "cap": cap, "seed": seed, "themes": themes}
+    # `source` tells apply this result was not itself reviewed (see
+    # theme_cap_split.review_digest); it is not part of parts_digest.
+    return {"format": RESULT_FORMAT, "source": "compute", "cap": cap, "seed": seed,
+            "themes": themes}
