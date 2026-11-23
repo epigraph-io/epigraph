@@ -93,8 +93,8 @@ use epigraph_cli::belief_cache::read_snapshot;
 use epigraph_cli::belief_mode_check::{enforce_or_exit, RunIntent, MODE_CHECK_REFUSED_EXIT};
 use epigraph_cli::recompute_betp::{
     cse_str, drift_decomposition, fold_str, parse_accept_list, predict_cached_after, select_cohort,
-    select_wave_cohort, vacate_listed_claim, write_wave_claim, DiskGate, DriftLine, WaveLog,
-    WaveRole, DRIFT_COMPONENTS,
+    select_wave_cohort, vacate_listed_claim, write_run_record, write_wave_claim, DiskGate,
+    DriftLine, WaveLog, WaveRole, DRIFT_COMPONENTS,
 };
 use epigraph_engine::atom_items::{AtomFoldMode, CompoundSourceEdges};
 use epigraph_engine::edge_factor::{AtomCacheOutcome, AtomCacheSettings, VacateOutcome};
@@ -682,16 +682,6 @@ async fn run_real(
         .await?;
     }
     Ok(())
-}
-
-/// `<wave file>.run.json`: what the run was (its modes and its disk gate,
-/// including a `--no-backup-check` opt-out), beside the records it makes.
-fn write_run_record(wave_file: &std::path::Path, record: &serde_json::Value) -> Result<(), String> {
-    let mut p = wave_file.as_os_str().to_owned();
-    p.push(".run.json");
-    let p = PathBuf::from(p);
-    let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
-    std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
 }
 
 async fn pace(cli: &Cli, batch: usize) {

@@ -1155,6 +1155,37 @@ viewer the maintenance session owns.
   * A dropped or panicking claim mid-transaction is rolled back, so the file
     never misses a committed write. At worst it holds a record of a write
     that never committed, which a restore reports as `already_restored`.
+* **A writing `recompute_claim_belief` run checks the belief modes first**
+  (backlog a7ab715d), as `recompute_betp` and `backfill_factors` do. Before
+  it opens the database it reads the API's `/health` → `belief_modes`
+  (`EPIGRAPH_API`, else `EPIGRAPH_API_URL`, else `http://127.0.0.1:8080`) and
+  exits 3, writing nothing, when any mode differs from its own or cannot be
+  read. It also exits 3 under any `EPIGRAPH_ATOM_FOLD` other than `legacy`:
+  the owner-frame recompute it calls folds only the legacy way. Run it from
+  the API's environment, with the API reachable. `--dry-run` is exempt.
+  Exit 3 is also the wave-file STOP above; stderr says which.
+* **A writing `recompute_claim_belief` run passes a disk gate before every
+  batch** (backlog 1ea4f6bf; `recompute_betp`'s `DiskGate`). It needs
+  `--disk-path <path on the database's data volume>` and
+  `--disk-check-cmd <backup and archive health check>`, or an explicit
+  `--no-backup-check`; clap refuses a writing run without them (exit 2).
+  The id list is worked in batches of `--batch-size` (default 1000). Before
+  each batch, the volume's free space less the batch's projected writes
+  (`--projected-bytes-per-claim`, default 65536: WAL and archive, plus the
+  wave file's records when it is on that volume) must stay at or above
+  `--min-free-gb` (default 20), and the check command must exit 0. A failure
+  stops the run before that batch writes (exit 4, `STOPPED by the disk
+  gate`); what committed before it is recorded, so the wave file restores
+  it. The wave file's own volume is not gated: a record that does not fit
+  already rolls its claim back and stops the run (exit 3). The projection
+  default is `recompute_betp`'s provisional figure; measure it for this
+  binary before relying on a tight headroom. `--disk-path` must be a path
+  the operator's user can `df` on the database's filesystem, or the gate
+  fails closed at batch 1 (exit 4).
+* **A `--snapshot` run writes `<wave file>.run.json` before its first
+  write**: the run's belief modes, whether `--allow-mode-skew` overrode the
+  mode check, and its disk gate, including a `--no-backup-check` opt-out
+  (as `recompute_betp` records its runs). Keep it with the wave file.
 
 ### The Python scripts
 

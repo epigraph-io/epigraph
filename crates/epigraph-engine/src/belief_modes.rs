@@ -18,13 +18,14 @@
 //!
 //! The modes are reported by:
 //!
+//! - the job runner (`drain_jobs`), which journals it at boot;
 //! - the API server and the HTTP and stdio MCP servers, which journal it at
 //!   boot and report [`current`] on `/health` → `belief_modes` and
 //!   `system_stats` → `belief_modes`; the pre-flip mode check (SPEC §10.4)
 //!   compares those reports across live processes;
 //! - the CLI wave bins `recompute_betp`, `backfill_factors`,
-//!   `sweep_retired_source_bbas`, `refresh_truth_mirrors` and
-//!   `decompose_claims --retarget`, which compare their own [`current`] with
+//!   `recompute_claim_belief`, `sweep_retired_source_bbas`,
+//!   `refresh_truth_mirrors` and `decompose_claims --retarget`, which compare their own [`current`] with
 //!   the API's report before a writing run ([`BeliefModes::skew`]).
 //!
 //! # Defaults, and what this build acts on

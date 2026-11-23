@@ -468,6 +468,24 @@ fn parse_df_available_kib(out: &str) -> Option<u64> {
 
 // ── the wave file ──────────────────────────────────────────────────────────
 
+/// Write `<wave file>.run.json`: what the run was (its modes and its disk
+/// gate, including a `--no-backup-check` or `--allow-mode-skew` opt-out),
+/// beside the records it makes, so the wave file carries its own evidence of
+/// how it was run. Written before the run's first write.
+///
+/// # Errors
+/// The record cannot be serialised or written.
+pub fn write_run_record(
+    wave_file: &std::path::Path,
+    record: &serde_json::Value,
+) -> Result<(), String> {
+    let mut p = wave_file.as_os_str().to_owned();
+    p.push(".run.json");
+    let p = std::path::PathBuf::from(p);
+    let text = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
+    std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))
+}
+
 /// Where a writing run records what it wrote (SPEC §10.8): the wave file
 /// (claim caches, [`WaveRecord`]) and its scoped sidecar
 /// ([`ScopedWaveRecord`]), both appended and flushed BEFORE the write they
