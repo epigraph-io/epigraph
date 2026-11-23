@@ -23,7 +23,8 @@ import pytest
 from scripts import label_themes_llm as L
 from scripts import theme_cap_core as core
 from scripts import theme_cap_split as S
-from tests.theme.conftest import TEST_DSN, make_embedding
+from tests.theme.conftest import make_embedding, script_dsn
+from tests import db_roles
 from tests.theme.test_theme_cap_core import _blobs
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -125,7 +126,7 @@ def test_plan_lists_every_over_cap_theme_with_part_sizes(db, seed_agent, tmp_pat
     small, _, _ = _theme(db, seed_agent, (12,), label="Small Theme", seed0=20)
     before = _snapshot(db)
 
-    out, _ = _run(["plan", "--database-url", TEST_DSN, "--cap", str(CAP),
+    out, _ = _run(["plan", "--database-url", script_dsn(), "--cap", str(CAP),
                    "--out", str(tmp_path / "plan.json")])
 
     report = {r["theme_id"]: r for r in json.loads(out)["themes"]}
@@ -139,11 +140,11 @@ def test_plan_lists_every_over_cap_theme_with_part_sizes(db, seed_agent, tmp_pat
     assert {t["theme_id"] for t in result["themes"]} == {big, pair}
 
 
-def test_apply_leaves_no_theme_over_cap_and_largest_keeps_id(db, seed_agent, tmp_path):
+def test_apply_leaves_no_theme_over_cap_and_largest_keeps_id(db, script_db, seed_agent, tmp_path):
     theme, (g0, g1, g2), _ = _theme(db, seed_agent, (30, 25, 20))
 
-    result, _ = S.plan(db, cap=CAP)
-    manifest = S.apply_result(db, result, tmp_path / "m.json")
+    result, _ = S.plan(script_db, cap=CAP)
+    manifest = S.apply_result(script_db, result, tmp_path / "m.json")
 
     sizes = _sizes(db)
     assert max(sizes.values()) <= CAP
@@ -172,13 +173,13 @@ def test_apply_leaves_no_theme_over_cap_and_largest_keeps_id(db, seed_agent, tmp
         assert props["split_id_chunk_cuts"] == 0
 
 
-def test_resplit_keeps_earlier_lineage_and_a_unique_path(db, seed_agent, tmp_path):
+def test_resplit_keeps_earlier_lineage_and_a_unique_path(db, script_db, seed_agent, tmp_path):
     earlier = str(uuid.uuid4())
     theme, _, _ = _theme(db, seed_agent, (30, 25), label="Older Part · part 2", props={
         "cluster_run_id": RUN_ID, "cluster_id": 7, "split_of": earlier, "split_part": 1})
 
-    result, _ = S.plan(db, cap=CAP)
-    S.apply_result(db, result, tmp_path / "m.json")
+    result, _ = S.plan(script_db, cap=CAP)
+    S.apply_result(script_db, result, tmp_path / "m.json")
 
     with db.cursor() as cur:
         cur.execute("SELECT label, properties FROM claim_themes ORDER BY claim_count DESC")
@@ -199,7 +200,7 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
 
     old_umask = os.umask(0o022)  # a typical umask: the export must not rely on a strict one
     try:
-        _run(["export", "--database-url", TEST_DSN, "--cap", str(CAP), "--out", str(export)])
+        _run(["export", "--database-url", script_dsn(), "--cap", str(CAP), "--out", str(export)])
     finally:
         os.umask(old_umask)
     npz = sorted(export.glob("*.npz"))
@@ -208,11 +209,11 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
     for f in [export, export / "export.json", *npz]:
         assert f.stat().st_mode & 0o077 == 0, (f.name, oct(f.stat().st_mode))
     _run(["compute", "--from", str(export), "--out", str(result)])
-    _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
+    _run(["apply", "--database-url", script_dsn(), "--from", str(result),
           "--manifest", str(manifest)])
     assert _snapshot(db) != before
     assert max(_sizes(db).values()) <= CAP
-    _run(["reverse", "--database-url", TEST_DSN, "--manifest", str(manifest)])
+    _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
 
     assert _snapshot(db) == before, "reverse must restore claim_themes and membership exactly"
 
@@ -237,11 +238,11 @@ def test_no_claim_text_reaches_any_output(db, seed_agent, tmp_path):
     try:
         export, result, manifest = tmp_path / "e", tmp_path / "r.json", tmp_path / "m.json"
         outputs = [
-            _run(["plan", "--database-url", TEST_DSN, "--cap", str(CAP),
+            _run(["plan", "--database-url", script_dsn(), "--cap", str(CAP),
                   "--out", str(tmp_path / "p.json")]),
-            _run(["export", "--database-url", TEST_DSN, "--cap", str(CAP), "--out", str(export)]),
+            _run(["export", "--database-url", script_dsn(), "--cap", str(CAP), "--out", str(export)]),
             _run(["compute", "--from", str(export), "--out", str(result)]),
-            _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
+            _run(["apply", "--database-url", script_dsn(), "--from", str(result),
                   "--manifest", str(manifest)]),
         ]
         blobs = [s.encode() for pair in outputs for s in pair]
@@ -265,29 +266,29 @@ def test_no_claim_text_reaches_any_output(db, seed_agent, tmp_path):
         db.commit()
 
 
-def test_apply_refuses_a_stale_result_and_writes_nothing(db, seed_agent, tmp_path):
+def test_apply_refuses_a_stale_result_and_writes_nothing(db, script_db, seed_agent, tmp_path):
     theme, _, _ = _theme(db, seed_agent, (30, 25, 20))
-    result, _ = S.plan(db, cap=CAP)
+    result, _ = S.plan(script_db, cap=CAP)
     with db.cursor() as cur:
         _claim(cur, seed_agent, theme, 1)  # assigned after the plan
     db.commit()
     before = _snapshot(db)
 
     with pytest.raises(ValueError, match="no longer matches"):
-        S.apply_result(db, result, tmp_path / "m.json")
+        S.apply_result(script_db, result, tmp_path / "m.json")
 
     assert _snapshot(db) == before
     assert not (tmp_path / "m.json").exists()
 
 
-def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_agent, tmp_path):
+def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, script_db, seed_agent, tmp_path):
     _theme(db, seed_agent, (30, 25, 20), unembedded=15)
-    result, report = S.plan(db, cap=CAP)
+    result, report = S.plan(script_db, cap=CAP)
     assert report[0]["reaches_cap"] is False
     before = _snapshot(db)
 
     with pytest.raises(ValueError, match="over the cap"):
-        S.apply_result(db, result, tmp_path / "m.json")
+        S.apply_result(script_db, result, tmp_path / "m.json")
 
     assert _snapshot(db) == before
     assert not (tmp_path / "m.json").exists()
@@ -297,33 +298,33 @@ def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_
     ((35,), 10),  # embedded members fit in ONE part; the theme is still over the cap
     ((), 45),     # no embedded member at all: the result has no parts for it
 ], ids=["one-part", "no-embeddings"])
-def test_apply_refuses_an_over_cap_theme_it_cannot_split(db, seed_agent, tmp_path,
+def test_apply_refuses_an_over_cap_theme_it_cannot_split(db, script_db, seed_agent, tmp_path,
                                                          embedded, unembedded):
     """A theme the split leaves whole must not pass as applied: the apply would
     report success and the theme would stay over the cap."""
     stuck, _, _ = _theme(db, seed_agent, embedded, label="Unembedded Theme", seed0=40,
                          unembedded=unembedded)
     _theme(db, seed_agent, (30, 25, 20))  # a splittable theme in the same result
-    result, report = S.plan(db, cap=CAP)
+    result, report = S.plan(script_db, cap=CAP)
     by_id = {r["theme_id"]: r for r in report}
     assert by_id[stuck]["current"] == 45 and by_id[stuck]["reaches_cap"] is False
     before = _snapshot(db)
 
     with pytest.raises(ValueError, match=f"over the cap.*{stuck}"):
-        S.apply_result(db, result, tmp_path / "m.json")
+        S.apply_result(script_db, result, tmp_path / "m.json")
 
     assert _snapshot(db) == before, "the whole apply is refused, the splittable theme too"
     assert not (tmp_path / "m.json").exists()
 
 
-def test_plan_and_parts_record_an_id_order_cut(db, seed_agent, tmp_path):
+def test_plan_and_parts_record_an_id_order_cut(db, script_db, seed_agent, tmp_path):
     """Members with identical vectors can only be cut by claim id. The dry run
     and the written parts both say so, so it is countable on a real corpus."""
     theme, _, _ = _theme(db, seed_agent, (45,))  # one seeded group: identical embeddings
 
-    result, report = S.plan(db, cap=CAP)
+    result, report = S.plan(script_db, cap=CAP)
     assert report[0]["id_chunk_cuts"] >= 1 and report[0]["part_sizes"] == [23, 22]
-    S.apply_result(db, result, tmp_path / "m.json")
+    S.apply_result(script_db, result, tmp_path / "m.json")
 
     with db.cursor() as cur:
         cur.execute("SELECT properties FROM claim_themes")
@@ -347,14 +348,15 @@ def test_apply_refuses_a_result_whose_cap_is_over_its_own():
         S.apply_result(_NoDB(), result, "unused.json")
 
 
-def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
+def test_reverse_keeps_a_column_added_after_the_apply(db, script_db, seed_agent, tmp_path):
     """A claim_themes column added between apply and reverse (a later Atlas item
     may add one) is not in the snapshot. Reverse leaves it as it is, rather
     than writing NULL into it or failing on its NOT NULL."""
     theme, _, _ = _theme(db, seed_agent, (30, 25, 20))
     before = _snapshot(db)
-    result, _ = S.plan(db, cap=CAP)
-    manifest = S.apply_result(db, result, tmp_path / "m.json")
+    result, _ = S.plan(script_db, cap=CAP)
+    manifest = S.apply_result(script_db, result, tmp_path / "m.json")
+    script_db.rollback()  # the ALTER below waits on any lock the script's session holds
     try:
         with db.cursor() as cur:
             cur.execute("ALTER TABLE claim_themes ADD COLUMN w1_added text NOT NULL "
@@ -362,7 +364,7 @@ def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
             cur.execute("UPDATE claim_themes SET w1_added = 'changed' WHERE id = %s", (theme,))
         db.commit()
 
-        S.reverse_manifest(db, manifest)
+        S.reverse_manifest(script_db, manifest)
 
         with db.cursor() as cur:
             cur.execute("SELECT w1_added FROM claim_themes")
@@ -376,17 +378,17 @@ def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
     assert _snapshot(db) == before
 
 
-def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
+def test_the_cap_counts_current_members_only(db, script_db, seed_agent, tmp_path):
     """Superseded and duplicate-marked members keep their theme_id but are not
     drawn and cannot be clustered: they neither trigger a split nor overflow the
     kept part. (Current members without an embedding do; see the test above.)"""
     under, _, _ = _theme(db, seed_agent, (35,), label="Mostly Retired", seed0=30, retired=20)
     over, groups, retired = _theme(db, seed_agent, (30, 25, 20), retired=15)
 
-    result, report = S.plan(db, cap=CAP)
+    result, report = S.plan(script_db, cap=CAP)
     assert [r["theme_id"] for r in report] == [over], "a theme of 35 current members is not over"
     assert report[0]["retired"] == 15 and report[0]["reaches_cap"]
-    S.apply_result(db, result, tmp_path / "m.json")
+    S.apply_result(script_db, result, tmp_path / "m.json")
 
     assert _theme_of(db, retired) == [over], "retired members stay with the kept part"
     assert _theme_of(db, groups[0]) == [over]
@@ -399,11 +401,11 @@ def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
     assert current[over] == 30 and current[under] == 35
 
 
-def test_reverse_refuses_drift_unless_allowed(db, seed_agent, tmp_path):
+def test_reverse_refuses_drift_unless_allowed(db, script_db, seed_agent, tmp_path):
     theme, _, _ = _theme(db, seed_agent, (30, 25, 20))
     before = _snapshot(db)
-    result, _ = S.plan(db, cap=CAP)
-    manifest = S.apply_result(db, result, tmp_path / "m.json")
+    result, _ = S.plan(script_db, cap=CAP)
+    manifest = S.apply_result(script_db, result, tmp_path / "m.json")
     new_part = manifest["themes"][0]["new_parts"][0]["theme_id"]
     with db.cursor() as cur:
         late = _claim(cur, seed_agent, new_part, 2)  # assigned to a part after the apply
@@ -411,10 +413,10 @@ def test_reverse_refuses_drift_unless_allowed(db, seed_agent, tmp_path):
     applied = _snapshot(db)
 
     with pytest.raises(ValueError, match="membership changed"):
-        S.reverse_manifest(db, manifest)
+        S.reverse_manifest(script_db, manifest)
     assert _snapshot(db) == applied, "a refused reverse must write nothing"
 
-    S.reverse_manifest(db, manifest, allow_drift=True)
+    S.reverse_manifest(script_db, manifest, allow_drift=True)
     sizes = _sizes(db)
     assert set(sizes) == {theme} and sizes[theme] == 76
     assert _theme_of(db, [late]) == [theme]
@@ -425,23 +427,23 @@ def test_reverse_refuses_drift_unless_allowed(db, seed_agent, tmp_path):
     db.rollback()
 
 
-def test_manifest_of_an_uncommitted_apply_reverses_as_a_no_op(db, seed_agent, tmp_path,
+def test_manifest_of_an_uncommitted_apply_reverses_as_a_no_op(db, script_db, seed_agent, tmp_path,
                                                              monkeypatch):
     _theme(db, seed_agent, (30, 25, 20))
     before = _snapshot(db)
-    result, _ = S.plan(db, cap=CAP)
+    result, _ = S.plan(script_db, cap=CAP)
 
     def crash(conn):
         raise RuntimeError("connection lost at commit")
 
     monkeypatch.setattr(S, "_commit", crash)
     with pytest.raises(RuntimeError):
-        S.apply_result(db, result, tmp_path / "m.json")
+        S.apply_result(script_db, result, tmp_path / "m.json")
     monkeypatch.undo()
 
     assert _snapshot(db) == before
     manifest = json.loads((tmp_path / "m.json").read_text())  # written before the commit
-    assert S.reverse_manifest(db, manifest) == [
+    assert S.reverse_manifest(script_db, manifest) == [
         {"parent_id": manifest["themes"][0]["parent_id"], "status": "nothing to reverse"}]
     assert _snapshot(db) == before
 
@@ -461,6 +463,19 @@ def test_a_session_under_row_security_is_refused(db):
             cur.execute("RESET SESSION AUTHORIZATION")
         db.commit()
     S.require_maintenance_session(db)  # the fixture's own session passes
+
+
+def test_the_maintenance_login_passes_the_guard_by_epigraph_bypass(script_db):
+    """The production session (a NON-superuser login in epigraph_maintenance,
+    tests/db_roles.py) is admitted by the database's epigraph_bypass(), not by
+    a superuser's privilege: the guard's own branch for it runs here."""
+    with script_db.cursor() as cur:
+        cur.execute("SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = session_user")
+        privileged = cur.fetchone()[0]
+    script_db.rollback()
+    if db_roles.REQUIRE_DB:
+        assert not privileged, "CI must run the scripts as the maintenance login"
+    S.require_maintenance_session(script_db)
 
 
 # ── DB-free: the off-box compute step, names, the role guard ──

@@ -17,7 +17,7 @@ def test_parse_subcluster_label_strips_noise():
     assert R.parse_subcluster_label("") == ""
 
 
-def test_auto_refine_splits_cluster(db, seed_agent, monkeypatch):
+def test_auto_refine_splits_cluster(db, script_db, seed_agent, monkeypatch):
     run_id = "22222222-2222-2222-2222-222222222222"
     # One cluster (id=0) holding two embedding blobs -> should split into 2.
     with db.cursor() as cur:
@@ -41,7 +41,7 @@ def test_auto_refine_splits_cluster(db, seed_agent, monkeypatch):
     # Avoid real claude: deterministic labels.
     monkeypatch.setattr(R, "llm_label_subcluster", lambda samples, idx: f"sub-{idx}")
 
-    result = R.auto_refine(db, cluster_id=0, run_id=run_id, min_sub_size=5)
+    result = R.auto_refine(script_db, cluster_id=0, run_id=run_id, min_sub_size=5)
     assert result["split"] is True
     assert result["n_subclusters"] >= 2
 
@@ -51,7 +51,7 @@ def test_auto_refine_splits_cluster(db, seed_agent, monkeypatch):
         assert cur.fetchone()[0] >= 2  # cluster 0 replaced by 0*100+sub ids
 
 
-def test_auto_refine_no_id_collision_with_sibling(db, seed_agent, monkeypatch):
+def test_auto_refine_no_id_collision_with_sibling(db, script_db, seed_agent, monkeypatch):
     """Splitting cluster 0 in a consolidated run must NOT reuse sibling ids.
 
     Regression for the cluster_id*100+sub scheme, which produced ids {0,1,2}
@@ -97,7 +97,7 @@ def test_auto_refine_no_id_collision_with_sibling(db, seed_agent, monkeypatch):
     db.commit()
 
     monkeypatch.setattr(R, "llm_label_subcluster", lambda samples, idx: f"sub-{idx}")
-    result = R.auto_refine(db, cluster_id=0, run_id=run_id, min_sub_size=5)
+    result = R.auto_refine(script_db, cluster_id=0, run_id=run_id, min_sub_size=5)
     assert result["split"] is True
 
     with db.cursor() as cur:

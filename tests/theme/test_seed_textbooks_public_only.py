@@ -13,9 +13,11 @@ import argparse
 import json
 import uuid
 
+import psycopg2
+
 from scripts import label_themes_llm as L
 from scripts import seed_themes_from_textbooks as S
-from tests.theme.conftest import TEST_DSN, make_embedding
+from tests.theme.conftest import make_embedding, script_dsn
 from tests.theme.test_label_excludes_intake import _group
 
 PUBLIC_SECTION = "seed-public-only public section on streamline flow"
@@ -95,9 +97,13 @@ def _seed_all(db, monkeypatch, dry_run=False):
         return {"label": "LLM label", "description": "LLM description"}
 
     monkeypatch.setattr(S, "label_via_claude", fake_llm)
-    args = argparse.Namespace(database_url=TEST_DSN, dry_run=dry_run)
-    sections = S.fetch_textbook_l1_claims(db, None)
-    db.rollback()
+    args = argparse.Namespace(database_url=script_dsn(), dry_run=dry_run)
+    # The section list, too, is read as the script's login (its own connection).
+    conn = psycopg2.connect(script_dsn())
+    try:
+        sections = S.fetch_textbook_l1_claims(conn, None)
+    finally:
+        conn.close()
     return [S.seed_one(s, args) for s in sections], sent
 
 
@@ -160,7 +166,7 @@ def test_a_public_section_is_labelled_from_public_atoms_only(db, seed_agent, mon
         _cleanup(db, ids, group)
 
 
-def test_the_placeholder_survives_drop_auto_themes(db, seed_agent):
+def test_the_placeholder_survives_drop_auto_themes(db, script_db, seed_agent):
     """--drop-auto-after deletes every `auto-%` theme and unassigns its members.
     A theme no public member could name must not be swept up with them: losing
     a seeded one's row would let the next seed run label its section again."""
@@ -183,8 +189,8 @@ def test_the_placeholder_survives_drop_auto_themes(db, seed_agent):
         cur.execute("UPDATE claims SET theme_id = %s WHERE id = %s", (auto, freed))
     db.commit()
     try:
-        assert S.drop_auto_themes(db) == 1
-        db.commit()
+        assert S.drop_auto_themes(script_db) == 1
+        script_db.commit()
         with db.cursor() as cur:
             cur.execute("SELECT id FROM claim_themes")
             assert [r[0] for r in cur.fetchall()] == [placeholder]

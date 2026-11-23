@@ -21,7 +21,7 @@ from scripts import cluster_claims as C
 from scripts import evidential_clustering as E
 from scripts import label_themes_llm as L
 from scripts import refine_clusters as R
-from tests.theme.conftest import TEST_DSN, make_embedding
+from tests.theme.conftest import make_embedding, script_dsn
 from tests.theme.test_label_excludes_intake import (
     PUBLIC_TEXT,
     REFINE_RUN,
@@ -64,18 +64,28 @@ def _cleanup(db, ids, group):
     db.commit()
 
 
-def test_the_theme_label_sample_reads_public_members_only(db, seed_agent):
+def test_the_theme_label_sample_reads_public_members_only(db, script_db, seed_agent):
+    """As the script's maintenance login, which reads the other group's private
+    member (test_script_session_role.py): only public_label_source keeps it out."""
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         theme = _theme(cur, "auto-1")
-        _claim(cur, seed_agent, PUBLIC_TEXT, theme_id=theme)
-        _private(cur, seed_agent, group, PRIVATE_TEXT, theme_id=theme)
+        ids = [
+            _claim(cur, seed_agent, PUBLIC_TEXT, theme_id=theme),
+            _private(cur, seed_agent, group, PRIVATE_TEXT, theme_id=theme),
+        ]
         cur.execute("SELECT count(*) FROM bug_report_intake_settings")
         assert cur.fetchone()[0] == 0  # the intake conjunct excludes nothing here
-
-    [t] = [t for t in L.load_themes_with_samples(db) if t["id"] == str(theme)]
-    assert [s["content"] for s in t["samples"]] == [PUBLIC_TEXT]
-    db.rollback()  # nothing above was committed
+    db.commit()
+    try:
+        with script_db.cursor() as cur:
+            cur.execute("SELECT count(*) FROM claims WHERE theme_id = %s", (theme,))
+            assert cur.fetchone()[0] == 2, "the script's session must read the private member"
+        [t] = [t for t in L.load_themes_with_samples(script_db) if t["id"] == str(theme)]
+        assert [s["content"] for s in t["samples"]] == [PUBLIC_TEXT]
+    finally:
+        script_db.rollback()
+        _cleanup(db, ids, group)
 
 
 def _run_labeller(monkeypatch, *extra):
@@ -89,7 +99,7 @@ def _run_labeller(monkeypatch, *extra):
 
     monkeypatch.setattr(L, "call_claude_cli", fake_cli)
     monkeypatch.delenv("MAINTENANCE_DATABASE_URL", raising=False)
-    monkeypatch.setattr(sys, "argv", ["label_themes_llm.py", "--database-url", TEST_DSN, *extra])
+    monkeypatch.setattr(sys, "argv", ["label_themes_llm.py", "--database-url", script_dsn(), *extra])
     L.main()
     return prompts
 
@@ -140,7 +150,7 @@ def test_a_theme_with_no_public_member_gets_a_placeholder_not_an_llm_label(
         _cleanup(db, ids, group)
 
 
-def test_cluster_labels_quote_public_members_only(db, seed_agent):
+def test_cluster_labels_quote_public_members_only(db, script_db, seed_agent):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         ids = [
@@ -156,8 +166,8 @@ def test_cluster_labels_quote_public_members_only(db, seed_agent):
             cid: {0: {"belief": 0.9, "plausibility": 0.95, "ignorance": 0.05}} for cid in ids
         }
         writers = (
-            lambda run_id: C.label_clusters(db, ids, reduced, labels, centroids, 1, run_id),
-            lambda run_id: E.store_results(db, ids, beliefs, {}, 1, {}, {}, run_id),
+            lambda run_id: C.label_clusters(script_db, ids, reduced, labels, centroids, 1, run_id),
+            lambda run_id: E.store_results(script_db, ids, beliefs, {}, 1, {}, {}, run_id),
         )
         for write in writers:
             run_id = str(uuid.uuid4())
@@ -173,7 +183,7 @@ def test_cluster_labels_quote_public_members_only(db, seed_agent):
         _cleanup(db, ids, group)
 
 
-def test_auto_refine_labels_quote_public_members_only(db, seed_agent, monkeypatch):
+def test_auto_refine_labels_quote_public_members_only(db, script_db, seed_agent, monkeypatch):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         public, private = _refine_members(cur, seed_agent, group, text=PRIVATE_TEXT,
@@ -189,7 +199,7 @@ def test_auto_refine_labels_quote_public_members_only(db, seed_agent, monkeypatc
     monkeypatch.setattr(R, "llm_label_subcluster", labeller)
     try:
         _place_in_cluster_0(db, ids)
-        result = R.auto_refine(db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
+        result = R.auto_refine(script_db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
         assert result["split"] is True, result
         parts, labels = _split(db)
         assert asked and all(call for call in asked), asked
@@ -205,7 +215,7 @@ def test_auto_refine_labels_quote_public_members_only(db, seed_agent, monkeypatc
         _cleanup(db, ids, group)
 
 
-def test_interactive_refinement_shows_public_members_only(db, seed_agent, monkeypatch, capsys):
+def test_interactive_refinement_shows_public_members_only(db, script_db, seed_agent, monkeypatch, capsys):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         public, private = _refine_members(cur, seed_agent, group, text=PRIVATE_TEXT,
@@ -216,7 +226,7 @@ def test_interactive_refinement_shows_public_members_only(db, seed_agent, monkey
     monkeypatch.setattr("builtins.input", lambda _p="": answers.pop(0) if answers else "0")
     try:
         _place_in_cluster_0(db, ids)
-        labeled, _, names = R.interactive_label(db, 0, REFINE_RUN)
+        labeled, _, names = R.interactive_label(script_db, 0, REFINE_RUN)
         shown = capsys.readouterr().err
         assert PRIVATE_TEXT not in shown
         assert PUBLIC_TEXT in shown
