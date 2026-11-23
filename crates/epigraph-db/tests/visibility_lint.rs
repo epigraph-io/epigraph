@@ -3100,6 +3100,17 @@ fn every_conn_taking_repo_fn_takes_a_viewer_or_is_exempt() {
 /// [`CONN_WITHOUT_VIEWER`] are, so each entry is a visible diff naming the
 /// function.
 const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
+    // Backlog 57943a39: a verifier holding key BYTES asks whether they are a
+    // signature verifier.
+    (
+        "agent.rs",
+        "key_kind_of_public_key",
+        "READ of `agents`, projecting only `key_kind` for one public key the caller already holds \
+         (a claim's resolved signer key, an agent OAuth client's `client_id`). Same table and \
+         reason as `public_key_if_signer`: `agents` is not tenancy-partitioned (migration 077's \
+         `USING (true)`), and the one column returned is what lets a signature verifier refuse \
+         a key whose private half is public (`seed-derived`, migration 230).",
+    ),
     // Atlas P3a (migration 197): untenanted layout reads. Each is ONE statement
     // over `atlas_layout_*` (no claim_id, no FK to claims, no visibility or
     // owner_group_id) and `claim_themes` (a corpus-wide row, as

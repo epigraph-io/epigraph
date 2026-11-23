@@ -373,6 +373,17 @@ struct SubmitResponse {
 struct CreateAgentRequest {
     public_key: String,
     display_name: Option<String>,
+    /// `seed-derived` for a key computable from a public seed (the server then
+    /// stores it as no verifier and provisions no OAuth client); omitted for a
+    /// real signer, which the server takes as `ed25519`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_kind: Option<&'static str>,
+    /// With `key_kind`: the hex signature, under `public_key`, of
+    /// `key_kind_declaration_message(key_kind, public_key)`, proving this
+    /// caller holds the key it declares (the server refuses a declaration
+    /// without it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_kind_proof: Option<String>,
 }
 
 /// Response from POST /agents
@@ -386,28 +397,50 @@ struct AgentResponse {
 /// Generate a deterministic Ed25519 signer from a seed string.
 /// Uses BLAKE3(seed) as the 32-byte secret key, so the same seed always
 /// produces the same keypair.
+///
+/// The seed is PUBLIC (`<doi>:<author name>`), so anyone can compute this
+/// private key: it NAMES an author and must never sign a claim, evidence or
+/// edge (backlog 57943a39). It leaves this file only through
+/// [`author_agent_request`]: its public half, and the domain-separated
+/// proof that declares it `seed-derived`.
 fn deterministic_signer(seed: &str) -> AgentSigner {
     let hash = ContentHasher::hash(seed.as_bytes());
     let key_bytes: [u8; 32] = hash[..32].try_into().expect("BLAKE3 produces 32 bytes");
     AgentSigner::from_bytes(&key_bytes).expect("valid Ed25519 key from BLAKE3 output")
 }
 
+/// The POST /agents body for one author of the paper `doi`: the public half
+/// of the deterministic `<doi>:<name>` key (so the same author of the same
+/// paper is the same agent on every run), declared `seed-derived` because
+/// its private half is computable by anyone, with the proof of possession
+/// the server requires for that declaration. The server stores it so that no
+/// verifier accepts the key and gives it no OAuth client.
+fn author_agent_request(doi: &str, name: &str) -> CreateAgentRequest {
+    let seed = format!("{doi}:{name}");
+    let author = deterministic_signer(&seed);
+    let public_key = author.public_key();
+    let proof = author.sign(&epigraph_crypto::key_kind_declaration_message(
+        "seed-derived",
+        &public_key,
+    ));
+    CreateAgentRequest {
+        public_key: hex::encode(public_key),
+        display_name: Some(name.to_string()),
+        key_kind: Some("seed-derived"),
+        key_kind_proof: Some(hex::encode(proof)),
+    }
+}
+
 /// Register an agent via the API. Returns the server-assigned agent ID.
 async fn register_agent(
     client: &reqwest::Client,
     endpoint: &str,
-    signer: &AgentSigner,
-    display_name: &str,
+    req: &CreateAgentRequest,
 ) -> Result<Uuid, String> {
-    let req = CreateAgentRequest {
-        public_key: hex::encode(signer.public_key()),
-        display_name: Some(display_name.to_string()),
-    };
-
     let url = format!("{endpoint}/agents");
     let resp = client
         .post(&url)
-        .json(&req)
+        .json(req)
         .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
@@ -687,8 +720,15 @@ async fn main() {
         id
     } else {
         let client = auth_client.clone();
-        let display_name = format!("literature-ingester:{}", extraction.source.doi);
-        match register_agent(&client, &args.endpoint, &signer, &display_name).await {
+        // The run's own signer: a random or operator-supplied key, a real
+        // verifier (it signs the evidence), so no `key_kind` is declared.
+        let req = CreateAgentRequest {
+            public_key: hex::encode(signer.public_key()),
+            display_name: Some(format!("literature-ingester:{}", extraction.source.doi)),
+            key_kind: None,
+            key_kind_proof: None,
+        };
+        match register_agent(&client, &args.endpoint, &req).await {
             Ok(id) => {
                 println!("Registered agent: {id}");
                 id
@@ -817,15 +857,15 @@ async fn main() {
     let mut submitted = 0;
     let mut failed = 0;
 
-    // Register per-author agents (deterministic keys so same author → same keypair)
+    // Register per-author agents (deterministic keys so same author → same
+    // agent), declared seed-derived: they name the authors and sign nothing.
     let mut author_agents: std::collections::HashMap<String, Uuid> =
         std::collections::HashMap::new();
 
     for author in &extraction.source.authors {
         let name = author.name();
-        let seed = format!("{}:{}", extraction.source.doi, name);
-        let author_signer = deterministic_signer(&seed);
-        match register_agent(&client, &args.endpoint, &author_signer, name).await {
+        let req = author_agent_request(&extraction.source.doi, name);
+        match register_agent(&client, &args.endpoint, &req).await {
             Ok(id) => {
                 println!("Registered author agent: {name} → {id}");
                 author_agents.insert(name.to_string(), id);
@@ -1671,6 +1711,51 @@ mod tests {
         assert!(extraction.claims[1].instruments_used.is_empty());
         assert_eq!(extraction.claims[1].reagents_involved, vec!["TIMe-Ge"]);
         assert!(extraction.claims[1].conditions.is_empty());
+    }
+
+    /// Backlog 57943a39: an author's key is computable from the DOI and the
+    /// name, so its registration must declare it `seed-derived` (the server
+    /// then stores no verifier and provisions no OAuth client). Before, the
+    /// body carried no `key_kind` and the server stored an `ed25519` signer
+    /// with an active client. The key is still the deterministic one, so the
+    /// same author of the same paper stays one agent.
+    #[test]
+    fn an_author_is_registered_as_a_seed_derived_key() {
+        let doi = "10.48550/arXiv.2508.16798";
+        let body = serde_json::to_value(author_agent_request(doi, "Huff, T.")).unwrap();
+        assert_eq!(body["key_kind"], "seed-derived", "{body}");
+        assert_eq!(
+            body["public_key"],
+            hex::encode(deterministic_signer(&format!("{doi}:Huff, T.")).public_key()),
+            "{body}"
+        );
+        assert_eq!(body["display_name"], "Huff, T.", "{body}");
+        // The proof of possession the server requires with the declaration.
+        let key: [u8; 32] = hex::decode(body["public_key"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let proof: [u8; 64] = hex::decode(body["key_kind_proof"].as_str().expect("proof"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert!(epigraph_crypto::SignatureVerifier::verify(
+            &key,
+            &epigraph_crypto::key_kind_declaration_message("seed-derived", &key),
+            &proof
+        )
+        .unwrap());
+
+        // The run's own signer is a real verifier: no declaration at all.
+        let run = CreateAgentRequest {
+            public_key: hex::encode(AgentSigner::generate().public_key()),
+            display_name: None,
+            key_kind: None,
+            key_kind_proof: None,
+        };
+        let body = serde_json::to_value(run).unwrap();
+        assert!(body.get("key_kind").is_none(), "{body}");
+        assert!(body.get("key_kind_proof").is_none(), "{body}");
     }
 
     #[test]

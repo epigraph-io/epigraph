@@ -304,6 +304,16 @@ impl AgentKeyRepository {
     /// `dual_purpose`) is application-insertable, so a key planted under one
     /// of those must never make a signature verify.
     ///
+    /// Never the `identity-legacy` row of a `seed-derived` agent (backlog
+    /// 57943a39): that row carries the agent's own `agents.public_key`, whose
+    /// private half is computable from a public seed. Migration 161's backfill
+    /// wrote one for every agent that existed before 230 marked such keys, so
+    /// without this filter re-marking a row `seed-derived` (the operator
+    /// repair) would still leave it verifying through its legacy row. The
+    /// kind is read per KEY ROW's agent, so a seed-derived author never hides
+    /// a real signer's legacy key. A `derived` agent's legacy row is kept: it
+    /// binds pre-cut-over signatures and its window is closed at cut-over.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     pub async fn attested_keys_for_claim<'e, E: sqlx::PgExecutor<'e>>(
@@ -319,8 +329,11 @@ impl AgentKeyRepository {
                    k.valid_from, k.valid_until
               FROM claims c
               JOIN agent_keys k ON k.agent_id = c.agent_id OR k.agent_id = c.signer_id
+              JOIN agents a ON a.id = k.agent_id
              WHERE c.id = $1
                AND lower(btrim(k.key_type)) IN ('signing', 'identity-legacy')
+               AND NOT (lower(btrim(k.key_type)) = 'identity-legacy'
+                        AND a.key_kind = 'seed-derived')
                /* {VISIBILITY:c} */
              ORDER BY k.created_at, k.id
             "#,

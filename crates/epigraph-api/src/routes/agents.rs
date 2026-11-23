@@ -98,6 +98,22 @@ pub struct CreateAgentRequest {
     /// granted, as `/oauth/register`'s agent arm registers it.
     #[serde(default)]
     pub login: bool,
+    /// What `public_key` is: `ed25519` (the default, a real signature
+    /// verifier) or `seed-derived`, a key derived from a PUBLIC seed (an
+    /// author's name, a DOI) whose private half anyone can compute. A
+    /// `seed-derived` agent only NAMES someone: it is stored so that no
+    /// verifier accepts its key (migration 230, backlog 57943a39), and it gets
+    /// no OAuth client. Declaring it on an existing key changes nothing.
+    #[serde(default)]
+    pub key_kind: Option<String>,
+    /// Required with `key_kind: "seed-derived"`: the hex Ed25519 signature,
+    /// under `public_key`, of
+    /// `epigraph_crypto::key_kind_declaration_message("seed-derived", key)`.
+    /// The declaration is permanent, so the caller must prove it holds the
+    /// key: otherwise anyone with `agents:write` could declare another
+    /// party's not yet registered key and lock its holder out.
+    #[serde(default)]
+    pub key_kind_proof: Option<String>,
 }
 
 /// Agent response structure
@@ -182,6 +198,37 @@ fn parse_public_key(hex_key: &str) -> Result<[u8; ED25519_PUBLIC_KEY_BYTE_LENGTH
 #[cfg(feature = "db")]
 const AGENT_DEFAULT_SCOPES: &[&str] = epigraph_core::canonical_scopes::AGENT_PROVISION_SCOPES;
 
+/// Refuse a `key_kind` declaration whose proof of possession is missing or
+/// does not verify under `public_key` (backlog 57943a39). See
+/// [`CreateAgentRequest::key_kind_proof`].
+#[cfg(feature = "db")]
+fn check_key_kind_proof(
+    public_key: &[u8; 32],
+    kind: &str,
+    proof_hex: Option<&str>,
+) -> Result<(), ApiError> {
+    let refuse = |reason: &str| ApiError::ValidationError {
+        field: "key_kind_proof".to_string(),
+        reason: format!(
+            "{reason}: declaring key_kind {kind:?} requires the hex Ed25519 signature, under \
+             public_key, of key_kind_declaration_message({kind:?}, public_key)"
+        ),
+    };
+    let Some(proof_hex) = proof_hex else {
+        return Err(refuse("missing proof of possession"));
+    };
+    let proof: [u8; 64] = hex::decode(proof_hex)
+        .ok()
+        .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| refuse("the proof is not a hex-encoded 64-byte signature"))?;
+    let message = epigraph_crypto::key_kind_declaration_message(kind, public_key);
+    if epigraph_crypto::SignatureVerifier::verify(public_key, &message, &proof).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(refuse("the proof does not verify under public_key"))
+    }
+}
+
 /// Create a new agent
 ///
 /// POST /agents
@@ -226,6 +273,28 @@ pub async fn create_agent(
         });
     }
 
+    let seed_derived = match request.key_kind.as_deref() {
+        None | Some("ed25519") => false,
+        Some(k) if k == epigraph_db::KEY_KIND_SEED_DERIVED => true,
+        Some(other) => {
+            return Err(ApiError::ValidationError {
+                field: "key_kind".to_string(),
+                reason: format!(
+                    "unknown key_kind {other:?}: expected \"ed25519\" (the default) or \
+                     \"seed-derived\""
+                ),
+            });
+        }
+    };
+
+    if seed_derived {
+        check_key_kind_proof(
+            &public_key,
+            epigraph_db::KEY_KIND_SEED_DERIVED,
+            request.key_kind_proof.as_deref(),
+        )?;
+    }
+
     let mut agent = Agent::new(public_key, request.display_name);
     if let Some(labels) = request.labels {
         agent.labels = labels;
@@ -242,14 +311,17 @@ pub async fn create_agent(
     // here for forward-compatibility but not persisted until core model is extended.
     let _ = request.properties; // acknowledged but unused until core model supports it
     let (created_agent, was_created) =
-        AgentRepository::create_or_get(&state.db_pool, &agent).await?;
+        AgentRepository::create_or_get_declaring(&state.db_pool, &agent, seed_derived).await?;
     let new_agent_id = Uuid::from(created_agent.id);
 
     // A login is provisioned only on an explicit request (backlog 2f87eb08),
     // and only for a *newly created* agent: on a find-hit the agent already
     // exists, and re-creating its client would hit the `oauth_clients` unique
     // constraint on `client_id`.
-    if was_created && login {
+    //
+    // Never for a `seed-derived` key: its private half is public, so an
+    // active client for it is a credential anyone can use (backlog 57943a39).
+    if was_created && login && !seed_derived {
         let client_id_str = hex::encode(public_key);
         let client_name = created_agent.display_name.as_deref().unwrap_or("Agent");
         let scopes: Vec<String> = AGENT_DEFAULT_SCOPES.iter().map(|s| s.to_string()).collect();

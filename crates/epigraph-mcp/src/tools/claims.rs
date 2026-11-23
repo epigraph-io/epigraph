@@ -1391,19 +1391,36 @@ pub async fn verify_claim(
     //
     // `signed` keeps "no signature to check" distinguishable from "signature
     // present and rejected" — both of which report `signature_valid = false`.
+    //
+    // The signer's bare `agents.public_key` is offered to the binder only when
+    // it is a signature VERIFIER (`key_kind = 'ed25519'`, the rule
+    // `AgentRepository::public_key_if_signer` applies by id). A `seed-derived`
+    // key (migration 230: an ingested author's name / ORCID key, an org key,
+    // the legacy system constant, the unkeyed LLM identity) has a private half
+    // anyone can compute from its public seed, and the `derived` OAuth
+    // placeholder has none at all; a signature under either proves nothing
+    // (backlog 57943a39). The all-zero key of a claim with no signer is held
+    // by no agent, so it is never offered.
     let signed = claim.signature.is_some();
-    let keys = if signed {
-        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *read, viewer, id)
+    let (keys, signer_key_is_verifier) = if signed {
+        let keys = epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *read, viewer, id)
             .await
-            .map_err(internal_error)?
+            .map_err(internal_error)?;
+        let kind = epigraph_db::AgentRepository::key_kind_of_public_key(
+            &mut *read,
+            claim.public_key.as_slice(),
+        )
+        .await
+        .map_err(internal_error)?;
+        (keys, kind.as_deref() == Some("ed25519"))
     } else {
-        Vec::new()
+        (Vec::new(), false)
     };
     read.commit().await.map_err(internal_error)?;
     let binding = crate::signing_identity::bind_signature(
         &claim.content_hash,
         claim.signature.as_ref(),
-        &claim.public_key,
+        signer_key_is_verifier.then_some(&claim.public_key),
         claim.agent_id.as_uuid(),
         claim.created_at,
         &keys,

@@ -136,11 +136,20 @@ everywhere. Three seed strategies are in use today:
 Every seed above is an IDENTIFIER, never a credential: anyone can compute
 its private half, so an agent named by one must not sign. An agent row
 created for such a key is stored with `key_kind = 'seed-derived'`
-(migration 230). `AgentRepository::public_key_if_signer`, the key source of
-the packet-signature check, refuses such a key. Three other verifiers do
-not read `key_kind` yet: `verify_claim`, the edge-signature check and the
-OAuth `client_credentials` assertion check still accept a signature under
-the agent's bare public key.
+(migration 230), and no signature verifier accepts it:
+`AgentRepository::public_key_if_signer` (the packet-signature check's key
+source), `verify_claim`'s bare-key fallback and the edge-signature check
+admit an agent's bare key only when `key_kind = 'ed25519'` and never admit a
+`seed-derived` agent's `identity-legacy` key (the same key, written by
+migration 161's backfill), and the OAuth agent assertion check
+(`client_credentials` and refresh) refuses a key held by any agent whose
+`key_kind` is not `ed25519` (backlog 57943a39). A client that registers such a key through `POST /api/v1/agents`
+declares it with `"key_kind": "seed-derived"` and a `"key_kind_proof"`, its
+signature of `epigraph_crypto::key_kind_declaration_message` under the key
+(so nobody can declare a key they do not hold), and the route then provisions
+no OAuth client for it. Rows written before these checks may still be stored
+as `ed25519`; re-marking them `seed-derived` is an operator task, and it is
+enough for every verifier above.
 
 A seed is not the only way the MCP server gets its identity. It picks its signer in this order (`select_signer` in `crates/epigraph-mcp/src/main.rs`), first match wins:
 

@@ -271,10 +271,15 @@ pub struct AgentPublicProfile {
 /// Ed25519 SECRET, so anyone who knows the seed holds the private key. Such a
 /// key names the agent and is NOT a signature verifier:
 /// [`AgentRepository::public_key_if_signer`] returns `None` for it, as for
-/// the OAuth placeholder `derived`. NOT YET enforced by the verifiers that
-/// read `agents.public_key` directly: `verify_claim`'s bare-key fallback, the
-/// edge-signature check and the OAuth assertion check. Insert these rows with
-/// [`AgentRepository::create_seed_derived_conn`].
+/// the OAuth placeholder `derived`, and so do the verifiers that read the
+/// bare key directly (backlog 57943a39): `verify_claim`'s bare-key fallback
+/// ([`AgentRepository::key_kind_of_public_key`]), the edge-signature check
+/// and the OAuth agent assertion check. The claim and edge verifiers also
+/// skip such an agent's `identity-legacy` row, which carries the same key
+/// (`AgentKeyRepository::attested_keys_for_claim`), so re-marking an existing
+/// row is enough. Insert these rows with
+/// [`AgentRepository::create_seed_derived_conn`] (over HTTP, `POST /agents`
+/// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
 /// Step 2 of [`AgentRepository::ensure_for_client`]: refuse to adopt an
@@ -529,6 +534,59 @@ impl AgentRepository {
             Err(DbError::DuplicateKey { .. }) => {
                 // Lost a concurrent registration race — re-find.
                 match Self::get_by_public_key(pool, &agent.public_key).await? {
+                    Some(existing) => Ok((existing, false)),
+                    None => Err(DbError::InvalidData {
+                        reason: "agent disappeared after DuplicateKey".to_string(),
+                    }),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Self::create_or_get`], except that a NEW row is stored with
+    /// `key_kind =` [`KEY_KIND_SEED_DERIVED`] when `seed_derived`
+    /// ([`Self::create_seed_derived_conn`]): the caller declares that the key
+    /// is derived from a public seed and so is NOT a signature verifier
+    /// (backlog 57943a39). `false` is exactly [`Self::create_or_get`].
+    ///
+    /// A find-hit returns the existing row UNCHANGED, whatever its kind: the
+    /// application role may not update `key_kind` (migration 118), and a
+    /// caller's declaration must not demote, or promote, a row someone else
+    /// registered. Re-marking an existing row is an operator task; a
+    /// declaration that finds a row of another kind logs a warning naming it.
+    ///
+    /// # Errors
+    /// As [`Self::create_or_get`].
+    pub async fn create_or_get_declaring(
+        pool: &PgPool,
+        agent: &Agent,
+        seed_derived: bool,
+    ) -> Result<(Agent, bool), DbError> {
+        if !seed_derived {
+            return Self::create_or_get(pool, agent).await;
+        }
+        if let Some(existing) = Self::get_by_public_key(pool, &agent.public_key).await? {
+            // Ignored, but never silently: an author registered before
+            // `seed-derived` existed is still a live signer, and only the
+            // operator repair (re-mark, revoke its client) closes it.
+            let kind = Self::key_kind_of_public_key(pool, &agent.public_key).await?;
+            if kind.as_deref() != Some(KEY_KIND_SEED_DERIVED) {
+                tracing::warn!(
+                    agent_id = %existing.id.as_uuid(),
+                    stored_key_kind = kind.as_deref().unwrap_or("?"),
+                    "seed-derived declaration NOT applied: the key is already registered under \
+                     another key_kind; re-marking it is an operator task (backlog 57943a39)"
+                );
+            }
+            return Ok((existing, false));
+        }
+        let mut conn = pool.acquire().await?;
+        match Self::create_seed_derived_conn(&mut conn, agent).await {
+            Ok(created) => Ok((created, true)),
+            Err(DbError::DuplicateKey { .. }) => {
+                // Lost a concurrent registration race: re-find.
+                match Self::get_by_public_key(&mut *conn, &agent.public_key).await? {
                     Some(existing) => Ok((existing, false)),
                     None => Err(DbError::InvalidData {
                         reason: "agent disappeared after DuplicateKey".to_string(),
@@ -2488,6 +2546,31 @@ impl AgentRepository {
             sqlx::query_as("SELECT public_key FROM agents WHERE id = $1 AND key_kind = 'ed25519'")
                 .bind(id)
                 .fetch_optional(&mut *conn)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// The `key_kind` of the agent whose `public_key` is `public_key`, or
+    /// `None` when no agent holds those bytes (`agents_public_key_unique`
+    /// makes the holder unique).
+    ///
+    /// For a verifier that holds KEY BYTES rather than an agent id (the
+    /// signer key `verify_claim` resolves through `claims.signer_id`, the
+    /// `client_id` of an agent OAuth client): only `Some("ed25519")` is a
+    /// signature verifier. `derived` and [`KEY_KIND_SEED_DERIVED`] are not,
+    /// exactly as [`Self::public_key_if_signer`] decides for an id.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, public_key))]
+    pub async fn key_kind_of_public_key<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        public_key: &[u8],
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT key_kind::text FROM agents WHERE public_key = $1")
+                .bind(public_key)
+                .fetch_optional(executor)
                 .await?;
         Ok(row.map(|r| r.0))
     }
