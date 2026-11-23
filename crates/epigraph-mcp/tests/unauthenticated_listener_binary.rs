@@ -111,19 +111,23 @@ fn start_listener(db_url: &str, key_hex: &str, tag: &str, extra: &[&str]) -> Run
         "--allow-unauthenticated-http",
     ];
     args.extend_from_slice(extra);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"));
+    // Only what this test sets reaches the child: an exported EPIGRAPH_* (agent
+    // identity, operator, tokens, allowed hosts, ...) in the shell running the
+    // tests must not change which principal the binary serves with. The one
+    // exception is the libpq-style PG* connection variables, which sqlx reads
+    // when `db_url` leaves a part out; forwarding them lets the child reach the
+    // database exactly as this test's own pool does.
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("RUST_LOG", "info");
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_some_and(|n| n.starts_with("PG")) {
+            cmd.env(name, value);
+        }
+    }
+    let mut child = cmd
         .args(&args)
-        // Only what this test sets reaches the child.
-        .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
-        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
-        .env_remove("EPIGRAPH_JWT_SECRET")
-        .env_remove("EPIGRAPH_OPERATOR_ID")
-        .env_remove("EPIGRAPH_MCP_EXTENSIONS")
-        .env_remove("EPIGRAPH_SESSION_GUC_MODE")
-        .env_remove("EPIGRAPH_OPERATOR_LINK_ENFORCEMENT")
-        .env_remove("MAINTENANCE_DATABASE_URL")
-        .env_remove("OPENAI_API_KEY")
-        .env("RUST_LOG", "info")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
