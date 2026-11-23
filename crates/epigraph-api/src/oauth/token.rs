@@ -861,9 +861,17 @@ async fn handle_client_credentials(
 
     // RFC 6749 section 5.2: no client identification and an unknown client
     // are `invalid_client`, with the same generic description as a wrong
-    // credential (so the answer is no oracle for which client ids exist).
+    // credential. This does NOT hide which client ids exist: a known client
+    // that is not active (403 below) or not confidential (400 `BadRequest`
+    // below) still answers differently, as it did before this grant answered
+    // `invalid_client`. It only stops the answer saying which credential check
+    // failed for a confidential client.
+    //
+    // The two refusals before the client lookup are anonymous and cheap to
+    // provoke, so they log at info, and never the presented id itself (a
+    // caller-chosen string, sometimes a pasted secret): only its length.
     let Some(client_id_str) = req.client_id.as_deref() else {
-        tracing::warn!(
+        tracing::info!(
             grant_type = %req.grant_type,
             reason = "no client_id",
             "confidential client authentication failed"
@@ -877,8 +885,8 @@ async fn handle_client_credentials(
             message: e.to_string(),
         })?
     else {
-        tracing::warn!(
-            client_id = ?client_id_str,
+        tracing::info!(
+            client_id_len = client_id_str.len(),
             grant_type = %req.grant_type,
             reason = "unknown or not active client_id",
             "confidential client authentication failed"
