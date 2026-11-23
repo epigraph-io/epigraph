@@ -514,7 +514,8 @@ fn der(tag: &[u8], content: &[u8]) -> Vec<u8> {
 
 /// What an `android-key` statement's certificates say ([`TestAttestation::android_key_with`]).
 /// The default is a genuine TEE key: both security levels 1 (TEE), `purpose`
-/// and `origin` in the TEE-enforced list, the leaf issued by the root
+/// and `origin` in the TEE-enforced list, a `rootOfTrust` there saying the
+/// bootloader is locked and the boot Verified, the leaf issued by the root
 /// directly, random serials.
 #[derive(Clone, Debug)]
 pub struct AndroidKeyOpts {
@@ -540,6 +541,17 @@ pub struct AndroidKeyOpts {
     /// The leaf's validity, (notBefore, notAfter) in Unix seconds; from
     /// yesterday for a year when `None`.
     pub leaf_validity: Option<(i64, i64)>,
+    /// The KeyDescription's `rootOfTrust` [704]: (`deviceLocked`,
+    /// `verifiedBootState`: 0 Verified, 1 SelfSigned, 2 Unverified,
+    /// 3 Failed); none at all when `None`.
+    pub root_of_trust: Option<(bool, u8)>,
+    /// `rootOfTrust` in the SOFTWARE-enforced list instead of the
+    /// TEE-enforced one.
+    pub root_of_trust_in_software_list: bool,
+    /// A `[704]` that is not a RootOfTrust (an INTEGER where the SEQUENCE
+    /// belongs), in place of `root_of_trust`: a KeyDescription this crate's
+    /// parser refuses and the library's (which skips the tag) accepts.
+    pub root_of_trust_malformed: bool,
 }
 
 impl Default for AndroidKeyOpts {
@@ -553,6 +565,9 @@ impl Default for AndroidKeyOpts {
             leaf_serial: None,
             intermediate_serial: None,
             leaf_validity: None,
+            root_of_trust: Some((true, 0)),
+            root_of_trust_in_software_list: false,
+            root_of_trust_malformed: false,
         }
     }
 }
@@ -564,7 +579,9 @@ impl Default for AndroidKeyOpts {
 /// and one holding `purpose` [1] = {SIGN (2)} and `origin` [702] =
 /// GENERATED (0) (the TEE-enforced one unless `opts.in_software_list`), with
 /// no `allApplications` [600] (WebAuthn §8.4.1: the key is scoped to the RP
-/// id).
+/// id), and `rootOfTrust` [704] as `opts` says (in the TEE-enforced list
+/// unless `opts.root_of_trust_in_software_list`). Tags appear in ascending
+/// order within each list, as DER's SEQUENCE of the Android schema has them.
 fn android_key_description(challenge: &[u8], opts: &AndroidKeyOpts) -> Vec<u8> {
     let enforced = [
         // [1] EXPLICIT SET OF INTEGER { 2 }
@@ -573,11 +590,42 @@ fn android_key_description(challenge: &[u8], opts: &AndroidKeyOpts) -> Vec<u8> {
         der(&[0xBF, 0x85, 0x3E], &der(&[0x02], &[0x00])),
     ]
     .concat();
-    let (software, tee) = if opts.in_software_list {
-        (der(&[0x30], &enforced), der(&[0x30], &[]))
+    // [704] EXPLICIT RootOfTrust: 704 = 5 * 128 + 64. SEQUENCE {
+    // verifiedBootKey OCTET STRING, deviceLocked BOOLEAN, verifiedBootState
+    // ENUMERATED, verifiedBootHash OCTET STRING }.
+    let malformed = opts
+        .root_of_trust_malformed
+        .then(|| der(&[0xBF, 0x85, 0x40], &der(&[0x02], &[0x01])));
+    let root_of_trust = malformed.or_else(|| {
+        opts.root_of_trust.map(|(locked, state)| {
+            der(
+                &[0xBF, 0x85, 0x40],
+                &der(
+                    &[0x30],
+                    &[
+                        der(&[0x04], &[0x5A; 32]),
+                        der(&[0x01], &[if locked { 0xFF } else { 0x00 }]),
+                        der(&[0x0A], &[state]),
+                        der(&[0x04], &[0xA5; 32]),
+                    ]
+                    .concat(),
+                ),
+            )
+        })
+    });
+    let (mut software, mut tee) = if opts.in_software_list {
+        (enforced, Vec::new())
     } else {
-        (der(&[0x30], &[]), der(&[0x30], &enforced))
+        (Vec::new(), enforced)
     };
+    if let Some(rot) = root_of_trust {
+        if opts.root_of_trust_in_software_list {
+            software.extend(rot);
+        } else {
+            tee.extend(rot);
+        }
+    }
+    let (software, tee) = (der(&[0x30], &software), der(&[0x30], &tee));
     der(
         &[0x30],
         &[

@@ -36,7 +36,13 @@
 //! the challenge allows only the TICKET person's live passkeys, with user
 //! verification required; the assertion is verified with the library against
 //! those passkeys and handed to migration 125's confirm definer, which opens
-//! the session (at most 15 minutes) or RETURNS an audited refusal. The
+//! the session (at most 15 minutes) or RETURNS an audited refusal. Before
+//! the definer, the asserting passkey's attestation must still be in good
+//! standing (`epigraph_passkey::Passkeys::assertion_standing`: an
+//! `android-key` passkey none of whose certificates is on a CURRENT
+//! attestation status list); one that is not is refused here (403, or 503
+//! when the list cannot be checked) with the ticket left live, and that
+//! refusal is logged, not audited in the database. The
 //! signature counter is the definer's to check (under its row lock, with an
 //! audit row), not the library's: the challenge is started with
 //! `Passkeys::start_authentication_deferring_counter`.
@@ -118,12 +124,54 @@ use epigraph_db::{
 };
 use epigraph_passkey::{
     act_challenge as act_challenge_of, ActAnchor, AuthenticationState, LineagePasskey,
-    PasskeyError, Passkeys, RegistrationState, StoredPasskey, ACT_NONCE_LEN,
+    PasskeyError, Passkeys, RegistrationState, StandingRefusal, StoredPasskey, ACT_NONCE_LEN,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::state::AppState;
+
+/// The refusal of an assertion whose passkey's attestation is no longer in
+/// good standing (`Passkeys::assertion_standing`): the ceremony is left live,
+/// so a refreshed status list lets the same ticket or act be retried. A
+/// listed certificate is 403; a standing the API cannot check is 503 (no
+/// Android key roots configured, or no current status list: the log says
+/// which). The 503's detail is fixed text: the full reason names server
+/// paths and settings, so it goes to the log (the caller's WARN), not to
+/// this unauthenticated page.
+fn standing_refused(refusal: &StandingRefusal) -> Response {
+    match refusal {
+        StandingRefusal::NotInGoodStanding(_) => {
+            json_error(StatusCode::FORBIDDEN, refusal.code(), refusal.to_string())
+        }
+        StandingRefusal::Unknown(_) => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            refusal.code(),
+            "this passkey's attestation standing cannot be checked: the server's Android key \
+             attestation configuration (its key roots or its status list) is not usable; ask the \
+             operator to check it, then retry",
+        ),
+    }
+}
+
+/// The refusal of an assertion the library verified for a credential that is
+/// not among the rows the definer served (unreachable today: the library
+/// matches the credential the response names, which was already required to
+/// be one of them). Refused rather than skipped, so the standing check can
+/// never be bypassed by a mismatch; the ceremony is left live.
+fn unmatched_assertion(target: &'static str, id: Uuid) -> Response {
+    tracing::error!(
+        target: "elevate",
+        ceremony = target,
+        id = %id,
+        "the verified assertion's credential is not among the served passkeys"
+    );
+    json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "assertion_passkey_unmatched",
+        "the verified assertion's passkey could not be matched to a stored passkey",
+    )
+}
 
 /// The ceremony pages' Content-Security-Policy.
 ///
@@ -839,6 +887,24 @@ pub async fn ticket_assert(
                 return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
             }
         };
+        // The asserting passkey's attestation must still be in good standing
+        // (an Android key whose batch certificate was revoked after it
+        // enrolled no longer elevates), read from the row the definer serves,
+        // never the ceremony state.
+        // No matching row refuses: the check is never skipped.
+        let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
+            return unmatched_assertion("elevate.ticket", id);
+        };
+        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+            tracing::warn!(
+                target: "elevate.ticket",
+                ticket = %id,
+                code = refusal.code(),
+                reason = %refusal,
+                "assertion refused: the passkey's attestation is not in good standing"
+            );
+            return standing_refused(&refusal);
+        }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
             counter: i64::from(a.counter),
@@ -1269,6 +1335,20 @@ pub async fn act_assert(
                 return json_error(StatusCode::BAD_REQUEST, code, err.to_string());
             }
         };
+        // As at the elevation: the passkey's attestation in good standing.
+        let Some(k) = keys.iter().find(|k| k.credential_id == a.credential_id) else {
+            return unmatched_assertion("elevate.act", id);
+        };
+        if let Err(refusal) = rp.assertion_standing(&k.passkey, &k.attestation_format) {
+            tracing::warn!(
+                target: "elevate.act",
+                act = %id,
+                code = refusal.code(),
+                reason = %refusal,
+                "act assertion refused: the passkey's attestation is not in good standing"
+            );
+            return standing_refused(&refusal);
+        }
         let asserted = AssertedCredential {
             credential_id: &a.credential_id,
             counter: i64::from(a.counter),

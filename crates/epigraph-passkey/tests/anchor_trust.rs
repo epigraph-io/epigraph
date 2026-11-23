@@ -22,8 +22,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use epigraph_passkey::android::StatusFreshness;
 use epigraph_passkey::{
     act_challenge, AaguidAllowlist, ActAnchor, AnchorRefusal, AttestationPolicy, AttestedPolicy,
-    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StoredPasskey,
-    ACT_NONCE_LEN, STATEMENT_KEY,
+    LineagePasskey, PasskeyConfig, PasskeyError, Passkeys, RegisteredPasskey, StandingRefusal,
+    StoredPasskey, ACT_NONCE_LEN, STATEMENT_KEY,
 };
 use support::{
     android_status, AndroidKeyOpts, ClientUv, SoftAuthenticator, TestAttestation, ORIGIN, RP_ID,
@@ -358,6 +358,123 @@ async fn a_key_description_outside_the_leaf_is_refused() {
 }
 
 // =====================================================================
+// f6087c6e: the device's boot state (RootOfTrust)
+// =====================================================================
+
+/// An Android key is hardware only on a device whose bootloader is locked
+/// and whose boot verified against its vendor's key: the KeyDescription's
+/// `rootOfTrust`, read from the TEE-enforced list. A key from an unlocked
+/// device, from a device locked to its owner's own key (SelfSigned), from
+/// an Unverified or Failed boot, with no root of trust, or with one only in
+/// the software-enforced list is refused at registration, and the same key
+/// recorded where nothing checks it (the software policy) anchors nothing
+/// once the Android root is configured, neither directly nor from the
+/// LINEAGE of an otherwise good anchor. CALIBRATION: the default key
+/// (locked, Verified) registers and anchors, and the same default key
+/// recorded under the software policy anchors and passes on a lineage.
+/// Mutations: the root-of-trust gate removed from `android::hardware_rules`
+/// -> every case registers and anchors; the gate reading the software list
+/// -> the calibration is refused; SelfSigned accepted -> that case
+/// registers and anchors; the lineage loop skipped in `check_anchor` ->
+/// every lineage case anchors.
+#[tokio::test]
+async fn an_android_key_from_an_unlocked_or_unverified_device_neither_registers_nor_anchors() {
+    let google = TestAttestation::new("Android");
+    let rp = attested(None, Some(&google), true);
+    let (mut auth, good) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let good = good.expect("CALIBRATION: a locked, verified device's key registers");
+    let good_anchor = confirmed_anchor(&rp, &mut auth, &good, Uuid::new_v4()).await;
+    assert_eq!(
+        rp.check_anchor(&good_anchor),
+        Ok(()),
+        "CALIBRATION: it anchors"
+    );
+
+    // CALIBRATION, like for like with the refused cases below: a locked,
+    // Verified key recorded under the software policy anchors directly and
+    // passes as a lineage ancestor of the good anchor.
+    let soft = software();
+    let (mut soft_auth, soft_good) =
+        android_registration(&soft, &google, &AndroidKeyOpts::default()).await;
+    let soft_good = soft_good.expect("the software policy records it");
+    let anchor = confirmed_anchor(&rp, &mut soft_auth, &soft_good, Uuid::new_v4()).await;
+    assert_eq!(
+        rp.check_anchor(&anchor),
+        Ok(()),
+        "CALIBRATION: a software-recorded good key anchors"
+    );
+    let mut via_good = good_anchor.clone();
+    via_good.anchor_lineage = vec![lineage_entry(&soft_good)];
+    assert_eq!(
+        rp.check_anchor(&via_good),
+        Ok(()),
+        "CALIBRATION: a software-recorded good key passes on the lineage"
+    );
+
+    for (label, root_of_trust, in_software_list, expected) in [
+        (
+            "unlocked bootloader",
+            Some((false, 0)),
+            false,
+            "bootloader is unlocked",
+        ),
+        (
+            "locked to its owner's key (SelfSigned)",
+            Some((true, 1)),
+            false,
+            "verified boot state 1",
+        ),
+        (
+            "Unverified boot",
+            Some((true, 2)),
+            false,
+            "verified boot state 2",
+        ),
+        (
+            "Failed boot",
+            Some((true, 3)),
+            false,
+            "verified boot state 3",
+        ),
+        ("no root of trust", None, false, "root of trust"),
+        (
+            "root of trust software-enforced",
+            Some((true, 0)),
+            true,
+            "root of trust",
+        ),
+    ] {
+        let opts = AndroidKeyOpts {
+            root_of_trust,
+            root_of_trust_in_software_list: in_software_list,
+            ..AndroidKeyOpts::default()
+        };
+        let (_, reg) = android_registration(&rp, &google, &opts).await;
+        let why = policy_refusal(reg);
+        assert!(why.contains(expected), "{label}: {why}");
+
+        let (mut auth, reg) = android_registration(&soft, &google, &opts).await;
+        let reg = reg.unwrap_or_else(|e| panic!("{label}: the software policy records it: {e}"));
+        assert_eq!(reg.attestation_format, "android-key", "{label}");
+        let anchor = confirmed_anchor(&rp, &mut auth, &reg, Uuid::new_v4()).await;
+        assert_eq!(
+            rp.check_anchor(&anchor),
+            Err(AnchorRefusal::AnchorNotAttested),
+            "{label}"
+        );
+
+        // On the lineage of a good anchor, it withdraws that anchor too.
+        let mut via = good_anchor.clone();
+        via.anchor_lineage = vec![lineage_entry(&reg)];
+        assert_eq!(
+            rp.check_anchor(&via),
+            Err(AnchorRefusal::LineageNotAttested),
+            "{label}: on the lineage"
+        );
+    }
+}
+
+// =====================================================================
 // P779-2: the attestation status list, local, fail closed
 // =====================================================================
 
@@ -588,6 +705,316 @@ async fn a_certificate_listed_after_registration_stops_the_anchor() {
         after.check_anchor(&anchor),
         Err(AnchorRefusal::AnchorNotAttested)
     );
+}
+
+// =====================================================================
+// 16a43893: an assertion re-checks the Android key's standing
+// =====================================================================
+
+/// `path` rewritten with `list`, modified `age` ago: the operator's refresh
+/// job (or its failure) between two assertions.
+fn rewrite_status(path: &std::path::Path, list: &str, age: Duration) {
+    std::fs::write(path, list).expect("rewrite the status list");
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open the status list")
+        .set_modified(SystemTime::now() - age)
+        .expect("date the status list");
+}
+
+/// An Android passkey whose certificate is revoked AFTER it enrolled no
+/// longer asserts: `assertion_standing` re-reads the status list at every
+/// call. Its leaf (and, in a second passkey, its batch intermediate) listed
+/// on a fresh list is `NotInGoodStanding`; a list older than 48 hours, or
+/// missing, is `Unknown` (fail closed, as at enrollment); a fresh list that
+/// does not list it is Ok again. A row whose column says `none` over an
+/// `android-key` credential is still checked (the credential decides too),
+/// and refused as a mismatch. CALIBRATION: both register, and assert, under
+/// the empty list.
+/// Mutations: `assertion_standing` returning Ok -> every refusal passes;
+/// the status lookup given no serials -> the listed cases pass; the format
+/// decided by the row's column alone -> the mismatch case passes.
+#[tokio::test]
+async fn an_android_passkey_revoked_after_enrollment_no_longer_asserts() {
+    let google = TestAttestation::new("Android");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(None, Some(&google), Some(status.clone()), false);
+    let leaf = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let batch = AndroidKeyOpts {
+        intermediate: true,
+        intermediate_serial: Some(android_status::SUSPENDED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let (_, by_leaf) = android_registration(&rp, &google, &leaf).await;
+    let by_leaf = by_leaf.expect("CALIBRATION: registers under the empty list");
+    let (_, by_batch) = android_registration(&rp, &google, &batch).await;
+    let by_batch = by_batch.expect("CALIBRATION: registers under the empty list");
+    for reg in [&by_leaf, &by_batch] {
+        assert_eq!(reg.attestation_format, "android-key");
+        assert_eq!(
+            rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+            Ok(()),
+            "CALIBRATION: in good standing"
+        );
+    }
+
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    for (reg, expected) in [
+        (&by_leaf, "2c8cdddfd5e03bfc is REVOKED"),
+        (&by_batch, "c8966fcb2fbb0d7a is SUSPENDED"),
+    ] {
+        match rp.assertion_standing(&reg.passkey, &reg.attestation_format) {
+            Err(StandingRefusal::NotInGoodStanding(why)) => {
+                assert!(why.contains(expected), "{why}");
+            }
+            other => panic!("{expected}: {other:?}"),
+        }
+    }
+    // The row's column cannot opt the credential out of the check.
+    let refusal = rp.assertion_standing(&by_leaf.passkey, "none").unwrap_err();
+    assert_eq!(refusal.code(), "attestation_not_in_good_standing");
+
+    rewrite_status(
+        &status,
+        android_status::EMPTY,
+        Duration::from_secs(49 * 3600),
+    );
+    match rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format) {
+        Err(StandingRefusal::Unknown(why)) => assert!(why.contains("refresh"), "{why}"),
+        other => panic!("a stale list: {other:?}"),
+    }
+    std::fs::remove_file(&status).expect("remove the status list");
+    assert_eq!(
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format)
+            .map_err(|r| r.code()),
+        Err("attestation_status_unavailable")
+    );
+
+    rewrite_status(&status, android_status::EMPTY, Duration::ZERO);
+    assert_eq!(
+        rp.assertion_standing(&by_leaf.passkey, &by_leaf.attestation_format),
+        Ok(()),
+        "a refreshed list that does not list it"
+    );
+}
+
+/// The assertion re-check verifies the stored chain to an Android root
+/// configured NOW (the deploy guide's "keep a retired Android root" step):
+/// once the root an enrolled passkey chains to is dropped from the PEM, the
+/// passkey is not in good standing (403), and under a policy with no
+/// Android roots at all its standing cannot be checked (503).
+/// CALIBRATION: under the roots it registered with, it is in good standing.
+/// Mutations: the chain-verification failure in `android_key_serials`
+/// mapped to `Unknown` -> the dropped-root case is `Unknown`; the missing
+/// roots mapped to `NotInGoodStanding` -> the no-roots case is.
+#[tokio::test]
+async fn an_android_passkey_whose_root_is_no_longer_configured_does_not_assert() {
+    let google = TestAttestation::new("Android");
+    let rotated = TestAttestation::new("Android");
+    let vendor = TestAttestation::new("Allowlisted");
+    let rp = attested(None, Some(&google), false);
+    let (_, reg) = android_registration(&rp, &google, &AndroidKeyOpts::default()).await;
+    let reg = reg.expect("a genuine phone registers");
+    assert_eq!(
+        rp.assertion_standing(&reg.passkey, &reg.attestation_format),
+        Ok(()),
+        "CALIBRATION: under its own root"
+    );
+
+    let dropped = attested(None, Some(&rotated), false);
+    match dropped.assertion_standing(&reg.passkey, &reg.attestation_format) {
+        Err(StandingRefusal::NotInGoodStanding(why)) => {
+            assert!(why.contains("Android key root"), "{why}");
+        }
+        other => panic!("its root dropped from the PEM: {other:?}"),
+    }
+
+    let no_roots = attested(Some((&vendor, &[MODEL][..])), None, false);
+    match no_roots.assertion_standing(&reg.passkey, &reg.attestation_format) {
+        Err(StandingRefusal::Unknown(why)) => {
+            assert!(why.contains("no Android key roots"), "{why}");
+        }
+        other => panic!("no Android roots configured: {other:?}"),
+    }
+}
+
+/// What the assertion re-check does NOT do. It does not hold an Android
+/// passkey to its certificates' validity periods (an attestation speaks for
+/// its registration; an expiry is not a revocation): a stored chain whose
+/// leaf expired yesterday is in good standing under a fresh list that does
+/// not list it, and refused under one that does. It does not touch other
+/// formats: a `packed` passkey asserts under a list naming nothing of it,
+/// and a `none` one too. And under the software policy, which trusts no
+/// attestation, an Android passkey with a listed certificate asserts.
+/// Mutations: the library's time checks left on in `android_key_serials`
+/// (or `chain_valid_at` called) -> the expired case is refused; the
+/// software-policy early return removed -> that case is `Unknown`.
+#[tokio::test]
+async fn the_assertion_recheck_is_about_standing_only() {
+    let google = TestAttestation::new("Android");
+    let att = TestAttestation::new("Allowlisted");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(
+        Some((&att, &[MODEL][..])),
+        Some(&google),
+        Some(status.clone()),
+        false,
+    );
+
+    // A registration whose response this test keeps, to splice an expired
+    // chain for the same key into its stored credential.
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let opts = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let reg = rp
+        .finish_registration(
+            &google.android_key_with(&auth, &created, true, &opts),
+            &state,
+        )
+        .expect("CALIBRATION: registers");
+    let now = now_unix();
+    let expired = with_stored_chain(
+        &reg,
+        &google.android_chain_der(
+            &auth,
+            &created,
+            &AndroidKeyOpts {
+                leaf_validity: Some((now - 30 * 86_400, now - 86_400)),
+                ..opts
+            },
+        ),
+    );
+    assert!(
+        rp.hardware_attested(&expired.passkey, "android-key", Uuid::nil(), false)
+            .is_err(),
+        "CALIBRATION: the spliced chain has expired"
+    );
+    assert_eq!(
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format),
+        Ok(())
+    );
+
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut hw = SoftAuthenticator::new(MODEL);
+    let packed = rp
+        .finish_registration(
+            &att.rewrap(&hw.register(ORIGIN, options, ClientUv::AsRequested).await),
+            &state,
+        )
+        .expect("CALIBRATION: an allowlisted packed key registers");
+    assert_eq!(packed.attestation_format, "packed");
+
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    assert_eq!(
+        rp.assertion_standing(&expired.passkey, &expired.attestation_format)
+            .map_err(|r| r.code()),
+        Err("attestation_not_in_good_standing"),
+        "CALIBRATION: the expired chain's leaf is listed"
+    );
+    assert_eq!(
+        rp.assertion_standing(&packed.passkey, &packed.attestation_format),
+        Ok(())
+    );
+    let soft = software();
+    let (options, state) = soft.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut synced = SoftAuthenticator::new(MODEL);
+    let none = soft
+        .finish_registration(
+            &synced
+                .register(ORIGIN, options, ClientUv::AsRequested)
+                .await,
+            &state,
+        )
+        .expect("a synced passkey");
+    assert_eq!(none.attestation_format, "none");
+    assert_eq!(
+        rp.assertion_standing(&none.passkey, &none.attestation_format),
+        Ok(())
+    );
+    assert_eq!(
+        soft.assertion_standing(&reg.passkey, &reg.attestation_format),
+        Ok(()),
+        "the software policy trusts no attestation"
+    );
+}
+
+/// An enrolled Android passkey's assertions are not held to its
+/// KeyDescription: a stored chain whose leaf says the bootloader was
+/// unlocked, or whose `rootOfTrust` does not parse at all (as a chain
+/// enrolled before this crate read the field might), anchors nothing but is
+/// in good standing under a fresh list that does not list it, and refused
+/// under one that does (its serials are still read).
+/// Mutations: `android_key_serials` reading serials through
+/// `android::inspect_chain` (which parses the KeyDescription) -> the
+/// unparseable case is refused under the empty list; `hardware_rules` run
+/// at assertion -> both cases are.
+#[tokio::test]
+async fn an_enrolled_android_passkey_asserts_whatever_its_key_description_says() {
+    let google = TestAttestation::new("Android");
+    let status = android_status::fresh_empty();
+    let rp = attested_with(None, Some(&google), Some(status.clone()), false);
+    let (options, state) = rp.start_registration(Uuid::new_v4(), "op", "Op").unwrap();
+    let mut auth = SoftAuthenticator::new(MODEL).hardware();
+    let created = auth.register(ORIGIN, options, ClientUv::AsRequested).await;
+    let revoked_leaf = AndroidKeyOpts {
+        leaf_serial: Some(android_status::REVOKED_SERIAL.to_vec()),
+        ..AndroidKeyOpts::default()
+    };
+    let reg = rp
+        .finish_registration(
+            &google.android_key_with(&auth, &created, true, &revoked_leaf),
+            &state,
+        )
+        .expect("CALIBRATION: registers");
+    let spliced = [
+        (
+            "unparseable root of trust",
+            AndroidKeyOpts {
+                root_of_trust_malformed: true,
+                ..revoked_leaf.clone()
+            },
+        ),
+        (
+            "unlocked bootloader",
+            AndroidKeyOpts {
+                root_of_trust: Some((false, 0)),
+                ..revoked_leaf.clone()
+            },
+        ),
+    ]
+    .map(|(label, opts)| {
+        let stored = with_stored_chain(&reg, &google.android_chain_der(&auth, &created, &opts));
+        assert!(
+            rp.hardware_attested(&stored.passkey, "android-key", Uuid::nil(), false)
+                .is_err(),
+            "CALIBRATION {label}: it anchors nothing"
+        );
+        (label, stored)
+    });
+    for (label, stored) in &spliced {
+        assert_eq!(
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format),
+            Ok(()),
+            "{label}"
+        );
+    }
+    rewrite_status(&status, android_status::GOOGLE_EXAMPLE, Duration::ZERO);
+    for (label, stored) in &spliced {
+        assert_eq!(
+            rp.assertion_standing(&stored.passkey, &stored.attestation_format)
+                .map_err(|r| r.code()),
+            Err("attestation_not_in_good_standing"),
+            "{label}: its leaf is listed"
+        );
+    }
 }
 
 // =====================================================================

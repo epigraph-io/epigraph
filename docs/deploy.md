@@ -574,8 +574,8 @@ For the others, anything else is off.
 | `EPIGRAPH_API_SIGNING_KEY_FILE` | unset | A file holding the API's own 32-byte Ed25519 edge-signing key, as 64 hex characters. Unset → HTTP edges are written unsigned, logged once. Set but unusable → the server refuses to start. The module doc of `crates/epigraph-api/src/edge_signer.rs` covers rotation. |
 | `EPIGRAPH_WEBAUTHN_RP_ID`, `EPIGRAPH_WEBAUTHN_ORIGIN` | unset | The passkey relying party. Both unset → passkeys off, and the ceremonies answer 503. A partial or malformed configuration → exit 1. The RP id is effectively permanent: a passkey registered under one never asserts under another. |
 | `EPIGRAPH_WEBAUTHN_AAGUIDS`, `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` | — | The attestation allowlist (authenticator model UUIDs) and the PEM file of the roots they chain to: `packed` and `tpm` attestation by a listed model. Both or neither; required unless `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` is set. |
-| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
-| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` | unset | A local copy of Google's attestation status list (the JSON at `https://android.googleapis.com/attestation/status`), refreshed by an operator job; the API never fetches it. REQUIRED with `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (either without the other → exit 1, as is a file that is unreadable or not a status list). Re-read at every Android enrollment and anchor use; a listed certificate anywhere in the chain refuses, and a file older than 48 hours (by modification time) refuses every Android enrollment and anchor. Section 10, as above. |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` | unset | A PEM file of Android hardware attestation roots. They are trusted for EVERY key they attest, but only in the `android-key` format, for a device-bound (not backup-eligible), user-verified credential whose attestation puts it in a TEE or StrongBox on a device with a locked bootloader and a Verified boot; any other format chaining to them is refused. Usable alone or with the allowlist. Requires `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE`. An unreadable file, one with no certificate, a certificate that does not parse, or a root also in `EPIGRAPH_WEBAUTHN_ATTESTATION_CA_FILE` → exit 1. Section 10, "Android hardware keys and a synced second passkey". |
+| `EPIGRAPH_WEBAUTHN_ANDROID_KEY_STATUS_FILE` | unset | A local copy of Google's attestation status list (the JSON at `https://android.googleapis.com/attestation/status`), refreshed by an operator job; the API never fetches it. REQUIRED with `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (either without the other → exit 1, as is a file that is unreadable or not a status list). Re-read at every Android enrollment, anchor use and assertion (elevation, admin-act confirmation) by an Android passkey; a listed certificate anywhere in the chain refuses, and a file older than 48 hours (by modification time) refuses every Android enrollment, anchor and assertion. Section 10, as above. |
 | `EPIGRAPH_WEBAUTHN_ALLOW_SYNCED_ANCHORED_PASSKEY` | off | On: a person's LATER passkey, enrolled on a confirmed `passkey.register` act, may carry no attestation (a synced passkey, e.g. a password manager's), when the act was confirmed by one of that person's live passkeys that is hardware-attested under the CURRENT configuration, as is every passkey that authorized it. A first passkey is always attested. Served on an armed database. Needs migration 200. Section 10, as above. |
 | `EPIGRAPH_WEBAUTHN_ALLOW_SOFTWARE_ATTESTATION` | off | Tests and development only. Accepts `none` and self attestation. Refused at boot on a database armed for operator binding, and with either setting above (exit 1). |
 | `EPIGRAPH_OPERATOR_LINK_ENFORCEMENT` | on | `off` is the emergency valve for operator binding: it relieves `OPL01` only (section 9). |
@@ -3123,6 +3123,23 @@ when all of these hold:
     Software, and they are refused.
   - The pinned library refuses StrongBox (level 2) outright, so a
     StrongBox-only key cannot register until the library parses it.
+- the device's boot was trusted when the key was made. The KeyDescription's
+  `rootOfTrust` must be in the hardware-enforced list with `deviceLocked`
+  true and `verifiedBootState` Verified (0). A TEE attests whatever the
+  device booted, so a key from a device with an unlocked bootloader, or
+  whose boot chain did not verify, is still TEE-level while the software
+  that asked for its user verification is not the vendor's. Refused:
+  - an unlocked bootloader;
+  - SelfSigned (1): a bootloader locked to its owner's own key, as a custom
+    ROM such as GrapheneOS installs. There is no setting to admit it;
+  - Unverified (2) and Failed (3);
+  - no `rootOfTrust`, or one only in the software-enforced list.
+
+  This is checked at enrollment and at every anchor and lineage use, so an
+  Android passkey enrolled before this check from such a device stops
+  anchoring, and so does every later passkey whose lineage holds it (a
+  security key enrolled on an act that phone confirmed, for example). It
+  still elevates: assertions re-check only the status list;
 - only the leaf carries a KeyDescription. A chain with a second one, which
   would be an attacker's certificate extending a genuine chain, is refused;
 - no certificate of the chain, the root included, is on the attestation
@@ -3151,9 +3168,10 @@ The policy:
   is not a status list, are a boot error (exit 1). The file alone, without
   the roots, is also a boot error. A file that is valid but stale never
   blocks boot; it refuses Android enrollments and anchors only.
-- **At every use.** The file is re-read at every Android enrollment and at
-  every use of an Android passkey as an anchor. A refreshed file takes
-  effect without a restart.
+- **At every use.** The file is re-read at every Android enrollment, at
+  every use of an Android passkey as an anchor, and at every assertion by an
+  Android passkey (an elevation, an admin act's confirmation). A refreshed
+  file takes effect without a restart.
 - **Any listed serial refuses.** A certificate of the chain listed with any
   status (`REVOKED` or `SUSPENDED`) refuses the enrollment or the anchor.
 - **Older than 48 hours refuses (fail closed).** The age is the file's
@@ -3169,16 +3187,44 @@ The policy:
     included, even when that Android passkey is revoked (a person whose first
     passkey was a phone, for example). The API logs those as
     `refusal=lineage_not_attested`, and their enrollments fall back to the
-    attested ceremony, which refuses a synced passkey at the finish.
+    attested ceremony, which refuses a synced passkey at the finish;
+  - every assertion by an Android passkey: its elevation and its admin-act
+    confirmations answer `503 attestation_status_unavailable`, the ticket or
+    act left live, until the list is refreshed. A person whose only passkeys
+    are Android keys cannot elevate during the outage.
 
   A missing or unreadable file, and one dated more than 5 minutes in the
-  future, are refused the same way. Android passkeys still ASSERT (elevate)
-  while the file is stale.
+  future, are refused the same way.
+- **A revoked certificate stops an enrolled passkey asserting.** At every
+  elevation and admin-act confirmation, after the assertion verifies, the
+  API re-checks an `android-key` passkey's stored chain against the CURRENT
+  list: a listed certificate (the leaf, a batch intermediate, the root)
+  answers `403 attestation_not_in_good_standing`, the ticket or act left
+  live, and is logged at WARN (`elevate.ticket` / `elevate.act`); it is not
+  recorded as a refusal in the database. Only the standing is re-checked
+  there: certificate validity periods and the TEE/StrongBox and boot-state
+  rules are not (an expired attestation chain still elevates). A passkey
+  recorded `none` on the anchored path is not re-checked either, even when
+  its anchor's certificate is later listed: it holds through its anchor, and
+  stops only when the anchor is revoked (`revoke-passkey`). Under the
+  software policy nothing is re-checked.
+- **Keep a retired Android root in the PEM while any passkey chains to it.**
+  The same re-check verifies the stored chain to a root configured NOW. An
+  enrolled `android-key` passkey whose chain reaches no root in
+  `EPIGRAPH_WEBAUTHN_ANDROID_KEY_CA_FILE` (for example after Google rotates
+  its attestation roots and an old one is dropped from the file) answers
+  `403 attestation_not_in_good_standing` at every elevation and admin-act
+  confirmation, as if revoked, and stops anchoring. Before removing a root,
+  count the enrolled `android-key` passkeys whose stored chain verifies only
+  to it, and re-enroll or revoke them first. An `android-key` passkey under
+  a policy with no Android roots at all answers
+  `503 attestation_status_unavailable` instead (the WARN log says that the
+  roots, not the list, are missing).
 
 Fetching and refreshing the file is an operator job outside the API. A job
 that fails leaves the old file in place, and nothing in the API refuses until
 the file is 48 hours old. Without an alert, the first sign would be a refused
-enrollment. Install BOTH of the following, because each catches what the other
+enrollment or elevation. Install BOTH of the following, because each catches what the other
 cannot: a failing run alerts at once, and a job that stopped running (a
 disabled timer never fails) is caught by its age.
 
@@ -3303,8 +3349,8 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     credential against today's roots, never the columns its registration
     wrote:
     - `packed`/`tpm`: an allowlist root that still admits its model;
-    - `android-key`: an Android root, plus the TEE/StrongBox rule and the
-      status list above.
+    - `android-key`: an Android root, plus the TEE/StrongBox and boot-state
+      rules and the status list above.
 
     The row's recorded format, AAGUID and backup-eligible flag must also
     agree with that credential. The anchor's certificate validity periods are
@@ -3359,8 +3405,8 @@ manager's synced passkey. It is anchored by a passkey they already hold:
     trusted under the configuration the API runs now: self attestation, a
     model not on the allowlist, a root that is not configured, or an Android
     key that fails the Android rules (a software-level key, `purpose` or
-    `origin` only software-enforced, a KeyDescription outside the leaf, a
-    backup-eligible credential) or has a certificate on a CURRENT status
+    `origin` only software-enforced, an unlocked or unverified boot, a
+    KeyDescription outside the leaf, a backup-eligible credential) or has a certificate on a CURRENT status
     list. Such an attestation is dropped, as a browser drops it when asked
     for none, and logged at INFO. The passkey holds only through its anchor:
     it never anchors a further one, and it is revoked with its anchor.

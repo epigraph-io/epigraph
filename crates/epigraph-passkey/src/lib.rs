@@ -934,6 +934,8 @@ impl Passkeys {
     /// * `android-key`: chains to an Android key root, its KeyDescription
     ///   (the leaf's, and only the leaf's) places the attestation and the key
     ///   in a TEE or StrongBox with `purpose` and `origin` hardware-enforced,
+    ///   on a device whose bootloader was locked and whose boot was Verified
+    ///   (its hardware-enforced `rootOfTrust`, [`android::hardware_rules`]),
     ///   and no certificate of the chain, root included, is on the status list
     ///   (which must be no older than
     ///   [`android::ANDROID_KEY_STATUS_MAX_AGE`]);
@@ -1322,6 +1324,138 @@ impl Passkeys {
             }
         }
         Ok(())
+    }
+
+    /// Whether a STORED passkey's attestation is still in good standing for
+    /// an ASSERTION (an elevation, an admin act's confirmation): the check a
+    /// caller runs after [`Self::finish_authentication`] verified the
+    /// assertion, on the passkey row the database serves for the asserting
+    /// credential.
+    ///
+    /// * `android-key` (by the row's `attestation_format` OR by the stored
+    ///   credential's own; a row and credential that disagree are refused):
+    ///   its stored chain must still reach an Android key root configured
+    ///   now (its signatures; the library's time checks off), and no
+    ///   certificate of it, the root included, may be on today's status list,
+    ///   which must be fresh, as at enrollment (fail closed: a stale, missing
+    ///   or unreadable list refuses). A batch key Google revokes after the
+    ///   passkey enrolled therefore stops it elevating at the next refresh of
+    ///   the list.
+    ///
+    ///   NOT re-checked here: the certificates' validity periods (an
+    ///   attestation speaks for the moment of registration, and a remotely
+    ///   provisioned intermediate may be short-lived, so an expiry would lock
+    ///   a person out of a key nobody revoked) and the hardware rules
+    ///   ([`android::hardware_rules`]: checked at registration and at every
+    ///   anchor use; a rule added since does not retire an enrolled key's
+    ///   assertions).
+    /// * every other format: in good standing. `packed` / `tpm` have no
+    ///   status list, and a `none` passkey holds only through its anchor.
+    /// * under the software policy, every passkey: that policy trusts no
+    ///   attestation, so none has a standing to lose.
+    ///
+    /// # Errors
+    /// [`StandingRefusal::NotInGoodStanding`]: a certificate is listed, the
+    /// chain no longer reaches a configured Android root, or the row and the
+    /// credential disagree. [`StandingRefusal::Unknown`]: no Android roots or
+    /// no current status list to check it against.
+    pub fn assertion_standing(
+        &self,
+        passkey: &Value,
+        attestation_format: &str,
+    ) -> Result<(), StandingRefusal> {
+        if self.config.allows_software_attestation() {
+            return Ok(());
+        }
+        let cred = passkey.get("cred");
+        let stored_format = cred
+            .and_then(|c| c.get("attestation_format"))
+            .and_then(Value::as_str);
+        let android = |f: Option<&str>| f == Some("android-key");
+        if !android(Some(attestation_format)) && !android(stored_format) {
+            return Ok(());
+        }
+        if stored_format != Some(attestation_format) {
+            return Err(StandingRefusal::NotInGoodStanding(format!(
+                "the row's attestation format `{attestation_format}` is not the credential's \
+                 ({stored_format:?})"
+            )));
+        }
+        let cred = cred.ok_or_else(|| {
+            StandingRefusal::NotInGoodStanding("the stored credential has no `cred`".into())
+        })?;
+        let attestation: ParsedAttestation = cred
+            .get("attestation")
+            .cloned()
+            .ok_or_else(|| "the stored credential holds no attestation".to_string())
+            .and_then(|a| {
+                serde_json::from_value(a)
+                    .map_err(|e| format!("the stored attestation does not parse: {e}"))
+            })
+            .map_err(StandingRefusal::NotInGoodStanding)?;
+        let serials = self.android_key_serials(&attestation)?;
+        self.android_key_standing(&serials).map_err(|d| match d {
+            Distrust::Untrusted(why) => StandingRefusal::NotInGoodStanding(why),
+            Distrust::StatusUnknown(why) => StandingRefusal::Unknown(why),
+        })
+    }
+
+    /// The serials of a stored Android chain and of the configured root it
+    /// reaches, for [`Self::assertion_standing`]: the chain's signatures are
+    /// verified to a root configured now, its validity periods are not.
+    fn android_key_serials(
+        &self,
+        attestation: &ParsedAttestation,
+    ) -> Result<Vec<Vec<u8>>, StandingRefusal> {
+        let cas = self.android_cas.as_ref().ok_or_else(|| {
+            StandingRefusal::Unknown(format!(
+                "no Android key roots are configured ({}), so an android-key passkey's standing \
+                 cannot be checked",
+                config::ENV_ANDROID_KEY_CA_FILE
+            ))
+        })?;
+        let untrusted = StandingRefusal::NotInGoodStanding;
+        let chain = match &attestation.data {
+            ParsedAttestationData::Basic(chain) if !chain.is_empty() => chain,
+            _ => {
+                return Err(untrusted(
+                    "the stored Android key attestation holds no certificate chain".into(),
+                ))
+            }
+        };
+        let ca = verify_attestation_ca_chain(&attestation.data, cas, true)
+            .map_err(|e| {
+                untrusted(format!(
+                    "its chain does not verify to an Android key root: {e}"
+                ))
+            })?
+            .ok_or_else(|| untrusted("it carries no certificate chain".into()))?;
+        // Each certificate's serial, and nothing else: the KeyDescription is
+        // NOT parsed here, so a parser or rule added after a passkey enrolled
+        // cannot stop it asserting (registration enforced them).
+        let mut serials = chain
+            .iter()
+            .enumerate()
+            .map(|(index, c)| {
+                let der = c
+                    .to_der()
+                    .map_err(|e| untrusted(format!("a certificate does not encode: {e}")))?;
+                let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| {
+                    untrusted(format!(
+                        "attestation certificate {index} does not parse: {e}"
+                    ))
+                })?;
+                Ok(cert.raw_serial().to_vec())
+            })
+            .collect::<Result<Vec<_>, StandingRefusal>>()?;
+        let root = ca
+            .ca()
+            .to_der()
+            .map_err(|e| untrusted(format!("the root does not encode: {e}")))?;
+        let (_, root) = x509_parser::parse_x509_certificate(&root)
+            .map_err(|e| untrusted(format!("the root does not parse: {e}")))?;
+        serials.push(root.raw_serial().to_vec());
+        Ok(serials)
     }
 
     /// The rules for a registration that verified under the Android key
@@ -1736,6 +1870,34 @@ impl AnchorRefusal {
             Self::AssertionDoesNotVerify => "assertion_does_not_verify",
             Self::CredentialMismatch => "credential_mismatch",
             Self::BackupEligibilityChanged => "backup_eligibility_changed",
+        }
+    }
+}
+
+/// Why a stored passkey may not assert now
+/// ([`Passkeys::assertion_standing`]).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum StandingRefusal {
+    /// Its attestation is not in good standing: a certificate of its chain
+    /// is on the attestation status list, the chain no longer reaches a
+    /// configured root, or its row and credential disagree.
+    #[error("the passkey's attestation is no longer in good standing: {0}")]
+    NotInGoodStanding(String),
+    /// Its standing cannot be checked: no Android roots configured (the
+    /// remedy is to restore them), or no current attestation status list
+    /// (stale, missing, unreadable: the remedy is to refresh it). The reason
+    /// says which.
+    #[error("the passkey's attestation standing cannot be checked: {0}")]
+    Unknown(String),
+}
+
+impl StandingRefusal {
+    /// A stable snake_case code for logs and responses.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotInGoodStanding(_) => "attestation_not_in_good_standing",
+            Self::Unknown(_) => "attestation_status_unavailable",
         }
     }
 }
