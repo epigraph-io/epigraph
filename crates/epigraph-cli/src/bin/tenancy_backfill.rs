@@ -2405,6 +2405,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // session cannot read is admitted: fail OPEN, the defect the function
     // closes. The owner is load-bearing.
     ("epigraph_edges_reach", 254),
+    // 255 (backlog 9ee6799d), the operator's audited write of
+    // `papers.licence`, whose application-role INSERT and UPDATE 255 revokes.
+    // Under a non-member owner it fails CLOSED: its `security_events` audit
+    // INSERT is refused by `security_events_paper_licence_privileged` (no
+    // `epigraph_definer_bypass()`), so every set errors 42501 and the licence
+    // UPDATE rolls back with it (loud). Under the migration runner's
+    // superuser it keeps working with more authority than intended.
+    ("epigraph_set_paper_licence", 255),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3337,6 +3345,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_admin_deprecate_workflow_row",
             "public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)",
             true,
+        ),
+        // 255: setting a paper's licence is a maintenance act; an app grant
+        // would let the request DSN mark any source open-licensed, and so make
+        // ingest retain its publisher text.
+        (
+            "epigraph_set_paper_licence",
+            "public.epigraph_set_paper_licence(uuid, text, text)",
+            false,
         ),
     ];
 

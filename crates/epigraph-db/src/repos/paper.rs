@@ -325,7 +325,12 @@ impl PaperRepository {
     /// when none is recorded or no paper has this id. `None` means "unknown",
     /// which every caller must treat as all rights reserved. Ingest only READS
     /// this; it is set by an operator, never from an extraction, so a caller
-    /// cannot declare its own source open-licensed (backlog 8709d128).
+    /// cannot declare its own source open-licensed (backlog 8709d128). The
+    /// database enforces that since migration 255 (backlog 9ee6799d): the
+    /// application role holds no INSERT or UPDATE on `licence`, and no UPDATE
+    /// on `doi` or `id`, so it can neither write a licence nor move a licensed
+    /// row onto another DOI (this is read by id after a lookup by DOI). The
+    /// operator writes it through the audited `epigraph_set_paper_licence`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.

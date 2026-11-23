@@ -3116,9 +3116,10 @@ restart.
   passage (`passage_retention_permitted`: an exact allowlist of public
   domain, CC0, CC BY and CC BY-SA SPDX ids; never NC/ND, and free text fails
   closed); otherwise the row carries the citation, a locator and the
-  passage's BLAKE3 hash only. Ingest never writes the column; by convention
-  an operator sets it (not enforced: the application role keeps UPDATE on
-  the REGISTRY table `papers`). `papers` carries no tenancy, so no policy
+  passage's BLAKE3 hash only. Ingest never writes the column; an operator
+  sets it (a convention at 226: the application role kept UPDATE on the
+  REGISTRY table `papers`; enforced since 255, which also audits each set
+  through `epigraph_set_paper_licence`). `papers` carries no tenancy, so no policy
   changes. Sets `lock_timeout = '3s'`. **Scope:** evidence rows only; a
   level-2 paragraph claim's `content` still holds the paragraph text. The
   locator's byte span (a reproducible hash check) exists for Tier-1
@@ -3797,6 +3798,40 @@ restart.
   **Deploy order:** migrate BEFORE rolling out a 254 binary: without the function every
   cycle-checked `link_hierarchical` call fails 42883 and writes nothing. Undo only after
   rolling every 254 binary back.
+- **255**: public `paper_licence_operator_only` (backlog 9ee6799d). Makes 226's
+  "an operator sets `papers.licence`" an enforced rule. `epigraph_app` loses table-level
+  INSERT and UPDATE on `papers`; it gets back INSERT on every column except `licence` (read
+  from the catalog) and UPDATE on `title` and `journal` only (an allowlist). So an
+  application session can neither UPDATE a paper's licence, nor INSERT a paper naming one
+  (pre-registering a not-yet-ingested DOI as open), nor set it in an `ON CONFLICT DO
+  UPDATE`, nor UPDATE `doi` or `id` to move an open-licensed row onto a paywalled DOI
+  (ingest finds the paper by DOI, then reads that row's licence); SELECT and DELETE are
+  unchanged, and the request path's writers (`PaperRepository::get_or_create`,
+  `POST /api/v1/papers`) INSERT only `doi`, `title` and `journal` and UPDATE only `title`
+  and `journal`. The operator path is the SECURITY DEFINER
+  `epigraph_set_paper_licence(paper uuid, licence text, reason text)` on 172's form, owned by
+  `epigraph_maintenance`, EXECUTE revoked from PUBLIC and `epigraph_app`: it refuses a blank
+  reason or an unknown paper (`LIC01`..`LIC03`, 22023), sets or clears (NULL) the licence
+  (226's CHECK still applies), writes one `security_events` row `paper.licence_set`
+  (paper, DOI, previous, new, reason, session user) and returns the previous licence. A
+  RESTRICTIVE insert policy `security_events_paper_licence_privileged` reserves the
+  `paper.licence` event prefix (case- and blank-insensitive) for a privileged or definer
+  frame stamped `now()`, as 123 does for `platform.`. Re-states the column comment. Refuses
+  (`LIC09`, 55000, nothing applied) if `epigraph_app` can still INSERT `licence`, or UPDATE
+  any column but `title` and `journal`, by any route afterwards. A later migration that adds
+  a `papers` column the request path writes must grant it to `epigraph_app` column-level, and
+  one the request path UPDATEs must also extend the allowlist in
+  `paper_licence_operator_only.rs` (which fails until it does). **Not closed:** the maintenance DSN can still UPDATE `licence` directly, without
+  the audit row (as in 123); the application role can still write publisher text into
+  `evidence.raw_content` directly; licences set before 255 carry no audit row. Pinned by
+  `epigraph-db/tests/paper_licence_operator_only.rs` (each refusal mutation-tested, the
+  `doi`/`id` re-point refused, the application writers as controls, the column ratchet, the
+  definer's audit) and
+  `paper_licence_operator_only_undo.rs`; `epigraph-mcp/tests/ingest_evidence_passage_retention.rs`
+  now sets licences through the definer. Undo: `docs/runbooks/255-undo.sql`. **Operator
+  path:** on the maintenance DSN, `SELECT epigraph_set_paper_licence('<paper id>',
+  'CC-BY-4.0', '<where the licence was read>');` (by id: DOI spellings are canonicalised in
+  the application). **Deploy order:** none required; no binary depends on it.
 - **256**: `derived_writer_scope_read_committed` (backlog a8cabb45). Re-states 166's
   `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
   so that 165's role-DERIVED writer arm admits a write only under READ COMMITTED. Under

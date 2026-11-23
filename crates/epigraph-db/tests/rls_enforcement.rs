@@ -1627,6 +1627,17 @@ async fn no_policy_arm_is_session_independent(pool: PgPool) {
              `epigraph_countersign_authorship` definer.",
         ),
         (
+            "security_events_paper_licence_privileged",
+            "paper.licence",
+            "255's RESTRICTIVE insert policy: its row-only arm (the trimmed, lower-cased event \
+             type does not start `paper.licence`) says WHICH rows the restriction applies to, \
+             and grants nothing. A restrictive policy is AND-ed with the permissive \
+             `security_events_append`, so every other row still needs 077's attribution arms; a \
+             licence audit row needs one of the two session arms beside it (`epigraph_bypass()` \
+             / `epigraph_definer_bypass()`), i.e. the maintenance session or the \
+             `epigraph_set_paper_licence` definer.",
+        ),
+        (
             "workflow_outcome_reports_read",
             "workflow_outcome_reports.workflow_id",
             "221's read policy: its arm `EXISTS (SELECT 1 FROM workflows w WHERE w.id = \

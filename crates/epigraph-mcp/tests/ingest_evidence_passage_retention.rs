@@ -54,7 +54,9 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
-/// Record a licence on the paper row before ingest, the way an operator would.
+/// Record a licence on the paper row before ingest, the way an operator does:
+/// through the audited maintenance definer (migration 255), on a session that
+/// is the maintenance role. The application role cannot write the column.
 async fn set_licence(pool: &PgPool, doi: &str, title: &str, licence: &str) {
     let paper_id = PaperRepository::get_or_create(
         pool,
@@ -65,12 +67,17 @@ async fn set_licence(pool: &PgPool, doi: &str, title: &str, licence: &str) {
     )
     .await
     .expect("paper row");
-    sqlx::query("UPDATE papers SET licence = $2 WHERE id = $1")
-        .bind(paper_id)
-        .bind(licence)
-        .execute(pool)
-        .await
-        .expect("set licence");
+    let licence = licence.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        sqlx::query("SELECT epigraph_set_paper_licence($1, $2, 'test fixture')")
+            .bind(paper_id)
+            .bind(&licence)
+            .execute(&mut *conn)
+            .await
+            .expect("set licence through the operator definer");
+        (conn, ())
+    })
+    .await;
 }
 
 /// Every evidence body this paper's ingest wrote, with its stored digest.
