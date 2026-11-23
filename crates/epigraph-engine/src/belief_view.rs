@@ -299,10 +299,20 @@ pub struct BeliefView {
     /// On the wire it is `profile_identity`, not `profile`: `profile` is
     /// already the spine compound's [`LeafProfile`]. Every view of one read
     /// carries the same identity; a `Legacy` view's numbers come from the
-    /// kept cache, not from this profile (its `basis` says so). The hash
-    /// covers the context's global and perspective tiers; an atom row's own
-    /// frame tier (`FramedBeliefContext::profile_for_frame`) is resolved per
-    /// row and is not in it.
+    /// kept cache, not from this profile (its `basis` says so).
+    ///
+    /// The hash is of the context's resolved profile
+    /// ([`crate::belief_query::FramedBeliefContext::profile`]). Two limits:
+    /// - An atom row's OWN frame tier is resolved per row
+    ///   (`FramedBeliefContext::profile_for_frame`, used by the discount) and
+    ///   is not in the hash, so (rows, hash) does not reproduce the value of
+    ///   an atom whose frames carry overrides.
+    /// - A context that carries a frame tier of its own
+    ///   (`FramedBeliefContext::resolve`) hashes that tier, and the atom fold
+    ///   reads it for the combination threshold, but the per-row discount
+    ///   does not. The view builders' callers pass `FramedBeliefContext::global`
+    ///   or `FramedBeliefContext::for_perspective`, which carry no frame tier,
+    ///   so for them the hash is exactly the global and perspective tiers.
     pub profile_identity: crate::belief_profile::ProfileIdentity,
 }
 
