@@ -66,8 +66,9 @@
 --       frame_id, source_agent_id, perspective_id, slot_kind, slot_id)` added,
 --       with `mass_functions_slot_shape` (kind and id together; a known kind;
 --       never both a slot and a perspective) and a partial index on the slot.
---   (4) DELETES the slot rows of `perspectives` (with BBAs or none), and
---       every row (2) moved BBAs off, then adds
+--   (4) DELETES the slot rows of `perspectives` (with BBAs or none; a
+--       perspective that is not a slot row is kept even when (3) moved BBAs
+--       off it, since it is a viewpoint 267 could not restore), then adds
 --       `perspectives_not_bba_slot CHECK (perspective_type IS NULL OR
 --       perspective_type NOT IN ('edge', 'evidence'))`.
 --   (5) RE-STATES three definers whose bodies keyed an edge's BBAs on
@@ -202,15 +203,17 @@ SELECT mf.id AS mf_id,
     OR (mf.combination_method = 'auto_wire'
         AND EXISTS (SELECT 1 FROM public.evidence v WHERE v.id = mf.perspective_id));
 
--- Every `perspectives` row (4) deletes: the slot rows, BBAs or none, and every
--- row (3) moves BBAs off.
+-- Every `perspectives` row (4) deletes: the slot rows, BBAs or none. A
+-- perspective that is not a slot row stays even when (3) moves BBAs off it
+-- (an edge factor or auto-wire row filed on a viewpoint whose id is the edge's
+-- or the evidence row's): it is somebody's viewpoint, 267 has no copy of its
+-- name, description, frames or properties to restore, and it is not typed
+-- `edge` / `evidence` (A5), so the CHECK in (4) holds without deleting it.
 CREATE TEMPORARY TABLE t267_gone ON COMMIT DROP AS
 SELECT p.id
   FROM public.perspectives p
  WHERE (p.perspective_type = 'edge' AND p.name = 'edge_factor')
-    OR (p.perspective_type = 'evidence' AND p.name = 'evidence_grounded')
-UNION
-SELECT t.slot_id FROM t267_slot t;
+    OR (p.perspective_type = 'evidence' AND p.name = 'evidence_grounded');
 
 DO $$
 DECLARE

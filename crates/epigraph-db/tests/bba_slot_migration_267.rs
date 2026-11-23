@@ -271,7 +271,9 @@ async fn perspective_ids(pool: &PgPool) -> BTreeSet<Uuid> {
 
 /// Every legacy shape lands on the slot it names; a genuine perspective's BBA
 /// and the agent's unscoped BBA are untouched; every slot-shaped perspective
-/// (the orphan included) is deleted and a new one is refused.
+/// (the orphan included) is deleted and a new one is refused; a viewpoint a
+/// legacy edge factor was filed on is kept as it was (review finding 4: 267
+/// has no copy of it to restore).
 /// Mutations: dropping the old unique key AFTER the move instead of before
 /// fails the migration (the two evidence rows collide); classifying by
 /// `perspective_type` alone leaves `legacy_edge_row` on its perspective.
@@ -308,9 +310,24 @@ async fn legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go(pool: 
 
     let left = perspective_ids(&pool).await;
     assert!(left.contains(&l.genuine), "the genuine perspective stays");
+    // The viewpoint the legacy edge factor was filed on is not a slot row: its
+    // BBA moved to the edge slot, but the row itself is kept as it was.
+    let kept: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT name, perspective_type FROM perspectives WHERE id = $1")
+            .bind(l.legacy_edge)
+            .fetch_optional(&pool)
+            .await
+            .expect("read the legacy edge's perspective");
+    assert_eq!(
+        kept,
+        Some((
+            "lens-that-was-there".to_string(),
+            Some("analytical".to_string())
+        )),
+        "a perspective that is not a slot row is kept, name and type unchanged"
+    );
     for (what, id) in [
         ("edge", l.edge),
-        ("legacy edge", l.legacy_edge),
         ("ev1", l.ev1),
         ("ev2", l.ev2),
         ("assessment", l.assess_slot),
@@ -532,8 +549,9 @@ async fn catalog(pool: &PgPool) -> BTreeSet<String> {
 
 /// The undo restores the catalog below 267 exactly (the three definer bodies
 /// byte for byte, the old unique key, no slot column, no CHECK, no new
-/// definer), puts every moved row back on a re-created slot perspective of
-/// the old type, and a second run changes nothing.
+/// definer), puts every moved row back on a perspective of its old type (a
+/// re-created slot row, or the viewpoint 267 kept), and a second run changes
+/// nothing.
 /// Mutation: an undo that leaves one predecessor body out, or re-adds the
 /// unique key under another definition, shows in the catalog diff.
 #[sqlx::test(migrations = false)]
@@ -586,7 +604,7 @@ async fn the_267_undo_returns_the_catalog_and_the_rows_below_267(pool: PgPool) {
         (
             l.legacy_edge_row,
             Some(l.legacy_edge),
-            Some("edge".to_string()),
+            Some("analytical".to_string()),
         ),
         (l.ev1_row, Some(l.ev1), Some("evidence".to_string())),
         (l.ev2_row, Some(l.ev2), Some("evidence".to_string())),

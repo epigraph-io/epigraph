@@ -3419,7 +3419,7 @@ restart.
   another name (A5: a viewpoint, `create_perspective` never validated the type); rebuilds the unique key as
   `mass_functions_unique_per_key UNIQUE NULLS NOT DISTINCT (claim_id, frame_id,
   source_agent_id, perspective_id, slot_kind, slot_id)` with `mass_functions_slot_shape`
-  and `idx_mass_functions_slot`; deletes the slot rows (and every row it moved BBAs off) and
+  and `idx_mass_functions_slot`; deletes the slot rows (a perspective that is not a slot row is kept even when BBAs move off it: it is a viewpoint 267 has no copy of) and
   adds `perspectives_not_bba_slot` (a `create_perspective` with either type is then refused
   with 23514).
   Re-states 194's `epigraph_cascade_delete_edge_bbas`, 115's `epigraph_dedup_move_bbas`

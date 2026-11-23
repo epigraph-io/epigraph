@@ -11,7 +11,9 @@
 --     slot, `owner_agent_id` = the `source_agent_id` of the slot's earliest
 --     BBA (every write path stamped the BBA's source agent as the slot row's
 --     owner), public over the world group (the instance-wide declaration
---     the writers used);
+--     the writers used). A slot whose id is still a perspective (a
+--     viewpoint 267 kept although it moved BBAs off it) is left as it is
+--     (`ON CONFLICT (id) DO NOTHING`), so its BBAs go back onto it unchanged;
 --   * moves every slot row back onto `perspective_id` and drops the slot
 --     columns, `mass_functions_unique_per_key`, `mass_functions_slot_shape`
 --     and `idx_mass_functions_slot`; re-adds 034's
