@@ -368,3 +368,58 @@ async fn evolve_step_on_a_world_owned_public_step_is_403_and_writes_nothing(pool
         );
     }
 }
+
+/// The lineage-less twin of the test above (backlog 50aa4027, PR #738
+/// test-lens follow-up (f)): a world-owned public step with NO lineage yet. A
+/// `revises` then meets the lineage back-fill UPDATE before any INSERT, and
+/// that UPDATE is the claims policy's 42501 WITH CHECK refusal: 403, nothing
+/// written, the parent still without a lineage, for both edge types.
+#[sqlx::test(migrations = "../../migrations")]
+async fn evolve_step_on_a_lineage_less_world_owned_step_is_403_and_back_fills_nothing(
+    pool: PgPool,
+) {
+    let (author, _) = seed_agent_with_group(&pool, "world-author").await;
+    let (caller, _) = seed_agent_with_group(&pool, "world-reader").await;
+    let parent = viewer_fixture::seed_public_claim(
+        &pool,
+        author,
+        &format!(
+            "a world-owned public step with no lineage {}",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    let state = app_role_state(&pool).await;
+
+    for edge_type in ["supersedes", "revises"] {
+        let content = format!("{edge_type} of a lineage-less step {}", Uuid::new_v4());
+        let (status, body) = evolve_as(&pool, &state, caller, parent, &content, edge_type).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{edge_type} of a readable, lineage-less step the caller cannot write is 403: {body}"
+        );
+        assert!(
+            body.contains("no write authority over the group that owns this step")
+                && body.contains("nothing was written"),
+            "{edge_type}: the denial says what was refused: {body}"
+        );
+        assert_eq!(
+            claims_with_content(&pool, &content).await,
+            0,
+            "{edge_type}: no successor"
+        );
+        assert_eq!(
+            current_heads(&pool, parent).await,
+            1,
+            "{edge_type}: one current head"
+        );
+        let lineage: Option<Uuid> =
+            sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+                .bind(parent)
+                .fetch_one(&pool)
+                .await
+                .expect("parent lineage");
+        assert_eq!(lineage, None, "{edge_type}: no lineage was back-filled");
+    }
+}
