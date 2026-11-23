@@ -29,7 +29,9 @@ added here with a line saying what it is for.
 
 - [`architecture/`](architecture/): living design notes for how the system
   is built (noun-claims and verb-edges, edge provenance, memory features).
-  Each states its status at the top.
+  A doc with a `**Status:**` line at its top says there whether it is
+  canonical or informational; one without that line (the memory-features
+  design) makes no claim to match the current code.
 - [`conventions/`](conventions/): how recurring work is done: backlog
   retirement, duplicates versus index hygiene, label-family dedup.
 - [`governance/`](governance/): policy notes and preregistrations (the
