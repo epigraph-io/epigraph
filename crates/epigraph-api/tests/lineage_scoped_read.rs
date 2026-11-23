@@ -889,3 +889,47 @@ async fn the_both_arm_counts_a_claim_one_walk_cut_and_the_other_served_once(pool
     );
     assert_edges_closed(&both, "both");
 }
+
+/// The descendant cap runs before the edges are read: a back-edge from a cut
+/// claim into a kept one is not served (T104 review finding 1).
+///
+/// The fan fixtures above cannot tell the order apart for the DESCENDANT walk:
+/// a cut child's only parent is the kept root, and its edge hangs off the cut
+/// child, so no served claim names it. Here `root -> a -> c` and `root -> k`
+/// put `c` at depth 2 and `k` at depth 1, and `c -> k` makes `k` name `c` as a
+/// parent. A cap of 3 keeps root, a and k and cuts c, so the edge `c -> k`
+/// must not be served.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_descendant_cap_does_not_serve_a_back_edge_from_a_cut_claim(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap-back-edge").await;
+    let root = seed_group_claim(&pool, agent, group, "back-edge root").await;
+    let a = seed_group_claim(&pool, agent, group, "back-edge a").await;
+    let k = seed_group_claim(&pool, agent, group, "back-edge k").await;
+    let c = seed_group_claim(&pool, agent, group, "back-edge c").await;
+    seed_edge(&pool, root, a).await;
+    seed_edge(&pool, a, c).await;
+    seed_edge(&pool, root, k).await;
+    seed_edge(&pool, c, k).await; // the back-edge into a kept claim
+
+    // CALIBRATION: with room for all four, c is served and so is c -> k.
+    let full = walk_capped(&pool, agent, root, LineageDirection::Descendants, 4).await;
+    assert_eq!(full.nodes.len(), 4, "{:?}", node_ids(&full));
+    assert!(
+        full.edges
+            .iter()
+            .any(|e| e.source_id == c && e.target_id == k),
+        "CALIBRATION: the back-edge c -> k must be served uncapped, or the capped \
+         assertion below proves nothing"
+    );
+
+    let cut = walk_capped(&pool, agent, root, LineageDirection::Descendants, 3).await;
+    let mut ids = node_ids(&cut);
+    ids.sort();
+    let mut want = vec![root, a, k];
+    want.sort();
+    assert_eq!(ids, want, "the cap keeps the root and the depth-1 layer");
+    assert!(cut.truncated && !cut.truncated_by_depth);
+    assert_eq!(cut.nodes_omitted, 1);
+    assert_edges_closed(&cut, "descendants with a back-edge from a cut claim");
+}
+

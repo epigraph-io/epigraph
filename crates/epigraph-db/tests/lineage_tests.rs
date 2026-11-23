@@ -1277,6 +1277,100 @@ async fn test_descendants_max_nodes_keeps_root_and_nearest_descendants(pool: PgP
     assert!(!exact.truncated && exact.omitted_by_node_cap.is_empty());
 }
 
+/// Test: the descendant cap runs BEFORE the edges and evidence statements, so
+/// nothing a kept claim carries points at a claim the cap cut.
+///
+/// **Evidence**: T104 review finding 1. Every other capped fixture is a chain
+/// or a one-layer fan, where a kept descendant's parents are all kept, so a
+/// cap moved below the follow-up statements (with `claims` still built from
+/// the kept rows) left every test green while a kept claim named a cut parent
+/// and the cut claims' evidence was fetched and served.
+/// **Reasoning**: a back-edge from a cut claim into a kept one is the shape
+/// that tells the two orders apart. `root -> a -> c` puts `c` at depth 2;
+/// `root -> k` puts `k` at depth 1; `c -> k` is the back-edge (it leaves `k`
+/// at depth 1, its shortest). A cap of 3 keeps root, a and k and cuts c. `c`
+/// carries evidence, which must not be served either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_descendants_max_nodes_cut_claim_does_not_leak_through_a_back_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = AgentRepository::create(&pool, &make_agent(None))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for name in ["root", "a", "k", "c"] {
+        let claim = make_claim(agent.id, &format!("back-edge fixture {name}"), 0.6);
+        let claim = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
+        ids.push(claim.id);
+    }
+    let [root, a, k, c] = [ids[0], ids[1], ids[2], ids[3]].map(|id| id.as_uuid());
+    create_claim_edge(&pool, root, a, "supports").await;
+    create_claim_edge(&pool, a, c, "supports").await;
+    create_claim_edge(&pool, root, k, "supports").await;
+    create_claim_edge(&pool, c, k, "supports").await; // the back-edge
+
+    let ev_k = make_evidence(agent.id, ids[2], "evidence on the kept claim k");
+    let ev_k = EvidenceRepository::create(&pool, &ev_k, epigraph_db::EvidenceEdge::supports(None))
+        .await
+        .unwrap()
+        .id
+        .as_uuid();
+    let ev_c = make_evidence(agent.id, ids[3], "evidence on the cut claim c");
+    let ev_c = EvidenceRepository::create(&pool, &ev_c, epigraph_db::EvidenceEdge::supports(None))
+        .await
+        .unwrap()
+        .id
+        .as_uuid();
+
+    // CALIBRATION: uncapped, c is a depth-2 descendant and k names it as a
+    // parent, so the back-edge is really in the walk.
+    let full = LineageRepository::get_descendants(&pool, &viewer, root, None, None)
+        .await
+        .expect("uncapped descendant walk");
+    assert_eq!(full.claims.len(), 4);
+    assert_eq!(full.claims[&c].depth, 2);
+    assert_eq!(full.claims[&k].depth, 1);
+    assert!(
+        full.claims[&k].parent_ids.contains(&c),
+        "CALIBRATION: k must name c as a parent uncapped, or the capped \
+         assertions below prove nothing; got {:?}",
+        full.claims[&k].parent_ids
+    );
+    assert!(full.evidence.contains_key(&ev_c));
+
+    let capped = LineageRepository::get_descendants(&pool, &viewer, root, None, Some(3))
+        .await
+        .expect("capped descendant walk");
+    assert_eq!(
+        capped.claims.keys().copied().collect::<HashSet<_>>(),
+        HashSet::from([root, a, k])
+    );
+    assert_eq!(capped.omitted_by_node_cap, vec![c]);
+    assert!(capped.truncated && !capped.truncated_by_depth);
+    for kept in capped.claims.values() {
+        for p in &kept.parent_ids {
+            assert!(
+                capped.claims.contains_key(p),
+                "claim {} names parent {p}, which the cap cut",
+                kept.id
+            );
+        }
+    }
+    assert_eq!(capped.claims[&k].parent_ids, vec![root]);
+    assert!(
+        capped.evidence.contains_key(&ev_k),
+        "CALIBRATION: a kept claim's evidence is served"
+    );
+    assert!(
+        !capped.evidence.contains_key(&ev_c),
+        "the cut claim's evidence must not be fetched and served"
+    );
+    for ev in capped.evidence.values() {
+        assert!(capped.claims.contains_key(&ev.claim_id));
+    }
+}
+
 /// Test: depth-based truncation sets `truncated = true` even without `max_nodes`
 ///
 /// **Evidence**: Reusing the existing max_depth=2 scenario over a 5-claim
