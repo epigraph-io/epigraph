@@ -2499,6 +2499,712 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
     Ok(failures)
 }
 
+/// The EXECUTE register [`verify_operator_function_grants`] checks: `(name,
+/// signature, app_must_execute)` per definer whose callers matter. `name`
+/// keys the presence check (the act-taking overloads are keyed on
+/// `epigraph_consume_admin_act`, see their note); `signature` is what is
+/// checked. Module scope so the tests can hold it against
+/// [`DEFERRED_DEFINER_FUNCTIONS`] (backlog a2b079a1).
+const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
+    (
+        "epigraph_operator_actor",
+        "public.epigraph_operator_actor(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operator_of_author",
+        "public.epigraph_operator_of_author(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operates_agents",
+        "public.epigraph_operates_agents(uuid)",
+        true,
+    ),
+    (
+        "epigraph_link_operator",
+        "public.epigraph_link_operator(uuid, uuid)",
+        false,
+    ),
+    (
+        "epigraph_link_retired_agent",
+        "public.epigraph_link_retired_agent(uuid, uuid)",
+        false,
+    ),
+    // 116 (batch HTTP-id): the attested retire of a former shared signer
+    // is a link function too, so the request DSN must not call it.
+    (
+        "epigraph_link_retired_shared_signer",
+        "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
+        false,
+    ),
+    // 122 (operator binding). `default_decl_for_author` calls the check on
+    // the request path, so a missing grant is 42501 on every default-decl
+    // claim write once armed; the three reads it and the trigger use are
+    // app-callable for the same reason. Arming is a maintenance act.
+    (
+        "epigraph_require_bound_author",
+        "public.epigraph_require_bound_author(uuid)",
+        true,
+    ),
+    (
+        "epigraph_author_binding",
+        "public.epigraph_author_binding(uuid)",
+        true,
+    ),
+    (
+        "epigraph_is_human_operator",
+        "public.epigraph_is_human_operator(uuid)",
+        true,
+    ),
+    (
+        "epigraph_operator_binding_enforced",
+        "public.epigraph_operator_binding_enforced()",
+        true,
+    ),
+    (
+        "epigraph_arm_operator_binding",
+        "public.epigraph_arm_operator_binding()",
+        false,
+    ),
+    (
+        "epigraph_operator_writes_group",
+        "public.epigraph_operator_writes_group(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_operator_scope",
+        "public.epigraph_require_operator_scope(uuid, uuid)",
+        true,
+    ),
+    // Registering a human is a maintenance act; the request DSN must not.
+    (
+        "epigraph_register_human_operator",
+        "public.epigraph_register_human_operator(uuid, text, uuid)",
+        false,
+    ),
+    // The writer binding the claims trigger applies (review SEC-1/2/4):
+    // the request path's workflow-ingest caller check calls the first two,
+    // and every read is app-callable for the trigger's own reason.
+    (
+        "epigraph_require_bound_writer",
+        "public.epigraph_require_bound_writer(uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_writer_scope",
+        "public.epigraph_require_writer_scope(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_attributable",
+        "public.epigraph_require_attributable(uuid, uuid, boolean)",
+        true,
+    ),
+    (
+        "epigraph_human_of",
+        "public.epigraph_human_of(uuid, boolean)",
+        true,
+    ),
+    (
+        "epigraph_operator_binding_armed",
+        "public.epigraph_operator_binding_armed()",
+        true,
+    ),
+    (
+        "epigraph_revoke_human_operator",
+        "public.epigraph_revoke_human_operator(uuid, text)",
+        false,
+    ),
+    // Registering a system agent (migration 148) is a maintenance act.
+    (
+        "epigraph_register_system_agent",
+        "public.epigraph_register_system_agent(text, uuid, text)",
+        false,
+    ),
+    // 149 (the author-binding allowlist): allowing and revoking a client
+    // are maintenance acts, and the read helper is reached only through
+    // the two re-bodied binding reads above.
+    (
+        "epigraph_allow_author_binding_client",
+        "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_revoke_author_binding_client",
+        "public.epigraph_revoke_author_binding_client(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_allowlisted_operator",
+        "public.epigraph_allowlisted_operator(uuid)",
+        false,
+    ),
+    // A link function: the request DSN must never record links.
+    (
+        "epigraph_link_legacy_authors",
+        "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
+        false,
+    ),
+    // 123 (the custodian role): the request path reads its OWN role
+    // (subject-bound readers) and the audit trail; granting, ending,
+    // recording a custodial act and the unbound roster read are
+    // maintenance acts the request DSN must never call.
+    (
+        "epigraph_live_role_assignment",
+        "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_role_assignment_for",
+        "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
+        true,
+    ),
+    (
+        "epigraph_holds_role",
+        "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
+        true,
+    ),
+    (
+        "epigraph_grant_role",
+        "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_end_role_assignment",
+        "public.epigraph_end_role_assignment(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_record_custodial_act",
+        "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_platform_audit",
+        "public.epigraph_platform_audit(timestamp with time zone, integer)",
+        true,
+    ),
+    // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
+    // request DSN, so its three definers (the reader, the challenge store,
+    // the completion) are app-callable; opening a ticket and revoking a
+    // passkey are maintenance acts the request DSN must never call.
+    (
+        "epigraph_create_passkey_enrollment",
+        "public.epigraph_create_passkey_enrollment(uuid, text, text)",
+        false,
+    ),
+    (
+        "epigraph_enrollment_for_ceremony",
+        "public.epigraph_enrollment_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_passkey_enrollment_challenge",
+        "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_complete_passkey_enrollment",
+        "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
+        true,
+    ),
+    (
+        "epigraph_revoke_passkey",
+        "public.epigraph_revoke_passkey(uuid, text)",
+        false,
+    ),
+    // 125 (elevation): the ticket API, the unauthenticated ceremony, the
+    // elevate grant and the viewer's liveness check all run on the request
+    // DSN, so the nine principal-bound or ticket-keyed definers are
+    // app-callable. The three unbound helpers are NOT: "who may elevate",
+    // "whose family is this" for any person would be a roster oracle, and
+    // ending another person's expired sessions is not the request DSN's.
+    (
+        "epigraph_create_elevation_ticket",
+        "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
+        true,
+    ),
+    (
+        "epigraph_ticket_for_ceremony",
+        "public.epigraph_ticket_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_elevation_ticket_challenge",
+        "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_passkeys_for_ticket",
+        "public.epigraph_passkeys_for_ticket(uuid)",
+        true,
+    ),
+    (
+        "epigraph_confirm_elevation",
+        "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_redeem_elevation_ticket",
+        "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
+        true,
+    ),
+    (
+        "epigraph_elevation_live",
+        "public.epigraph_elevation_live(uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_end_elevation",
+        "public.epigraph_end_elevation(uuid, text)",
+        true,
+    ),
+    (
+        "epigraph_is_elevated",
+        "public.epigraph_is_elevated()",
+        true,
+    ),
+    (
+        "epigraph_live_elevating_assignment",
+        "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_family_of_person_is_live",
+        "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
+        false,
+    ),
+    (
+        "epigraph_elevated_access_ready",
+        "public.epigraph_elevated_access_ready()",
+        false,
+    ),
+    (
+        "epigraph_elevation_session_is_live",
+        "public.epigraph_elevation_session_is_live(uuid)",
+        false,
+    ),
+    (
+        "epigraph_end_expired_elevations",
+        "public.epigraph_end_expired_elevations(uuid, uuid)",
+        false,
+    ),
+    // 127 (the elevated-access log): the API's response layer and the MCP
+    // tool-call wrapper record on the request DSN, and the subject's read
+    // policy calls the admin-group helper as the application role, so all
+    // three are app-callable: the recorder refuses an unelevated
+    // connection (ELV07), the helper answers only for the caller, and the
+    // audit reader returns nothing to an unentitled caller.
+    (
+        "epigraph_record_elevated_access",
+        "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
+        true,
+    ),
+    (
+        "epigraph_admin_group_ids",
+        "public.epigraph_admin_group_ids()",
+        true,
+    ),
+    (
+        "epigraph_elevated_access_audit",
+        "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
+        true,
+    ),
+    // 128 (the admin-scope arming switch): the token endpoint reads the
+    // switch and records the would-strip measurement on the request DSN,
+    // so both are app-callable; arming and disarming are maintenance acts.
+    (
+        "epigraph_admin_scopes_armed",
+        "public.epigraph_admin_scopes_armed()",
+        true,
+    ),
+    (
+        "epigraph_record_admin_scope_would_strip",
+        "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
+        true,
+    ),
+    (
+        "epigraph_set_admin_scope_enforcement",
+        "public.epigraph_set_admin_scope_enforcement(boolean, text)",
+        false,
+    ),
+    // 130 (pending admin acts): proposing (elevation-gated) and the
+    // act-keyed confirmation ceremony run on the request DSN, so they are
+    // app-callable; consuming an act, the passkey oracle and the
+    // act-taking forms of the maintenance verbs are maintenance acts.
+    (
+        "epigraph_propose_admin_act",
+        "public.epigraph_propose_admin_act(text, jsonb, text, text)",
+        true,
+    ),
+    (
+        "epigraph_act_for_ceremony",
+        "public.epigraph_act_for_ceremony(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_admin_act_challenge",
+        "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_passkeys_for_act",
+        "public.epigraph_passkeys_for_act(uuid)",
+        true,
+    ),
+    // 200: the anchored enrollment page's reader, app-callable like 124's
+    // ceremony reader; the compromised revoke is a maintenance act like
+    // 124's revoke, which the request DSN must never call.
+    (
+        "epigraph_enrollment_anchor",
+        "public.epigraph_enrollment_anchor(uuid)",
+        true,
+    ),
+    (
+        "epigraph_revoke_passkey_compromised",
+        "public.epigraph_revoke_passkey_compromised(uuid, text)",
+        false,
+    ),
+    // 206: claim visibility controls, all five app-callable. The two
+    // reads run on every claim write that names no visibility
+    // (`ClaimRepository::resolve_visibility_choice`), so a
+    // missing grant there is 42501 on every default write, an outage like
+    // 107's actor read; the three writes are the publicize, share and
+    // default-team surfaces, which would be refused outright.
+    (
+        "epigraph_writable_teams",
+        "public.epigraph_writable_teams(uuid)",
+        true,
+    ),
+    // 234: `Viewer::resolve` asks it on EVERY viewer resolution, so a
+    // missing grant would be 42501 on every request (an outage), not a
+    // feature quietly off. The repo maps only 42883 (no such function,
+    // migration not yet applied) to "no team".
+    (
+        "epigraph_readable_teams",
+        "public.epigraph_readable_teams(uuid)",
+        true,
+    ),
+    (
+        "epigraph_default_group",
+        "public.epigraph_default_group(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_default_group",
+        "public.epigraph_set_default_group(uuid)",
+        true,
+    ),
+    (
+        "epigraph_publicize_claims",
+        "public.epigraph_publicize_claims(uuid[], text)",
+        true,
+    ),
+    (
+        "epigraph_share_claims_with_team",
+        "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
+        true,
+    ),
+    // 209: the private-default read runs on every claim write that names
+    // no visibility (a missing grant is 42501 on every default write); the
+    // setter is the API, MCP and operator-CLI default surface.
+    (
+        "epigraph_default_private",
+        "public.epigraph_default_private(uuid)",
+        true,
+    ),
+    (
+        "epigraph_set_agent_default_group",
+        "public.epigraph_set_agent_default_group(uuid, uuid, boolean)",
+        true,
+    ),
+    // 207: the bug-report intake's two definers run on the request DSN
+    // (MCP submit_bug_report / list_my_bug_reports), so both are
+    // app-callable; a missing grant refuses every report (42501).
+    (
+        "epigraph_submit_bug_report",
+        "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
+        true,
+    ),
+    (
+        "epigraph_my_bug_reports",
+        "public.epigraph_my_bug_reports(integer)",
+        true,
+    ),
+    // 207: the preflight runs on the request DSN before the embedding
+    // call; the caller gate takes a principal as an argument, so the
+    // request DSN must never call it (an oracle for any agent).
+    (
+        "epigraph_bug_report_preflight",
+        "public.epigraph_bug_report_preflight()",
+        true,
+    ),
+    (
+        "epigraph_bug_report_gate",
+        "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
+        false,
+    ),
+    // 213: every agent client_credentials and refresh grant records its
+    // assertion nonce on the request DSN; a missing grant refuses every
+    // agent mint (500).
+    (
+        "epigraph_oauth_assertion_nonce_consume",
+        "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
+        true,
+    ),
+    (
+        "epigraph_confirm_admin_act",
+        "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
+        true,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_has_live_passkey",
+        "public.epigraph_has_live_passkey(uuid)",
+        false,
+    ),
+    // The act-taking OVERLOADS share their names with the 123 / 124
+    // forms, and the presence check below reads the name; each is
+    // therefore keyed on `epigraph_consume_admin_act`, which exists
+    // exactly when 130 (and so the overload) does.
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_end_role_assignment(uuid, text, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
+        false,
+    ),
+    (
+        "epigraph_consume_admin_act",
+        "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
+        false,
+    ),
+    // 131: the proposer's own acts, principal-bound, on the request DSN.
+    (
+        "epigraph_admin_acts_of_principal",
+        "public.epigraph_admin_acts_of_principal(integer)",
+        true,
+    ),
+    // 161: the shared link body is a link function (maintenance only);
+    // the identity registration belongs to the attestor role alone; the
+    // prompt-history read is principal-gated and called on the request DSN.
+    (
+        "epigraph_link_operator_body",
+        "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_register_agent_identity",
+        "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
+        false,
+    ),
+    (
+        "epigraph_agent_prompt_history",
+        "public.epigraph_agent_prompt_history(uuid)",
+        true,
+    ),
+    // 161 (review CR6): the cut-over's legacy-key backfill is a
+    // maintenance act; the request DSN never runs it.
+    (
+        "epigraph_backfill_legacy_agent_keys",
+        "public.epigraph_backfill_legacy_agent_keys()",
+        false,
+    ),
+    // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
+    // it on the request DSN.
+    (
+        "epigraph_live_memberships",
+        "public.epigraph_live_memberships(uuid)",
+        true,
+    ),
+    // 164: creating a team group and changing its roster are maintenance
+    // acts; the request DSN must never call them.
+    (
+        "epigraph_create_team_group",
+        "public.epigraph_create_team_group(text, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_add_member",
+        "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_remove_member",
+        "public.epigraph_team_group_remove_member(uuid, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_team_group_set_member_role",
+        "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
+        false,
+    ),
+    // 165: binding a role to a group is a maintenance act, and the
+    // derivation and the roster answer for any principal (a roster
+    // oracle); the request DSN calls none of them. It reaches the
+    // derivation only through `epigraph_live_memberships` and the claims
+    // trigger's writer scope, both maintenance-owned.
+    (
+        "epigraph_define_group_role",
+        "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
+        false,
+    ),
+    (
+        "epigraph_bind_group_role",
+        "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
+        false,
+    ),
+    // 179: the mode-taking overloads of the same two verbs (a binding
+    // that admits the holder and the role's attached agents only).
+    (
+        "epigraph_bind_group_role",
+        "public.epigraph_bind_group_role(text, uuid, text, text, text)",
+        false,
+    ),
+    (
+        "epigraph_define_group_role",
+        "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
+        false,
+    ),
+    (
+        "epigraph_end_group_role_binding",
+        "public.epigraph_end_group_role_binding(uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_role_derived_memberships",
+        "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_group_role_roster",
+        "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
+        false,
+    ),
+    // 166: attaching and detaching a role's agents is a maintenance act;
+    // the request DSN asks whether an agent may run, and reaches the write
+    // check only through the maintenance-owned writer checks; never the
+    // gate's any-time form.
+    (
+        "epigraph_attach_agent_to_role",
+        "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
+         timestamp with time zone, text)",
+        false,
+    ),
+    (
+        "epigraph_detach_agent_from_role",
+        "public.epigraph_detach_agent_from_role(text, uuid, text)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_gate",
+        "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_may_run",
+        "public.epigraph_role_agent_may_run(uuid)",
+        true,
+    ),
+    (
+        "epigraph_require_role_holder",
+        "public.epigraph_require_role_holder(uuid)",
+        false,
+    ),
+    // The author relief and the write trigger are reached only from
+    // maintenance-owned definers and triggers; the application role
+    // EXECUTEs neither.
+    (
+        "epigraph_agent_is_retired",
+        "public.epigraph_agent_is_retired(uuid)",
+        false,
+    ),
+    (
+        "epigraph_role_agent_write_check",
+        "public.epigraph_role_agent_write_check()",
+        false,
+    ),
+    // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
+    // own maintenance-owned frame, so an app grant would be an existence
+    // oracle over links the application role cannot read; recording a
+    // succession after the fact is a maintenance act.
+    (
+        "epigraph_is_legacy_fleet_parent",
+        "public.epigraph_is_legacy_fleet_parent(uuid)",
+        false,
+    ),
+    (
+        "epigraph_record_legacy_succession",
+        "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
+        false,
+    ),
+    // 181: the member-removal route marks the re-key obligation through
+    // it on the request DSN; without the grant every removal is 42501.
+    (
+        "epigraph_mark_group_reseal_required",
+        "public.epigraph_mark_group_reseal_required(uuid)",
+        true,
+    ),
+    // 191: retiring a live link is a maintenance act; an app grant would
+    // let the request DSN end an agent's authority (and revoke its
+    // membership) for any agent.
+    (
+        "epigraph_retire_operator_link",
+        "public.epigraph_retire_operator_link(uuid, text, boolean)",
+        false,
+    ),
+    // 198: the request path builds the agent-lookup card through it;
+    // without the grant find_agent / get_agent fail 42501.
+    (
+        "epigraph_disclosed_role_assignments",
+        "public.epigraph_disclosed_role_assignments(uuid[])",
+        true,
+    ),
+    // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
+    // calls it on the request DSN for `authored_by.prompt_snapshot`;
+    // without the grant every claim read is 42501.
+    (
+        "epigraph_agent_prompt_snapshot_at",
+        "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
+        true,
+    ),
+    // 199: every claim read calls it on the request DSN for
+    // `authored_by.human` (the filer's and each ingester's human);
+    // without the grant every claim read is 42501.
+    (
+        "epigraph_operator_bound_at",
+        "public.epigraph_operator_bound_at(uuid, timestamptz)",
+        true,
+    ),
+    // 208: MCP `countersign_authorship` calls it on the request DSN as
+    // the caller; without the grant every countersign is 42501.
+    (
+        "epigraph_countersign_authorship",
+        "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
+        true,
+    ),
+    // 219: the `evolve_step` gate calls it on the request DSN (REST and
+    // MCP); without the grant every evolve of an executed step is 42501.
+    (
+        "epigraph_step_lineage_executors",
+        "public.epigraph_step_lineage_executors(uuid)",
+        true,
+    ),
+];
+
 /// Migration 107's EXECUTE grants to `epigraph_app`, which the ownership check
 /// above does not see. Returns the number of failing checks.
 ///
@@ -2528,706 +3234,6 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
 /// exists — with no `epigraph_app` there is no grant to be wrong.
 async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize> {
     const APP_ROLE: &str = "epigraph_app";
-    const GRANTS: &[(&str, &str, bool)] = &[
-        (
-            "epigraph_operator_actor",
-            "public.epigraph_operator_actor(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operator_of_author",
-            "public.epigraph_operator_of_author(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operates_agents",
-            "public.epigraph_operates_agents(uuid)",
-            true,
-        ),
-        (
-            "epigraph_link_operator",
-            "public.epigraph_link_operator(uuid, uuid)",
-            false,
-        ),
-        (
-            "epigraph_link_retired_agent",
-            "public.epigraph_link_retired_agent(uuid, uuid)",
-            false,
-        ),
-        // 116 (batch HTTP-id): the attested retire of a former shared signer
-        // is a link function too, so the request DSN must not call it.
-        (
-            "epigraph_link_retired_shared_signer",
-            "public.epigraph_link_retired_shared_signer(uuid, uuid, uuid[])",
-            false,
-        ),
-        // 122 (operator binding). `default_decl_for_author` calls the check on
-        // the request path, so a missing grant is 42501 on every default-decl
-        // claim write once armed; the three reads it and the trigger use are
-        // app-callable for the same reason. Arming is a maintenance act.
-        (
-            "epigraph_require_bound_author",
-            "public.epigraph_require_bound_author(uuid)",
-            true,
-        ),
-        (
-            "epigraph_author_binding",
-            "public.epigraph_author_binding(uuid)",
-            true,
-        ),
-        (
-            "epigraph_is_human_operator",
-            "public.epigraph_is_human_operator(uuid)",
-            true,
-        ),
-        (
-            "epigraph_operator_binding_enforced",
-            "public.epigraph_operator_binding_enforced()",
-            true,
-        ),
-        (
-            "epigraph_arm_operator_binding",
-            "public.epigraph_arm_operator_binding()",
-            false,
-        ),
-        (
-            "epigraph_operator_writes_group",
-            "public.epigraph_operator_writes_group(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_operator_scope",
-            "public.epigraph_require_operator_scope(uuid, uuid)",
-            true,
-        ),
-        // Registering a human is a maintenance act; the request DSN must not.
-        (
-            "epigraph_register_human_operator",
-            "public.epigraph_register_human_operator(uuid, text, uuid)",
-            false,
-        ),
-        // The writer binding the claims trigger applies (review SEC-1/2/4):
-        // the request path's workflow-ingest caller check calls the first two,
-        // and every read is app-callable for the trigger's own reason.
-        (
-            "epigraph_require_bound_writer",
-            "public.epigraph_require_bound_writer(uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_writer_scope",
-            "public.epigraph_require_writer_scope(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_attributable",
-            "public.epigraph_require_attributable(uuid, uuid, boolean)",
-            true,
-        ),
-        (
-            "epigraph_human_of",
-            "public.epigraph_human_of(uuid, boolean)",
-            true,
-        ),
-        (
-            "epigraph_operator_binding_armed",
-            "public.epigraph_operator_binding_armed()",
-            true,
-        ),
-        (
-            "epigraph_revoke_human_operator",
-            "public.epigraph_revoke_human_operator(uuid, text)",
-            false,
-        ),
-        // Registering a system agent (migration 148) is a maintenance act.
-        (
-            "epigraph_register_system_agent",
-            "public.epigraph_register_system_agent(text, uuid, text)",
-            false,
-        ),
-        // 149 (the author-binding allowlist): allowing and revoking a client
-        // are maintenance acts, and the read helper is reached only through
-        // the two re-bodied binding reads above.
-        (
-            "epigraph_allow_author_binding_client",
-            "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_revoke_author_binding_client",
-            "public.epigraph_revoke_author_binding_client(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_allowlisted_operator",
-            "public.epigraph_allowlisted_operator(uuid)",
-            false,
-        ),
-        // A link function: the request DSN must never record links.
-        (
-            "epigraph_link_legacy_authors",
-            "public.epigraph_link_legacy_authors(uuid, uuid[], timestamp with time zone)",
-            false,
-        ),
-        // 123 (the custodian role): the request path reads its OWN role
-        // (subject-bound readers) and the audit trail; granting, ending,
-        // recording a custodial act and the unbound roster read are
-        // maintenance acts the request DSN must never call.
-        (
-            "epigraph_live_role_assignment",
-            "public.epigraph_live_role_assignment(uuid, text, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_role_assignment_for",
-            "public.epigraph_role_assignment_for(uuid, text, timestamp with time zone)",
-            true,
-        ),
-        (
-            "epigraph_holds_role",
-            "public.epigraph_holds_role(uuid, text, timestamp with time zone)",
-            true,
-        ),
-        (
-            "epigraph_grant_role",
-            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_end_role_assignment",
-            "public.epigraph_end_role_assignment(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_record_custodial_act",
-            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_platform_audit",
-            "public.epigraph_platform_audit(timestamp with time zone, integer)",
-            true,
-        ),
-        // 124 (passkeys): the unauthenticated enrollment ceremony runs on the
-        // request DSN, so its three definers (the reader, the challenge store,
-        // the completion) are app-callable; opening a ticket and revoking a
-        // passkey are maintenance acts the request DSN must never call.
-        (
-            "epigraph_create_passkey_enrollment",
-            "public.epigraph_create_passkey_enrollment(uuid, text, text)",
-            false,
-        ),
-        (
-            "epigraph_enrollment_for_ceremony",
-            "public.epigraph_enrollment_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_passkey_enrollment_challenge",
-            "public.epigraph_set_passkey_enrollment_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_complete_passkey_enrollment",
-            "public.epigraph_complete_passkey_enrollment(uuid, bytea, jsonb, uuid, text, boolean, boolean)",
-            true,
-        ),
-        (
-            "epigraph_revoke_passkey",
-            "public.epigraph_revoke_passkey(uuid, text)",
-            false,
-        ),
-        // 125 (elevation): the ticket API, the unauthenticated ceremony, the
-        // elevate grant and the viewer's liveness check all run on the request
-        // DSN, so the nine principal-bound or ticket-keyed definers are
-        // app-callable. The three unbound helpers are NOT: "who may elevate",
-        // "whose family is this" for any person would be a roster oracle, and
-        // ending another person's expired sessions is not the request DSN's.
-        (
-            "epigraph_create_elevation_ticket",
-            "public.epigraph_create_elevation_ticket(uuid, uuid, text, text, bytea)",
-            true,
-        ),
-        (
-            "epigraph_ticket_for_ceremony",
-            "public.epigraph_ticket_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_elevation_ticket_challenge",
-            "public.epigraph_set_elevation_ticket_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_passkeys_for_ticket",
-            "public.epigraph_passkeys_for_ticket(uuid)",
-            true,
-        ),
-        (
-            "epigraph_confirm_elevation",
-            "public.epigraph_confirm_elevation(uuid, bytea, bigint, boolean, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_redeem_elevation_ticket",
-            "public.epigraph_redeem_elevation_ticket(uuid, bytea, uuid)",
-            true,
-        ),
-        (
-            "epigraph_elevation_live",
-            "public.epigraph_elevation_live(uuid, uuid)",
-            true,
-        ),
-        (
-            "epigraph_end_elevation",
-            "public.epigraph_end_elevation(uuid, text)",
-            true,
-        ),
-        (
-            "epigraph_is_elevated",
-            "public.epigraph_is_elevated()",
-            true,
-        ),
-        (
-            "epigraph_live_elevating_assignment",
-            "public.epigraph_live_elevating_assignment(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_family_of_person_is_live",
-            "public.epigraph_family_of_person_is_live(uuid, uuid, uuid)",
-            false,
-        ),
-        (
-            "epigraph_elevated_access_ready",
-            "public.epigraph_elevated_access_ready()",
-            false,
-        ),
-        (
-            "epigraph_elevation_session_is_live",
-            "public.epigraph_elevation_session_is_live(uuid)",
-            false,
-        ),
-        (
-            "epigraph_end_expired_elevations",
-            "public.epigraph_end_expired_elevations(uuid, uuid)",
-            false,
-        ),
-        // 127 (the elevated-access log): the API's response layer and the MCP
-        // tool-call wrapper record on the request DSN, and the subject's read
-        // policy calls the admin-group helper as the application role, so all
-        // three are app-callable: the recorder refuses an unelevated
-        // connection (ELV07), the helper answers only for the caller, and the
-        // audit reader returns nothing to an unentitled caller.
-        (
-            "epigraph_record_elevated_access",
-            "public.epigraph_record_elevated_access(text, jsonb, integer, uuid[])",
-            true,
-        ),
-        (
-            "epigraph_admin_group_ids",
-            "public.epigraph_admin_group_ids()",
-            true,
-        ),
-        (
-            "epigraph_elevated_access_audit",
-            "public.epigraph_elevated_access_audit(timestamp with time zone, integer)",
-            true,
-        ),
-        // 128 (the admin-scope arming switch): the token endpoint reads the
-        // switch and records the would-strip measurement on the request DSN,
-        // so both are app-callable; arming and disarming are maintenance acts.
-        (
-            "epigraph_admin_scopes_armed",
-            "public.epigraph_admin_scopes_armed()",
-            true,
-        ),
-        (
-            "epigraph_record_admin_scope_would_strip",
-            "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
-            true,
-        ),
-        (
-            "epigraph_set_admin_scope_enforcement",
-            "public.epigraph_set_admin_scope_enforcement(boolean, text)",
-            false,
-        ),
-        // 130 (pending admin acts): proposing (elevation-gated) and the
-        // act-keyed confirmation ceremony run on the request DSN, so they are
-        // app-callable; consuming an act, the passkey oracle and the
-        // act-taking forms of the maintenance verbs are maintenance acts.
-        (
-            "epigraph_propose_admin_act",
-            "public.epigraph_propose_admin_act(text, jsonb, text, text)",
-            true,
-        ),
-        (
-            "epigraph_act_for_ceremony",
-            "public.epigraph_act_for_ceremony(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_admin_act_challenge",
-            "public.epigraph_set_admin_act_challenge(uuid, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_passkeys_for_act",
-            "public.epigraph_passkeys_for_act(uuid)",
-            true,
-        ),
-        // 200: the anchored enrollment page's reader, app-callable like 124's
-        // ceremony reader; the compromised revoke is a maintenance act like
-        // 124's revoke, which the request DSN must never call.
-        (
-            "epigraph_enrollment_anchor",
-            "public.epigraph_enrollment_anchor(uuid)",
-            true,
-        ),
-        (
-            "epigraph_revoke_passkey_compromised",
-            "public.epigraph_revoke_passkey_compromised(uuid, text)",
-            false,
-        ),
-        // 206: claim visibility controls, all five app-callable. The two
-        // reads run on every claim write that names no visibility
-        // (`ClaimRepository::resolve_visibility_choice`), so a
-        // missing grant there is 42501 on every default write, an outage like
-        // 107's actor read; the three writes are the publicize, share and
-        // default-team surfaces, which would be refused outright.
-        (
-            "epigraph_writable_teams",
-            "public.epigraph_writable_teams(uuid)",
-            true,
-        ),
-        // 234: `Viewer::resolve` asks it on EVERY viewer resolution, so a
-        // missing grant would be 42501 on every request (an outage), not a
-        // feature quietly off. The repo maps only 42883 (no such function,
-        // migration not yet applied) to "no team".
-        (
-            "epigraph_readable_teams",
-            "public.epigraph_readable_teams(uuid)",
-            true,
-        ),
-        (
-            "epigraph_default_group",
-            "public.epigraph_default_group(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_default_group",
-            "public.epigraph_set_default_group(uuid)",
-            true,
-        ),
-        (
-            "epigraph_publicize_claims",
-            "public.epigraph_publicize_claims(uuid[], text)",
-            true,
-        ),
-        (
-            "epigraph_share_claims_with_team",
-            "public.epigraph_share_claims_with_team(uuid[], uuid, text)",
-            true,
-        ),
-        // 209: the private-default read runs on every claim write that names
-        // no visibility (a missing grant is 42501 on every default write); the
-        // setter is the API, MCP and operator-CLI default surface.
-        (
-            "epigraph_default_private",
-            "public.epigraph_default_private(uuid)",
-            true,
-        ),
-        (
-            "epigraph_set_agent_default_group",
-            "public.epigraph_set_agent_default_group(uuid, uuid, boolean)",
-            true,
-        ),
-        // 207: the bug-report intake's two definers run on the request DSN
-        // (MCP submit_bug_report / list_my_bug_reports), so both are
-        // app-callable; a missing grant refuses every report (42501).
-        (
-            "epigraph_submit_bug_report",
-            "public.epigraph_submit_bug_report(text, text, text, text, text, text, text, bytea, bytea, text)",
-            true,
-        ),
-        (
-            "epigraph_my_bug_reports",
-            "public.epigraph_my_bug_reports(integer)",
-            true,
-        ),
-        // 207: the preflight runs on the request DSN before the embedding
-        // call; the caller gate takes a principal as an argument, so the
-        // request DSN must never call it (an oracle for any agent).
-        (
-            "epigraph_bug_report_preflight",
-            "public.epigraph_bug_report_preflight()",
-            true,
-        ),
-        (
-            "epigraph_bug_report_gate",
-            "public.epigraph_bug_report_gate(uuid, integer, integer, boolean)",
-            false,
-        ),
-        // 213: every agent client_credentials and refresh grant records its
-        // assertion nonce on the request DSN; a missing grant refuses every
-        // agent mint (500).
-        (
-            "epigraph_oauth_assertion_nonce_consume",
-            "public.epigraph_oauth_assertion_nonce_consume(bytea, bytea, timestamptz)",
-            true,
-        ),
-        (
-            "epigraph_confirm_admin_act",
-            "public.epigraph_confirm_admin_act(uuid, bytea, bigint, boolean, jsonb)",
-            true,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_consume_admin_act(uuid, text, bytea, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_has_live_passkey",
-            "public.epigraph_has_live_passkey(uuid)",
-            false,
-        ),
-        // The act-taking OVERLOADS share their names with the 123 / 124
-        // forms, and the presence check below reads the name; each is
-        // therefore keyed on `epigraph_consume_admin_act`, which exists
-        // exactly when 130 (and so the overload) does.
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_grant_role(text, uuid, timestamp with time zone, timestamp with time zone, uuid, text, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_end_role_assignment(uuid, text, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb, uuid)",
-            false,
-        ),
-        (
-            "epigraph_consume_admin_act",
-            "public.epigraph_create_passkey_enrollment(uuid, text, text, uuid)",
-            false,
-        ),
-        // 131: the proposer's own acts, principal-bound, on the request DSN.
-        (
-            "epigraph_admin_acts_of_principal",
-            "public.epigraph_admin_acts_of_principal(integer)",
-            true,
-        ),
-        // 161: the shared link body is a link function (maintenance only);
-        // the identity registration belongs to the attestor role alone; the
-        // prompt-history read is principal-gated and called on the request DSN.
-        (
-            "epigraph_link_operator_body",
-            "public.epigraph_link_operator_body(uuid, uuid, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_register_agent_identity",
-            "public.epigraph_register_agent_identity(bytea, uuid, text, text, text, bytea, jsonb)",
-            false,
-        ),
-        (
-            "epigraph_agent_prompt_history",
-            "public.epigraph_agent_prompt_history(uuid)",
-            true,
-        ),
-        // 161 (review CR6): the cut-over's legacy-key backfill is a
-        // maintenance act; the request DSN never runs it.
-        (
-            "epigraph_backfill_legacy_agent_keys",
-            "public.epigraph_backfill_legacy_agent_keys()",
-            false,
-        ),
-        // 164 re-states 077's viewer group-set read; `Viewer::resolve` calls
-        // it on the request DSN.
-        (
-            "epigraph_live_memberships",
-            "public.epigraph_live_memberships(uuid)",
-            true,
-        ),
-        // 164: creating a team group and changing its roster are maintenance
-        // acts; the request DSN must never call them.
-        (
-            "epigraph_create_team_group",
-            "public.epigraph_create_team_group(text, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_add_member",
-            "public.epigraph_team_group_add_member(uuid, uuid, text, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_remove_member",
-            "public.epigraph_team_group_remove_member(uuid, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_team_group_set_member_role",
-            "public.epigraph_team_group_set_member_role(uuid, uuid, text, text)",
-            false,
-        ),
-        // 165: binding a role to a group is a maintenance act, and the
-        // derivation and the roster answer for any principal (a roster
-        // oracle); the request DSN calls none of them. It reaches the
-        // derivation only through `epigraph_live_memberships` and the claims
-        // trigger's writer scope, both maintenance-owned.
-        (
-            "epigraph_define_group_role",
-            "public.epigraph_define_group_role(text, text, uuid, text, boolean, text)",
-            false,
-        ),
-        (
-            "epigraph_bind_group_role",
-            "public.epigraph_bind_group_role(text, uuid, text, boolean, text)",
-            false,
-        ),
-        // 179: the mode-taking overloads of the same two verbs (a binding
-        // that admits the holder and the role's attached agents only).
-        (
-            "epigraph_bind_group_role",
-            "public.epigraph_bind_group_role(text, uuid, text, text, text)",
-            false,
-        ),
-        (
-            "epigraph_define_group_role",
-            "public.epigraph_define_group_role(text, text, uuid, text, text, text)",
-            false,
-        ),
-        (
-            "epigraph_end_group_role_binding",
-            "public.epigraph_end_group_role_binding(uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_role_derived_memberships",
-            "public.epigraph_role_derived_memberships(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_group_role_roster",
-            "public.epigraph_group_role_roster(uuid, timestamp with time zone)",
-            false,
-        ),
-        // 166: attaching and detaching a role's agents is a maintenance act;
-        // the request DSN asks whether an agent may run, and reaches the write
-        // check only through the maintenance-owned writer checks; never the
-        // gate's any-time form.
-        (
-            "epigraph_attach_agent_to_role",
-            "public.epigraph_attach_agent_to_role(text, uuid, timestamp with time zone, \
-             timestamp with time zone, text)",
-            false,
-        ),
-        (
-            "epigraph_detach_agent_from_role",
-            "public.epigraph_detach_agent_from_role(text, uuid, text)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_gate",
-            "public.epigraph_role_agent_gate(uuid, timestamp with time zone)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_may_run",
-            "public.epigraph_role_agent_may_run(uuid)",
-            true,
-        ),
-        (
-            "epigraph_require_role_holder",
-            "public.epigraph_require_role_holder(uuid)",
-            false,
-        ),
-        // The author relief and the write trigger are reached only from
-        // maintenance-owned definers and triggers; the application role
-        // EXECUTEs neither.
-        (
-            "epigraph_agent_is_retired",
-            "public.epigraph_agent_is_retired(uuid)",
-            false,
-        ),
-        (
-            "epigraph_role_agent_write_check",
-            "public.epigraph_role_agent_write_check()",
-            false,
-        ),
-        // 180: the legacy-parent rule reads the FORCEd `operator_links` in its
-        // own maintenance-owned frame, so an app grant would be an existence
-        // oracle over links the application role cannot read; recording a
-        // succession after the fact is a maintenance act.
-        (
-            "epigraph_is_legacy_fleet_parent",
-            "public.epigraph_is_legacy_fleet_parent(uuid)",
-            false,
-        ),
-        (
-            "epigraph_record_legacy_succession",
-            "public.epigraph_record_legacy_succession(uuid, uuid, text, text)",
-            false,
-        ),
-        // 181: the member-removal route marks the re-key obligation through
-        // it on the request DSN; without the grant every removal is 42501.
-        (
-            "epigraph_mark_group_reseal_required",
-            "public.epigraph_mark_group_reseal_required(uuid)",
-            true,
-        ),
-        // 191: retiring a live link is a maintenance act; an app grant would
-        // let the request DSN end an agent's authority (and revoke its
-        // membership) for any agent.
-        (
-            "epigraph_retire_operator_link",
-            "public.epigraph_retire_operator_link(uuid, text, boolean)",
-            false,
-        ),
-        // 198: the request path builds the agent-lookup card through it;
-        // without the grant find_agent / get_agent fail 42501.
-        (
-            "epigraph_disclosed_role_assignments",
-            "public.epigraph_disclosed_role_assignments(uuid[])",
-            true,
-        ),
-        // 199: every claim read (REST GET /api/v1/claims/:id, MCP get_claim)
-        // calls it on the request DSN for `authored_by.prompt_snapshot`;
-        // without the grant every claim read is 42501.
-        (
-            "epigraph_agent_prompt_snapshot_at",
-            "public.epigraph_agent_prompt_snapshot_at(uuid, timestamptz, boolean)",
-            true,
-        ),
-        // 199: every claim read calls it on the request DSN for
-        // `authored_by.human` (the filer's and each ingester's human);
-        // without the grant every claim read is 42501.
-        (
-            "epigraph_operator_bound_at",
-            "public.epigraph_operator_bound_at(uuid, timestamptz)",
-            true,
-        ),
-        // 208: MCP `countersign_authorship` calls it on the request DSN as
-        // the caller; without the grant every countersign is 42501.
-        (
-            "epigraph_countersign_authorship",
-            "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
-            true,
-        ),
-        // 219: the `evolve_step` gate calls it on the request DSN (REST and
-        // MCP); without the grant every evolve of an executed step is 42501.
-        (
-            "epigraph_step_lineage_executors",
-            "public.epigraph_step_lineage_executors(uuid)",
-            true,
-        ),
-    ];
-
     let app_exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
             .bind(APP_ROLE)
@@ -3237,7 +3243,7 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         return Ok(0);
     }
     let mut failures = 0usize;
-    for (name, signature, app_must_execute) in GRANTS {
+    for (name, signature, app_must_execute) in OPERATOR_FUNCTION_GRANTS {
         // Presence by SIGNATURE, not by name: a name can exist through an
         // older overload while the registered signature is installed by a
         // migration not applied yet (179's text overloads beside 165's
