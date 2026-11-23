@@ -933,6 +933,146 @@ fn backfill_factors_refuses_a_targeted_real_run_without_its_list_and_snapshots()
     assert_eq!(left.len(), 1, "only the wave file: {left:?}");
 }
 
+/// A flag that would do nothing in the chosen mode is refused from argv
+/// (exit 2, before any connection) rather than silently ignored: a page
+/// bound on a targeted run, a pass cap without `--until-fixed`, a snapshot
+/// file on a predict, a predict report on an apply, a targeted switch on the
+/// un-targeted phase, and `--written-before` outside `rewire-edges`.
+#[test]
+fn backfill_factors_refuses_flags_that_would_do_nothing() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let list = dir.join("accepted.txt");
+    std::fs::write(&list, "").expect("empty list");
+    let f = |name: &str| path_str(&dir.join(name)).to_string();
+    let (snap, rows, pj) = (f("snap.jsonl"), f("rows.jsonl"), f("predict.json"));
+    let w = path_str(&wave).to_string();
+    let l = path_str(&list).to_string();
+    let targeted = |extra: &[&str]| -> Vec<String> {
+        let mut a: Vec<String> = ["--phase", "rewire-edges", "--sources-from-waves", &w]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        a.extend(extra.iter().map(|s| (*s).to_string()));
+        a
+    };
+    let real = |extra: &[&str]| -> Vec<String> {
+        let mut a = targeted(&[
+            "--edges-from",
+            &l,
+            "--snapshot",
+            &snap,
+            "--edge-rows",
+            &rows,
+        ]);
+        a.extend(extra.iter().map(|s| (*s).to_string()));
+        a
+    };
+    let plain = |extra: &[&str]| -> Vec<String> { extra.iter().map(|s| (*s).to_string()).collect() };
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (targeted(&["--dry-run", "--limit", "5"]), "--limit"),
+        (targeted(&["--dry-run", "--offset", "5"]), "--offset"),
+        (
+            targeted(&["--dry-run", "--written-before", "2026-01-01T00:00:00Z"]),
+            "--written-before",
+        ),
+        (targeted(&["--dry-run", "--max-passes", "10"]), "--max-passes"),
+        (targeted(&["--dry-run", "--snapshot", &snap]), "--snapshot"),
+        (targeted(&["--dry-run", "--edge-rows", &rows]), "--edge-rows"),
+        (real(&["--predict-json", &pj]), "--predict-json"),
+        (real(&["--limit", "5"]), "--limit"),
+        (
+            plain(&["--phase", "rewire-edges", "--dry-run", "--max-passes", "3"]),
+            "--max-passes",
+        ),
+        (
+            plain(&["--phase", "rewire-edges", "--dry-run", "--epsilon", "1e-6"]),
+            "--epsilon",
+        ),
+        (
+            plain(&["--phase", "rewire-edges", "--dry-run", "--rewrite-unchanged"]),
+            "--rewrite-unchanged",
+        ),
+        (
+            plain(&["--phase", "edges", "--dry-run", "--written-before", "2026-01-01T00:00:00Z"]),
+            "--written-before",
+        ),
+    ];
+    for (args, needle) in cases {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = run(
+            BACKFILL_FACTORS,
+            &argv,
+            &[("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none")],
+        );
+        assert_eq!(
+            r.code,
+            Some(2),
+            "{argv:?} must be refused\nstdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains(needle) && r.stderr.contains("refused rather than ignored"),
+            "{argv:?}: the refusal names {needle}; stderr: {}",
+            r.stderr
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(left.len(), 2, "only the wave and list files: {left:?}");
+}
+
+/// The control for [`backfill_factors_refuses_flags_that_would_do_nothing`]:
+/// the same flags where they DO act get past the argv check and fail only
+/// at the connection (no `DATABASE_URL`), so the refusals above are the
+/// argv check's doing.
+#[test]
+fn backfill_factors_accepts_the_same_flags_where_they_act() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let w = path_str(&wave).to_string();
+    let pj = path_str(&dir.join("predict.json")).to_string();
+    let cases: Vec<Vec<&str>> = vec![
+        vec![
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            &w,
+            "--dry-run",
+            "--until-fixed",
+            "--max-passes",
+            "10",
+            "--epsilon",
+            "1e-6",
+            "--predict-json",
+            &pj,
+        ],
+        vec![
+            "--phase",
+            "rewire-edges",
+            "--dry-run",
+            "--limit",
+            "5",
+            "--offset",
+            "5",
+            "--written-before",
+            "2026-01-01T00:00:00Z",
+        ],
+        vec!["--phase", "edges", "--dry-run", "--limit", "5", "--offset", "1"],
+    ];
+    for argv in cases {
+        let r = run(BACKFILL_FACTORS, &argv, &[]);
+        assert_ne!(r.code, Some(2), "{argv:?}\nstdout: {}\nstderr: {}", r.stdout, r.stderr);
+        assert!(
+            r.stderr.contains("DATABASE_URL not set"),
+            "{argv:?} reached the connection; stderr: {}",
+            r.stderr
+        );
+    }
+}
+
 /// A real targeted rewire is a writing run: under mode skew it is refused
 /// (exit 3) like every other writing run of this binary, before it creates
 /// its snapshot files or writes anything.

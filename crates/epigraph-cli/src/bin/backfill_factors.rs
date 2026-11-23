@@ -41,7 +41,14 @@
 //! default (`--only-changed`, kept as an explicit spelling of the default):
 //! a rewrite of an unchanged row bumps its `created_at` and refolds its
 //! target for nothing, and the verify would count it as a rewrite.
-//! `--rewrite-unchanged` opts out, for predict and apply alike. On a cycle, a finite `--epsilon` leaves each row
+//! `--rewrite-unchanged` opts out, for predict and apply alike.
+//!
+//! A flag that would do nothing in the chosen mode is refused (exit 2) rather
+//! than ignored: `--limit`, `--offset` and `--written-before` on a targeted
+//! run, `--max-passes` without `--until-fixed` (one pass), `--snapshot` and
+//! `--edge-rows` on a predict, `--predict-json` on an apply, the targeted
+//! switches on the un-targeted phases, `--written-before` outside
+//! `rewire-edges`. On a cycle, a finite `--epsilon` leaves each row
 //! within about epsilon of a fresh wire, so there the verify is bounded (no
 //! hold, every |d_edge| below the run's tolerance) rather than empty. Undo an
 //! apply with `restore_edge_factors --edge-rows` and then
@@ -69,12 +76,13 @@ struct Cli {
     /// Which phase to run
     #[arg(long, value_enum, default_value_t = Phase::All)]
     phase: Phase,
-    /// Process at most N rows in each phase (0 = unlimited)
-    #[arg(long, default_value_t = 0)]
-    limit: usize,
-    /// Skip first N rows (paginate)
-    #[arg(long, default_value_t = 0)]
-    offset: usize,
+    /// Process at most N rows in each phase (0, the default, = unlimited).
+    /// Not in targeted mode, which takes its edges from the waves.
+    #[arg(long)]
+    limit: Option<usize>,
+    /// Skip first N rows (paginate; default 0). Not in targeted mode.
+    #[arg(long)]
+    offset: Option<usize>,
     /// Log what would be written without persisting
     #[arg(long)]
     dry_run: bool,
@@ -100,12 +108,15 @@ struct Cli {
     /// (must not exist).
     #[arg(long)]
     predict_json: Option<PathBuf>,
-    /// rewire-edges, targeted: stop after this many passes.
-    #[arg(long, default_value_t = DEFAULT_MAX_PASSES)]
-    max_passes: usize,
-    /// rewire-edges, targeted: a target moved when bel or pl changed by more.
-    #[arg(long, default_value_t = DEFAULT_EPSILON)]
-    epsilon: f64,
+    /// rewire-edges, targeted, with --until-fixed: stop after this many
+    /// passes (default 10). Without --until-fixed the run is one pass, so
+    /// the flag is refused there rather than ignored.
+    #[arg(long)]
+    max_passes: Option<usize>,
+    /// rewire-edges, targeted: a target moved when bel or pl changed by more
+    /// (default 1e-9).
+    #[arg(long)]
+    epsilon: Option<f64>,
     /// rewire-edges, targeted: leave a row alone when a fresh wire equals it.
     /// The default; accepted as its explicit spelling.
     #[arg(long, conflicts_with = "rewrite_unchanged")]
@@ -128,28 +139,82 @@ struct Cli {
     edge_rows: Option<PathBuf>,
 }
 
-/// Why a targeted invocation is refused before it touches the database, if
-/// it is: a real run is always a list, with both snapshot files.
-fn targeted_argv_problem(cli: &Cli) -> Option<String> {
+/// Why an invocation is refused before it touches the database, if it is.
+///
+/// A flag that would do nothing in the chosen mode is refused rather than
+/// silently ignored: an operator who passes `--max-passes 10` without
+/// `--until-fixed`, or `--limit` to a targeted run, believes the run is
+/// bounded in a way it is not. And a real targeted run is always an
+/// accepted list, with both snapshot files.
+fn argv_problem(cli: &Cli) -> Option<String> {
+    fn named(flags: &[(bool, &'static str)]) -> Vec<&'static str> {
+        flags.iter().filter(|(set, _)| *set).map(|(_, f)| *f).collect()
+    }
+    let refuse = |flags: Vec<&str>, why: &str| -> Option<String> {
+        (!flags.is_empty()).then(|| {
+            format!(
+                "{} {why}; refused rather than ignored",
+                flags.join(", ")
+            )
+        })
+    };
     if cli.sources_from_waves.is_empty() {
-        let targeted_only = cli.edges_from.is_some()
-            || cli.predict_json.is_some()
-            || cli.snapshot.is_some()
-            || cli.edge_rows.is_some()
-            || cli.only_changed
-            || cli.rewrite_unchanged
-            || cli.until_fixed;
-        return targeted_only.then(|| {
-            "--edges-from, --predict-json, --snapshot, --edge-rows, --only-changed, \
-             --rewrite-unchanged and --until-fixed need targeted mode (--sources-from-waves)"
-                .to_string()
-        });
+        let targeted_only = named(&[
+            (cli.edges_from.is_some(), "--edges-from"),
+            (cli.predict_json.is_some(), "--predict-json"),
+            (cli.snapshot.is_some(), "--snapshot"),
+            (cli.edge_rows.is_some(), "--edge-rows"),
+            (cli.only_changed, "--only-changed"),
+            (cli.rewrite_unchanged, "--rewrite-unchanged"),
+            (cli.until_fixed, "--until-fixed"),
+            (cli.max_passes.is_some(), "--max-passes"),
+            (cli.epsilon.is_some(), "--epsilon"),
+        ]);
+        if let Some(p) = refuse(targeted_only, "need targeted mode (--sources-from-waves)") {
+            return Some(p);
+        }
+        return refuse(
+            named(&[(
+                cli.written_before.is_some() && cli.phase != Phase::RewireEdges,
+                "--written-before",
+            )]),
+            "applies only to --phase rewire-edges",
+        );
     }
     if cli.phase != Phase::RewireEdges {
         return Some("--sources-from-waves needs --phase rewire-edges".into());
     }
+    if let Some(p) = refuse(
+        named(&[
+            (cli.limit.is_some(), "--limit"),
+            (cli.offset.is_some(), "--offset"),
+            (cli.written_before.is_some(), "--written-before"),
+        ]),
+        "page the un-targeted phase only (a targeted run takes its edges from the waves \
+         and --edges-from)",
+    ) {
+        return Some(p);
+    }
+    if let Some(p) = refuse(
+        named(&[(cli.max_passes.is_some() && !cli.until_fixed, "--max-passes")]),
+        "needs --until-fixed (without it a targeted run is one pass)",
+    ) {
+        return Some(p);
+    }
     if cli.dry_run {
-        return None;
+        return refuse(
+            named(&[
+                (cli.snapshot.is_some(), "--snapshot"),
+                (cli.edge_rows.is_some(), "--edge-rows"),
+            ]),
+            "record a real run's writes (a --dry-run predict writes none)",
+        );
+    }
+    if let Some(p) = refuse(
+        named(&[(cli.predict_json.is_some(), "--predict-json")]),
+        "is the --dry-run predict's report (a real run writes none)",
+    ) {
+        return Some(p);
     }
     let mut missing = Vec::new();
     if cli.edges_from.is_none() {
@@ -186,7 +251,7 @@ async fn main() {
         .init();
 
     let cli = Cli::parse();
-    if let Some(problem) = targeted_argv_problem(&cli) {
+    if let Some(problem) = argv_problem(&cli) {
         eprintln!("backfill_factors: {problem}");
         std::process::exit(2);
     }
@@ -242,12 +307,13 @@ async fn run(
     pool: sqlx::PgPool,
     viewer: &epigraph_db::visibility::Viewer,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (limit, offset) = (cli.limit.unwrap_or(0), cli.offset.unwrap_or(0));
     if matches!(cli.phase, Phase::All | Phase::Evidence) {
-        let summary = run_evidence_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_evidence_phase(&pool, viewer, limit, offset, cli.dry_run).await?;
         println!("evidence phase: {summary}");
     }
     if matches!(cli.phase, Phase::All | Phase::Edges) {
-        let summary = run_edge_phase(&pool, viewer, cli.limit, cli.offset, cli.dry_run).await?;
+        let summary = run_edge_phase(&pool, viewer, limit, offset, cli.dry_run).await?;
         println!("edge phase: {summary}");
     }
     if cli.phase == Phase::RewireEdges && !cli.sources_from_waves.is_empty() {
@@ -255,8 +321,8 @@ async fn run(
     }
     if cli.phase == Phase::RewireEdges {
         let opts = RewireOptions {
-            limit: cli.limit,
-            offset: cli.offset,
+            limit,
+            offset,
             dry_run: cli.dry_run,
             written_before: cli.written_before,
         };
@@ -267,7 +333,7 @@ async fn run(
             // page must step past them or it reselects them forever.
             println!(
                 "rewire-edges paging: next --offset {} (same --written-before)",
-                cli.offset + summary.persisting()
+                offset + summary.persisting()
             );
             if !summary.made_progress() {
                 eprintln!(
@@ -322,11 +388,16 @@ async fn run_targeted(
                 .map_err(|e| format!("{}: {e}", p.display()))?,
         );
     }
-    let seed = seed_from_waves(&records, cli.epsilon);
+    let epsilon = cli.epsilon.unwrap_or(DEFAULT_EPSILON);
+    let seed = seed_from_waves(&records, epsilon);
     let opts = TargetedRunOptions {
         edges: cli.edges_from.as_deref().map(read_edge_list).transpose()?,
-        max_passes: if cli.until_fixed { cli.max_passes } else { 1 },
-        epsilon: cli.epsilon,
+        max_passes: if cli.until_fixed {
+            cli.max_passes.unwrap_or(DEFAULT_MAX_PASSES)
+        } else {
+            1
+        },
+        epsilon,
         only_changed: !cli.rewrite_unchanged,
         ..TargetedRunOptions::default()
     };
