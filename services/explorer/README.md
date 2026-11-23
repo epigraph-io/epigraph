@@ -79,6 +79,7 @@ generates includes the base path.
 | `GET /atlas` | The Atlas: a zoomable map of regions, themes and claims (Topics view). Deep links are `/atlas#c-<32 hex claim id>` |
 | `GET /bff/claim/{id}` · `/bff/search` · `/bff/graph/ego/{id}?max_degree=` · `/bff/themes` · `/bff/communities` · `/bff/neighborhood/{id}` | JSON for the canvas |
 | `GET /bff/atlas/layout` · `/bff/atlas/theme/{id}/claims` · `/bff/atlas/claim/{id}` · `/bff/atlas/links` · `/bff/atlas/search` · `/bff/atlas/resolve/{key}` | JSON for the Atlas, every response `private, no-store` |
+| `GET /bff/atlas/sources?theme_id=&kind=&after=&limit=` · `/bff/atlas/timeline?theme_id=&from=&to=&after=&limit=` | JSON for a theme's Sources and Timeline panels (P3b, P3c), over the kernel's `GET /sources/overview` and `GET /claims?theme_id=&include_links=true`; an API without those routes or filters is a 503 that says so |
 | `GET /auth/login` · `GET /auth/callback` · `POST /auth/logout` · `POST /auth/redeem` | Sign-in (see Security model) |
 | `GET /health` | Liveness: `{"status":"ok","version":"…"}` |
 | `GET /static/{path}` | Compiled-in CSS/JS |
@@ -90,6 +91,17 @@ exception is `/claim/{id}`. For an anonymous visitor it returns **200** with a
 sign-in prompt and OpenGraph tags, because a redirect would unfurl in chat
 apps as a login page. `/atlas` does the same, and its sign-in link keeps the
 `#c-…` fragment in `return_to`.
+
+A theme's panel offers **Sources** (papers with their authors and DOI link,
+agents that filed claims directly, web domains, each with the claims the viewer
+can read) and **Timeline** (the theme's current claims by filing date on one
+SVG lane, ticks by year, quarter, month, week or day, and arcs from the earlier
+to the later of two linked claims, toned support or oppose by relationship).
+Their rules are pure functions in `static/atlas_views.js`, tested with
+`node --test js-tests/atlas_views.test.cjs`. Links are drawn within each page
+of up to 100 claims, not between pages. Not built yet: the zoomable Sources and
+Timeline tabs of the design (lanes per source, `x…`/`tc-` deep links), the
+provenance panel's `authored_by` and ingestion notes, and tours.
 
 The Atlas draws on a canvas with a few d3 modules (`d3-color`,
 `d3-interpolate`, `d3-ease`, `d3-hierarchy`, `d3-dispatch`, `d3-timer`,

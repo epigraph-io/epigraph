@@ -28,6 +28,11 @@
  *   simulation. Every level request names the map, the hierarchy and the
  *   level. The rules (flow styles, switch, placement, addressing) live in
  *   atlas_nested.js. Without the attribute themes behave as before.
+ * - Sources and Timeline (P3b, P3c): a theme's panel offers its sources
+ *   (data-sources-url: papers with authors and DOI, agents, web domains)
+ *   and its timeline (data-timeline-url: its claims by filing date, with
+ *   arcs between linked claims), drawn in the panel as lists and an SVG
+ *   lane built with createElementNS. The rules live in atlas_views.js.
  * - Safety: untrusted strings reach the DOM only through textContent or
  *   setAttribute on non-URL attributes. Local URLs from data must pass
  *   localPath; the only external link is a DOI that passes doiHref. No
@@ -130,6 +135,8 @@
     ['themes', 'data-themes-url'],
     ['login', 'data-login-url'],
     ['atlas', 'data-atlas-url'],
+    ['sources', 'data-sources-url'],
+    ['timeline', 'data-timeline-url'],
   ]) {
     cfg[key] = localPath(root.getAttribute(attr));
   }
@@ -137,6 +144,7 @@
   const PREVIEW = MODE === 'preview';
   cfg.claimPage = localPath(root.getAttribute('data-claim-page-prefix'));
   const NESTED = window.AtlasNested || null;
+  const VIEWS = window.AtlasViews || null;
   // A prefix, not a path: <this><map key>/<hierarchy>/<claim id>.
   cfg.claimLeaf = NESTED ? NESTED.localPrefix(root.getAttribute('data-atlas-claim-leaf-url')) : null;
 
@@ -2236,6 +2244,7 @@
       return;
     }
     if (node.kind !== 'root' && node.kind !== 'unplaced') dom.panelBody.appendChild(el('p', 'small muted', countText(node)));
+    if (node.kind === 'theme') themeViewButtons(node);
     if (node.state === 'error') unavailable(section(null), node.error, () => retryNode(node));
     const kids = node.children || [];
     if (node.kind !== 'root' && node.children === null && node.state !== 'error') {
@@ -2531,6 +2540,188 @@
         if (isAbort(e)) return;
         setPanelStatus('');
         unavailable(box, e.message, () => showLinksPanel(a, b));
+      }
+    };
+    load(null);
+  }
+
+  // ---- sources and timeline (P3b, P3c) --------------------------------------
+
+  /** A theme's Sources and Timeline buttons, when the page has the routes. */
+  function themeViewButtons(theme) {
+    if (!VIEWS || !uuid(theme.id) || (!cfg.sources && !cfg.timeline)) return;
+    const s = section(null);
+    s.className = 'atlas__section atlas__views';
+    if (cfg.sources) s.appendChild(button('button-quiet', 'Sources', () => showSourcesPanel(theme)));
+    if (cfg.timeline) s.appendChild(button('button-quiet', 'Timeline', () => showTimelinePanel(theme)));
+  }
+
+  function backToTheme(theme) {
+    dom.panelBody.appendChild(button('button-quiet atlas__back', '← ' + (theme.label || 'Back to the theme'), () => select(theme, false)));
+  }
+
+  /** Who said what in one theme: papers, agents and web sources, paged. */
+  function showSourcesPanel(theme) {
+    clearPanel('Sources · ' + (theme.label || 'Untitled'));
+    backToTheme(theme);
+    setPanelStatus('Loading sources…');
+    const signal = signalFor('panel');
+    const box = section(null);
+    let all = [];
+    const load = async (after) => {
+      const url = VIEWS.sourcesUrl(cfg.sources, theme.id, after);
+      if (!url) return;
+      try {
+        const body = await getJSON(url, signal);
+        setPanelStatus('');
+        all = all.concat(Array.isArray(body.sources) ? body.sources : []);
+        while (box.firstChild) box.removeChild(box.firstChild);
+        const groups = VIEWS.sourceGroups(all);
+        if (!groups.length) box.appendChild(el('p', 'small muted', 'No sources you can read in this theme.'));
+        for (const g of groups) {
+          box.appendChild(el('h4', 'small', g.title));
+          const ul = el('ul', 'atlas__list');
+          for (const it of g.items) {
+            const li = el('li');
+            if (it.href && it.external && doiHref(it.href)) {
+              const a = el('a', null, it.label);
+              a.setAttribute('href', doiHref(it.href));
+              a.setAttribute('rel', 'noopener noreferrer');
+              a.setAttribute('target', '_blank');
+              li.appendChild(a);
+            } else if (it.href && !it.external) {
+              li.appendChild(link(it.href, it.label));
+            } else {
+              li.appendChild(el('span', null, it.label));
+            }
+            li.appendChild(el('span', 'small muted', ' · ' + VIEWS.countWords(it.count)));
+            if (it.detail) li.appendChild(el('div', 'small muted', it.detail));
+            ul.appendChild(li);
+          }
+          box.appendChild(ul);
+        }
+        if (body.next) {
+          box.appendChild(button('button-quiet', 'Show more sources', () => load(body.next)));
+        }
+      } catch (e) {
+        if (isAbort(e)) return;
+        setPanelStatus('');
+        unavailable(box, e.message, () => showSourcesPanel(theme));
+      }
+    };
+    load(null);
+  }
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const TL = { width: 560, height: 150, lane: 104, axis: 132 };
+
+  function svgEl(tag, attrs, text) {
+    const e = document.createElementNS(SVG_NS, tag);
+    for (const k of Object.keys(attrs || {})) e.setAttribute(k, String(attrs[k]));
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+
+  function toneColour(tone) {
+    if (tone === 'support') return colours.accent;
+    if (tone === 'oppose') return colours.critical;
+    return colours.muted;
+  }
+
+  /** One lane: ticks, arcs from earlier to later claims, then the dots. */
+  function drawTimeline(box, page) {
+    const lay = VIEWS.timelineLayout(page.claims, page.links, { width: TL.width, pad: 18, maxRise: TL.lane - 16, maxTicks: 6 });
+    const svg = svgEl('svg', {
+      class: 'atlas__timeline',
+      viewBox: '0 0 ' + TL.width + ' ' + TL.height,
+      role: 'group',
+      'aria-label': 'Claims by filing date',
+    });
+    svg.appendChild(svgEl('line', { x1: 0, y1: TL.lane, x2: TL.width, y2: TL.lane, stroke: colours.outline, 'stroke-width': 0.5 }));
+    for (const t of lay.ticks) {
+      const x = t.x;
+      svg.appendChild(svgEl('line', { x1: x, y1: TL.lane + 4, x2: x, y2: TL.axis - 10, stroke: colours.muted, 'stroke-width': 0.5 }));
+      svg.appendChild(svgEl('text', { x, y: TL.axis + 4, 'text-anchor': 'middle', class: 'atlas__timeline-tick', fill: colours.muted }, t.label));
+    }
+    for (const a of lay.arcs) {
+      const mid = (a.x1 + a.x2) / 2;
+      const path = svgEl('path', {
+        d: 'M ' + a.x1 + ' ' + TL.lane + ' Q ' + mid + ' ' + (TL.lane - 2 * a.rise) + ' ' + a.x2 + ' ' + TL.lane,
+        fill: 'none',
+        stroke: toneColour(a.tone),
+        'stroke-width': 1.2,
+        'stroke-opacity': 0.75,
+      });
+      path.appendChild(svgEl('title', null, a.relationship));
+      svg.appendChild(path);
+    }
+    for (const d of lay.dots) {
+      const dot = svgEl('circle', {
+        cx: d.x,
+        cy: TL.lane,
+        r: 4.5,
+        fill: fillFor(d.truth),
+        stroke: colours.outline,
+        'stroke-width': 0.5,
+        class: 'atlas__timeline-dot',
+        tabindex: 0,
+        role: 'button',
+        'aria-label': d.label,
+      });
+      dot.appendChild(svgEl('title', null, VIEWS.dayLabel(new Date(d.t).toISOString()) + ' · ' + d.label));
+      dot.addEventListener('click', () => followClaim(d.id));
+      dot.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          followClaim(d.id);
+        }
+      });
+      svg.appendChild(dot);
+    }
+    box.appendChild(svg);
+    const ul = el('ul', 'atlas__list');
+    for (const d of lay.dots) {
+      const li = el('li');
+      li.appendChild(button('atlas__item', VIEWS.dayLabel(new Date(d.t).toISOString()) + ' · ' + d.label, () => followClaim(d.id)));
+      ul.appendChild(li);
+    }
+    box.appendChild(ul);
+  }
+
+  /** One theme's claims by filing date, with the links among them, paged. */
+  function showTimelinePanel(theme) {
+    clearPanel('Timeline · ' + (theme.label || 'Untitled'));
+    backToTheme(theme);
+    setPanelStatus('Loading the timeline…');
+    const signal = signalFor('panel');
+    const box = section(null);
+    let page = { claims: [], links: [] };
+    let truncated = false;
+    let pages = 0;
+    const load = async (after) => {
+      const url = VIEWS.timelineUrl(cfg.timeline, theme.id, after);
+      if (!url) return;
+      try {
+        const body = await getJSON(url, signal);
+        setPanelStatus('');
+        page = VIEWS.mergePages(page, body);
+        pages += 1;
+        truncated = truncated || body.links_truncated === true;
+        while (box.firstChild) box.removeChild(box.firstChild);
+        if (!page.claims.length) {
+          box.appendChild(el('p', 'small muted', 'No current claims you can read in this theme.'));
+          return;
+        }
+        drawTimeline(box, page);
+        const notes = [];
+        if (truncated) notes.push('Not every link between these claims is drawn.');
+        if (pages > 1 || body.next) notes.push('Links are drawn within each page of claims, not between pages.');
+        for (const n of notes) box.appendChild(el('p', 'small muted', n));
+        if (body.next) box.appendChild(button('button-quiet', 'Show later claims', () => load(body.next)));
+      } catch (e) {
+        if (isAbort(e)) return;
+        setPanelStatus('');
+        unavailable(box, e.message, () => showTimelinePanel(theme));
       }
     };
     load(null);

@@ -455,6 +455,13 @@ async fn atlas_page_signed_in_is_a_shell_without_inline_script_or_style() {
     assert!(body.contains(r#"data-layout-url="/explorer/bff/atlas/layout""#));
     assert!(body.contains(r#"data-resolve-prefix="/explorer/bff/atlas/resolve/""#));
     assert!(body.contains(r#"data-themes-url="/explorer/bff/themes""#));
+    assert!(body.contains(r#"data-sources-url="/explorer/bff/atlas/sources""#));
+    assert!(body.contains(r#"data-timeline-url="/explorer/bff/atlas/timeline""#));
+    // The view rules load before atlas.js reads them, content-hashed.
+    let views = body
+        .find("src=\"/explorer/static/atlas_views.js?v=")
+        .expect("atlas_views.js is loaded and hashed");
+    assert!(views < body.find("src=\"/explorer/static/atlas.js").unwrap());
     // With no map list the page lays out as before: the nested leaf legend
     // takes no row (hidden, not just invisible) and the controls are hidden.
     assert!(!body.contains("data-atlas-maps"));
@@ -540,6 +547,22 @@ async fn every_atlas_route_is_built_at_both_mounts() {
                   "items": [link_item(E1, "supports", C1, C2)], "next": null})),
     )
     .await;
+    mount_get(
+        &app,
+        "/api/v1/sources/overview",
+        ok(
+            json!({"sources": [{"kind": "agent", "id": AGENT, "display_name": "A",
+                               "claim_count": 1}], "next_cursor": null}),
+        ),
+    )
+    .await;
+    mount_get(
+        &app,
+        "/api/v1/claims",
+        ok(json!({"claims": [], "total": 0, "limit": 100, "offset": 0,
+                  "next_cursor": null, "links": [], "links_truncated": false})),
+    )
+    .await;
     let sid = app.sign_in("tok");
 
     for base in ["/explorer", ""] {
@@ -559,6 +582,8 @@ async fn every_atlas_route_is_built_at_both_mounts() {
             format!("/bff/atlas/links?from={T}&to={T2}"),
             "/bff/atlas/search?q=water".to_string(),
             format!("/bff/atlas/resolve/c-{}", simple(C1)),
+            format!("/bff/atlas/sources?theme_id={T}"),
+            format!("/bff/atlas/timeline?theme_id={T}"),
         ] {
             let uri = format!("{base}{route}");
             let res = app.get_as(&uri, &sid).await;
@@ -592,6 +617,8 @@ async fn atlas_bff_routes_require_sign_in() {
         format!("/explorer/bff/atlas/links?from={T}&to={T2}"),
         "/explorer/bff/atlas/search?q=x".to_string(),
         format!("/explorer/bff/atlas/resolve/c-{}", simple(C1)),
+        format!("/explorer/bff/atlas/sources?theme_id={T}"),
+        format!("/explorer/bff/atlas/timeline?theme_id={T}"),
     ] {
         let res = app.get(&uri).await;
         assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{uri}");
@@ -2706,6 +2733,54 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
         let body = &js[js.find(f).expect(f)..];
         assert!(body[..body.find("\n  }\n").unwrap()].contains("await goToResolved(res)"));
     }
+}
+
+/// A theme's panel offers Sources and Timeline (P3b, P3c) from the page's
+/// `data-sources-url` and `data-timeline-url`, through the tested rules in
+/// static/atlas_views.js, and the timeline lane is SVG built element by
+/// element (the parse-free rule of `atlas_js_never_parses_strings_as_code_or_html`
+/// still holds for the whole file).
+#[test]
+fn atlas_js_theme_panel_offers_sources_and_timeline() {
+    let js = include_str!("../static/atlas.js");
+    for needed in [
+        "['sources', 'data-sources-url'],",
+        "['timeline', 'data-timeline-url'],",
+        "const VIEWS = window.AtlasViews || null;",
+    ] {
+        assert!(js.contains(needed), "atlas.js reads {needed}");
+    }
+    let body = |name: &str| -> &str {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let panel = body("function showNodePanel(");
+    let offer = panel
+        .find("if (node.kind === 'theme') themeViewButtons(node);")
+        .expect("a theme panel offers the views");
+    let off_map = panel.find("if (node.offMap)").expect("off-map gate");
+    assert!(off_map < offer, "a theme not on the map offers nothing");
+    let buttons = body("function themeViewButtons(");
+    assert!(
+        buttons.contains("showSourcesPanel(theme)") && buttons.contains("showTimelinePanel(theme)")
+    );
+    let sources = body("function showSourcesPanel(");
+    assert!(sources.contains("VIEWS.sourcesUrl(cfg.sources, theme.id, after)"));
+    assert!(sources.contains("VIEWS.sourceGroups(all)"));
+    assert!(
+        sources.contains("doiHref(it.href)"),
+        "a paper links out only through doiHref"
+    );
+    let timeline = body("function showTimelinePanel(");
+    assert!(timeline.contains("VIEWS.timelineUrl(cfg.timeline, theme.id, after)"));
+    assert!(timeline.contains("VIEWS.mergePages(page, body)"));
+    let draw = body("function drawTimeline(");
+    assert!(draw.contains("VIEWS.timelineLayout("));
+    assert!(
+        draw.contains("followClaim(d.id)"),
+        "a dot opens its claim on the map"
+    );
+    assert!(body("function svgEl(").contains("document.createElementNS(SVG_NS, tag)"));
 }
 
 /// The leaf legend is un-hidden only once the page has a map list, and in
