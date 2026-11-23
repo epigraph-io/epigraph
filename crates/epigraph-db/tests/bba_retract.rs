@@ -16,6 +16,8 @@
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+#[path = "support/maintenance_login.rs"]
+mod login;
 
 use epigraph_db::repos::atom_axiom::atom_input_rows;
 use epigraph_db::repos::compound_valuation::compound_own_rows;
@@ -1602,4 +1604,440 @@ async fn no_session_clears_a_retraction_outside_the_unretract_definer(pool: PgPo
         (true, Some(w.owner), Some("superseded".to_string()))
     );
     assert!(unretract_rows(&pool, id).await.is_empty());
+}
+
+/// Backlog 6bdac68f (migration 251): a MAINTENANCE session cannot clear a
+/// retraction outside the un-retract definer either. Before 251 the clear
+/// guard admitted any statement run "as the maintenance role"
+/// (`epigraph_definer_bypass()`) that also set `epigraph.mf_unretract_id`,
+/// and a maintenance login is the maintenance role, so it could set the marker
+/// and UPDATE the retract columns to NULL with no audit row. Since 251 the
+/// clear is admitted only by consuming an unretract grant of the ledger, which
+/// only `epigraph_mf_guard_grant` writes. Checked on a REAL NOSUPERUSER login
+/// connected with its own password, and on the maintenance role itself; then
+/// the same login un-retracts through the definer (stamped as the owner),
+/// which still works, audits, and leaves one consumed ledger row naming the
+/// login and the row as it was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_maintenance_login_cannot_clear_a_retraction_but_the_definer_still_can(pool: PgPool) {
+    let w = world(&pool).await;
+    let p = pool.clone();
+    let (owner, id) = (w.owner, w.owner_bba);
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        MassFunctionRepository::retract_conn(&mut conn, id, "superseded", None)
+            .await
+            .expect("the owner retracts its BBA");
+        (conn, ())
+    })
+    .await;
+
+    const CLEAR: &str = "UPDATE mass_functions \
+                            SET retracted_at = NULL, retracted_by = NULL, retract_reason = NULL \
+                          WHERE id = $1";
+    let (role, login) = login::maintenance_login(&pool, "t63u").await;
+
+    // The forged clear, on the login: the marker set for this transaction,
+    // then the UPDATE.
+    let mut tx = login.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.mf_unretract_id', $1, true)")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("any session sets the marker");
+    let forged = sqlx::query(CLEAR).bind(id).execute(&mut *tx).await;
+    drop(tx);
+
+    // The same on the maintenance role itself.
+    let maint = fixture::downgraded_pool(&pool, "epigraph_maintenance").await;
+    let mut tx = maint.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('epigraph.mf_unretract_id', $1, true)")
+        .bind(id.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("set the marker");
+    let forged_role = sqlx::query(CLEAR).bind(id).execute(&mut *tx).await;
+    drop(tx);
+    maint.close().await;
+
+    let state_after_forgery = retract_columns(&pool, id).await;
+    let audits_after_forgery = unretract_rows(&pool, id).await.len();
+
+    // The definer, on the same login, stamped as the BBA's owner.
+    let mut conn = login.acquire().await.expect("acquire");
+    stamp(&mut conn, &pool, owner).await;
+    let unretracted =
+        MassFunctionRepository::unretract_conn(&mut conn, id, "maintenance un-retract", None).await;
+    drop(conn);
+    login::drop_login(&pool, &role, login).await;
+
+    for (who, r) in [
+        ("a maintenance login", forged),
+        ("the maintenance role", forged_role),
+    ] {
+        let (code, message) = db_message(r, &format!("{who} cannot forge the clear"));
+        assert_eq!(code, "42501", "{who}: {message}");
+        assert!(message.contains("RT06"), "{who}: {message}");
+    }
+    assert_eq!(
+        state_after_forgery,
+        (true, Some(w.owner), Some("superseded".to_string())),
+        "the forged clears changed nothing"
+    );
+    assert_eq!(audits_after_forgery, 0);
+
+    let unretracted = unretracted.expect("the un-retract definer works on a maintenance login");
+    assert_eq!(unretracted.status, BbaUnretractStatus::Unretracted);
+    assert_eq!(unretracted.arm, BbaRetractArm::Owner);
+    assert_eq!(retract_columns(&pool, id).await, (false, None, None));
+    let audit = unretract_rows(&pool, id).await;
+    assert_eq!(audit.len(), 1, "the definer audits once: {audit:#?}");
+    assert_eq!(audit[0].1["reason"], "maintenance un-retract");
+    let ledger = ledger_rows(&pool, id).await;
+    assert_eq!(ledger.len(), 1, "one ledger grant: {ledger:#?}");
+    let (kind, granted_by, consumed_by, row) = &ledger[0];
+    assert_eq!(kind, "unretract");
+    assert_eq!(granted_by, &role, "the grant names the login");
+    assert_eq!(consumed_by.as_deref(), Some(role.as_str()));
+    let row = row.as_ref().expect("the guard recorded the row");
+    assert_eq!(row["id"], id.to_string());
+    assert_eq!(
+        row["retract_reason"], "superseded",
+        "the row as it was: {row}"
+    );
+}
+
+/// The retracted-BBA ledger rows naming `id`: `(kind, grant_login,
+/// consumed_login, consumed_row)`, oldest first.
+async fn ledger_rows(
+    pool: &PgPool,
+    id: Uuid,
+) -> Vec<(String, String, Option<String>, Option<serde_json::Value>)> {
+    sqlx::query_as(
+        "SELECT kind, grant_login::text, consumed_login::text, consumed_row \
+           FROM public.mass_function_purge_grants WHERE mf_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .expect("read the ledger")
+}
+
+// ---------------------------------------------------------------------------
+// Backlog 6bdac68f: no session's own code runs as the ledger's owner
+// ---------------------------------------------------------------------------
+
+/// The session's trap: a domain `pg_temp.text` whose check runs the session's
+/// own function. Any body that resolves the type name `text` without
+/// `pg_catalog` first and `pg_temp` last (an INVOKER trigger whose path omits
+/// `pg_temp`, or a function a maintenance login re-pathed with `ALTER
+/// FUNCTION`) runs it, as whatever role that body runs as. It records that
+/// role and tries to write a purge grant for the victim straight into the
+/// ledger, in either table shape (with and without 251's `kind`), swallowing
+/// the refusal so the attack goes on.
+const TRAP: &str = r#"
+CREATE FUNCTION pg_temp.t63_probe(v pg_catalog.text) RETURNS pg_catalog.bool
+LANGUAGE plpgsql AS $f$
+BEGIN
+    PERFORM pg_catalog.set_config('t63.ran_as',
+        pg_catalog.concat_ws(',', pg_catalog.current_setting('t63.ran_as', true),
+                             current_user::pg_catalog.text), false);
+    BEGIN
+        EXECUTE 'INSERT INTO public.mass_function_purge_grants (mf_id, kind, reason) '
+                'VALUES ($1, ''purge'', ''forged'')'
+          USING pg_catalog.current_setting('t63.victim')::pg_catalog.uuid;
+    EXCEPTION WHEN OTHERS THEN NULL;
+    END;
+    BEGIN
+        EXECUTE 'INSERT INTO public.mass_function_purge_grants (mf_id, reason) '
+                'VALUES ($1, ''forged'')'
+          USING pg_catalog.current_setting('t63.victim')::pg_catalog.uuid;
+    EXCEPTION WHEN OTHERS THEN NULL;
+    END;
+    RETURN true;
+END $f$;
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.t63_probe(VALUE));
+"#;
+
+/// What the session does inside the trapped transaction before it tries the
+/// victim's delete.
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    /// Un-retract the decoy through the definer, stamped as its owner.
+    UnretractDecoy,
+    /// Purge an id that does not exist (the DELETE matches nothing, but its
+    /// statement triggers fire).
+    PurgeNothing,
+    /// Call the ledger's own functions directly, with the session's path
+    /// searching `pg_temp` first.
+    CallTheLedger,
+}
+
+#[derive(Debug)]
+struct Probe {
+    /// Every role the trap ran as.
+    ran_as: String,
+    /// `epigraph_mf_purge_granted(victim)` at the end: true when a forged
+    /// grant is waiting.
+    forged: Result<bool, String>,
+    /// The victim's delete: rows deleted, or the refusal.
+    deleted: Result<u64, String>,
+}
+
+async fn in_savepoint<'c, T, F>(
+    tx: &mut sqlx::Transaction<'c, sqlx::Postgres>,
+    f: F,
+) -> Result<T, String>
+where
+    F: for<'t> FnOnce(
+        &'t mut PgConnection,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, sqlx::Error>> + Send + 't>,
+    >,
+{
+    sqlx::query("SAVEPOINT p").execute(&mut **tx).await.unwrap();
+    let r = f(tx).await;
+    if r.is_err() {
+        sqlx::query("ROLLBACK TO SAVEPOINT p")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+    }
+    sqlx::query("RELEASE SAVEPOINT p")
+        .execute(&mut **tx)
+        .await
+        .unwrap();
+    r.map_err(|e| e.to_string())
+}
+
+/// One attack, on `session`, in ONE transaction that is rolled back: arm the
+/// trap, apply `alters` (statements a maintenance login may run on functions
+/// its role owns), do `act`, then try to delete `victim`.
+async fn probe(
+    session: &PgPool,
+    pool: &PgPool,
+    w: &World,
+    victim: Uuid,
+    alters: &[&str],
+    act: Act,
+) -> Probe {
+    let mut tx = session.begin().await.expect("begin");
+    sqlx::query("SELECT set_config('t63.victim', $1, false), set_config('t63.ran_as', '', false)")
+        .bind(victim.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("name the victim");
+    for sql in alters {
+        sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("the session alters a function its role owns: {sql}: {e}"));
+    }
+    sqlx::raw_sql(TRAP)
+        .execute(&mut *tx)
+        .await
+        .expect("arm the trap");
+    match act {
+        Act::UnretractDecoy => {
+            stamp(&mut tx, pool, w.owner).await;
+            let decoy = w.owner_bba;
+            let r = in_savepoint(&mut tx, |c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "SELECT public.epigraph_unretract_mass_function($1, 'decoy', NULL, NULL)",
+                    )
+                    .bind(decoy)
+                    .execute(c)
+                    .await
+                })
+            })
+            .await;
+            r.expect("the decoy un-retraction goes through the definer");
+        }
+        Act::PurgeNothing => {
+            let _ = in_savepoint(&mut tx, |c| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "SELECT public.epigraph_purge_mass_functions(ARRAY[$1]::uuid[], 'nothing')",
+                    )
+                    .bind(Uuid::new_v4())
+                    .execute(c)
+                    .await
+                })
+            })
+            .await;
+        }
+        Act::CallTheLedger => {
+            sqlx::query("SET LOCAL search_path = pg_temp, public")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            for sql in [
+                "SELECT public.epigraph_mf_guard_grant('purge', ARRAY[$1]::uuid[], 'unrelated', NULL)",
+                "SELECT public.epigraph_mf_guard_consume('purge', $1, '{}'::jsonb)",
+                "SELECT public.epigraph_mf_purge_granted($1)",
+            ] {
+                let id = Uuid::new_v4();
+                let _ = in_savepoint(&mut tx, |c| {
+                    Box::pin(async move { sqlx::query(sql).bind(id).execute(c).await })
+                })
+                .await;
+            }
+            sqlx::query("SET LOCAL search_path = \"$user\", public")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+    }
+    // The delete runs stamped as the victim's own writer, so row security
+    // lets an application session reach the row and only the guard decides.
+    stamp(&mut tx, pool, w.other).await;
+    let forged = in_savepoint(&mut tx, |c| {
+        Box::pin(async move {
+            sqlx::query_scalar::<_, bool>("SELECT public.epigraph_mf_purge_granted($1)")
+                .bind(victim)
+                .fetch_one(c)
+                .await
+        })
+    })
+    .await;
+    let ran_as: String = sqlx::query_scalar("SELECT current_setting('t63.ran_as')")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let deleted = in_savepoint(&mut tx, |c| {
+        Box::pin(async move {
+            sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(victim)
+                .execute(c)
+                .await
+                .map(|r| r.rows_affected())
+        })
+    })
+    .await;
+    tx.rollback().await.expect("rollback");
+    Probe {
+        ran_as,
+        forged,
+        deleted,
+    }
+}
+
+fn assert_probe_refused(p: &Probe, who: &str, what: &str, may_run_as: &[&str]) {
+    let foreign: Vec<&str> = p
+        .ran_as
+        .split(',')
+        .filter(|r| !r.is_empty() && !may_run_as.contains(r))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "{who}, {what}: the session's own code ran as {foreign:?}, a role it does not hold: \
+         {p:?}"
+    );
+    assert_eq!(
+        p.forged.as_ref().ok(),
+        Some(&false),
+        "{who}, {what}: a forged purge grant is waiting: {p:?}"
+    );
+    let refused = p.deleted.as_ref().err().is_some_and(|e| e.contains("SR09"));
+    assert!(
+        refused,
+        "{who}, {what}: the victim's delete must be refused SR09: {p:?}"
+    );
+}
+
+/// Backlog 6bdac68f, the attack class a review of the first fix found: a
+/// session makes a type of its own in `pg_temp`, then drives code that runs
+/// as the ledger's owner into resolving that type name, so its own function
+/// runs with the owner's privileges and writes a grant. Before this change
+/// the un-retract and purge definers ran as the owner, and inside them ran
+/// 184's guard (an INVOKER body on a path without `pg_temp`, so the temporary
+/// schema was searched first) and every maintenance-owned function and
+/// trigger on the tables they write, which any maintenance login may re-path
+/// or flip to SECURITY INVOKER with `ALTER FUNCTION`. Now only three small
+/// functions run as the owner and the guard lists `pg_temp` last.
+///
+/// Every probe runs on REAL NOSUPERUSER logins (maintenance and
+/// application), in a transaction that is rolled back; each must leave the
+/// trap never run as a role the login does not hold (for the application
+/// login that includes the maintenance role, which 184's guard ran as inside
+/// the un-retract definer), no forged grant, and the victim's delete refused
+/// SR09.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_session_runs_its_own_code_as_the_ledger_owner(pool: PgPool) {
+    let w = world(&pool).await;
+    let p = pool.clone();
+    let (owner, other, decoy, victim) = (w.owner, w.other, w.owner_bba, w.other_bba);
+    fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, owner).await;
+        MassFunctionRepository::retract_conn(&mut conn, decoy, "decoy", None)
+            .await
+            .expect("retract the decoy");
+        stamp(&mut conn, &p, other).await;
+        MassFunctionRepository::retract_conn(&mut conn, victim, "victim", None)
+            .await
+            .expect("retract the victim");
+        (conn, ())
+    })
+    .await;
+
+    const FLIP_ELEVATED: &str = "ALTER FUNCTION public.epigraph_is_elevated() \
+                                 SECURITY INVOKER SET search_path = public";
+    const FLIP_STMT_TRIGGER: &str = "ALTER FUNCTION public.epigraph_role_agent_write_check() \
+                                     SECURITY INVOKER SET search_path = public";
+
+    let (mrole, maint) = login::maintenance_login(&pool, "t63pm").await;
+    let mut results = Vec::new();
+    for (what, alters, act) in [
+        ("the un-retract definer", &[][..], Act::UnretractDecoy),
+        (
+            "the un-retract definer, epigraph_is_elevated flipped",
+            &[FLIP_ELEVATED][..],
+            Act::UnretractDecoy,
+        ),
+        (
+            "a purge of nothing, the statement trigger flipped",
+            &[FLIP_STMT_TRIGGER][..],
+            Act::PurgeNothing,
+        ),
+        ("the ledger's own functions", &[][..], Act::CallTheLedger),
+    ] {
+        results.push((
+            "a maintenance login",
+            what,
+            vec![mrole.clone(), "epigraph_maintenance".to_string()],
+            probe(&maint, &pool, &w, victim, alters, act).await,
+        ));
+    }
+    login::drop_login(&pool, &mrole, maint).await;
+
+    let (arole, app) = login::app_login(&pool, "t63pa").await;
+    for (what, act) in [
+        ("the un-retract definer", Act::UnretractDecoy),
+        ("the ledger's own functions", Act::CallTheLedger),
+    ] {
+        results.push((
+            "an application login",
+            what,
+            vec![arole.clone(), "epigraph_app".to_string()],
+            probe(&app, &pool, &w, victim, &[], act).await,
+        ));
+    }
+    login::drop_login(&pool, &arole, app).await;
+
+    for (who, what, may_run_as, p) in &results {
+        let may: Vec<&str> = may_run_as.iter().map(String::as_str).collect();
+        assert_probe_refused(p, who, what, &may);
+    }
+    assert!(
+        retract_columns(&pool, victim).await.0,
+        "the victim is still there, retracted"
+    );
+    let forged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM public.mass_function_purge_grants WHERE reason = 'forged'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(forged, 0);
 }

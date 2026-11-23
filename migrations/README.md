@@ -3862,6 +3862,64 @@ restart.
   (`consistent` is necessary, not sufficient, for a genuine record). Rows
   outside the snapshot passed the guard, so the procedure can only
   over-classify. Drop the snapshot table afterwards.
+- **251**: public `retracted_bba_guard_owner` (backlog 6bdac68f). Closes the residual 184
+  and 194 recorded: a maintenance login could write a row of `mass_function_purge_grants`
+  itself (the maintenance role held INSERT on it because its definers needed it) and then
+  delete a retracted BBA with no audit row, and could set `epigraph.mf_unretract_id` and
+  clear a retraction with no audit row (184's clear guard admitted any statement run as the
+  maintenance role). Moving the definers to a NOLOGIN owner is not enough on its own: the
+  definers write tables whose policies and triggers call maintenance-owned functions, which
+  any maintenance login may `ALTER` (to SECURITY INVOKER, or onto a path that searches the
+  session's `pg_temp` first for type names), and 184's INVOKER guard did not list `pg_temp`,
+  so a session's own type in `pg_temp` could run its code as the owner. 251 therefore keeps
+  the privileged frame tiny: `mass_function_purge_grants` becomes an append-only LEDGER
+  (`kind` purge/unretract, `grant_login` = `session_user`, `granted_at`, and the consumption
+  `consumed_at`, `consumed_login`, `consumed_row`; an identity key replaces (mf_id, xact_id);
+  an index on (xact_id, mf_id, kind)), owned by the runner, with no trigger and no row
+  security. `epigraph_bba_guard_owner` (NOLOGIN, no attribute, a member of no role, granted
+  to none) holds only SELECT, INSERT and UPDATE of the three consumption columns on it, and
+  owns exactly three SECURITY DEFINER functions on `pg_catalog, pg_temp` that touch nothing
+  but the ledger: `epigraph_mf_guard_grant(kind, ids, reason, granted_by)` (EXECUTE:
+  maintenance), `epigraph_mf_guard_consume(kind, id, row)` (EXECUTE: maintenance,
+  application, a non-superuser `mass_functions` owner) and 194's `epigraph_mf_purge_granted`
+  (now: unconsumed purge grants). 194's delete guard and 184's clear arm admit only by
+  consuming a grant with `to_jsonb(OLD)`; the retract guard's path now lists `pg_temp` last.
+  The purge and un-retract definers stay maintenance-owned and write their grants through
+  `epigraph_mf_guard_grant` (the purge keeps them instead of deleting them; the un-retract
+  no longer sets the marker, whose `proconfig` entry stays, inert). `REVOKE ALL` on the
+  ledger from the maintenance role. `epigraph_bba_guard_owner_faults()` (SECURITY INVOKER,
+  runner-owned, EXECUTE to the maintenance role): every way the owner or the ledger could
+  be reached, `{}` when sound (a member of it, ADMIN-only grants included; ADMIN OPTION on
+  it; any non-superuser CREATEROLE role; any other role that can write the ledger,
+  `pg_write_all_data` included; the owner's attributes, memberships, extra objects or ledger
+  DELETE/TRUNCATE/UPDATE; a trigger or row security on the ledger); the migration refuses
+  `55000` unless it is `{}` at the end, and `epigraph-tenancy-backfill verify` reports every
+  fault. Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the five bodies
+  it re-states are those at 250 (retract guard, delete guard, helper, purge and un-retract
+  definers; the retract guard may also be on `pg_catalog, public, pg_temp`, the interim
+  mitigation of backlog eff4aaf5), and `epigraph_maintenance` exists. A login that may not create the role or
+  re-own to it is refused `42501`. An existing owner role holding the maintenance role (an
+  earlier draft of this change) has that membership revoked. What a maintenance login can
+  still do: call `epigraph_mf_guard_grant` itself (the definers its role owns must) and then
+  delete or un-retract, as it could through the definers; the ledger keeps a row it cannot
+  remove, naming its login and the row's content. Not changed: 184's MARK arm still admits a
+  maintenance session. Pinned by `epigraph-db/tests/bba_guard_owner.rs` (what runs as the
+  owner at head, the fault check calibrated on every way to reach it, the bodies before,
+  the refusals, the earlier draft's membership, the undo), `bba_retract.rs`
+  (`no_session_runs_its_own_code_as_the_ledger_owner`: a `pg_temp` type trap through the
+  un-retract definer, a flipped maintenance-owned definer, a flipped statement trigger and
+  the ledger's own functions, on real maintenance and application logins; the forged clear
+  and the ledger row of a real un-retract), `mass_function_purge_guard.rs` (d, d2, d3, d4,
+  e, f, g), `schema_contract.rs`, `epigraph-cli`'s register test and
+  `verify_reports_a_ledger_another_role_can_write`, and `operator_delete_frames.rs` (the
+  census). Undo: `docs/runbooks/251-undo.sql` (restores the five bodies, the retract guard
+  on `pg_catalog, public, pg_temp` rather than 184's path, and 194's table shape; keep the
+  ledger first; leaves the role and names the statement that drops it).
+  Slot assigned by the 2026-11-22 backlog triage; checked before claiming: no migration on
+  main or any origin branch carries a `251`. **Deploy order:** install the `delete-frames`
+  built with 251 together with it (an older one refuses its purge over 251, rolled back);
+  the API and MCP binaries need no change. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 - **252**: `admin_audit_agent_key_events` (backlog 6492de67). Re-states 112's
   `epigraph_admin_audit_write` (an md5 precondition refuses to apply over any other body)
   to accept two more event types, `agent_keys.admin_rotate` and `agent_keys.admin_revoke`,

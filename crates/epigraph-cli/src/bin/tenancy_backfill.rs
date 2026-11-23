@@ -183,6 +183,13 @@ use uuid::Uuid;
 /// the role `epigraph_definer_bypass()` (migration 067) tests membership of.
 const MAINTENANCE_ROLE: &str = "epigraph_maintenance";
 
+/// Migration 251's NOLOGIN owner of the retracted-BBA grant ledger, and the
+/// registered definer it took over from the maintenance role (194's helper,
+/// which reads the ledger only that owner may). [`verify_bba_guard_owner`]
+/// checks that role, its three functions and the ledger in full.
+const LEDGER_OWNER_ROLE: &str = "epigraph_bba_guard_owner";
+const LEDGER_OWNED_DEFINERS: &[&str] = &["epigraph_mf_purge_granted"];
+
 /// The world group: a SHAPE CONSTANT, never an owner (plan §2.3).
 const WORLD: Uuid = Uuid::nil();
 
@@ -1876,7 +1883,9 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Fails CLOSED under a non-member owner: such an owner holds no privilege
     // on `mass_function_purge_grants` (only `epigraph_maintenance` does), so
     // its read is refused and every delete of a retracted row, the purge
-    // definer's included, errors with nothing deleted (loud).
+    // definer's included, errors with nothing deleted (loud). Since 251 its
+    // owner is the ledger's (`LEDGER_OWNER_ROLE`), which the ownership check
+    // accepts for it and `verify_bba_guard_owner` checks.
     ("epigraph_mf_purge_granted", 194),
     // 194 (H10), the audited purge of retracted mass functions. Fails CLOSED
     // under a non-member owner: its grant INSERT is refused (no privilege on
@@ -2710,6 +2719,10 @@ async fn verify_definer_ownership(pool: &PgPool) -> anyhow::Result<usize> {
                 );
             }
             Some((_, true)) => {}
+            // 251: the ledger's helper belongs to the ledger's owner, which no
+            // login can act as; `verify_bba_guard_owner` checks it in full.
+            Some((rolname, false))
+                if rolname == LEDGER_OWNER_ROLE && LEDGER_OWNED_DEFINERS.contains(&f.as_str()) => {}
             Some((rolname, false)) => {
                 failures += 1;
                 eprintln!(
@@ -3728,6 +3741,44 @@ async fn verify_no_maintenance_create_on_public(pool: &PgPool) -> anyhow::Result
     Ok(1)
 }
 
+/// 251 (backlog 6bdac68f): `epigraph_bba_guard_owner`, the NOLOGIN owner of
+/// the retracted-BBA grant ledger, is reachable by no role and owns only the
+/// ledger's three functions, and only it can write the ledger. The migration
+/// refuses to apply otherwise, but a grant made AFTER it (a role granted the
+/// owner, ADMIN OPTION on it, a CREATEROLE role, `pg_write_all_data` or a
+/// direct privilege on the ledger given to a login, a trigger on the ledger)
+/// silently reopens what it closed: a login that can act as the owner, or
+/// write the ledger, deletes or un-retracts a retracted BBA with no record.
+/// Every fault `epigraph_bba_guard_owner_faults()` names is a failure. Skipped
+/// (with a NOTE) before 251.
+async fn verify_bba_guard_owner(pool: &PgPool) -> anyhow::Result<usize> {
+    let applies: bool = sqlx::query_scalar(
+        "SELECT to_regprocedure('public.epigraph_bba_guard_owner_faults()') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !applies {
+        eprintln!(
+            "NOTE: skipping the retracted-BBA ledger check — migration 251 has not been \
+             applied, so public.epigraph_bba_guard_owner_faults() does not exist."
+        );
+        return Ok(0);
+    }
+    let faults: Vec<String> =
+        sqlx::query_scalar("SELECT unnest(public.epigraph_bba_guard_owner_faults())")
+            .fetch_all(pool)
+            .await?;
+    for fault in &faults {
+        eprintln!(
+            "FAIL: retracted-BBA ledger: {fault}. Only the ledger's three functions may act as \
+             {LEDGER_OWNER_ROLE} or write public.mass_function_purge_grants; while this holds, \
+             a session that can deletes or un-retracts a retracted BBA with no record. Remove \
+             the membership, attribute, privilege or object named (docs/deploy.md, the 251 row)."
+        );
+    }
+    Ok(faults.len())
+}
+
 /// 166: every public table the application role can write carries the
 /// role-holder write check (`role_agent_write_check`, a BEFORE ... FOR EACH
 /// STATEMENT trigger) on INSERT, UPDATE, DELETE and TRUNCATE, except
@@ -3808,6 +3859,7 @@ async fn verify(pool: &PgPool, mode: Option<LegacyOwner>) -> anyhow::Result<usiz
     failures += verify_operator_function_grants(pool).await?;
     failures += verify_no_maintenance_create_on_public(pool).await?;
     failures += verify_role_holder_write_check_coverage(pool).await?;
+    failures += verify_bba_guard_owner(pool).await?;
 
     // A4. NOT the plan's rationale: an earlier revision of this comment said
     // "the derivation is total, because claims.agent_id is NOT NULL". NOT NULL
@@ -4607,11 +4659,14 @@ mod definer_register_tests {
             .iter()
             .map(|(n, _, _)| *n)
             .collect();
+        // 251: registered, but owned by the ledger's NOLOGIN owner at head.
+        let ledger_owned: BTreeSet<&str> = super::LEDGER_OWNED_DEFINERS.iter().copied().collect();
         let listed: BTreeSet<&str> = register()
             .into_iter()
             .chain(INVOKER_EXEMPT.iter().copied())
             .chain(PRE_REGISTER_DEFINERS.iter().copied())
             .filter(|n| !dedicated.contains(n))
+            .filter(|n| !ledger_owned.contains(n))
             .collect();
         // A dedicated-owner definer is owned by EXACTLY its role at head (a
         // silently no-opped re-own leaves it with epigraph_maintenance, which
@@ -4634,6 +4689,26 @@ mod definer_register_tests {
                 !owners.is_empty() && owners.iter().all(|o| o == role),
                 "public.{name} must be owned by {role} at head (migration {version}); found \
                  {owners:?}"
+            );
+        }
+        for name in &ledger_owned {
+            assert!(
+                register().contains(name),
+                "LEDGER_OWNED_DEFINERS names public.{name}, which is not registered"
+            );
+            let owner: String = sqlx::query_scalar(
+                "SELECT pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+                   JOIN pg_namespace n ON n.oid = p.pronamespace \
+                  WHERE n.nspname = 'public' AND p.proname = $1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("public.{name}: {e}"));
+            assert_eq!(
+                owner,
+                super::LEDGER_OWNER_ROLE,
+                "public.{name} is listed as the ledger owner's at head"
             );
         }
         let unlisted: Vec<&&str> = owned.difference(&listed).collect();
@@ -4971,5 +5046,51 @@ mod definer_register_tests {
                 "a stray app grant on {signature} is reported"
             );
         }
+    }
+
+    /// `verify` reports a ledger the owner no longer alone writes (251,
+    /// backlog 6bdac68f): a login granted INSERT on it, and row security
+    /// enabled on it, are each a failure. CONTROL: at head it passes. Both
+    /// faults are local to this test's database (a GRANT of the owner role
+    /// itself would be cluster-wide; `bba_guard_owner.rs` covers those inside
+    /// rolled-back transactions).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn verify_reports_a_ledger_another_role_can_write(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_bba_guard_owner(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        let login = format!("t63_ledger_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE ROLE {login} LOGIN NOSUPERUSER"))
+            .execute(&pool)
+            .await
+            .expect("a login");
+        sqlx::query(&format!(
+            "GRANT INSERT ON public.mass_function_purge_grants TO {login}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("a stray grant");
+        let one = super::verify_bba_guard_owner(&pool).await.expect("check");
+        sqlx::query("ALTER TABLE public.mass_function_purge_grants ENABLE ROW LEVEL SECURITY")
+            .execute(&pool)
+            .await
+            .expect("row security on the ledger");
+        let two = super::verify_bba_guard_owner(&pool).await.expect("check");
+        sqlx::query(&format!(
+            "REVOKE ALL ON public.mass_function_purge_grants FROM {login}"
+        ))
+        .execute(&pool)
+        .await
+        .expect("revoke");
+        sqlx::query(&format!("DROP ROLE {login}"))
+            .execute(&pool)
+            .await
+            .expect("drop the login");
+        assert_eq!(one, 1, "a login that can write the ledger is reported");
+        assert_eq!(two, 2, "and row security on it as well");
     }
 }
