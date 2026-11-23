@@ -1307,10 +1307,11 @@ restart.
     every request that carries a delegated run token (`dlg`), and the
     run-token grant reads it before it mints one. Both go through
     `AgentRepository::delegated_principal_pool`, which calls
-    `epigraph_author_binding` and `epigraph_human_of`. The viewer reads it
-    for every principal: `Viewer::resolve` reads
-    `epigraph_live_memberships`, which calls `epigraph_human_of` since 164
-    and reads `author_binding_clients` directly since 235. Webhook delivery
+    `epigraph_author_binding` and `epigraph_human_of`. The viewer can reach
+    it for any principal: `Viewer::resolve` reads
+    `epigraph_live_memberships`, which calls `epigraph_human_of` for
+    team-group rows (since 164) and reads `author_binding_clients` directly
+    for personal-group rows (since 235). Webhook delivery
     resolves its subscriber through `Viewer::resolve`, so it reads it too.
     The mint's operated-agent refusal (`refuse_operated_agent`) still does
     not consult it.
