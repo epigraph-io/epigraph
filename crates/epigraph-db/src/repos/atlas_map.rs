@@ -160,6 +160,31 @@ pub struct MapLevel {
     pub nothing_left: bool,
 }
 
+/// One run of one map as an operator undo reads it, from
+/// [`AtlasMapRepository::run_for_undo`].
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
+pub struct MapRunForUndo {
+    pub id: Uuid,
+    pub algo: String,
+    pub params: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    /// `None` while a build is still writing the run.
+    pub finished_at: Option<DateTime<Utc>>,
+    pub level_count: Option<i32>,
+    /// Stored `meaning` level documents of the run.
+    pub meaning_levels: i64,
+    /// Stored `links` level documents of the run.
+    pub links_levels: i64,
+    /// Runs of the same map whose `params` name this run as their source
+    /// (`nightly_from_run`, `named_from_run`), oldest first.
+    pub dependents: Vec<Uuid>,
+    /// The latest finished run of the map: the one served now.
+    pub served_now: Option<Uuid>,
+    /// The latest finished run of the map other than this one: the one
+    /// served once this run is gone (`None`: the map would have none).
+    pub served_after: Option<Uuid>,
+}
+
 /// Per-team Atlas map storage. See the module documentation.
 pub struct AtlasMapRepository;
 
@@ -557,6 +582,92 @@ impl AtlasMapRepository {
         .bind(owner)
         .bind(visibility)
         .bind(keep)
+        .execute(&mut *conn)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    // ── operator undo (backlog b3e39c55) ─────────────────────────────────────
+
+    /// What an operator undo of one run needs to know about it, as `viewer`
+    /// may read it, in one statement: the run row, its stored levels per
+    /// hierarchy, the runs of the same map whose `params` name it as their
+    /// source (`nightly_from_run`, `named_from_run`), the run served now and
+    /// the run that would be served without it. `None` when `map` has no run
+    /// `run_id` (another map's run included: every read names the map's
+    /// tenancy columns).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn run_for_undo(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        map: AtlasMap,
+        run_id: Uuid,
+    ) -> Result<Option<MapRunForUndo>, DbError> {
+        let (owner, visibility) = map.tenancy();
+        let sql = viewer.splice(
+            "SELECT r.id, r.algo, r.params, r.created_at, r.finished_at, r.level_count, \
+                    (SELECT COUNT(*) FROM atlas_map_levels l \
+                      WHERE l.run_id = r.id AND l.hierarchy = 'meaning' \
+                        /* {VISIBILITY:l} */)::int8 AS meaning_levels, \
+                    (SELECT COUNT(*) FROM atlas_map_levels k \
+                      WHERE k.run_id = r.id AND k.hierarchy = 'links' \
+                        /* {VISIBILITY:k} */)::int8 AS links_levels, \
+                    ARRAY(SELECT d.id FROM atlas_map_runs d \
+                           WHERE d.owner_group_id = $2 AND d.visibility = $3 \
+                             AND d.id <> r.id \
+                             AND (d.params->>'nightly_from_run' = r.id::text \
+                                  OR d.params->>'named_from_run' = r.id::text) \
+                             /* {VISIBILITY:d} */ \
+                           ORDER BY d.created_at, d.id) AS dependents, \
+                    (SELECT s.id FROM atlas_map_runs s \
+                      WHERE s.owner_group_id = $2 AND s.visibility = $3 \
+                        AND s.finished_at IS NOT NULL /* {VISIBILITY:s} */ \
+                      ORDER BY s.finished_at DESC, s.id DESC LIMIT 1) AS served_now, \
+                    (SELECT a.id FROM atlas_map_runs a \
+                      WHERE a.owner_group_id = $2 AND a.visibility = $3 \
+                        AND a.finished_at IS NOT NULL AND a.id <> r.id /* {VISIBILITY:a} */ \
+                      ORDER BY a.finished_at DESC, a.id DESC LIMIT 1) AS served_after \
+               FROM atlas_map_runs r \
+              WHERE r.id = $1 AND r.owner_group_id = $2 AND r.visibility = $3 \
+                /* {VISIBILITY:r} */",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, MapRunForUndo>(&sql)
+            .bind(run_id)
+            .bind(owner)
+            .bind(visibility);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(q.fetch_optional(&mut *conn).await?)
+    }
+
+    /// Delete one FINISHED run of `map` (its levels go by `ON DELETE
+    /// CASCADE`), scoped by the map's tenancy columns, so another map's run
+    /// is never touched. Returns the number of runs deleted (0 or 1). The
+    /// operator undo calls it after [`Self::run_for_undo`]'s checks, on the
+    /// same transaction and under [`Self::lock_map_for_publish`].
+    /// Maintenance connection only (the application role holds SELECT only on
+    /// these tables).
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the statement fails.
+    pub async fn delete_run(
+        conn: &mut PgConnection,
+        map: AtlasMap,
+        run_id: Uuid,
+    ) -> Result<u64, DbError> {
+        let (owner, visibility) = map.tenancy();
+        let done = sqlx::query(
+            "DELETE FROM atlas_map_runs r \
+              WHERE r.id = $1 AND r.owner_group_id = $2 AND r.visibility = $3 \
+                AND r.finished_at IS NOT NULL",
+        )
+        .bind(run_id)
+        .bind(owner)
+        .bind(visibility)
         .execute(&mut *conn)
         .await?;
         Ok(done.rows_affected())

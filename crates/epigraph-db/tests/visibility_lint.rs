@@ -2896,6 +2896,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          it on the maintenance connection and the application role holds SELECT only on the \
          table.",
     ),
+    // Backlog b3e39c55: the operator undo of one apply run (`atlas_meaning reverse`,
+    // `atlas_links reverse`).
+    (
+        "atlas_map.rs",
+        "delete_run",
+        "WRITE. Deletes ONE finished `atlas_map_runs` row of one map by id, its levels going by \
+         the FK cascade; the statement is scoped by the map's own tenancy columns, the operator \
+         binaries call it on the maintenance connection after `run_for_undo` (spliced) read the \
+         run on the same transaction, and the application role holds SELECT only on the table.",
+    ),
     (
         "atlas_map.rs",
         "lock_map_for_publish",

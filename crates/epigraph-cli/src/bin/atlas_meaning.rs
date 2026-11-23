@@ -6,6 +6,7 @@
 //! atlas_meaning export --map M --out DIR [--theme-id T]... [--cap 100] [--seed 42]
 //! python3 scripts/atlas_meaning_core.py compute --from DIR --out result.json   # anywhere
 //! atlas_meaning apply  --map M --from result.json [--from result2.json]... [--cap 100] [--apply]
+//! atlas_meaning reverse --map M --run-id R [--apply]
 //! ```
 //!
 //! A run is the WHOLE map: `apply` refuses a result that lacks any theme the
@@ -30,11 +31,16 @@
 //! it hides any earlier run's links levels (the nightly writes both into one
 //! run instead).
 //!
-//! Undo (there is no `reverse` subcommand yet): an `apply --apply` writes one
-//! `atlas_map_runs` row and its levels and nothing else. Deleting that row by
-//! the `run_id` the report prints, as the maintenance login, removes its
-//! levels too (`ON DELETE CASCADE`) and the previous finished run is served
-//! again.
+//! Undo: `reverse --run-id R` with the `run_id` the apply's report printed.
+//! An `apply --apply` writes one `atlas_map_runs` row and its levels and
+//! nothing else, so deleting that row (its levels go by `ON DELETE CASCADE`)
+//! is a complete undo and the previous finished run is served again. The
+//! reverse refuses a run of another map, a run this binary's apply did not
+//! write, and a run a later nightly or naming pass was built from; DRY RUN BY
+//! DEFAULT, it reports what the cascade deletes and which run is served
+//! after, and with `--apply` it deletes the run and writes a
+//! `security_events` audit row in one transaction
+//! (`epigraph_cli::atlas_undo`).
 //!
 //! # Authority
 //!
@@ -52,14 +58,16 @@ use clap::{Parser, Subcommand};
 use epigraph_cli::atlas_meaning::build::{apply_result, export_map, ExportOptions};
 use epigraph_cli::atlas_meaning::files::{merge_results, prepare_export_dir, read_result};
 use epigraph_cli::atlas_meaning::tree::parse_map_key;
+use epigraph_cli::atlas_undo::{reverse_run, ApplyKind};
 use epigraph_db::repos::atlas_leaf::ATLAS_LEAF_NODE_CAP;
 use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "atlas_meaning",
-    about = "Export a map's themes for the off-box \"by meaning\" clustering, or apply its \
-             result as one Atlas run (dry run unless --apply), on the maintenance connection"
+    about = "Export a map's themes for the off-box \"by meaning\" clustering, apply its \
+             result as one Atlas run, or reverse such a run (dry run unless --apply), on the \
+             maintenance connection"
 )]
 struct Cli {
     /// PostgreSQL connection URL of the application database (names the
@@ -107,6 +115,17 @@ enum Cmd {
         #[arg(long)]
         apply: bool,
     },
+    /// Undo one `apply --apply`: delete its run (dry run unless --apply).
+    Reverse {
+        #[arg(long)]
+        map: String,
+        /// The `run_id` the apply's report printed.
+        #[arg(long = "run-id")]
+        run_id: Uuid,
+        /// Delete the run and write the audit row. Without it, nothing is written.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 fn check_cap(cap: usize) -> anyhow::Result<()> {
@@ -134,6 +153,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Apply { map, cap, .. } => {
             parse_map_key(map)?;
             check_cap(*cap)?;
+        }
+        Cmd::Reverse { map, .. } => {
+            parse_map_key(map)?;
         }
     }
 
@@ -187,6 +209,17 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<anyhow::Result<Vec<_>>>()?,
             )?;
             apply_result(conn, viewer, parse_map_key(&map)?, &result, cap, apply).await?
+        }
+        Cmd::Reverse { map, run_id, apply } => {
+            reverse_run(
+                conn,
+                viewer,
+                parse_map_key(&map)?,
+                run_id,
+                ApplyKind::Meaning,
+                apply,
+            )
+            .await?
         }
     };
     println!(

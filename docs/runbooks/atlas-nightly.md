@@ -153,6 +153,12 @@ with it (`ON DELETE CASCADE`) and the previous finished run is served again:
 DELETE FROM atlas_map_runs WHERE id = '<run_id>';
 ```
 
+An operator build's run (`atlas_meaning apply --apply`, `atlas_links apply
+--apply`) is undone with the binary's own `reverse` instead of a DELETE:
+`atlas_meaning reverse --map M --run-id R` reports what it would delete and
+which run is served after, and `--apply` deletes it and writes an audit row.
+It refuses a nightly run, and an operator run a later night was built from.
+
 The pruned older runs are gone, so the rollback reaches back `--keep-runs - 1`
 nights. The theme assignment of step 1 is not rolled back by this; it only
 set `claims.theme_id` on claims that had none. Once the cause is fixed,
