@@ -138,6 +138,11 @@ pub struct Outcome {
     pub applied: bool,
 }
 
+/// The longest `--reason` the verbs record, in characters: the cap migration
+/// 191's retire definer applies to its reason (`length(p_reason) > 1000`), so
+/// every operator verb's audit reason is bounded alike (backlog 452a1330).
+pub const REASON_MAX_CHARS: usize = 1000;
+
 /// The access-token window a status change does not close, for `client_type`.
 #[must_use]
 pub fn access_token_window(client_type: &str) -> &'static str {
@@ -150,7 +155,8 @@ pub fn access_token_window(client_type: &str) -> &'static str {
 /// Run one act on `client`.
 ///
 /// # Errors
-/// A blank reason, an unknown client, a revoked client asked to be suspended
+/// A blank reason or one over [`REASON_MAX_CHARS`] characters, an unknown
+/// client, a revoked client asked to be suspended
 /// (or a status the act does not move from), or a failed statement. Nothing
 /// is committed in any of these cases.
 pub async fn run(
@@ -164,6 +170,13 @@ pub async fn run(
     let reason = reason.trim();
     if reason.is_empty() {
         bail!("--reason must not be blank: it is the audit record of why the client was contained");
+    }
+    let chars = reason.chars().count();
+    if chars > REASON_MAX_CHARS {
+        bail!(
+            "--reason is {chars} characters; it is at most {REASON_MAX_CHARS} characters; \
+             nothing was changed"
+        );
     }
     let mut tx = conn.begin().await.context("beginning the transaction")?;
 

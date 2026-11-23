@@ -1410,7 +1410,7 @@ struct ClientStatusArgs {
     /// The client's `oauth_clients.id` (not its `client_id` string).
     #[arg(long)]
     client: Uuid,
-    /// Recorded in the audit row. Required, not blank.
+    /// Recorded in the audit row. Required, not blank, at most 1000 characters.
     #[arg(long)]
     reason: String,
     /// Commit. Without it, the change and its audit row roll back.

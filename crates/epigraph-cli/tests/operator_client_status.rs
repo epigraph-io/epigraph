@@ -13,6 +13,12 @@
 //! a revoked one is never suspended (revoke is final); a blank reason and an
 //! unknown client are refused with nothing written. Suspending the recorded
 //! client of a registered human operator says so, and un-registers the human.
+//!
+//! Backlog 452a1330: a reason over 1000 characters is refused; an `active`
+//! client is revoked in one step with its live refresh chains; a `pending`
+//! client can be suspended; an access token minted before a revoke still
+//! passes the bearer check, within the window the command prints; and a login
+//! outside `epigraph_maintenance` is refused with nothing written.
 
 mod viewer_fixture;
 
@@ -84,6 +90,11 @@ async fn drop_role(pool: &PgPool, role: &str) {
 /// A service client with a known secret (`identity_provisioning.rs`'s shape):
 /// `(oauth_clients.id, client_id, secret)`.
 async fn service_client(pool: &PgPool) -> (Uuid, String, String) {
+    service_client_with_status(pool, "active").await
+}
+
+/// [`service_client`] at `status`.
+async fn service_client_with_status(pool: &PgPool, status: &str) -> (Uuid, String, String) {
     let (agent, _) = fixture::seed_agent_with_group(pool, "service-principal").await;
     let secret_bytes: [u8; 32] = *blake3::hash(agent.as_bytes()).as_bytes();
     let secret = hex::encode(secret_bytes);
@@ -93,12 +104,13 @@ async fn service_client(pool: &PgPool) -> (Uuid, String, String) {
                                     allowed_scopes, granted_scopes, status, agent_id, \
                                     legal_entity_name, legal_contact_email) \
          VALUES ($1, $2, 'status test service', 'service', ARRAY['claims:read'], \
-                 ARRAY['claims:read'], 'active', $3, 'Fixture Org', \
+                 ARRAY['claims:read'], $4, $3, 'Fixture Org', \
                  'fixture@example.invalid') RETURNING id",
     )
     .bind(&client_id)
     .bind(blake3::hash(&secret_bytes).as_bytes().as_slice())
     .bind(agent)
+    .bind(status)
     .fetch_one(pool)
     .await
     .expect("the service client");
@@ -396,4 +408,322 @@ async fn suspending_a_humans_recorded_client_says_it_unregisters_the_human(pool:
     assert!(dry_human, "a dry run un-registers nobody");
     assert_eq!(applied.code, 0, "{}", applied.show());
     assert!(!applied_human, "the human is no longer registered");
+}
+
+/// Backlog 452a1330 part 1: `--reason` is capped at 1000 characters, the cap
+/// migration 191's retire definer applies to its reason, so an audit row's
+/// reason is bounded on every operator verb. 1001 characters are refused
+/// with nothing written (no status change, no chain revoked, no audit row);
+/// exactly 1000 (multi-byte characters, so the count is in characters, not
+/// bytes) are accepted and recorded whole.
+///
+/// Verified to fail: without the cap (the code before this change) the
+/// 1001-character reason suspends the client and is recorded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_reason_over_1000_characters_is_refused(pool: PgPool) {
+    let (id, _, _) = service_client(&pool).await;
+    let (role, dsn) = maintenance_login(&pool).await;
+    let c = id.to_string();
+    let too_long = "x".repeat(1001);
+    let at_cap = "é".repeat(1000);
+
+    let refused = run_dsn(
+        &as_args(&verb("suspend-client", &c, &too_long, &["--apply"])),
+        &dsn,
+    );
+    let refused_state = state(&pool, id).await;
+    let accepted = run_dsn(
+        &as_args(&verb("suspend-client", &c, &at_cap, &["--apply"])),
+        &dsn,
+    );
+    let accepted_state = state(&pool, id).await;
+    let rows = audit(&pool, id).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused.stderr.contains("1000 characters"),
+        "the refusal names the cap: {}",
+        refused.show()
+    );
+    assert_eq!(
+        refused_state,
+        ("active".to_string(), 0, 0, 0),
+        "the refusal writes nothing"
+    );
+    assert_eq!(accepted.code, 0, "{}", accepted.show());
+    assert_eq!(accepted_state, ("suspended".to_string(), 0, 0, 1));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["reason"], serde_json::json!(at_cap));
+}
+
+/// Backlog 452a1330 part 4: `revoke-client` straight from `active`, on a
+/// client holding two live refresh chains, revokes both chains (reason
+/// `client`) in the act, and the token endpoint then refuses the client's
+/// `client_credentials` grant and its held refresh token. The audit row
+/// records `active -> revoked` and two chains.
+///
+/// Verified to fail: the `epigraph_refresh_token_revoke_client` call removed
+/// from `client_status::run` -> both chains stay live and the held refresh
+/// token still mints.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_an_active_client_kills_its_live_refresh_chains(pool: PgPool) {
+    let (id, client_id, secret) = service_client(&pool).await;
+    let (ok1, first) = token(&pool, client_credentials(&client_id, &secret)).await;
+    let (ok2, _) = token(&pool, client_credentials(&client_id, &secret)).await;
+    assert_eq!(
+        (ok1, ok2),
+        (StatusCode::OK, StatusCode::OK),
+        "CALIBRATION: {first}"
+    );
+    let refresh = first["refresh_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a refresh token: {first}"))
+        .to_string();
+    assert_eq!(
+        state(&pool, id).await,
+        ("active".to_string(), 2, 0, 0),
+        "PREMISE"
+    );
+
+    let (role, dsn) = maintenance_login(&pool).await;
+    let c = id.to_string();
+    let revoked = run_dsn(
+        &as_args(&verb("revoke-client", &c, "compromised", &["--apply"])),
+        &dsn,
+    );
+    let revoked_state = state(&pool, id).await;
+    let (rt_status, rt_body) = token(
+        &pool,
+        serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh }),
+    )
+    .await;
+    let (cc_status, cc_body) = token(&pool, client_credentials(&client_id, &secret)).await;
+    let rows = audit(&pool, id).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(revoked.code, 0, "{}", revoked.show());
+    assert!(
+        revoked.stdout.starts_with("REVOKED\t")
+            && revoked.stdout.contains("refresh_chains_revoked=2"),
+        "{}",
+        revoked.show()
+    );
+    assert_eq!(revoked_state, ("revoked".to_string(), 0, 2, 1));
+    assert_ne!(
+        rt_status,
+        StatusCode::OK,
+        "the held refresh token is dead: {rt_body}"
+    );
+    assert_eq!(cc_status, StatusCode::UNAUTHORIZED, "{cc_body}");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (kind, d) = &rows[0];
+    assert_eq!(kind, "oauth.client_revoked");
+    assert_eq!(d["status"]["before"], serde_json::json!("active"));
+    assert_eq!(d["status"]["after"], serde_json::json!("revoked"));
+    assert_eq!(d["refresh_chains_revoked"], serde_json::json!(2));
+}
+
+/// Backlog 452a1330 part 4: a `pending` client (registered, never approved)
+/// can be suspended, audited `pending -> suspended`.
+///
+/// Verified to fail: `pending` removed from `StatusAct::Suspend`'s
+/// `from_statuses` -> the suspend is refused and the client stays pending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pending_client_can_be_suspended(pool: PgPool) {
+    let (id, _, _) = service_client_with_status(&pool, "pending").await;
+    let (role, dsn) = maintenance_login(&pool).await;
+    let c = id.to_string();
+    let suspended = run_dsn(
+        &as_args(&verb("suspend-client", &c, "never approved", &["--apply"])),
+        &dsn,
+    );
+    let suspended_state = state(&pool, id).await;
+    let rows = audit(&pool, id).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(suspended.code, 0, "{}", suspended.show());
+    assert!(
+        suspended.stdout.starts_with("SUSPENDED\t")
+            && suspended.stdout.contains("status_before=pending"),
+        "{}",
+        suspended.show()
+    );
+    assert_eq!(suspended_state, ("suspended".to_string(), 0, 0, 1));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1["status"]["before"], serde_json::json!("pending"));
+    assert_eq!(rows[0].1["status"]["after"], serde_json::json!("suspended"));
+}
+
+/// Seconds in the window the command prints ("at most 1 hour" / "at most 15
+/// minutes").
+fn printed_window_secs(stdout: &str) -> i64 {
+    let rest = stdout
+        .split("(at most ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("a printed access-token window: {stdout}"));
+    let mut words = rest.split_whitespace();
+    let n: i64 = words.next().and_then(|w| w.parse().ok()).expect("a number");
+    match words.next() {
+        Some(u) if u.starts_with("hour") => n * 3600,
+        Some(u) if u.starts_with("minute") => n * 60,
+        other => panic!("unknown unit {other:?} in {stdout}"),
+    }
+}
+
+/// `POST /oauth/introspect` for `access`: `(active, exp - iat)`. The endpoint
+/// applies the bearer check's own tests (signature, expiry, the `jti`
+/// revocation denylist), so `active` is what a request bearing the token
+/// would get.
+async fn introspect(pool: &PgPool, access: &str) -> (bool, Option<i64>) {
+    let app = epigraph_api::create_router(epigraph_api::AppState::with_db(
+        pool.clone(),
+        epigraph_api::ApiConfig::default(),
+    ));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/introspect")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": access }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK, "introspection answers");
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let life = v["exp"].as_i64().zip(v["iat"].as_i64()).map(|(e, i)| e - i);
+    (v["active"] == serde_json::json!(true), life)
+}
+
+/// `GET /api/v1/webhooks` with `access` as the bearer: a route behind
+/// `bearer_auth_middleware` that answers from the caller's principal alone, so
+/// an admitted token gets 200 and a refused one 401. This is the bearer path
+/// itself, not introspection's re-implementation of it.
+async fn bearer_admits(pool: &PgPool, access: &str) -> (StatusCode, String) {
+    let app = epigraph_api::create_router(epigraph_api::AppState::with_db(
+        pool.clone(),
+        epigraph_api::ApiConfig::default(),
+    ));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/webhooks")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Backlog 452a1330 part 4: the access-token NOTE is true. An access token
+/// minted before `revoke-client` is still accepted afterwards (the bearer
+/// check reads neither the client's status nor a mint-time `jti`), and its
+/// lifetime is within the window the command prints for the client's type.
+/// If a later change makes a revoke kill minted tokens, this fails and the
+/// NOTE (and module doc) must change with it.
+///
+/// "Still accepted" is checked on a bearer-protected route (`bearer_admits`)
+/// as well as through introspection, so a status check added to the bearer
+/// middleware alone also fails this test.
+///
+/// Verified to fail: `access_token_window` returning "15 minutes" for a
+/// service client -> the minted token outlives the printed window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_access_token_minted_before_a_revoke_lives_within_the_printed_window(pool: PgPool) {
+    let (id, client_id, secret) = service_client(&pool).await;
+    let (ok, minted) = token(&pool, client_credentials(&client_id, &secret)).await;
+    assert_eq!(ok, StatusCode::OK, "CALIBRATION: {minted}");
+    let access = minted["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an access token: {minted}"))
+        .to_string();
+    let (before, life) = introspect(&pool, &access).await;
+    assert!(before, "CALIBRATION: the fresh token is active");
+    let life = life.expect("exp and iat");
+    let (admitted, body) = bearer_admits(&pool, &access).await;
+    assert_eq!(
+        admitted,
+        StatusCode::OK,
+        "CALIBRATION: the bearer route admits the fresh token: {body}"
+    );
+
+    let (role, dsn) = maintenance_login(&pool).await;
+    let c = id.to_string();
+    let revoked = run_dsn(
+        &as_args(&verb("revoke-client", &c, "compromised", &["--apply"])),
+        &dsn,
+    );
+    let (after, _) = introspect(&pool, &access).await;
+    let (admitted_after, body_after) = bearer_admits(&pool, &access).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(revoked.code, 0, "{}", revoked.show());
+    assert_eq!(state(&pool, id).await.0, "revoked");
+    assert!(
+        after,
+        "the NOTE says an already-minted access token outlives the revoke"
+    );
+    assert_eq!(
+        admitted_after,
+        StatusCode::OK,
+        "the NOTE says the bearer middleware still admits a token minted before \
+         the revoke: {body_after}"
+    );
+    let window = printed_window_secs(&revoked.stdout);
+    assert!(
+        life <= window,
+        "the token lives {life}s, beyond the printed window of {window}s: {}",
+        revoked.show()
+    );
+}
+
+/// Backlog 452a1330 part 4: a login that is not a member of
+/// `epigraph_maintenance` is refused before any statement, and nothing is
+/// written.
+///
+/// Verified to fail: the membership refusal in `operator::connect` removed ->
+/// the refusal is the table's privilege error, not the gate's message.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_maintenance_login_is_refused(pool: PgPool) {
+    let (id, _, _) = service_client(&pool).await;
+    let url = fixture::database_url_for(&pool).await;
+    let role = format!("client_status_probe_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'probe-only' NOSUPERUSER"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create role");
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    let dsn = format!("{scheme}://{role}:probe-only@{host}");
+    let c = id.to_string();
+    let r = run_dsn(
+        &as_args(&verb("revoke-client", &c, "not mine", &["--apply"])),
+        &dsn,
+    );
+    let after = state(&pool, id).await;
+    drop_role(&pool, &role).await;
+
+    assert_eq!(r.code, 1, "{}", r.show());
+    assert!(
+        r.stderr.contains("is not a member of epigraph_maintenance"),
+        "{}",
+        r.show()
+    );
+    assert_eq!(
+        after,
+        ("active".to_string(), 0, 0, 0),
+        "nothing was written"
+    );
 }
