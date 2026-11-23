@@ -280,8 +280,8 @@ pub async fn create_agent(
             return Err(ApiError::ValidationError {
                 field: "key_kind".to_string(),
                 reason: format!(
-                    "unknown key_kind {other:?}: expected \"ed25519\" (the default) or \
-                     \"seed-derived\""
+                    "unknown key_kind {other:?}: expected `ed25519` (the default) or \
+                     `seed-derived`"
                 ),
             });
         }
