@@ -1235,7 +1235,7 @@ pub async fn submit_evidence(
     //     written or announced. `refuse` answers 422 with the atoms the
     //     caller can see; `warn` goes ahead (the row is inert: a compound has
     //     no cache-owner frame, so neither step 13 nor any later owner-rule
-    //     recompute folds it), tells the caller and logs it.
+    //     recompute folds it), tells the caller and logs it once committed.
     let deprecated_compound_target = {
         use epigraph_engine::compound_write_guard::{decide, GuardDecision};
         let mut read = state.read_as(&viewer).await?;
@@ -2048,6 +2048,11 @@ pub async fn submit_evidence(
     }
 
     tx.commit().await?;
+    // The compound write has landed: only now does it count in the guard's
+    // journal (a request refused above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("frames_evidence", Some(caller));
+    }
 
     // 13c. CDST residual mass analysis
     {

@@ -205,7 +205,7 @@ pub async fn assess_claim(
     // answers 422 with the atoms the caller can see; `warn` goes ahead (the
     // row is inert: a compound has no cache-owner frame, so the cache
     // refresh below and every later owner-rule recompute leave its cache
-    // alone), reports the atoms and logs the caller.
+    // alone), reports the atoms and, once the slot row commits, logs the caller.
     let deprecated_compound_target = {
         use epigraph_engine::compound_write_guard::{decide, GuardDecision};
         let mut read = state.read_as(&viewer).await?;
@@ -502,6 +502,11 @@ pub async fn assess_claim(
         .map_err(|e| ApiError::InternalError {
             message: format!("commit assessment slot: {e}"),
         })?;
+    // The compound assessment has landed: only now does it count in the
+    // guard's journal (a request refused above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("assess", caller);
+    }
 
     // Ensure claim is assigned to frame + create WITHIN_FRAME edge
     let _ = sqlx::query(

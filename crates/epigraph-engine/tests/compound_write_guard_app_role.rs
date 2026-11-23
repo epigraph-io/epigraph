@@ -12,7 +12,9 @@
 //! - An atom and a standalone claim are not compounds, in either mode.
 //! - A compound the caller cannot read is not decided (no existence oracle:
 //!   the writer's own not-found answers it).
-//! - `warn` logs the caller and the writer, never the claim's content.
+//! - `decide` does not log a `warn` acceptance (the writer does, after its
+//!   commit); `CompoundTarget::log_accepted` logs the caller and the writer,
+//!   never the claim's content.
 //!
 //! Fixtures are seeded on the harness superuser pool.
 
@@ -148,10 +150,20 @@ async fn the_guard_decides_role_on_the_whole_graph_and_lists_only_the_callers_at
     )
     .await
     .expect("decide hidden, warn");
+    let GuardDecision::Accept(accepted) = &warned else {
+        panic!("warn accepts the hidden compound: {warned:?}");
+    };
     assert!(
-        matches!(&warned, GuardDecision::Accept(t) if t.visible_atoms.is_empty()),
-        "warn accepts the hidden compound and lists nothing: {warned:?}"
+        accepted.visible_atoms.is_empty(),
+        "lists nothing: {warned:?}"
     );
+    // `decide` does not log a warn-mode acceptance: the writer does, once its
+    // write commits.
+    assert!(
+        !logs_contain("textless BBA write on a compound accepted"),
+        "decide must leave the acceptance line to the committed write"
+    );
+    accepted.log_accepted("test_writer", Some(caller));
 
     // The mixed compound: only the visible atom is listed.
     let mixed_decision = decide(
@@ -202,7 +214,7 @@ async fn the_guard_decides_role_on_the_whole_graph_and_lists_only_the_callers_at
     }
     tx.commit().await.expect("commit");
 
-    // The warn path logged the writer and the caller, and no content.
+    // The acceptance line carries the writer and the caller, and no content.
     assert!(logs_contain("textless BBA write on a compound accepted"));
     assert!(logs_contain("test_writer"));
     assert!(logs_contain(&caller.to_string()));

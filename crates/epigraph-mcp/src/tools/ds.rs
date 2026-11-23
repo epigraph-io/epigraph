@@ -354,7 +354,8 @@ pub async fn submit_ds_evidence(
     // 193's definer), before anything is written. `refuse` refuses with the
     // atoms this caller can see; `warn` goes ahead (the row is inert: a
     // compound has no cache-owner frame, so neither the recompute below nor
-    // any later owner-rule recompute folds it), tells the caller and logs it.
+    // any later owner-rule recompute folds it), tells the caller and, once
+    // the write commits, logs it.
     let deprecated_compound_target = match epigraph_engine::compound_write_guard::decide(
         &mut tx,
         viewer,
@@ -812,6 +813,11 @@ pub async fn submit_ds_evidence(
     }
 
     tx.commit().await.map_err(internal_error)?;
+    // The compound write has landed: only now does it count in the guard's
+    // journal (a call that failed above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("submit_ds_evidence", Some(agent_id));
+    }
 
     let betp = pignistic_prob.unwrap_or(0.0);
     let ign = plausibility - belief;

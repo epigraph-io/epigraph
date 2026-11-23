@@ -17,10 +17,12 @@
 //! compound's cached belief. (The derived compound view, SPEC §3.6, reads the
 //! refutation mass of a compound's own rows by design, this one included.)
 //! The caller gets a `deprecated_compound_target`
-//! field naming the atoms it can see, and the write is logged under
-//! [`LOG_TARGET`] with the writer and the caller's agent id (never the
-//! claim's content), so the callers to fix before a flip to `refuse` can be
-//! read from the journal.
+//! field naming the atoms it can see, and once the write has committed the
+//! writer logs it under [`LOG_TARGET`] ([`CompoundTarget::log_accepted`])
+//! with the writer and the caller's agent id (never the claim's content), so
+//! the callers to fix before a flip to `refuse` can be read from the journal.
+//! A write that then fails (a missing frame, a refused write permission) is
+//! not logged, so the journal counts only writes that `refuse` would stop.
 //!
 //! Under [`CompoundWriteGuard::Refuse`] the write is refused before anything
 //! is written, with the visible atoms in the refusal ([`REFUSAL_CODE`]: MCP
@@ -128,6 +130,25 @@ impl CompoundTarget {
         })
     }
 
+    /// Log a `warn`-mode write on this compound that has COMMITTED, under
+    /// [`LOG_TARGET`]: the writer, the claim id, the caller's agent id and the
+    /// mode, never content. Each guarded writer calls it right after its
+    /// write commits, not when [`decide`] answers, so a request that is
+    /// refused later (a missing frame, no write permission) adds no line to
+    /// the journal an operator reads before switching to `refuse`.
+    pub fn log_accepted(&self, writer: &'static str, caller: Option<Uuid>) {
+        let caller = caller.map(|c| c.to_string());
+        tracing::warn!(
+            target: LOG_TARGET,
+            writer,
+            claim_id = %self.claim_id,
+            caller = caller.as_deref().unwrap_or("anonymous"),
+            guard = self.guard.as_str(),
+            "textless BBA write on a compound accepted (inert); the caller should write \
+             on the compound's atoms"
+        );
+    }
+
     fn atoms_phrase(&self) -> String {
         match self.visible_atom_count {
             0 => "none of its atoms is visible to this caller".to_string(),
@@ -184,8 +205,10 @@ pub async fn visible_atoms(
 }
 
 /// Decide a textless BBA write by `caller` through `writer` onto `claim_id`
-/// under `mode`, before anything is written. A compound target is logged
-/// under [`LOG_TARGET`] (writer, claim id, caller, mode; never content).
+/// under `mode`, before anything is written. A refusal is logged here under
+/// [`LOG_TARGET`] (writer, claim id, caller, mode; never content); an
+/// accepted (`warn`) write is logged by the writer once it has committed
+/// ([`CompoundTarget::log_accepted`]).
 ///
 /// `conn` should carry the caller's tenancy stamp, so the listed atoms are
 /// the ones the caller can read; the compound test itself ignores it. A
@@ -221,21 +244,10 @@ pub async fn decide(
         visible_atom_count,
         guard: mode,
     };
-    let caller = caller.map(|c| c.to_string());
     match mode {
-        CompoundWriteGuard::Warn => {
-            tracing::warn!(
-                target: LOG_TARGET,
-                writer,
-                %claim_id,
-                caller = caller.as_deref().unwrap_or("anonymous"),
-                guard = mode.as_str(),
-                "textless BBA write on a compound accepted (inert); the caller should write \
-                 on the compound's atoms"
-            );
-            Ok(GuardDecision::Accept(target))
-        }
+        CompoundWriteGuard::Warn => Ok(GuardDecision::Accept(target)),
         CompoundWriteGuard::Refuse => {
+            let caller = caller.map(|c| c.to_string());
             tracing::info!(
                 target: LOG_TARGET,
                 writer,
