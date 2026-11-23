@@ -397,8 +397,9 @@ async fn unauthenticated_unscoped_and_malformed_requests_write_nothing(pool: PgP
 
 /// Two ingesters named the same person on the same paper. `ingested_by`
 /// confirms only that ingester's naming: the other stays pending (no label,
-/// in force), so the card still counts the paper as pending until the
-/// person acts on it too.
+/// in force). One confirmed naming is enough for the card to count the
+/// paper as authored, so it reads authored 1, pending 0; a second call
+/// without `ingested_by` then confirms the remaining naming.
 #[sqlx::test(migrations = "../../migrations")]
 async fn ingested_by_confirms_only_that_ingesters_naming(pool: PgPool) {
     let state = app_role_state(&pool).await;
