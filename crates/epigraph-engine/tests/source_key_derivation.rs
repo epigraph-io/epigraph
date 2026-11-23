@@ -216,12 +216,17 @@ async fn claims_linked_to_a_paper_only_by_intra_source_edges_are_same_source(poo
     insert_claim_edge(&pool, x, v, "same_source").await;
 
     let kw = derive_source_key(&pool, w).await.expect("derive w");
+    assert!(kw.paper_anchored, "w is asserted by the paper");
     for (name, id) in [("y", y), ("z", z), ("v", v)] {
         let k = derive_source_key(&pool, id).await.expect("derive");
         assert_eq!(
             k.paper_dois,
             vec!["10.9/intra-source".to_string()],
             "{name} reaches the paper only through intra-source edges"
+        );
+        assert!(
+            !k.paper_anchored,
+            "{name}'s DOI comes from the closure, not from an asserts anchor"
         );
         assert!(
             is_same_source(&k, &kw, SourceFilterConfig::default()),
@@ -288,6 +293,41 @@ async fn decomposes_to_is_walked_upward_only(pool: PgPool) {
         vec!["10.9/p".to_string(), "10.9/q".to_string()]
     );
     assert_eq!(kt.paper_dois, vec!["10.9/p".to_string()]);
+    // An atom of a paper-asserted compound is a paper claim through its
+    // ancestry, exactly as before the closure was added: it must not fall
+    // under the non-paper same-agent rule.
+    assert!(ks.paper_anchored && kt.paper_anchored);
+}
+
+/// 9da3cf2b review: folding the closure into `paper_dois` must not let a
+/// non-paper claim escape the same-agent rule. One agent writes two non-paper
+/// claims `m1` and `m2`; `m1` gets a `same_source` edge to a claim of paper
+/// P. Before the closure both had no DOI and the pair was a same-agent
+/// restatement (same-source). With the closure `m1` carries P and `m2` does
+/// not, and a rule reading `paper_dois.is_empty()` passed them as
+/// cross-source, so the matcher could propose them as corroboration.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_closure_doi_does_not_lift_the_same_agent_rule(pool: PgPool) {
+    use epigraph_engine::matching::source_key::{is_same_source, SourceFilterConfig};
+
+    let p = insert_paper(&pool, "10.9/probe").await;
+    let x = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, p, x).await;
+    let author = insert_agent(&pool).await;
+    let m1 = insert_claim(&pool, author).await;
+    let m2 = insert_claim(&pool, author).await;
+    insert_agent_asserts(&pool, author, m1).await;
+    insert_agent_asserts(&pool, author, m2).await;
+    insert_claim_edge(&pool, m1, x, "same_source").await;
+
+    let k1 = derive_source_key(&pool, m1).await.expect("derive m1");
+    let k2 = derive_source_key(&pool, m2).await.expect("derive m2");
+    assert_eq!(k1.paper_dois, vec!["10.9/probe".to_string()]);
+    assert!(k2.paper_dois.is_empty());
+    assert!(
+        is_same_source(&k1, &k2, SourceFilterConfig::default()),
+        "two non-paper claims of one agent stay same-source; got {k1:?} vs {k2:?}"
+    );
 }
 
 /// 9da3cf2b cost measurement, not a correctness test: `#[ignore]`d, run with
