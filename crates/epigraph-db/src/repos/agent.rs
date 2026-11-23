@@ -1892,6 +1892,12 @@ impl AgentRepository {
     /// unattached agent always may; an attached one only while its linked
     /// human holds every role it is attached to.
     ///
+    /// Asked on ONE connection, inside a transaction that stamps `agent_id` as
+    /// `epigraph.principal_id` (transaction-local, so the stamp ends with the
+    /// read): since migration 248 an application session is answered only
+    /// about its own stamped principal (the attestor and a maintenance session
+    /// about any agent). The caller asks about the agent it is about to serve.
+    ///
     /// # Errors
     /// `DbError::QueryFailed` if the function is absent (a database that has
     /// not applied migration 166) or the read fails. Deliberately NOT mapped to
@@ -1901,13 +1907,20 @@ impl AgentRepository {
         pool: &PgPool,
         agent_id: Uuid,
     ) -> Result<RoleAgentRunGate, DbError> {
-        Ok(sqlx::query_as::<_, RoleAgentRunGate>(
+        let mut tx = pool.begin().await?;
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, true)")
+            .bind(agent_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        let gate = sqlx::query_as::<_, RoleAgentRunGate>(
             "SELECT may_run, role, holder, reason \
                FROM public.epigraph_role_agent_may_run($1)",
         )
         .bind(agent_id)
-        .fetch_one(pool)
-        .await?)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(gate)
     }
 
     /// [`Self::operator_actor`] for a caller holding a pool.
