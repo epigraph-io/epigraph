@@ -13,8 +13,9 @@
 //!
 //! 1. the read-only listener (the default): a public claim is served
 //!    (calibration: the listener reads at all), a claim in the server agent's
-//!    personal group reads as not found, and the dedicated reader agent that
-//!    `listener_principal` creates exists with no membership;
+//!    personal group reads as not found, and the dedicated reader agent
+//!    (reserved by migration 241, looked up by `listener_principal`) is still
+//!    the one row with that key, with no membership;
 //! 2. CALIBRATION, `--allow-unauthenticated-writes`: the listener's principal
 //!    is the server agent, and the same group claim IS served. So the group row
 //!    is one the binary's server principal reads with, and its absence in run 1
@@ -29,8 +30,9 @@
 //!   principal): the group claim is served in run 1;
 //! * the pre-fe514fc3 shape, `UnauthenticatedPrincipal::lazily_from(probe)
 //!   .with_writes(unauthenticated_writes)`: the public claim is refused in run 1
-//!   (`request_viewer` refuses a grouped principal-less viewer), and no reader
-//!   agent is created.
+//!   (`request_viewer` refuses a grouped principal-less viewer). (Before
+//!   migration 241 that shape also left no reader agent; 241 now reserves the
+//!   row, so that half no longer distinguishes it.)
 
 #![cfg(unix)]
 
@@ -310,10 +312,16 @@ async fn the_binary_unauthenticated_listener_serves_public_rows_only(pool: PgPoo
     let public = fixture::seed_public_claim(&pool, server_agent, "c80597de public row").await;
     let private =
         fixture::seed_group_claim(&pool, server_agent, group, "c80597de server-group row").await;
-    assert!(
-        agents_with_key(&pool, READER_PUBLIC_KEY).await.is_empty(),
-        "CALIBRATION: no reader agent exists before the binary runs"
+    // Since migration 241 the reader's row is reserved by the migration (a
+    // binary only looks it up), so it exists, alone and in no group, before
+    // the binary runs.
+    let reserved = agents_with_key(&pool, READER_PUBLIC_KEY).await;
+    assert_eq!(
+        reserved.len(),
+        1,
+        "CALIBRATION: migration 241 reserves exactly one reader agent"
     );
+    assert_eq!(live_memberships(&pool, reserved[0]).await, 0);
 
     // 1. The read-only listener: public only.
     let (url, k) = (db_url.clone(), key.clone());
@@ -343,9 +351,8 @@ async fn the_binary_unauthenticated_listener_serves_public_rows_only(pool: PgPoo
     // The principal `main` installed is the dedicated reader, in no group.
     let readers = agents_with_key(&pool, READER_PUBLIC_KEY).await;
     assert_eq!(
-        readers.len(),
-        1,
-        "main must install `listener_principal`'s reader, which creates exactly one reader agent"
+        readers, reserved,
+        "main must install `listener_principal`'s reader, the one reserved row (no second one)"
     );
     assert_ne!(readers[0], server_agent);
     assert_eq!(live_memberships(&pool, readers[0]).await, 0);
