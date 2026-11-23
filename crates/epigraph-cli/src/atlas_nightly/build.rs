@@ -74,11 +74,34 @@ impl Default for NightOptions {
     }
 }
 
+/// What the contract's edge limit cut from the leaves of a theme or a map
+/// ([`super::leaves::cap_leaf_edges`]): the leaves that kept only their
+/// heaviest [`epigraph_atlas_contract::MAX_LEAF_EDGES`] edges, and the edges
+/// left out. Counts of rows the map may draw, so the run's `params` may hold
+/// them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct EdgeCut {
+    capped_leaves: usize,
+    dropped_edges: usize,
+}
+
+impl EdgeCut {
+    fn add(&mut self, other: Self) {
+        self.capped_leaves += other.capped_leaves;
+        self.dropped_edges += other.dropped_edges;
+    }
+
+    fn json(self) -> Value {
+        json!({"capped_leaves": self.capped_leaves, "dropped_edges": self.dropped_edges})
+    }
+}
+
 /// The night's work for one theme that built.
 struct BuiltTheme {
     docs: Vec<LevelDocument>,
     mirrors: Vec<Uuid>,
     stats: Value,
+    edge_cut: EdgeCut,
 }
 
 enum ThemeOutcome {
@@ -133,7 +156,9 @@ fn tree_documents(
 /// Make every leaf of `docs` real: W3's node set, W7's weighted edges, the
 /// agent and evidence labels, each claim's stored `truth_value` (the colour
 /// value only, read under the map's predicate); then check every document against the
-/// contract (a leaf over the edge cap fails here).
+/// contract. A leaf whose edges exceed the contract's limit (in practice one
+/// claim whose own attachments carry more) keeps its heaviest and the cut is
+/// returned, as the cross-group link caps report theirs.
 async fn real_leaves(
     tx: &mut PgConnection,
     viewer: &Viewer,
@@ -141,7 +166,7 @@ async fn real_leaves(
     rows: &epigraph_db::repos::atlas_leaf::LeafRows,
     docs: &mut [LevelDocument],
     cap: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<EdgeCut> {
     let mut sets = Vec::new();
     for doc in docs.iter() {
         if let LevelDocument::Leaf(l) = doc {
@@ -174,17 +199,24 @@ async fn real_leaves(
         .into_iter()
         .collect();
     let truths = AtlasMeaningRepository::claim_truth_values(tx, viewer, map, &claims).await?;
+    let mut cut = EdgeCut::default();
     for (doc, set) in docs.iter_mut().zip(&sets) {
         if let (LevelDocument::Leaf(l), Some(set)) = (doc, set) {
             let inputs = AtlasFlowRepository::read_flow_inputs(tx, viewer, map, set).await?;
-            fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
+            let dropped = fill_leaf(l, set, &inputs, &agent_labels, &evidence_labels, &truths)?;
+            if dropped > 0 {
+                cut.add(EdgeCut {
+                    capped_leaves: 1,
+                    dropped_edges: dropped,
+                });
+            }
         }
     }
     for doc in docs.iter() {
         doc.to_stored_json()
             .map_err(|v| anyhow::anyhow!("level {} breaks the contract: {v}", doc.level_id()))?;
     }
-    Ok(())
+    Ok(cut)
 }
 
 /// One theme's night, on the build's snapshot (the caller runs it inside a
@@ -279,7 +311,7 @@ async fn build_theme(
     let labels = AtlasMeaningRepository::claim_labels(tx, viewer, map, &ids).await?;
     let mut docs = tree_documents(&m_tree, &labels, &m_switch)?;
     docs.extend(tree_documents(&l_tree, &labels, &l_switch)?);
-    real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
+    let edge_cut = real_leaves(tx, viewer, map, &rows, &mut docs, cap).await?;
 
     let inner = |t: &MeaningTree| {
         t.nodes
@@ -302,7 +334,9 @@ async fn build_theme(
                       "mirrors": mirror_count, "joined": l_delta.joined,
                       "new_link_leaves": l_delta.new_link_leaves,
                       "new_mirrors": l_delta.new_mirrors},
+            "leaf_edge_cap": edge_cut.json(),
         }),
+        edge_cut,
     }))
 }
 
@@ -408,6 +442,7 @@ struct MapBuild {
     themes: Value,
     unembedded: i64,
     links: LinksReport,
+    edge_cut: EdgeCut,
     texts: BTreeMap<Uuid, String>,
     names: crate::atlas_naming::name::Previous,
 }
@@ -453,6 +488,7 @@ async fn read_and_build(
 
     let mut docs = Vec::new();
     let mut mirrors = Vec::new();
+    let mut edge_cut = EdgeCut::default();
     let (mut built, mut carried, mut dropped, mut unbuilt) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let empty: Vec<&RunLevel> = Vec::new();
@@ -474,6 +510,7 @@ async fn read_and_build(
                 sp.commit().await.context("release a theme savepoint")?;
                 docs.extend(b.docs);
                 mirrors.extend(b.mirrors);
+                edge_cut.add(b.edge_cut);
                 built.push(json!({"theme_id": theme, "stats": b.stats}));
             }
             Ok(ThemeOutcome::Unbuilt(n)) => {
@@ -544,6 +581,7 @@ async fn read_and_build(
         themes: json!({"built": built, "carried": carried, "dropped": dropped, "unbuilt": unbuilt}),
         unembedded,
         links,
+        edge_cut,
         texts,
         names,
     }))
@@ -578,6 +616,7 @@ pub async fn night_for_map(
         themes,
         unembedded,
         links,
+        edge_cut,
         texts,
         names,
     } = b;
@@ -639,6 +678,7 @@ pub async fn night_for_map(
         "themes": themes,
         "unembedded_members": unembedded,
         "links": links,
+        "leaf_edge_cap": edge_cut.json(),
         "layout": {"computed": fill.computed, "warm_started": fill.warm_started,
                    "reused": fill.reused, "relaid": relaid},
         "naming": {"report": naming_report, "renamed": renamed},
@@ -662,6 +702,7 @@ pub async fn night_for_map(
         "themes": report["themes"].clone(),
         "unembedded_members": unembedded,
         "links": links,
+        "leaf_edge_cap": edge_cut.json(),
         MIRRORS_KEY: mirrors,
     });
     // Errors stay in the report (the journal), not in a row the map's
