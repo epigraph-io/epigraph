@@ -48,7 +48,9 @@ use std::time::Duration;
 use epigraph_db::{AgentRepository, ScopedPool, SessionGucMode};
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools::supersede::{mark_duplicate, supersede_claim, unmark_duplicate};
-use epigraph_mcp::types::{MarkDuplicateParams, SupersedeClaimParams, UnmarkDuplicateParams};
+use epigraph_mcp::types::{
+    ConsolidateClaimsParams, MarkDuplicateParams, SupersedeClaimParams, UnmarkDuplicateParams,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -493,4 +495,151 @@ async fn without_a_retire_the_delegate_unmark_commits(pool: PgPool) {
         is_current(&pool, dup).await,
         "the duplicate is current again"
     );
+}
+
+/// The batch dedup, `consolidate_claims(mode='identity')`: every source's gate
+/// runs first, each on its own transaction that is rolled back (releasing the
+/// link lock), and then ONE transaction commits every mark. A source admitted
+/// through an operator link that is retired between its gate and that commit
+/// must refuse the whole batch there, with nothing written: the batch decides
+/// each link grant again on the committing transaction, under the lock.
+///
+/// The window is pinned with 107's link lock, held EXCLUSIVELY by the test:
+/// the linked source's gate queues on it, the retire queues behind that gate,
+/// and releasing the lock lets the gate read the link as live and roll back
+/// before the retire runs. The retire is then held uncommitted, so the batch's
+/// transaction is stamped while the link's membership is still live; the
+/// batch's re-check queues behind the retire and reads it retired.
+///
+/// The survivor and the first duplicate are the server agent's own claims in
+/// a group it writes independently of the link (owner arm, no link read), so
+/// the batch's own `begin_claim_act` does not wait on the lock: only the
+/// re-check of the linked source does. Without that re-check the batch
+/// commits both marks on its stale stamp before the retire commits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_link_retired_between_a_batch_dedups_gates_and_its_commit_refuses_it(pool: PgPool) {
+    let (p, p_g) = delegation::human_operator(&pool, "race-batch-operator").await;
+    let (server, me) = app_role_server(&pool).await;
+    link(&pool, me, p).await;
+    let mine: Uuid = sqlx::query_scalar(
+        "INSERT INTO groups (display_name, did_key, public_key, kind) \
+         VALUES ('batch race team', 'did:epigraph:test-team:' || gen_random_uuid()::text, \
+                 decode(repeat('ab', 32), 'hex'), 'team') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the server agent's own team");
+    delegation::membership(&pool, mine, me, "writer").await;
+    let survivor = claim(&pool, me, mine).await;
+    let own_dup = claim(&pool, me, mine).await;
+    let linked_dup = claim(&pool, p, p_g).await;
+
+    let mut link_lock = pool.acquire().await.expect("the link-lock session");
+    sqlx::query("SELECT pg_advisory_lock(hashtext('epigraph.operator_links'))")
+        .execute(&mut *link_lock)
+        .await
+        .expect("hold the link lock exclusively");
+    let mut retire = pool.begin().await.expect("begin the retire");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let done = AtomicBool::new(false);
+    let act = async {
+        let out = epigraph_mcp::tools::consolidate::consolidate_claims(
+            &server,
+            &viewer,
+            ConsolidateClaimsParams {
+                source_claim_ids: vec![
+                    survivor.to_string(),
+                    own_dup.to_string(),
+                    linked_dup.to_string(),
+                ],
+                merged_content: String::new(),
+                mode: "identity".to_string(),
+                survivor_claim_id: Some(survivor.to_string()),
+                reason: "link-retire batch race test".to_string(),
+                confidence: None,
+            },
+            None,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| e.message.to_string());
+        done.store(true, Ordering::SeqCst);
+        out
+    };
+    let choreography = async {
+        let mut queued = false;
+        for _ in 0..400 {
+            if lock_waiters(&pool).await > 0 {
+                queued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            queued,
+            "PREMISE: the linked source's gate queued on the link lock"
+        );
+        let retire_stmt = async {
+            let (outcome,): (String,) = sqlx::query_as(
+                "SELECT outcome FROM public.epigraph_retire_operator_link($1, \
+                 'link-retire batch race test', true)",
+            )
+            .bind(me)
+            .fetch_one(&mut *retire)
+            .await
+            .expect("the retire verb");
+            outcome
+        };
+        let release = async {
+            for _ in 0..400 {
+                if lock_waiters(&pool).await > 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            sqlx::query("SELECT pg_advisory_unlock(hashtext('epigraph.operator_links'))")
+                .execute(&mut *link_lock)
+                .await
+                .expect("release the link lock");
+        };
+        let (outcome, ()) = tokio::join!(retire_stmt, release);
+        assert_eq!(
+            outcome, "retired",
+            "PREMISE: the retire retired the live link"
+        );
+        for _ in 0..200 {
+            if done.load(Ordering::SeqCst) || lock_waiters(&pool).await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        retire.commit().await.expect("commit the retire");
+    };
+    let (out, ()) = tokio::join!(act, choreography);
+
+    assert_eq!(
+        acting_operator(&pool, me).await,
+        None,
+        "the retire committed"
+    );
+    let err = out.expect_err(
+        "a batch whose linked source's link was retired before the batch committed must be \
+         refused",
+    );
+    assert!(
+        err.contains(STDIO_REFUSAL),
+        "the ownership gate refused on the batch's transaction: {err}"
+    );
+    assert_eq!(
+        marked_onto(&pool, linked_dup).await,
+        None,
+        "the linked source was marked"
+    );
+    assert_eq!(
+        marked_onto(&pool, own_dup).await,
+        None,
+        "the batch is all or nothing: the own source was marked"
+    );
+    assert!(is_current(&pool, linked_dup).await && is_current(&pool, own_dup).await);
 }
