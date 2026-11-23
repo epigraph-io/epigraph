@@ -2962,3 +2962,48 @@ async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_
     );
     assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
 }
+
+/// Backlog b1e2151c (2): every batch transaction reports how long it held
+/// the LOCKED-PER-BATCH locks, and the result reports the longest, with the
+/// batch size: the per-batch stall a concurrent edge or fragment writer
+/// sees. A dry run reports it too (it takes the same locks).
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_batch_reports_how_long_it_held_the_instance_wide_locks(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a, fx.b]);
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: &["--batch-size", "1"],
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    let batches: Vec<&str> = dry
+        .stdout
+        .lines()
+        .filter(|l| l.starts_with("BATCH "))
+        .collect();
+    assert_eq!(batches.len(), 2, "{}", dry.show());
+    for l in &batches {
+        let ms = l
+            .split("locks held ")
+            .nth(1)
+            .and_then(|t| t.strip_suffix(" ms"))
+            .and_then(|t| t.parse::<u128>().ok());
+        assert!(ms.is_some(), "a BATCH line without its lock hold: {l}");
+    }
+    assert!(
+        dry.stdout.lines().any(|l| l.contains("longest lock hold: ")
+            && l.contains("over 2 transaction(s) at --batch-size 1")),
+        "{}",
+        dry.show()
+    );
+}

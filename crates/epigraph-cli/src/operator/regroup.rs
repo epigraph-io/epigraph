@@ -129,7 +129,12 @@
 //! (`LOCKED-PER-BATCH`), so a concurrent INSERT on a moving claim either
 //! commits before the batch reads its rows or is stamped after the move: no
 //! edge or fragment lands on the pre-move tuple behind the batch. That blocks
-//! every write to those tables on the instance while a batch runs.
+//! every write to those tables on the instance while a batch runs. Each
+//! `BATCH` line prints how long its transaction held those locks (`locks
+//! held <ms> ms`) and the result prints the longest (`longest lock hold`):
+//! the stall a concurrent edge or fragment writer sees, per batch. A dry run
+//! takes the same locks, so its figure at the intended `--batch-size` is the
+//! estimate to plan an apply with (`docs/deploy.md`).
 //!
 //! Every moved claim is `('group', TARGET)`; every recorded row ends exactly
 //! where the rule above puts it and no row became public; the per-table row
@@ -1876,6 +1881,26 @@ pub struct RunReport {
     pub irreversible_claims: usize,
     pub manifest_rows: usize,
     pub audit_written: bool,
+    /// How long each batch transaction (probes included) held the
+    /// `LOCKED-PER-BATCH` locks.
+    pub lock_hold: LockHold,
+}
+
+/// The per-transaction lock-hold times of a run: every batch transaction
+/// (and every `--refuse-irreversible` probe) holds `SHARE ROW EXCLUSIVE` on
+/// the `LOCKED-PER-BATCH` tables from its first statement to its end, which
+/// is the longest any edge or fragment write on the instance waits on it.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct LockHold {
+    pub transactions: usize,
+    pub max_ms: u128,
+}
+
+impl LockHold {
+    fn record(&mut self, ms: u128) {
+        self.transactions += 1;
+        self.max_ms = self.max_ms.max(ms);
+    }
 }
 
 /// `--refuse-irreversible`'s probe of one batch: run it in a transaction that
@@ -1895,14 +1920,17 @@ async fn probe_irreversible(
     ctx: &Ctx<'_>,
     mut claims: Vec<Uuid>,
     known: &Known,
+    lock_hold: &mut LockHold,
 ) -> anyhow::Result<(Vec<Uuid>, Vec<(Uuid, Hold)>)> {
     let mut refused: Vec<(Uuid, Hold)> = Vec::new();
     let probe_ctx = Ctx { sample: 0, ..*ctx };
     while !claims.is_empty() {
+        let started = std::time::Instant::now();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let mut scratch = Sink::Memory(Default::default(), 0);
         let r = run_batch(&mut tx, &probe_ctx, &claims, &mut scratch, known, None).await;
         tx.rollback().await?;
+        lock_hold.record(started.elapsed().as_millis());
         let Ok(b) = r else { break };
         let mut named: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
         for (edge, verdict) in &b.irreversible {
@@ -2185,9 +2213,11 @@ pub async fn run(
         // that is always rolled back and records into memory only (so the
         // manifest never names a claim this run does not move), and drop
         // every claim an IRREVERSIBLE-EDGE names; repeat until none is named.
+        // Each probe holds the batch's locks for its own duration.
         let mut claims: Vec<Uuid> = batch.to_vec();
         if opts.refuse_irreversible {
-            let (kept, refused) = probe_irreversible(conn, &ctx, claims, &known).await?;
+            let (kept, refused) =
+                probe_irreversible(conn, &ctx, claims, &known, &mut report.lock_hold).await?;
             claims = kept;
             report.held_under_lock.extend(refused);
         }
@@ -2200,6 +2230,7 @@ pub async fn run(
             )?;
             continue;
         }
+        let started = std::time::Instant::now();
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
             (opts.apply && !report.audit_written).then_some((&audit_details, opts.operator));
@@ -2213,6 +2244,8 @@ pub async fn run(
         } else {
             tx.rollback().await?;
         }
+        let held_ms = started.elapsed().as_millis();
+        report.lock_hold.record(held_ms);
         match r {
             Ok(b) => {
                 report.claims_moved += b.claims_moved;
@@ -2247,13 +2280,17 @@ pub async fn run(
                 }
                 writeln!(
                     out,
-                    "BATCH {}/{total}\tOK\t{} claim(s) moved",
+                    "BATCH {}/{total}\tOK\t{} claim(s) moved\tlocks held {held_ms} ms",
                     i + 1,
                     b.claims_moved
                 )?;
             }
             Err(e) => {
-                writeln!(out, "BATCH {}/{total}\tROLLED BACK\t{e}", i + 1)?;
+                writeln!(
+                    out,
+                    "BATCH {}/{total}\tROLLED BACK\t{e}\tlocks held {held_ms} ms",
+                    i + 1
+                )?;
                 report.batch_failures.push((i + 1, e.to_string()));
                 if opts.apply {
                     writeln!(out, "STOPPED: no further batch was attempted")?;
@@ -2321,6 +2358,13 @@ pub async fn run(
         report.irreversible_edges, report.irreversible_claims
     )?;
     writeln!(out, "  manifest row records: {}", report.manifest_rows)?;
+    writeln!(
+        out,
+        "  longest lock hold: {} ms over {} transaction(s) at --batch-size {} (LOCKED-PER-BATCH: \
+         every edge and fragment write on the instance waits up to this long per batch; a dry \
+         run takes the same locks, so its figure is the stall to expect)",
+        report.lock_hold.max_ms, report.lock_hold.transactions, opts.batch_size
+    )?;
     writeln!(
         out,
         "  invariants: {}",

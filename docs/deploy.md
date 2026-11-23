@@ -2663,7 +2663,19 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   (`LOCKED-PER-BATCH`), so an edge or fragment inserted on a moving claim
   while the batch runs either lands before the batch reads its rows or is
   stamped after the move. Every write to those tables on the instance waits
-  for the batch; keep `--batch-size` small on a busy instance.
+  for the batch; keep `--batch-size` small on a busy instance. Each `BATCH`
+  line prints how long its transaction held the locks (`locks held <ms>
+  ms`), and the result prints the longest (`longest lock hold: <ms> ms over
+  <n> transaction(s) at --batch-size <N>`): that is the stall a concurrent
+  edge or fragment writer sees per batch. There is no fixed figure per batch
+  size; it depends on the claims' rows and the instance's load. Measure it:
+  a dry run takes the same locks for the same work, so run the dry run at
+  the `--batch-size` you intend to apply with, at a comparable time of day,
+  and lower the batch size until the longest hold is one your writers can
+  wait (their `lock_timeout` and request timeouts are the limit). The locks
+  are not narrowed to the moving claims: every edge and fragment writer
+  would have to take the same row or advisory lock, which is a schema
+  change.
 - **Left as they are**: an outsider's challenge (it is the challenger's; it
   is readable with its claim) and a fragment shared with a claim that stays.
 - **Invariants per batch**: the row census, every row's end state, and
