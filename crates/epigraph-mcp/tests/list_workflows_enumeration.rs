@@ -9,8 +9,12 @@
 //! * every lineage the caller reads is listed exactly once, through pages
 //!   smaller than the registry, as its HEAD (highest generation), and the walk
 //!   terminates with a null cursor;
-//! * the head is picked BEFORE the deprecation filter, so a lineage with a
-//!   deprecated head is omitted, never listed through an older live generation;
+//! * the head is picked BEFORE any truth test, so a deprecated head is
+//!   reported as the head, never replaced by an older live generation; a
+//!   lineage rolled back that way (deprecated head, live older generation,
+//!   which `find_workflow*` still serves) stays listed by default, naming
+//!   that live generation, and only a lineage with no live generation is
+//!   left out unless deprecated workflows are asked for;
 //! * a lineage that gains a generation mid-walk is not listed a second time;
 //! * a group-private lineage (and a group-private generation, and its count)
 //!   is listed to readers of the group only;
@@ -198,16 +202,19 @@ struct Registry {
     member: Viewer,
     stranger: Viewer,
     /// canonical_name -> (head id, head generation, generations), as the
-    /// MEMBER reads it, deprecated lineage excluded.
+    /// MEMBER reads it in a default walk (the lineage with no live generation
+    /// excluded).
     member_view: BTreeMap<String, (Uuid, i64, i64)>,
     retired_head: Uuid,
+    retired_live: Uuid,
+    sunset: Uuid,
     split_public_gen0: Uuid,
     flat_public: Uuid,
     flat_private: Uuid,
     flat_retired: Uuid,
 }
 
-/// Six lineages, of which only ONE has "workflow" in its name or goal, and
+/// Eight lineages, of which only ONE has "workflow" in its name or goal, and
 /// three flat workflow claims:
 ///
 /// * `alpha-calibration`: three public generations; the head's goal diverged.
@@ -215,7 +222,9 @@ struct Registry {
 /// * `delta-roadmap`: one generation, private to the member's group.
 /// * `split-tenancy`: gen 0 public, gen 1 (the head) private to the group.
 /// * `zz-workflow-audit`: the one lineage a keyword search for "workflow" finds.
-/// * `retired-plan`: gen 0 live, gen 1 the head, DEPRECATED (truth 0.05).
+/// * `retired-plan`: gen 0 live, gen 1 the head, DEPRECATED (truth 0.05):
+///   a rolled-back lineage, still listed by default.
+/// * `echo-sunset`: its only generation DEPRECATED: listed only on request.
 /// * flat: one public, one group-private, one public but not current.
 ///
 /// The created_at order is deliberately NOT the canonical_name order.
@@ -256,7 +265,7 @@ async fn seed_registry(pool: &PgPool) -> Registry {
     )
     .await;
     let audit = public("zz-workflow-audit", 0, "audit every workflow", 1).await;
-    seed_generation(
+    let retired_live = seed_generation(
         pool,
         "retired-plan",
         0,
@@ -278,6 +287,17 @@ async fn seed_registry(pool: &PgPool) -> Registry {
         3,
     )
     .await;
+    let sunset = seed_generation(
+        pool,
+        "echo-sunset",
+        0,
+        "a plan nobody runs any more",
+        0.05,
+        "public",
+        group,
+        4,
+    )
+    .await;
 
     let flat_public = seed_flat(pool, member_id, None, "flat public workflow").await;
     let flat_private = seed_flat(pool, member_id, Some(group), "flat private workflow").await;
@@ -293,6 +313,7 @@ async fn seed_registry(pool: &PgPool) -> Registry {
         ("bravo-intake".to_string(), (bravo, 0, 1)),
         ("charlie-recompute".to_string(), (charlie_head, 1, 2)),
         ("delta-roadmap".to_string(), (delta, 0, 1)),
+        ("retired-plan".to_string(), (retired_head, 1, 2)),
         ("split-tenancy".to_string(), (split_head, 1, 2)),
         ("zz-workflow-audit".to_string(), (audit, 0, 1)),
     ]);
@@ -301,6 +322,8 @@ async fn seed_registry(pool: &PgPool) -> Registry {
         stranger: Viewer::resolve(pool, stranger_id).await.expect("stranger"),
         member_view,
         retired_head,
+        retired_live,
+        sunset,
         split_public_gen0,
         flat_public,
         flat_private,
@@ -309,14 +332,14 @@ async fn seed_registry(pool: &PgPool) -> Registry {
 }
 
 /// The backlog symptom and its fix: a keyword search for "workflow" finds one
-/// lineage of six, while a walk in pages of two lists every lineage once, as
+/// lineage of the seven live ones, while a walk in pages of two lists every lineage once, as
 /// its head with its generation count, then the flat claims, and ends.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_paged_walk_lists_every_lineage_once_as_its_head(pool: PgPool) {
     let server = app_role_server(&pool).await;
     let r = seed_registry(&pool).await;
 
-    // The audit's old recipe: a keyword search. It misses five lineages.
+    // The audit's old recipe: a keyword search. It misses six lineages.
     let found = find_workflow_hierarchical(
         &server,
         &r.member,
@@ -354,8 +377,8 @@ async fn a_paged_walk_lists_every_lineage_once_as_its_head(pool: PgPool) {
         "every live lineage the member reads, once, as its head: {all:?}"
     );
     assert!(
-        pages.len() >= 4,
-        "six lineages and two flat claims in pages of two take at least four pages: {pages:?}"
+        pages.len() >= 5,
+        "seven lineages and two flat claims in pages of two take at least five pages: {pages:?}"
     );
 
     // Lineages first, in canonical_name order, then the flat claims.
@@ -390,19 +413,45 @@ async fn a_paged_walk_lists_every_lineage_once_as_its_head(pool: PgPool) {
     assert!(all.iter().all(|e| e["deprecated"] == false), "{all:?}");
 }
 
-/// Head first, filter second: the deprecated head of `retired-plan` hides the
-/// lineage by default; it is NOT listed through its older live generation. With
-/// include_deprecated the lineage is listed as that head, flagged, and the
-/// retired flat claim is listed too.
+/// A deprecated head never hides a live generation, and never poses as one:
+/// * `retired-plan` (head gen 1 deprecated, gen 0 live) is listed BY DEFAULT,
+///   as its real head (gen 1, `head_deprecated`), naming gen 0 as the live
+///   generation `find_workflow*` still serves, and not `deprecated`;
+/// * `echo-sunset` (no live generation) is left out by default and listed with
+///   include_deprecated, `deprecated`, with no live generation;
+/// * the retired flat claim follows the same switch.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_deprecated_head_hides_its_lineage_unless_asked_for(pool: PgPool) {
+async fn a_deprecated_head_keeps_a_rolled_back_lineage_listed(pool: PgPool) {
     let server = app_role_server(&pool).await;
     let r = seed_registry(&pool).await;
+    let by_name = |all: &[Value], name: &str| -> Option<Value> {
+        all.iter().find(|e| e["canonical_name"] == name).cloned()
+    };
 
     let default_walk = entries(&walk(&server, &r.member, 50, None).await);
+    let retired = by_name(&default_walk, "retired-plan")
+        .unwrap_or_else(|| panic!("a rolled-back lineage is listed by default: {default_walk:?}"));
+    assert_eq!(
+        retired["workflow_id"],
+        r.retired_head.to_string(),
+        "listed as its real (deprecated) head, never as gen 0 posing as the head: {retired}"
+    );
+    assert_eq!(retired["generation"], 1, "{retired}");
+    assert_eq!(retired["head_deprecated"], true, "{retired}");
+    assert_eq!(
+        retired["live_workflow_id"],
+        r.retired_live.to_string(),
+        "names the live generation agents still run: {retired}"
+    );
+    assert_eq!(retired["live_generation"], 0, "{retired}");
+    assert_eq!(retired["deprecated"], false, "{retired}");
+    // A live head is its own live generation.
+    let bravo = by_name(&default_walk, "bravo-intake").expect("bravo-intake");
+    assert_eq!(bravo["head_deprecated"], false, "{bravo}");
+    assert_eq!(bravo["live_workflow_id"], bravo["workflow_id"], "{bravo}");
     assert!(
-        !lineages(&default_walk).contains_key("retired-plan"),
-        "a lineage whose head is deprecated is not listed by default: {default_walk:?}"
+        by_name(&default_walk, "echo-sunset").is_none(),
+        "a lineage with no live generation is not listed by default: {default_walk:?}"
     );
     assert!(!flat_ids(&default_walk).contains(&r.flat_retired));
 
@@ -411,13 +460,18 @@ async fn a_deprecated_head_hides_its_lineage_unless_asked_for(pool: PgPool) {
     assert_eq!(
         listed.get("retired-plan"),
         Some(&(r.retired_head, 1, 2)),
-        "listed as its deprecated head, never as the live generation 0: {all:?}"
+        "{all:?}"
     );
-    let retired = all
-        .iter()
-        .find(|e| e["canonical_name"] == "retired-plan")
-        .expect("retired-plan entry");
-    assert_eq!(retired["deprecated"], true, "{retired}");
+    assert_eq!(
+        listed.get("echo-sunset"),
+        Some(&(r.sunset, 0, 1)),
+        "{all:?}"
+    );
+    let sunset = by_name(&all, "echo-sunset").expect("echo-sunset entry");
+    assert_eq!(sunset["deprecated"], true, "{sunset}");
+    assert_eq!(sunset["head_deprecated"], true, "{sunset}");
+    assert!(sunset["live_workflow_id"].is_null(), "{sunset}");
+    assert!(sunset["live_generation"].is_null(), "{sunset}");
     assert!(flat_ids(&all).contains(&r.flat_retired), "{all:?}");
     let flat_retired = all
         .iter()

@@ -103,6 +103,12 @@ pub struct HierarchicalLineageHeadRow {
     pub truth_value: f64,
     /// Generations of this `canonical_name` the connection reads.
     pub generations: i64,
+    /// The highest generation the connection reads whose truth is at least
+    /// the live threshold (the head itself when the head is live); `None`
+    /// when every generation it reads is below the threshold.
+    pub live_id: Option<Uuid>,
+    /// [`Self::live_id`]'s generation.
+    pub live_generation: Option<i32>,
 }
 
 /// One row of [`WorkflowRepository::list_flat_page`].
@@ -1964,11 +1970,18 @@ impl WorkflowRepository {
     /// lack the query text is never returned however many pages a caller
     /// walks (backlog 039ef40a).
     ///
-    /// * **Head first, filter second.** The head is picked over every row the
-    ///   connection reads, and `min_truth` then applies to the HEAD only, so a
-    ///   lineage whose head is deprecated is omitted (or, at `min_truth` 0.0,
-    ///   returned flagged by its truth), never reported through an older live
-    ///   generation posing as its head.
+    /// * **The head is the head.** It is picked over every row the connection
+    ///   reads, before any truth test, so a deprecated head is reported as the
+    ///   head (its truth shows it), never replaced by an older live generation
+    ///   posing as the head.
+    /// * **A rolled-back lineage stays listed.** `live_id` / `live_generation`
+    ///   name the highest generation with truth at least `live_min_truth`
+    ///   (picked in the head's order, under the same row security). A lineage
+    ///   whose head is deprecated but which still has a live generation is
+    ///   returned (agents still find and run that generation through
+    ///   `find_workflow*`, so an enumeration that dropped it would undercount
+    ///   what is in use). Only a lineage with NO live generation is omitted,
+    ///   unless `include_without_live` is set.
     /// * **Keyed on the lineage, not on time.** A lineage that gains a
     ///   generation while a caller pages keeps its `canonical_name`, so it is
     ///   returned exactly once; a `(created_at, id)` key would move it past the
@@ -1989,7 +2002,8 @@ impl WorkflowRepository {
     pub async fn list_hierarchical_lineage_heads<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         after: Option<&str>,
-        min_truth: f64,
+        live_min_truth: f64,
+        include_without_live: bool,
         limit: i64,
     ) -> Result<Vec<HierarchicalLineageHeadRow>, sqlx::Error> {
         sqlx::query_as::<_, HierarchicalLineageHeadRow>(
@@ -2002,15 +2016,25 @@ impl WorkflowRepository {
                  WHERE ($1::text IS NULL OR canonical_name > $1::text) \
                  ORDER BY canonical_name, generation DESC, created_at DESC, id ASC \
              ) \
-             SELECT id, canonical_name, generation, goal, parent_id, created_at, truth_value, \
-                    generations \
-             FROM heads \
-             WHERE truth_value >= $2 \
-             ORDER BY canonical_name \
-             LIMIT $3",
+             SELECT h.id, h.canonical_name, h.generation, h.goal, h.parent_id, h.created_at, \
+                    h.truth_value, h.generations, \
+                    live.id AS live_id, live.generation AS live_generation \
+             FROM heads h \
+             LEFT JOIN LATERAL ( \
+                 SELECT w.id, w.generation \
+                 FROM workflows w \
+                 WHERE w.canonical_name = h.canonical_name \
+                   AND w.truth_value >= $2 \
+                 ORDER BY w.generation DESC, w.created_at DESC, w.id ASC \
+                 LIMIT 1 \
+             ) live ON true \
+             WHERE $3 OR live.id IS NOT NULL \
+             ORDER BY h.canonical_name \
+             LIMIT $4",
         )
         .bind(after)
-        .bind(min_truth)
+        .bind(live_min_truth)
+        .bind(include_without_live)
         .bind(limit)
         .fetch_all(executor)
         .await

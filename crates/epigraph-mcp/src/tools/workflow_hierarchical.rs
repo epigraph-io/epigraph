@@ -191,10 +191,10 @@ pub async fn find_workflow_hierarchical(
 
 // ── list_workflows ─────────────────────────────────────────────────────────
 
-/// The truth below which a hierarchical lineage head counts as deprecated:
+/// The truth below which a hierarchical generation counts as deprecated:
 /// `find_workflow_hierarchical`'s default `min_truth` (`deprecate_workflow`
 /// writes 0.05).
-const LIVE_HEAD_MIN_TRUTH: f64 = 0.3;
+const LIVE_MIN_TRUTH: f64 = 0.3;
 
 /// Where a `list_workflows` page starts. The enumeration walks the
 /// hierarchical lineages (keyed on `canonical_name`) and then the flat
@@ -269,11 +269,6 @@ pub async fn list_workflows(
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
     let include_deprecated = params.include_deprecated.unwrap_or(false);
     let cursor = ListWorkflowsCursor::parse(params.cursor.as_deref())?;
-    let head_min_truth = if include_deprecated {
-        f64::MIN
-    } else {
-        LIVE_HEAD_MIN_TRUTH
-    };
 
     let mut read = server.read_as(viewer, "list_workflows").await?;
     let mut workflows: Vec<serde_json::Value> = Vec::new();
@@ -290,7 +285,8 @@ pub async fn list_workflows(
             let mut rows = epigraph_db::WorkflowRepository::list_hierarchical_lineage_heads(
                 &mut *read,
                 after,
-                head_min_truth,
+                LIVE_MIN_TRUTH,
+                include_deprecated,
                 limit + 1,
             )
             .await
@@ -314,7 +310,10 @@ pub async fn list_workflows(
                     "parent_id": r.parent_id,
                     "created_at": r.created_at,
                     "truth_value": r.truth_value,
-                    "deprecated": r.truth_value < LIVE_HEAD_MIN_TRUTH,
+                    "head_deprecated": r.truth_value < LIVE_MIN_TRUTH,
+                    "live_workflow_id": r.live_id,
+                    "live_generation": r.live_generation,
+                    "deprecated": r.live_id.is_none(),
                 }));
             }
             None

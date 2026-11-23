@@ -1298,7 +1298,7 @@ pub struct ListWorkflowsParams {
     pub cursor: Option<String>,
 
     #[schemars(
-        description = "When true, also list deprecated workflows: a hierarchical lineage whose head's truth is below 0.3 (deprecate_workflow writes 0.05) and a flat workflow claim that is no longer current. Defaults to false."
+        description = "When true, also list deprecated workflows: a hierarchical lineage none of whose generations you can read has truth 0.3 or above (deprecate_workflow writes 0.05) and a flat workflow claim that is no longer current. A lineage whose head is deprecated but which still has a live generation is listed either way. Defaults to false."
     )]
     pub include_deprecated: Option<bool>,
 }
