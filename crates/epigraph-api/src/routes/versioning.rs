@@ -791,6 +791,8 @@ pub async fn supersede_claim(
 ///   cannot read it (the two are indistinguishable)
 /// - 409 Conflict: the duplicate is already superseded, or the canonical is
 ///   not current (operator ruling R-55: a state refusal, with its reason)
+/// - 500: the database failed (a lock timeout, a lost connection); nothing was
+///   written, and the detail is in the server log
 /// - 200 OK: duplicate marked successfully
 #[cfg(feature = "db")]
 #[utoipa::path(
@@ -805,6 +807,7 @@ pub async fn supersede_claim(
         (status = 403),
         (status = 404),
         (status = 409),
+        (status = 500),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -933,31 +936,7 @@ pub async fn mark_duplicate(
         &provenance,
     )
     .await
-    .map_err(|e| match e {
-        e if crate::errors::db_is_insufficient_privilege(&e) => {
-            tracing::warn!(
-                target: "tenancy.scoped_write",
-                handler = "mark_duplicate",
-                claim = %dup_id,
-                error = %e,
-                "the database refused the dedup"
-            );
-            crate::errors::write_refused("claim")
-        }
-        epigraph_db::DbError::NotFound { id, .. } => ApiError::NotFound {
-            entity: "Claim".into(),
-            id: id.to_string(),
-        },
-        // The act's own refusals by kind (operator ruling R-55): FA04/FA07
-        // are 403, a retired canonical or an already-superseded duplicate 409.
-        e @ epigraph_db::DbError::Refused { .. } => ApiError::from(e),
-        epigraph_db::DbError::QueryFailed { .. } => ApiError::Conflict {
-            reason: "claim already superseded or invalid input".into(),
-        },
-        other => ApiError::DatabaseError {
-            message: other.to_string(),
-        },
-    })?;
+    .map_err(|e| mark_duplicate_act_error(e, dup_id))?;
     let trigger = epigraph_engine::admin_cascade::CascadeTrigger::new(
         epigraph_engine::admin_cascade::CascadeCause::Dedup,
         viewer.principal(),
@@ -1025,6 +1004,84 @@ pub async fn mark_duplicate(
     }))
 }
 
+/// The answer `mark_duplicate` gives when the dedup's act fails:
+///
+/// - row security refused the write (42501): the group-write 403;
+/// - a claim is missing or unreadable: 404;
+/// - the act's designed refusal by its kind (FA04/FA07 are 403, a retired
+///   canonical or an already-superseded duplicate 409), a reviewed coded
+///   refusal with its code, and the coded denials (OPL01, OPL02, ROL01, the
+///   personal-group and elevation denials, a row-security write refusal) as
+///   `From<DbError>` answers them;
+/// - every other error, including an uncoded `QueryFailed` (a lock timeout, a
+///   lost connection) and the variants `From<DbError>` would answer as the
+///   caller's 400/409 (`InvalidData`, a constraint violation, a duplicate key,
+///   `Conflict`): the redacted 500. None of those is the caller's error on
+///   this path, where both claims were already resolved; their text is a
+///   server diagnostic and stays in the log.
+///
+/// An uncoded `QueryFailed` used to be answered 409 "claim already superseded
+/// or invalid input", from before the act's refusals had their own variant
+/// (backlog dca9ed56). The list is an allow-list, so a new `DbError` variant
+/// defaults to the redacted 500.
+#[cfg(feature = "db")]
+fn mark_duplicate_act_error(e: epigraph_db::DbError, dup_id: Uuid) -> ApiError {
+    use epigraph_db::DbError;
+    match e {
+        e if crate::errors::db_is_insufficient_privilege(&e) => {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                handler = "mark_duplicate",
+                claim = %dup_id,
+                error = %e,
+                "the database refused the dedup"
+            );
+            crate::errors::write_refused("claim")
+        }
+        DbError::NotFound { id, .. } => ApiError::NotFound {
+            entity: "Claim".into(),
+            id: id.to_string(),
+        },
+        e @ (DbError::Refused { .. }
+        | DbError::QueryFailed { .. }
+        | DbError::WriteRefused { .. }
+        | DbError::ElevatedReadOnly
+        | DbError::MembershipRevoked { .. }
+        | DbError::PersonalGroupNotOwned { .. }
+        | DbError::OperatorLinkRequired { .. }
+        | DbError::OperatorScopeRefused { .. }
+        | DbError::RoleHolderRequired { .. }) => ApiError::from(e),
+        other => ApiError::DatabaseError {
+            message: other.to_string(),
+        },
+    }
+}
+
+/// The answer `unmark_duplicate` gives when the administrative un-mark
+/// changed nothing ([`epigraph_engine::admin_cascade::UnmarkRefusal`]):
+///
+/// - the act's designed refusal by its kind, as any repo refusal is answered
+///   (`From<DbError>`: input 400, authority 403, state 409), its text the
+///   reason;
+/// - no record to reverse the mark from: 409, with the reason;
+/// - a failure: 500, its text in the server log only.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn unmark_refusal(e: epigraph_engine::admin_cascade::UnmarkRefusal) -> ApiError {
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+    match e {
+        UnmarkRefusal::Act { kind, message } => {
+            ApiError::from(epigraph_db::DbError::Refused { kind, message })
+        }
+        e @ UnmarkRefusal::NoRecord => ApiError::Conflict {
+            reason: e.to_string(),
+        },
+        e @ UnmarkRefusal::Failed(_) => ApiError::InternalError {
+            message: e.to_string(),
+        },
+    }
+}
+
 /// Un-mark a duplicate: reverse `POST /api/v1/claims/{id}/dedup`.
 ///
 /// POST /api/v1/claims/{id}/undedup
@@ -1052,6 +1109,7 @@ pub async fn mark_duplicate(
         (status = 403),
         (status = 404),
         (status = 409),
+        (status = 500),
     ),
     security(("ed25519_signature" = [])),
     tag = "claims"
@@ -1216,14 +1274,7 @@ pub async fn unmark_duplicate(
         Some(&chain),
     )
     .await
-    .map_err(|e| match e {
-        epigraph_engine::admin_cascade::UnmarkRefusal::Failed(_) => ApiError::InternalError {
-            message: e.to_string(),
-        },
-        other => ApiError::Conflict {
-            reason: other.to_string(),
-        },
-    })?;
+    .map_err(unmark_refusal)?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule). Stored only if the claim is still current and unsealed.
@@ -1586,5 +1637,111 @@ mod nodb_stub_tests {
             challenge.contains(r#"error="invalid_token""#),
             "got: {challenge}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod unmark_refusal_tests {
+    use super::unmark_refusal;
+    use axum::response::IntoResponse;
+    use epigraph_db::RefusalKind;
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+
+    fn status(e: UnmarkRefusal) -> u16 {
+        unmark_refusal(e).into_response().status().as_u16()
+    }
+
+    /// An un-mark's act refusal is answered by its kind, as every repo refusal
+    /// is (backlog dca9ed56): an authority refusal is 403, not the 409 every
+    /// act refusal used to be; a failure is a 500 whose text stays in the log.
+    #[test]
+    fn an_unmark_refusal_is_answered_by_its_kind() {
+        let act = |kind| UnmarkRefusal::Act {
+            kind,
+            message: "unmark_duplicate: refused".into(),
+        };
+        assert_eq!(status(act(RefusalKind::Input)), 400);
+        assert_eq!(status(act(RefusalKind::Authority)), 403);
+        assert_eq!(status(act(RefusalKind::State)), 409);
+        assert_eq!(status(UnmarkRefusal::NoRecord), 409);
+        let failed = unmark_refusal(UnmarkRefusal::Failed(
+            "Query failed: canceling statement due to lock timeout".into(),
+        ));
+        assert!(
+            matches!(failed, crate::errors::ApiError::InternalError { .. }),
+            "{failed:?}"
+        );
+        assert_eq!(failed.into_response().status().as_u16(), 500);
+    }
+
+    /// The status and the whole body of `mark_duplicate`'s answer to `e`.
+    async fn dedup_answer(e: epigraph_db::DbError) -> (u16, String) {
+        use http_body_util::BodyExt;
+        let response = super::mark_duplicate_act_error(e, uuid::Uuid::new_v4()).into_response();
+        let status = response.status().as_u16();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("an in-memory body")
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A dedup act's error is the caller's only when it is a designed
+    /// refusal or a coded denial (backlog dca9ed56): every other error is a
+    /// server fault on this path, where both claims were already resolved, so
+    /// it is the redacted 500 and its text stays in the log, not a 400/409
+    /// carrying a server diagnostic as the caller's reason.
+    #[tokio::test]
+    async fn a_dedup_act_error_is_the_callers_only_when_it_is_a_designed_refusal() {
+        use epigraph_db::DbError;
+        const DIAGNOSTIC: &str = "edge properties do not recompute to the digest signed over them";
+        let faults = [
+            DbError::InvalidData {
+                reason: DIAGNOSTIC.into(),
+            },
+            DbError::Conflict {
+                reason: DIAGNOSTIC.into(),
+            },
+            DbError::CheckViolation {
+                constraint: DIAGNOSTIC.into(),
+                message: DIAGNOSTIC.into(),
+            },
+            DbError::ForeignKeyViolation {
+                constraint: DIAGNOSTIC.into(),
+            },
+            DbError::DuplicateKey {
+                entity: DIAGNOSTIC.into(),
+            },
+            DbError::QueryFailed {
+                source: sqlx::Error::Protocol(DIAGNOSTIC.into()),
+            },
+        ];
+        for fault in faults {
+            let label = format!("{fault:?}");
+            let (status, body) = dedup_answer(fault).await;
+            assert_eq!(status, 500, "{label}: {body}");
+            assert!(!body.contains(DIAGNOSTIC), "{label} leaked: {body}");
+        }
+        // The designed refusals and the coded denials keep their answers.
+        let refused = |kind| DbError::Refused {
+            kind,
+            message: "mark_duplicate: refused".into(),
+        };
+        assert_eq!(dedup_answer(refused(RefusalKind::Input)).await.0, 400);
+        assert_eq!(dedup_answer(refused(RefusalKind::Authority)).await.0, 403);
+        assert_eq!(dedup_answer(refused(RefusalKind::State)).await.0, 409);
+        let missing = DbError::NotFound {
+            entity: "Claim".into(),
+            id: uuid::Uuid::new_v4(),
+        };
+        assert_eq!(dedup_answer(missing).await.0, 404);
+        let role = DbError::RoleHolderRequired {
+            message: "ROL01: refused".into(),
+        };
+        let (status, body) = dedup_answer(role).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(body.contains("ROL01"), "{body}");
     }
 }

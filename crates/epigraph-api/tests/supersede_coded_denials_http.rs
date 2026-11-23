@@ -574,3 +574,100 @@ async fn an_unlisted_coded_42501_is_the_group_write_403_until_reviewed(pool: PgP
         "pinned: the unreviewed text is not sent: {reason}"
     );
 }
+
+/// The role the ROL01 fixtures attach an agent to.
+const ROL01_ROLE: &str = "role:test-supersede-rol01";
+
+/// A platform role with its role node (as `role_attached_agents.rs` seeds it).
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+/// Attach `agent` to `role` through the maintenance definer, live from a few
+/// seconds ago.
+async fn attach_to_role(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    viewer_fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// Grant `role` to `holder`, live from a few seconds ago, open-ended.
+async fn grant_role(pool: &PgPool, role: &str, holder: Uuid) {
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
+                'test grant')",
+    )
+    .bind(role)
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("grant role");
+}
+
+/// ROL01 (migration 166), the third code `From<DbError>` answers as a coded
+/// 403 beside OPL01 / OPL02, had no supersede pin of its own (backlog
+/// 86a26e69 part 3). X is bound to human A and writes A's group, but X is
+/// attached to a role nobody holds, so once armed the database refuses X's
+/// supersede: 403 naming ROL01, nothing written.
+///
+/// CONTROL: once A holds the role, the same supersede lands, so the refusal
+/// was the role's and nothing else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_rol01_supersede_is_a_coded_403(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    seed_role(&pool, ROL01_ROLE).await;
+    let (a, ag) = viewer_fixture::seed_human_operator(&pool, "rol01-http-human-a").await;
+    let (x, _) = seed_agent_with_group(&pool, "rol01-http-a-agent-x").await;
+    link(&pool, x, a).await;
+    let claim = claim_of(&pool, a, ag, "A's claim").await;
+    attach_to_role(&pool, ROL01_ROLE, x).await;
+    arm(&pool).await;
+
+    let e = http_supersede(&pool, &state, x, &["claims:write"], claim)
+        .await
+        .expect_err("an agent of an unheld role may not supersede once armed");
+    let (status, reason) = rendered(e).await;
+    assert_eq!(status, 403, "{reason}");
+    assert!(reason.contains("ROL01"), "the code is named: {reason}");
+    assert!(
+        !reason.contains("OPL01") && !reason.contains("OPL02"),
+        "calibration: X is bound, inside its human's groups: {reason}"
+    );
+    assert_nothing_written(&pool, claim, "ROL01").await;
+
+    grant_role(&pool, ROL01_ROLE, a).await;
+    http_supersede(&pool, &state, x, &["claims:write"], claim)
+        .await
+        .unwrap_or_else(|e| panic!("CONTROL: A now holds the role: {e:?}"));
+    assert!(!is_current(&pool, claim).await, "CONTROL: it landed");
+}

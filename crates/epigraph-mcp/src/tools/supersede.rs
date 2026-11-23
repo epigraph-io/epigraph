@@ -161,7 +161,7 @@ pub fn supersede_refusal(claim: uuid::Uuid, e: epigraph_db::DbError) -> McpError
         return denial;
     }
     if let Some(message) = database_42501(&e) {
-        if !opens_with_refusal_code(&message) {
+        if !crate::errors::coded(&message) {
             tracing::warn!(
                 target: "tenancy.scoped_write",
                 tool = "supersede_claim",
@@ -243,19 +243,6 @@ fn caller_denial(message: String) -> McpError {
         message: std::borrow::Cow::from(message),
         data: None,
     }
-}
-
-/// Whether a database message opens with a schema refusal code (two to five
-/// ASCII capitals, two digits, a colon: `FA04: ...`), the convention the
-/// migrations' designed refusals follow.
-fn opens_with_refusal_code(message: &str) -> bool {
-    let b = message.as_bytes();
-    let caps = b.iter().take_while(|c| c.is_ascii_uppercase()).count();
-    (2..=5).contains(&caps)
-        && b.len() > caps + 2
-        && b[caps].is_ascii_digit()
-        && b[caps + 1].is_ascii_digit()
-        && b[caps + 2] == b':'
 }
 
 /// [`admin_session_or_deferral`] for `supersede_claim`: the deferral's own
@@ -1044,6 +1031,24 @@ pub(crate) async fn unmark_gate(
     })
 }
 
+/// The answer the un-mark tools give when the administrative un-mark changed
+/// nothing ([`admin_cascade::UnmarkRefusal`]): an act refusal of authority is
+/// a denial (`INVALID_REQUEST`), as on every other write tool; any other act
+/// refusal, and a mark with no record to reverse, is the caller's to correct
+/// (`INVALID_PARAMS`), with its text; a failure is a redacted internal error.
+pub(crate) fn unmark_refusal(e: admin_cascade::UnmarkRefusal) -> McpError {
+    match e {
+        admin_cascade::UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::Authority,
+            message,
+        } => caller_denial(message),
+        e @ (admin_cascade::UnmarkRefusal::Act { .. } | admin_cascade::UnmarkRefusal::NoRecord) => {
+            invalid_params(e.to_string())
+        }
+        e @ admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
+    }
+}
+
 /// [`unmark_duplicate`]'s body, for a caller that knows which dedup it means
 /// to undo (`revert_label_dedup`, see [`UnmarkExpectation`]). Returns the
 /// tool's response object.
@@ -1096,10 +1101,7 @@ pub(crate) async fn unmark_duplicate_expecting(
             .map(|r| r as &dyn admin_cascade::UnmarkPrecondition),
     )
     .await
-    .map_err(|e| match e {
-        admin_cascade::UnmarkRefusal::Failed(_) => internal_error(e),
-        other => invalid_params(other.to_string()),
-    })?;
+    .map_err(unmark_refusal)?;
 
     // Current again: embed post-commit, best-effort (CLAUDE.md's write-path
     // rule), through the claim's author like every other write path.
@@ -1126,38 +1128,36 @@ pub(crate) async fn unmark_duplicate_expecting(
 
 #[cfg(test)]
 mod tests {
-    use super::opens_with_refusal_code;
+    use super::unmark_refusal;
+    use epigraph_db::RefusalKind;
+    use epigraph_engine::admin_cascade::UnmarkRefusal;
+    use rmcp::model::ErrorCode;
 
-    /// The boundaries of the refusal-code grammar the supersede mapper splits
-    /// `42501` on (two to five ASCII capitals, exactly two digits, a colon, at
-    /// the very start), which is `errors::coded`'s grammar byte for byte.
+    /// An un-mark's act refusal of AUTHORITY is a denial (`INVALID_REQUEST`),
+    /// as on every other write tool; its other refusals stay the caller's to
+    /// correct (`INVALID_PARAMS`) with their text; a failure is redacted
+    /// (backlog dca9ed56: the act's driver errors used to be stringified into
+    /// the refusal and sent).
     #[test]
-    fn opens_with_refusal_code_admits_exactly_the_code_grammar() {
-        for coded in [
-            "CX03: the act",
-            "OPL01: unbound",
-            "ABCDE12: five capitals",
-            "AB12:",
-        ] {
-            assert!(opens_with_refusal_code(coded), "{coded:?} is coded");
+    fn an_unmark_refusal_is_answered_by_its_kind() {
+        let act = |kind| UnmarkRefusal::Act {
+            kind,
+            message: "unmark_duplicate: refused".into(),
+        };
+        let denial = unmark_refusal(act(RefusalKind::Authority));
+        assert_eq!(denial.code, ErrorCode::INVALID_REQUEST, "{denial:?}");
+        assert_eq!(denial.message, "unmark_duplicate: refused");
+        for kind in [RefusalKind::Input, RefusalKind::State] {
+            let e = unmark_refusal(act(kind));
+            assert_eq!(e.code, ErrorCode::INVALID_PARAMS, "{kind:?}: {e:?}");
+            assert_eq!(e.message, "unmark_duplicate: refused");
         }
-        for uncoded in [
-            "A12: one capital",
-            "ABCDEF12: six capitals",
-            "FA4: one digit",
-            "FA123: three digits",
-            "FA04 no colon",
-            "FA04",
-            " CX03: leading space",
-            "cx03: lower case",
-            "new row violates row-level security policy for table \"claims\"",
-            "permission denied for function epigraph_record_cascade_deferral",
-            "",
-        ] {
-            assert!(
-                !opens_with_refusal_code(uncoded),
-                "{uncoded:?} is not coded"
-            );
-        }
+        let none = unmark_refusal(UnmarkRefusal::NoRecord);
+        assert_eq!(none.code, ErrorCode::INVALID_PARAMS, "{none:?}");
+        let failed = unmark_refusal(UnmarkRefusal::Failed(
+            "Query failed: canceling statement due to lock timeout".into(),
+        ));
+        assert_eq!(failed.code, ErrorCode::INTERNAL_ERROR, "{failed:?}");
+        assert!(!failed.message.contains("lock timeout"), "{failed:?}");
     }
 }

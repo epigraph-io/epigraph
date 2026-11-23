@@ -952,8 +952,17 @@ pub struct UnmarkOutcome {
 /// Why an un-mark changed nothing (its transaction rolled back).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnmarkRefusal {
-    /// The act refused: not a dedup-marked duplicate, or not writable.
-    Act(String),
+    /// The act refused, by design: the claim is not a dedup-marked duplicate,
+    /// its mark is not the one the caller was checked against, or the chain
+    /// moved since. `kind` decides the transport's answer, as for any
+    /// [`epigraph_db::DbError::Refused`] (input 400, authority 403, state 409),
+    /// and `message` is text written for the caller. Only a designed refusal
+    /// is an `Act`: any other error of the act is [`Self::Failed`], so driver
+    /// text never reaches a caller as a refusal's reason (backlog dca9ed56).
+    Act {
+        kind: epigraph_db::RefusalKind,
+        message: String,
+    },
     /// No applied repair record and no open cascade for this mark, and it is
     /// not a legacy mark the operator backfill gave its identity edge: there is
     /// nothing to reverse it from.
@@ -965,7 +974,7 @@ pub enum UnmarkRefusal {
 impl std::fmt::Display for UnmarkRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Act(e) => write!(f, "{e}"),
+            Self::Act { message, .. } => f.write_str(message),
             Self::NoRecord => f.write_str(
                 "there is no record of this dedup's repair (it was repaired before revert \
                  records existed, or not through the administrative cascade), so it cannot \
@@ -973,6 +982,26 @@ impl std::fmt::Display for UnmarkRefusal {
             ),
             Self::Failed(e) => write!(f, "the un-mark failed and nothing was changed: {e}"),
         }
+    }
+}
+
+/// The un-mark's answer to an error of its act
+/// ([`ClaimRepository::unmark_duplicate_act_authorized_conn`]): a designed
+/// refusal keeps its kind and its text ([`UnmarkRefusal::Act`]); a claim that
+/// vanished since the caller read it is a state refusal; anything else (the
+/// database failing: a lock timeout, a lost connection) is
+/// [`UnmarkRefusal::Failed`], whose text the transports keep in the server log.
+fn act_refusal(e: epigraph_db::DbError) -> UnmarkRefusal {
+    match e {
+        epigraph_db::DbError::Refused { kind, message } => UnmarkRefusal::Act { kind, message },
+        // The duplicate was deleted after the caller read it: its state moved,
+        // and the text is the fixed not-found template naming an id the caller
+        // supplied.
+        e @ epigraph_db::DbError::NotFound { .. } => UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: e.to_string(),
+        },
+        other => UnmarkRefusal::Failed(other.to_string()),
     }
 }
 
@@ -1061,7 +1090,7 @@ pub async fn apply_unmark_authorized(
 /// transaction, not only on the request's earlier, rolled-back one: run by
 /// [`apply_unmark_checked`] first, before the act, on the transaction the
 /// un-mark commits on. A refusal (`Err` with its text) rolls back with nothing
-/// changed and is answered as [`UnmarkRefusal::Act`].
+/// changed and is answered as an authority [`UnmarkRefusal::Act`] (403).
 ///
 /// What it is for (backlog 9a5bc055): a request path that admitted the caller
 /// through an operator link re-decides that admission here, under the link
@@ -1079,8 +1108,9 @@ pub trait UnmarkPrecondition: Send + Sync {
 /// [`apply_unmark_authorized`].
 ///
 /// # Errors
-/// As [`apply_unmark`], and [`UnmarkRefusal::Act`] with the precondition's
-/// text when it refuses.
+/// As [`apply_unmark`], and an authority [`UnmarkRefusal::Act`]
+/// ([`epigraph_db::RefusalKind::Authority`]) with the precondition's text
+/// when it refuses.
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_unmark_checked(
     admin: &mut sqlx::PgConnection,
@@ -1102,7 +1132,13 @@ pub async fn apply_unmark_checked(
         precondition
             .check(&mut tx)
             .await
-            .map_err(UnmarkRefusal::Act)?;
+            // The one precondition (the link grant's re-check, #999) is an
+            // authority decision: its refusal is a 403, as the act's own
+            // authority refusals are.
+            .map_err(|message| UnmarkRefusal::Act {
+                kind: epigraph_db::RefusalKind::Authority,
+                message,
+            })?;
     }
     // The act re-reads the canonical's chain and refuses one other than
     // `authorized_chain` (the canonical was replaced again since the caller
@@ -1114,16 +1150,20 @@ pub async fn apply_unmark_checked(
         authorized_chain,
     )
     .await
-    .map_err(|e| UnmarkRefusal::Act(e.to_string()))?;
+    .map_err(act_refusal)?;
     let canonical_id = unmarked.canonical;
     // The act locked the duplicate's row; the mark it found must be the one
     // the caller was authorized against (read earlier, on its own transaction).
     if canonical_id != expected_canonical {
-        return Err(UnmarkRefusal::Act(format!(
-            "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
-             {expected_canonical}, which the caller's authority was checked against; \
-             nothing was changed"
-        )));
+        // State: the mark moved since the caller was checked.
+        return Err(UnmarkRefusal::Act {
+            kind: epigraph_db::RefusalKind::State,
+            message: format!(
+                "claim {dup_id} is now marked a duplicate of {canonical_id}, not of \
+                 {expected_canonical}, which the caller's authority was checked against; \
+                 nothing was changed"
+            ),
+        });
     }
     let current_canonical_id = unmarked.current_canonical();
     let failed = |e: String| UnmarkRefusal::Failed(e);
@@ -1714,6 +1754,43 @@ pub async fn replay_deferred(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The act's errors split three ways (backlog dca9ed56): a designed
+    /// refusal keeps its kind; a duplicate deleted after the caller read it
+    /// is a state refusal (409 / INVALID_PARAMS), with the fixed not-found
+    /// text naming the id the caller supplied; anything else is a failure,
+    /// redacted by both transports. No request path can delete the duplicate
+    /// between the caller's read and the act on demand, so the `NotFound` arm
+    /// is pinned here.
+    #[test]
+    fn an_act_error_is_a_refusal_only_when_it_is_designed() {
+        use epigraph_db::{DbError, RefusalKind};
+        let refused = act_refusal(DbError::Refused {
+            kind: RefusalKind::Authority,
+            message: "unmark_duplicate: refused".into(),
+        });
+        assert_eq!(
+            refused,
+            UnmarkRefusal::Act {
+                kind: RefusalKind::Authority,
+                message: "unmark_duplicate: refused".into(),
+            }
+        );
+        let id = Uuid::new_v4();
+        let deleted = act_refusal(DbError::NotFound {
+            entity: "Claim".into(),
+            id,
+        });
+        let UnmarkRefusal::Act { kind, message } = &deleted else {
+            panic!("a deleted duplicate must be a state refusal: {deleted:?}");
+        };
+        assert_eq!(*kind, RefusalKind::State);
+        assert_eq!(message, &format!("Claim with ID {id} not found"));
+        let failed = act_refusal(DbError::QueryFailed {
+            source: sqlx::Error::PoolTimedOut,
+        });
+        assert!(matches!(failed, UnmarkRefusal::Failed(_)), "{failed:?}");
+    }
 
     #[test]
     fn counts_only_replaces_every_array_by_its_length() {
