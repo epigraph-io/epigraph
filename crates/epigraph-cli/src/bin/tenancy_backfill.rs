@@ -2406,6 +2406,18 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // OPEN (quiet). Its read of `workflows` (to leave a hierarchical id to
     // that trigger) is filtered too under a non-member owner; not measured.
     ("epigraph_claim_behavioral_executions_follow", 240),
+    // 250 (backlog a278f16d), the events provenance guards. Both fail CLOSED
+    // under a non-member owner, which holds no privilege on
+    // `mass_function_masses_writes` (only `epigraph_maintenance` does): the
+    // AFTER trigger body's upsert is refused, so every `mass_functions` INSERT
+    // and every masses UPDATE errors 42501 with nothing written (loud, every
+    // BBA write halted); the `events` guard's read of that table is refused,
+    // so every `claim.assessed` record from a non-bypass session errors
+    // (the assess path refused). Its bypass arm reads `epigraph_bypass()`
+    // (session_user), which the owner does not change. Under the migration
+    // runner's superuser both keep working with more authority than intended.
+    ("epigraph_mass_function_masses_written", 250),
+    ("epigraph_events_assessment_guard", 250),
     // 254 (backlog 7149132e), the cycle walk of MCP `link_hierarchical`'s
     // workflow references (`EdgeRepository::reaches_in_force_conn`). Its read
     // of the FORCEd `edges` is admitted by `epigraph_definer_bypass()` (the
