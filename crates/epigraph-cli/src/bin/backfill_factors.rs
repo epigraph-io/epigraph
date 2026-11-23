@@ -148,15 +148,15 @@ struct Cli {
 /// accepted list, with both snapshot files.
 fn argv_problem(cli: &Cli) -> Option<String> {
     fn named(flags: &[(bool, &'static str)]) -> Vec<&'static str> {
-        flags.iter().filter(|(set, _)| *set).map(|(_, f)| *f).collect()
+        flags
+            .iter()
+            .filter(|(set, _)| *set)
+            .map(|(_, f)| *f)
+            .collect()
     }
     let refuse = |flags: Vec<&str>, why: &str| -> Option<String> {
-        (!flags.is_empty()).then(|| {
-            format!(
-                "{} {why}; refused rather than ignored",
-                flags.join(", ")
-            )
-        })
+        (!flags.is_empty())
+            .then(|| format!("{} {why}; refused rather than ignored", flags.join(", ")))
     };
     if cli.sources_from_waves.is_empty() {
         let targeted_only = named(&[

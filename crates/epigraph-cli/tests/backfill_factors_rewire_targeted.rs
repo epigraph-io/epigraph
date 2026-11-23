@@ -807,7 +807,10 @@ async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless_after_the_
     .expect("statement trigger");
     let before = footprint(&pool, &w).await;
     let source_before = cache(&pool, w.source).await;
-    assert!(source_before.belief.is_some(), "fixture: the source has a cache");
+    assert!(
+        source_before.belief.is_some(),
+        "fixture: the source has a cache"
+    );
 
     let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
 

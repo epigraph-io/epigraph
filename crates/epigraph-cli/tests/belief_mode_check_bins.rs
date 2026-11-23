@@ -969,7 +969,8 @@ fn backfill_factors_refuses_flags_that_would_do_nothing() {
         a.extend(extra.iter().map(|s| (*s).to_string()));
         a
     };
-    let plain = |extra: &[&str]| -> Vec<String> { extra.iter().map(|s| (*s).to_string()).collect() };
+    let plain =
+        |extra: &[&str]| -> Vec<String> { extra.iter().map(|s| (*s).to_string()).collect() };
     let cases: Vec<(Vec<String>, &str)> = vec![
         (targeted(&["--dry-run", "--limit", "5"]), "--limit"),
         (targeted(&["--dry-run", "--offset", "5"]), "--offset"),
@@ -977,9 +978,15 @@ fn backfill_factors_refuses_flags_that_would_do_nothing() {
             targeted(&["--dry-run", "--written-before", "2026-01-01T00:00:00Z"]),
             "--written-before",
         ),
-        (targeted(&["--dry-run", "--max-passes", "10"]), "--max-passes"),
+        (
+            targeted(&["--dry-run", "--max-passes", "10"]),
+            "--max-passes",
+        ),
         (targeted(&["--dry-run", "--snapshot", &snap]), "--snapshot"),
-        (targeted(&["--dry-run", "--edge-rows", &rows]), "--edge-rows"),
+        (
+            targeted(&["--dry-run", "--edge-rows", &rows]),
+            "--edge-rows",
+        ),
         (real(&["--predict-json", &pj]), "--predict-json"),
         (real(&["--limit", "5"]), "--limit"),
         (
@@ -991,11 +998,22 @@ fn backfill_factors_refuses_flags_that_would_do_nothing() {
             "--epsilon",
         ),
         (
-            plain(&["--phase", "rewire-edges", "--dry-run", "--rewrite-unchanged"]),
+            plain(&[
+                "--phase",
+                "rewire-edges",
+                "--dry-run",
+                "--rewrite-unchanged",
+            ]),
             "--rewrite-unchanged",
         ),
         (
-            plain(&["--phase", "edges", "--dry-run", "--written-before", "2026-01-01T00:00:00Z"]),
+            plain(&[
+                "--phase",
+                "edges",
+                "--dry-run",
+                "--written-before",
+                "2026-01-01T00:00:00Z",
+            ]),
             "--written-before",
         ),
     ];
@@ -1060,11 +1078,25 @@ fn backfill_factors_accepts_the_same_flags_where_they_act() {
             "--written-before",
             "2026-01-01T00:00:00Z",
         ],
-        vec!["--phase", "edges", "--dry-run", "--limit", "5", "--offset", "1"],
+        vec![
+            "--phase",
+            "edges",
+            "--dry-run",
+            "--limit",
+            "5",
+            "--offset",
+            "1",
+        ],
     ];
     for argv in cases {
         let r = run(BACKFILL_FACTORS, &argv, &[]);
-        assert_ne!(r.code, Some(2), "{argv:?}\nstdout: {}\nstderr: {}", r.stdout, r.stderr);
+        assert_ne!(
+            r.code,
+            Some(2),
+            "{argv:?}\nstdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
         assert!(
             r.stderr.contains("DATABASE_URL not set"),
             "{argv:?} reached the connection; stderr: {}",
@@ -1317,22 +1349,44 @@ async fn backfill_factors_targeted_runs_only_changed_by_default(pool: PgPool) {
     };
 
     let (r, plain) = predict("plain", &[]);
-    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert!(
         read_predict(&plain).run.only_changed,
         "a targeted run without the flag leaves unchanged rows alone"
     );
-    assert!(r.stdout.contains("only_changed=true"), "stdout: {}", r.stdout);
+    assert!(
+        r.stdout.contains("only_changed=true"),
+        "stdout: {}",
+        r.stdout
+    );
 
     let (r, opted_out) = predict("opted-out", &["--rewrite-unchanged"]);
-    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert!(
         !read_predict(&opted_out).run.only_changed,
         "--rewrite-unchanged opts out"
     );
 
     let (r, both) = predict("both", &["--only-changed", "--rewrite-unchanged"]);
-    assert_eq!(r.code, Some(2), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert_eq!(
+        r.code,
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
     assert!(
         r.stderr.contains("--rewrite-unchanged") && r.stderr.contains("--only-changed"),
         "the conflict names both flags; stderr: {}",
