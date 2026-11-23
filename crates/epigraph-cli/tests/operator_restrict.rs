@@ -1906,3 +1906,260 @@ async fn connected_nodes_stay_and_only_this_claims_links_narrow(pool: PgPool) {
         "nodes and links reversed",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-batch locks on edges and harvester_fragments (backlog 48f5cb6f)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Open (and leave uncommitted) an edge INSERT from `from` to `to` on its own
+/// transaction. Its tenancy trigger stamps the edge from the endpoints as this
+/// statement reads them, i.e. BEFORE any batch that runs while it is open.
+async fn open_edge_insert(
+    pool: &PgPool,
+    from: Uuid,
+    to: Uuid,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, Uuid, i32) {
+    let mut tx = pool.begin().await.expect("begin");
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO edges (id, source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, 'claim', $3, 'claim', 'supports')",
+    )
+    .bind(id)
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await
+    .expect("concurrent edge insert");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("pid");
+    (tx, id, pid)
+}
+
+/// Spawn the binary with `args`, wait until it is BLOCKED behind backend
+/// `pid` (`pg_blocking_pids`), then commit `tx` and collect the run. Panics
+/// if the binary finishes before it ever waits on the open transaction: that
+/// is a batch that ran past an uncommitted edge insert on its claim.
+async fn run_blocked_behind(
+    pool: &PgPool,
+    tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    pid: i32,
+    args: &[&str],
+) -> Run {
+    let url = fixture::database_url_for(pool).await;
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, &url)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn epigraph-operator");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let out = child.wait_with_output().expect("output");
+            panic!(
+                "{} finished ({status}) without waiting for the open edge insert\n\
+                 --- stdout\n{}\n--- stderr\n{}",
+                args[0],
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE $1 = ANY (pg_blocking_pids(pid)))",
+        )
+        .bind(pid)
+        .fetch_one(pool)
+        .await
+        .expect("pg_blocking_pids");
+        if blocked {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} never blocked on the open insert",
+            args[0]
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tx.commit().await.expect("commit the concurrent insert");
+    let out = child.wait_with_output().expect("output");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+fn restrict_args<'a>(
+    ids: &'a str,
+    target: &'a str,
+    op: &'a str,
+    mf: &'a str,
+    apply: bool,
+) -> Vec<&'a str> {
+    let mut a = vec![
+        "restrict-claims",
+        "--claims-file",
+        ids,
+        "--target-group",
+        target,
+        "--operator",
+        op,
+        "--manifest-out",
+        mf,
+        "--lock-timeout",
+        "60s",
+    ];
+    if apply {
+        a.extend([
+            "--apply",
+            "--confirm-count",
+            "1",
+            "--ruling",
+            RULING,
+            "--reason",
+            "test",
+        ]);
+    }
+    a
+}
+
+/// A concurrent edge INSERT on the claim being restricted, open when the batch
+/// starts: its trigger stamped A's PUBLIC tuple. The batch waits for it (it
+/// holds SHARE ROW EXCLUSIVE on `edges`), then sees the committed edge and
+/// narrows it with A. Without the lock the batch would commit past the
+/// invisible row, which would then commit PUBLIC on a claim now in the target.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_concurrent_edge_insert_on_a_restricted_claim_is_waited_for_and_narrowed(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let (tx, late, pid) = open_edge_insert(&pool, fx.a, fx.b).await;
+    let (target, op) = (fx.target.to_string(), fx.operator.to_string());
+    let args = restrict_args(
+        ids.to_str().unwrap(),
+        &target,
+        &op,
+        mf.to_str().unwrap(),
+        true,
+    );
+    let run = run_blocked_behind(&pool, tx, pid, &args).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, grp(fx.target));
+    assert_eq!(
+        edge(&pool, late).await,
+        (fx.target, "group".to_string(), None),
+        "the edge committed during the batch was narrowed with its claim\n{}",
+        run.show()
+    );
+    let locked: Vec<&str> = run
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("LOCKED-PER-BATCH\t"))
+        .and_then(|rest| rest.split('\t').next())
+        .map(|list| list.split(',').collect())
+        .unwrap_or_default();
+    // Only the edge race is exercised above. `harvester_fragments` is pinned
+    // by the printed list alone: its lock is defence in depth, since a
+    // fragment's stamp comes through a `harvester_claim_provenance` insert
+    // whose foreign key to `claims` already waits on the batch's row lock
+    // (`tables::batch_lock_tables`).
+    for t in ["edges", "harvester_fragments"] {
+        assert!(
+            locked.contains(&t),
+            "every batch locks {t}; the plan's LOCKED-PER-BATCH list is {locked:?}\n{}",
+            run.show()
+        );
+    }
+}
+
+/// The dry run runs the same batches (rolled back), so it holds the same
+/// locks: it too waits for an open edge insert on a listed claim, and writes
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dry_run_also_waits_for_an_open_edge_insert(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let (tx, late, pid) = open_edge_insert(&pool, fx.a, fx.b).await;
+    let (target, op) = (fx.target.to_string(), fx.operator.to_string());
+    let args = restrict_args(
+        ids.to_str().unwrap(),
+        &target,
+        &op,
+        mf.to_str().unwrap(),
+        false,
+    );
+    let run = run_blocked_behind(&pool, tx, pid, &args).await;
+    assert_eq!(run.code, 0, "{}", run.show());
+    assert_eq!(row(&pool, "claims", fx.a).await, publ(WORLD));
+    assert_eq!(edge(&pool, late).await.1, "public", "{}", run.show());
+    assert!(!mf.exists(), "a dry run must not write a manifest");
+}
+
+/// The reversal's batches hold the same locks: an edge INSERT on a restricted
+/// claim, open when `reown-reverse` starts, is waited for (its trigger
+/// stamped the claim's ('group', target) tuple, which a reversal committed
+/// past it would leave on a claim that is public again).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reversal_waits_for_an_open_edge_insert_on_a_restricted_claim(pool: PgPool) {
+    let fx = seed(&pool).await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[fx.a]);
+    let mf = dir.join("m.jsonl");
+    let r = restrict(
+        &pool,
+        Restrict {
+            ids: &ids,
+            target: fx.target,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(1),
+            extra: &[],
+        },
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    let (tx, late, pid) = open_edge_insert(&pool, fx.a, fx.b).await;
+    let args = vec![
+        "reown-reverse",
+        "--manifest",
+        mf.to_str().unwrap(),
+        "--lock-timeout",
+        "60s",
+        "--apply",
+    ];
+    let run = run_blocked_behind(&pool, tx, pid, &args).await;
+    // Under the lock the batch sees the committed edge: a non-public row the
+    // manifest does not name, which restoring A would leave narrower than its
+    // claim. So it HOLDS A, and A and that edge stay together in the target.
+    assert_eq!(
+        row(&pool, "claims", fx.a).await,
+        grp(fx.target),
+        "{}",
+        run.show()
+    );
+    assert_eq!(
+        edge(&pool, late).await,
+        (fx.target, "group".to_string(), None),
+        "{}",
+        run.show()
+    );
+    assert!(
+        run.stdout
+            .contains(&format!("edges {late} is ({}, group", fx.target))
+            && run.stdout.contains("was written after the restriction"),
+        "the reversal names the edge it waited for\n{}",
+        run.show()
+    );
+}

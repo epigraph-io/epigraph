@@ -1293,10 +1293,16 @@ Those refusals emit the structured tracing event
 upgrade a database whose clients predate that, see
 [section 13](#before-the-router-allowlist-every-active-client-needs-an-agent_id).
 
-**Known gap.** `GET /api/v1/openapi.json` under-reports authentication.
-utoipa's `security(...)` annotations are per-operation, and many read
-operations carry none, so the schema advertises them as requiring nothing.
-The document itself is anonymous, which is correct.
+**Authentication in `GET /api/v1/openapi.json`.** The document (itself
+anonymous, which is correct) declares a default security requirement,
+`ed25519_signature`, so an operation with no `security(...)` of its own is
+advertised as needing a token. An operation the router serves anonymously
+(`/health`) says so with an explicit empty requirement. The unit test
+`openapi::tests::every_documented_operation_declares_its_authentication`
+holds every documented operation to the anonymous routes `routes/mod.rs`
+registers. The document still lists only a subset of the routes (path
+coverage is a separate open item), so a route missing from it is
+undocumented, not anonymous.
 
 ### Routes that need more than a token
 
@@ -2609,8 +2615,25 @@ epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
   meet of its endpoints (the same tuple a claim-endpoint edge gets) unless it
   is already at least as narrow. Each is recorded and restored like every
   other edge. The plan counts them (`EVIDENCE-ENDPOINT-EDGES`).
-- **Not covered**: `claims.updated_at` is stamped by its trigger on apply and
-  on reverse.
+- **Locks**: each batch, dry runs and reversal included, holds `SHARE ROW
+  EXCLUSIVE` on `edges`, `harvester_fragments` and the derived tables with no
+  key to claims (`LOCKED-PER-BATCH`), as `regroup-claims` does. An edge
+  inserted on a claim being restricted therefore either lands before the
+  batch reads its rows (and is narrowed with them) or is stamped after the
+  move; it can no longer commit public on a restricted claim. (A fragment was
+  already safe: it is stamped through a `harvester_claim_provenance` insert,
+  whose foreign key to `claims` waits on the batch's row lock; its table lock
+  is defence in depth.) Every write to those tables on the instance waits for
+  the batch; keep `--batch-size` small on a busy instance.
+- **Not covered (outside the reversal contract)**: `claims.updated_at`. Its
+  trigger (migration 001, unconditional `BEFORE UPDATE`) stamps `now()` on the
+  apply and again on the reverse, so a reversal does not restore it, and both
+  acts look like content updates to a reader that sorts or filters on it. The
+  manifest does not record it and `reown-reverse` does not claim to restore
+  it. Putting it back would need the trigger disabled around the claims
+  UPDATE (an `ACCESS EXCLUSIVE` lock on `claims`) or a migration that makes
+  the trigger skip tenancy-only updates; neither is part of this tool. Read
+  `updated_at` as "last written", not "last edited", on restricted claims.
 
 ### `epigraph-operator regroup-claims` — move group-private claims between groups (no migration)
 

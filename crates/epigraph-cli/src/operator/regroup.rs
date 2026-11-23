@@ -887,7 +887,7 @@ struct Known {
 #[derive(Clone, Copy)]
 struct Ctx<'a> {
     specs: &'a [TableSpec],
-    /// Every table each batch locks (`batch_lock_tables`).
+    /// Every table each batch locks (`tables::batch_lock_tables`).
     unkeyed: &'a [String],
     nodes: &'a NodeTypes,
     source: Uuid,
@@ -1007,29 +1007,6 @@ async fn sealed_claims_of(
         }
     }
     Ok(out)
-}
-
-/// The tables every batch (apply and reverse) holds `SHARE ROW EXCLUSIVE` on
-/// for its duration: the derived tables with no key to claims
-/// (`tables::unkeyed_tables`), plus `edges` and `harvester_fragments`.
-///
-/// Why the last two: a concurrent INSERT of an edge (or fragment) on a moving
-/// claim is stamped by its trigger from the claim as that statement reads it,
-/// so one that read the claim before the batch's commit would land on the
-/// pre-move (source) tuple after the commit, outside every check. The lock
-/// makes such an INSERT either commit before the batch reads its rows (the
-/// batch then sees and moves it) or wait until the batch commits (its trigger,
-/// which reads the claim with a fresh snapshot, then sees the move). Cost: a
-/// batch, dry runs included, blocks every edge and fragment write on the
-/// instance while it runs; keep batches short.
-fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = unkeyed.to_vec();
-    for t in ["edges", "harvester_fragments"] {
-        if !out.iter().any(|u| u == t) {
-            out.push(t.to_string());
-        }
-    }
-    out
 }
 
 /// Read every row the candidates carry and decide, per row, whether it
@@ -1941,7 +1918,7 @@ pub async fn run(
             t.name
         );
     }
-    let unkeyed = batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
+    let unkeyed = tables::batch_lock_tables(&tables::unkeyed_tables(conn, &specs).await?);
     let nodes = node_types(conn).await?;
     tables::probe_session_switch(conn).await?;
     let guard = super::hide::guard_status(conn).await?;
@@ -2963,7 +2940,7 @@ pub async fn reverse_manifest(
         res.claim_posts.len(),
         res.rows.len()
     )?;
-    let locks = batch_lock_tables(unkeyed);
+    let locks = tables::batch_lock_tables(unkeyed);
     let nodes = node_types(conn).await?;
     let rc = RevCtx {
         specs,

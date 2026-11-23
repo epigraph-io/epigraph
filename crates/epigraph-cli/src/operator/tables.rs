@@ -401,8 +401,8 @@ pub struct Attached {
     /// other claim endpoint.
     pub neighbours: BTreeSet<Uuid>,
     /// Migration 114's `writer_owned`, on a table that carries it; `None`
-    /// elsewhere. Read by `restrict-claims` (a narrowing clears it), ignored
-    /// by the re-own.
+    /// elsewhere. Read by `restrict-claims` (a narrowing clears it) and by the
+    /// re-own (a public-to-public move leaves the row on its writer's group).
     pub writer_owned: Option<bool>,
     /// Evidence only: `evidence_type`, `labels` and the first 80 characters of
     /// `raw_content`, for the hide selectors and their preview.
@@ -769,6 +769,47 @@ pub async fn lock_unkeyed_tables(conn: &mut PgConnection, tables: &[String]) -> 
     .await
     .with_context(|| format!("locking the tables with no key to claims: {tables:?}"))?;
     Ok(())
+}
+
+/// The tables every batch of a NARROWING or re-grouping act (`restrict-claims`
+/// and `regroup-claims`, apply, dry run and reverse) holds `SHARE ROW
+/// EXCLUSIVE` on for its duration: the derived tables with no key to claims
+/// ([`unkeyed_tables`]), plus `edges` and `harvester_fragments`.
+///
+/// Why `edges`: a concurrent edge INSERT on a moving claim is stamped by its
+/// trigger from the claim as that statement reads it, and an edge has no
+/// foreign key to `claims` (its endpoints are polymorphic), so nothing makes
+/// it wait for the batch's `FOR UPDATE` on the claim. One that read the claim
+/// before the batch's commit would land on the pre-move tuple after the
+/// commit, outside every check (for a restriction: a PUBLIC edge on a claim
+/// that is now group-private). The lock makes such an INSERT either commit
+/// before the batch reads its rows (the batch then sees and moves it) or wait
+/// until the batch commits (its trigger, which reads the claim with a fresh
+/// snapshot, then sees the move).
+///
+/// `harvester_fragments` is defence in depth, not a second closed gap: a
+/// fragment takes its tenancy from the AFTER INSERT statement trigger on
+/// `harvester_claim_provenance` (migration 089, ranked by 218), and that
+/// insert's foreign key to `claims` already takes `KEY SHARE` on the claim,
+/// which waits for the batch's `FOR UPDATE` (or makes the batch wait). The
+/// lock keeps any other fragment writer that reads a claim's tenancy without
+/// that key serialised too. Only the edge race is exercised by a test.
+///
+/// Cost: a batch, dry runs included, blocks every edge and fragment write on
+/// the instance while it runs; keep batches short.
+///
+/// `reown-claims` does not use this list: it moves public claims to another
+/// public owner, and a public edge's tuple does not depend on its endpoints'
+/// owners (migration 120), so a stale stamp there is still the right one.
+#[must_use]
+pub fn batch_lock_tables(unkeyed: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = unkeyed.to_vec();
+    for t in ["edges", "harvester_fragments"] {
+        if !out.iter().any(|u| u == t) {
+            out.push(t.to_string());
+        }
+    }
+    out
 }
 
 /// Row-change counters for the current transaction, per `public` table:
