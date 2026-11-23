@@ -98,18 +98,98 @@ pub struct RevokeKeyRequest {
 /// caller's own input. Key rows themselves are not secret:
 /// `GET /api/v1/agents/:id/keys` lists them to any `agents:read` holder.)
 ///
+/// Returns the ADMIN to audit: `None` when the caller is the target agent
+/// (the self path, which writes no admin audit row), `Some(admin)` when the
+/// caller was admitted through the `claims:admin` override on another agent's
+/// key. The override needs a principal to attribute the audit row to
+/// (migration 112's definer refuses a null admin, `ADM01`). Both key routes
+/// take a `ViewerExtractor`, which already refuses a token with no principal
+/// (401) before the handler runs; the `None` arm below keeps this function
+/// sound for a caller that does not.
+///
 /// [`AuthContext::has_scope`]: crate::middleware::bearer::AuthContext::has_scope
 #[cfg(feature = "db")]
 fn require_self_or_admin(
     auth: &crate::middleware::bearer::AuthContext,
     agent_id: Uuid,
-) -> Result<(), ApiError> {
-    if !auth.has_scope("claims:admin") && auth.agent_id != Some(agent_id) {
+) -> Result<Option<Uuid>, ApiError> {
+    if auth.agent_id == Some(agent_id) {
+        return Ok(None);
+    }
+    if !auth.has_scope("claims:admin") {
         return Err(ApiError::Forbidden {
             reason: "can only mutate your own agent record".into(),
         });
     }
-    Ok(())
+    match auth.agent_id {
+        Some(admin) => Ok(Some(admin)),
+        None => Err(ApiError::Forbidden {
+            reason: "the claims:admin override on another agent's key is audited, and this \
+                     token names no principal to attribute the audit row to; nothing was \
+                     written"
+                .into(),
+        }),
+    }
+}
+
+/// `security_events.event_type` of an admin's rotation of another agent's
+/// signing key (migration 252).
+#[cfg(feature = "db")]
+const ADMIN_ROTATE_EVENT: &str = "agent_keys.admin_rotate";
+
+/// `security_events.event_type` of an admin's revocation of another agent's
+/// key (migration 252).
+#[cfg(feature = "db")]
+const ADMIN_REVOKE_EVENT: &str = "agent_keys.admin_revoke";
+
+/// Record an admin's change to another agent's key (backlog 6492de67) through
+/// migration 112's definer `epigraph_admin_audit_write` (event types added by
+/// migration 252), on the key change's OWN transaction, so the change and its
+/// audit row commit together or not at all.
+///
+/// The definer re-checks the token's client record (an active
+/// `oauth_clients` row bound to `admin` that grants `claims:admin`, `ADM02`),
+/// so the override is no longer admitted on the token's scope alone; that
+/// refusal is a 403 and nothing is written. Any other failure (`ADM03` on a
+/// database without migration 252, or any other refusal) is a 500, and
+/// nothing is written either.
+#[cfg(feature = "db")]
+async fn audit_admin_key_change(
+    conn: &mut sqlx::PgConnection,
+    auth: &crate::middleware::bearer::AuthContext,
+    admin: Uuid,
+    event_type: &str,
+    details: serde_json::Value,
+) -> Result<(), ApiError> {
+    epigraph_db::SecurityEventRepository::admin_audit_write(
+        conn,
+        auth.client_id,
+        auth.jti,
+        admin,
+        event_type,
+        &details,
+    )
+    .await
+    .map_err(|e| {
+        // Only the definer's own `ADM02` is the missing grant. Any other
+        // refusal (a 42501 from row security on a misowned definer, say) is
+        // a server fault, not the caller's, and is reported as what it is.
+        if crate::errors::db_is_insufficient_privilege(&e) && e.to_string().contains("ADM02:") {
+            ApiError::Forbidden {
+                reason: "the token carries claims:admin, but its client record grants no live \
+                         claims:admin to this principal (ADM02); the override on another \
+                         agent's key needs that grant. Nothing was written."
+                    .into(),
+            }
+        } else {
+            ApiError::InternalError {
+                message: format!(
+                    "{event_type}: could not write the admin audit row (migration 252 \
+                     applied?): {e}. Nothing was written."
+                ),
+            }
+        }
+    })
 }
 
 /// List all keys for an agent
@@ -244,6 +324,9 @@ fn key_write_refusal(e: epigraph_db::DbError) -> ApiError {
 /// lookup and the signature checks. The old-key signature alone is not an
 /// ownership proof: a derived LLM-agent key is computable from public inputs.
 ///
+/// An admin rotating ANOTHER agent's key writes an `agent_keys.admin_rotate`
+/// admin audit row (migration 252) on the rotation's own transaction.
+///
 /// # Errors
 ///
 /// - 400 Bad Request: a field is not valid hex or has the wrong length
@@ -253,9 +336,10 @@ fn key_write_refusal(e: epigraph_db::DbError) -> ApiError {
 ///   extractor runs before the handler; since migration 239 a service
 ///   `claims:admin` token with no principal is refused here)
 /// - 403 Forbidden: Missing scope or caller is not the target agent; the
-///   token is a pre-link token of an operated agent (viewer extractor); or
-///   the database refused the rotation (no EXECUTE on the application role,
-///   `AK02` attested key, `AK03` caller)
+///   token is a pre-link token of an operated agent (viewer extractor); the
+///   database refused the rotation (no EXECUTE on the application role,
+///   `AK02` attested key, `AK03` caller); or the `claims:admin` override's
+///   token has no live `claims:admin` grant on its client record (`ADM02`)
 /// - 404 Not Found: The agent has no active signing key
 /// - 422 Unprocessable Entity: the body does not deserialize (missing field
 ///   or wrong JSON type); refused by the extractor, the same for every caller
@@ -276,7 +360,7 @@ pub async fn rotate_agent_key(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-    require_self_or_admin(auth, id)?;
+    let admin = require_self_or_admin(auth, id)?;
 
     // Decode the new public key from hex
     let new_key_bytes =
@@ -333,10 +417,13 @@ pub async fn rotate_agent_key(
 
     let agent_id = AgentId::from_uuid(id);
 
-    // Every read and write below runs on ONE transaction stamped with the
-    // caller's viewer: since migration 239 the rotation definer admits only
-    // the key's own agent (the stamped principal) or an admin, and refuses an
-    // unstamped application session.
+    // Every read and write below, the admin audit row included, runs on ONE
+    // transaction stamped with the caller's viewer: since migration 239 the
+    // rotation definer admits only the key's own agent (the stamped
+    // principal) or an admin, and refuses an unstamped application session;
+    // and the rotation and (on the admin override) its audit row commit
+    // together or not at all, so an admin rotation is never committed
+    // unaudited. An early return drops `tx`, which rolls it back.
     let mut tx = state
         .write_as(&viewer, "agent_keys::rotate_agent_key")
         .await?;
@@ -395,7 +482,29 @@ pub async fn rotate_agent_key(
             entity: "ActiveAgentKey".to_string(),
             id: id.to_string(),
         })?;
-    tx.commit().await?;
+
+    // The admin override's audit row (migration 252) names the key the
+    // definer minted, on the same transaction as the rotation.
+    if let Some(admin) = admin {
+        audit_admin_key_change(
+            &mut tx,
+            auth,
+            admin,
+            ADMIN_ROTATE_EVENT,
+            serde_json::json!({
+                "target_agent_id": id,
+                "retired_key_id": active_key.id,
+                "new_key_id": new_key_row.id,
+                "new_public_key": request.new_public_key,
+                "reason": request.reason,
+            }),
+        )
+        .await?;
+    }
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("rotate_agent_key: could not commit the rotation: {e}"),
+    })?;
 
     Ok(Json(new_key_row.into()))
 }
@@ -425,7 +534,9 @@ pub async fn rotate_agent_key(
 /// on an admin override.
 /// Requires `agents:write` scope. Caller must be the target agent
 /// (auth.agent_id == :id) or have `claims:admin` (unarmed admin-scope switch
-/// only; see `require_self_or_admin`).
+/// only; see `require_self_or_admin`). An admin revoking ANOTHER agent's key
+/// writes an `agent_keys.admin_revoke` admin audit row (migration 252) on the
+/// revocation's own transaction.
 ///
 /// # Errors
 ///
@@ -435,9 +546,11 @@ pub async fn rotate_agent_key(
 ///   since migration 239 a service `claims:admin` token with no principal is
 ///   refused here)
 /// - 403 Forbidden: Missing scope or caller is not the target agent; the
-///   token is a pre-link token of an operated agent (viewer extractor); or
-///   the database refused the change (`AK02` attested key, `AK03`: the
-///   stamped principal is neither the key's agent nor an admin)
+///   token is a pre-link token of an operated agent (viewer extractor); the
+///   database refused the change (`AK02` attested key, `AK03`: the stamped
+///   principal is neither the key's agent nor an admin); or the
+///   `claims:admin` override's token has no live `claims:admin` grant on its
+///   client record (`ADM02`)
 /// - 404 Not Found: Agent or key does not exist
 /// - 422 Unprocessable Entity: the body does not deserialize
 #[cfg(feature = "db")]
@@ -455,11 +568,13 @@ pub async fn revoke_agent_key(
         });
     };
     crate::middleware::scopes::check_scopes(auth, &["agents:write"])?;
-    require_self_or_admin(auth, id)?;
+    let admin = require_self_or_admin(auth, id)?;
 
-    // One transaction stamped with the caller's viewer: since migration 239
-    // the status definer moves a key only for the key's own agent (the
-    // stamped principal) or an admin.
+    // The lookup, the revocation and (on the admin override) its admin audit
+    // row share ONE transaction stamped with the caller's viewer, so an admin
+    // revocation is never committed unaudited; and since migration 239 the
+    // status definer moves a key only for the key's own agent (the stamped
+    // principal) or an admin.
     let mut tx = state
         .write_as(&viewer, "agent_keys::revoke_agent_key")
         .await?;
@@ -489,19 +604,37 @@ pub async fn revoke_agent_key(
     // admin override records no one: `revoked_by` references `agents(id)` and
     // an admin principal need not have an agents row, so recording it could
     // fail the emergency revoke path; recording the target would be false.
-    let caller_is_agent = auth_ctx
-        .as_ref()
-        .is_some_and(|axum::Extension(auth)| auth.agent_id == Some(id));
+    // (`admin` is `None` exactly when the caller is the target agent.)
+    if let Some(admin) = admin {
+        audit_admin_key_change(
+            &mut tx,
+            auth,
+            admin,
+            ADMIN_REVOKE_EVENT,
+            serde_json::json!({
+                "target_agent_id": id,
+                "key_id": key_id,
+                "key_type": key.key_type,
+                "prior_status": key.status,
+                "reason": request.reason,
+            }),
+        )
+        .await?;
+    }
+
     let updated = AgentKeyRepository::update_status(
         &mut *tx,
         key_id,
         "revoked",
         Some(request.reason.as_str()),
-        caller_is_agent.then_some(id),
+        admin.is_none().then_some(id),
     )
     .await
     .map_err(key_write_refusal)?;
-    tx.commit().await?;
+
+    tx.commit().await.map_err(|e| ApiError::InternalError {
+        message: format!("revoke_agent_key: could not commit the revocation: {e}"),
+    })?;
 
     Ok(Json(updated.into()))
 }

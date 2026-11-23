@@ -599,6 +599,9 @@ impl AgentKeyRepository {
     /// Returns `DbError::NotFound` if no key with the given ID exists.
     /// Returns `DbError::QueryFailed` for other database errors, a `42501`
     /// refusal (`AK02`, `AK03`) and an illegal transition (`AK01`) included.
+    ///
+    /// Generic over the executor so a handler can run it on the same
+    /// transaction as the key's other writes and its audit row.
     #[instrument(skip(executor))]
     pub async fn update_status<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,

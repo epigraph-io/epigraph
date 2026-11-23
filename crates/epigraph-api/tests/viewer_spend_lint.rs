@@ -142,18 +142,22 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "list_acts",
         &["AdminActCeremony::list_mine"],
     ),
-    // stamped + untenanted (backlog 54018ca1, migration 239): `agent_keys`
-    // has no tenancy columns and no row security; the route first refuses a
-    // caller who is neither the agent nor an admin (`require_self_or_admin`),
-    // then reads the key and changes its status or rotates it on ONE
-    // `write_as` transaction stamped with this viewer, where 239's definers
-    // apply the same agent-or-admin gate (AK03) in the database.
+    // stamped + untenanted (backlog 54018ca1, migration 239; backlog
+    // 6492de67, migration 252): `agent_keys` has no tenancy columns and no
+    // row security; the route first refuses a caller who is neither the agent
+    // nor an admin (`require_self_or_admin`), then reads the key and changes
+    // its status or rotates it on ONE `write_as` transaction stamped with
+    // this viewer, where 239's definers apply the same agent-or-admin gate
+    // (AK03) in the database. On the admin override the admin audit row
+    // (migration 112's definer, which re-checks the client grant) is written
+    // on that same transaction.
     (
         "agent_keys.rs",
         "revoke_agent_key",
         &[
             "AgentKeyRepository::get_by_id",
             "AgentKeyRepository::update_status",
+            "audit_admin_key_change",
         ],
     ),
     (
@@ -162,6 +166,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         &[
             "AgentKeyRepository::get_active_key",
             "AgentKeyRepository::rotate",
+            "audit_admin_key_change",
         ],
     ),
     // stamped: a security-definer read that refuses a caller who is neither

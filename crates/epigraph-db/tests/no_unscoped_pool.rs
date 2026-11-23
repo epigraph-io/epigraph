@@ -848,6 +848,9 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `propagate_beliefs` reads its scalar priors and alternative-set classes on
 /// the caller's stamped read (`routes/computation.rs` 5 -> 3). No file
 /// reached zero.
+/// backlog 6492de67 (migration 252; 187 -> 182 on its own branch) moved the
+/// same `routes/agent_keys.rs` sites onto the caller's stamped transaction
+/// as 54018ca1 above and adds the admin audit row on it: no further change.
 const HIGH_WATER: usize = 170;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///

@@ -3758,6 +3758,21 @@ restart.
   (restores 195's body byte for byte and drops the index; run it BEFORE `195-undo.sql`).
   **Deploy order:** after 195; no binary depends on it. The index is built inside the
   migration's transaction (writers of `role_agents` wait for it; the table is small).
+- **252**: `admin_audit_agent_key_events` (backlog 6492de67). Re-states 112's
+  `epigraph_admin_audit_write` (an md5 precondition refuses to apply over any other body)
+  to accept two more event types, `agent_keys.admin_rotate` and `agent_keys.admin_revoke`,
+  beside `workflows.admin_write`; ADM01/ADM02/ADM03 and the row it writes are 112's. Path
+  `pg_catalog, public, pg_temp` (190's); owner and grants unchanged. The API's
+  `rotate_agent_key` / `revoke_agent_key` write one such row when a `claims:admin` caller
+  changes ANOTHER agent's key, on the key change's own transaction; the override now also
+  needs a live `claims:admin` grant on the token's client record (ADM02, 403). Pinned by
+  `epigraph-db/tests/admin_audit_agent_key_events.rs` (the accepted and refused types, the
+  grant re-check, the path, the precondition, the undo) and
+  `epigraph-api/tests/agent_mutation_auth_test.rs`. `epigraph_agent_key_set_status` is not
+  touched (a later re-statement starts from 163's body). Undo:
+  `docs/runbooks/252-undo.sql` (roll the binary back first). **Deploy order:** migrate
+  FIRST: a binary ahead of 252 is refused ADM03 on every admin rotation or revocation of
+  another agent's key (self-rotation and self-revocation are unaffected).
 - **253**: `reown_legacy_edges_excludes_server_signers` (backlog 2f39eee7). Re-states 120's
   `epigraph_reown_legacy_edges_to_signer` (an md5 precondition refuses to apply over any other
   body; the path stays 190's `pg_catalog, public, pg_temp`). The function now excludes every
