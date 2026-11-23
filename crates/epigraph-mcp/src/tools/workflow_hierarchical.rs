@@ -355,9 +355,12 @@ fn validate_quality(quality: Option<f64>) -> Result<(), McpError> {
 /// attributed to a step: which `step_index` values were recorded with a NULL
 /// `step_claim_id`, and a warning saying why. `None` when every row resolved.
 ///
-/// The warning names BOTH causes and never says which applied, and never how
-/// many steps the plan has: telling "out of range" apart from "not visible to
-/// you" would disclose that a step the caller cannot read exists. Shared with
+/// The warning names all THREE causes and never says which applied, and never
+/// how many steps the plan has: telling "out of range" apart from "not visible
+/// to you", or from a readable step whose plan position the caller cannot
+/// prove (`WorkflowRepository::plan_step_claim_ids` returns only the provable
+/// prefix; backlog 0f35c13b), would disclose that a step the caller cannot
+/// read exists. Shared with
 /// the HTTP route (`epigraph-api` `routes/workflows.rs`) so both transports
 /// say the same thing.
 #[must_use]
@@ -367,12 +370,22 @@ pub fn unresolved_steps_warning(unresolved: &[usize]) -> Option<String> {
     }
     Some(format!(
         "{} step row(s) were recorded with a null step_claim_id: step_index {:?} did not match \
-         a step of this workflow that you can read (the index is out of range, or the step is \
-         not visible to you). The run and its counters were recorded.",
+         a step of this workflow that you can read (the index is out of range, the step is not \
+         visible to you, or its position in the plan cannot be established from the steps you \
+         can read). The run and its counters were recorded.",
         unresolved.len(),
         unresolved
     ))
 }
+
+/// The message both transports log (`tracing::warn!`) when an outcome report
+/// recorded step rows with a NULL `step_claim_id`. Like
+/// [`unresolved_steps_warning`] it lists every cause and never says which
+/// applied. Shared with the HTTP route (`epigraph-api` `routes/workflows.rs`).
+pub const UNRESOLVED_STEPS_LOG: &str =
+    "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
+     (step_index out of range, the step is not visible to the reporter, or its position in the \
+     plan cannot be established from the steps the reporter can read)";
 
 /// Outcome reporting for hierarchical workflows, on ONE transaction stamped
 /// with the REPORTER's viewer. Updates `workflows.metadata` rolling counters and
@@ -572,8 +585,8 @@ pub async fn do_report_hierarchical_outcome_as(
             workflow_id = %workflow_id,
             principal = ?viewer.principal(),
             unresolved_step_indices = ?unresolved,
-            "outcome report: behavioral_executions rows recorded with a NULL step_claim_id \
-             (step_index out of range, or the step is not visible to the reporter)"
+            "{}",
+            UNRESOLVED_STEPS_LOG
         );
     }
 
