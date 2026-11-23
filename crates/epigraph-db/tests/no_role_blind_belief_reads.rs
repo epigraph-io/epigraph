@@ -29,6 +29,12 @@
 //!   the compound predicate) holds rows the role already filtered, so its
 //!   field reads are not role-blind. Files whose path names `belief_view`
 //!   are the sanctioned home of these reads and are not scanned for them.
+//! * **Column list** (Rust only, backlog 4e4d6ad4): the unit names a
+//!   `const` array of cache column names (`CACHE_COLUMN_NAMES`) that it
+//!   splices into SQL with `format!`, directly or through a text-returning
+//!   helper of its file (see Known limits for the exact shape). No SQL
+//!   literal names the column, so without this a unit that reads only
+//!   through such a list measures as write-only.
 //!
 //! # Classified, registered, or a finding
 //!
@@ -56,9 +62,18 @@
 //!   the row type or calls its producer; a row handed to a helper that names
 //!   neither is not seen. Units with the same name in one file share a key.
 //! * Lower-case SQL is not SQL to this scan; the tree has none today.
-//! * A column list assembled at runtime (`format!` over a const array such as
-//!   `CACHE_COLUMN_NAMES`) is not measured as a read, so a unit that reads
-//!   only through such a list measures as write-only.
+//! * A column list assembled at runtime is measured only in one shape: a
+//!   module- or `impl`-level `const` / `static` holding a cache column name
+//!   as a whole string literal (`belief_cache.rs`'s `CACHE_COLUMN_NAMES`).
+//!   Every unit whose code names it reads, and so does every unit calling a
+//!   fn OF THE SAME FILE that names it and returns text (`String`, `&str`,
+//!   `Cow`), transitively; propagation stops at a fn returning anything
+//!   else, which ran the statement itself. Not seen: a list local to a fn (a
+//!   `let` array or a fn-local `const`), a list of `truth_value` (a belief
+//!   only in context), a list built from parts or read from elsewhere, a text
+//!   helper called from another file, or a helper that returns the array
+//!   itself rather than text. A whole `#[cfg(test)]` module file is out of
+//!   scope for this rule.
 
 mod belief_lint;
 
@@ -159,9 +174,10 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-api/src/routes/policies.rs", "resolve_challenge", Tag::Writer("one UPDATE moves a challenged claim's truth_value from its own value; it serves no belief")),
     ("crates/epigraph-api/src/routes/search.rs", "semantic_search", Tag::Todo { pr: "PR-R5", why: "REST /search/semantic maps c.belief / c.plausibility per hit; SPEC §7.2 BeliefView per hit" }),
     // --- epigraph-cli -------------------------------------------------------
+    ("crates/epigraph-cli/src/belief_cache.rs", "cache_equals", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; builds restore_wave_with's compare-and-swap probe, every cache column of CACHE_COLUMN_NAMES compared with the wave file's values, and serves no belief")),
     ("crates/epigraph-cli/src/belief_cache.rs", "read_cache_columns", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; reads the raw cache columns of listed claims for a bit-exact record (the wave writer's before/after rows that the CAS restore takes as input) and serves no belief")),
     ("crates/epigraph-cli/src/belief_cache.rs", "restore_scoped", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; PR-C2's compare-and-swap restore of a wave's ds_combined_beliefs rows by row id, whose probe compares the raw stored columns; it serves no belief")),
-    ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::Writer("PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote; its probe compares the stored columns through a format!-built list (see Known limits), operator ruling D5 (2026-10-25): stays role-blind by design; it serves no belief")),
+    ("crates/epigraph-cli/src/belief_cache.rs", "restore_wave_with", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; PR-C1's compare-and-swap restore writes a wave's before values back where the columns still equal what it wrote, and its probe reads the stored columns through CACHE_COLUMN_NAMES (measured as a read since backlog 4e4d6ad4); it serves no belief")),
     ("crates/epigraph-cli/src/belief_cache.rs", "write_snapshot", Tag::ByDesign("operator ruling D5 (2026-10-25): stays role-blind by design; the snapshot copies every current claim's raw cache columns, compounds included (the compound-cache cleanup NULLs them only after a snapshot), so it must be bit-exact")),
     ("crates/epigraph-cli/src/bin/analyze_graph.rs", "main", Tag::Todo { pr: "unassigned", why: "operator analysis report buckets claims by truth_value; no plan row converts it" }),
     ("crates/epigraph-cli/src/bin/dekg.rs", "handle_migrate", Tag::Todo { pr: "PR-W4", why: "dekg migrate reads claim Pl to bootstrap raw BBAs; SPEC §4.1 W13" }),
@@ -416,9 +432,145 @@ fn field_reads(code: &str) -> Vec<(usize, &'static str)> {
     out
 }
 
+/// The files of `rust` that are whole `#[cfg(test)]` modules: `<name>.rs`
+/// declared `#[cfg(test)] mod <name>;` by its parent module (such as
+/// `epigraph-atlas-contract/src/tests.rs`). `rust_view` blanks a test item
+/// inside a file, not a test module kept in a file of its own, and a unit
+/// test's fixture list is not a served read.
+fn test_module_files(rust: &[Source]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for s in rust {
+        // The raw text: `rust_view` blanks the `#[cfg(test)]` declaration
+        // itself.
+        let code = &s.text;
+        for at in find_words(code, "mod") {
+            let Some(attr) = code[..at].trim_end().strip_suffix(']') else {
+                continue;
+            };
+            let attr = attr.trim_end();
+            let attr = attr.strip_suffix("pub(crate)").unwrap_or(attr).trim_end();
+            if !attr.ends_with("#[cfg(test)") {
+                continue;
+            }
+            let rest = code[at + 3..].trim_start();
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() || !rest[name.len()..].trim_start().starts_with(';') {
+                continue; // an inline `mod name { .. }`, already blanked
+            }
+            let (dir, file) = s.path.rsplit_once('/').unwrap_or(("", &s.path));
+            let parent = match file {
+                "lib.rs" | "main.rs" | "mod.rs" => dir.to_string(),
+                f => format!("{dir}/{}", f.trim_end_matches(".rs")),
+            };
+            out.insert(format!("{parent}/{name}.rs"));
+        }
+    }
+    out
+}
+
+/// The column lists of `rust`: every module-level (or `impl`-level) `const` /
+/// `static` item holding a cache column name ([`FIELDS`]) as a whole string
+/// literal, such as `belief_cache.rs`'s `CACHE_COLUMN_NAMES`. Such a list is
+/// spliced into SQL at runtime (`format!` over the array), so no SQL literal
+/// names the column and the SQL scan cannot see the read.
+fn column_list_consts(rust: &[Source], test_files: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for s in rust.iter().filter(|s| !test_files.contains(&s.path)) {
+        let view = rust_view(&s.text);
+        let units = RustUnits::new(&view.code);
+        for lit in &view.literals {
+            if !FIELDS.contains(&lit.text.trim()) {
+                continue;
+            }
+            if let Some(name) = units.unit_at(lit.start).0.strip_prefix("const ") {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Does a fn returning `ret` hand back text (`String`, `&str`, `Cow<str>`)?
+/// Only such a helper carries a column list on to its callers: a fn that
+/// returns anything else has already used the text itself.
+fn returns_text(ret: &str) -> bool {
+    ["String", "str", "Cow"].iter().any(|t| has_word(ret, t))
+}
+
+/// Is `code[at..]` the name of a call: `name(` or `name::<..>(`, and not the
+/// `fn name` that defines it?
+fn is_call_at(code: &str, at: usize, name: &str) -> bool {
+    let before = code[..at].trim_end();
+    if before.ends_with("fn")
+        && before[..before.len() - 2]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return false;
+    }
+    let after = code[at + name.len()..].trim_start();
+    let after = after
+        .strip_prefix("::<")
+        .map(|r| r.find('>').map_or("", |e| r[e + 1..].trim_start()))
+        .unwrap_or(after);
+    after.starts_with('(')
+}
+
+/// The units of one Rust code view that read a column list: `(unit, span,
+/// list)`. A unit reads one when its code names the list (or a `const` of the
+/// same file that names it), or calls a fn of the same file that names it and
+/// returns text (such as `belief_cache.rs`'s `cache_equals`), transitively.
+/// Propagation stops at the first fn that does not return text: that fn
+/// builds and runs the statement, so it is the reader, not its callers.
+fn column_list_readers(
+    code: &str,
+    units: &RustUnits,
+    lists: &BTreeSet<String>,
+) -> Vec<(String, Option<(usize, usize)>, String)> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut done = BTreeSet::new();
+    // (name, is a fn, the column list it carries)
+    let mut queue: Vec<(String, bool, String)> = lists
+        .iter()
+        .map(|l| (l.clone(), false, l.clone()))
+        .collect();
+    while let Some((name, is_fn, list)) = queue.pop() {
+        if !done.insert((name.clone(), is_fn)) {
+            continue;
+        }
+        for at in find_words(code, &name) {
+            if is_fn && !is_call_at(code, at, &name) {
+                continue;
+            }
+            let (unit, span) = units.unit_at(at);
+            if unit == "<module>" || unit == format!("const {name}") {
+                continue; // a `use`, or the item's own definition
+            }
+            if let Some(c) = unit.strip_prefix("const ") {
+                queue.push((c.to_string(), false, list.clone()));
+            } else if let Some(f) = units.fn_at(at) {
+                if returns_text(f.return_type(code)) {
+                    queue.push((f.name.clone(), true, list.clone()));
+                }
+            }
+            if seen.insert(unit.clone()) {
+                out.push((unit, span, list.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// The measured role-blind readers, keyed `(path, unit)`.
 fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
     let (row_types, producers) = claim_row_types(rust);
+    let test_files = test_module_files(rust);
+    let column_lists = column_list_consts(rust, &test_files);
     let mut out: Measured = BTreeMap::new();
 
     for s in rust {
@@ -440,6 +592,17 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             let u = out.entry((s.path.clone(), unit)).or_default();
             u.kinds.extend(kinds);
             u.reads |= !is_write_sql(&sql);
+            u.marked |= marked(span);
+        }
+        let lists = if test_files.contains(&s.path) {
+            BTreeSet::new()
+        } else {
+            column_lists.clone()
+        };
+        for (unit, span, list) in column_list_readers(&view.code, &units, &lists) {
+            let u = out.entry((s.path.clone(), unit)).or_default();
+            u.kinds.insert(format!("column list {list}"));
+            u.reads = true;
             u.marked |= marked(span);
         }
         if s.path.contains("belief_view") {
@@ -1039,5 +1202,164 @@ def report(cur):
     assert!(
         f.iter().any(|l| l.contains(&format!("{path}::report"))),
         "an executed triple-quoted statement is a reader; got {f:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Column lists built at runtime (backlog 4e4d6ad4)
+// ---------------------------------------------------------------------------
+
+const SCRATCH_LIST_PATH: &str = "crates/epigraph-cli/src/scratch_column_list.rs";
+
+/// A belief read whose column list is a `const` array spliced in with
+/// `format!` names no column in any SQL literal. It is still a new
+/// role-blind reader, and so is a text helper that builds the predicate
+/// from the array AND the fn that runs the helper's text; the role-spliced
+/// twin is classified.
+#[test]
+fn a_format_built_column_list_read_fails_unless_registered() {
+    let rust = rust_sources();
+    let scripts = script_sources();
+
+    let direct = r#"
+const SCRATCH_COLUMNS: [&str; 2] = ["belief", "pignistic_prob"];
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    let sql = format!("SELECT {} FROM claims c", SCRATCH_COLUMNS.join(", "));
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    let measured = measure(&with_scratch(&rust, SCRATCH_LIST_PATH, direct), &scripts);
+    let unit = measured
+        .get(&(
+            SCRATCH_LIST_PATH.to_string(),
+            "scratch_list_read".to_string(),
+        ))
+        .unwrap_or_else(|| panic!("the format!-built read is not measured"));
+    assert!(unit.reads, "a read through a column list is a read");
+    assert!(
+        unit.kinds.contains("column list SCRATCH_COLUMNS"),
+        "{:?}",
+        unit.kinds
+    );
+    let f = findings(&measured);
+    assert!(
+        f.iter()
+            .any(|l| l.contains(&format!("{SCRATCH_LIST_PATH}::scratch_list_read: NEW"))),
+        "a new format!-built belief read must be a finding; got {f:#?}"
+    );
+
+    let through_a_helper = r#"
+const SCRATCH_COLUMNS: [&str; 2] = ["plausibility", "classification"];
+fn scratch_equal(prefix: &str) -> String {
+    SCRATCH_COLUMNS
+        .iter()
+        .map(|c| format!("c.{c} = w.{prefix}_{c}"))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+pub async fn scratch_probe(pool: &sqlx::PgPool) -> Vec<uuid::Uuid> {
+    let sql = format!("SELECT c.id FROM claims c, w WHERE {}", scratch_equal("w"));
+    sqlx::query_scalar(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    let f = findings(&measure(
+        &with_scratch(&rust, SCRATCH_LIST_PATH, through_a_helper),
+        &scripts,
+    ));
+    for unit in ["scratch_equal", "scratch_probe"] {
+        assert!(
+            f.iter()
+                .any(|l| l.contains(&format!("{SCRATCH_LIST_PATH}::{unit}: NEW"))),
+            "{unit} reads the column list (the helper builds it, the caller runs it); \
+             got {f:#?}"
+        );
+    }
+
+    let spliced = r#"
+use epigraph_db::repos::claim_role::{render, IS_COMPOUND_SQL};
+const SCRATCH_COLUMNS: [&str; 2] = ["belief", "pignistic_prob"];
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    let sql = format!(
+        "SELECT {} FROM claims c WHERE NOT {}",
+        SCRATCH_COLUMNS.join(", "),
+        render(IS_COMPOUND_SQL, "c")
+    );
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    let f = findings(&measure(
+        &with_scratch(&rust, SCRATCH_LIST_PATH, spliced),
+        &scripts,
+    ));
+    assert!(
+        !names(&f, SCRATCH_LIST_PATH),
+        "a column-list reader that splices IS_COMPOUND_SQL is classified; got {f:#?}"
+    );
+}
+
+/// The column-list rule is bounded: a `const` array naming no cache column
+/// is not a column list, and the caller of a fn that reads a column list but
+/// returns no text is not a reader (the fn ran the statement; its caller only
+/// gets its result), so `belief_cache::restore_wave` is not measured beside
+/// `restore_wave_with`.
+#[test]
+fn a_column_list_taints_only_its_readers() {
+    let rust = rust_sources();
+    let scripts = script_sources();
+
+    let unrelated = r#"
+const SCRATCH_COLUMNS: [&str; 2] = ["statement", "created_at"];
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<String> {
+    let sql = format!("SELECT {} FROM claims c", SCRATCH_COLUMNS.join(", "));
+    sqlx::query_scalar(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    let measured = measure(&with_scratch(&rust, SCRATCH_LIST_PATH, unrelated), &scripts);
+    assert!(
+        !measured.keys().any(|(p, _)| p == SCRATCH_LIST_PATH),
+        "a list naming no cache column is not a belief read"
+    );
+
+    let wrapped = r#"
+const SCRATCH_COLUMNS: [&str; 1] = ["pignistic_prob"];
+pub async fn scratch_run(pool: &sqlx::PgPool) -> anyhow::Result<Vec<f64>> {
+    let sql = format!("SELECT {} FROM claims c", SCRATCH_COLUMNS.join(", "));
+    Ok(sqlx::query_scalar(&sql).fetch_all(pool).await?)
+}
+pub async fn scratch_outer(pool: &sqlx::PgPool) -> usize {
+    scratch_run(pool).await.map(|v| v.len()).unwrap_or(0)
+}
+"#;
+    let measured = measure(&with_scratch(&rust, SCRATCH_LIST_PATH, wrapped), &scripts);
+    let key = |u: &str| (SCRATCH_LIST_PATH.to_string(), u.to_string());
+    assert!(measured.contains_key(&key("scratch_run")));
+    assert!(
+        !measured.contains_key(&key("scratch_outer")),
+        "the caller of a non-text fn is not a column-list reader"
+    );
+
+    let live = measure(&rust, &scripts);
+    let cache = "crates/epigraph-cli/src/belief_cache.rs";
+    for unit in ["cache_equals", "restore_wave_with"] {
+        assert!(
+            live.get(&(cache.to_string(), unit.to_string()))
+                .is_some_and(|u| u.reads && u.kinds.contains("column list CACHE_COLUMN_NAMES")),
+            "{cache}::{unit} reads CACHE_COLUMN_NAMES"
+        );
+    }
+    assert!(
+        !live.contains_key(&(cache.to_string(), "restore_wave".to_string())),
+        "{cache}::restore_wave only calls restore_wave_with"
+    );
+    // A unit test's fixture list in a `#[cfg(test)]` module file (the
+    // atlas contract's banned belief keys) is not a served read.
+    let contract_tests = "crates/epigraph-atlas-contract/src/tests.rs";
+    assert!(
+        test_module_files(&rust).contains(contract_tests),
+        "{contract_tests} is a #[cfg(test)] module file"
+    );
+    assert!(
+        !live.keys().any(|(p, _)| p == contract_tests),
+        "{contract_tests} is out of scope"
     );
 }
