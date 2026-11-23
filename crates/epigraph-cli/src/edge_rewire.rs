@@ -418,6 +418,21 @@ pub struct EdgeRowRestoreReport {
     /// Retracted since the rewire: left alone (migration 184 audit row).
     pub retracted_since_rewire: Vec<Uuid>,
     pub missing: Vec<Uuid>,
+    /// Batches finished (committed, or rolled back on a dry run) when this
+    /// report was taken, out of `batches_total`: a report written after each
+    /// batch is complete when the two are equal.
+    #[serde(default)]
+    pub batches_done: usize,
+    #[serde(default)]
+    pub batches_total: usize,
+}
+
+impl EdgeRowRestoreReport {
+    /// Every batch finished.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.batches_done == self.batches_total
+    }
 }
 
 /// One row a restore puts back: chained like `belief_cache::plan_restore`
@@ -479,9 +494,37 @@ pub async fn restore_edge_rows(
     records: &[EdgeRowRecord],
     dry_run: bool,
 ) -> anyhow::Result<EdgeRowRestoreReport> {
+    restore_edge_rows_batched(pool, records, dry_run, EDGE_ROW_RESTORE_BATCH, &mut |_| {
+        Ok(())
+    })
+    .await
+}
+
+/// [`restore_edge_rows`] in transactions of `batch_size` rows, handing
+/// `on_batch` the cumulative report after EACH batch commits (or rolls back,
+/// on a dry run), so a caller can write its outcomes as it goes: a restore
+/// that stops part-way (a database error, a killed process) leaves the
+/// outcomes of every batch it committed on disk, not none. An `on_batch`
+/// error stops the restore after that batch, which stays committed; a re-run
+/// finds its rows `already_restored`.
+///
+/// # Errors
+/// Any database error, or `on_batch`'s; batches already committed stay
+/// committed.
+pub async fn restore_edge_rows_batched(
+    pool: &PgPool,
+    records: &[EdgeRowRecord],
+    dry_run: bool,
+    batch_size: usize,
+    on_batch: &mut (dyn FnMut(&EdgeRowRestoreReport) -> anyhow::Result<()> + Send),
+) -> anyhow::Result<EdgeRowRestoreReport> {
     let plan = plan_edge_rows(records);
-    let mut report = EdgeRowRestoreReport::default();
-    for chunk in plan.chunks(EDGE_ROW_RESTORE_BATCH) {
+    let batch_size = batch_size.max(1);
+    let mut report = EdgeRowRestoreReport {
+        batches_total: plan.len().div_ceil(batch_size),
+        ..EdgeRowRestoreReport::default()
+    };
+    for chunk in plan.chunks(batch_size) {
         let mut tx = pool.begin().await?;
         for e in chunk {
             let restored: Option<Uuid> = sqlx::query_scalar(
@@ -538,6 +581,8 @@ pub async fn restore_edge_rows(
         } else {
             tx.commit().await?;
         }
+        report.batches_done += 1;
+        on_batch(&report)?;
     }
     Ok(report)
 }

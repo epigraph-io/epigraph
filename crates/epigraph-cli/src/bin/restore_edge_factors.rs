@@ -14,7 +14,11 @@
 //! the caches were folded from come back before the caches do.
 //!
 //! The outcomes go to `--outcomes-out` (default `<edge-rows>.restore-<UTC
-//! stamp>.outcomes.json`), which must not exist.
+//! stamp>.outcomes.json`), which must not exist. The file is rewritten after
+//! EVERY batch (written beside it, then renamed over it), so a restore that
+//! stops part-way leaves the outcomes of the batches it committed;
+//! `batches_done` < `batches_total` says it did not finish. A re-run of the
+//! same `--edge-rows` finds the committed rows `already_restored`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -22,7 +26,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use epigraph_cli::edge_rewire::{read_edge_row_records, restore_edge_rows};
+use epigraph_cli::edge_rewire::{
+    read_edge_row_records, restore_edge_rows_batched, EdgeRowRestoreReport, EDGE_ROW_RESTORE_BATCH,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -66,21 +72,45 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         p.push(format!(".restore-{stamp}{suffix}.outcomes.json"));
         PathBuf::from(p)
     });
-    let mut out = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&out_path)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?,
-    );
+    // Reserve the name (must not exist); each batch's report replaces it.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out_path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?;
+    let write_outcomes = |report: &EdgeRowRestoreReport| -> anyhow::Result<()> {
+        let mut tmp = out_path.as_os_str().to_owned();
+        tmp.push(".partial");
+        let tmp = PathBuf::from(tmp);
+        let mut out = BufWriter::new(
+            File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?,
+        );
+        serde_json::to_writer_pretty(&mut out, report)?;
+        out.write_all(b"\n")?;
+        out.into_inner()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?
+            .sync_all()?;
+        std::fs::rename(&tmp, &out_path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?;
+        Ok(())
+    };
 
     let maint = epigraph_cli::MaintenancePool::connect("restore_edge_factors")
         .await
         .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    let report = restore_edge_rows(maint.pool(), &records, cli.dry_run).await?;
-    serde_json::to_writer_pretty(&mut out, &report)?;
-    out.write_all(b"\n")?;
-    out.flush()?;
+    let mut on_batch = |r: &EdgeRowRestoreReport| write_outcomes(r);
+    let report = restore_edge_rows_batched(
+        maint.pool(),
+        &records,
+        cli.dry_run,
+        EDGE_ROW_RESTORE_BATCH,
+        &mut on_batch,
+    )
+    .await?;
+    // An empty file has no batch; write its (empty, complete) report once.
+    if report.batches_total == 0 {
+        write_outcomes(&report)?;
+    }
     println!(
         "restore_edge_factors{}: restored={} already_restored={} superseded_since_rewire={} \
          retracted_since_rewire={} missing={} (outcomes: {})",
