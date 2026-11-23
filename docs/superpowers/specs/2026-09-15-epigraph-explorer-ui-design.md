@@ -277,6 +277,27 @@ For this UI, `get_provenance_chain` and `check_already_ingested` are the ones
 that bite: the first is a claim-page feature we would have to drop, the second
 blocks the Notion ingest half from being driven over HTTP.
 
+**Status, 2026-11-23 (backlog `fff61b9e`).** Each routed twin runs the tool's
+own core (an `epigraph-mcp` function returning the tool's response type) on the
+caller's viewer-stamped read, under the tool's `scope_map` scope; see
+`crates/epigraph-api/src/routes/mcp_twins.rs` and its parity test
+`crates/epigraph-api/tests/mcp_twin_read_routes.rs`.
+
+| MCP tool | Status |
+|---|---|
+| `structure_source` | Routed: `POST /api/v1/ingest/structure-source` |
+| `check_already_ingested` | Routed: `GET /api/v1/ingest/already-ingested?doi=&pipeline_version=` |
+| `query_undecomposed_claims` | Routed: `GET /api/v1/claims/undecomposed?limit=&offset=` |
+| `verify_claim` | Routed: `GET /api/v1/claims/:id/verify` (an unreadable or missing claim is a 404) |
+| `suggest_alternative_sets` | Routed: `GET /api/v1/alternative-sets/suggestions` |
+| `get_provenance_chain` | Routed earlier: `GET /api/v1/claims/:id/provenance-chain` |
+| `recall` | Not here: tracked by its own backlog item (`a601168e`) |
+| `get_recall_events` | Held until tenancy covers `recall_events` (section 10) |
+| `memorize`, `update_with_evidence`, `consolidate_claims`, `ingest_document_inline`, `ingest_document_spine`, `resolve_backlog_item` | Open. These WRITE: the MCP tools sign with the MCP server's `AgentSigner` and resolve the author through `write_identity`, while `AppState` holds only the edge signer. Which key signs a claim authored over HTTP is a decision to take before they are routed |
+| `ingest_document` | Proposed: do not expose. It reads `file_path` from the serving process's own filesystem (under its working directory); over HTTP that is a read of the server's disk. `ingest_document_inline` is the HTTP-shaped form |
+| `sweep_semantic_duplicates` | Proposed: do not expose. It runs on a privileged maintenance session as the server's own agent, with no viewer; the request servers serve no maintenance surface |
+| `update_partition` | Obsolete: the tool was deleted (PR-14); nothing to route |
+
 ### 8.3 The drift is already real — `recall` vs `/search/semantic`
 
 These are not one operation with two skins. Compare parameters:
