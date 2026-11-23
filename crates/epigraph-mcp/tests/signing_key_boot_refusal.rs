@@ -59,6 +59,7 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], extra_args: &[&str], until: &st
     cmd.args(&args)
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .env_remove("EPIGRAPH_MCP_AGENT_KEY")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")
@@ -238,6 +239,85 @@ async fn the_binary_boots_only_on_a_registered_signing_key(pool: PgPool) {
         0,
         "a refused boot creates no agent for the identity"
     );
+}
+
+/// Backlog 8bd859e5 / 8331811d: the binary boots in the separate-signing-key
+/// mode with the signing key in a 0600 FILE and NOT in its environment
+/// (`run_mcp` clears `EPIGRAPH_AGENT_SIGNING_KEY`, so `/proc/<pid>/environ`
+/// holds only the path). The same file opened to others, and the file next
+/// to the variable, are refused at boot (exit 1) without echoing the key.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binary_boots_on_a_signing_key_file_without_the_key_in_its_env(pool: PgPool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let identity = AgentSigner::from_bytes(&[0xD1; 32])
+        .expect("id")
+        .public_key();
+    let signing_secret = [0xD2u8; 32];
+    let signing = AgentSigner::from_bytes(&signing_secret)
+        .expect("sk")
+        .public_key();
+    register(&pool, identity, signing).await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "epigraph-mcp-boot-key-file-{}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).expect("mkdir");
+    let key_file = dir.join("signing.key");
+    std::fs::write(&key_file, format!("{}\n", hex::encode(signing_secret))).expect("write");
+    let chmod = |mode: u32| {
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(mode)).expect("chmod")
+    };
+    chmod(0o600);
+    let file_env = || {
+        vec![
+            ("EPIGRAPH_AGENT_IDENTITY_PUBKEY", hex::encode(identity)),
+            (
+                "EPIGRAPH_AGENT_SIGNING_KEY_FILE",
+                key_file.to_str().expect("utf-8 temp path").to_string(),
+            ),
+        ]
+    };
+
+    match run(&pool, file_env(), &[]).await {
+        Outcome::PastTheCheck { .. } => {}
+        Outcome::Exited { code, stderr } => {
+            panic!("the registered pair from a key file must boot; exited {code:?}:\n{stderr}")
+        }
+    }
+
+    chmod(0o644);
+    match run(&pool, file_env(), &[]).await {
+        Outcome::Exited { code, stderr } => {
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(
+                stderr.contains("group and others must have no access"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains(&hex::encode(signing_secret)), "{stderr}");
+        }
+        Outcome::PastTheCheck { stderr } => {
+            panic!("a world-readable key file must not boot:\n{stderr}")
+        }
+    }
+    chmod(0o600);
+
+    let mut both = file_env();
+    both.push(("EPIGRAPH_AGENT_SIGNING_KEY", hex::encode(signing_secret)));
+    match run(&pool, both, &[]).await {
+        Outcome::Exited { code, stderr } => {
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(stderr.contains("are both set"), "{stderr}");
+            assert!(!stderr.contains(&hex::encode(signing_secret)), "{stderr}");
+        }
+        Outcome::PastTheCheck { stderr } => {
+            panic!("the key in both the file and the env must not boot:\n{stderr}")
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Half a configuration is refused, not completed with a generated key: the
@@ -423,6 +503,7 @@ fn the_separate_signing_key_mode_is_refused_on_an_http_listener() {
             .env_remove("EPIGRAPH_MCP_AGENT_KEY")
             .env_remove("EPIGRAPH_AGENT_MODEL")
             .env_remove("MAINTENANCE_DATABASE_URL")
+            .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
             .env("EPIGRAPH_AGENT_IDENTITY_PUBKEY", hex::encode(identity))
             .env("EPIGRAPH_AGENT_SIGNING_KEY", hex::encode(signing_secret))
             .args([
@@ -457,6 +538,7 @@ fn the_signing_key_is_not_accepted_on_the_command_line() {
     let signing_secret_hex = hex::encode([0xF2u8; 32]);
     let out = Command::new(env!("CARGO_BIN_EXE_epigraph-mcp-full"))
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .env_remove("EPIGRAPH_MCP_AGENT_KEY")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_OPERATOR_ID")

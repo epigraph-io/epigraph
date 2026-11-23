@@ -56,6 +56,7 @@ fn run_mcp(db_url: &str, env: &[(&str, String)], until: &str) -> Outcome {
     cmd.args(["--database-url", db_url])
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .env_remove("EPIGRAPH_MCP_AGENT_KEY")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")

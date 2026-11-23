@@ -600,7 +600,7 @@ For the others, anything else is off.
 | `MAINTENANCE_DATABASE_URL` | must be unset | Set → exit 1, on every transport. |
 | `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` | unset | The signer's Ed25519 secret key, 64 hex characters. |
 | `--agent-model` / `EPIGRAPH_AGENT_MODEL`, `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT`, `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | must be unset | Set → exit 1 (backlog bfc2eff8). They derived the signing key as BLAKE3 of public inputs (model and prompt hash), which anyone can recompute. Use the separate-signing-key mode, whose identity the host derives with a secret, or `--agent-key`. |
-| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. |
+| `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY_FILE` or `EPIGRAPH_AGENT_SIGNING_KEY` (environment only, exactly one) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. Prefer `EPIGRAPH_AGENT_SIGNING_KEY_FILE`: a path to a regular file (not a symlink) owned by the process's uid, mode 0600 or 0400, holding the 64 hex characters; anything else → exit 1. `EPIGRAPH_AGENT_SIGNING_KEY` puts the key itself in `/proc/<pid>/environ` for the life of the process. Both set → exit 1. |
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | A TCP `--listen` needs this or `--jwt-jwks`. At least 32 bytes. The same secret as the API. Beside `--jwt-jwks` it is the HS256 accept window. |
@@ -2505,6 +2505,7 @@ attested-type gate). Windows closed in between stay closed.
 **Separate signing keys.** A host can register an identity key and give the
 agent process a different, active `signing` key of that agent:
 `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with
+`EPIGRAPH_AGENT_SIGNING_KEY_FILE` (a 0600 key file, preferred) or
 `EPIGRAPH_AGENT_SIGNING_KEY` (environment only, never the command line),
 stdio only. `epigraph-mcp-full` refuses to serve unless the signing key is an
 ACTIVE `signing` key of the agent the identity key names.

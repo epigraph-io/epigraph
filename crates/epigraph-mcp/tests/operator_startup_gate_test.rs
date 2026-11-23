@@ -47,6 +47,7 @@ fn an_http_listener_refuses_an_operator_flag() {
     let out = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -78,6 +79,7 @@ fn an_http_listener_refuses_the_operator_env_var() {
     let out = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -106,6 +108,7 @@ fn an_operator_without_a_declared_identity_is_refused() {
     let out = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .args([
             "--database-url",
             "postgres://invalid:invalid@127.0.0.1:1/nope",
@@ -136,6 +139,7 @@ fn spawn_listener(db_url: &str, key_hex: &str) -> Outcome {
     let mut child = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .args([
             "--database-url",
             db_url,
@@ -330,6 +334,7 @@ fn spawn_stdio_with_operator(db_url: &str, agent_key_hex: &str, operator: Uuid) 
     let mut child = Command::new(mcp_bin())
         .env_remove("EPIGRAPH_AGENT_IDENTITY_PUBKEY")
         .env_remove("EPIGRAPH_AGENT_SIGNING_KEY")
+        .env_remove("EPIGRAPH_AGENT_SIGNING_KEY_FILE")
         .env_remove("EPIGRAPH_AGENT_MODEL")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT")
         .env_remove("EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH")

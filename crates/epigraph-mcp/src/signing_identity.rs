@@ -10,8 +10,9 @@
 //! * The SIGNING key is random. The host registers its public half for the
 //!   agent in `agent_keys` (`key_type 'signing'`, through migration 161's
 //!   attestor-only registration) and gives the container the private half
-//!   (`EPIGRAPH_AGENT_SIGNING_KEY`). Every signature this process makes is
-//!   by it.
+//!   (`EPIGRAPH_AGENT_SIGNING_KEY`, or the 0600 file
+//!   `EPIGRAPH_AGENT_SIGNING_KEY_FILE` names). Every signature this process
+//!   makes is by it.
 //!
 //! # Why the boot check
 //!
@@ -124,7 +125,8 @@ fn signing_key_verdict(
             .join("; ")
     };
     Err(format!(
-        "the signing key {signing_hex} (public half of EPIGRAPH_AGENT_SIGNING_KEY) is not an \
+        "the signing key {signing_hex} (public half of EPIGRAPH_AGENT_SIGNING_KEY, or of the \
+         key in the file EPIGRAPH_AGENT_SIGNING_KEY_FILE names) is not an \
          active signing key of agent {agent}: {found}. The host registers the signing key \
          (epigraph_register_agent_identity) before the container starts; refusing to start."
     ))
