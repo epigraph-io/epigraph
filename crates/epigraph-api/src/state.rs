@@ -340,6 +340,15 @@ pub struct AppState {
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
     #[cfg(feature = "db")]
     pub bp_apply: BpApply,
+    /// What a textless BBA write aimed at a compound does
+    /// (`EPIGRAPH_COMPOUND_WRITE_GUARD`, `epigraph_engine::compound_write_guard`;
+    /// read by `POST /api/v1/frames/:id/evidence` and
+    /// `POST /api/v1/claims/:id/assess`). Every constructor takes the mode this
+    /// process read at startup (`belief_modes::current`), the value `/health`
+    /// reports, so no boot step can forget to set it;
+    /// [`Self::with_compound_write_guard`] overrides it (tests).
+    #[cfg(feature = "db")]
+    pub compound_write_guard: epigraph_engine::belief_modes::CompoundWriteGuard,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -1325,6 +1334,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1441,6 +1451,18 @@ impl AppState {
     #[must_use]
     pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
         self.bp_apply = bp_apply;
+        self
+    }
+
+    /// Set what a textless BBA write aimed at a compound does; see
+    /// [`Self::compound_write_guard`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_compound_write_guard(
+        mut self,
+        guard: epigraph_engine::belief_modes::CompoundWriteGuard,
+    ) -> Self {
+        self.compound_write_guard = guard;
         self
     }
 
@@ -1916,6 +1938,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1997,6 +2020,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,

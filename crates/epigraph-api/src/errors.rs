@@ -308,6 +308,21 @@ pub enum ApiError {
         error: &'static str,
         description: String,
     },
+
+    /// `422`, `compound_target` (`EPIGRAPH_COMPOUND_WRITE_GUARD=refuse`,
+    /// backlog 7435772c, SPEC §4.1 W3): a textless BBA write
+    /// (`POST /api/v1/frames/:id/evidence`, `POST /api/v1/claims/:id/assess`)
+    /// named a COMPOUND, whose belief is derived from its atoms. Nothing was
+    /// written. `data` is the machine-keyed body MCP `submit_ds_evidence`
+    /// carries in its refusal's `data`
+    /// (`epigraph_engine::compound_write_guard::CompoundTarget::refusal_data`):
+    /// `error`, `claim_id`, `visible_atoms` (the atoms the caller can see,
+    /// `{id, content}`), `visible_atom_count`, `flag`, `retryable: false`.
+    #[error("{message}")]
+    CompoundTarget {
+        message: String,
+        data: serde_json::Value,
+    },
 }
 
 impl ApiError {
@@ -442,6 +457,15 @@ impl IntoResponse for ApiError {
             )
                 .into_response();
         }
+        // The compound write guard's refusal (backlog 7435772c): the shared
+        // machine-keyed body, with the message beside it.
+        if let ApiError::CompoundTarget { message, data } = &self {
+            let mut body = data.clone();
+            if let Some(map) = body.as_object_mut() {
+                map.insert("message".to_string(), serde_json::json!(message));
+            }
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response();
+        }
         let (status, error_type, details) = match &self {
             ApiError::BadRequest { message } => (
                 StatusCode::BAD_REQUEST,
@@ -554,6 +578,9 @@ impl IntoResponse for ApiError {
             // Answered above with its own body; kept here so the match stays
             // exhaustive.
             ApiError::OAuthGrantError { error, .. } => (StatusCode::BAD_REQUEST, *error, None),
+            ApiError::CompoundTarget { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "compound_target", None)
+            }
         };
 
         // RFC 6750 §3 REQUIRES a `WWW-Authenticate` challenge on a 401 from a
