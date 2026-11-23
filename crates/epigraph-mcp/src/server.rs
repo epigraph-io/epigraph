@@ -2425,6 +2425,19 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Enumerate every workflow you can read, page by page, with no text filter: the exhaustive walk find_workflow and find_workflow_hierarchical (similarity / keyword search, which miss workflows whose goal and name lack the query words) are not. One entry per hierarchical LINEAGE (store \"hierarchical\": its head, the highest generation you can read, with canonical_name, generation, `generations` = how many generations of it you can read, goal, parent_id, created_at, truth_value), ordered by canonical_name; then one entry per flat `workflow`-labelled claim (store \"flat\": workflow_id, content, truth_value, labels, is_current), ordered by id. Pass the returned `next_cursor` back as `cursor` until it is null; each lineage is listed once even if it gains a generation while you page. By default deprecated workflows are left out (a lineage whose head's truth is below 0.3, a flat claim that is not current); include_deprecated=true lists them too, flagged `deprecated`. Group-private workflows are listed only to readers of their group. Steps are not included: read a workflow's plan with get_workflow_plan."
+    )]
+    async fn list_workflows(
+        &self,
+        Parameters(params): Parameters<ListWorkflowsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflow_hierarchical::list_workflows(self, viewer, params).await
+    }
+
+    #[tool(
         description = "Record an outcome for a hierarchical workflow run by workflows-table id. Updates rolling counters in workflows.metadata (use_count, success_count, failure_count, avg_variance) and writes one behavioral_executions row per step_execution, with step_index mapped to the workflow's steps in original PLAN order (the order find_workflow / find_workflow_hierarchical list them: the step_follows chain, so a step add_step inserted at slot i is step i; when the plan's step_follows pairs fork or cycle (two generations of one canonical_name sharing reordered steps), there is no single chain and readers fall back to stored plan_index order, where an unindexed step comes last). Writes no evidence and changes no belief. All-or-nothing: the counters and every step row commit together, so an error (including a step row the database refuses) writes nothing and step_executions_written always equals the number of step_executions sent; a `quality` outside [0, 1] is refused before anything is written. NOT idempotent: every successful call adds to the counters and rows, so do not retry a call that succeeded (a call that returned an error wrote nothing and can be retried). Each step_index is resolved against the steps YOU can read: a step_index that is out of range, or whose step is not visible to you (for example a group-private step outside your groups), is stored with a null step_claim_id, and the response lists it in unresolved_step_indices with a warning (the two causes are not told apart). A non-blank goal_text is embedded onto every step row (best-effort), so the run feeds find_workflow's behavioral affinity for this workflow. There is no ownership check on the workflow, but a caller that can read none of its steps (no step executes edge; a visible thesis, phase or shared operation atom does not count, so a plan with no steps is refused to every caller) gets the same not-found error as an unknown id, and nothing is written. `report_workflow_outcome` is the compatibility entry point for callers that may have either store_workflow ids or legacy flat workflow claim ids."
     )]
     async fn report_hierarchical_outcome(

@@ -214,6 +214,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/workflow.rs", "find_by_text", Tag::Todo { pr: "unassigned", why: "workflow search gated and scored on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/workflow.rs", "find_hierarchical_by_embedding", Tag::Todo { pr: "unassigned", why: "workflow search gated on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/workflow.rs", "list", Tag::Todo { pr: "unassigned", why: "workflow list ordered on truth_value; procedural, no plan row" }),
+    ("crates/epigraph-db/src/repos/workflow.rs", "list_hierarchical_lineage_heads", Tag::Todo { pr: "unassigned", why: "workflow lineage enumeration gated on the head's truth_value (deprecation); procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_embedding_scored", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/workflow.rs", "search_hierarchical_by_text", Tag::Todo { pr: "unassigned", why: "workflow search scored on truth_value; procedural, no plan row" }),
     // --- epigraph-engine ----------------------------------------------------
