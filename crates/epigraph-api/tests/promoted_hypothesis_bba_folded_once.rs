@@ -841,3 +841,114 @@ async fn a_promotion_racing_a_committed_promotion_is_refused(
         "the refused promotion leaves the source in place"
     );
 }
+
+/// The route reads the source BBA OUTSIDE the promotion's transaction, so the
+/// row can be retracted between that read and the retire step (SPEC §11 K4a
+/// site 6, through the REST route). Here the retraction lands inside the
+/// promotion's own transaction, right after its status flip (a trigger on
+/// that flip; the outside read, on another connection, still sees the row
+/// live). A retracted row is never retired: the promotion is refused as a
+/// caller that cannot retire its source, and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_source_retracted_between_the_read_and_the_retire_refuses_the_promotion(
+    pool_opts: PgPoolOptions,
+    conn_opts: PgConnectOptions,
+) {
+    let pool = pool_opts
+        .connect_with(conn_opts.clone())
+        .await
+        .expect("seeding pool");
+    let (agent, group) = viewer_fixture::seed_agent_with_group(&pool, "k4a-s6-promoter").await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, agent, group, "k4a s6 raced hypothesis").await;
+    let r = make_promotable(&pool, &conn_opts, agent, claim).await;
+    let source = rows(&pool, r.claim, r.hyp_frame).await.remove(0);
+    let retracted = |pool: PgPool, id: Uuid| async move {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT retracted_at IS NOT NULL FROM mass_functions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("read the source")
+    };
+    assert!(
+        !retracted(pool.clone(), source.id).await,
+        "PREMISE: the source is live"
+    );
+
+    // The race, made deterministic: the promotion's status flip retracts the
+    // source in the same transaction (all three retraction columns, as the
+    // retract definer writes them).
+    for sql in [
+        format!(
+            "CREATE FUNCTION k4a_s6_race() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+             AS $f$ BEGIN \
+               UPDATE mass_functions SET retracted_at = now(), retracted_by = '{agent}'::uuid, \
+                      retract_reason = 'k4a s6 race' \
+                WHERE id = '{}'::uuid; \
+               RETURN NEW; END $f$",
+            source.id
+        ),
+        format!(
+            "CREATE TRIGGER k4a_s6_race AFTER UPDATE ON claims FOR EACH ROW \
+             WHEN (NEW.id = '{}'::uuid \
+                   AND NEW.properties->>'hypothesis_status' = 'promoted') \
+             EXECUTE FUNCTION k4a_s6_race()",
+            r.claim
+        ),
+    ] {
+        sqlx::query(&sql)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "a source retracted since the read must refuse the promotion: {status} {body}"
+    );
+    assert!(
+        body.contains("cannot retire that BBA"),
+        "the refusal is the retire's clean false, not an error: {body}"
+    );
+    assert!(
+        rows(&pool, r.claim, r.rv_frame).await.is_empty(),
+        "a refused promotion writes no research_validity copy"
+    );
+    assert!(
+        rows(&pool, r.claim, r.hyp_frame)
+            .await
+            .iter()
+            .any(|row| row.id == source.id),
+        "a refused promotion leaves the source in place"
+    );
+    assert!(
+        !retracted(pool.clone(), source.id).await,
+        "the race's retraction rolled back with the refused promotion"
+    );
+    let promoted: Option<String> =
+        sqlx::query_scalar("SELECT properties->>'hypothesis_status' FROM claims WHERE id = $1")
+            .bind(r.claim)
+            .fetch_one(&pool)
+            .await
+            .expect("read the status");
+    assert_ne!(
+        promoted.as_deref(),
+        Some("promoted"),
+        "a refused promotion leaves the status unpromoted"
+    );
+
+    // CALIBRATION: without the race the same promotion lands, so the refusal
+    // above was the retracted row's.
+    for sql in [
+        "DROP TRIGGER k4a_s6_race ON claims",
+        "DROP FUNCTION k4a_s6_race()",
+    ] {
+        sqlx::query(sql).execute(&pool).await.expect(sql);
+    }
+    let (status, body) = promote(r.addr, agent, r.claim).await;
+    assert!(status.is_success(), "promote: {status} {body}");
+}
