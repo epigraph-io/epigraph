@@ -561,7 +561,7 @@ async fn a_non_owners_aggregate_writes_are_claim_owned_audited_and_leave_truth_a
             let class = MassFunctionRepository::update_claim_classification(
                 &mut *conn,
                 fresh,
-                "supported",
+                Some("supported"),
                 frame,
             )
             .await;
@@ -806,7 +806,7 @@ async fn a_non_owner_refreshes_the_claims_belief_frame_but_never_re_points_it(po
             let class_b = MassFunctionRepository::update_claim_classification(
                 &mut *conn,
                 claim,
-                "contradicted",
+                Some("contradicted"),
                 frame_b,
             )
             .await;
@@ -979,7 +979,7 @@ async fn a_frameless_legacy_cache_is_never_seeded_over_and_only_binary_truth_see
             let b = MassFunctionRepository::update_claim_classification(
                 &mut *conn,
                 legacy,
-                "contradicted",
+                Some("contradicted"),
                 bt,
             )
             .await;

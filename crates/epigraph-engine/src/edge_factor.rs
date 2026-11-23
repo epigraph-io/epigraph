@@ -626,7 +626,10 @@ pub async fn recompute_claim_belief_binary(
 /// own a public claim (migration 114, `epigraph_foreign_belief_cache`,
 /// reached through `MassFunctionRepository::update_claim_belief`): it may
 /// refresh the cache on the frame already recorded, or seed an empty cache on
-/// `binary_truth`; on any other frame its write is a no-op, not an error.
+/// `binary_truth`, or (migration 243, backlog 0296077b) move it off a recorded
+/// frame that holds no cache-admissible input onto the canonical frame the
+/// cache-owner rule elects; on any other frame its write is a no-op, not an
+/// error.
 ///
 /// Returns whether the claim's cache was WRITTEN (backlog 8d720490 (2)):
 /// `Ok(false)` when the claim has no BBAs on `frame_id`, when the derivation
@@ -1667,7 +1670,8 @@ const VACATED_CLASSIFICATION: &str = "not_enough_info";
 /// Write half of the combine pipeline: persist what [`compute_combined_belief`]
 /// computes to `claims.{belief, plausibility, pignistic_prob, conflict_k,
 /// missing_mass}` (and `classification`: on the binary frame, or on any
-/// frame when the cache is vacated under ruling R-80). No-ops (does not
+/// frame when the cache is vacated under ruling R-80; cleared to NULL when
+/// the cache is written on any other frame). No-ops (does not
 /// write) when the claim has no BBAs on `frame_id`, or none the scope rule
 /// admits and nothing to vacate.
 ///
@@ -1724,11 +1728,21 @@ async fn recompute_combined_belief(
 
     // The verdict belongs to the cache it describes: when the cache was not
     // written (a non-owner on a frame the claim's cache does not carry,
-    // migration 114), neither is its classification.
-    if let (true, Some(label)) = (written, preview.classification) {
-        MassFunctionRepository::update_claim_classification(&mut *conn, claim_id, &label, frame_id)
-            .await
-            .map_err(|e| format!("update_claim_classification: {e}"))?;
+    // migration 114), neither is its classification. When it was, the verdict
+    // is this fold's, and a fold with no verdict (any frame but the binary
+    // one, unless vacated) CLEARS the old label rather than leaving it: that
+    // label was the verdict on another frame's fold, e.g. a `binary_truth`
+    // fold of evidence since narrowed, and every reader of the claim is served
+    // it (backlog 0296077b).
+    if written {
+        MassFunctionRepository::update_claim_classification(
+            &mut *conn,
+            claim_id,
+            preview.classification.as_deref(),
+            frame_id,
+        )
+        .await
+        .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
 
     Ok(written)
@@ -2375,7 +2389,7 @@ async fn write_atom_cache(
         MassFunctionRepository::update_claim_classification(
             &mut *conn,
             claim_id,
-            &label.to_string(),
+            Some(&label.to_string()),
             binary,
         )
         .await
