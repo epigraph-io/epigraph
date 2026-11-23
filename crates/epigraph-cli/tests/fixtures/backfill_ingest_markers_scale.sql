@@ -77,8 +77,11 @@ SELECT r, rr, md5('bf-paper-' || rr)::uuid AS id,
        rr % 97 = 5 AS conflicted
   FROM fx_conf, generate_series(1, n_papers) r,
        LATERAL (SELECT ceil(r / s)::int AS rr) k;
-INSERT INTO papers (id, doi, title)
-SELECT id, '10.9999/scale-' || rr, 'Scale paper ' || rr FROM fx_paper;
+-- Public papers rows, declared like the claims below (migration 246 gives
+-- papers a required tenancy; with triggers off nothing would default it).
+INSERT INTO papers (id, doi, title, visibility, owner_group_id)
+SELECT p.id, '10.9999/scale-' || p.rr, 'Scale paper ' || p.rr, 'public', c.world
+  FROM fx_conf c, fx_paper p;
 
 CREATE TEMP TABLE fx_auth AS
 SELECT p.rr, p.id AS paper, j,
