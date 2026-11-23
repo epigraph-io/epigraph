@@ -672,3 +672,29 @@ test('with no usable lookup URL the lookup asks nothing', async () => {
   assert.equal(await N.lookupClaimLeaf(get, PREFIX, null, 'meaning', claim.id), null);
   assert.equal(asked, 0);
 });
+
+test('a cold claim lands under the theme the picked map names, or stops with the reason', async () => {
+  const [m] = leafMaps();
+  const { leaf, claim } = coldClaim(m);
+  const place = await N.lookupClaimLeaf(async () => leafBody(m, leaf, claim.id), PREFIX, m, 'meaning', claim.id);
+  const resolved = { id: leaf.theme_id };
+  const other = { id: '00000000-0000-4000-8000-0000000000aa' };
+  const loaded = new Map([[resolved.id, resolved], [other.id, other]]);
+  const byId = (id) => loaded.get(id);
+  // The route agrees with resolve: land under that theme.
+  assert.deepEqual(N.coldClaimHome(resolved, place, byId), { home: resolved });
+  // The picked map places the claim in another loaded theme: re-home there,
+  // never attach its chain under the theme resolve named.
+  const elsewhere = Object.assign({}, place, { theme_id: other.id });
+  assert.equal(N.coldClaimHome(resolved, elsewhere, byId).home, other);
+  // ... and when that theme is not loaded, stop with a notice, no home.
+  const unloaded = N.coldClaimHome(resolved, elsewhere, () => undefined);
+  assert.equal(unloaded.home, undefined);
+  assert.match(unloaded.notice, /not loaded yet/);
+  // The route's not-found answer (lookupClaimLeaf resolves null) stops, never throws.
+  const off = N.coldClaimHome(resolved, await N.lookupClaimLeaf(async () => {
+    throw notFound();
+  }, PREFIX, m, 'meaning', claim.id), byId);
+  assert.equal(off.home, undefined);
+  assert.match(off.notice, /not on the map you picked/);
+});

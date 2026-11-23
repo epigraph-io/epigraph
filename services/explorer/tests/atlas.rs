@@ -2722,13 +2722,19 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
         .find("if (!doc && !cfg.claimLeaf) {")
         .expect("a page without the lookup does not claim the claim is off the map");
     assert!(fetched < no_url && no_url < lookup);
+    // The theme to attach under is the tested NESTED.coldClaimHome decision
+    // (js-tests/atlas_nested.test.cjs): the picked map's place, not resolve.
+    let landing = nested
+        .find("NESTED.coldClaimHome(theme, place, ")
+        .expect("the route's answer picks the home theme");
+    assert!(nested[landing..].contains("home = landing.home;"));
     let leaf = nested
         .find("fetchLevel(place.level_id, 'leaf', NS.hierarchy)")
         .expect("the named leaf is fetched as a leaf");
     let chain = nested
         .rfind("attachChain(home, doc)")
         .expect("and attached with its breadcrumb chain");
-    assert!(lookup < leaf && leaf < chain);
+    assert!(lookup < landing && landing < leaf && leaf < chain);
     // Both entry points reach it: a #c- hash and a search pick resolve, then
     // hand a nested theme's claim to goToNestedClaim.
     let pick = &js[js.find("function pick(").expect("pick")..];

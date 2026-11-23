@@ -375,6 +375,23 @@
     return body;
   }
 
+  /**
+   * Which theme a cold claim link lands under, once the claim-to-leaf route
+   * has answered with `place` (null for its not-found answer). `theme` is the
+   * theme resolve named; `themeById(id)` is the page's loaded-theme lookup.
+   * Returns {home} to fetch place.level_id and attach it under `home`, or
+   * {notice} to stop at `theme` with that notice. The picked map, not
+   * resolve, decides the theme: a place in another loaded theme re-homes
+   * there, so its chain is never attached under the wrong theme.
+   */
+  function coldClaimHome(theme, place, themeById) {
+    if (!place) return { notice: 'That claim is not on the map you picked.' };
+    if (theme && place.theme_id === theme.id) return { home: theme };
+    const home = typeof themeById === 'function' ? themeById(place.theme_id) : null;
+    if (!home) return { notice: 'On the map you picked, that claim is in a theme that is not loaded yet.' };
+    return { home };
+  }
+
   /** The ids to fetch to attach a level under its theme: its ancestors, then itself. */
   function chainIds(doc) {
     const ids = (doc.breadcrumbs || []).map((b) => uuid(b.level_id)).filter(Boolean);
@@ -530,6 +547,7 @@
     claimLeafUrl,
     claimLeafProblem,
     lookupClaimLeaf,
+    coldClaimHome,
     MAPS_SCHEMA_VERSION,
     localPrefix,
     parseMaps,

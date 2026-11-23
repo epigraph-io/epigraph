@@ -2859,17 +2859,13 @@
         setNotice(e.message);
         return;
       }
-      if (!place) {
+      const landing = NESTED.coldClaimHome(theme, place, (id) => S.themesById.get(id));
+      if (!landing.home) {
         select(theme, true);
-        setNotice('That claim is not on the map you picked.');
+        setNotice(landing.notice);
         return;
       }
-      if (place.theme_id !== theme.id) home = S.themesById.get(place.theme_id) || null;
-      if (!home) {
-        select(theme, true);
-        setNotice('On the map you picked, that claim is in a theme that is not loaded yet.');
-        return;
-      }
+      home = landing.home;
       markWanted(place.level_id);
       try {
         doc = await fetchLevel(place.level_id, 'leaf', NS.hierarchy);
