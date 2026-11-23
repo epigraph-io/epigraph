@@ -43,15 +43,19 @@
 --                    kept an existing row's type);
 --         assessment typed `evidence`, `combination_method = 'discount'`
 --                    (the assess route's label);
---         evidence   typed `evidence`, or the row is an `auto_wire` row and
---                    its perspective's id is an evidence row's id. A row on an
---                    evidence-typed perspective with a label other than
---                    `auto_wire` (the DS auto-wire's) or `discount` is refused
---                    (A1 below);
+--         evidence   its perspective's id is an evidence row's id, or the
+--                    perspective is an evidence slot row and the label is
+--                    not `discount`. A row on an evidence slot with a label
+--                    other than `auto_wire` (the DS auto-wire's) or `discount`
+--                    (the REST route's) is refused (A1 below);
+--       a slot row is one a slot writer wrote: typed `edge` named
+--       `edge_factor`, or typed `evidence` named `evidence_grounded`. It
 --       refuses (A2) when a `community_members` row names a slot row (the
---       DELETE in (4) would cascade it away), and (A3) when a row it did not
---       classify is keyed on an edge's id or on a perspective named
---       `edge_factor` / `evidence_grounded` (the slot writers' names).
+--       DELETE in (4) would cascade it away), (A3) when a row it did not
+--       classify is keyed on an edge's id or on a slot row, (A4) when an edge
+--       names a slot row as a `perspective` endpoint (it would dangle), and
+--       (A5) when a perspective is typed `edge` / `evidence` under another
+--       name (a viewpoint: `create_perspective` never validated the type).
 --   (3) MOVES each classified row: `slot_kind`/`slot_id` = (kind, old
 --       `perspective_id`), `perspective_id` = NULL. The unique key is
 --       rebuilt around it: `mass_functions_unique_per_perspective` is dropped
@@ -60,8 +64,8 @@
 --       frame_id, source_agent_id, perspective_id, slot_kind, slot_id)` added,
 --       with `mass_functions_slot_shape` (kind and id together; a known kind;
 --       never both a slot and a perspective) and a partial index on the slot.
---   (4) DELETES the slot rows of `perspectives`: every row typed `edge` or
---       `evidence`, and every row (2) moved BBAs off, then adds
+--   (4) DELETES the slot rows of `perspectives` (with BBAs or none), and
+--       every row (2) moved BBAs off, then adds
 --       `perspectives_not_bba_slot CHECK (perspective_type IS NULL OR
 --       perspective_type NOT IN ('edge', 'evidence'))`.
 --   (5) RE-STATES three definers whose bodies keyed an edge's BBAs on
@@ -166,37 +170,75 @@ COMMENT ON COLUMN public.mass_functions.slot_id IS
 -- -------------------------------------------------------------------
 -- (2) CLASSIFY, FAIL CLOSED
 -- -------------------------------------------------------------------
+-- A slot row is one a slot writer wrote: typed `edge` and named `edge_factor`,
+-- or typed `evidence` and named `evidence_grounded` (the only names those
+-- writers used). `create_perspective` never validated `perspective_type`, so a
+-- typed row with any other name is a viewpoint somebody chose: A5 refuses it
+-- rather than delete it.
 CREATE TEMPORARY TABLE t267_slot ON COMMIT DROP AS
 SELECT mf.id AS mf_id,
        mf.perspective_id AS slot_id,
        CASE
            WHEN p.perspective_type = 'edge' OR mf.combination_method = 'edge_factor'
                THEN 'edge'
-           WHEN p.perspective_type = 'evidence' AND mf.combination_method = 'discount'
+           -- An evidence row's id names that row whatever the label (the REST
+           -- `/frames/:id/evidence` route could file a `discount` row on it);
+           -- an assessment slot id is blake3-derived and never an evidence id.
+           WHEN EXISTS (SELECT 1 FROM public.evidence v WHERE v.id = mf.perspective_id)
+               THEN 'evidence'
+           WHEN mf.combination_method = 'discount'
                THEN 'assessment'
            ELSE 'evidence'
        END AS kind,
        mf.combination_method AS method
   FROM public.mass_functions mf
   JOIN public.perspectives p ON p.id = mf.perspective_id
- WHERE p.perspective_type IN ('edge', 'evidence')
+ WHERE (p.perspective_type = 'edge' AND p.name = 'edge_factor')
+    OR (p.perspective_type = 'evidence' AND p.name = 'evidence_grounded')
     OR (mf.combination_method = 'edge_factor'
         AND EXISTS (SELECT 1 FROM public.edges e WHERE e.id = mf.perspective_id))
     OR (mf.combination_method = 'auto_wire'
         AND EXISTS (SELECT 1 FROM public.evidence v WHERE v.id = mf.perspective_id));
+
+-- Every `perspectives` row (4) deletes: the slot rows, BBAs or none, and every
+-- row (3) moves BBAs off.
+CREATE TEMPORARY TABLE t267_gone ON COMMIT DROP AS
+SELECT p.id
+  FROM public.perspectives p
+ WHERE (p.perspective_type = 'edge' AND p.name = 'edge_factor')
+    OR (p.perspective_type = 'evidence' AND p.name = 'evidence_grounded')
+UNION
+SELECT t.slot_id FROM t267_slot t;
 
 DO $$
 DECLARE
     v_bad    bigint;
     v_labels text;
     v_comm   bigint;
+    v_edges  bigint;
+    v_typed  bigint;
 BEGIN
-    -- (A1) an evidence slot carries the auto-wire's label; anything else is a
-    -- row no known writer produced, and it is not guessed at.
+    -- (A5) a perspective typed `edge` / `evidence` that no slot writer named:
+    -- a viewpoint with a reserved type, which 267 can neither keep (the CHECK
+    -- below) nor delete.
+    SELECT count(*) INTO v_typed
+      FROM public.perspectives p
+     WHERE p.perspective_type IN ('edge', 'evidence')
+       AND p.id NOT IN (SELECT g.id FROM t267_gone g);
+    IF v_typed > 0 THEN
+        RAISE EXCEPTION '267: % perspective(s) typed edge or evidence are not BBA slot rows '
+                        '(another name); 267 would have to delete them; nothing was changed',
+                        v_typed
+            USING ERRCODE = '55000',
+                  HINT = 'Retype those perspectives (README entry 267) before applying 267.';
+    END IF;
+    -- (A1) an evidence slot carries the auto-wire's or the REST route's label;
+    -- anything else is a row no known writer produced, and it is not guessed at.
     SELECT count(*), string_agg(DISTINCT COALESCE(t.method, '(NULL)'), ', ')
       INTO v_bad, v_labels
       FROM t267_slot t
-     WHERE t.kind = 'evidence' AND t.method IS DISTINCT FROM 'auto_wire';
+     WHERE t.kind = 'evidence' AND t.method IS DISTINCT FROM 'auto_wire'
+       AND t.method IS DISTINCT FROM 'discount';
     -- (A3) a row left on its perspective that still looks like a slot row.
     IF v_bad = 0 THEN
         SELECT count(*), string_agg(DISTINCT COALESCE(mf.combination_method, '(NULL)'), ', ')
@@ -205,6 +247,7 @@ BEGIN
           JOIN public.perspectives p ON p.id = mf.perspective_id
          WHERE NOT EXISTS (SELECT 1 FROM t267_slot t WHERE t.mf_id = mf.id)
            AND (p.name IN ('edge_factor', 'evidence_grounded')
+                OR p.id IN (SELECT g.id FROM t267_gone g)
                 OR EXISTS (SELECT 1 FROM public.edges e WHERE e.id = mf.perspective_id));
     END IF;
     IF v_bad > 0 THEN
@@ -218,13 +261,26 @@ BEGIN
     -- (A2) the DELETE below would cascade a community membership away.
     SELECT count(*) INTO v_comm
       FROM public.community_members cm
-      JOIN public.perspectives p ON p.id = cm.perspective_id
-     WHERE p.perspective_type IN ('edge', 'evidence')
-        OR p.id IN (SELECT t.slot_id FROM t267_slot t);
+     WHERE cm.perspective_id IN (SELECT g.id FROM t267_gone g);
     IF v_comm > 0 THEN
         RAISE EXCEPTION '267: % community membership(s) name a BBA slot perspective; deleting '
                         'the slot rows would remove them; nothing was changed', v_comm
             USING ERRCODE = '55000';
+    END IF;
+    -- (A4) an edge naming a slot row as a `perspective` endpoint (a past
+    -- `dekg migrate` wrote CONTRIBUTES_TO edges from every BBA's
+    -- perspective, slot ids included) would dangle: nothing deletes an edge
+    -- when its perspective goes.
+    SELECT count(*) INTO v_edges
+      FROM public.edges e
+     WHERE (e.source_type = 'perspective' AND e.source_id IN (SELECT g.id FROM t267_gone g))
+        OR (e.target_type = 'perspective' AND e.target_id IN (SELECT g.id FROM t267_gone g));
+    IF v_edges > 0 THEN
+        RAISE EXCEPTION '267: % edge(s) name a BBA slot perspective as an endpoint; deleting '
+                        'the slot rows would leave them dangling; nothing was changed', v_edges
+            USING ERRCODE = '55000',
+                  HINT = 'Decide those edges (README entry 267 lists the measuring query) '
+                         'before applying 267.';
     END IF;
 END $$;
 
@@ -258,8 +314,7 @@ CREATE INDEX idx_mass_functions_slot
 -- (4) THE SLOT ROWS OF `perspectives` GO, AND STAY GONE
 -- -------------------------------------------------------------------
 DELETE FROM public.perspectives p
- WHERE p.perspective_type IN ('edge', 'evidence')
-    OR p.id IN (SELECT t.slot_id FROM t267_slot t);
+ WHERE p.id IN (SELECT g.id FROM t267_gone g);
 
 DO $$
 DECLARE v_left bigint;

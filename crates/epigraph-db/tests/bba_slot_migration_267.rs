@@ -4,9 +4,9 @@
 //! `perspectives_not_bba_slot` keeps them gone. `docs/runbooks/267-undo.sql`
 //! takes it back out.
 //!
-//! A fresh database has no legacy rows, so these tests migrate to 235 (the
-//! last migration below 267 in this tree), seed the shapes the pre-267 writers
-//! left, then apply 267:
+//! A fresh database has no legacy rows, so these tests migrate to the last
+//! migration below 267 in the tree, seed the shapes the pre-267 writers left,
+//! then apply 267:
 //!
 //! * `legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go`: each
 //!   shape lands on the slot it names, a genuine perspective's BBA is left
@@ -17,8 +17,8 @@
 //!   restores the catalog below 267 exactly, puts the rows back on their
 //!   re-created perspectives, and is idempotent.
 //!
-//! On the code before 267 every test fails: `up_to(267)` is `up_to(235)`, so
-//! the slot columns the assertions read do not exist.
+//! On the code before 267 every test fails: there `up_to(267)` is the head
+//! below it, so the slot columns the assertions read do not exist.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -29,8 +29,17 @@ use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
-/// The last migration below 267 in this tree.
-const BELOW: i64 = 235;
+/// The last migration below 267 in this tree (computed, so a migration merged
+/// below 267 later is part of "below" for the undo's catalog comparison).
+fn below() -> i64 {
+    MIGRATOR
+        .migrations
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| *v < 267)
+        .max()
+        .expect("migrations below 267")
+}
 
 fn up_to(max: i64) -> sqlx::migrate::Migrator {
     sqlx::migrate::Migrator {
@@ -130,7 +139,7 @@ async fn frame(pool: &PgPool) -> Uuid {
     .expect("seed a frame")
 }
 
-/// Everything a legacy database at 235 can hold, by row.
+/// Everything a legacy database below 267 can hold, by row.
 struct Legacy {
     agent: Uuid,
     target: Uuid,
@@ -145,6 +154,7 @@ struct Legacy {
     legacy_edge_row: Uuid,
     ev1_row: Uuid,
     ev2_row: Uuid,
+    rest_row: Uuid,
     assess_row: Uuid,
     genuine_row: Uuid,
     unscoped_row: Uuid,
@@ -193,6 +203,10 @@ async fn seed_legacy(pool: &PgPool) -> Legacy {
     perspective(pool, ev2, "evidence_grounded", Some("evidence"), agent).await;
     let ev1_row = bba(pool, target, f, agent, Some(ev1), "auto_wire", Some(ev1)).await;
     let ev2_row = bba(pool, target, f, agent, Some(ev2), "auto_wire", Some(ev2)).await;
+    // A REST `/frames/:id/evidence` row another agent filed on ev1's slot
+    // perspective: a `discount` label, but its key is an evidence row's id.
+    let (other, _) = fixture::seed_agent_with_group(pool, "m267-rest").await;
+    let rest_row = bba(pool, target, f, other, Some(ev1), "discount", None).await;
     // The assess route's slot (typed `evidence`, `discount`).
     perspective(
         pool,
@@ -224,6 +238,7 @@ async fn seed_legacy(pool: &PgPool) -> Legacy {
         legacy_edge_row,
         ev1_row,
         ev2_row,
+        rest_row,
         assess_row,
         genuine_row,
         unscoped_row,
@@ -261,7 +276,7 @@ async fn perspective_ids(pool: &PgPool) -> BTreeSet<Uuid> {
 /// `perspective_type` alone leaves `legacy_edge_row` on its perspective.
 #[sqlx::test(migrations = false)]
 async fn legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let l = seed_legacy(&pool).await;
     migrate(&pool, &up_to(267)).await;
     assert!(has_slot_columns(&pool).await, "267 adds the slot columns");
@@ -274,6 +289,11 @@ async fn legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go(pool: 
     );
     assert_eq!(key_of(&pool, l.ev1_row).await, slot("evidence", l.ev1));
     assert_eq!(key_of(&pool, l.ev2_row).await, slot("evidence", l.ev2));
+    assert_eq!(
+        key_of(&pool, l.rest_row).await,
+        slot("evidence", l.ev1),
+        "an evidence row's id is an evidence slot whatever the label"
+    );
     assert_eq!(
         key_of(&pool, l.assess_row).await,
         slot("assessment", l.assess_slot)
@@ -323,7 +343,7 @@ async fn legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go(pool: 
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(on_target, 6, "no BBA was lost or added");
+    assert_eq!(on_target, 7, "no BBA was lost or added");
 }
 
 /// `267` refused: the error names it, and nothing changed (no slot column,
@@ -350,7 +370,7 @@ async fn assert_refused(pool: &PgPool, needle: &str) {
 /// stores is not guessed at.
 #[sqlx::test(migrations = false)]
 async fn an_unclassifiable_evidence_slot_row_refuses_267(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let l = seed_legacy(&pool).await;
     let f = frame(&pool).await;
     bba(&pool, l.target, f, l.agent, Some(l.ev1), "Dempster", None).await;
@@ -361,7 +381,7 @@ async fn an_unclassifiable_evidence_slot_row_refuses_267(pool: PgPool) {
 /// cascade away.
 #[sqlx::test(migrations = false)]
 async fn a_community_membership_of_a_slot_row_refuses_267(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let l = seed_legacy(&pool).await;
     let community: Uuid =
         sqlx::query_scalar("INSERT INTO communities (name) VALUES ('m267') RETURNING id")
@@ -381,7 +401,7 @@ async fn a_community_membership_of_a_slot_row_refuses_267(pool: PgPool) {
 /// edge's id with a label no edge writer stores).
 #[sqlx::test(migrations = false)]
 async fn a_slot_shaped_row_267_would_leave_behind_refuses_267(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let l = seed_legacy(&pool).await;
     let f = frame(&pool).await;
     bba(
@@ -397,10 +417,38 @@ async fn a_slot_shaped_row_267_would_leave_behind_refuses_267(pool: PgPool) {
     assert_refused(&pool, "cannot be classified").await;
 }
 
+/// A4: an edge naming a slot row as a `perspective` endpoint (what a past
+/// `dekg migrate` wrote from every BBA's perspective) would dangle.
+#[sqlx::test(migrations = false)]
+async fn an_edge_from_a_slot_row_refuses_267(pool: PgPool) {
+    migrate(&pool, &up_to(below())).await;
+    let l = seed_legacy(&pool).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'perspective', $2, 'claim', 'CONTRIBUTES_TO')",
+    )
+    .bind(l.edge)
+    .bind(l.target)
+    .execute(&pool)
+    .await
+    .expect("seed a CONTRIBUTES_TO edge from the edge's slot row");
+    assert_refused(&pool, "name a BBA slot perspective as an endpoint").await;
+}
+
+/// A5: a viewpoint somebody typed `edge` (`create_perspective` never checked
+/// the type) is neither kept nor deleted.
+#[sqlx::test(migrations = false)]
+async fn a_viewpoint_typed_edge_refuses_267(pool: PgPool) {
+    migrate(&pool, &up_to(below())).await;
+    let l = seed_legacy(&pool).await;
+    perspective(&pool, Uuid::new_v4(), "my edge lens", Some("edge"), l.agent).await;
+    assert_refused(&pool, "are not BBA slot rows").await;
+}
+
 /// The body precondition: a re-bodied definer refuses 267.
 #[sqlx::test(migrations = false)]
 async fn a_re_bodied_definer_refuses_267(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let src: String = sqlx::query_scalar(
         "SELECT pg_get_functiondef('public.epigraph_cascade_delete_edge_bbas(uuid[], text)'\
          ::regprocedure)",
@@ -471,7 +519,7 @@ async fn catalog(pool: &PgPool) -> BTreeSet<String> {
 /// unique key under another definition, shows in the catalog diff.
 #[sqlx::test(migrations = false)]
 async fn the_267_undo_returns_the_catalog_and_the_rows_below_267(pool: PgPool) {
-    migrate(&pool, &up_to(BELOW)).await;
+    migrate(&pool, &up_to(below())).await;
     let before = catalog(&pool).await;
     let l = seed_legacy(&pool).await;
     migrate(&pool, &up_to(267)).await;
@@ -507,6 +555,7 @@ async fn the_267_undo_returns_the_catalog_and_the_rows_below_267(pool: PgPool) {
         l.legacy_edge_row,
         l.ev1_row,
         l.ev2_row,
+        l.rest_row,
         l.assess_row,
         l.genuine_row,
     ])
@@ -522,6 +571,7 @@ async fn the_267_undo_returns_the_catalog_and_the_rows_below_267(pool: PgPool) {
         ),
         (l.ev1_row, Some(l.ev1), Some("evidence".to_string())),
         (l.ev2_row, Some(l.ev2), Some("evidence".to_string())),
+        (l.rest_row, Some(l.ev1), Some("evidence".to_string())),
         (
             l.assess_row,
             Some(l.assess_slot),
