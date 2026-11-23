@@ -3403,6 +3403,23 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **268**: public `agent_prompt_history_meta` (backlog bedd59b7, 24a9f4fa). Adds the
+  SECURITY DEFINER `epigraph_agent_prompt_history_meta(agent, after_depth, after_agent,
+  after_first_seen, after_snapshot, limit)`: 161's prompt-history gate (its admin assignment
+  token for token, AID06 for a refused caller) and walk, returning 161's rows WITHOUT the four
+  file-content columns (each file by its key only; `agent_prompt_blobs` is never read) plus the
+  whole walk's `lineage_min_depth` / `lineage_max_depth`, one keyset page at a time in the order
+  `(abs(depth), depth, agent_id, first_seen, snapshot_id)` (limit NULL/below 1 = 100, clamped
+  to 1000; a half position is 22023). Owned by `epigraph_maintenance` on 172's
+  `pg_catalog, pg_temp` path, EXECUTE granted to `epigraph_app` and `epigraph_maintenance`
+  (guarded). GET /api/v1/agents/:id/prompt-history lists through it with `?limit=` /
+  `?after=` and a per-page byte budget, answering `truncated` and `next_cursor`; the blob
+  route still reads one file through 161. Pinned by
+  `epigraph-db/tests/prompt_history_meta_definer.rs` (catalog shape and content-free result,
+  the listing with the owner's blob SELECT revoked, gate text and caller parity with 161,
+  paging at every page size) and `epigraph-api/tests/agent_prompt_history_route.rs`. Undo:
+  `docs/runbooks/268-undo.sql`. **Deploy order:** migrate BEFORE the binary that lists
+  through it (without it every listing is a 500, 42883); an older binary ignores it.
 
 ## `-- no-transaction` migrations
 

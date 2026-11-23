@@ -1754,6 +1754,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_identity.rs",
+        "prompt_history_page",
+        "READ through migration 268's `epigraph_agent_prompt_history_meta` SECURITY DEFINER \
+         function: 161's gate on the SESSION principal (operator or admin, else AID06) and 161's \
+         walk and per-member `readable` mark, returning only keys and metadata (it never reads \
+         agent_prompt_blobs), one keyset page at a time; it reads strictly less than \
+         `prompt_history` and a Viewer splice has no tenancy column to act on.",
+    ),
+    (
+        "agent_identity.rs",
         "prompt_history_blob",
         "READ through the same migration 161 `epigraph_agent_prompt_history` SECURITY DEFINER \
          function as `prompt_history`, with the same gate on the SESSION principal (operator or \

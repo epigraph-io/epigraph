@@ -25,6 +25,11 @@
 //!   history names. A server's memory then grows with the number of snapshots
 //!   and with one file, not with the sum of every file. (The definer itself
 //!   still builds its whole result, content included, inside the database.)
+//! * [`AgentIdentityRepository::prompt_history_page`] reads migration 268's
+//!   content-free definer `epigraph_agent_prompt_history_meta` (161's gate and
+//!   walk, hashes and metadata only, never `agent_prompt_blobs`), one keyset
+//!   page at a time, so no file content is built or crosses the connection
+//!   and a page is bounded in rows.
 
 use std::borrow::Cow;
 
@@ -199,7 +204,7 @@ pub struct PromptSnapshotIndex {
     pub last_seen: DateTime<Utc>,
 }
 
-/// One row of [`AgentIdentityRepository::prompt_history_index`]: as
+/// One row of [`AgentIdentityRepository::prompt_history_page`]: as
 /// [`PromptHistoryEntry`], with the snapshot named by hash only.
 #[derive(Debug, Clone)]
 pub struct PromptHistoryIndexEntry {
@@ -213,6 +218,84 @@ pub struct PromptHistoryIndexEntry {
     pub readable: bool,
     /// None when unreadable, or when the agent has no snapshot.
     pub snapshot: Option<PromptSnapshotIndex>,
+}
+
+impl PromptHistoryIndexEntry {
+    /// The page position just after this row: pass it back as the `after` of
+    /// [`AgentIdentityRepository::prompt_history_page`] for the next page.
+    #[must_use]
+    pub fn cursor(&self) -> PromptHistoryCursor {
+        PromptHistoryCursor {
+            depth: self.depth,
+            agent_id: self.agent_id,
+            snapshot: self.snapshot.as_ref().map(|s| (s.first_seen, s.id)),
+        }
+    }
+}
+
+/// The largest page migration 268's definer returns (its `LEAST(p_limit,
+/// 1000)`); a larger `limit` is clamped to it.
+pub const PROMPT_HISTORY_PAGE_MAX: u32 = 1000;
+
+/// A position in an agent's prompt history: the key of the last row of a page,
+/// in migration 268's order `(abs(depth), depth, agent_id, first_seen,
+/// snapshot_id)`. A row with no snapshot has no `snapshot` part.
+///
+/// A position only: every page re-runs the definer's gate and walk, so a
+/// forged cursor reads nothing the caller could not read from the first page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptHistoryCursor {
+    pub depth: i32,
+    pub agent_id: Uuid,
+    /// The row's snapshot `(first_seen, id)`, if it has one.
+    pub snapshot: Option<(DateTime<Utc>, Uuid)>,
+}
+
+impl PromptHistoryCursor {
+    /// `depth_agent` or `depth_agent_firstseenmicros_snapshot`, uuids in
+    /// simple (unhyphenated) form.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let head = format!("{}_{}", self.depth, self.agent_id.simple());
+        match self.snapshot {
+            None => head,
+            Some((at, id)) => format!("{head}_{}_{}", at.timestamp_micros(), id.simple()),
+        }
+    }
+
+    /// The inverse of [`Self::encode`]; `None` for anything it did not write.
+    #[must_use]
+    pub fn decode(raw: &str) -> Option<Self> {
+        let parts: Vec<&str> = raw.split('_').collect();
+        let (depth, agent) = match parts.as_slice() {
+            [d, a] | [d, a, _, _] => (d.parse::<i32>().ok()?, Uuid::try_parse(a).ok()?),
+            _ => return None,
+        };
+        let snapshot = match parts.as_slice() {
+            [_, _, at, id] => Some((
+                DateTime::from_timestamp_micros(at.parse::<i64>().ok()?)?,
+                Uuid::try_parse(id).ok()?,
+            )),
+            _ => None,
+        };
+        Some(Self {
+            depth,
+            agent_id: agent,
+            snapshot,
+        })
+    }
+}
+
+/// One page of [`AgentIdentityRepository::prompt_history_page`].
+#[derive(Debug, Clone)]
+pub struct PromptHistoryPage {
+    /// The page's rows, in the definer's order.
+    pub rows: Vec<PromptHistoryIndexEntry>,
+    /// The farthest ancestor depth of the WHOLE walk (0 when it found none),
+    /// whatever page this is; `None` only for an empty page.
+    pub lineage_min_depth: Option<i32>,
+    /// The farthest descendant depth of the whole walk, likewise.
+    pub lineage_max_depth: Option<i32>,
 }
 
 /// The outcome of [`AgentIdentityRepository::prompt_history_blob`].
@@ -248,6 +331,8 @@ struct IndexRow {
     global_claude_md_hash: Option<Vec<u8>>,
     group_claude_md_hash: Option<Vec<u8>>,
     learned_md_hash: Option<Vec<u8>>,
+    lineage_min_depth: i32,
+    lineage_max_depth: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -416,6 +501,58 @@ impl AgentIdentityRepository {
         .fetch_all(&mut *conn)
         .await?;
         rows.into_iter().map(index_entry).collect()
+    }
+
+    /// One page of [`Self::prompt_history`] without any file content, through
+    /// migration 268's `epigraph_agent_prompt_history_meta`: 161's gate (the
+    /// connection must be stamped with the caller's principal) and walk, the
+    /// same rows, each file named by its key only. The definer never reads
+    /// `agent_prompt_blobs`, so no blob is built or crosses the connection.
+    ///
+    /// `after` is the [`PromptHistoryIndexEntry::cursor`] of the previous
+    /// page's last row (`None` for the first page); at most `limit` rows come
+    /// back (clamped to `[1, PROMPT_HISTORY_PAGE_MAX]`). Ask for one row more
+    /// than you show to learn whether a next page exists.
+    ///
+    /// # Errors
+    /// As [`Self::prompt_history`]: `AID06` ([`PROMPT_HISTORY_REFUSED`]) for
+    /// a caller who is neither the operator nor an admin; and
+    /// [`DbError::InvalidData`] for a stored key that is not 32 bytes (the
+    /// blob table's CHECK makes that unreachable).
+    pub async fn prompt_history_page(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        after: Option<&PromptHistoryCursor>,
+        limit: u32,
+    ) -> Result<PromptHistoryPage, DbError> {
+        let limit = i32::try_from(limit.clamp(1, PROMPT_HISTORY_PAGE_MAX))
+            .expect("PROMPT_HISTORY_PAGE_MAX fits an i32");
+        let rows = sqlx::query_as::<_, IndexRow>(
+            "SELECT agent_id, relation, depth, readable, snapshot_id, group_folder, model, \
+                    prompt_hash, in_prompt, blob_refused, runner_version, host_sha, first_seen, \
+                    last_seen, identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
+                    learned_md_hash, lineage_min_depth, lineage_max_depth \
+               FROM public.epigraph_agent_prompt_history_meta($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(agent_id)
+        .bind(after.map(|c| c.depth))
+        .bind(after.map(|c| c.agent_id))
+        .bind(after.and_then(|c| c.snapshot.map(|(at, _)| at)))
+        .bind(after.and_then(|c| c.snapshot.map(|(_, id)| id)))
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+        let extent = rows
+            .first()
+            .map(|r| (r.lineage_min_depth, r.lineage_max_depth));
+        Ok(PromptHistoryPage {
+            rows: rows
+                .into_iter()
+                .map(index_entry)
+                .collect::<Result<_, _>>()?,
+            lineage_min_depth: extent.map(|e| e.0),
+            lineage_max_depth: extent.map(|e| e.1),
+        })
     }
 
     /// One file of an agent's prompt history, by key: fetched only when a
@@ -714,5 +851,45 @@ mod tests {
         let at = corrupt.len() / 2;
         corrupt[at] ^= 0x01;
         verified_blob("learned_md", Some(key), Some(corrupt)).expect_err("corrupted frame");
+    }
+
+    /// A cursor survives its own encoding, with and without a snapshot part,
+    /// at a negative depth, at microsecond precision; anything else is
+    /// refused rather than read as some other position.
+    #[test]
+    fn a_cursor_round_trips_and_a_malformed_one_is_refused() {
+        let at = DateTime::from_timestamp_micros(1_790_000_000_123_456).expect("instant");
+        for c in [
+            PromptHistoryCursor {
+                depth: -64,
+                agent_id: Uuid::new_v4(),
+                snapshot: Some((at, Uuid::new_v4())),
+            },
+            PromptHistoryCursor {
+                depth: 3,
+                agent_id: Uuid::new_v4(),
+                snapshot: None,
+            },
+        ] {
+            assert_eq!(PromptHistoryCursor::decode(&c.encode()), Some(c));
+        }
+        let good = PromptHistoryCursor {
+            depth: 1,
+            agent_id: Uuid::nil(),
+            snapshot: Some((at, Uuid::nil())),
+        }
+        .encode();
+        assert!(PromptHistoryCursor::decode(&good).is_some(), "CALIBRATION");
+        for bad in [
+            "",
+            "1",
+            "x_00000000000000000000000000000000",
+            "1_not-a-uuid",
+            &format!("{good}_extra"),
+            "1_00000000000000000000000000000000_123",
+            "1_00000000000000000000000000000000_nan_00000000000000000000000000000000",
+        ] {
+            assert_eq!(PromptHistoryCursor::decode(bad), None, "{bad:?}");
+        }
     }
 }

@@ -93,8 +93,8 @@ pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
-    PromptBlobRead, PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot,
-    PromptSnapshotIndex,
+    PromptBlobRead, PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
+    PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
 };
 pub use repos::{
     agent_lookup, authored_by, AgentAuthorship, AgentCard, AgentKind, AgentLookupRepository,
