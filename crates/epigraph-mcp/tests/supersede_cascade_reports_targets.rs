@@ -448,13 +448,32 @@ async fn a_refused_downstream_target_fails_alone_on_the_stamped_cascade(pool: Pg
         1,
         "D's stale BBA must be ROLLED BACK with its refused savepoint, not lost: {cascade}"
     );
+    // D's refusal is reported by the step and the edge it ran on; the
+    // database's text ("injected: ...") stays in the server log and the
+    // agent-less audit row, never in the caller's 2xx (backlog f9acb220).
+    let onto_d: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM edges WHERE target_id = $1")
+        .bind(d)
+        .fetch_all(&pool)
+        .await
+        .expect("the edges onto D");
+    let errors: Vec<&str> = cascade["errors"]
+        .as_array()
+        .expect("errors")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
     assert!(
-        cascade["errors"]
-            .as_array()
-            .expect("errors")
-            .iter()
-            .any(|e| e.as_str().is_some_and(|s| s.contains("injected"))),
-        "D's refusal must be reported: {cascade}"
+        errors.iter().any(|e| {
+            std::iter::once(&d)
+                .chain(&onto_d)
+                .any(|id| e.contains(&id.to_string()))
+                && e.ends_with(": failed; the details are in the audit row")
+        }),
+        "D's refusal must be reported, naming D or the edge it failed on: {cascade}"
+    );
+    assert!(
+        errors.iter().all(|e| !e.contains("injected")),
+        "the database's error text must not reach the caller: {cascade}"
     );
 }
 

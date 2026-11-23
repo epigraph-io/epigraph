@@ -374,6 +374,28 @@ struct ErrorResponse {
     details: Option<serde_json::Value>,
 }
 
+impl ApiError {
+    /// The text a CALLER may read for this error: exactly the top-level
+    /// `message` of its rendered response body.
+    ///
+    /// `Display` (`to_string()`) renders the carried message, which for
+    /// [`ApiError::InternalError`] and [`ApiError::DatabaseError`] is the
+    /// server-side detail, often with a driver error interpolated. A route that
+    /// puts an error's text into a SUCCESS body (a per-item result in a batch
+    /// answered 200) must take it from here, never from `to_string()`, or the
+    /// detail the 500 body withholds reaches the caller through the 200
+    /// (backlog f9acb220). The redacted variants answer their fixed literals;
+    /// every other variant's text is designed for the caller and is unchanged.
+    #[must_use]
+    pub fn caller_message(&self) -> String {
+        match self {
+            ApiError::InternalError { .. } => format!("Internal error: {INTERNAL_ERROR_BODY}"),
+            ApiError::DatabaseError { .. } => format!("Database error: {DATABASE_ERROR_BODY}"),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // The MOVED contract (operator decision D9) has its own body, keyed for
@@ -575,13 +597,7 @@ impl IntoResponse for ApiError {
                 | ApiError::SignatureError { .. }
         );
 
-        // `Display` renders the carried message, so the redacted variants'
-        // top-level `message` is built from the literal, not from `self`.
-        let message = match &self {
-            ApiError::InternalError { .. } => format!("Internal error: {INTERNAL_ERROR_BODY}"),
-            ApiError::DatabaseError { .. } => format!("Database error: {DATABASE_ERROR_BODY}"),
-            other => other.to_string(),
-        };
+        let message = self.caller_message();
         let body = ErrorResponse {
             error: error_type.to_string(),
             message,
@@ -1174,6 +1190,48 @@ mod tests {
                 v["message"].as_str().is_some_and(|m| !m.is_empty()),
                 "{kind}: the body still says something: {body}"
             );
+        }
+    }
+
+    /// `caller_message` is the text a per-item result in a 200 may carry
+    /// (backlog f9acb220), so it must be what the rendered body's top-level
+    /// `message` says, for a redacted variant and a designed one alike, and
+    /// never the server-side detail a redacted variant was built with.
+    #[tokio::test]
+    async fn caller_message_is_the_rendered_message_and_withholds_the_detail() {
+        let canary = "relation canary_7f3a_internal does not exist";
+        for error in [
+            ApiError::InternalError {
+                message: format!("query failed: {canary}"),
+            },
+            ApiError::DatabaseError {
+                message: format!("Failed to commit transaction: {canary}"),
+            },
+            ApiError::BadRequest {
+                message: "content must not be empty".to_string(),
+            },
+            ApiError::Forbidden {
+                reason: "no write authority".to_string(),
+            },
+        ] {
+            let said = error.caller_message();
+            let redacted = matches!(
+                error,
+                ApiError::InternalError { .. } | ApiError::DatabaseError { .. }
+            );
+            let (_status, body) = rendered(error).await;
+            let v: serde_json::Value = serde_json::from_str(&body).expect("a JSON body");
+            assert_eq!(
+                v["message"].as_str(),
+                Some(said.as_str()),
+                "caller_message drifted from the rendered message: {body}"
+            );
+            if redacted {
+                assert!(
+                    !said.contains("canary_7f3a"),
+                    "caller_message carries the server-side detail: {said}"
+                );
+            }
         }
     }
 
