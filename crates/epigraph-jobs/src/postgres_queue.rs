@@ -76,6 +76,29 @@ pub struct ReapedJob {
     pub one_attempt: bool,
 }
 
+/// A privatization plan left in a RUNNING state (`applying` or `reverting`)
+/// with no `pending` or `running` apply or revert job naming it, found by
+/// [`PostgresJobQueue::stranded_privatization_plans`] (backlog e8c8dd03).
+///
+/// Nothing will move such a plan: its job ended (failed by the reaper after
+/// its crash re-deliveries, failed by its handler, or cancelled) without the
+/// plan reaching `applied`, `reverted` or `failed`. Its claims may be partly
+/// moved. Recovery is the operator's: abort the plan, then revert it (see
+/// `docs/tenancy.md`, "A plan stranded in `applying` or `reverting`").
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StrandedPlan {
+    /// The plan.
+    pub plan_id: Uuid,
+    /// `applying` or `reverting`.
+    pub state: String,
+    /// The newest apply or revert job naming the plan, if any.
+    pub last_job_id: Option<Uuid>,
+    /// That job's state (`failed`, `cancelled`, or `completed`).
+    pub last_job_state: Option<String>,
+    /// That job's `error_message`.
+    pub last_job_error: Option<String>,
+}
+
 // ============================================================================
 // PostgreSQL Job Queue
 // ============================================================================
@@ -871,6 +894,70 @@ impl PostgresJobQueue {
             message: format!("Failed to count pending jobs of unregistered types: {e}"),
         })?;
         Ok(rows.into_iter().collect())
+    }
+
+    /// Every privatization plan in `applying` or `reverting` that no `pending`
+    /// or `running` apply or revert job names: a [`StrandedPlan`] (backlog
+    /// e8c8dd03), ordered by plan id. One read; it writes nothing.
+    ///
+    /// The apply and revert jobs are one-attempt rows, so once the reaper
+    /// fails one after [`MAX_CRASH_REDELIVERIES`] crash re-deliveries, or its
+    /// handler fails on a fault that is not a refusal (a refusal sets the plan
+    /// `failed` itself), the plan keeps its running state with nothing left to
+    /// finish it. The dispatch writes the state flip and the job in one
+    /// transaction, so a plan in a running state with no live job is never a
+    /// dispatch in progress.
+    ///
+    /// A job names its plan in its payload (`EpiGraphJob`'s externally tagged
+    /// `{"PrivatizationApply": {"plan_id": …}}` or `PrivatizationRevert`);
+    /// the reseal job is keyed on a group and cannot strand a plan.
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error.
+    #[instrument(skip(self))]
+    pub async fn stranded_privatization_plans(&self) -> Result<Vec<StrandedPlan>, JobError> {
+        /// `(plan id, plan state, last job id, its state, its error)`.
+        type Row = (Uuid, String, Option<Uuid>, Option<String>, Option<String>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "WITH named AS ( \
+                    SELECT j.id, j.state, j.error_message, j.created_at, \
+                           COALESCE(j.payload -> 'PrivatizationApply' ->> 'plan_id', \
+                                    j.payload -> 'PrivatizationRevert' ->> 'plan_id') AS plan_id \
+                      FROM jobs j \
+                     WHERE j.job_type IN ($1, $2) \
+                 ) \
+                 SELECT p.id, p.state::text, last.id, last.state, last.error_message \
+                   FROM privatization_plans p \
+                   LEFT JOIN LATERAL ( \
+                        SELECT n.id, n.state, n.error_message FROM named n \
+                         WHERE n.plan_id = p.id::text \
+                         ORDER BY n.created_at DESC, n.id DESC LIMIT 1 \
+                   ) last ON true \
+                  WHERE p.state IN ('applying', 'reverting') \
+                    AND NOT EXISTS (SELECT 1 FROM named n \
+                                     WHERE n.plan_id = p.id::text \
+                                       AND n.state IN ('pending', 'running')) \
+                  ORDER BY p.id",
+        )
+        .bind(crate::privatization::APPLY_JOB_TYPE)
+        .bind(crate::privatization::REVERT_JOB_TYPE)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to read stranded privatization plans: {e}"),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(plan_id, state, last_job_id, last_job_state, last_job_error)| StrandedPlan {
+                    plan_id,
+                    state,
+                    last_job_id,
+                    last_job_state,
+                    last_job_error,
+                },
+            )
+            .collect())
     }
 
     /// Set every `pending` job whose type is in `job_types` to `cancelled`,

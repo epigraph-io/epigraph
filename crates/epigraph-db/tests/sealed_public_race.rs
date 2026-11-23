@@ -61,6 +61,12 @@
 //! [`the_227_undo_returns_the_catalog_below_227`]: the undo runbook restores
 //! 176's body (whole definition by md5) and is idempotent.
 //!
+//! [`a_multi_claim_seal_and_publicize_in_opposite_orders_do_not_deadlock`]
+//! (backlog d1818fd0): the real `seal_claims_conn`, handed its items in
+//! DESCENDING id order, beside 206's shipped publicize of the same two claims
+//! (which locks in ascending id order). Both finish; the publicize answers
+//! `refused_sealed` for both.
+//!
 //! # Verified to fail
 //!
 //! - `FOR NO KEY UPDATE OF c` removed from 227's locked read: the 227 halves
@@ -71,6 +77,9 @@
 //!   with `deadlock detected`.
 //! - The `IF NOT FOUND` fallback removed: the hidden-row test fails (the seal
 //!   of the public claim is admitted).
+//! - `seal_claims_conn`'s sort of its items and its `ORDER BY t.claim_id`
+//!   removed (the code before d1818fd0): the opposite-order test fails, one
+//!   side aborted with `deadlock detected`.
 //!
 //! Uses the non-macro `sqlx::query` forms so the offline `.sqlx/` cache is
 //! not extended.
@@ -802,4 +811,434 @@ async fn the_227_undo_returns_the_catalog_below_227(pool: PgPool) {
             "after the {run} run the catalog is exactly the one below 227"
         );
     }
+}
+
+// ===========================================================================
+// Lock order of the multi-claim privatization writes (backlog d1818fd0)
+// ===========================================================================
+
+/// Poll `pg_stat_activity` until backend `pid` waits on a lock, or `task`
+/// has finished, bounded at ten seconds. `true` when the wait was seen.
+async fn seen_waiting<T>(pool: &PgPool, pid: i32, task: &tokio::task::JoinHandle<T>) -> bool {
+    for _ in 0..500 {
+        if task.is_finished() {
+            return false;
+        }
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                             WHERE pid = $1 AND wait_event_type = 'Lock')",
+        )
+        .bind(pid)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if blocked {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// A fresh non-superuser, non-BYPASSRLS member of `epigraph_maintenance`, the
+/// shape of a deployed maintenance login, with the DELETE grant such a login
+/// needs for the seal's derived-extraction DELETEs (as in
+/// `sealed_row_encryption_write_scope.rs`).
+async fn maintenance_member(pool: &PgPool) -> String {
+    let role = format!("d1818fd0_maint_{}", Uuid::new_v4().simple());
+    for stmt in [
+        format!("CREATE ROLE {role} NOLOGIN"),
+        format!("GRANT {MAINTENANCE} TO {role}"),
+        format!("GRANT DELETE ON ALL TABLES IN SCHEMA public TO {role}"),
+    ] {
+        sqlx::query(&stmt)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{stmt}: {e}"));
+    }
+    role
+}
+
+/// Two claims of `group`, `(lo, hi)` by id, with `hi` stored BEFORE `lo` in
+/// the heap, so a sequential or bitmap scan meets `hi` first, as an unnest of
+/// `[hi, lo]` does. Seeds until two consecutive claims come out in descending
+/// id order (the spares are harmless).
+async fn descending_pair(pool: &PgPool, author: Uuid, group: Uuid) -> (Uuid, Uuid) {
+    let mut prev = viewer_fixture::seed_group_claim(pool, author, group, "pair 0").await;
+    for n in 1..32 {
+        let next =
+            viewer_fixture::seed_group_claim(pool, author, group, &format!("pair {n}")).await;
+        if prev > next {
+            return (next, prev);
+        }
+        prev = next;
+    }
+    panic!("no descending pair in 32 seeded claims");
+}
+
+fn seal_item(claim_id: Uuid) -> epigraph_db::repos::privatization::SealCommitItem {
+    epigraph_db::repos::privatization::SealCommitItem {
+        claim_id,
+        content_ct: vec![0xAA; 48],
+        labels_ct: vec![0xAB; 48],
+        properties_ct: vec![0xAC; 48],
+        content_hash: vec![0x11; 32],
+        versions: Vec::new(),
+        evidence: Vec::new(),
+    }
+}
+
+fn unseal_item(claim_id: Uuid) -> epigraph_db::repos::privatization::UnsealCommitItem {
+    epigraph_db::repos::privatization::UnsealCommitItem {
+        claim_id,
+        content: format!("restored {claim_id}"),
+        content_hash: vec![0x22; 32],
+        labels: Vec::new(),
+        properties: serde_json::json!({}),
+        versions: Vec::new(),
+        evidence: Vec::new(),
+    }
+}
+
+/// The multi-claim privatization write under test, each handed its claims in
+/// DESCENDING id order `[hi, lo]`.
+enum Act {
+    /// `seal_claims_conn` under `group`.
+    Seal { group: Uuid },
+    /// `unseal_claims_conn` under `group`.
+    Unseal { group: Uuid },
+    /// `restrict_claims_conn` into `target`.
+    Restrict { target: Uuid },
+    /// `restore_claims_conn` of `plan`'s items out of `target`.
+    Restore { plan: Uuid, target: Uuid },
+}
+
+impl Act {
+    /// Run in `conn`'s open transaction. `Ok` carries the ids the act
+    /// reported (the restore reports a count; its ids are not returned).
+    async fn run(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        lo: Uuid,
+        hi: Uuid,
+    ) -> Result<Vec<Uuid>, epigraph_db::DbError> {
+        use epigraph_db::repos::privatization::PrivatizationRepository as R;
+        match *self {
+            Act::Seal { group } => {
+                R::seal_claims_conn(conn, group, 0, &[seal_item(hi), seal_item(lo)]).await
+            }
+            Act::Unseal { group } => {
+                R::unseal_claims_conn(conn, group, &[unseal_item(hi), unseal_item(lo)]).await
+            }
+            Act::Restrict { target } => R::restrict_claims_conn(conn, &[hi, lo], target).await,
+            Act::Restore { plan, target } => R::restore_claims_conn(conn, plan, &[hi, lo], target)
+                .await
+                .map(|n| vec![Uuid::nil(); usize::try_from(n).unwrap_or(0)]),
+        }
+    }
+}
+
+/// What the race left: the act's result and the publicize's per-claim
+/// outcomes, each `Err` carrying the error text.
+struct Race {
+    act: Result<Vec<Uuid>, String>,
+    publicize: Result<Vec<(Uuid, String)>, String>,
+}
+
+/// Force the interleaving in which a caller-order lock deadlocks against
+/// 206's id-order publicize, and return what both sides did.
+///
+/// A holder session takes `hi`'s row lock (`FOR NO KEY UPDATE`, the mode
+/// both sides take). The act starts, handed `[hi, lo]`, on a fresh
+/// maintenance member, and is seen waiting. 206's `epigraph_publicize_claims`
+/// of `[lo, hi]` starts as `epigraph_app` with `publicizer`'s session GUCs
+/// over `readable`, and is seen waiting. The holder rolls back.
+///
+/// An act that locks in its caller's order waited on `hi` holding nothing
+/// while the publicize took `lo` and queued on `hi`; released, the act takes
+/// `hi` and waits on `lo`: `deadlock detected` (40P01), one side aborted. An
+/// act that locks in id order took `lo` before waiting on `hi`, so the
+/// publicize queued behind it and runs after it commits. `lock_timeout` is
+/// 30 s on both sides, far above `deadlock_timeout`, so a 55P03 cannot stand
+/// in for the deadlock.
+async fn opposite_order_race(
+    pool: &PgPool,
+    act: Act,
+    (lo, hi): (Uuid, Uuid),
+    publicizer: Uuid,
+    readable: Uuid,
+) -> Race {
+    let role = maintenance_member(pool).await;
+
+    let mut holder = pool.acquire().await.expect("acquire the holder");
+    holder.execute("BEGIN").await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(hi)
+        .execute(&mut *holder)
+        .await
+        .expect("the holder locks the higher claim");
+
+    let mut actor = pool.acquire().await.expect("acquire the act's session");
+    actor
+        .execute(format!("SET SESSION AUTHORIZATION {role}").as_str())
+        .await
+        .expect("the act's role");
+    let act_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *actor)
+        .await
+        .expect("the act's pid");
+    let act_task = tokio::spawn(async move {
+        let run = async {
+            let mut tx = sqlx::Connection::begin(&mut *actor).await?;
+            sqlx::query("SET LOCAL lock_timeout = '30s'")
+                .execute(&mut *tx)
+                .await?;
+            match act.run(&mut tx, lo, hi).await {
+                Ok(ids) => {
+                    tx.commit().await?;
+                    Ok(Ok(ids))
+                }
+                Err(e) => Ok::<_, sqlx::Error>(Err(format!("{e:?}"))),
+            }
+        };
+        let out = run.await.map_err(|e| e.to_string()).and_then(|r| r);
+        let _ = actor.execute("RESET SESSION AUTHORIZATION").await;
+        out
+    });
+    assert!(
+        seen_waiting(pool, act_pid, &act_task).await,
+        "CALIBRATION: the act must wait on the holder's lock of the higher claim"
+    );
+
+    let mut public = pool.acquire().await.expect("acquire the publicizer");
+    public
+        .execute("SET SESSION AUTHORIZATION epigraph_app")
+        .await
+        .expect("the publicizer's role");
+    let publicize_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *public)
+        .await
+        .expect("the publicizer's pid");
+    let publicize_task = tokio::spawn(async move {
+        let run = async {
+            public.execute("BEGIN").await?;
+            public.execute("SET LOCAL lock_timeout = '30s'").await?;
+            sqlx::query(
+                "SELECT set_config('epigraph.principal_id', $1, true), \
+                        set_config('epigraph.group_ids', $2, true), \
+                        set_config('epigraph.writable_group_ids', $2, true)",
+            )
+            .bind(publicizer.to_string())
+            .bind(readable.to_string())
+            .execute(&mut *public)
+            .await?;
+            let outcomes: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT claim_id, outcome \
+                   FROM public.epigraph_publicize_claims(ARRAY[$1, $2]::uuid[], 'd1818fd0')",
+            )
+            .bind(lo)
+            .bind(hi)
+            .fetch_all(&mut *public)
+            .await?;
+            public.execute("COMMIT").await?;
+            Ok::<_, sqlx::Error>(outcomes)
+        };
+        let out = run.await.map_err(|e| e.to_string());
+        if out.is_err() {
+            let _ = public.execute("ROLLBACK").await;
+        }
+        let _ = public.execute("RESET SESSION AUTHORIZATION").await;
+        out
+    });
+    assert!(
+        seen_waiting(pool, publicize_pid, &publicize_task).await,
+        "CALIBRATION: the publicize must wait on a lock before the holder is released"
+    );
+
+    holder
+        .execute("ROLLBACK")
+        .await
+        .expect("release the holder");
+    let act = act_task.await.expect("the act's task");
+    let publicize = publicize_task.await.expect("the publicize's task");
+    let race = Race {
+        act: act.map(|mut ids| {
+            ids.sort();
+            ids
+        }),
+        publicize: publicize.map(|mut o| {
+            o.sort();
+            o
+        }),
+    };
+    for (who, err) in [
+        ("the act", race.act.as_ref().err()),
+        ("the publicize", race.publicize.as_ref().err()),
+    ] {
+        if let Some(e) = err {
+            assert!(
+                !e.contains("deadlock") && !e.contains("40P01"),
+                "{who} was aborted by a lock-order deadlock: {e}"
+            );
+        }
+    }
+    race
+}
+
+/// Backlog d1818fd0: the real `seal_claims_conn`, handed `[hi, lo]`, beside
+/// 206's publicize of `[lo, hi]`. Both commit; the publicize, serialized
+/// after the seal, refuses both sealed claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_claim_seal_and_publicize_in_opposite_orders_do_not_deadlock(pool: PgPool) {
+    let (author, group) = seal_group(&pool).await;
+    let pair = descending_pair(&pool, author, group).await;
+    let (lo, hi) = pair;
+    let race = opposite_order_race(&pool, Act::Seal { group }, pair, author, group).await;
+    assert_eq!(race.act, Ok(vec![lo, hi]), "the seal seals both claims");
+    assert_eq!(
+        race.publicize,
+        Ok(vec![
+            (lo, "refused_sealed".to_string()),
+            (hi, "refused_sealed".to_string())
+        ]),
+        "the publicize, serialized after the seal, refuses both sealed claims"
+    );
+    let public_and_sealed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims c \
+          WHERE c.id = ANY($1) AND c.visibility = 'public' \
+            AND EXISTS (SELECT 1 FROM claim_encryption ce WHERE ce.claim_id = c.id)",
+    )
+    .bind(vec![lo, hi])
+    .fetch_one(&pool)
+    .await
+    .expect("read the end state");
+    assert_eq!(public_and_sealed, 0, "no claim ends public and sealed");
+}
+
+/// The unseal path: `unseal_claims_conn`, handed `[hi, lo]`, beside 206's
+/// publicize of the same (sealed) claims `[lo, hi]`. 206 locks a sealed group
+/// claim before classifying it, so the two contend. Both commit; the
+/// publicize, serialized after the unseal, finds plain group claims and
+/// publicizes them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_claim_unseal_and_publicize_in_opposite_orders_do_not_deadlock(pool: PgPool) {
+    use epigraph_db::repos::privatization::PrivatizationRepository;
+
+    let (author, group) = seal_group(&pool).await;
+    let pair = descending_pair(&pool, author, group).await;
+    let (lo, hi) = pair;
+    // Sealed one at a time, `hi` first: the seal rewrites each claim row, so
+    // this leaves `hi`'s new version ahead of `lo`'s in the heap, the order
+    // a scan of the unseal's join meets them in.
+    for claim in [hi, lo] {
+        let mut tx = pool.begin().await.expect("begin the seal");
+        let sealed =
+            PrivatizationRepository::seal_claims_conn(&mut tx, group, 0, &[seal_item(claim)])
+                .await
+                .expect("seal the claim first");
+        tx.commit().await.expect("commit the seal");
+        assert_eq!(sealed, vec![claim], "CALIBRATION: the claim is sealed");
+    }
+
+    let race = opposite_order_race(&pool, Act::Unseal { group }, pair, author, group).await;
+    assert_eq!(
+        race.act,
+        Ok(vec![lo, hi]),
+        "the unseal restores both claims"
+    );
+    assert_eq!(
+        race.publicize,
+        Ok(vec![
+            (lo, "publicized".to_string()),
+            (hi, "publicized".to_string())
+        ]),
+        "the publicize, serialized after the unseal, publicizes both restored claims"
+    );
+}
+
+/// The apply path: `restrict_claims_conn`, handed `[hi, lo]`, moving two
+/// claims of the publicizer's group into another group, beside 206's
+/// publicize of `[lo, hi]` by that group's admin. Both commit; the restrict
+/// moves both claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_claim_restrict_and_publicize_in_opposite_orders_do_not_deadlock(pool: PgPool) {
+    let (author, group) = seal_group(&pool).await;
+    let (_, target) = seal_group(&pool).await;
+    let pair = descending_pair(&pool, author, group).await;
+    let (lo, hi) = pair;
+    let race = opposite_order_race(&pool, Act::Restrict { target }, pair, author, group).await;
+    assert_eq!(race.act, Ok(vec![lo, hi]), "the restrict moves both claims");
+    assert!(race.publicize.is_ok(), "{:?}", race.publicize);
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE id = ANY($1) \
+            AND visibility = 'group' AND owner_group_id = $2",
+    )
+    .bind(vec![lo, hi])
+    .bind(target)
+    .fetch_one(&pool)
+    .await
+    .expect("read the end state");
+    assert_eq!(moved, 2, "both claims end in the target group");
+}
+
+/// The revert path: `restore_claims_conn`, handed `[hi, lo]`, moving two
+/// claims of the publicizer's group back to the group a plan recorded,
+/// beside 206's publicize of `[lo, hi]` by the current group's admin. Both
+/// commit; the restore moves both claims.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_multi_claim_restore_and_publicize_in_opposite_orders_do_not_deadlock(pool: PgPool) {
+    let (author, target) = seal_group(&pool).await;
+    let (_, before) = seal_group(&pool).await;
+    let pair = descending_pair(&pool, author, target).await;
+    let (lo, hi) = pair;
+    // The plan and its items are FIXTURE rows: 081's plan guards (target
+    // age, a quorum of other live admins) are not what this test is about, so
+    // they are seeded with triggers off, in one superuser transaction. Every
+    // id they name is real.
+    let mut tx = pool.begin().await.expect("begin the plan fixture");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("fixture rows without the plan guards");
+    let plan: Uuid = sqlx::query_scalar(
+        "INSERT INTO privatization_plans (mode, target_group_id, selector, created_by) \
+         VALUES ('restrict', $1, '{}'::jsonb, $2) RETURNING id",
+    )
+    .bind(target)
+    .bind(author)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("a plan");
+    sqlx::query(
+        "INSERT INTO privatization_plan_items (plan_id, kind, entity_id, depth, via, \
+             before_visibility, before_owner_group_id, before_had_embedding) \
+         SELECT $1, 'claim', id, 0, 'seed', 'group', $2, false FROM claims WHERE id = ANY($3)",
+    )
+    .bind(plan)
+    .bind(before)
+    .bind(vec![hi, lo])
+    .execute(&mut *tx)
+    .await
+    .expect("the plan's items");
+    tx.commit().await.expect("commit the plan fixture");
+
+    let race =
+        opposite_order_race(&pool, Act::Restore { plan, target }, pair, author, target).await;
+    assert_eq!(
+        race.act.as_ref().map(Vec::len),
+        Ok(2),
+        "the restore moves both claims: {:?}",
+        race.act
+    );
+    assert!(race.publicize.is_ok(), "{:?}", race.publicize);
+    let restored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM claims WHERE id = ANY($1) \
+            AND visibility = 'group' AND owner_group_id = $2",
+    )
+    .bind(vec![lo, hi])
+    .bind(before)
+    .fetch_one(&pool)
+    .await
+    .expect("read the end state");
+    assert_eq!(restored, 2, "both claims end in the recorded group");
 }

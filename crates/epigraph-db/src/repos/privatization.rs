@@ -2736,6 +2736,39 @@ impl PrivatizationRepository {
         .map_err(|source| DbError::QueryFailed { source })
     }
 
+    /// Lock `claim_ids`' rows in ascending id order, before a multi-claim
+    /// write takes them in its planner's order (backlog d1818fd0).
+    ///
+    /// Migration 206's `epigraph_publicize_claims` and
+    /// `epigraph_share_claims_with_team` lock their claims `ORDER BY c.id FOR
+    /// NO KEY UPDATE`. An `UPDATE … WHERE c.id = ANY(…)` or `UPDATE … FROM
+    /// unnest(…)` locks in whatever order its plan visits the rows (heap order
+    /// under a sequential or bitmap scan, the array's order under a nested
+    /// loop), so the same two claims taken in opposite orders by such a write
+    /// and a publicize deadlock and Postgres aborts one with `40P01`. Taking
+    /// every lock here first, in the publicize's order, makes the two wait for
+    /// each other instead. `FOR NO KEY UPDATE` is the mode the write's own
+    /// UPDATE takes, so this adds no new kind of lock and blocks nothing the
+    /// write would not; it only moves the waits to the start, in id order.
+    ///
+    /// The caller's row security applies (a locking read is filtered by the
+    /// UPDATE policies), so a row this cannot lock is one the write cannot
+    /// update either.
+    async fn lock_claims_in_id_order_conn(
+        conn: &mut PgConnection,
+        claim_ids: &[Uuid],
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "SELECT 1 FROM public.claims c WHERE c.id = ANY($1) \
+              ORDER BY c.id FOR NO KEY UPDATE OF c",
+        )
+        .bind(claim_ids)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(|source| DbError::QueryFailed { source })
+    }
+
     /// `restrict`: move a batch of claims into the target group.
     ///
     /// This is the whole of `restrict` mode. `content`, `content_tsv` and
@@ -2792,6 +2825,8 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(Vec::new());
         }
+        // Lock order: by id, as 206's publicize locks (backlog d1818fd0).
+        Self::lock_claims_in_id_order_conn(conn, claim_ids).await?;
         sqlx::query_scalar::<_, Uuid>(
             r#"
             UPDATE public.claims c
@@ -3099,6 +3134,8 @@ impl PrivatizationRepository {
         if claim_ids.is_empty() {
             return Ok(0);
         }
+        // Lock order: by id, as 206's publicize locks (backlog d1818fd0).
+        Self::lock_claims_in_id_order_conn(conn, claim_ids).await?;
         sqlx::query("SET LOCAL epigraph.allow_declassify = 'yes'")
             .execute(&mut *conn)
             .await
@@ -3783,23 +3820,43 @@ impl PrivatizationRepository {
     /// applied. It is load-bearing anyway, because it is what makes the
     /// ordering an invariant of the database rather than of this function.
     ///
-    /// # Row locks (migration 227)
+    /// # Row locks (migration 227) and their order (backlog d1818fd0)
     ///
-    /// Since 227 that trigger reads each claim's visibility `FOR NO KEY
-    /// UPDATE`, so statement 1, not statement 2, is where this function first
-    /// takes the claim rows' locks and waits on a concurrent publicize (which
-    /// then either commits first and the seal is refused, or waits for the
-    /// seal and is refused by 074). The rows are locked in the order of
-    /// `items`. Under the route's `lock_timeout` a contended claim therefore
-    /// surfaces as a `55P03` from statement 1, and a lock-order deadlock with a
-    /// multi-claim publicize (possible before 227 at statement 2) as a `40P01`
-    /// from either statement; both abort the transaction with nothing written.
+    /// Before statement 1 this function locks every claim row of `items`
+    /// `FOR NO KEY UPDATE` in ascending id order
+    /// ([`Self::lock_claims_in_id_order_conn`]): the order migration 206's
+    /// `epigraph_publicize_claims` and `epigraph_share_claims_with_team` take
+    /// them in (`ORDER BY c.id FOR NO KEY UPDATE`). So the seal waits on a
+    /// concurrent publicize there, before it writes anything, and the
+    /// publicize then either commits first (and 227's trigger, which reads
+    /// each claim's visibility `FOR NO KEY UPDATE` on the lock the seal now
+    /// holds, refuses the seal) or waits for the seal (and is refused by 074).
+    /// Under the route's `lock_timeout` a contended claim surfaces as a
+    /// `55P03` from that first lock, which aborts the transaction with nothing
+    /// written. Before this the rows were locked in the caller's order, by
+    /// 227's trigger as statement 1 inserted each row, and a seal sent
+    /// `[b, a]` beside a publicize of `[a, b]` aborted one of them with
+    /// `40P01`. `items` is also sorted by `claim_id` and statement 1 inserts
+    /// `ORDER BY claim_id`, so the trigger's own locks follow the same order
+    /// even where its locking read finds no row to lock.
+    ///
+    /// A re-delivered commit running beside the first waits at that lock,
+    /// then finds the ciphertext rows (`ON CONFLICT DO NOTHING`) and returns
+    /// nothing.
+    ///
+    /// A duplicate `claim_id` keeps its FIRST occurrence, which is the one
+    /// statement 1's `ON CONFLICT DO NOTHING` kept before; statement 2 used to
+    /// take its hash from either copy, so a duplicate with different bytes
+    /// could pair one copy's ciphertext with the other's hash.
     ///
     /// # Errors
     ///
     /// [`DbError`] for a query fault. A `42501` from statement 1 is the PRV01
-    /// guard refusing an unrestricted claim; a `55P03` or `40P01` is a lock
-    /// wait that timed out or deadlocked (above).
+    /// guard refusing an unrestricted claim; a `55P03` from the first lock is
+    /// a lock wait that timed out (above). A `40P01` is still possible against
+    /// a writer that does not take claim rows in id order, or that locks other
+    /// rows first (edge rows are not ordered here): nothing is written and the
+    /// commit may be retried.
     pub async fn seal_claims_conn(
         conn: &mut PgConnection,
         group_id: Uuid,
@@ -3809,7 +3866,15 @@ impl PrivatizationRepository {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Ascending claim id, first occurrence kept: the lock order 206's
+        // publicize uses (see "Row locks" above). A stable sort, so
+        // `dedup_by_key` keeps the caller's first copy of a duplicate.
+        let mut ordered: Vec<&SealCommitItem> = items.iter().collect();
+        ordered.sort_by_key(|i| i.claim_id);
+        ordered.dedup_by_key(|i| i.claim_id);
+        let items = ordered;
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        Self::lock_claims_in_id_order_conn(conn, &claim_ids).await?;
         let content_cts: Vec<Vec<u8>> = items.iter().map(|i| i.content_ct.clone()).collect();
         let labels_cts: Vec<Vec<u8>> = items.iter().map(|i| i.labels_ct.clone()).collect();
         let props_cts: Vec<Vec<u8>> = items.iter().map(|i| i.properties_ct.clone()).collect();
@@ -3817,7 +3882,8 @@ impl PrivatizationRepository {
 
         // 1. The ciphertext row. ON CONFLICT DO NOTHING is what makes a
         //    re-delivered commit a no-op; the RETURNING set is what bounds
-        //    every statement after it.
+        //    every statement after it. `ORDER BY t.claim_id` is the lock
+        //    order: 227's trigger locks each claim row as its row is inserted.
         let sealed: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
             r"
             INSERT INTO public.claim_encryption
@@ -3826,6 +3892,7 @@ impl PrivatizationRepository {
             SELECT t.claim_id, $5, $6, $7, t.content_ct, t.labels_ct, t.props_ct
               FROM unnest($1::uuid[], $2::bytea[], $3::bytea[], $4::bytea[])
                 AS t(claim_id, content_ct, labels_ct, props_ct)
+             ORDER BY t.claim_id
             ON CONFLICT (claim_id) DO NOTHING
             RETURNING claim_id
             ",
@@ -4321,7 +4388,16 @@ impl PrivatizationRepository {
         if items.is_empty() {
             return Ok(Vec::new());
         }
+        // Ascending claim id, first occurrence kept, and every claim row
+        // locked in that order before the head UPDATE (backlog d1818fd0): its
+        // `FROM unnest(…)` join locks in planner order, and 206's publicize of
+        // the same sealed claims locks by id.
+        let mut ordered: Vec<&UnsealCommitItem> = items.iter().collect();
+        ordered.sort_by_key(|i| i.claim_id);
+        ordered.dedup_by_key(|i| i.claim_id);
+        let items = ordered;
         let claim_ids: Vec<Uuid> = items.iter().map(|i| i.claim_id).collect();
+        Self::lock_claims_in_id_order_conn(conn, &claim_ids).await?;
         let contents: Vec<String> = items.iter().map(|i| i.content.clone()).collect();
         let hashes: Vec<Vec<u8>> = items.iter().map(|i| i.content_hash.clone()).collect();
         let labels: Vec<serde_json::Value> = items

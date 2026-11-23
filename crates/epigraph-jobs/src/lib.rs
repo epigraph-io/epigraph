@@ -55,7 +55,7 @@ pub use async_trait::async_trait;
 // PostgreSQL job queue module
 mod postgres_queue;
 pub use postgres_queue::{
-    PostgresJobQueue, ReapedJob, ENQUEUE_UNIQUE_LOCK_CLASS, MAX_CRASH_REDELIVERIES,
+    PostgresJobQueue, ReapedJob, StrandedPlan, ENQUEUE_UNIQUE_LOCK_CLASS, MAX_CRASH_REDELIVERIES,
     REAPED_REDELIVERIES_SPENT_MESSAGE, REAPED_SPENT_MESSAGE,
 };
 
