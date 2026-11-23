@@ -49,6 +49,16 @@ with a transposed head would otherwise silently invert every stance.
   stack bump that breaks the model path).
 - Container: `docker build -t epigraph-nli services/nli` then run with
   `-p 8000:8000`; front with the `Caddyfile.snippet` stanza.
+  - torch comes from the PyTorch CPU wheel index (only the torch wheel, at
+    the version `requirements.txt` pins), so the image carries no CUDA
+    libraries; a later step fails the build if a CUDA torch got in anyway.
+  - The build pre-caches the model and scores one pair through
+    `precache_model.py` (which runs the `id2label` guard); if the model does
+    not load or the pair is not entailment-dominant, the build fails.
+  - `--build-arg NLI_STUB=1` skips the model for a stub image. It is a build
+    argument only: run that image with `-e NLI_STUB=1` too, or its first
+    request tries to download the model.
+  - `pytest test_dockerfile.py` checks these build steps without Docker.
 
 ## Wiring (DST belief path — the canonical consumer)
 
