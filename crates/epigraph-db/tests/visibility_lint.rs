@@ -5227,6 +5227,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "frozen_plan",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
+    // untenanted (a definer that applies its own audience): migration 259's
+    // `epigraph_plan_step_skeleton(workflow, visible)` reads the plan's `executes` edges and
+    // `step_follows` pairs unfiltered and masks every claim not in `visible` to a per-result
+    // token; `visible` is the step ids the fn's viewer-spliced statement produced, so no
+    // hidden claim id or content leaves the database (backlog a1474e22).
+    (
+        "workflow.rs",
+        "plan_step_claim_ids",
+        &["Self::plan_step_skeleton"],
+    ),
     // write: migration 237's two definers, `epigraph_workflow_lock_readable` (locks the
     // `workflows` row only if the session reads it, 183's read predicate restated) and
     // `epigraph_workflow_record_outcome` (writes only the four counters of that locked row);
