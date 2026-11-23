@@ -407,6 +407,9 @@ async fn supersede_act_conn_answers_not_found_for_a_claim_the_caller_cannot_read
         .await
         .expect("retire B's public claim");
     let missing = Uuid::new_v4();
+    // A claim in A's own group: an unstamped (public-only) session cannot read
+    // it, so the calibration below also proves the stamp took effect.
+    let own = fixture::seed_group_claim(&pool, a, ag, "A's own group-private claim").await;
 
     let (seen, on_hidden, on_missing, on_readable) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -422,7 +425,7 @@ async fn supersede_act_conn_answers_not_found_for_a_claim_the_caller_cannot_read
             .expect("stamp A");
             let seen: Vec<Uuid> =
                 sqlx::query_scalar("SELECT id FROM claims WHERE id = ANY($1) ORDER BY id")
-                    .bind(vec![hidden, readable])
+                    .bind(vec![hidden, readable, own])
                     .fetch_all(&mut *conn)
                     .await
                     .expect("calibration read");
@@ -441,11 +444,14 @@ async fn supersede_act_conn_answers_not_found_for_a_claim_the_caller_cannot_read
         })
         .await;
 
-    // CALIBRATION: A's session reads B's public claim and not the private one.
+    // CALIBRATION: A's session reads B's public claim and its own group's
+    // claim (so the stamp took effect), and not B's private one.
+    let mut expected = vec![readable, own];
+    expected.sort();
     assert_eq!(
-        seen,
-        vec![readable],
-        "A's stamped session must read the public claim and not B's private one"
+        seen, expected,
+        "A's stamped session must read the public claim and its own group's claim, \
+         and not B's private one"
     );
 
     let hidden_err = on_hidden.expect_err("a claim the caller cannot read is not superseded");
