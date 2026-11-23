@@ -8,7 +8,9 @@ wrote no `same_as` identity edge, so the mark could not be un-marked. It now
 marks through `POST /api/v1/claims/{dup}/dedup` and reads the database only.
 
 These tests assert the RECALL CONSEQUENCE and the identity edge, and drive the
-real script end to end against a disposable database. The executed-mark test
+real script end to end against a disposable database. The script reads as the
+maintenance login it uses in production when CI provides one
+(tests/db_roles.py); fixtures write as the superuser. The executed-mark test
 also needs an API serving that database (DEDUP_TEST_API_BASE) and a bearer
 token for it with `claims:write` (plus `claims:admin` for a cross-agent
 cluster) in DEDUP_TEST_TOKEN, and skips without them; the rest are
@@ -24,11 +26,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import uuid
 
 import pytest
+
+from tests import db_roles
 
 # CI (.github/workflows/ci.yml, job `python`) provisions a migrated `_test`
 # database and sets this, so a database-backed arm that cannot reach it FAILS
@@ -150,6 +155,68 @@ def seeded(db):
 API_BASE = os.environ.get("DEDUP_TEST_API_BASE")
 API_TOKEN = os.environ.get("DEDUP_TEST_TOKEN")
 
+DUP_TEXT = "PEG brush spring constant is 21 pN/nm over a 40x40 nm tile"
+
+
+def _seed_pair(db, agent_id: str, group_id: str, visibility: str) -> list[str]:
+    """A canonical and its duplicate, both embedded, by `agent_id` in `group_id`."""
+    vec = "[" + ",".join(["0.01"] * 1536) + "]"
+    vec_3072 = "[" + ",".join(["0.01"] * 3072) + "]"
+    ids = []
+    with db.cursor() as cur:
+        for _ in range(2):
+            cid = str(uuid.uuid4())
+            cur.execute(
+                "INSERT INTO claims "
+                "(id, content, content_hash, agent_id, owner_group_id, visibility, embedding, "
+                " embedding_3072) "
+                "VALUES (%s::uuid, %s, %s, %s::uuid, %s, %s, %s::vector, %s::vector)",
+                (cid, DUP_TEXT, psycopg2.Binary(os.urandom(32)), agent_id, group_id,
+                 visibility, vec, vec_3072),
+            )
+            ids.append(cid)
+    db.commit()
+    return ids
+
+
+def _drop_pair(db, ids: list[str]) -> None:
+    db.rollback()
+    with db.cursor() as cur:
+        cur.execute("UPDATE claims SET supersedes = NULL WHERE id = ANY(%s::uuid[])", (ids,))
+        cur.execute("DELETE FROM edges WHERE source_id = ANY(%s::uuid[]) "
+                    "OR target_id = ANY(%s::uuid[])", (ids, ids))
+        cur.execute("DELETE FROM claims WHERE id = ANY(%s::uuid[])", (ids,))
+    db.commit()
+
+
+@pytest.fixture
+def other_groups_private_pair(db):
+    """A canonical and its duplicate that are group-private to a team the
+    script's login is not a member of."""
+    agent_id = str(uuid.uuid4())
+    group_id = str(uuid.uuid4())
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO agents (id, public_key, role, state) "
+            "VALUES (%s::uuid, %s, 'researcher', 'active')",
+            (agent_id, psycopg2.Binary(os.urandom(32))),
+        )
+        cur.execute(
+            "INSERT INTO groups (id, display_name, did_key, public_key, kind, "
+            "                    created_by_agent_id) "
+            "VALUES (%s, 'dedup-private', 'did:test:team:' || %s, sha256(%s::bytea), 'team', %s)",
+            (group_id, group_id, group_id, agent_id),
+        )
+    db.commit()
+    ids = _seed_pair(db, agent_id, group_id, "group")
+    yield ids
+    _drop_pair(db, ids)
+    with db.cursor() as cur:
+        cur.execute("SET LOCAL epigraph.allow_group_delete = 'yes'")
+        cur.execute("DELETE FROM groups WHERE id = %s", (group_id,))
+        cur.execute("DELETE FROM agents WHERE id = %s::uuid", (agent_id,))
+    db.commit()
+
 
 def run_script(tmp_path, groups, execute: bool, token: str | None = None, expect_rc: int = 0):
     snapshot = tmp_path / "semantic-dedup.json"
@@ -160,7 +227,7 @@ def run_script(tmp_path, groups, execute: bool, token: str | None = None, expect
         "--input",
         str(snapshot),
         "--database-url",
-        TEST_DSN,
+        db_roles.script_dsn(TEST_DSN),
     ]
     if execute:
         argv.append("--execute")
@@ -235,6 +302,21 @@ def test_executed_dedup_removes_the_duplicate_from_recall(db, seeded, tmp_path):
     assert emb_3072_null is True
     # The dedup record: what makes the mark reversible (32c01f7d).
     assert identity_edges == 1
+
+
+def test_another_groups_private_cluster_is_read_whole(db, other_groups_private_pair, tmp_path):
+    """The script's reads must see every member, whoever owns it: a session row
+    security narrowed (an application login) finds no live member, so the
+    cluster reads as already deduped and the duplicate is never marked. Run as
+    the maintenance login (tests/db_roles.py), the cluster counts."""
+    canonical, dup = other_groups_private_pair
+
+    stdout = run_script(
+        tmp_path, [{"rep": canonical, "members": [canonical, dup]}], execute=False
+    )
+
+    assert re.search(r"^duplicates_would_mark:\s+1$", stdout, re.M), stdout
+    assert re.search(r"^clusters_skipped_already_deduped:\s+0$", stdout, re.M), stdout
 
 
 def test_execute_without_a_token_refuses_and_writes_nothing(db, seeded, tmp_path):
