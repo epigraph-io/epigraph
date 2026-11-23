@@ -19,9 +19,12 @@
 //!   (still compiled by `cargo test` and `clippy --all-targets`);
 //! - registered below, with its lane.
 //!
-//! The scan is textual: a trimmed line starting with `#[ignore` (or a
-//! `#[cfg_attr(..., ignore ...)]`), then the next `fn` name. Comment lines start
-//! with `//`, so a doc comment that mentions `#[ignore]` is not an attribute.
+//! The scan is textual: every attribute (a trimmed line starting with `#[`,
+//! joined with the lines after it until its brackets balance, since rustfmt
+//! wraps a long `#[cfg_attr(..., ignore = "...")]` so its first line is a bare
+//! `#[cfg_attr(`) that is `#[ignore...]` or a `cfg_attr` naming `ignore`, then
+//! the next `fn` name. Comment lines start with `//`, so a doc comment that
+//! mentions `#[ignore]` is not an attribute.
 //!
 //! CI selection: test-shard.py runs this target on a change to any member's
 //! `src/` (WALKERS), not on every test-only change; a new `#[ignore]` in a test
@@ -113,9 +116,76 @@ fn scanned_files(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-fn is_ignore_attribute(trimmed: &str) -> bool {
-    trimmed.starts_with("#[ignore")
-        || (trimmed.starts_with("#[cfg_attr(") && trimmed.contains("ignore"))
+/// Net bracket depth of `line` (`[`/`(` open, `]`/`)` close), not counting
+/// brackets inside string literals.
+fn bracket_delta(line: &str) -> i32 {
+    let mut depth = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if in_str {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' | '(' => depth += 1,
+            ']' | ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// Every attribute on `lines`: (index of its last line, its text with the
+/// lines it spans joined by spaces). An attribute starts on a trimmed line
+/// beginning `#[` and runs until its brackets balance.
+fn attributes(lines: &[&str]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim_start().starts_with("#[") {
+            let mut text = String::new();
+            let mut depth = 0;
+            loop {
+                let l = lines[i].trim();
+                depth += bracket_delta(l);
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(l);
+                if depth <= 0 || i + 1 == lines.len() {
+                    break;
+                }
+                i += 1;
+            }
+            out.push((i, text));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Whether a (joined) attribute marks its item ignored.
+fn is_ignore_attribute(attr: &str) -> bool {
+    attr.starts_with("#[ignore") || (attr.starts_with("#[cfg_attr(") && attr.contains("ignore"))
+}
+
+/// The name of the test under each ignore attribute on `lines`.
+fn ignored_fns(lines: &[&str]) -> Vec<String> {
+    attributes(lines)
+        .into_iter()
+        .filter(|(_, attr)| is_ignore_attribute(attr))
+        .map(|(end, _)| {
+            next_fn_name(lines[end + 1..].iter().copied())
+                .unwrap_or_else(|| format!("<no fn after line {}>", end + 1))
+        })
+        .collect()
 }
 
 /// The name of the first `fn` declared on `lines` (attributes and blank lines
@@ -148,12 +218,8 @@ fn ignored_tests(root: &Path, files: &[PathBuf]) -> Vec<(String, String)> {
             .to_string_lossy()
             .replace('\\', "/");
         let lines: Vec<&str> = text.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
-            if is_ignore_attribute(line.trim_start()) {
-                let name = next_fn_name(lines[i + 1..].iter().copied())
-                    .unwrap_or_else(|| format!("<no fn after line {}>", i + 1));
-                found.push((rel.clone(), name));
-            }
+        for name in ignored_fns(&lines) {
+            found.push((rel.clone(), name));
         }
     }
     found
@@ -240,12 +306,28 @@ fn the_scan_sees_attributes_and_not_comments() {
         "#[cfg_attr(not(feature = \"x\"), ignore)]",
         "#[test]",
         "pub fn conditionally_ignored() {}",
+        // rustfmt's wrapping of a long conditional ignore: the first line is a
+        // bare `#[cfg_attr(`, and the reason holds brackets of its own.
+        "#[cfg_attr(",
+        "    not(feature = \"some_quite_long_feature_name_here\"),",
+        "    ignore = \"needs a service [CI has none) that is long enough to wrap\"",
+        ")]",
+        "#[tokio::test]",
+        "async fn wrapped_conditional_ignore() {}",
+        // A wrapped attribute that is not an ignore.
+        "#[cfg_attr(",
+        "    feature = \"some_quite_long_feature_name_here\",",
+        "    allow(clippy::too_many_lines)",
+        ")]",
+        "#[test]",
+        "fn wrapped_but_not_ignored() {}",
     ];
-    let hits: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| is_ignore_attribute(l.trim_start()))
-        .map(|(i, _)| next_fn_name(lines[i + 1..].iter().copied()).unwrap())
-        .collect();
-    assert_eq!(hits, ["ignored_one", "conditionally_ignored"]);
+    assert_eq!(
+        ignored_fns(&lines),
+        [
+            "ignored_one",
+            "conditionally_ignored",
+            "wrapped_conditional_ignore"
+        ]
+    );
 }
