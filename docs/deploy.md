@@ -1542,11 +1542,16 @@ review red flag, not a compile error.
 `<API base>/oauth/token`) with the `client_credentials` grant, the same
 resolution as `decompose_claims`. The server then decides the token's scopes
 (the request intersected with the client's grants) and its `agent_id` (the
-client's own agent). The client **exits at construction** when it has neither,
-when the endpoint refuses, or, on the exchange, when the client was not granted
-every scope the job requests, rather than dying on a 401 or 403 partway through
-a run. `EPIGRAPH_TOKEN` is used without a scope check: a token missing a scope
-the job needs fails with a 403 at the first request that needs it. A job that
+client's own agent). An `EPIGRAPH_TOKEN` is first sent to the API's
+`/oauth/introspect` (`<API base>/oauth/introspect`, JSON body). The client
+**exits at construction**, rather than dying on a 401 or 403 partway through a
+run, when it has neither credential, when the token endpoint refuses, when the
+token's scopes miss one the job requests (the exchange's granted scopes, or the
+introspected scopes of `EPIGRAPH_TOKEN`), or when introspection says the token
+is not active or cannot be reached. An elevated token carrying `platform:admin`
+counts as holding the `*:admin` scopes, as the server does. The check reads
+only the token: a scope the server's admin-scope switch or a delegation ceiling
+withholds still fails at the request that needs it. A job that
 had both `EPIGRAPH_TOKEN` and `EPIGRAPH_JWT_SECRET` set used to ignore the
 token and sign its own; it now runs on the token. That covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
 `update_theme_workflow_steps.py` and `lib/nli_stance.py`.
