@@ -3,10 +3,11 @@
 //! Generates an OpenAPI 3.1 document for the EpiGraph REST API, served at
 //! `GET /api/v1/openapi.json`.
 //!
-//! **The document is PARTIAL.** It describes the 19 operations listed in
+//! **The document is PARTIAL.** It describes the 20 operations listed in
 //! `ApiDoc`'s `paths(...)` below (health, packet submit, RAG query, admin
 //! stats, challenges, supersede / dedup / undedup, claim get / patch / labels,
-//! agent search, five workflow routes and the hierarchical edge create), with
+//! agent search, five workflow routes, the hierarchical edge create and the
+//! authorship countersign), with
 //! their schemas and the bearer security scheme. The router in
 //! `routes/mod.rs` registers well over two hundred routes; the rest are not
 //! described here, and no test ties this list to the route table. Each entry
@@ -29,6 +30,9 @@ use crate::routes::claims::{
     AuthorRefView, AuthoredByView, ClaimResponse, FilerView, IngesterView, PaperAuthorView,
     PaperAuthorshipView, PaperRefView, PatchClaimRequest, PromptSnapshotView, UpdateLabelsRequest,
     UpdateLabelsResponse,
+};
+use crate::routes::countersign::{
+    CountersignAuthorshipRequest, CountersignAuthorshipResponse, CountersignedRowView,
 };
 use crate::routes::edges::{LinkHierarchicalRequest, LinkHierarchicalResponse};
 use crate::routes::health::HealthResponse;
@@ -114,6 +118,7 @@ use workflow_schema_stubs::{
         ingest_workflow_doc,
         create_hierarchical_edge_doc,
         search_agents_doc,
+        countersign_authorship_doc,
     ),
     components(
         schemas(
@@ -174,6 +179,9 @@ use workflow_schema_stubs::{
             LineageHeadResult,
             LinkHierarchicalRequest,
             LinkHierarchicalResponse,
+            CountersignAuthorshipRequest,
+            CountersignAuthorshipResponse,
+            CountersignedRowView,
         )
     ),
     modifiers(&SecurityAddon),
@@ -186,6 +194,7 @@ use workflow_schema_stubs::{
         (name = "claims", description = "Claim management endpoints"),
         (name = "workflows", description = "Workflow management endpoints"),
         (name = "edges", description = "Edge creation and management"),
+        (name = "papers", description = "Papers and their authorship"),
     )
 )]
 pub struct ApiDoc;
@@ -641,6 +650,32 @@ async fn ingest_workflow_doc() {}
 )]
 async fn create_hierarchical_edge_doc() {}
 
+/// Confirm or decline a pending authorship of a paper (doc stub)
+///
+/// The named person (or that agent's live operator, passing `agent_id`)
+/// confirms or declines an ingester's naming of them as an author of the
+/// paper. 200 with the rows changed, or with `changed: []` and a `message`
+/// when nothing is pending (a repeat included; nothing written). 403 with a
+/// coded reason when the definer refuses the caller (`CSG01`: no
+/// authenticated principal; `CSG02`: not the named agent nor its live
+/// operator), or without `claims:write`. The REST twin of MCP
+/// `countersign_authorship`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/papers/{id}/authors/countersign",
+    tag = "papers",
+    params(("id" = uuid::Uuid, Path, description = "UUID of the paper the caller was named on")),
+    request_body = CountersignAuthorshipRequest,
+    responses(
+        (status = 200, body = CountersignAuthorshipResponse),
+        (status = 400, body = ErrorResponse),
+        (status = 401, body = ErrorResponse),
+        (status = 403, body = ErrorResponse),
+    ),
+    security(("ed25519_signature" = []))
+)]
+async fn countersign_authorship_doc() {}
+
 /// Generate the OpenAPI JSON specification.
 ///
 /// The `version` field is overridden at runtime with `CARGO_PKG_VERSION` so it
@@ -672,6 +707,37 @@ mod tests {
         let spec = openapi_spec();
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains("ed25519_signature"));
+    }
+
+    /// Backlog 04c02296: the countersign route is described, as a POST with
+    /// its typed body and the bearer scheme.
+    #[test]
+    fn openapi_spec_documents_the_countersign_route() {
+        let doc = serde_json::to_value(openapi_spec()).unwrap();
+        let op = &doc["paths"]["/api/v1/papers/{id}/authors/countersign"]["post"];
+        assert!(op.is_object(), "countersign route not described");
+        let body_ref = op["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            body_ref.ends_with("/CountersignAuthorshipRequest"),
+            "request body: {body_ref:?}"
+        );
+        let ok_ref = op["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            ok_ref.ends_with("/CountersignAuthorshipResponse"),
+            "200 body: {ok_ref:?}"
+        );
+        assert!(op["responses"]["403"].is_object());
+        let schemes: Vec<&str> = op["security"]
+            .as_array()
+            .expect("security")
+            .iter()
+            .flat_map(|o| o.as_object().unwrap().keys().map(String::as_str))
+            .collect();
+        assert!(schemes.contains(&"ed25519_signature"), "{schemes:?}");
     }
 
     #[test]
