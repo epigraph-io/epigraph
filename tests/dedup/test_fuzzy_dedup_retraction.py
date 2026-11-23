@@ -327,9 +327,11 @@ def test_an_author_with_claims_write_only_removes_its_own_duplicate_from_recall(
     db, writer_pair, tmp_path
 ):
     """The common case, backlog 32905f60: an author marks a duplicate of its own
-    claim with a `claims:write` token and no `claims:admin`. The endpoint admits
-    it on the author arm only (the token's agent wrote both claims and writes
-    their group), and the duplicate leaves recall exactly as on the admin path."""
+    claim with a `claims:write` token and no `claims:admin`, and the duplicate
+    leaves recall exactly as on the admin path. The token's agent wrote both
+    claims and writes their group, so this covers a non-admin writer who is also
+    the author: the mark handler admits its Author and GroupWriter arms alike
+    (the arm is only logged), and this test cannot tell those two apart."""
     canonical, dup = writer_pair
 
     assert recallable(db, canonical) and recallable(db, dup)
