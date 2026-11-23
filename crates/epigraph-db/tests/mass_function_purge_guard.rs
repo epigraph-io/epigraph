@@ -752,6 +752,102 @@ async fn f_a_grant_from_an_earlier_transaction_admits_no_delete(pool: PgPool) {
     assert!(exists(&pool, "mass_functions", w.retracted).await);
 }
 
+/// T-N3: arms (c) and (d) as a REAL login that is a MEMBER of
+/// `epigraph_maintenance` (NOSUPERUSER, INHERIT), the shape a deployed
+/// maintenance session has. [`maintenance`] reaches the role by `SET SESSION
+/// AUTHORIZATION epigraph_maintenance`, where `session_user` IS the role;
+/// here `session_user` is the member login, so every check keyed on role
+/// membership (`epigraph_bypass()`'s `pg_has_role(session_user, ...)`, the
+/// inherited grants on the grant table and on `mass_functions`) is
+/// exercised as production runs it. (c): with no grant the delete is SR09
+/// and the row survives; (d): the documented residual holds for a member
+/// login too (a grant row it writes for its own transaction admits the
+/// delete).
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool) {
+    grant_table_exists(&pool).await;
+    let w = world(&pool).await;
+    let login = format!("h10_member_{}", Uuid::new_v4().simple());
+    let url = fixture::database_url_for(&pool).await;
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    let dsn = format!("{scheme}://{login}:probe-only@{host}");
+    let (retracted, live) = (w.retracted, w.live);
+    let (who, c_refusal, d_deleted) = with_cluster_role(
+        &pool,
+        &login,
+        &format!(
+            "CREATE ROLE {login} LOGIN PASSWORD 'probe-only' NOSUPERUSER NOBYPASSRLS INHERIT \
+             IN ROLE epigraph_maintenance"
+        ),
+        |_pool| async move {
+            let mut conn = PgConnection::connect(&dsn)
+                .await
+                .expect("the member logs in");
+            let who: (String, bool, bool) = sqlx::query_as(
+                "SELECT session_user::text, \
+                        (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                        public.epigraph_bypass()",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .expect("who is this session");
+            // (c) no grant: SR09, as a single row and as a bulk delete.
+            let c = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&mut conn)
+                .await
+                .map(|d| d.rows_affected());
+            let c = refusal(c, "a member login's delete without a grant");
+            let bulk = sqlx::query("DELETE FROM mass_functions WHERE id = ANY($1)")
+                .bind(vec![retracted, live])
+                .execute(&mut conn)
+                .await
+                .map(|d| d.rows_affected());
+            assert_sr09(
+                refusal(bulk, "a member login's bulk delete over a retracted row"),
+                "(c) bulk, member login",
+            );
+            // (d) the residual: a grant row for this transaction admits it.
+            let mut tx = conn.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO public.mass_function_purge_grants (mf_id, reason) \
+                 VALUES ($1, 'residual, member login')",
+            )
+            .bind(retracted)
+            .execute(&mut *tx)
+            .await
+            .expect("a member login inherits INSERT on the grant table");
+            let n = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&mut *tx)
+                .await
+                .expect("a grant for this transaction admits the delete")
+                .rows_affected();
+            tx.rollback().await.expect("rollback");
+            conn.close().await.expect("close");
+            (who, c, n)
+        },
+    )
+    .await;
+
+    assert!(!role_exists(&pool, &login).await, "the login is gone");
+    assert_eq!(
+        who,
+        (login.clone(), false, true),
+        "fixture: a NOSUPERUSER member login, privileged through membership only"
+    );
+    assert_sr09(c_refusal, "(c), member login");
+    assert_eq!(
+        d_deleted, 1,
+        "(d), member login: the grant admits the delete"
+    );
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives (the residual delete was rolled back)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (e) (g): the purge definer and the application role
 // ---------------------------------------------------------------------------
