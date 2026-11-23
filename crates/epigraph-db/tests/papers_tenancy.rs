@@ -558,9 +558,12 @@ async fn the_246_undo_returns_the_catalog_below_246(pool: PgPool) {
 }
 
 /// A group-private paper, or two rows of one document, refuse the undo and
-/// change nothing.
-#[sqlx::test(migrations = "../../migrations")]
+/// change nothing. Through 246 exactly: 258 re-states the two functions over
+/// 246's bodies, so at head the undo's body guard refuses first (258 must be
+/// undone before 246), which would hide the data guard this test pins.
+#[sqlx::test(migrations = false)]
 async fn the_246_undo_refuses_while_a_paper_is_private(pool: PgPool) {
+    migrate(&pool, &up_to(246)).await;
     let (_, g) = fixture::seed_agent_with_group(&pool, "undo-owner").await;
     sqlx::query(
         "INSERT INTO papers (doi, visibility, owner_group_id) \

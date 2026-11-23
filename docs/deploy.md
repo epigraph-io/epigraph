@@ -2860,8 +2860,10 @@ epigraph-operator reown-reverse --manifest private-move-1.jsonl [--apply]
 - **Held whole**: a private row a third group owns, an edge whose new tuple
   would drop a group its current one requires, an edge to a group-private
   frame, context, perspective, community or reasoning trace that does not move
-  (the edges trigger counts such a node as public, so the edge would go to the
-  target naming a node the target cannot read), and a SEALED row: a plan claim
+  (the edges trigger counts a reasoning trace as public, so the edge would go
+  to the target naming a node the target cannot read; since migration 258 it
+  meets a frame, context, perspective or community with its own row, and the
+  hold is kept for those as the conservative choice), and a SEALED row: a plan claim
   with a `claim_encryption` row or a sealed version
   (`claim_version_encryption`), evidence of one with an `evidence_encryption`
   row, or a moving edge with an `edge_encryption` row. A move does not re-key

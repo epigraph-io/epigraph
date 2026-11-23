@@ -79,12 +79,13 @@
 //!   other end, and an edge from a claim outside the run to a moving trace
 //!   takes the exact meet too (co-owned, reported as `CO-OWNED-EDGE`; a public
 //!   one holds the claim, `public-row`).
-//!   `epigraph_node_tenancy` (070), and so the trigger, count such a node as
-//!   public (a workflow excepted since migration 219, which meets it with its
-//!   own row, as this tool does): left alone, the trigger would put an edge
-//!   from a source-private context on `('group', TARGET)` alone, which
-//!   source-only members lose and target-only members gain while it names a
-//!   node they cannot read. The
+//!   `epigraph_node_tenancy` (070), and so the trigger, counted such a node as
+//!   public until migrations 219 (a workflow) and 258 (a frame, context,
+//!   perspective or community) met it with its own row, as this tool does; a
+//!   reasoning trace is still counted as public. Left alone, a trigger that
+//!   counts the node as public puts an edge from a source-private node on
+//!   `('group', TARGET)` alone, which source-only members lose and target-only
+//!   members gain while it names a node they cannot read. The
 //!   tool writes the exact meet instead (co-owned with the node's group) and
 //!   reports every edge to a group-private node that is not the target's
 //!   (`SOURCE-NODE-EDGE` lines and a count). A public node, or one in the
@@ -454,12 +455,14 @@ fn model_readable(
 /// table carries its own `(owner_group_id, visibility)`: entity type -> table.
 ///
 /// `epigraph_node_tenancy` (070) answers `('public', world)` for every type but
-/// claim, evidence, (since migration 219) workflow and (since migration 246)
-/// paper, so the trigger's meet
+/// claim, evidence, workflow (since migration 219), paper (since migration
+/// 246) and frame, context, perspective and community (since migration 258),
+/// so the trigger's meet
 /// treats such a node as public even when the row itself is group-private (a
-/// frame, context, perspective or community, migration 062; a reasoning trace,
-/// which follows its claim; a workflow, migration 183, until 219). A workflow
-/// or a paper stays in this map: reading its own row agrees with the oracle. Read from the schema,
+/// reasoning trace, which follows its claim; a workflow, migration 183, until
+/// 219; the four registries, migration 062, until 258). The types the oracle
+/// meets (a workflow, a paper, the four registries) stay in this map: reading
+/// their own row agrees with it. Read from the schema,
 /// not from `entity_types.tenancy_tier` (which still says `derived` for
 /// `workflow`), so a type that gains tenancy columns later is covered.
 pub type NodeTypes = BTreeMap<String, String>;

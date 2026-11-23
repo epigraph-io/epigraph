@@ -4066,6 +4066,35 @@ restart.
   because that admin login is CREATEROLE (and, on PG 16, holds ADMIN on a role it
   creates). **Applied to throwaway databases
   only, NOT to any deployed database.**
+- **258**: public `registry_endpoint_tenancy` (backlog a07c25c0). A `frame`,
+  `context`, `perspective` or `community` edge endpoint contributes its own row's
+  tenancy (062's `owner_group_id`, `visibility`) to the edge's meet. Re-states 246's
+  `epigraph_node_tenancy(uuid, text)` with the four arms and 246's
+  `epigraph_propagate_tenancy()` with a LEFT JOIN per table per endpoint (nothing else
+  in either body changes; CREATE OR REPLACE keeps owner and ACL, and the owner is
+  re-set). Re-meets, once, every edge with a non-public registry endpoint (group meet
+  only, never widening; an already-private edge keeps every group it requires, so a
+  legacy declaration becomes co-owned; an edge that would need three groups is held;
+  an edge whose other endpoint no longer exists is skipped, since writing it would
+  trip `edges_validate_refs` and abort the migration) and RAISEs a NOTICE with the
+  counts. So an edge from a public claim onto a
+  group-private registry row is that row's group's, and one onto another group's
+  claim is co-owned. Not changed: re-tenanting a registry row does not re-meet its
+  edges by itself (no trigger on the four tables, as on `workflows`);
+  `epigraph-tenancy-backfill run --entity registry-edges` (with `--dry-run` first) is
+  the repair, and `verify` fails while such an edge is off its meet or held. A GUARD
+  refuses to apply 258 unless both functions still hold 246's bodies (md5 of
+  `prosrc`; 258 was written against 219's and rebuilt over 246's, which re-stated
+  both first, when the two were merged); the undo carries the same guard against
+  258's bodies and restores 246's. Pinned by
+  `epigraph-db/tests/registry_endpoint_tenancy.rs` (application role, per type),
+  `epigraph-db/tests/registry_endpoint_tenancy_undo.rs` and
+  `epigraph-cli/tests/backfill_idempotence.rs`. Must run as the maintenance role or a
+  superuser (it refuses otherwise). Undo: `docs/runbooks/258-undo.sql` (tested: run
+  twice, it returns the `public` catalog to below 258; the edges it narrowed stay
+  narrowed). **Deploy order:** migrate, then run the `epigraph-tenancy-backfill` built
+  with it (`verify`). Another open change re-stating the same two functions must be
+  re-stated over the merged body (the guard of whichever applies second refuses).
 - **259**: public `plan_step_skeleton` (backlog a1474e22). Adds the definer
   `epigraph_plan_step_skeleton(workflow uuid, visible uuid[])`: a plan's `executes` edges
   (every level, in the plan-order readers' key: ordinal, `created_at`, claim id) and the

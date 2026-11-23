@@ -96,9 +96,12 @@
 //!   (`CO-OWNED-EDGE`);
 //! * an edge to a group-private node of another type with its own tenancy (a
 //!   frame, context, perspective, community or reasoning trace that does not
-//!   end in the TO state) holds its lineage: the cascade meets such a node as
-//!   public, so the edge would go to the target naming a node the target
-//!   cannot read;
+//!   end in the TO state) holds its lineage. The cascade meets a reasoning
+//!   trace as public, so the edge would go to the target naming a node the
+//!   target cannot read; since migration 258 it meets a frame, context,
+//!   perspective or community with its own row (the edge would be co-owned,
+//!   not leaked), and the hold is kept for those as the conservative choice:
+//!   the operator decides an edge onto a third group's registry row;
 //! * an unstamped session reads none of these rows before or after, so every
 //!   batch also reads them as a session whose read set is ONLY the source and
 //!   one whose read set is ONLY the target, before and after, and each must
@@ -1581,9 +1584,12 @@ async fn classify_narrowing(
             out.kept.push((e, "already as narrow as its plan"));
             continue;
         }
-        // The cascade meets such a node as public: an edge to a group-private
-        // node that does not end in the TO state would go to the target while
-        // naming a node the target's members cannot read.
+        // The cascade meets a reasoning trace as public: an edge to a
+        // group-private one that does not end in the TO state would go to the
+        // target while naming a node the target's members cannot read. Since
+        // migration 258 a frame, context, perspective or community is met with
+        // its own row (the edge would be co-owned instead); it is still held,
+        // conservatively, for the operator to decide.
         let private_node = [&e.source, &e.target].into_iter().any(|n| {
             other_nodes
                 .get(n)
@@ -1592,8 +1598,10 @@ async fn classify_narrowing(
         let why = if private_node {
             Some(
                 "it names a group-private node (a frame, context, perspective, community or \
-                 reasoning trace) that does not move with the plan, which the cascade counts as \
-                 public: moved, the edge would name a node its new readers cannot read",
+                 reasoning trace) that does not move with the plan: moved, the edge would name \
+                 a node its new readers cannot read (a trace, which the cascade counts as \
+                 public) or need that node's group as co-owner (a registry row, since \
+                 migration 258); an operator decides it",
             )
         } else {
             hand_off(act, &e.tenancy, &post, true, stray.owns_edge(&e))
@@ -2526,8 +2534,10 @@ async fn sealed_holds(
 /// Every endpoint of `edges` whose entity type has its own tenancy columns
 /// and is not a workflow (`regroup::node_types`: a frame, context,
 /// perspective, community, reasoning trace, ...): `(id, type) -> (table, its
-/// own tuple)`. `epigraph_node_tenancy` answers public for these, so the
-/// edges trigger's meet does not see a group-private one.
+/// own tuple)`. `epigraph_node_tenancy` answers public for a reasoning trace,
+/// so the edges trigger's meet does not see a group-private one; since
+/// migration 258 it meets a frame, context, perspective or community with its
+/// own row, and this model still holds an edge onto one (conservative).
 async fn node_tuples(
     conn: &mut PgConnection,
     edges: &[EdgeRow],

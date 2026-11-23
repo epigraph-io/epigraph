@@ -1905,3 +1905,435 @@ async fn strict_verify_lists_world_owned_provenance_rows_by_their_key(pool: PgPo
         "verify FAILS on world-owned rows; stderr:\n{stderr}"
     );
 }
+
+// ===========================================================================
+// Registry edges — migration 258 (backlog a07c25c0)
+// ===========================================================================
+
+/// [`run_backfill`], returning `(exit_code, stdout, stderr)`.
+async fn run_backfill_out(pool: &PgPool, args: &[&str]) -> (i32, String, String) {
+    let url = fixture::database_url_for(pool).await;
+    let out = Command::new(BIN)
+        .args(args)
+        .env("DATABASE_URL", &url)
+        .env("MAINTENANCE_DATABASE_URL", &url)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn epigraph-tenancy-backfill");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// A frame private to `group` (a legacy re-stamp or a group writer's direct
+/// write; no first-party writer produces one).
+async fn seed_private_frame(pool: &PgPool, group: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses, owner_group_id, visibility) \
+         VALUES ($1, ARRAY['a','b'], $2, 'group') RETURNING id",
+    )
+    .bind(format!("private-frame-{}", Uuid::new_v4()))
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("seed a group-private frame")
+}
+
+async fn seed_typed_edge(pool: &PgPool, s: (Uuid, &str), t: (Uuid, &str)) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, $2, $3, $4, 'relates_to') RETURNING id",
+    )
+    .bind(s.0)
+    .bind(s.1)
+    .bind(t.0)
+    .bind(t.1)
+    .fetch_one(pool)
+    .await
+    .expect("insert edge")
+}
+
+async fn edge_tuple(pool: &PgPool, id: Uuid) -> (String, Uuid, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("read edge tenancy")
+}
+
+/// Since migration 258 an edge's meet reads a frame, context, perspective or
+/// community endpoint from its own row. An edge stamped while the oracle met
+/// such a row as public (or left behind when the row was re-tenanted later) is
+/// off its meet: world-owned while naming a private frame, or owned by its
+/// claim's group alone. Neither of the two older edge checks sees it (they
+/// read claims and evidence only). `verify` FAILS on it, the dry run of
+/// `--entity registry-edges` lists it without writing, the arm re-meets it,
+/// and `verify` passes. An edge that would need three groups is held and
+/// keeps `verify` failing.
+///
+/// Verified to fail with the `.rs` changes stashed: `--entity registry-edges`
+/// is not a valid value (exit 2) and `verify` exits 0 on the stale edges.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_flags_a_registry_edge_off_its_meet_and_the_registry_arm_repairs_it(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-g").await;
+    let (agent_h, group_h) = fixture::seed_agent_with_group(&pool, "registry-h").await;
+    let (_, group_k) = fixture::seed_agent_with_group(&pool, "registry-k").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let theirs = fixture::seed_group_claim(&pool, agent_h, group_h, "H's private claim").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+
+    let e_world = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    let e_cross = seed_typed_edge(&pool, (frame, "frame"), (theirs, "claim")).await;
+    let e_held = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    assert_eq!(
+        edge_tuple(&pool, e_world).await,
+        ("group".to_string(), group_g, None),
+        "CALIBRATION: 258's trigger meets the frame with its own row"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_cross).await,
+        ("group".to_string(), group_g, Some(group_h)),
+        "CALIBRATION: a frame of G onto H's claim is co-owned"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "CALIBRATION: the corpus is clean; stderr:\n{stderr}"
+    );
+
+    // The pre-258 stamps, written without touching the endpoint columns.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e_world)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the world-owned stamp");
+    force_edge_tenancy(&pool, e_cross, group_h, None).await;
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "verify must FAIL on the stale registry edges; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("2 edge(s) with a non-public frame")
+            && stderr.contains("--entity registry-edges"),
+        "the failure counts them and names the remediation; stderr:\n{stderr}"
+    );
+
+    let before = (
+        edge_tuple(&pool, e_world).await,
+        edge_tuple(&pool, e_cross).await,
+    );
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        stdout.contains("would re-meet 2 edge(s)") && stdout.contains("0 held"),
+        "the dry run reports the edges it would re-tenant; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("relates_to\tpublic to group\t1")
+            && stdout.contains("relates_to\tgroup to co-owned\t1"),
+        "by relationship and transition; stdout:\n{stdout}"
+    );
+    assert_eq!(
+        before,
+        (
+            edge_tuple(&pool, e_world).await,
+            edge_tuple(&pool, e_cross).await
+        ),
+        "the dry run writes nothing"
+    );
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(stdout.contains("re-met 2 edge(s)"), "stdout:\n{stdout}");
+    assert_eq!(
+        edge_tuple(&pool, e_world).await,
+        ("group".to_string(), group_g, None),
+        "the world-owned edge goes to the frame's group"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_cross).await,
+        ("group".to_string(), group_g, Some(group_h)),
+        "the claim-only edge becomes co-owned"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "verify clears once they are re-met; stderr:\n{stderr}"
+    );
+
+    // An edge declared co-owned by H and K onto G's frame needs three groups:
+    // held, never written, and `verify` fails on it.
+    force_edge_tenancy(&pool, e_held, group_h, Some(group_k)).await;
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert!(
+        stdout.contains("re-met 0 edge(s)") && stdout.contains("1 held"),
+        "stdout:\n{stdout}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_held).await,
+        ("group".to_string(), group_h, Some(group_k)),
+        "a held edge is left as it is"
+    );
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(stderr.contains("need three groups"), "stderr:\n{stderr}");
+}
+
+/// Below migration 258 the registry-edge check is SKIPPED and says so: this
+/// pre-flight runs before a release's migrations, and on a database whose
+/// oracle still meets a registry row as public every edge onto a private one
+/// is off its meet until 258's own re-meet runs. The gate reads the oracle's
+/// body (the catalog), so 258's undo runbook, which puts 246's body back, is
+/// what "below 258" looks like here.
+///
+/// Verified to fail without the gate: `verify` exits 1 after the undo.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_skips_the_registry_edge_check_before_migration_258(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-gate").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the pre-258 world-owned stamp");
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 1,
+        "CALIBRATION: at head the stale edge fails; stderr:\n{stderr}"
+    );
+
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
+    )
+    .expect("read 258's undo runbook");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("undo 258's function bodies");
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(
+        code, 0,
+        "below 258 the registry-edge check must not block the pre-flight; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("skipping the registry-edge check"),
+        "and it must SAY it skipped; stderr:\n{stderr}"
+    );
+}
+
+/// Turn `edges_validate_refs` off or on inside `tx` (harness superuser): the
+/// only way to write or re-stamp an edge whose endpoint no longer exists, the
+/// shape a deleted endpoint leaves behind.
+async fn set_ref_check(tx: &mut sqlx::PgConnection, on: bool) {
+    let verb = if on { "ENABLE" } else { "DISABLE" };
+    sqlx::query(&format!(
+        "ALTER TABLE edges {verb} TRIGGER edges_validate_refs"
+    ))
+    .execute(tx)
+    .await
+    .expect("toggle edges_validate_refs");
+}
+
+/// An edge from a private frame to an agent that does not exist cannot be
+/// re-met (`edges_validate_refs` refuses any UPDATE of it), so the registry
+/// arm SKIPS it, counts it, and still re-meets the rest; `verify` fails on it
+/// with its own remediation (delete or restore), since the arm cannot fix it.
+///
+/// Verified to fail without the `refs_ok` guard: the arm's UPDATE aborts on
+/// the reference check and `run --entity registry-edges` exits non-zero.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_registry_arm_skips_an_edge_with_a_dangling_endpoint(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-dangling").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e_stale = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    let mut tx = pool.begin().await.expect("begin");
+    set_ref_check(&mut tx, false).await;
+    let e_dangling: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'frame', $2, 'agent', 'relates_to') RETURNING id",
+    )
+    .bind(frame)
+    .bind(Uuid::new_v4())
+    .fetch_one(&mut *tx)
+    .await
+    .expect("insert an edge onto an agent that does not exist");
+    // The pre-258 stamps (the frame counted as public).
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = ANY($1)",
+    )
+    .bind([e_stale, e_dangling].as_slice())
+    .bind(WORLD)
+    .execute(&mut *tx)
+    .await
+    .expect("force the pre-258 world-owned stamps");
+    set_ref_check(&mut tx, true).await;
+    tx.commit().await.expect("commit");
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "one dangling edge must not abort the arm; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("re-met 1 edge(s)")
+            && stdout.contains("1 skipped with a dangling endpoint")
+            && stdout.contains("relates_to\tskipped: dangling endpoint\t1"),
+        "stdout:\n{stdout}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_stale).await,
+        ("group".to_string(), group_g, None),
+        "the other stale edge is still re-met"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e_dangling).await,
+        ("public".to_string(), WORLD, None),
+        "the dangling edge is not written"
+    );
+
+    let (code, stderr) = run_backfill(&pool, &["verify"]).await;
+    assert_eq!(code, 1, "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("1 edge(s) with a non-public frame") && stderr.contains("no longer exists"),
+        "verify names the dangling edge and its own remediation; stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("are not on their endpoints' meet (migration 258)"),
+        "and does not send it to the arm that skips it; stderr:\n{stderr}"
+    );
+}
+
+/// Below migration 258 the registry arm refuses to WRITE when asked for by
+/// name: the database's own re-meets still meet a registry row as public
+/// there, and 258's section 4 performs this re-meet when it applies. Its dry
+/// run is allowed and is the pre-migration measurement.
+///
+/// Verified to fail without the gate: the arm re-meets the edge and exits 0.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_registry_arm_refuses_to_write_before_migration_258(pool: PgPool) {
+    let (agent_g, group_g) = fixture::seed_agent_with_group(&pool, "registry-pre").await;
+    let public = seed_public_claim_owned_by(&pool, agent_g, group_g, "public near a frame").await;
+    let frame = seed_private_frame(&pool, group_g).await;
+    let e = seed_typed_edge(&pool, (public, "claim"), (frame, "frame")).await;
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE id = $1",
+    )
+    .bind(e)
+    .bind(WORLD)
+    .execute(&pool)
+    .await
+    .expect("force the pre-258 world-owned stamp");
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/258-undo.sql"),
+    )
+    .expect("read 258's undo runbook");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("undo 258's function bodies");
+
+    let (code, stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+            "--dry-run",
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 0,
+        "the dry run is allowed below 258; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("would re-meet 1 edge(s)") && stdout.contains("258 is not applied"),
+        "and is labelled as the pre-migration measurement; stdout:\n{stdout}"
+    );
+
+    let (code, _stdout, stderr) = run_backfill_out(
+        &pool,
+        &[
+            "run",
+            "--legacy-owner",
+            "operator",
+            "--entity",
+            "registry-edges",
+        ],
+    )
+    .await;
+    assert_ne!(code, 0, "below 258 the write is refused; stderr:\n{stderr}");
+    assert!(
+        stderr.contains("migration 258") && stderr.contains("has not been applied"),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(
+        edge_tuple(&pool, e).await,
+        ("public".to_string(), WORLD, None),
+        "and nothing is written"
+    );
+}
