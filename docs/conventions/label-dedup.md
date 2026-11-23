@@ -28,7 +28,8 @@ it that way:
   `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` (comma-separated, read once at startup;
   empty refuses every family, `FAMILY_NOT_ALLOWED`).
 
-Both checks are decided from the profile alone, before any read.
+Both checks are decided from the profile alone, before any family is read.
+(A `profile_claim_id` profile is itself read first, as the caller; see below.)
 
 Not sure label dedup is the right tool? See
 [duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md).
@@ -74,7 +75,11 @@ On stdio:
 `profile_claim_id` names a profile stored in the graph: a claim whose
 `content` is the profile's exact bytes (store it with `submit_claim`, which
 keeps content verbatim; the claim content limit, 64 KiB, bounds a stored
-profile). Then:
+profile). Pass `novelty_threshold: 0.0` when storing it: at the default
+threshold the semantic novelty gate can answer with an existing near-identical
+claim (an earlier revision of the profile, possibly another author's) and
+write nothing, and the next plan then fails `PROFILE_HASH_MISMATCH`. Use the
+`claim_id` that call returns. Then:
 
 - The claim is read as the caller, on a connection stamped from the caller's
   viewer. A claim the caller cannot read gives the same `PROFILE_NOT_FOUND`
@@ -399,7 +404,7 @@ Tool errors carry `data.code`:
 - `PROFILE_NOT_FOUND`
 - `PROFILE_TOO_LARGE`
 - `PROFILE_SOURCE_REQUIRED`
-- `PROFILE_CLAIM_DEFERRED`
+- `PROFILE_CLAIM_REFUSED` (stdio, `profile_claim_id` with no pin)
 - `PROFILE_HASH_MISMATCH`
 - `PROFILE_SCHEMA_INVALID`
 - `INVALID_ARGUMENT`
@@ -414,7 +419,7 @@ Tool errors carry `data.code`:
   refused here)
 - `TRUNCATED` (probe)
 - `FAMILY_NOT_INDEX`, `FAMILY_NOT_ALLOWED` (plan, apply and probe, before any
-  read; revert and the index view take no profile)
+  family read; revert and the index view take no profile)
 - `ADMIN_CONNECTION_REQUIRED`, `UNMARK_REFUSED` (revert)
 
 Apply's `TRUNCATED`, `RESOURCE_CAP` and `PLAN_DRIFT` are a `refused` status, not

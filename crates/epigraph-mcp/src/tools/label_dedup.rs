@@ -7,7 +7,8 @@
 //! one by one with `mark_duplicate`. Every family a profile names must be
 //! declared `family_kind: "index"` (`FAMILY_NOT_INDEX`) and be on this
 //! server's allowlist, [`INDEX_FAMILIES_ENV`] (`FAMILY_NOT_ALLOWED`; empty
-//! refuses every family), decided from the profile alone, before any read.
+//! refuses every family), decided from the profile alone, before any family
+//! read (a `profile_claim_id` profile is itself read first, as the caller).
 //!
 //! # The profile
 //!
@@ -607,9 +608,9 @@ async fn prepare(
 }
 
 /// Every family the profile names must be declared an index and be on this
-/// server's allowlist, decided from the profile alone, before any read: label
-/// dedup is bookkeeping on an operational index and must never be pointed at
-/// a family of knowledge claims.
+/// server's allowlist, decided from the profile alone, before any family
+/// read: label dedup is bookkeeping on an operational index and must never be
+/// pointed at a family of knowledge claims.
 fn check_families(
     profile: &LabelDedupProfile,
     allowed: &std::collections::BTreeSet<String>,
