@@ -2003,3 +2003,100 @@ async fn a_compound_hypothesis_reads_one_frame_either_side_of_promotion(pool: Pg
         );
     }
 }
+
+// ── profile identity (addendum §3.1, backlog dc32b884 part 4) ──────────────
+
+/// Every view reports the profile identity `{name, hash}` of the lens it was
+/// read under: an atom read `Axiom`, `Legacy` or `Unproven`, a derived
+/// compound and a spine profile all carry the lens context's
+/// `profile_identity()`. The lens is a perspective whose `belief_profile`
+/// override moves one hashed parameter, so its hash differs from the global
+/// read's, and the global read of the same claims reports the global hash.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_view_reports_the_profile_identity_of_its_lens(pool: PgPool) {
+    let author = agent(&pool).await;
+    let evidenced = claim(&pool, author, "identity evidenced leaf").await;
+    store(
+        &pool,
+        evidenced,
+        Row::plain(agent(&pool).await),
+        serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    let legacy = claim(&pool, author, "identity legacy leaf").await;
+    set_cache(&pool, legacy, 0.4, 0.7, 0.55, 0.1).await;
+    let unproven = claim(&pool, author, "identity unproven leaf").await;
+
+    let k = claim(&pool, author, "identity compound").await;
+    let section = claim(&pool, author, "identity section").await;
+    set_level(&pool, section, "1").await;
+    for parent in [k, section] {
+        for leaf in [evidenced, legacy, unproven] {
+            decompose(&pool, parent, leaf).await;
+        }
+    }
+
+    let lens = PerspectiveRepository::create(
+        &pool,
+        "identity lens",
+        None,
+        None,
+        Some("analytical"),
+        &[],
+        None,
+        None,
+    )
+    .await
+    .expect("perspective");
+    // A hashed parameter no fold consumes yet: the identity must move even
+    // though no value does.
+    sqlx::query(
+        "UPDATE perspectives SET properties = COALESCE(properties, '{}'::jsonb) \
+         || '{\"belief_profile\": {\"testimonial_ceiling\": 0.3}}'::jsonb WHERE id = $1",
+    )
+    .bind(lens.id)
+    .execute(&pool)
+    .await
+    .expect("perspective override");
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let lens_ctx = FramedBeliefContext::for_perspective(&pool, &viewer, Some(lens.id))
+        .await
+        .expect("lens context");
+    let global_ctx = FramedBeliefContext::global();
+    let lensed = lens_ctx.profile_identity();
+    let global = global_ctx.profile_identity();
+    assert_ne!(
+        lensed.hash, global.hash,
+        "fixture: the perspective override must move the resolved hash"
+    );
+    assert_eq!(lensed.name, global.name);
+
+    for (ctx, want) in [(&lens_ctx, &lensed), (&global_ctx, &global)] {
+        let mut conn = pool.acquire().await.expect("conn");
+        let atoms = atom_belief_view_batch(&mut conn, &viewer, &[evidenced, legacy, unproven], ctx)
+            .await
+            .expect("atom views");
+        drop(conn);
+        let compounds = derive_as(&pool, &viewer, &[k, section], ctx).await;
+        for (id, basis) in [
+            (evidenced, Basis::Axiom),
+            (legacy, Basis::Legacy),
+            (unproven, Basis::Unproven),
+        ] {
+            let v = &atoms[&id];
+            assert_eq!(v.basis, basis, "fixture");
+            assert_eq!(&v.profile_identity, want, "{basis:?} atom");
+        }
+        for (id, basis) in [(k, Basis::Derived), (section, Basis::Profile)] {
+            let v = &compounds[&id];
+            assert_eq!(v.basis, basis, "fixture");
+            assert_eq!(&v.profile_identity, want, "{basis:?} compound");
+        }
+        // On the wire, beside (not in place of) the spine's leaf profile.
+        let j = serde_json::to_value(&compounds[&section]).expect("serialize");
+        assert_eq!(j["profile_identity"]["hash"], want.hash.as_str());
+        assert_eq!(j["profile_identity"]["name"], want.name.as_str());
+        assert_eq!(j["profile"]["rule"], "profile_v1");
+    }
+}

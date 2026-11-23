@@ -49,7 +49,7 @@ use crate::atom_items::{
     atom_axiom_rows, atom_fold_under, key_and_discount, read_rows, reads_this_side_of_promotion,
     AxiomClass, AxiomMode, AxiomRow,
 };
-use crate::belief_profile::BeliefProfile;
+use crate::belief_profile::{BeliefProfile, ProfileIdentity};
 use crate::belief_query::FramedBeliefContext;
 use crate::belief_view::{
     compound_ready, Basis, BeliefView, DerivedBelief, Envelope, InputSummary, LeafProfile,
@@ -71,6 +71,8 @@ struct AtomInputs {
     rows: HashMap<Uuid, Vec<AxiomRow>>,
     caches: HashMap<Uuid, AtomCache>,
     profile: BeliefProfile,
+    /// The lens's profile identity, which every view of this read reports.
+    identity: ProfileIdentity,
 }
 
 impl AtomInputs {
@@ -94,6 +96,7 @@ impl AtomInputs {
             rows,
             caches,
             profile: ctx.profile().clone(),
+            identity: ctx.profile_identity(),
         })
     }
 
@@ -129,6 +132,7 @@ impl AtomInputs {
                         items: f.items(),
                         legacy_compound_edge_items: count_compound_edge_keys(rows),
                     },
+                    profile_identity: self.identity.clone(),
                 }
             }
             LeafState::Legacy => {
@@ -144,6 +148,7 @@ impl AtomInputs {
                     profile: None,
                     rule_version: LEGACY_RULE,
                     inputs: InputSummary::default(),
+                    profile_identity: self.identity.clone(),
                 }
             }
             LeafState::Unproven => BeliefView {
@@ -157,6 +162,7 @@ impl AtomInputs {
                 profile: None,
                 rule_version: AEF_RULE,
                 inputs: InputSummary::default(),
+                profile_identity: self.identity.clone(),
             },
         })
     }
@@ -968,6 +974,7 @@ fn derived_view(
             items: served.items,
             legacy_compound_edge_items: served.compound_edges,
         },
+        profile_identity: inputs.identity.clone(),
     })
 }
 
@@ -1045,5 +1052,6 @@ fn profile_view(
             items: q.items.len(),
             legacy_compound_edge_items: q.compound_edges,
         },
+        profile_identity: inputs.identity.clone(),
     })
 }

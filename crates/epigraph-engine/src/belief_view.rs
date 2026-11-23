@@ -291,6 +291,29 @@ pub struct BeliefView {
     pub rule_version: &'static str,
     /// What went into it.
     pub inputs: InputSummary,
+    /// The belief profile the read was resolved under (addendum §3.1, SPEC
+    /// §3.5 `BeliefView.profile`): the named global profile and the hash of
+    /// the lens context's RESOLVED parameters
+    /// ([`crate::belief_query::FramedBeliefContext::profile_identity`]).
+    ///
+    /// On the wire it is `profile_identity`, not `profile`: `profile` is
+    /// already the spine compound's [`LeafProfile`]. Every view of one read
+    /// carries the same identity; a `Legacy` view's numbers come from the
+    /// kept cache, not from this profile (its `basis` says so).
+    ///
+    /// The hash is of the context's resolved profile
+    /// ([`crate::belief_query::FramedBeliefContext::profile`]). Two limits:
+    /// - An atom row's OWN frame tier is resolved per row
+    ///   (`FramedBeliefContext::profile_for_frame`, used by the discount) and
+    ///   is not in the hash, so (rows, hash) does not reproduce the value of
+    ///   an atom whose frames carry overrides.
+    /// - A context that carries a frame tier of its own
+    ///   (`FramedBeliefContext::resolve`) hashes that tier, and the atom fold
+    ///   reads it for the combination threshold, but the per-row discount
+    ///   does not. The view builders' callers pass `FramedBeliefContext::global`
+    ///   or `FramedBeliefContext::for_perspective`, which carry no frame tier,
+    ///   so for them the hash is exactly the global and perspective tiers.
+    pub profile_identity: crate::belief_profile::ProfileIdentity,
 }
 
 /// What `get_belief` serves for `EPIGRAPH_COMPOUND_BELIEF` (SPEC §7.1,
@@ -411,6 +434,10 @@ mod tests {
             profile: None,
             rule_version: AEF_RULE,
             inputs: InputSummary::default(),
+            profile_identity: crate::belief_profile::ProfileIdentity {
+                name: crate::belief_profile::DEFAULT_PROFILE_NAME.to_string(),
+                hash: String::new(),
+            },
         };
         let j = serde_json::to_value(&v).expect("serialize");
         assert_eq!(j["basis"], "unproven");

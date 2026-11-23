@@ -46,6 +46,16 @@
 //! removes a map entry. An override that names an unknown parameter, has the
 //! wrong type, or carries a number outside its range is REJECTED as a whole
 //! tier (with a warning) and the tier below stands; it never fails a read.
+//! The same check runs when a frame's object is WRITTEN
+//! ([`set_frame_overrides`]), which refuses it; the repo layer's generic
+//! frame-property setter refuses the key altogether. A perspective's object
+//! has no write path in code (only the fixed reliability maps do).
+//! [`set_frame_overrides`] has no production caller either (no API route,
+//! MCP tool or CLI writes a frame's object today), so an object written with
+//! raw SQL is still unchecked until it is read; a database-side check needs a
+//! migration, and a production writer must first settle how a profile change
+//! reaches the cached beliefs (see the cache-event note on
+//! [`set_frame_overrides`]).
 //!
 //! # Where it applies
 //!
@@ -64,6 +74,41 @@
 //! RESOLVED parameters (map keys sorted, `-0.0` read as `0.0`), so a served
 //! value can be recomputed from (rows, profile hash). The profile's name is not
 //! a parameter and is not hashed.
+//!
+//! # Numbers outside the profile
+//!
+//! Some belief-adjacent numbers are deliberately NOT parameters here, and some
+//! are not here YET. Kept apart on purpose (backlog dc32b884, part 2), so a
+//! deferral is never read as a decision:
+//!
+//! **Stay outside, with the reason:**
+//! - *Request defaults for `min_truth`* (MCP `recall` 0.3, workflow finds
+//!   0.3, REST RAG 0.7, the other read routes' own defaults). They are
+//!   read-surface filters the caller can override per request and that tool
+//!   schemas and the OpenAPI document publish; they do not shape any belief
+//!   value, only which already-served values a page returns. Several are the workflow deprecation gate (a deprecated step is
+//!   written at truth 0.05, the default hides it at 0.3), an API contract, not
+//!   an epistemic parameter. Making them follow a lens would make an API
+//!   default vary with the profile, which nothing asks for.
+//! - *Conformal quantiles* (`calibration.toml` `[conformal]`,
+//!   [`crate::classifier::classify_conformal`]). No served value or write path
+//!   reads them today; they are fit offline and label a value, they do not
+//!   compute one. Revisit if a surface starts serving the conformal set.
+//!
+//! **Deferred (real belief numbers outside the hash; each needs its own
+//! change, because adding a parameter moves every profile hash and the golden
+//! pins):**
+//! - *The `RestrictionProfile::scientific` transmission factors*
+//!   (`crate::sheaf`). The edge-factor write path and the compound `not_all`
+//!   valuation read the factor values (the atom fold reads only the
+//!   relationship classification), so a profile change cannot move them and
+//!   the profile hash does not cover them. The sheaf
+//!   tools also select a second named set (`regulatory`), which a move must
+//!   reconcile with the profile's own naming.
+//! - *Section tier weights* (`calibration.toml` `[section_tier_weights]`,
+//!   read by [`crate::bba::build_bba_directed`] on the REST assess write
+//!   path). Configurable through the calibration but not hashed; they belong
+//!   in [`CalibrationTables`] beside the methodology and journal tables.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -80,8 +125,10 @@ use crate::edge_factor::PerspectiveReliability;
 pub const DEFAULT_PROFILE_NAME: &str = "opinionated-v1";
 
 /// Key of the override object in `frames.properties` and
-/// `perspectives.properties`.
-pub const PROFILE_PROPERTY_KEY: &str = "belief_profile";
+/// `perspectives.properties`. The repo layer's generic frame-property setter
+/// refuses this key ([`epigraph_db::FrameRepository::BELIEF_PROFILE_KEY`]);
+/// [`set_frame_overrides`] is the validated write.
+pub const PROFILE_PROPERTY_KEY: &str = epigraph_db::FrameRepository::BELIEF_PROFILE_KEY;
 
 /// Domain separator for the profile hash; bump the version when the
 /// canonical encoding changes.
@@ -437,6 +484,54 @@ pub enum ProfileError {
         value: f64,
         range: &'static str,
     },
+}
+
+/// Why [`set_frame_overrides`] refused a write.
+#[derive(Debug, thiserror::Error)]
+pub enum OverrideWriteError {
+    /// The object is one the read path would reject (and ignore with a
+    /// warning); nothing was written.
+    #[error("belief_profile override refused: {0}")]
+    Invalid(#[from] ProfileError),
+    /// The frame write itself failed (unknown frame, refused write, ...).
+    #[error(transparent)]
+    Db(#[from] epigraph_db::DbError),
+}
+
+/// Check an override object exactly as the read path will apply it: as a
+/// merge patch over the served profile ([`BeliefProfile::served`], the base
+/// every frame and perspective tier is resolved over), rejected whole on an
+/// unknown parameter, a wrong type, a number out of range, `lens`, or a
+/// non-object. An object this accepts is one the read path applies.
+///
+/// # Errors
+/// The [`ProfileError`] the read path would log and ignore.
+pub fn validate_overrides(overrides: &Value) -> Result<(), ProfileError> {
+    BeliefProfile::served()
+        .with_overrides(overrides)
+        .map(|_| ())
+}
+
+/// Write a frame's `belief_profile` override object, refusing one the read
+/// path would ignore ([`validate_overrides`]) so an invalid object can no
+/// longer be stored and then silently skipped at every read (backlog
+/// dc32b884). The object is stored verbatim, replacing any previous one.
+///
+/// A frame override moves the frame tier of the SERVED cache, so changing it
+/// is a cache event: the frame's cached beliefs keep the old tier until they
+/// are recomputed.
+///
+/// # Errors
+/// [`OverrideWriteError::Invalid`] with nothing written, or
+/// [`OverrideWriteError::Db`] from the write.
+pub async fn set_frame_overrides(
+    pool: &epigraph_db::PgPool,
+    frame_id: uuid::Uuid,
+    overrides: &Value,
+) -> Result<(), OverrideWriteError> {
+    validate_overrides(overrides)?;
+    epigraph_db::FrameRepository::set_validated_belief_profile(pool, frame_id, overrides).await?;
+    Ok(())
 }
 
 /// The frame tier's inputs: the generic override object and the two
