@@ -434,7 +434,7 @@ async fn run_targeted(
         println!(
             "PREDICT ({}): would_rewrite={} unchanged={} held={:?} would_remove={} \
              would_vacate={} cycle_unconverged={} not_selectable={} scc_sizes={:?} \
-             converged={} passes={}",
+             mass_unreadable={} converged={} passes={}",
             report.seed_mode,
             report.totals.would_rewrite,
             report.totals.unchanged,
@@ -444,6 +444,7 @@ async fn run_targeted(
             report.totals.cycle_unconverged,
             report.totals.not_selectable,
             report.totals.scc_sizes,
+            report.totals.mass_unreadable,
             report.converged,
             report.passes.len()
         );

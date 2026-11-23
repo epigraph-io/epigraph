@@ -645,6 +645,12 @@ pub struct PredictedEdge {
     /// it to that width (E-c, a stale open-world value).
     #[serde(default)]
     pub ow_clamped: bool,
+    /// A row the diffs above read is not a JSON object of numeric masses
+    /// (the stored `masses` does not parse, or a focal mass is not a
+    /// number): its `d_row_*` is `None` although a baseline exists, so this
+    /// flag, not a missing number, says why.
+    #[serde(default)]
+    pub mass_unreadable: bool,
 }
 
 /// One target the predict touched, binary frame.
@@ -706,6 +712,9 @@ pub struct PredictTotals {
     /// finite-epsilon run from an exact fixed point.
     #[serde(default)]
     pub scc_sizes: Vec<usize>,
+    /// Edges whose [`PredictedEdge::mass_unreadable`] is set.
+    #[serde(default)]
+    pub mass_unreadable: usize,
 }
 
 /// How many movers [`PredictTotals::top_movers`] lists.
@@ -720,21 +729,22 @@ pub struct Mover {
 }
 
 /// The largest absolute difference between two edge rows' focal masses (an
-/// absent focal set is mass 0); a non-numeric mass is a difference of NaN.
+/// absent focal set is mass 0). `None` when either side is not a JSON
+/// object or a focal mass is not a finite number: an unreadable row has no
+/// difference, and never reads as a clean 0.
 #[must_use]
-pub fn max_abs_mass_diff(a: &serde_json::Value, b: &serde_json::Value) -> f64 {
-    let mass = |v: &serde_json::Value, k: &str| -> f64 {
-        v.get(k).map_or(0.0, |m| m.as_f64().unwrap_or(f64::NAN))
+pub fn max_abs_mass_diff(a: &serde_json::Value, b: &serde_json::Value) -> Option<f64> {
+    let (oa, ob) = (a.as_object()?, b.as_object()?);
+    let mass = |o: &serde_json::Map<String, serde_json::Value>, k: &str| -> Option<f64> {
+        match o.get(k) {
+            None => Some(0.0),
+            Some(m) => m.as_f64().filter(|x| x.is_finite()),
+        }
     };
-    let keys: BTreeSet<&String> = a
-        .as_object()
-        .into_iter()
-        .chain(b.as_object())
-        .flat_map(|o| o.keys())
-        .collect();
-    keys.into_iter()
-        .map(|k| (mass(a, k) - mass(b, k)).abs())
-        .fold(0.0, f64::max)
+    let keys: BTreeSet<&String> = oa.keys().chain(ob.keys()).collect();
+    keys.into_iter().try_fold(0.0_f64, |acc, k| {
+        Some(acc.max((mass(oa, k)? - mass(ob, k)?).abs()))
+    })
 }
 
 /// [`PredictTotals::top_movers`]: the `n` targets with the largest |d_edge|,
@@ -1046,6 +1056,7 @@ pub async fn predict_targeted_rewire(
                 d_row_cal: None,
                 d_row_other: None,
                 ow_clamped: false,
+                mass_unreadable: false,
             };
             if accepted
                 .as_ref()
@@ -1100,14 +1111,16 @@ pub async fn predict_targeted_rewire(
                 .source
                 .is_some_and(|(b, p, ow)| ow.is_some_and(|ow| ow > (p - b).max(0.0) + 1e-12));
             if let Some(p0) = &d.p0 {
-                out.d_row_cal =
-                    d.p1.as_ref()
-                        .map(|p1| max_abs_mass_diff(&p1.masses_json, &p0.masses_json));
-                out.d_row_other = d
-                    .stored
-                    .as_ref()
-                    .and_then(|st| serde_json::from_str::<serde_json::Value>(&st.masses).ok())
-                    .map(|m_s| max_abs_mass_diff(&p0.masses_json, &m_s));
+                if let Some(p1) = &d.p1 {
+                    out.d_row_cal = max_abs_mass_diff(&p1.masses_json, &p0.masses_json);
+                    out.mass_unreadable |= out.d_row_cal.is_none();
+                }
+                if let Some(st) = &d.stored {
+                    out.d_row_other = serde_json::from_str::<serde_json::Value>(&st.masses)
+                        .ok()
+                        .and_then(|m_s| max_abs_mass_diff(&p0.masses_json, &m_s));
+                    out.mass_unreadable |= out.d_row_other.is_none();
+                }
             }
             if let Some(p1) = &d.p1 {
                 out.p1_masses = Some(p1.masses_json.clone());
@@ -1207,6 +1220,7 @@ pub async fn predict_targeted_rewire(
         .map(|e| (e.source_id, e.target_id))
         .collect();
     totals.scc_sizes = cycle_sizes(&reached);
+    totals.mass_unreadable = edges_out.iter().filter(|e| e.mass_unreadable).count();
     for p in &passes {
         totals.would_rewrite += p.rewired;
         totals.unchanged += p.unchanged;
@@ -1322,9 +1336,26 @@ mod tests {
     fn max_abs_mass_diff_takes_an_absent_focal_set_as_zero() {
         let a = serde_json::json!({"0": 0.6, "1": 0.1, "0,1": 0.3});
         let b = serde_json::json!({"0": 0.5, "0,1": 0.5});
-        assert!((max_abs_mass_diff(&a, &b) - 0.2).abs() < 1e-12);
-        assert!((max_abs_mass_diff(&b, &a) - 0.2).abs() < 1e-12);
-        assert_eq!(max_abs_mass_diff(&a, &a), 0.0);
+        assert!((max_abs_mass_diff(&a, &b).unwrap() - 0.2).abs() < 1e-12);
+        assert!((max_abs_mass_diff(&b, &a).unwrap() - 0.2).abs() < 1e-12);
+        assert_eq!(max_abs_mass_diff(&a, &a), Some(0.0));
+    }
+
+    /// A non-numeric mass (a string, a JSON null) or a side that is not an
+    /// object has no difference: `None`, never a clean-looking 0 (an `f64`
+    /// fold with `f64::max` drops a NaN and read 0.0 here).
+    #[test]
+    fn max_abs_mass_diff_has_no_difference_for_an_unreadable_row() {
+        let good = serde_json::json!({"0": 0.5, "0,1": 0.5});
+        for bad in [
+            serde_json::json!({"0": "x", "0,1": 0.5}),
+            serde_json::json!({"0": null, "0,1": 0.5}),
+            serde_json::json!([0.5, 0.5]),
+            serde_json::json!("0.5"),
+        ] {
+            assert_eq!(max_abs_mass_diff(&bad, &good), None, "{bad}");
+            assert_eq!(max_abs_mass_diff(&good, &bad), None, "{bad}");
+        }
     }
 
     fn target(d_edge: Option<f64>) -> PredictedTarget {

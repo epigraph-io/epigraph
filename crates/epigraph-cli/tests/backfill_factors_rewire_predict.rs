@@ -852,6 +852,7 @@ async fn predict_reports_row_components_movers_and_unselectable_edges(pool: PgPo
     );
     assert!(ab.d_row_cal.expect("ab has a baseline") > 1e-3, "{ab:?}");
     assert!(!ab.ow_clamped, "{ab:?}");
+    assert!(!ab.mass_unreadable, "{ab:?}");
     let held = edge(ch.held_edge);
     assert_eq!(held.outcome, "row_mixed");
     assert!(
@@ -879,6 +880,7 @@ async fn predict_reports_row_components_movers_and_unselectable_edges(pool: PgPo
     assert_eq!(report.passes[0].not_selectable, 1, "{:?}", report.passes);
     assert_eq!(report.totals.not_selectable, 1, "{:?}", report.totals);
     assert!(report.totals.scc_sizes.is_empty(), "{:?}", report.totals);
+    assert_eq!(report.totals.mass_unreadable, 0, "{:?}", report.totals);
 
     let movers: Vec<Uuid> = report
         .totals
