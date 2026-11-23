@@ -945,14 +945,26 @@ async fn a_lineage_larger_than_one_page_reads_fully_across_pages(pool: PgPool) {
         assert_eq!(rows, all, "limit {limit}: every row once");
     }
 
-    let (status, body) = get_json(
-        &state,
-        operator,
-        &["claims:read"],
-        &format!("/api/v1/agents/{agent}/prompt-history?after=not-a-cursor"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    for bad in [
+        "not-a-cursor".to_string(),
+        // A position no row has: past the walk's depth (and `abs()` overflow
+        // in the definer), and an instant `timestamptz` cannot hold.
+        format!("-2147483648_{}", agent.simple()),
+        format!(
+            "1_{}_-220000000000000000_{}",
+            agent.simple(),
+            agent.simple()
+        ),
+    ] {
+        let (status, body) = get_json(
+            &state,
+            operator,
+            &["claims:read"],
+            &format!("/api/v1/agents/{agent}/prompt-history?after={bad}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
 }
 
 /// Registers a chain of `n` generations in one group, each succeeding the

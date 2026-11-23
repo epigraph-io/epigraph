@@ -260,17 +260,27 @@ impl PromptHistoryCursor {
         }
     }
 
-    /// The inverse of [`Self::encode`]; `None` for anything it did not write.
+    /// The inverse of [`Self::encode`]; `None` for anything it did not write,
+    /// including a position no row can have: a depth past the walk's 64
+    /// generations (which would also overflow the definer's `abs()` at
+    /// `i32::MIN`) or an instant outside years 1..=9999 (`timestamptz` rejects
+    /// some instants chrono accepts).
     #[must_use]
     pub fn decode(raw: &str) -> Option<Self> {
+        use chrono::Datelike;
+        const MAX_DEPTH: u32 = 64;
         let parts: Vec<&str> = raw.split('_').collect();
         let (depth, agent) = match parts.as_slice() {
             [d, a] | [d, a, _, _] => (d.parse::<i32>().ok()?, Uuid::try_parse(a).ok()?),
             _ => return None,
         };
+        if depth.unsigned_abs() > MAX_DEPTH {
+            return None;
+        }
         let snapshot = match parts.as_slice() {
             [_, _, at, id] => Some((
-                DateTime::from_timestamp_micros(at.parse::<i64>().ok()?)?,
+                DateTime::from_timestamp_micros(at.parse::<i64>().ok()?)
+                    .filter(|t| (1..=9999).contains(&t.year()))?,
                 Uuid::try_parse(id).ok()?,
             )),
             _ => None,
@@ -860,6 +870,9 @@ mod tests {
             &format!("{good}_extra"),
             "1_00000000000000000000000000000000_123",
             "1_00000000000000000000000000000000_nan_00000000000000000000000000000000",
+            "-2147483648_00000000000000000000000000000000",
+            "65_00000000000000000000000000000000",
+            "1_00000000000000000000000000000000_-220000000000000000_00000000000000000000000000000000",
         ] {
             assert_eq!(PromptHistoryCursor::decode(bad), None, "{bad:?}");
         }
