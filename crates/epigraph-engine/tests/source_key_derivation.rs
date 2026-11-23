@@ -299,6 +299,27 @@ async fn decomposes_to_is_walked_upward_only(pool: PgPool) {
     assert!(ks.paper_anchored && kt.paper_anchored);
 }
 
+/// 9da3cf2b review: the closure's upward `decomposes_to` step. `para` reaches
+/// paper P only through `x -continues_argument-> para`; its atom has no
+/// lateral edge and no paper-asserted ancestor, so walk 1 (the ancestry)
+/// finds nothing and only walk 2 climbing `atom -> para` and then crossing to
+/// `x` resolves P. (Mutation: drop `'decomposes_to'` from the closure's
+/// reverse branch and the atom resolves no paper.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn closure_climbs_decomposes_to_from_an_unanchored_parent(pool: PgPool) {
+    let p = insert_paper(&pool, "10.9/p").await;
+    let x = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, p, x).await;
+    let para = claim_by_fresh_agent(&pool).await;
+    let atom = claim_by_fresh_agent(&pool).await;
+    insert_claim_edge(&pool, x, para, "continues_argument").await;
+    insert_claim_edge(&pool, para, atom, "decomposes_to").await;
+
+    let k = derive_source_key(&pool, atom).await.expect("derive atom");
+    assert_eq!(k.paper_dois, vec!["10.9/p".to_string()]);
+    assert!(!k.paper_anchored);
+}
+
 /// 9da3cf2b review: folding the closure into `paper_dois` must not let a
 /// non-paper claim escape the same-agent rule. One agent writes two non-paper
 /// claims `m1` and `m2`; `m1` gets a `same_source` edge to a claim of paper
