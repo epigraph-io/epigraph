@@ -549,19 +549,23 @@ async fn recall_with_context_measures_diversity_in_the_retrieved_dim(pool: PgPoo
 /// A hit that another filter is about to drop must not be allowed to SUPPRESS
 /// one that would have survived.
 ///
-/// `recall_with_context` applies `min_truth` after context assembly, while the
-/// diversity pass runs on the seed set. Order them naively and a low-truth
-/// paragraph ranked first can evict its high-truth near-duplicate, and then be
-/// dropped itself by `min_truth` — so switching on a DE-DUPLICATION filter
-/// deletes the good paragraph and returns an empty page, when the same query
-/// without it returns the good one.
+/// The diversity pass keeps a hit only if no hit ranked above it is within
+/// `diversity_radius`. Run it before a filter that drops hits AFTER context
+/// assembly and a doomed paragraph ranked first can evict its good
+/// near-duplicate, then be dropped itself, so switching on a DE-DUPLICATION
+/// filter deletes the good paragraph and returns an empty page, when the same
+/// query without it returns the good one.
 ///
-/// `near_low` is embedded exactly on the query vector so it ranks first;
-/// `near_high` is its near-duplicate one rank down. `min_truth=0.5` sits
-/// between their truth values.
+/// The doomed filter here is `exclude_contested`: it reads the dispute batch,
+/// which runs over the assembled page. (`min_truth` used to play this role,
+/// but since backlog d830c073 it drops hits before the cut to `limit`, so a
+/// floored hit never reaches the radius pass and cannot pin this ordering.)
 ///
-/// `recall`'s twin below pins the same property on the other surface, where
-/// `min_truth` and `exclude_contested` already run before the diversity pass.
+/// `contested` is embedded exactly on the query vector so it ranks first, and
+/// a live `contradicts` edge marks it contested; `clean` is its near-duplicate
+/// one rank down. `min_truth=0.0` keeps the belief floor out of the picture.
+///
+/// `recall`'s twin below pins the same property on the other surface.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -569,24 +573,33 @@ async fn a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one(pool: Pg
     let paper = seed_paper(&pool, "10.9999/diversity.2").await;
     let query_vec = cluster_pgvec(3072, 0, 1.0);
 
-    let near_low = seed_paragraph_3072_at_truth(
+    let contested = seed_paragraph_3072(
         &pool,
         agent,
         paper,
-        "low-confidence paragraph on the coefficient",
-        0.2,
+        "contested paragraph on the coefficient",
         &cluster_pgvec(3072, 0, 1.0),
     )
     .await;
-    let near_high = seed_paragraph_3072_at_truth(
+    let clean = seed_paragraph_3072(
         &pool,
         agent,
         paper,
-        "high-confidence paragraph on the coefficient",
-        0.9,
+        "clean paragraph on the coefficient",
         &cluster_pgvec(3072, 0, 0.98),
     )
     .await;
+    // The contester carries no 3072 vector, so it is never itself retrieved.
+    let rebuttal = seed_claim(&pool, agent, "coefficient rebuttal", None).await;
+    sqlx::query(
+        "INSERT INTO edges (source_id, target_id, source_type, target_type, relationship)
+         VALUES ($1, $2, 'claim', 'claim', 'contradicts')",
+    )
+    .bind(rebuttal)
+    .bind(contested)
+    .execute(&pool)
+    .await
+    .expect("seed dispute edge");
 
     let server = build_test_server(pool);
     let ids = |env: &Value| -> Vec<String> {
@@ -602,31 +615,44 @@ async fn a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one(pool: Pg
             })
             .collect()
     };
-    let with_min_truth = |radius: Option<f64>| {
+    let with_exclude = |radius: Option<f64>| {
         let mut p = ctx_params(radius);
-        p.min_truth = Some(0.5);
+        p.exclude_contested = true;
         p
     };
 
-    // Baseline: `min_truth` alone drops the 0.2 paragraph and keeps the 0.9 one.
+    // Precondition: without the exclusion, the contested paragraph ranks first,
+    // so it is the hit the radius pass would keep if it ran too early.
+    let unfiltered = ids(&envelope(
+        recall_with_context_with_pgvec(&server, &viewer, ctx_params(None), 3072, &query_vec)
+            .await
+            .expect("unfiltered ok"),
+    ));
+    assert_eq!(
+        unfiltered.first(),
+        Some(&contested.to_string()),
+        "precondition: the contested paragraph ranks first. got {unfiltered:?}"
+    );
+
+    // Baseline: `exclude_contested` alone drops the contested paragraph and
+    // keeps the clean one.
     let base = ids(&envelope(
-        recall_with_context_with_pgvec(&server, &viewer, with_min_truth(None), 3072, &query_vec)
+        recall_with_context_with_pgvec(&server, &viewer, with_exclude(None), 3072, &query_vec)
             .await
             .expect("baseline ok"),
     ));
     assert_eq!(
         base,
-        vec![near_high.to_string()],
-        "precondition: without the radius, min_truth leaves exactly the 0.9 paragraph"
+        vec![clean.to_string()],
+        "precondition: without the radius, exclude_contested leaves exactly the clean paragraph"
     );
-    assert!(!base.contains(&near_low.to_string()));
 
     // Adding a de-duplication filter must not take the survivor with it.
     let filtered = ids(&envelope(
         recall_with_context_with_pgvec(
             &server,
             &viewer,
-            with_min_truth(Some(RADIUS)),
+            with_exclude(Some(RADIUS)),
             3072,
             &query_vec,
         )
@@ -634,9 +660,9 @@ async fn a_hit_another_filter_will_drop_cannot_suppress_a_surviving_one(pool: Pg
         .expect("filtered ok"),
     ));
     assert!(
-        filtered.contains(&near_high.to_string()),
+        filtered.contains(&clean.to_string()),
         "switching on diversity_radius must not delete a hit that survives every \
-         other filter, by letting a min_truth-doomed duplicate evict it first. \
+         other filter, by letting a contested duplicate evict it first. \
          base={base:?} filtered={filtered:?}"
     );
 }
