@@ -348,6 +348,34 @@ pub async fn submit_ds_evidence(
     .map_err(internal_error)?
     .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
+    // EPIGRAPH_COMPOUND_WRITE_GUARD (backlog 7435772c, SPEC §4.1 W3): these
+    // masses carry no evidence text, so on a COMPOUND they can never be
+    // attributed to its atoms. The role is decided by structure (migration
+    // 193's definer), before anything is written. `refuse` refuses with the
+    // atoms this caller can see; `warn` goes ahead (the row is inert: a
+    // compound has no cache-owner frame, so neither the recompute below nor
+    // any later owner-rule recompute folds it), tells the caller and logs it.
+    let deprecated_compound_target = match epigraph_engine::compound_write_guard::decide(
+        &mut tx,
+        viewer,
+        claim_id,
+        server.compound_write_guard,
+        "submit_ds_evidence",
+        Some(agent_id),
+    )
+    .await
+    .map_err(internal_error)?
+    {
+        epigraph_engine::compound_write_guard::GuardDecision::NotCompound => None,
+        epigraph_engine::compound_write_guard::GuardDecision::Accept(target) => {
+            warnings.push(target.warning());
+            Some(target)
+        }
+        epigraph_engine::compound_write_guard::GuardDecision::Refuse(target) => {
+            return Err(compound_target_refusal(&target));
+        }
+    };
+
     // Evidence named on `hypothesis_assessment` for a PROMOTED hypothesis goes
     // to the frame its readers read, `research_validity` (writers follow the
     // readers, operator ruling R-8; `POST /frames/:id/evidence` does the same).
@@ -805,7 +833,22 @@ pub async fn submit_ds_evidence(
         warnings,
         unknown_keys,
         unknown_locality_tag,
+        deprecated_compound_target,
     })
+}
+
+/// The `refuse`-mode answer to a textless BBA write on a compound
+/// (`EPIGRAPH_COMPOUND_WRITE_GUARD=refuse`): `INVALID_PARAMS`, the caller's
+/// remedy (write on the atoms) in the message, and the machine-keyed body
+/// the REST twin's 422 carries in `data`. Nothing was written.
+fn compound_target_refusal(
+    target: &epigraph_engine::compound_write_guard::CompoundTarget,
+) -> McpError {
+    McpError {
+        code: rmcp::model::ErrorCode::INVALID_PARAMS,
+        message: std::borrow::Cow::from(target.refusal()),
+        data: Some(target.refusal_data()),
+    }
 }
 
 /// Whether `row` already holds exactly what this call is about to store, by
