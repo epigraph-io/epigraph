@@ -12,6 +12,13 @@ For each paper claim:
   6. Frontier papers: also run an anchor pass over review-paper L2 paragraph
      embeddings; emit INSTANTIATES edges into review L2 targets.
 
+Anchor labels are built from PUBLIC text only (theme_lib.public_label_source):
+an edge's `anchor_label` is stored, not viewer-derived, so when the paper claim
+or the review L2 target is not public it gets NO_PUBLIC_SOURCE_ANCHOR_LABEL
+instead of the judge's refined label (stored_anchor_label). The judge still
+sees the text, because its verdict decides membership (theme_id and which edges
+exist), which is outside that rule.
+
 Idempotent: skip paper claims whose properties.anchored_at is set.
 Resumable: --limit + --skip-anchored cursoring.
 
@@ -42,12 +49,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _api_client import EpiGraphClient
 
 from maintenance_dsn import maintenance_dsn
+import theme_lib
 
 DEFAULT_DATABASE_URL = (
     "postgres://epigraph:epigraph@127.0.0.1:5432/epigraph"
 )
 
 JUDGE_MODEL = "claude-haiku-4-5"  # informational only; the CLI picks the model
+
+# The anchor_label stored on an INSTANTIATES edge when the paper claim or its
+# target's text is not public (stored_anchor_label). Not derived from any text.
+NO_PUBLIC_SOURCE_ANCHOR_LABEL = "unnamed-no-public-source"
 
 JUDGE_PROMPT = """\
 You are deciding whether a paper claim is an instance of a textbook concept.
@@ -104,6 +116,7 @@ def fetch_paper_claims(conn, layer: str, level: int, limit: Optional[int]) -> li
           ORDER BY orig_id, depth DESC
         )
         SELECT c.id, c.content,
+               {theme_lib.public_label_source("c")} AS public_source,
                roots.root_id AS ancestor_id,
                ancestor.properties->>'document_type' AS doc_type
         FROM roots
@@ -120,8 +133,11 @@ def fetch_paper_claims(conn, layer: str, level: int, limit: Optional[int]) -> li
 
 def hnsw_theme_candidates(conn, claim_id: str, top_k: int = 8, min_sim: float = 0.45) -> list[dict]:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # A theme's label and description are stored labels, held to the
+    # public-only rule where they are written (label_themes_llm,
+    # seed_themes_from_textbooks), so they count as a public source here.
     cur.execute(
-        "SELECT t.id, t.label, t.description, "
+        "SELECT t.id, t.label, t.description, TRUE AS public_source, "
         "       t.properties->>'source_textbook_claim_id' AS source_textbook_claim_id, "
         "       1 - (t.centroid <=> c.embedding) AS sim "
         "FROM claim_themes t, claims c "
@@ -140,6 +156,7 @@ def hnsw_review_l2_candidates(conn, claim_id: str, top_k: int = 8, min_sim: floa
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(
         "SELECT rc.id, rc.content AS label, '' AS description, "
+        f"      {theme_lib.public_label_source('rc')} AS public_source, "
         "       rc.id::text AS source_textbook_claim_id, "
         "       1 - (rc.embedding <=> c.embedding) AS sim "
         "FROM claims c, claims rc "
@@ -177,6 +194,20 @@ def judge_via_claude(paper_text: str, label: str, description: str) -> dict:
     if parsed.get("verdict") not in {"yes", "maybe", "no"}:
         raise RuntimeError(f"bad verdict: {parsed}")
     return parsed
+
+
+def stored_anchor_label(claim: dict, cand: dict, verdict: dict) -> str:
+    """The anchor_label to store on the edge from `claim` to `cand`.
+
+    The judge's refined label is derived from both texts, and its fallback
+    (the candidate's label) is, for a review L2 candidate, that paragraph's raw
+    content. So it is stored only when both the paper claim and the candidate
+    are a public source (their `public_source` column); otherwise the
+    placeholder. A dict without the flag counts as not public.
+    """
+    if claim.get("public_source") is not True or cand.get("public_source") is not True:
+        return NO_PUBLIC_SOURCE_ANCHOR_LABEL
+    return verdict.get("refined_anchor_label", cand["label"])
 
 
 def insert_instantiates_edge(api: EpiGraphClient, source_id: str, target_id: str,
@@ -282,11 +313,11 @@ def anchor_one(conn, api: EpiGraphClient, claim: dict, layer: str, top_k: int, m
         if textbook_l1:
             insert_instantiates_edge(api, cid, textbook_l1,
                                      float(primary_verdict.get("confidence", 0.5)),
-                                     primary_verdict.get("refined_anchor_label", primary_cand["label"]))
+                                     stored_anchor_label(claim, primary_cand, primary_verdict))
     else:
         insert_instantiates_edge(api, cid, primary_cand["id"],
                                  float(primary_verdict.get("confidence", 0.5)),
-                                 primary_verdict.get("refined_anchor_label", primary_cand["label"]))
+                                 stored_anchor_label(claim, primary_cand, primary_verdict))
 
     # Secondaries
     for layer_name, cand, v in yes_or_strong_maybe[1:]:
@@ -295,7 +326,7 @@ def anchor_one(conn, api: EpiGraphClient, claim: dict, layer: str, top_k: int, m
             continue
         insert_instantiates_edge(api, cid, target_id,
                                  float(v.get("confidence", 0.5)),
-                                 v.get("refined_anchor_label", cand["label"]))
+                                 stored_anchor_label(claim, cand, v))
 
     mark_anchored(api, cid)
 
