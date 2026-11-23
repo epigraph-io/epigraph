@@ -1159,6 +1159,15 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::workflows_executing_step_lineage",
         ],
     ),
+    // write (a lock): `WorkflowRepository::lock_step_lineage_for_evolve` locks the parent's step
+    // row and takes its lineage's advisory lock on the evolve's own write transaction, between
+    // two viewer-threaded `require_lineage_authority` passes (backlog bf2e9aa6); it returns
+    // nothing.
+    (
+        "evolve_step.rs",
+        "require_lineage_authority_locked",
+        &["WorkflowRepository::lock_step_lineage_for_evolve"],
+    ),
     // authority: `check_explicit_author_ids`.
     (
         "ingest_authors.rs",
@@ -1188,6 +1197,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "retract_replaced_name_nodes",
         &["AgentRepository::get_by_public_key"],
     ),
+    // write (locks): `ClaimRepository::lock_new_content_hash_agents` takes, in key order, the
+    // (content hash, ingesting agent) dedup lock of every NEW atom in the plan before the walk
+    // takes any claim row lock (backlog 5b587ae8, #1029); advisory locks only, it reads nothing.
     // write: `ClaimIngestRepository::record_signed_conn`,
     // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
     // `ClaimRepository::update_trace_id_conn`,
@@ -1207,6 +1219,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimIngestRepository::record_signed_conn",
             "ClaimIngestRepository::record_signed_conn",
+            "ClaimRepository::lock_new_content_hash_agents",
             "ClaimRepository::set_properties_conn",
             "ClaimRepository::update_labels_conn",
             "ClaimRepository::update_trace_id_conn",
@@ -1659,6 +1672,55 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::session_may_unmark_conn",
         ],
     ),
+    // opener: `claim_helper::begin_author_stamped_tx`; write: the migration 263 definers
+    // (`PersonTeamGroupRepository::create_conn` / `invite_conn` / `accept_conn` /
+    // `decline_conn`) on that author-stamped transaction, which act only for the stamped
+    // principal (a live admin of a person-made group invites; only the invitee answers) and
+    // return the ids they wrote (backlog triage T75, #1024).
+    (
+        "team_groups.rs",
+        "accept_group_invitation",
+        &[
+            "PersonTeamGroupRepository::accept_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    (
+        "team_groups.rs",
+        "create_team_group",
+        &[
+            "PersonTeamGroupRepository::create_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    (
+        "team_groups.rs",
+        "decline_group_invitation",
+        &[
+            "PersonTeamGroupRepository::decline_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    (
+        "team_groups.rs",
+        "invite_to_group",
+        &[
+            "PersonTeamGroupRepository::invite_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
+    // stamped: `PersonTeamGroupRepository::my_groups_conn` and `my_invitations_conn` run on the
+    // caller's viewer-stamped transaction (`ScopedPool::begin_as`, rolled back) and read only the
+    // stamped principal's own rows through 263's definers (its live memberships, its pending
+    // invitations).
+    (
+        "team_groups.rs",
+        "list_my_groups",
+        &[
+            "PersonTeamGroupRepository::my_groups_conn",
+            "PersonTeamGroupRepository::my_invitations_conn",
+        ],
+    ),
     // opener: `claim_helper::begin_author_stamped_tx`.
     (
         "visibility.rs",
@@ -1870,20 +1932,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "hierarchical_workflow_result",
         &["WorkflowRepository::max_generation_by_canonical"],
     ),
-    // opener: `claim_helper::begin_caller_workflow_tx`; authority:
-    // `WorkflowRepository::name_has_hidden_rows_conn`, `owner::resolve_caller_owner`; stamped:
-    // `WorkflowRepository::head_by_canonical`.
+    // opener: `claim_helper::begin_caller_workflow_tx`. Since backlog triage T85 (#1031) the
+    // match itself (the head lookups, the hidden-row and caller-owner checks) runs in
+    // `epigraph_ingest_executor::matching_workflow_conn`, which is handed the caller's viewer,
+    // on that transaction, rolled back after the read.
     (
         "workflows.rs",
         "matching_workflow",
-        &[
-            "WorkflowRepository::head_by_canonical",
-            "WorkflowRepository::head_by_canonical",
-            "WorkflowRepository::name_has_hidden_rows_conn",
-            "WorkflowRepository::name_has_hidden_rows_conn",
-            "claim_helper::begin_caller_workflow_tx",
-            "owner::resolve_caller_owner",
-        ],
+        &["claim_helper::begin_caller_workflow_tx"],
     ),
     // write: `ClaimRepository::merge_properties`. Raw pool: `merge_properties` writes the
     // `promotion` property on `server.pool` after the viewer-gated assessment (registered in
