@@ -164,10 +164,14 @@ fn assert_attested_refusal(what: &str, status: StatusCode, text: &str) {
     }
 }
 
-/// Mutation: drop `.map_err(attested_key_refusal)` from rotate's
-/// `update_status` call -> the AK02 refusal surfaces as a 500 and this fails.
-/// (Rotate's second mapping, on `store`, is unreachable here: `update_status`
-/// is refused first.)
+/// Since migration 239 (backlog 54018ca1) the rotation is ONE call of the
+/// maintenance-only definer `epigraph_agent_key_rotate`, which the application
+/// role may not execute: on the application role every rotation, attested or
+/// not, is refused 42501 before the definer's AK02 gate runs, and the route
+/// answers it as `KeyWriteRefusal::RolePrivilege` (a 403 that names the
+/// maintenance session), not the attested-key text. Nothing is written either
+/// way. Mutation: drop `.map_err(key_write_refusal)` from the rotation call ->
+/// the 42501 surfaces as a 500 and this fails.
 #[sqlx::test(migrations = "../../migrations")]
 async fn rotating_an_attested_key_on_the_application_role_is_a_403_that_writes_nothing(
     pool: PgPool,
@@ -184,7 +188,13 @@ async fn rotating_an_attested_key_on_the_application_role_is_a_403_that_writes_n
         &valid_rotation_body(agent, &old, &new),
     )
     .await;
-    assert_attested_refusal("rotate", status, &text);
+    assert_eq!(status, StatusCode::FORBIDDEN, "rotate: {text}");
+    for phrase in [
+        "agent-key rotation runs on a maintenance session",
+        "nothing was written",
+    ] {
+        assert!(text.contains(phrase), "rotate: no {phrase:?} in {text}");
+    }
 
     assert_eq!(key_rows(&pool, agent).await, before, "rotate wrote a key");
     let holding_new: i64 =
