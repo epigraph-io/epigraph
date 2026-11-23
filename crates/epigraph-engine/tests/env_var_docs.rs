@@ -16,14 +16,17 @@
 //! - an `env = "X"` argument: clap's `#[arg(env = "X")]` and the
 //!   `belief_mode!` macro's `env = "X"`;
 //! - `env::var(C)` or `env = path::C`, with `C` a `const C: &str = "X"`
-//!   defined in a scanned source;
+//!   defined in a scanned source, or an alias of one (`const C: &str =
+//!   other::D;`), followed to the literal;
 //! - any `const` whose name says it is a variable name (`ENV`, `ENV_*`,
 //!   `*_ENV`, `*_ENV_*`) holding a literal: that is how the readers that go
 //!   through a lookup closure (`from_lookup(|k| env::var(k).ok())`) name
 //!   their variables.
 //!
 //! A read whose name is computed at run time cannot be resolved from the
-//! text. Each file holding one is listed in [`DYNAMIC_READERS`] with where its
+//! text: `env::var(k)`, a clap `env = <expression>` (inside an attribute;
+//! the same spelling elsewhere is a named format or macro argument), or a
+//! constant built by a macro (`concat!`) rather than holding a literal. Each file holding one is listed in [`DYNAMIC_READERS`] with where its
 //! names come from, so a new one is a reviewed decision rather than a gap.
 //! Such a file usually wraps the environment in a lookup closure or
 //! parameter (`let var = |k| env::var(k).ok()`, `from_lookup(get)`); the
@@ -230,9 +233,14 @@ fn classify(arg: &str) -> Arg {
     }
 }
 
-/// The text between the `(` at `open` and its matching `)`, skipping string
-/// literals.
+/// The text between the `(` (or `[`) at `open` and its matching `)` (or
+/// `]`), skipping string literals.
 fn call_argument(code: &str, open: usize) -> &str {
+    let (o, cl) = if code[open..].starts_with('[') {
+        ('[', ']')
+    } else {
+        ('(', ')')
+    };
     let mut depth = 0usize;
     let mut in_str = false;
     let mut escaped = false;
@@ -249,8 +257,8 @@ fn call_argument(code: &str, open: usize) -> &str {
         }
         match c {
             '"' => in_str = true,
-            '(' => depth += 1,
-            ')' => {
+            c if c == o => depth += 1,
+            c if c == cl => {
                 depth -= 1;
                 if depth == 0 {
                     return &code[open + 1..open + k];
@@ -307,8 +315,32 @@ fn calls_of<'c>(code: &'c str, name: &str) -> Vec<&'c str> {
     out
 }
 
-/// The value of every `env = <value>` argument (`(` or `,` before `env`).
-fn env_assignments(code: &str) -> Vec<&str> {
+/// The byte ranges of the attributes (`#[…]`, `#![…]`) in `code`, inside
+/// the brackets.
+fn attribute_spans(code: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find('#') {
+        let start = from + at;
+        from = start + 1;
+        let open = if code[from..].starts_with('[') {
+            from
+        } else if code[from..].starts_with("![") {
+            from + 1
+        } else {
+            continue;
+        };
+        let inner = call_argument(code, open);
+        out.push((open + 1, open + 1 + inner.len()));
+    }
+    out
+}
+
+/// The value of every `env = <value>` argument (`(` or `,` before `env`),
+/// and whether it is inside an attribute (clap's `#[arg(env = …)]`) rather
+/// than a named argument of a call or macro (`format!("{env}", env = x)`).
+fn env_assignments(code: &str) -> Vec<(&str, bool)> {
+    let attributes = attribute_spans(code);
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = code[from..].find("env") {
@@ -330,7 +362,8 @@ fn env_assignments(code: &str) -> Vec<&str> {
             Some(inner) => inner.find('"').map_or(rest.len(), |k| k + 2),
             None => rest.find([',', ')', ']', '\n']).unwrap_or(rest.len()),
         };
-        out.push(&rest[..end]);
+        let in_attribute = attributes.iter().any(|&(a, b)| a <= start && start < b);
+        out.push((&rest[..end], in_attribute));
     }
     out
 }
@@ -396,6 +429,53 @@ fn test_module_files(rel: &str, code: &str) -> Vec<String> {
     out
 }
 
+/// What a constant used as a variable name stands for.
+#[derive(Debug, Default)]
+struct Resolved {
+    /// The literals it (or the constant it aliases) holds.
+    names: BTreeSet<String>,
+    /// It is built at run time or by a macro (`concat!`), not a literal.
+    computed: bool,
+    /// It, or a constant it aliases, is defined in no scanned source.
+    undefined: bool,
+}
+
+/// Follow `name` through `literal` (constants holding a literal) and
+/// `other` (constants holding anything else: an alias of another constant,
+/// a macro call, a macro's `$env`) to what it stands for. A literal
+/// definition wins over another definition of the same name.
+fn resolve_const(
+    name: &str,
+    literal: &BTreeMap<String, BTreeSet<String>>,
+    other: &BTreeMap<String, BTreeSet<String>>,
+) -> Resolved {
+    let mut r = Resolved::default();
+    let mut seen = BTreeSet::new();
+    let mut todo = vec![name.to_string()];
+    while let Some(k) = todo.pop() {
+        if !seen.insert(k.clone()) {
+            continue;
+        }
+        if let Some(values) = literal.get(&k) {
+            r.names.extend(values.iter().cloned());
+            continue;
+        }
+        let Some(values) = other.get(&k) else {
+            r.undefined = true;
+            continue;
+        };
+        for v in values {
+            match classify(v) {
+                Arg::Const(next) => todo.push(next),
+                // A macro's `$env`: its invocations' literals are scanned.
+                _ if v.starts_with('$') => {}
+                _ => r.computed = true,
+            }
+        }
+    }
+    r
+}
+
 /// Scan `(repository-relative path, source)` pairs; `dynamic` names the
 /// lookups of the files that compute variable names.
 fn measure(sources: &[(String, String)], dynamic: &[DynamicReader]) -> Measured {
@@ -417,13 +497,20 @@ fn measure(sources: &[(String, String)], dynamic: &[DynamicReader]) -> Measured 
     // Constants that hold a literal, and the names defined without one
     // (macro-built or aliases of another constant).
     let mut literal_consts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut other_consts: BTreeSet<String> = BTreeSet::new();
+    let mut other_consts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut m = Measured::default();
     fn read(m: &mut Measured, name: &str, rel: &str) {
         m.names
             .entry(name.to_string())
             .or_default()
             .insert(rel.to_string());
+    }
+    fn computed(m: &mut Measured, rel: &str, arg: &str) {
+        *m.dynamic.entry(rel.to_string()).or_default() += 1;
+        m.computed_args
+            .entry(rel.to_string())
+            .or_default()
+            .push(arg.split_whitespace().collect::<Vec<_>>().join(" "));
     }
     for (rel, c) in &code {
         for (name, value) in str_consts(c) {
@@ -438,14 +525,17 @@ fn measure(sources: &[(String, String)], dynamic: &[DynamicReader]) -> Measured 
                         .insert(v);
                 }
                 _ => {
-                    other_consts.insert(name.to_string());
+                    other_consts
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(value.split_whitespace().collect::<Vec<_>>().join(" "));
                 }
             }
         }
     }
     for (rel, c) in &code {
         let calls = env_var_arguments(c).into_iter().map(|a| (a, true));
-        let assigns = env_assignments(c).into_iter().map(|a| (a, false));
+        let assigns = env_assignments(c).into_iter();
         let mut lookup_args = Vec::new();
         for d in dynamic.iter().filter(|d| d.file == rel) {
             for l in d.lookups {
@@ -458,26 +548,27 @@ fn measure(sources: &[(String, String)], dynamic: &[DynamicReader]) -> Measured 
             }
         }
         let lookups = lookup_args.into_iter().map(|a| (a, true));
-        for (arg, is_call) in calls.chain(assigns).chain(lookups) {
+        // `is_read`: a call, a lookup or an attribute's `env =`; a named
+        // format or macro argument spelled `env = x` is not a read.
+        for (arg, is_read) in calls.chain(assigns).chain(lookups) {
             match classify(arg) {
                 Arg::Literal(v) => read(&mut m, &v, rel),
-                Arg::Const(k) => match literal_consts.get(&k) {
-                    Some(values) => {
-                        for v in values {
-                            read(&mut m, v, rel);
-                        }
+                Arg::Const(k) => {
+                    let r = resolve_const(&k, &literal_consts, &other_consts);
+                    for v in &r.names {
+                        read(&mut m, v, rel);
                     }
-                    None if other_consts.contains(&k) => {}
-                    None => m.unresolved.push((rel.clone(), arg.trim().to_string())),
-                },
-                // `env = $env:literal` in a macro definition is not a read.
-                Arg::Dynamic if is_call => {
-                    *m.dynamic.entry(rel.clone()).or_default() += 1;
-                    m.computed_args
-                        .entry(rel.clone())
-                        .or_default()
-                        .push(arg.split_whitespace().collect::<Vec<_>>().join(" "));
+                    if r.undefined {
+                        m.unresolved.push((rel.clone(), arg.trim().to_string()));
+                    }
+                    if r.computed && is_read {
+                        computed(&mut m, rel, arg);
+                    }
                 }
+                // A macro's `$env` (`belief_mode!`): its invocations' `env =
+                // "..."` literals are the reads.
+                Arg::Dynamic if arg.trim_start().starts_with('$') => {}
+                Arg::Dynamic if is_read => computed(&mut m, rel, arg),
                 Arg::Dynamic => {}
             }
         }
@@ -972,4 +1063,61 @@ fn a_registered_lookup_nothing_calls_is_stale() {
     let f = findings(&m, docs, &BTreeMap::new(), &reg);
     assert_eq!(f.len(), 1, "{f:?}");
     assert!(f[0].contains("the lookup `get`"), "{f:?}");
+}
+
+#[test]
+fn a_constant_alias_is_followed_and_a_built_constant_is_computed() {
+    let m = scan(&src(&[(
+        "crates/a/src/lib.rs",
+        r#"
+        const BASE: &str = "EPIGRAPH_ALIASED";
+        const ALIAS: &str = crate::BASE;
+        const BUILT: &str = concat!("EPIGRAPH_", "BUILT");
+        const DANGLING: &str = other::NOWHERE;
+        fn f() {
+            let _ = std::env::var(ALIAS);
+            let _ = std::env::var(BUILT);
+            let _ = std::env::var(DANGLING);
+        }
+        "#,
+    )]));
+    assert_eq!(names(&m), ["EPIGRAPH_ALIASED"]);
+    assert_eq!(m.dynamic.get("crates/a/src/lib.rs"), Some(&1), "{m:?}");
+    assert_eq!(m.computed_args["crates/a/src/lib.rs"], ["BUILT"]);
+    assert_eq!(
+        m.unresolved,
+        [("crates/a/src/lib.rs".to_string(), "DANGLING".to_string())]
+    );
+}
+
+#[test]
+fn a_computed_clap_env_is_a_computed_read_and_a_named_argument_is_not() {
+    let m = scan(&src(&[(
+        "crates/a/src/lib.rs",
+        r#"
+        #[derive(Parser)]
+        struct Cli {
+            #[arg(long, help = "a; b [c] {d}", env = concat!("EPIGRAPH_", "FOO"))]
+            a: String,
+        }
+        macro_rules! flag {
+            ($name:ident, env = $env:literal) => {
+                pub const ENV: &'static str = $env;
+            };
+        }
+        fn f(name: &str) -> String {
+            let _ = std::env::var(Flag::ENV);
+            format!("{env}", env = name.to_string())
+        }
+        "#,
+    )]));
+    assert!(m.names.is_empty(), "{m:?}");
+    assert!(m.unresolved.is_empty(), "{m:?}");
+    // Only the attribute's computed value; not the format argument, the
+    // macro's `$env`, or the constant the macro builds from it.
+    assert_eq!(m.dynamic.get("crates/a/src/lib.rs"), Some(&1), "{m:?}");
+    assert!(
+        m.computed_args["crates/a/src/lib.rs"][0].starts_with("concat!"),
+        "{m:?}"
+    );
 }
