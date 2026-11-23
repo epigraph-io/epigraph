@@ -39,7 +39,10 @@
 //! with `readable: false` and no snapshots. The walk goes
 //! [`LINEAGE_DEPTH_LIMIT`] generations each way; `ancestors_at_limit` /
 //! `descendants_at_limit` say it reached that limit, so farther generations,
-//! if any, are not listed. Both flags describe the WHOLE walk on every page.
+//! if any, are not listed. Both flags describe the WHOLE walk on every page
+//! that has rows; they are taken from the rows served, so an empty page (only
+//! after a cursor this route did not issue, or after the lineage changed
+//! between pages) reports both as `false`.
 //!
 //! # Pages
 //!
@@ -55,7 +58,12 @@
 //! member whose snapshots straddle a page boundary appears on both pages, so
 //! a client reading every page merges members by `agent_id`. The cursor is a
 //! position only: every page re-runs the gate and the walk, so a forged one
-//! reads nothing the first page would not.
+//! reads nothing the first page would not. Reading every page yields each row
+//! once only while the lineage does not change between pages (keyset paging):
+//! a snapshot registered for a member the cursor has passed is not on a later
+//! page, and a new succession edge that brings a member nearer can move it
+//! before the cursor, so it is skipped; re-read from the first page to see
+//! such changes.
 //!
 //! The listing carries NO file content: each file is named by the BLAKE3 of
 //! its raw bytes (`{"blob_hash": ..}`), so the listing grows with the number of
