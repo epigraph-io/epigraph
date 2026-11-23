@@ -13,7 +13,8 @@
 //!   restored exactly (the moved edge back on the duplicate, the identity edge
 //!   retracted) and audited as `undedup` naming the acting operator; every
 //!   refusal, the dry run and a held replay lock write nothing; a label-dedup
-//!   apply's marks are preflighted as a whole before any is un-marked.
+//!   apply's marks are preflighted as a whole before any is un-marked, and the
+//!   preflight refuses what the act would (backlog 277b7efb).
 //!
 //! The logins are created per test (roles are cluster-global, so each name is
 //! unique) and dropped at the end; neither is a superuser. The superuser
@@ -1154,6 +1155,787 @@ async fn the_unmark_cli_follows_a_superseded_canonical(pool: PgPool) {
     );
     assert_eq!(claim_state(&pool, replacement).await, (true, Some(strong)));
     assert_eq!(undedup_rows(&pool, weak).await.len(), 1);
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+// ── unmark_duplicate: preflight predictions and CLI-level coverage ──────────
+// (backlog 277b7efb, 87f1d055)
+
+/// Write `v` to a fresh temp file for `--applied-marks`; the caller removes it.
+fn marks_file(v: &serde_json::Value) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("unmark-{}.json", Uuid::new_v4().simple()));
+    std::fs::write(&p, v.to_string()).expect("write the marks file");
+    p
+}
+
+/// One `applied_marks` entry, as an `apply_label_dedup` response lists it.
+fn applied_mark(unit: &str, dup: Uuid, canonical: Uuid, edge: Option<Uuid>) -> serde_json::Value {
+    let mut m = serde_json::json!({
+        "unit": unit, "dup": dup, "canonical": canonical, "rule": "strong_id",
+        "matched_on": unit,
+    });
+    if let Some(e) = edge {
+        m["identity_edge"] = serde_json::json!(e);
+    }
+    m
+}
+
+fn json_of(r: &Run) -> serde_json::Value {
+    serde_json::from_str(&r.stdout)
+        .unwrap_or_else(|e| panic!("stdout is not JSON ({e}):\n{}\n{}", r.stdout, r.stderr))
+}
+
+/// Two fresh public claims by one new author: `(canonical, dup)`. No
+/// embedding, so no sweep pairs them.
+async fn claim_pair(pool: &PgPool, tag: &str) -> (Uuid, Uuid) {
+    let author = seed_agent(pool).await;
+    let canonical = viewer_fixture::seed_public_claim(
+        pool,
+        author,
+        &format!("{tag} canonical {}", Uuid::new_v4()),
+    )
+    .await;
+    let dup = viewer_fixture::seed_public_claim(
+        pool,
+        author,
+        &format!("{tag} duplicate {}", Uuid::new_v4()),
+    )
+    .await;
+    (canonical, dup)
+}
+
+/// A mark the act made but nothing can reverse: the repository path's act and
+/// repair, which write no audit row, so there is no revert record and no open
+/// cascade, and it is not a backfilled legacy mark. The un-mark's act refuses
+/// it (`NoRecord`).
+async fn unrecorded_mark(pool: &PgPool) -> (Uuid, Uuid, Uuid) {
+    let (canonical, dup) = claim_pair(pool, "unrecorded").await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::ClaimRepository::mark_duplicate_with_repair_conn(
+        &mut conn,
+        epigraph_core::ClaimId::from_uuid(dup),
+        epigraph_core::ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("repository mark, no audit row");
+    let edge = identity_edge(pool, dup)
+        .await
+        .expect("CALIBRATION: the repository mark wrote its identity edge");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE details::text LIKE '%' || $1::text || '%'",
+    )
+    .bind(dup)
+    .fetch_one(pool)
+    .await
+    .expect("audit rows naming the duplicate");
+    assert_eq!(rows, 0, "CALIBRATION: the repository mark kept no record");
+    (canonical, dup, edge)
+}
+
+/// Backlog 277b7efb (1): the dry run predicts the act's `NoRecord` refusal. A
+/// mark with an identity edge but no revert record, no open cascade and no
+/// legacy backfill used to dry-run admissible and refuse only at `--apply`;
+/// in an `--applied-marks` run the targets un-marked before it had already
+/// committed, and the run ended `partial`. Now it is refused in the preflight
+/// and nothing is written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_preflight_refuses_a_mark_with_nothing_to_reverse_it_from(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (s1, w1, t1, e1) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "recorded pair", 0).await;
+    let (canonical, dup, edge) = unrecorded_mark(&pool).await;
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+    let why = "there is no record of this dedup's repair";
+
+    // The dry run says what --apply would: refused.
+    let d = dup.to_string();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &d],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan = json_of(&r);
+    assert_eq!(plan["admissible"], false, "{plan}");
+    assert!(
+        plan["unmarks"][0]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains(why)),
+        "{plan}"
+    );
+
+    // In an apply's marks the unrecorded mark is the FIRST entry, so newest
+    // first it is un-marked LAST, after the sound one: the case that ended
+    // partial. Nothing is written, not even the sound mark.
+    let file = marks_file(&serde_json::json!({"applied_marks": [
+        applied_mark("cluster:unrecorded", dup, canonical, Some(edge)),
+        applied_mark("cluster:recorded", w1, s1, Some(e1)),
+    ]}));
+    let path = file.to_string_lossy().into_owned();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan = json_of(&r);
+    assert_eq!(plan["admissible"], false, "{plan}");
+    assert_eq!(plan["unmarks"][0]["claim_id"], w1.to_string(), "{plan}");
+    assert_eq!(plan["unmarks"][0]["admissible"], true, "{plan}");
+    assert_eq!(plan["unmarks"][1]["claim_id"], dup.to_string(), "{plan}");
+    assert!(
+        plan["unmarks"][1]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains(why)),
+        "{plan}"
+    );
+    assert_eq!(
+        claim_state(&pool, w1).await,
+        (false, Some(s1)),
+        "w1 un-marked"
+    );
+    assert_eq!(identity_edge(&pool, w1).await, Some(e1));
+    assert_eq!(supports_into(&pool, t1).await, vec![s1]);
+    assert!(undedup_rows(&pool, w1).await.is_empty(), "w1 audited");
+    assert_eq!(claim_state(&pool, dup).await, (false, Some(canonical)));
+    assert_eq!(identity_edge(&pool, dup).await, Some(edge));
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Backlog 277b7efb (2): a target whose canonical the same run un-marks first
+/// is still checked for its own in-force identity edge. Y is retired onto X
+/// with no identity edge at all, and the apply's marks name none for it, so
+/// only that check stands between the run and a `partial` end (X un-marked,
+/// then Y's act refused).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_checks_the_identity_edge_of_a_mark_whose_canonical_it_unmarks_first(
+    pool: PgPool,
+) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (s, x, t, ex) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "unmarked first", 0).await;
+    let author = seed_agent(&pool).await;
+    let y = viewer_fixture::seed_public_claim(
+        &pool,
+        author,
+        &format!("retired onto x {}", Uuid::new_v4()),
+    )
+    .await;
+    sqlx::query("UPDATE claims SET supersedes = $1, is_current = false WHERE id = $2")
+        .bind(x)
+        .bind(y)
+        .execute(&pool)
+        .await
+        .expect("retire Y onto X without an identity edge");
+    assert_eq!(
+        identity_edge(&pool, y).await,
+        None,
+        "CALIBRATION: Y has no identity edge"
+    );
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+
+    let file = marks_file(&serde_json::json!({"applied_marks": [
+        applied_mark("u1", y, x, None),
+        applied_mark("u2", x, s, Some(ex)),
+    ]}));
+    let path = file.to_string_lossy().into_owned();
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    let plan = json_of(&r);
+    assert_eq!(plan["admissible"], false, "{plan}");
+    assert_eq!(plan["unmarks"][0]["claim_id"], x.to_string(), "{plan}");
+    assert_eq!(plan["unmarks"][0]["admissible"], true, "{plan}");
+    assert_eq!(plan["unmarks"][1]["claim_id"], y.to_string(), "{plan}");
+    assert!(
+        plan["unmarks"][1]["reason"]
+            .as_str()
+            .is_some_and(|s| s.contains("has no dedup identity edge")),
+        "{plan}"
+    );
+    assert_eq!(claim_state(&pool, x).await, (false, Some(s)), "X un-marked");
+    assert_eq!(identity_edge(&pool, x).await, Some(ex));
+    assert_eq!(supports_into(&pool, t).await, vec![s]);
+    assert_eq!(claim_state(&pool, y).await, (false, Some(x)));
+    assert!(undedup_rows(&pool, x).await.is_empty(), "X audited");
+    assert_eq!(
+        count(&pool, events).await,
+        before,
+        "a refused run wrote a row"
+    );
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Backlog 87f1d055 (3) and (7) through the binary: a legacy raw-SQL
+/// `fuzzy_dedup_claims` mark whose identity edge the operator backfill
+/// reconstructed is an ordinary record. It dry-runs admissible (it has no
+/// revert record, so the preflight's legacy arm is what admits it), is
+/// un-marked, and the restored claim loses the legacy `deduped` label and
+/// `deduped_*` properties, which the audit row records; its own labels and
+/// properties stay.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_unmarks_a_backfilled_legacy_mark_and_strips_its_marker(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (canonical, dup) = claim_pair(&pool, "legacy").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, \
+                           labels = COALESCE(labels, ARRAY[]::text[]) \
+                                    || ARRAY['own-label', 'deduped', 'deduped-x'], \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims', \
+                                                   'deduped_at', now()::text, \
+                                                   'own_prop', true, \
+                                                   'dedupedness', 'near miss') \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let edge = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let b = epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(
+            &mut conn, true,
+        )
+        .await
+        .expect("backfill");
+        assert_eq!(b.inserted, 1, "CALIBRATION: {b:?}");
+        b.duplicates[0].identity_edge.expect("the backfilled edge")
+    };
+    let (d, c) = (dup.to_string(), canonical.to_string());
+
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &d, "--canonical", &c],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let plan = json_of(&r);
+    assert_eq!(plan["admissible"], true, "{plan}");
+    assert_eq!(
+        plan["unmarks"][0]["identity_edge"],
+        edge.to_string(),
+        "{plan}"
+    );
+    assert_eq!(plan["unmarks"][0]["legacy_mark"], true, "{plan}");
+    assert_eq!(
+        claim_state(&pool, dup).await,
+        (false, Some(canonical)),
+        "a dry run wrote"
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &d,
+            "--canonical",
+            &c,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report = json_of(&r);
+    assert_eq!(report["status"], "reverted", "{report}");
+    assert_eq!(claim_state(&pool, dup).await, (true, None));
+    assert_eq!(
+        identity_edge(&pool, dup).await,
+        None,
+        "identity edge in force"
+    );
+
+    let rows = undedup_rows(&pool, dup).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (who, details) = &rows[0];
+    assert_eq!(*who, Some(operator));
+    assert_eq!(details["legacy_mark"], true, "{details}");
+    assert!(details["reversed_event_id"].is_null(), "{details}");
+    assert_eq!(
+        details["legacy_stripped"]["labels"],
+        serde_json::json!(["deduped"]),
+        "{details}"
+    );
+    assert_eq!(
+        details["legacy_stripped"]["properties"]["deduped_by"], "fuzzy_dedup_claims",
+        "{details}"
+    );
+
+    let (labels, properties): (Vec<String>, serde_json::Value) = sqlx::query_as(
+        "SELECT COALESCE(labels, ARRAY[]::text[]), properties FROM claims WHERE id = $1",
+    )
+    .bind(dup)
+    .fetch_one(&pool)
+    .await
+    .expect("the restored claim");
+    assert!(!labels.iter().any(|l| l == "deduped"), "{labels:?}");
+    assert!(labels.iter().any(|l| l == "own-label"), "{labels:?}");
+    assert!(labels.iter().any(|l| l == "deduped-x"), "{labels:?}");
+    let legacy_keys: Vec<&String> = properties
+        .as_object()
+        .map(|o| o.keys().filter(|k| k.starts_with("deduped_")).collect())
+        .unwrap_or_default();
+    assert!(legacy_keys.is_empty(), "{properties}");
+    assert_eq!(properties["own_prop"], true, "{properties}");
+    assert_eq!(properties["dedupedness"], "near miss", "{properties}");
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// The preflight reads what the act reads, in the act's order, before the
+/// legacy rule admits a mark: a backfilled legacy mark that also has a revert
+/// record naming no applied row fails the act's read, so it fails the dry run
+/// (exit 1, no plan) and the apply (before any write), instead of dry-running
+/// admissible and failing at the act.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_preflight_fails_on_a_revert_record_the_act_cannot_read(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (canonical, dup) = claim_pair(&pool, "legacy, bad record").await;
+    sqlx::query(
+        "UPDATE claims SET supersedes = $1, is_current = false, \
+                           labels = COALESCE(labels, ARRAY[]::text[]) || ARRAY['deduped'], \
+                           properties = COALESCE(properties, '{}'::jsonb) \
+                             || jsonb_build_object('deduped_into', $1::text, \
+                                                   'deduped_by', 'fuzzy_dedup_claims') \
+          WHERE id = $2",
+    )
+    .bind(canonical)
+    .bind(dup)
+    .execute(&pool)
+    .await
+    .expect("legacy raw-SQL mark");
+    let edge = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let b = epigraph_db::ClaimRepository::backfill_legacy_dedup_identity_edges_conn(
+            &mut conn, true,
+        )
+        .await
+        .expect("backfill");
+        assert_eq!(b.inserted, 1, "CALIBRATION: {b:?}");
+        b.duplicates[0].identity_edge.expect("the backfilled edge")
+    };
+    sqlx::query(
+        "INSERT INTO security_events (id, event_type, agent_id, success, details) \
+         VALUES (gen_random_uuid(), 'cascade.dedup_revert_record', NULL, true, \
+                 jsonb_build_object('cause', 'dedup', \
+                                    'subject_id', $1::text, 'identity_edge', $2::text, \
+                                    'revert', '{}'::jsonb))",
+    )
+    .bind(dup)
+    .bind(edge)
+    .execute(&pool)
+    .await
+    .expect("a revert record naming no applied row");
+    let (d, c) = (dup.to_string(), canonical.to_string());
+
+    for apply in [false, true] {
+        let mut args = vec!["--acting-agent", &op, "--claim-id", &d, "--canonical", &c];
+        if apply {
+            args.push("--apply");
+        }
+        let r = run(UNMARK, &args, &app_url, Some(&maint_url));
+        assert_eq!(r.code, Some(1), "apply={apply}\n{}\n{}", r.stdout, r.stderr);
+        assert!(
+            r.stderr.contains("names no applied row"),
+            "apply={apply}\n{}",
+            r.stderr
+        );
+        assert!(
+            !r.stdout.contains("\"admissible\""),
+            "apply={apply}: a plan was printed\n{}",
+            r.stdout
+        );
+        assert_eq!(claim_state(&pool, dup).await, (false, Some(canonical)));
+        assert_eq!(identity_edge(&pool, dup).await, Some(edge));
+        assert!(undedup_rows(&pool, dup).await.is_empty());
+    }
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// The preflight's open-cascade arm: a mark whose repair never ran (its
+/// cascade is still deferred) has no revert record, but the un-mark retires
+/// the cascade, so it is admissible and is un-marked.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_unmarks_a_mark_whose_cascade_is_still_deferred(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (canonical, dup) = claim_pair(&pool, "deferred").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("act");
+        let t = epigraph_engine::admin_cascade::CascadeTrigger::new(
+            epigraph_engine::admin_cascade::CascadeCause::Dedup,
+            Some(operator),
+            None,
+            dup,
+            Some(canonical),
+        );
+        epigraph_engine::admin_cascade::record_deferral(
+            &mut *conn,
+            &t,
+            "test: no maintenance connection",
+        )
+        .await
+        .expect("deferral");
+    }
+    let open = |pool: PgPool| async move {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::repos::admin_cascade::open_dedup_cascades(&mut *conn, dup)
+            .await
+            .expect("open cascades")
+            .len()
+    };
+    assert_eq!(open(pool.clone()).await, 1, "CALIBRATION: one open cascade");
+    let d = dup.to_string();
+
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &d],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(json_of(&r)["admissible"], true, "{}", r.stdout);
+
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--claim-id", &d, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(json_of(&r)["status"], "reverted", "{}", r.stdout);
+    assert_eq!(claim_state(&pool, dup).await, (true, None));
+    assert_eq!(
+        open(pool.clone()).await,
+        0,
+        "the deferred cascade was not retired"
+    );
+    let rows = undedup_rows(&pool, dup).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows[0].1["touched"]["cascades_retired"], 1,
+        "{:?}",
+        rows[0].1
+    );
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Backlog 87f1d055 (2): a duplicate whose canonical was CONSOLIDATED into a
+/// merged claim after the mark is un-marked against the merged claim, and the
+/// edge the dedup repair moved (and the consolidation carried on) comes back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_follows_a_consolidated_canonical(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, _) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "merged later", 0).await;
+    let author = seed_agent(&pool).await;
+    let partner =
+        viewer_fixture::seed_public_claim(&pool, author, &format!("partner {}", Uuid::new_v4()))
+            .await;
+    let merged = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        let merged = epigraph_db::ClaimRepository::consolidate_act_conn(
+            &mut conn,
+            None,
+            &[strong, partner],
+            &format!("merged later, merged {}", Uuid::new_v4()),
+            0.5,
+            epigraph_db::repos::claim::ConsolidateMode::Merge,
+            "merge",
+            author,
+        )
+        .await
+        .expect("consolidate act")
+        .merged_id;
+        epigraph_db::ClaimRepository::migrate_consolidated_edges_conn(
+            &mut conn,
+            merged,
+            &[strong, partner],
+        )
+        .await
+        .expect("edge migration");
+        merged
+    };
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "CALIBRATION: the canonical is retired"
+    );
+    assert_eq!(
+        supports_into(&pool, third).await,
+        vec![merged],
+        "CALIBRATION: the moved edge followed the canonical into the merged claim"
+    );
+    let (op, dup, canon, m) = (
+        operator.to_string(),
+        weak.to_string(),
+        strong.to_string(),
+        merged.to_string(),
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let plan = json_of(&r);
+    assert_eq!(plan["admissible"], true, "{plan}");
+    assert_eq!(
+        plan["unmarks"][0]["chain"],
+        serde_json::json!([canon, m]),
+        "{plan}"
+    );
+
+    let r = run(
+        UNMARK,
+        &[
+            "--acting-agent",
+            &op,
+            "--claim-id",
+            &dup,
+            "--canonical",
+            &canon,
+            "--apply",
+        ],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    let report = json_of(&r);
+    assert_eq!(report["status"], "reverted", "{report}");
+    assert_eq!(
+        report["steps"][0]["result"]["canonical_id"], canon,
+        "{report}"
+    );
+    assert_eq!(
+        report["steps"][0]["result"]["current_canonical_id"], m,
+        "{report}"
+    );
+    assert_eq!(claim_state(&pool, weak).await, (true, None));
+    assert_eq!(supports_into(&pool, third).await, vec![weak]);
+    // The consolidation stands.
+    assert!(
+        !claim_state(&pool, strong).await.0,
+        "the consolidation was undone"
+    );
+    assert!(
+        claim_state(&pool, merged).await.0,
+        "the merged claim was retired"
+    );
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Backlog 87f1d055 (5): a failure AFTER the preflight. A mark whose revert
+/// record exists but cannot be read back passes the preflight (it can only
+/// see that a record exists) and fails at the act; the marks un-marked before
+/// it stay committed. The run says so: `partial`, the failed step with its
+/// error, exit 1; the failed mark is untouched and unaudited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_reports_a_failure_after_the_preflight_as_partial(pool: PgPool) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let operator = seed_agent(&pool).await;
+    let op = operator.to_string();
+    let (s1, w1, t1, e1) = swept_pair(&pool, &app_url, &maint_url, operator, "sound pair", 0).await;
+    let (canonical, dup) = claim_pair(&pool, "unreadable record").await;
+    let edge = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::ClaimRepository::mark_duplicate_act_conn(
+            &mut conn,
+            epigraph_core::ClaimId::from_uuid(dup),
+            epigraph_core::ClaimId::from_uuid(canonical),
+        )
+        .await
+        .expect("act");
+        identity_edge(&pool, dup).await.expect("identity edge")
+    };
+    sqlx::query(
+        "INSERT INTO security_events (id, event_type, agent_id, success, details) \
+         VALUES (gen_random_uuid(), 'cascade.dedup_revert_record', NULL, true, \
+                 jsonb_build_object('cause', 'dedup', 'applied_event_id', gen_random_uuid(), \
+                                    'subject_id', $1::text, 'identity_edge', $2::text, \
+                                    'revert', jsonb_build_object('moved_bbas', 'not a list')))",
+    )
+    .bind(dup)
+    .bind(edge)
+    .execute(&pool)
+    .await
+    .expect("a revert record that does not parse");
+    let file = marks_file(&serde_json::json!({"applied_marks": [
+        applied_mark("cluster:unreadable", dup, canonical, Some(edge)),
+        applied_mark("cluster:sound", w1, s1, Some(e1)),
+    ]}));
+    let path = file.to_string_lossy().into_owned();
+
+    // CALIBRATION: the preflight admits both.
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path],
+        &app_url,
+        Some(&maint_url),
+    );
+    assert_eq!(r.code, Some(0), "{}\n{}", r.stdout, r.stderr);
+    assert_eq!(json_of(&r)["admissible"], true, "{}", r.stdout);
+
+    let r = run(
+        UNMARK,
+        &["--acting-agent", &op, "--applied-marks", &path, "--apply"],
+        &app_url,
+        Some(&maint_url),
+    );
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    assert!(r.stderr.contains("1 un-mark(s) failed"), "{}", r.stderr);
+    let report = json_of(&r);
+    assert_eq!(report["status"], "partial", "{report}");
+    let steps = report["steps"].as_array().expect("steps");
+    assert_eq!(steps.len(), 2, "{report}");
+    assert_eq!(steps[0]["claim_id"], w1.to_string(), "{report}");
+    assert_eq!(steps[0]["ok"], true, "{report}");
+    assert_eq!(steps[1]["claim_id"], dup.to_string(), "{report}");
+    assert_eq!(steps[1]["ok"], false, "{report}");
+    assert!(
+        steps[1]["error"]
+            .as_str()
+            .is_some_and(|s| s.contains("the un-mark failed and nothing was changed")),
+        "{report}"
+    );
+    // The sound mark committed; the failed one is untouched.
+    assert_eq!(claim_state(&pool, w1).await, (true, None));
+    assert_eq!(supports_into(&pool, t1).await, vec![w1]);
+    assert_eq!(undedup_rows(&pool, w1).await.len(), 1);
+    assert_eq!(claim_state(&pool, dup).await, (false, Some(canonical)));
+    assert_eq!(identity_edge(&pool, dup).await, Some(edge));
+    assert!(undedup_rows(&pool, dup).await.is_empty());
+
+    drop_login(&pool, &app_role).await;
+    drop_login(&pool, &maint_role).await;
+}
+
+/// Backlog 87f1d055 (4) and (6): the connection the un-mark runs on. A
+/// superuser login given only as DATABASE_URL is refused, as the unprivileged
+/// fallback is: the run needs an explicitly configured
+/// MAINTENANCE_DATABASE_URL. And a configured
+/// MAINTENANCE_DATABASE_URL whose login cannot bypass row security is refused
+/// rather than run as a silent no-op. Each writes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_unmark_cli_refuses_a_privileged_fallback_and_an_unprivileged_maintenance_dsn(
+    pool: PgPool,
+) {
+    let (app_role, app_url) = create_login(&pool, "epigraph_app").await;
+    let (maint_role, maint_url) = create_login(&pool, "epigraph_maintenance").await;
+    let superuser_url = viewer_fixture::database_url_for(&pool).await;
+    let operator = seed_agent(&pool).await;
+    let (strong, weak, third, edge) =
+        swept_pair(&pool, &app_url, &maint_url, operator, "stay marked", 0).await;
+    let (op, dup) = (operator.to_string(), weak.to_string());
+    let events = "SELECT count(*) FROM security_events";
+    let before = count(&pool, events).await;
+    let still_marked = |pool: PgPool| async move {
+        assert_eq!(claim_state(&pool, weak).await, (false, Some(strong)));
+        assert_eq!(identity_edge(&pool, weak).await, Some(edge));
+        assert_eq!(supports_into(&pool, third).await, vec![strong]);
+        assert_eq!(
+            count(&pool, events).await,
+            before,
+            "a refused run wrote a row"
+        );
+    };
+    let argv = [
+        "--acting-agent",
+        op.as_str(),
+        "--claim-id",
+        dup.as_str(),
+        "--apply",
+    ];
+
+    // A superuser (privileged by any test) as DATABASE_URL alone: the
+    // fallback is refused before any work.
+    let r = run(UNMARK, &argv, &superuser_url, None);
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    assert!(
+        r.stderr
+            .contains("runs only on an explicitly configured MAINTENANCE_DATABASE_URL"),
+        "{}",
+        r.stderr
+    );
+    still_marked(pool.clone()).await;
+
+    // The application login configured as MAINTENANCE_DATABASE_URL: refused,
+    // not run as a no-op that reads and writes nothing.
+    let r = run(UNMARK, &argv, &app_url, Some(&app_url));
+    assert_eq!(r.code, Some(1), "{}\n{}", r.stdout, r.stderr);
+    assert!(
+        r.stderr.contains("does not satisfy epigraph_bypass()"),
+        "{}",
+        r.stderr
+    );
+    still_marked(pool.clone()).await;
 
     drop_login(&pool, &app_role).await;
     drop_login(&pool, &maint_role).await;

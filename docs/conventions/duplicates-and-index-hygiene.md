@@ -40,8 +40,16 @@ sweep runs:
 - `--applied-marks <file>` takes an `apply_label_dedup` response and un-marks
   each of its marks newest first, with the canonical and identity edge the
   apply recorded. Every mark is checked before any is un-marked; one refusal
-  writes nothing. Revert the apply's label writes with `revert_label_dedup`
-  and `applied_units` only, which needs no maintenance connection.
+  writes nothing. The check refuses what the act would: a mark with no
+  in-force identity edge, and a mark with nothing to reverse it from (no
+  revert record, no open cascade, not a backfilled legacy mark). A record
+  the check cannot read (one that names no applied row) fails the whole run
+  before anything is written: exit 1, no plan. A failure only the act can
+  see (for example a revert record whose body does not parse) still stops
+  that mark after earlier ones committed: the report's `status` is then
+  `partial` and the failed step says why. Revert the apply's label
+  writes with `revert_label_dedup` and `applied_units` only, which needs no
+  maintenance connection.
 - `--apply` un-marks. Each un-mark is audited as cause `undedup` naming
   `--acting-agent`, and the restored claim is re-embedded when the CLI has an
   `OPENAI_API_KEY` (otherwise `embed_backfill` fills it). It does not run
