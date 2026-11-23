@@ -1702,11 +1702,17 @@ async fn the_backfill_gives_every_existing_agent_its_legacy_key(pool: PgPool) {
     }
 
     let retired_ids: Vec<Uuid> = retired.iter().map(|(id, _)| *id).collect();
+    // Migration 241 creates the unauthenticated reader's row AFTER this
+    // backfill ran, under a reserved key nobody holds a private half for; it
+    // is not a pre-existing agent, so it has no legacy key row by design.
+    let unauthenticated_reader_key: &[u8; 32] = b"epigraph-mcp:unauthenticated-rdr";
     let without: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM agents a WHERE a.id <> ALL($1) AND NOT EXISTS (\
-           SELECT 1 FROM agent_keys k WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')",
+        "SELECT count(*) FROM agents a WHERE a.id <> ALL($1) AND a.public_key <> $2 \
+           AND NOT EXISTS (SELECT 1 FROM agent_keys k \
+                            WHERE k.agent_id = a.id AND k.key_type = 'identity-legacy')",
     )
     .bind(&retired_ids)
+    .bind(&unauthenticated_reader_key[..])
     .fetch_one(&pool)
     .await
     .expect("agents without a legacy key");
