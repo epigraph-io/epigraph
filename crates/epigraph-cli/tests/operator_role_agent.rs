@@ -23,10 +23,14 @@
 //! * `--apply` detaches `A`'s row only; `A` and `D` derive nothing and `P`
 //!   keeps the group;
 //! * a second detach finds nothing to detach and changes nothing.
+//!
+//! The cluster-level maintenance login each DB test creates is removed by
+//! [`with_maintenance_login`] even when the test panics.
 
 mod viewer_fixture;
 
 use epigraph_db::AgentRepository;
+use futures::FutureExt;
 use sqlx::PgPool;
 use std::process::Command;
 use uuid::Uuid;
@@ -78,7 +82,7 @@ fn run_with(args: &[&str], dsn: Option<&str>) -> Run {
 }
 
 /// Create a NOSUPERUSER login in `epigraph_maintenance` and return
-/// `(role, dsn)`. The caller drops the role.
+/// `(role, dsn)`. Use it through [`with_maintenance_login`], which drops it.
 async fn maintenance_login(pool: &PgPool) -> (String, String) {
     let url = fixture::database_url_for(pool).await;
     let role = format!("ra_maint_{}", Uuid::new_v4().simple());
@@ -91,6 +95,38 @@ async fn maintenance_login(pool: &PgPool) -> (String, String) {
     let (scheme, rest) = url.split_once("://").expect("scheme");
     let (_, host) = rest.split_once('@').expect("credentials");
     (role.clone(), format!("{scheme}://{role}:probe-only@{host}"))
+}
+
+/// Run `body` with a fresh maintenance login `(role, dsn)` and ALWAYS drop
+/// that role afterwards. A role is cluster-wide: a panic between its
+/// `CREATE ROLE` and its `DROP ROLE` (a fixture's `expect`, a failed
+/// assertion) would otherwise leak it past the throwaway test database. The
+/// panic is caught, the role dropped, and the panic resumed.
+async fn with_maintenance_login<T, F, Fut>(pool: &PgPool, body: F) -> T
+where
+    F: FnOnce(String, String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (login, dsn) = maintenance_login(pool).await;
+    let caught = std::panic::AssertUnwindSafe(body(login.clone(), dsn))
+        .catch_unwind()
+        .await;
+    sqlx::query(&format!("DROP ROLE {login}"))
+        .execute(pool)
+        .await
+        .expect("drop the maintenance login");
+    match caught {
+        Ok(t) => t,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn role_exists(pool: &PgPool, role: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_roles")
 }
 
 async fn as_maintenance<T, F, Fut>(pool: &PgPool, f: F) -> T
@@ -323,73 +359,112 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
         );
     }
 
-    let (login, dsn) = maintenance_login(&pool).await;
     let (ps, as_, ds) = (p.to_string(), a.to_string(), d.to_string());
-    let attach = |apply: bool| {
-        let mut args = vec![
-            "role-attach",
-            "--role",
-            ROLE,
-            "--agent",
-            ps.as_str(),
-            "--reason",
-            "role-attach cli test",
-        ];
-        if apply {
-            args.push("--apply");
-        }
-        run_with(&args, Some(&dsn))
-    };
-    let detach = |apply: bool| {
-        let mut args = vec![
-            "role-detach",
-            "--role",
-            ROLE,
-            "--agent",
-            as_.as_str(),
-            "--reason",
-            "role-detach cli test",
-        ];
-        if apply {
-            args.push("--apply");
-        }
-        run_with(&args, Some(&dsn))
-    };
+    let (ps2, as2) = (ps.clone(), as_.clone());
+    let pool2 = pool.clone();
+    let (
+        login,
+        dry,
+        rows_after_dry,
+        events_after_dry,
+        applied,
+        rows_after_apply,
+        attached_events,
+        derived_after_attach,
+        ddry,
+        rows_after_ddry,
+        detached_after_ddry,
+        dapplied,
+        rows_after_detach,
+        detached_events,
+        derived_after_detach,
+        again,
+        rows_after_again,
+    ) = with_maintenance_login(&pool, |login, dsn| async move {
+        let (pool, ps, as_) = (pool2, ps2, as2);
+        let attach = |apply: bool| {
+            let mut args = vec![
+                "role-attach",
+                "--role",
+                ROLE,
+                "--agent",
+                ps.as_str(),
+                "--reason",
+                "role-attach cli test",
+            ];
+            if apply {
+                args.push("--apply");
+            }
+            run_with(&args, Some(&dsn))
+        };
+        let detach = |apply: bool| {
+            let mut args = vec![
+                "role-detach",
+                "--role",
+                ROLE,
+                "--agent",
+                as_.as_str(),
+                "--reason",
+                "role-detach cli test",
+            ];
+            if apply {
+                args.push("--apply");
+            }
+            run_with(&args, Some(&dsn))
+        };
 
-    // ---- attach, dry run ----
-    let dry = attach(false);
-    let (rows_after_dry, events_after_dry) = (
-        role_rows(&pool).await,
-        events(&pool, "platform.role_agent_attached").await,
-    );
-    // ---- attach, apply ----
-    let applied = attach(true);
-    let rows_after_apply = role_rows(&pool).await;
-    let attached_events = event_details(&pool, "platform.role_agent_attached").await;
-    let derived_after_attach = (
-        derived_in(&pool, p, group).await,
-        derived_in(&pool, a, group).await,
-        derived_in(&pool, d, group).await,
-    );
-    // ---- detach A, dry run ----
-    let ddry = detach(false);
-    let rows_after_ddry = role_rows(&pool).await;
-    let detached_after_ddry = events(&pool, "platform.role_agent_detached").await;
-    // ---- detach A, apply; then again ----
-    let dapplied = detach(true);
-    let rows_after_detach = role_rows(&pool).await;
-    let detached_events = event_details(&pool, "platform.role_agent_detached").await;
-    let derived_after_detach = (
-        derived_in(&pool, p, group).await,
-        derived_in(&pool, a, group).await,
-        derived_in(&pool, d, group).await,
-    );
-    let again = detach(true);
-    let rows_after_again = role_rows(&pool).await;
-    sqlx::query(&format!("DROP ROLE {login}"))
-        .execute(&pool)
-        .await
-        .expect("drop role");
+        // ---- attach, dry run ----
+        let dry = attach(false);
+        let (rows_after_dry, events_after_dry) = (
+            role_rows(&pool).await,
+            events(&pool, "platform.role_agent_attached").await,
+        );
+        // ---- attach, apply ----
+        let applied = attach(true);
+        let rows_after_apply = role_rows(&pool).await;
+        let attached_events = event_details(&pool, "platform.role_agent_attached").await;
+        let derived_after_attach = (
+            derived_in(&pool, p, group).await,
+            derived_in(&pool, a, group).await,
+            derived_in(&pool, d, group).await,
+        );
+        // ---- detach A, dry run ----
+        let ddry = detach(false);
+        let rows_after_ddry = role_rows(&pool).await;
+        let detached_after_ddry = events(&pool, "platform.role_agent_detached").await;
+        // ---- detach A, apply; then again ----
+        let dapplied = detach(true);
+        let rows_after_detach = role_rows(&pool).await;
+        let detached_events = event_details(&pool, "platform.role_agent_detached").await;
+        let derived_after_detach = (
+            derived_in(&pool, p, group).await,
+            derived_in(&pool, a, group).await,
+            derived_in(&pool, d, group).await,
+        );
+        let again = detach(true);
+        let rows_after_again = role_rows(&pool).await;
+        (
+            login,
+            dry,
+            rows_after_dry,
+            events_after_dry,
+            applied,
+            rows_after_apply,
+            attached_events,
+            derived_after_attach,
+            ddry,
+            rows_after_ddry,
+            detached_after_ddry,
+            dapplied,
+            rows_after_detach,
+            detached_events,
+            derived_after_detach,
+            again,
+            rows_after_again,
+        )
+    })
+    .await;
+    assert!(!role_exists(&pool, &login).await, "the login is dropped");
 
     // The dry-run attach: the row by name, BOTH copies (D's chained through
     // A's), three GAINED lines, and nothing written.
@@ -528,4 +603,31 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
         again.show()
     );
     assert_eq!(rows_after_again, (3, 2));
+}
+
+/// A test-only panic inside [`with_maintenance_login`]'s body still drops
+/// the login (and the panic reaches the test).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_panicking_body_still_drops_its_maintenance_login(pool: PgPool) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let s2 = seen.clone();
+    let caught =
+        std::panic::AssertUnwindSafe(with_maintenance_login(&pool, |login, _dsn| async move {
+            *s2.lock().unwrap() = login;
+            panic!("T94 probe panic");
+        }))
+        .catch_unwind()
+        .await;
+    let login = seen.lock().unwrap().clone();
+    assert!(!login.is_empty(), "the body ran");
+    let panic = caught.expect_err("the body's panic is resumed");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("T94 probe panic"),
+        "the body's own panic"
+    );
+    assert!(
+        !role_exists(&pool, &login).await,
+        "the login {login} is dropped although the body panicked"
+    );
 }
