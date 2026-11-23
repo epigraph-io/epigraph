@@ -42,35 +42,48 @@ fn finds_claims_table_in_epigraph_initial_schema() {
     );
 }
 
-/// Episcience tests require the sibling `episcience` repo checked out at
-/// `/home/jeremy/episcience` — a developer-machine assumption, not present in CI.
-/// Run locally with `cargo test -p epigraph-tools -- --ignored`.
+/// A sibling repository's migrations directory, committed as a fixture so the
+/// two tests below run in every gate. It has the layout the scan must handle:
+/// a top-level migration, a table in a nested `synthesis/` subdirectory, and a
+/// vendored `upstream/` copy of epigraph's schema that is passed as a skip
+/// directory. (These tests used to read a sibling checkout at a developer
+/// machine's absolute path and were `#[ignore]`d, so CI never ran them.)
+const SIBLING_MIGRATIONS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/table_graph/episcience_migrations"
+);
+
 #[test]
-#[ignore]
 fn finds_synthesis_tables_in_episcience() {
-    let tables = scan_migrations(&[(
-        "episcience",
-        "/home/jeremy/episcience/migrations",
-        &["upstream"],
-    )])
-    .unwrap();
+    let tables = scan_migrations(&[("episcience", SIBLING_MIGRATIONS, &["upstream"])]).unwrap();
     assert!(
         tables
             .iter()
             .any(|t| t.name == "syntheses" && t.repo == "episcience"),
         "expected to find episcience.syntheses (from migrations/synthesis/)"
     );
+    assert!(
+        tables
+            .iter()
+            .any(|t| t.name == "experiments" && t.repo == "episcience"),
+        "expected to find episcience.experiments (top-level migration)"
+    );
 }
 
 #[test]
-#[ignore]
 fn skips_episcience_upstream_directory() {
-    let tables = scan_migrations(&[(
-        "episcience",
-        "/home/jeremy/episcience/migrations",
-        &["upstream"],
-    )])
-    .unwrap();
+    // Non-vacuity: without the skip, the vendored `upstream/` schema IS
+    // attributed to the sibling repository, so the assertion below is about
+    // the skip list and not about a fixture that lacks `claims`.
+    let unskipped = scan_migrations(&[("episcience", SIBLING_MIGRATIONS, &[])]).unwrap();
+    assert!(
+        unskipped
+            .iter()
+            .any(|t| t.name == "claims" && t.repo == "episcience"),
+        "fixture must define claims under upstream/"
+    );
+
+    let tables = scan_migrations(&[("episcience", SIBLING_MIGRATIONS, &["upstream"])]).unwrap();
     assert!(
         !tables
             .iter()
