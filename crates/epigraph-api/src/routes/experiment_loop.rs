@@ -836,3 +836,93 @@ fn aggregate_errors(measurements: &[serde_json::Value], expected_value: f64) -> 
 
     (random_rms, systematic_rms, avg_effect)
 }
+
+// The attribute must start `#[cfg(all(test` so that
+// `epigraph-db/tests/maintenance_surface_register.rs` strips this module: the
+// lease below is a test fixture, not a request-binary maintenance lease.
+#[cfg(all(test, feature = "db"))]
+mod caller_author_tests {
+    use super::caller_author;
+    use crate::errors::ApiError;
+    use epigraph_db::{ScopedPool, SessionGucMode, SystemReason};
+    use uuid::Uuid;
+
+    fn forbidden_reason(r: Result<Uuid, ApiError>) -> String {
+        match r {
+            Err(ApiError::Forbidden { reason }) => reason,
+            other => panic!("expected 403 Forbidden, got {other:?}"),
+        }
+    }
+
+    /// Backlog 8672f843 (1): `caller_author`'s no-principal arm.
+    ///
+    /// A request viewer always carries a principal (`ViewerExtractor` answers
+    /// 401 first, and the guest viewer's principal is the nil id), so the
+    /// router cannot reach this arm; only a viewer with no principal can, and
+    /// the one such shape is the unrestricted viewer of a maintenance session.
+    /// Taken from a real session here, so the test pins the arm against the
+    /// viewer that actually has no principal, not a stand-in.
+    ///
+    /// Pinned: such a viewer is refused 403 with the write named in the
+    /// reason, whether or not the body names an `agent_id` (the no-principal
+    /// check runs before the named-author check, so a named id is never
+    /// compared against an absent caller). Calibration on a resolved viewer of
+    /// the same database: an omitted `agent_id` is the caller's own, and a
+    /// named id that is not the caller is the other 403.
+    #[tokio::test]
+    async fn a_viewer_with_no_principal_is_refused_by_name() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            eprintln!("Skipping DB test: DATABASE_URL not set");
+            return;
+        };
+        let scoped = ScopedPool::connect(&url, SessionGucMode::Session)
+            .await
+            .expect("connect a ScopedPool");
+        let session = scoped
+            .maintenance_session(SystemReason::SchemaContractTest)
+            .await
+            .expect("a maintenance session");
+        let no_principal = session.viewer();
+        assert_eq!(
+            no_principal.principal(),
+            None,
+            "fixture: the maintenance viewer must carry no principal"
+        );
+
+        for (named, what) in [
+            (None, "an experiment write"),
+            (Some(Uuid::new_v4()), "a reasoning trace"),
+        ] {
+            let reason = forbidden_reason(caller_author(no_principal, named, what));
+            assert_eq!(
+                reason,
+                format!("{what} needs an authenticated author"),
+                "named = {named:?}: the no-principal refusal, naming the write"
+            );
+        }
+
+        let caller = Uuid::new_v4();
+        let resolved = epigraph_db::Viewer::resolve(scoped.inner(), caller)
+            .await
+            .expect("resolve a viewer");
+        assert_eq!(
+            caller_author(&resolved, None, "an experiment write").expect("calibration"),
+            caller,
+            "calibration: an omitted agent_id is the caller's own"
+        );
+        assert_eq!(
+            caller_author(&resolved, Some(caller), "an experiment write").expect("calibration"),
+            caller,
+            "calibration: the caller may name itself"
+        );
+        let reason = forbidden_reason(caller_author(
+            &resolved,
+            Some(Uuid::new_v4()),
+            "an experiment write",
+        ));
+        assert!(
+            reason.starts_with("agent_id must be the authenticated caller's own"),
+            "calibration: another agent's id is the named-author refusal: {reason}"
+        );
+    }
+}
