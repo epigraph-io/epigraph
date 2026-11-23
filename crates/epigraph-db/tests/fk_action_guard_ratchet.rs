@@ -227,3 +227,85 @@ async fn the_scan_reports_a_probe_writing_action(pool: PgPool) {
         "the scan must report the probe's ON UPDATE CASCADE (and nothing else new)"
     );
 }
+
+/// The tables this ratchet covers: `claims` and `edges` through
+/// [`GUARDED_WRITING_ACTIONS`], `mass_functions` through [`MASS_FUNCTIONS_FKS`].
+const RATCHETED_TABLES: &[&str] = &["claims", "edges", "mass_functions"];
+
+/// T-N9: the guarded-table list, DERIVED from the catalog for the shape SF-17
+/// is about: a table one of whose own triggers runs a function that reads a
+/// custom setting (`current_setting`) AND consults
+/// `epigraph_definer_bypass()`. That is the guard an FK referential action
+/// defeats (it runs as the referencing table's owner, where the definer
+/// bypass can be true and the session's settings are in force). Measured on a
+/// fresh database migrated to head: `mass_functions` alone (184's
+/// `epigraph_mass_function_retract_guard`).
+///
+/// Not derived: a guard that reaches the setting through a helper function,
+/// rather than in its own body. A scan for any trigger function reading a
+/// setting is not a usable proxy: 166's statement trigger
+/// (`epigraph_role_agent_write_check`, the stamped principal) puts every
+/// application-writable table in it, about sixty, none of them keyed on a
+/// row-naming setting. That judgment stays with the reviewer of
+/// [`GUARDED_WRITING_ACTIONS`].
+async fn setting_keyed_guard_tables(pool: &PgPool) -> BTreeSet<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT c.relname::text \
+           FROM pg_trigger t \
+           JOIN pg_class c ON c.oid = t.tgrelid \
+           JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = 'public' \
+           JOIN pg_proc p ON p.oid = t.tgfoid \
+          WHERE NOT t.tgisinternal \
+            AND p.prosrc ~ 'current_setting' \
+            AND p.prosrc ~ 'epigraph_definer_bypass'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the trigger functions")
+    .into_iter()
+    .collect()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_table_with_a_setting_keyed_trigger_guard_is_ratcheted(pool: PgPool) {
+    let found = setting_keyed_guard_tables(&pool).await;
+    assert!(
+        found.contains("mass_functions"),
+        "CALIBRATION: 184's retract guard is found: {found:?}"
+    );
+    let ratcheted: BTreeSet<String> = RATCHETED_TABLES.iter().map(|t| (*t).to_string()).collect();
+    let unlisted: Vec<&String> = found.difference(&ratcheted).collect();
+    assert!(
+        unlisted.is_empty(),
+        "table(s) {unlisted:?} carry a trigger guard that reads a custom setting and consults \
+         epigraph_definer_bypass(), which an FK referential action defeats (SPEC §7.1, SF-17). \
+         Add each table's writing foreign keys to this ratchet (a list like \
+         GUARDED_WRITING_ACTIONS) and to RATCHETED_TABLES, or key the guard on a table-backed \
+         grant as H10 does"
+    );
+}
+
+/// Calibration: a probe guard of that shape on another table is reported.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_guard_scan_reports_a_probe_setting_keyed_guard(pool: PgPool) {
+    sqlx::query(
+        "CREATE FUNCTION public.fk_ratchet_probe_guard() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+           IF current_setting('epigraph.probe_ids', true) IS NOT NULL \
+              AND public.epigraph_definer_bypass() THEN RETURN OLD; END IF; \
+           RETURN OLD; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("create the probe guard");
+    sqlx::query(
+        "CREATE TRIGGER fk_ratchet_probe_guard BEFORE DELETE ON public.frames \
+         FOR EACH ROW EXECUTE FUNCTION public.fk_ratchet_probe_guard()",
+    )
+    .execute(&pool)
+    .await
+    .expect("attach the probe guard");
+    let found = setting_keyed_guard_tables(&pool).await;
+    assert!(found.contains("frames"), "the probe is reported: {found:?}");
+}
