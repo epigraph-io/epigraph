@@ -348,7 +348,7 @@ async fn warn_writes_inert_and_names_the_visible_atoms_on_either_route(
     assert_eq!(
         cache(&pool, compound).await,
         cache_before,
-        "no fold of the compound's belief may read the warn-mode rows"
+        "no cache fold of the compound may read the warn-mode rows"
     );
 
     // An atom under warn carries no field.

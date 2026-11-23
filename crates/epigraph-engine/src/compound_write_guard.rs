@@ -14,7 +14,9 @@
 //! stays inert on the compound: a compound has no cache-owner frame
 //! (`MassFunctionRepository::cache_owner_frame_for_claim`), so neither the
 //! write nor any later owner-rule recompute folds the row into the
-//! compound's cached belief. The caller gets a `deprecated_compound_target`
+//! compound's cached belief. (The derived compound view, SPEC §3.6, reads the
+//! refutation mass of a compound's own rows by design, this one included.)
+//! The caller gets a `deprecated_compound_target`
 //! field naming the atoms it can see, and the write is logged under
 //! [`LOG_TARGET`] with the writer and the caller's agent id (never the
 //! claim's content), so the callers to fix before a flip to `refuse` can be
@@ -89,9 +91,11 @@ impl CompoundTarget {
     pub fn warning(&self) -> String {
         format!(
             "claim {} is a compound: its belief is derived from the atoms it decomposes into, \
-             so this BBA was stored but is not folded into its belief, now or by a later \
-             recompute. Write it on the atoms instead ({}). Textless BBA writes on compounds \
-             are deprecated and will be refused (EPIGRAPH_COMPOUND_WRITE_GUARD=refuse).",
+             so this BBA was stored but is never folded into the compound's cached belief, now \
+             or by a later recompute (the derived compound view reads only its refutation \
+             mass, as for every row on a compound). Write it on the atoms instead ({}). Textless \
+             BBA writes on compounds are deprecated and will be refused \
+             (EPIGRAPH_COMPOUND_WRITE_GUARD=refuse).",
             self.claim_id,
             self.atoms_phrase()
         )
@@ -279,7 +283,9 @@ mod tests {
         assert!(none.refusal().contains("nothing was written"));
         assert!(none.refusal().contains("none of its atoms is visible"));
         let some = target(3);
-        assert!(some.warning().contains("not folded into its belief"));
+        assert!(some
+            .warning()
+            .contains("never folded into the compound's cached belief"));
         assert!(some.warning().contains("3 visible atom(s)"));
     }
 

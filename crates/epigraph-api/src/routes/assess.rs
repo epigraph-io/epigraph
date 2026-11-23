@@ -120,8 +120,9 @@ pub struct AssessClaimResponse {
     /// Set when the claim is a COMPOUND and the server runs
     /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
     /// the assessment was stored, but a compound's belief is derived from its
-    /// atoms, so no fold of its belief reads it. `visible_atoms` lists the
-    /// atoms the caller can see (`{id, content}`, at most 50;
+    /// atoms, so it is never folded into the compound's cached belief (the
+    /// derived compound view reads its refutation mass, as for every compound
+    /// row). `visible_atoms` lists the atoms the caller can see (`{id, content}`, at most 50;
     /// `visible_atom_count` is the full count): assess those instead. Under
     /// `refuse` the request is refused with 422 (`compound_target`). Omitted
     /// for a claim that is not a compound.

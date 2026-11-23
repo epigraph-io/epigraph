@@ -249,9 +249,8 @@ async fn warn_stores_the_bba_inert_and_tells_the_caller_where_to_write(pool: PgP
             .as_array()
             .expect("warnings")
             .iter()
-            .any(|w| w.as_str().is_some_and(
-                |w| w.contains("is a compound") && w.contains("not folded into its belief")
-            )),
+            .any(|w| w.as_str().is_some_and(|w| w.contains("is a compound")
+                && w.contains("never folded into the compound's cached belief"))),
         "{resp}"
     );
     let (bbas, _, _, _) = footprint(&pool, compound).await;
@@ -269,7 +268,7 @@ async fn warn_stores_the_bba_inert_and_tells_the_caller_where_to_write(pool: PgP
     assert_eq!(
         cache(&pool, compound).await,
         cache_before,
-        "no fold of the compound's belief may read the warn-mode row"
+        "no cache fold of the compound may read the warn-mode row"
     );
 
     // A non-compound under warn carries no field.
