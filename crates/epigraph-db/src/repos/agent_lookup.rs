@@ -42,7 +42,12 @@
 //!   (the legacy create path defaulted every row to `'human'`). Each evidence
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
 //!   falls through, so an agent whose only evidence is hidden reads exactly as
-//!   one with no evidence (`unknown`). See [`AgentKind`].
+//!   one with no evidence (`unknown`). See [`AgentKind`]. One arm is the
+//!   reverse of `operator_human`: an agent some agent's binding names
+//!   (`operator_of_bound_agent`, [`bound_operator_sql`]) reads as a human to
+//!   every reader, because every reader already sees that binding on the
+//!   bound agent's card; it is derived from the same binding rule, so it
+//!   never disagrees with the forward field and reads no status.
 //! * `roles`: migration 198's `epigraph_disclosed_role_assignments`: for any
 //!   agent, the assignments of roles that neither elevate nor read the audit
 //!   trail whose window is open now (exactly what 123's public projection
@@ -216,6 +221,28 @@ fn operator_binding_sql(agent: &str) -> String {
     )
 }
 
+/// SQL: true when some agent other than `{agent}` is CURRENTLY bound to it,
+/// i.e. some agent's [`operator_binding_sql`] names it: the reverse of the
+/// card's `operator_human`, derived from the forward rule itself so the two
+/// can never disagree. The candidates are every agent a 107 link names it the
+/// operator of (retired links included, through migration 269's
+/// `epigraph_agents_linked_to_operator`, the inverse of
+/// `epigraph_operator_of_author`) and every agent a 149 allowance row names it
+/// for (revoked included); the forward rule then keeps only a live link, or
+/// an unrevoked allowance of an unlinked agent. No status is read.
+fn bound_operator_sql(agent: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM ( \
+                   SELECT lk.agent_id FROM public.epigraph_agents_linked_to_operator({agent}) lk \
+                   UNION \
+                   SELECT al.agent_id FROM public.author_binding_clients al \
+                    WHERE al.operator_id = {agent}) cand \
+                  WHERE cand.agent_id <> {agent} \
+                    AND ({binding}) = {agent})",
+        binding = operator_binding_sql("cand.agent_id"),
+    )
+}
+
 /// The `authored -> paper` edge property a document ingest writes as `true`
 /// when it names an author it neither is nor operates: the authorship is the
 /// ingester's word until that person countersigns. The agent card reads it
@@ -304,7 +331,11 @@ pub enum AgentKind {
     /// to the human itself and admins (registration status is never shown to
     /// anyone else, the human's own agents included), and to every caller
     /// when the human holds a disclosed role (only registered humans are
-    /// granted roles; the window, not the current status, decides).
+    /// granted roles; the window, not the current status, decides) or when
+    /// some agent is currently bound to it (its card's `operator_human`, shown
+    /// to every reader: 122 refuses a link to an operator that is not a
+    /// registered human, and 149 an allowance; the binding record, not the
+    /// current status, decides).
     Human,
     /// An agent with an LLM model on its (visible) profile, or, failing a
     /// derived author key, an agent currently bound to a human
@@ -437,8 +468,8 @@ pub struct AgentCard {
     /// The visible evidence `kind` was derived from (every arm the caller may
     /// see, not only the winning one): `role_node`, `system_registry`,
     /// `registered_human_operator`, `holds_disclosed_role`,
-    /// `llm_model_on_profile`, `bound_to_visible_human`, `name_derived_key`,
-    /// `orcid_derived_key`.
+    /// `operator_of_bound_agent`, `llm_model_on_profile`,
+    /// `bound_to_visible_human`, `name_derived_key`, `orcid_derived_key`.
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
     pub orcid: Option<String>,
@@ -706,6 +737,7 @@ impl AgentLookupRepository {
                     COALESCE(($4::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
                       AND public.epigraph_is_human_operator(a.id), false) AS human_visible, \
                     CASE WHEN h.human IS DISTINCT FROM a.id THEN h.human END AS operator_human, \
+                    {bound_operator} AS operates_bound_agent, \
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
@@ -717,6 +749,7 @@ impl AgentLookupRepository {
               CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
             binding = operator_binding_sql("a.id"),
+            bound_operator = bound_operator_sql("a.id"),
         );
         type Row = (
             Uuid,
@@ -730,6 +763,7 @@ impl AgentLookupRepository {
             Option<String>,
             bool,
             Option<Uuid>,
+            bool,
             i64,
         );
         let rows: Vec<Row> = sqlx::query_as(&sql)
@@ -778,6 +812,7 @@ impl AgentLookupRepository {
             ror_id,
             human_visible,
             operator_human,
+            operates_bound_agent,
             _ord,
         ) in rows
         {
@@ -794,6 +829,9 @@ impl AgentLookupRepository {
             }
             if !roles.is_empty() {
                 evidence.push("holds_disclosed_role");
+            }
+            if operates_bound_agent {
+                evidence.push("operator_of_bound_agent");
             }
             if llm_model_visible {
                 evidence.push("llm_model_on_profile");
@@ -1217,7 +1255,10 @@ fn kind_from_evidence(evidence: &[&str]) -> AgentKind {
         AgentKind::Role
     } else if has("system_registry") {
         AgentKind::System
-    } else if has("registered_human_operator") || has("holds_disclosed_role") {
+    } else if has("registered_human_operator")
+        || has("holds_disclosed_role")
+        || has("operator_of_bound_agent")
+    {
         AgentKind::Human
     } else if has("llm_model_on_profile") {
         AgentKind::LlmAgent
@@ -1259,6 +1300,10 @@ mod tests {
         );
         assert_eq!(
             kind_from_evidence(&["holds_disclosed_role"]),
+            AgentKind::Human
+        );
+        assert_eq!(
+            kind_from_evidence(&["operator_of_bound_agent"]),
             AgentKind::Human
         );
         assert_eq!(

@@ -2322,6 +2322,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // case). The table has no row security, so a non-member owner changes
     // nothing else.
     ("epigraph_oauth_assertion_nonce_consume", 213),
+    // 269, the agent-lookup card's reverse binding read (find_agent /
+    // get_agent): the agents whose operator link names an agent. Its read of
+    // the FORCEd `operator_links` is admitted by `epigraph_definer_bypass()`
+    // (the owner). Under a non-member owner it reads no link: fail CLOSED,
+    // fewer humans shown, never more.
+    ("epigraph_agents_linked_to_operator", 269),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3224,6 +3230,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_step_lineage_executors",
             "public.epigraph_step_lineage_executors(uuid)",
+            true,
+        ),
+        // 269: the agent-lookup card's reverse binding read (find_agent /
+        // get_agent, on the request DSN); without the grant every card is
+        // 42501.
+        (
+            "epigraph_agents_linked_to_operator",
+            "public.epigraph_agents_linked_to_operator(uuid)",
             true,
         ),
     ];

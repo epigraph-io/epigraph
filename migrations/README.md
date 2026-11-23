@@ -3403,6 +3403,18 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **269**: public `agent_card_disclosure_readers` (backlog 0e419970, the agent-lookup card
+  follow-ups of PR #774). Adds the SECURITY DEFINER read `epigraph_agents_linked_to_operator(operator)`:
+  the agents whose 107 operator link names an agent (retired links included), the inverse of
+  `epigraph_operator_of_author`. It decides nothing: the card feeds each such agent, and each agent
+  a 149 allowance names, to the same forward binding rule that fills `operator_human`, and shows
+  the operator as `kind = human` (`operator_of_bound_agent`) when some agent is currently bound to
+  it. No registration or client status is read. 172's form (`pg_catalog, pg_temp`), owned by
+  `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded; `tenancy_backfill` registers
+  both). Pinned by `epigraph-db/tests/agent_lookup.rs`
+  (`a_human_some_agent_is_bound_to_reads_as_human_to_every_reader`, the catalog test). Undo:
+  `docs/runbooks/269-undo.sql`. **Deploy order:** migrate BEFORE the binary: a binary built
+  against 269 calls it on every `find_agent` / `get_agent` card and answers 42883 without it.
 
 ## `-- no-transaction` migrations
 
