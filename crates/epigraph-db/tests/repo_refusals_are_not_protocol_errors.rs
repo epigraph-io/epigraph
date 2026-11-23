@@ -26,13 +26,12 @@ fn src() -> PathBuf {
 
 /// Files allowed to keep `Protocol(`, how many sites each, and why. Counts are
 /// exact: a change in either direction fails.
-const ALLOWED: &[(&str, usize, &str)] = &[(
-    "repos/match_candidate.rs",
-    3,
-    "require_privileged and mark_retired_on's two refusals return sqlx::Result; their only \
-     production consumer (engine admin_cascade, via repair_with_audit!) stringifies the error, \
-     so they never reach MCP designed_refusal. Converting them changes public signatures.",
-)];
+///
+/// Empty: `repos/match_candidate.rs`, allowlisted at 3 when this ratchet
+/// landed, builds `DbError::Refused` for its three refusals since backlog
+/// 05f56dde. The machinery stays so the next grandfathering is not a
+/// redesign.
+const ALLOWED: &[(&str, usize, &str)] = &[];
 
 /// How many times the identifier `Protocol` is called in `code` (`Protocol(`,
 /// `Protocol (`). A count, not line numbers: the code view blanks string

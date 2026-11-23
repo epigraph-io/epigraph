@@ -1688,7 +1688,8 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
     // Retirement does not, by any route. The repo's own retire refuses in
     // Rust before any statement runs (retire_conn's require_privileged: the
     // flip is administrative, so it needs a privileged session), which is a
-    // protocol error naming the maintenance connection, not a database error.
+    // repo-authored authority refusal (`DbError::Refused`, backlog 05f56dde)
+    // naming the maintenance connection, not a database error.
     // The statement-level routes below never pass that check, so they are what
     // pin 118's guard: each refusal is the stale guard's own (MC01), not some
     // other 42501 on the way (a lost EXECUTE on a privilege helper, a missing
@@ -1698,8 +1699,14 @@ async fn the_app_role_cannot_make_a_match_candidate_stale(pool: PgPool) {
         .await
         .expect_err("retire on the application role");
     assert!(
-        e.as_database_error().is_none(),
-        "retire: expected the application-level refusal, got a database error: {e}"
+        matches!(
+            e,
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::Authority,
+                ..
+            }
+        ),
+        "retire: expected the repo's authority refusal, got: {e:?}"
     );
     assert!(
         e.to_string()

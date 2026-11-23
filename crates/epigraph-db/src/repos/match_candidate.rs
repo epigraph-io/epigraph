@@ -471,7 +471,7 @@ impl MatchCandidateRepo {
     /// path with no maintenance connection records the retirement as a
     /// deferred request instead and leaves the candidate untouched
     /// (`epigraph_engine::admin_cascade`).
-    pub async fn retire(&self, id: Uuid, by: Option<Uuid>) -> sqlx::Result<RetirementOutcome> {
+    pub async fn retire(&self, id: Uuid, by: Option<Uuid>) -> Result<RetirementOutcome, DbError> {
         let mut conn = self.pool.acquire().await?;
         Self::retire_conn(&mut conn, id, by, None).await
     }
@@ -487,15 +487,20 @@ impl MatchCandidateRepo {
     /// refusal is loud and nothing is written.
     ///
     /// # Errors
-    /// A protocol error on a non-privileged session, or when the candidate's
-    /// status is no longer `expected_status`; the query's error otherwise (a
-    /// missing candidate is `RowNotFound`).
+    /// [`DbError::Refused`] (backlog 05f56dde): of kind
+    /// [`RefusalKind::Authority`](crate::RefusalKind::Authority) on a
+    /// non-privileged session, of kind
+    /// [`RefusalKind::State`](crate::RefusalKind::State) when the candidate's
+    /// status is no longer `expected_status` or the flip to `stale` did not
+    /// change exactly one row. The query's error otherwise, converted by
+    /// `From<sqlx::Error>` (a missing candidate is
+    /// `QueryFailed { source: RowNotFound }`).
     pub async fn retire_conn(
         conn: &mut sqlx::PgConnection,
         id: Uuid,
         by: Option<Uuid>,
         expected_status: Option<&str>,
-    ) -> sqlx::Result<RetirementOutcome> {
+    ) -> Result<RetirementOutcome, DbError> {
         use sqlx::Acquire;
         let mut tx = conn.begin().await?;
         require_privileged(&mut tx, "MatchCandidateRepo::retire_conn").await?;
@@ -770,8 +775,10 @@ async fn current_decision(
 }
 
 /// Refuse a non-privileged session (migration 114's
-/// `epigraph_session_is_privileged_writer()`), naming the caller.
-async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::Result<()> {
+/// `epigraph_session_is_privileged_writer()`), naming the caller: a
+/// [`DbError::Refused`] of kind `Authority`, never a `sqlx::Error::Protocol`,
+/// which every transport redacts as a server fault (backlog 05f56dde).
+async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> Result<(), DbError> {
     let privileged: bool =
         sqlx::query_scalar("SELECT public.epigraph_session_is_privileged_writer()")
             .fetch_one(&mut *conn)
@@ -779,11 +786,14 @@ async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::
     if privileged {
         return Ok(());
     }
-    Err(sqlx::Error::Protocol(format!(
-        "{what} runs only on a privileged (maintenance) connection: a promoted matcher edge \
-         between two public claims is owned by nobody (migration 117), and the flip to \
-         `stale` is an administrative act (migration 118)"
-    )))
+    Err(DbError::Refused {
+        kind: crate::RefusalKind::Authority,
+        message: format!(
+            "{what} runs only on a privileged (maintenance) connection: a promoted matcher edge \
+             between two public claims is owned by nobody (migration 117), and the flip to \
+             `stale` is an administrative act (migration 118)"
+        ),
+    })
 }
 
 /// The act of [`MatchCandidateRepo::retire_conn`]: row-lock the candidate,
@@ -804,12 +814,15 @@ async fn require_privileged(conn: &mut sqlx::PgConnection, what: &str) -> sqlx::
 /// The flip is checked (`rows_affected == 1`): on a privileged session nothing
 /// filters the row, so a flip that changed nothing means the row vanished
 /// under the lock, and the retirement must not report success.
+///
+/// Both refusals are [`DbError::Refused`] of kind `State` (backlog 05f56dde),
+/// with literal text and the candidate's id and statuses only.
 async fn mark_retired_on(
     conn: &mut sqlx::PgConnection,
     id: Uuid,
     by: Option<Uuid>,
     expected_status: Option<&str>,
-) -> sqlx::Result<String> {
+) -> Result<String, DbError> {
     let previous_status: String =
         sqlx::query_scalar("SELECT status FROM match_candidates WHERE id = $1 FOR UPDATE")
             .bind(id)
@@ -817,11 +830,14 @@ async fn mark_retired_on(
             .await?;
     if let Some(expected) = expected_status {
         if previous_status != expected && previous_status != "stale" {
-            return Err(sqlx::Error::Protocol(format!(
-                "match candidate {id} was {expected} when its retirement was requested and is \
-                 {previous_status} now: it was decided again in between, so the request is not \
-                 carried out; nothing was changed"
-            )));
+            return Err(DbError::Refused {
+                kind: crate::RefusalKind::State,
+                message: format!(
+                    "match candidate {id} was {expected} when its retirement was requested and \
+                     is {previous_status} now: it was decided again in between, so the request \
+                     is not carried out; nothing was changed"
+                ),
+            });
         }
     }
     let flipped = sqlx::query(
@@ -835,10 +851,13 @@ async fn mark_retired_on(
     .await?
     .rows_affected();
     if flipped != 1 {
-        return Err(sqlx::Error::Protocol(format!(
-            "match candidate {id}: the flip to stale changed {flipped} rows, not 1; nothing was \
-             retired"
-        )));
+        return Err(DbError::Refused {
+            kind: crate::RefusalKind::State,
+            message: format!(
+                "match candidate {id}: the flip to stale changed {flipped} rows, not 1; nothing \
+                 was retired"
+            ),
+        });
     }
     Ok(previous_status)
 }

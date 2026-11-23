@@ -210,9 +210,11 @@ async fn assess_workflow_promotion(
     // released before refresh's write, so the tool never holds two pooled
     // connections.
     let mut read = server.read_as(viewer, "assess_workflow_promotion").await?;
+    // The typed error (backlog 0bc4636e): a coded database refusal keeps the
+    // type `internal_error` recognises it by; its `to_string()` did not.
     let parent_id = WorkflowRepository::immediate_variant_parent(&mut *read, viewer, variant_id)
         .await
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(internal_error)?;
 
     let variant =
         BehavioralExecutionRepository::success_stats(&mut *read, viewer, variant_id, window)
