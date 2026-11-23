@@ -130,7 +130,8 @@ pub use agent::{
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use agent_identity::{
     AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,
-    PromptFile, PromptHistoryEntry, PromptHistoryIndexEntry, PromptSnapshot, PromptSnapshotIndex,
+    PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
+    PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
 };
 pub use agent_key::{AgentKeyRepository, AgentKeyRow, AttestedKeyRow};
 pub use agent_lookup::{

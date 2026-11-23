@@ -2206,6 +2206,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // deprecation is refused as unchanged-but-live, and its audit INSERT is
     // refused by `security_events_append`. The owner is load-bearing.
     ("epigraph_admin_deprecate_workflow_row", 237),
+    // 268 (backlog bedd59b7 / 24a9f4fa), the content-free, paged prompt-history
+    // read behind 161's gate, for the GET /api/v1/agents/:id/prompt-history
+    // listing. It reads the FORCEd `agent_prompt_snapshots` and
+    // `agent_succession`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no
+    // succession and no snapshot, so every listing answers "this agent ran
+    // nothing and has no lineage" (quiet, the stake that makes the owner a
+    // control here).
+    ("epigraph_agent_prompt_history_meta", 268),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -4026,6 +4035,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_disclosed_role_attachments",
         "public.epigraph_disclosed_role_attachments(uuid[])",
+        true,
+    ),
+    // 268: the prompt-history listing calls it on the request DSN; without
+    // the grant every listing is 42501.
+    (
+        "epigraph_agent_prompt_history_meta",
+        "public.epigraph_agent_prompt_history_meta(uuid, integer, uuid, timestamptz, uuid, integer)",
         true,
     ),
 ];
