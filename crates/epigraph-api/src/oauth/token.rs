@@ -863,7 +863,11 @@ async fn handle_client_credentials(
     // are `invalid_client`, with the same generic description as a wrong
     // credential (so the answer is no oracle for which client ids exist).
     let Some(client_id_str) = req.client_id.as_deref() else {
-        tracing::warn!("client_credentials without a client_id");
+        tracing::warn!(
+            grant_type = %req.grant_type,
+            reason = "no client_id",
+            "confidential client authentication failed"
+        );
         return Err(invalid_client());
     };
 
@@ -874,8 +878,10 @@ async fn handle_client_credentials(
         })?
     else {
         tracing::warn!(
-            client_id = %client_id_str,
-            "client_credentials for an unknown (or not active) client_id"
+            client_id = ?client_id_str,
+            grant_type = %req.grant_type,
+            reason = "unknown or not active client_id",
+            "confidential client authentication failed"
         );
         return Err(invalid_client());
     };
