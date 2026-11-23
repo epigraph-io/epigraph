@@ -34,8 +34,20 @@
 //!   (`cache_owner_frame_keeping_recorded`); the claim's NEXT ordinary
 //!   recompute applies the admissible-first owner rule (8d720490) and refolds
 //!   the cache from `claim_validity`.
-//! * the refold fails closed: an operated agent whose session does not itself
-//!   write the target team is refused, and nothing moves.
+//! * backlog ecd842bf (migration 242): an operated agent does not share or
+//!   publicize on its own authority, even when it holds the target team's
+//!   writer (share) or the owning team's admin (publicize) membership itself,
+//!   and even when its human's team is the target; its human makes the same
+//!   call and succeeds. (Before 242 the agent's session also failed the
+//!   refold check when only its human wrote the team; 242 refuses it first.)
+//! * backlog fc33ef1a (migration 242): on share, a harvester fragment that a
+//!   moved claim cites and a claim that does NOT move (and is not already in
+//!   the team) also cites is held where it was, its audit report with it, and
+//!   counted (`harvester_fragments_held`); co-citing claims shared in two
+//!   calls end with the fragment in the team. On publicize, 218's arm (d)
+//!   guard is the hold (a group co-citer), now counted in the audit row; a
+//!   fragment whose other citer is public goes public, and co-citing claims
+//!   publicized in two calls end with it public.
 //! * backlog 0d9dfd24: `claims.truth_value`, which `update_with_evidence`
 //!   persisted as a copy of a fold that took in a BBA on evidence that stays
 //!   behind (pinned), is replaced by the refolded value: the new audience is
@@ -531,6 +543,321 @@ async fn publicize_carries_a_source_whose_fragments_all_went_public(pool: PgPool
     assert_eq!(events[0]["harvester_sources_held"], 0, "{events:?}");
 }
 
+/// `claim` also cites `fragment` (a provenance row stamped with the claim's
+/// tenancy; the fragment itself is not re-stamped: it has a real owner).
+async fn cite(pool: &PgPool, claim: Uuid, fragment: Uuid) {
+    sqlx::query(
+        "INSERT INTO harvester_claim_provenance (claim_id, fragment_id, visibility, \
+                                                 owner_group_id) \
+         SELECT $1, $2, c.visibility, c.owner_group_id FROM claims c WHERE c.id = $1",
+    )
+    .bind(claim)
+    .bind(fragment)
+    .execute(pool)
+    .await
+    .expect("seed harvester provenance");
+}
+
+/// An audit report on `fragment` (it takes the fragment's pair, 173).
+async fn audit_report(pool: &PgPool, fragment: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO harvester_audit_reports (fragment_id, extraction_id, passed_audit) \
+         VALUES ($1, $2, true) RETURNING id",
+    )
+    .bind(fragment)
+    .bind(Uuid::new_v4())
+    .fetch_one(pool)
+    .await
+    .expect("seed harvester audit report")
+}
+
+/// Backlog fc33ef1a, share: a fragment the shared claim cites and a claim that
+/// stays private also cites is held in the home group (spec 4.6,
+/// `shared-fragment`), its audit report with it, so the teammate reads
+/// neither; the fragment the shared claim alone cites moves. The audit row
+/// counts the held fragment, and the source of the held fragment does not
+/// follow the moved one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_holds_a_fragment_a_claim_that_stays_also_cites(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "hold-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "hold-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(&pool, &s, alice, "harvested finding", "private", None).await;
+    let stays = write(&pool, &s, alice, "note that stays home", "private", None).await;
+    let (source, shared) = harvested(&pool, c).await;
+    cite(&pool, stays, shared).await;
+    let own = fragment_of(&pool, source, c).await;
+    let report = audit_report(&pool, shared).await;
+    assert_eq!(
+        tenancy(&pool, "harvester_audit_reports", report).await,
+        group(home),
+        "PREMISE"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(t),
+        "PREMISE: moved"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", own).await,
+        group(t),
+        "a fragment only the moved claim cites moves with it"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(home),
+        "a fragment a claim that stays also cites is held"
+    );
+    assert!(!reads_row(&pool, &s, bob, "harvester_fragments", shared).await);
+    assert_eq!(
+        tenancy(&pool, "harvester_audit_reports", report).await,
+        group(home),
+        "its audit report stays with it"
+    );
+    assert!(!reads_row(&pool, &s, bob, "harvester_audit_reports", report).await);
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await,
+        group(home),
+        "the source's fragments disagree after the hold, so it stays"
+    );
+    let events = audit(&pool, "claim.shared_with_team").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_held"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_moved"], 0, "{events:?}");
+}
+
+/// Backlog fc33ef1a, share, a co-citer the SHARER cannot read: bob's private
+/// claim (bob's home group, which alice does not read) also cites the
+/// fragment. The definer still sees it, so the fragment is held in alice's
+/// home group and a team reader does not read it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_holds_a_fragment_a_claim_the_sharer_cannot_read_also_cites(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "blind-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "blind-bob").await;
+    let (dan, _) = fixture::seed_agent_with_group(&pool, "blind-dan").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, dan, "reader").await;
+    let c = write(&pool, &s, alice, "harvested finding", "private", None).await;
+    let hidden = write(&pool, &s, bob, "bob's private note", "private", None).await;
+    let (_, shared) = harvested(&pool, c).await;
+    cite(&pool, hidden, shared).await;
+    assert!(
+        !reads_row(&pool, &s, alice, "claims", hidden).await,
+        "PREMISE: the sharer cannot read the other citer"
+    );
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t), "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(home),
+        "held although the sharer cannot see the claim that holds it"
+    );
+    assert!(!reads_row(&pool, &s, dan, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.shared_with_team").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize, a co-citer the publisher cannot read: carol's
+/// private claim also cites the team's fragment. It stays the team's (218's
+/// guard), is counted held, and a stranger does not read it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_holds_a_fragment_a_claim_the_publisher_cannot_read_also_cites(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "blind-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "blind-carol").await;
+    let (dan, _) = fixture::seed_agent_with_group(&pool, "blind-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let hidden = write(&pool, &s, carol, "carol's private note", "private", None).await;
+    let (_, shared) = harvested(&pool, c).await;
+    cite(&pool, hidden, shared).await;
+    assert!(
+        !reads_row(&pool, &s, eve, "claims", hidden).await,
+        "PREMISE: the publisher cannot read the other citer"
+    );
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "claims", c).await.0, "public", "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(t),
+        "held although the publisher cannot see the claim that holds it"
+    );
+    assert!(!reads_row(&pool, &s, dan, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+}
+
+/// Backlog fc33ef1a, share, the other half of the hold: a co-citer that is
+/// ALREADY in the target team does not hold the fragment. Two claims that
+/// cite one fragment, shared into the same team in two calls: after the
+/// second call every citer is the team's, so the fragment and its source are
+/// too, and a teammate reads them. A hold on "any other citer" stranded the
+/// fragment and source in the home group for good (the first review of 242).
+#[sqlx::test(migrations = "../../migrations")]
+async fn sharing_co_citing_claims_in_two_calls_does_not_strand_their_fragment(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "seq-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "seq-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let a = write(&pool, &s, alice, "first harvested finding", "private", None).await;
+    let b = write(
+        &pool,
+        &s,
+        alice,
+        "second harvested finding",
+        "private",
+        None,
+    )
+    .await;
+    let (source, f) = harvested(&pool, a).await;
+    cite(&pool, b, f).await;
+
+    share(&pool, &s, alice, &[a], t).await.expect("share a");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", f).await,
+        group(home),
+        "held while b stays home"
+    );
+    share(&pool, &s, alice, &[b], t).await.expect("share b");
+
+    assert_eq!(tenancy(&pool, "claims", a).await, group(t), "PREMISE");
+    assert_eq!(tenancy(&pool, "claims", b).await, group(t), "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", f).await,
+        group(t),
+        "every citer is the team's now, so the fragment is too"
+    );
+    assert_eq!(tenancy(&pool, "harvester_sources", source).await, group(t));
+    assert!(reads_row(&pool, &s, bob, "harvester_fragments", f).await);
+    assert!(reads_row(&pool, &s, bob, "harvester_sources", source).await);
+    let events = audit(&pool, "claim.shared_with_team").await;
+    let mut held: Vec<i64> = events
+        .iter()
+        .map(|e| e["harvester_fragments_held"].as_i64().expect("count"))
+        .collect();
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        vec![0, 1],
+        "one call held it, the other not: {events:?}"
+    );
+}
+
+/// Backlog fc33ef1a, publicize: a fragment the publicized claim cites and a
+/// group-private claim that is NOT publicized also cites stays in its group
+/// (218's arm (d) guard), and 242 reports it held in the audit row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_reports_a_fragment_a_group_claim_still_cites_as_held(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "hold-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "hold-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let stays = write(&pool, &s, eve, "team note not published", "team", Some(t)).await;
+    let (source, shared) = harvested(&pool, c).await;
+    cite(&pool, stays, shared).await;
+    let own = fragment_of(&pool, source, c).await;
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "claims", c).await.0, "public", "PREMISE");
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", own).await.0,
+        "public",
+        "a fragment only the publicized claim cites goes public"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await,
+        group(t),
+        "a fragment a group claim still cites is held"
+    );
+    assert!(!reads_row(&pool, &s, carol, "harvester_fragments", shared).await);
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await,
+        group(t),
+        "the source's fragments disagree, so it stays"
+    );
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 1, "{events:?}");
+    assert_eq!(events[0]["harvester_sources_held"], 1, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize, the other half: a fragment whose other citer
+/// is already PUBLIC is not held. Publicize widens visibility and never
+/// changes the fragment's owner, so nothing is taken from the other citer's
+/// audience; holding it would leave a fragment narrower than every claim
+/// that cites it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_does_not_hold_a_fragment_whose_other_citer_is_public(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "pub-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "pub-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "harvested finding", "team", Some(t)).await;
+    let other = write(&pool, &s, carol, "an already public claim", "public", None).await;
+    let (source, shared) = harvested(&pool, c).await;
+    cite(&pool, other, shared).await;
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(
+        tenancy(&pool, "harvester_fragments", shared).await.0,
+        "public"
+    );
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await.0,
+        "public"
+    );
+    assert!(reads_row(&pool, &s, carol, "harvester_fragments", shared).await);
+    let events = audit(&pool, "claim.publicized").await;
+    assert_eq!(events[0]["harvester_fragments_held"], 0, "{events:?}");
+}
+
+/// Backlog fc33ef1a, publicize: two team claims that cite one fragment,
+/// publicized in two calls. The first call holds it (the second claim is
+/// still the team's); after the second, every citer is public and so are the
+/// fragment and its source.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicizing_co_citing_claims_in_two_calls_does_not_strand_their_fragment(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "seq-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "seq-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let a = write(&pool, &s, eve, "first team finding", "team", Some(t)).await;
+    let b = write(&pool, &s, eve, "second team finding", "team", Some(t)).await;
+    let (source, f) = harvested(&pool, a).await;
+    cite(&pool, b, f).await;
+
+    publicize(&pool, &s, eve, &[a]).await.expect("publicize a");
+    assert_eq!(tenancy(&pool, "harvester_fragments", f).await, group(t));
+    publicize(&pool, &s, eve, &[b]).await.expect("publicize b");
+
+    assert_eq!(tenancy(&pool, "harvester_fragments", f).await.0, "public");
+    assert_eq!(
+        tenancy(&pool, "harvester_sources", source).await.0,
+        "public"
+    );
+    assert!(reads_row(&pool, &s, carol, "harvester_fragments", f).await);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 31285392: the moved claim's belief, cached and scoped
 // ─────────────────────────────────────────────────────────────────────────────
@@ -790,38 +1117,132 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
     );
 }
 
-/// The refold fails closed. An agent its human operates writes a private
-/// claim (into the human's personal group, the agent's home) and shares it
-/// into a team the HUMAN writes: 206 admits the target through the operator
-/// arm, but the agent's own stamp does not write the team, so the refold
-/// could not reach the moved claim. The act is refused and nothing moves.
+/// An agent `human` operates through a LIVE link, the human a registered
+/// human operator. `(human, human_home, crew)`.
+async fn operated(pool: &PgPool, label: &str) -> (Uuid, Uuid, Uuid) {
+    let (human, human_home) = fixture::seed_human_operator(pool, &format!("{label}-human")).await;
+    let (crew, _) = fixture::seed_agent_with_group(pool, &format!("{label}-crew")).await;
+    let mut conn = pool.acquire().await.expect("acquire");
+    epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
+        .await
+        .expect("live link");
+    (human, human_home, crew)
+}
+
+/// Backlog ecd842bf, the shape 215 already refused (through the refold check)
+/// and 242 refuses in the definer: the agent shares its private draft into a
+/// team only its HUMAN writes. Refused as an operated agent; nothing moves.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_act_whose_session_cannot_refold_the_moved_claim_is_refused(pool: PgPool) {
+async fn an_operated_agent_does_not_share_into_its_humans_team(pool: PgPool) {
     let s = app_role(&pool).await;
     let t = team(&pool, "human's team").await;
-    let (human, human_home) = fixture::seed_human_operator(&pool, "casc-human").await;
-    let (crew, _) = fixture::seed_agent_with_group(&pool, "casc-crew").await;
+    let (human, human_home, crew) = operated(&pool, "gate-humans-team").await;
     add_member(&pool, t, human, "writer").await;
-    {
-        let mut conn = pool.acquire().await.expect("acquire");
-        epigraph_db::AgentRepository::link_operator(&mut conn, crew, human)
-            .await
-            .expect("live link");
-    }
     let c = write(&pool, &s, crew, "crew draft", "private", None).await;
     assert_eq!(tenancy(&pool, "claims", c).await, group(human_home));
 
     let err = share(&pool, &s, crew, &[c], t)
         .await
-        .expect_err("the crew agent's session does not write the team");
+        .expect_err("an operated agent does not share on its own authority");
     assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
-    assert!(err.message.contains("does not itself write"), "{err:?}");
+    assert!(err.message.contains("operated agent"), "{err:?}");
     assert_eq!(
         tenancy(&pool, "claims", c).await,
         group(human_home),
         "nothing moved"
     );
     assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
+}
+
+/// Backlog ecd842bf, the hole 215 left open: the operated agent holds its OWN
+/// writer membership of the team, so 215 admitted the target (`via = 'own'`)
+/// and the refold check passed. 242 refuses it; nothing moves and the
+/// teammate reads nothing. The human makes the same call and it succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_that_writes_the_team_itself_does_not_share_into_it(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (human, human_home, crew) = operated(&pool, "gate-share").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "gate-share-reader").await;
+    add_member(&pool, t, crew, "writer").await;
+    add_member(&pool, t, human, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(&pool, &s, crew, "crew draft", "private", None).await;
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(human_home),
+        "PREMISE: private to the human's personal group, the agent's home"
+    );
+
+    let err = share(&pool, &s, crew, &[c], t)
+        .await
+        .expect_err("an operated agent does not share on its own authority");
+    assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_REQUEST, "{err:?}");
+    assert!(err.message.contains("operated agent"), "{err:?}");
+    assert_eq!(
+        tenancy(&pool, "claims", c).await,
+        group(human_home),
+        "nothing moved"
+    );
+    assert!(!reads_row(&pool, &s, bob, "claims", c).await);
+    assert!(audit(&pool, "claim.shared_with_team").await.is_empty());
+
+    share(&pool, &s, human, &[c], t)
+        .await
+        .expect("the human shares its agent's draft");
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t));
+    assert!(reads_row(&pool, &s, bob, "claims", c).await);
+    assert_eq!(audit(&pool, "claim.shared_with_team").await.len(), 1);
+}
+
+/// Backlog ecd842bf for publicize: an operated agent that is itself an ADMIN
+/// of the owning team (215 admitted it: D-V2 asks only for a live admin), and
+/// an agent whose link is RETIRED and that holds the same admin membership,
+/// are both refused and nothing is published. The human, an admin of the
+/// team, publishes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_operated_agent_that_admins_the_team_itself_does_not_publicize(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (human, _, crew) = operated(&pool, "gate-pub").await;
+    let (retired, _) = fixture::seed_agent_with_group(&pool, "gate-pub-retired").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "gate-pub-stranger").await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_db::AgentRepository::link_retired_agent(&mut conn, retired, human)
+            .await
+            .expect("retired link");
+    }
+    add_member(&pool, t, crew, "admin").await;
+    add_member(&pool, t, retired, "admin").await;
+    add_member(&pool, t, human, "admin").await;
+    let c = write(&pool, &s, crew, "crew finding", "team", Some(t)).await;
+    assert_eq!(tenancy(&pool, "claims", c).await, group(t), "PREMISE");
+
+    for (who, agent) in [("live-linked", crew), ("retired-linked", retired)] {
+        let err = publicize(&pool, &s, agent, &[c])
+            .await
+            .expect_err("an operated agent does not publicize on its own authority");
+        assert_eq!(
+            err.code,
+            rmcp::model::ErrorCode::INVALID_REQUEST,
+            "{who}: {err:?}"
+        );
+        assert!(err.message.contains("operated agent"), "{who}: {err:?}");
+        assert_eq!(
+            tenancy(&pool, "claims", c).await,
+            group(t),
+            "{who}: nothing published"
+        );
+        assert!(!reads_row(&pool, &s, carol, "claims", c).await, "{who}");
+    }
+    assert!(audit(&pool, "claim.publicized").await.is_empty());
+
+    publicize(&pool, &s, human, &[c])
+        .await
+        .expect("the human, an admin of the team, publishes it");
+    assert_eq!(tenancy(&pool, "claims", c).await.0, "public");
+    assert!(reads_row(&pool, &s, carol, "claims", c).await);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

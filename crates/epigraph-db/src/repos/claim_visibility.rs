@@ -295,7 +295,13 @@ fn refusal_text(outcome: &str) -> &'static str {
             "you did not write this claim and are not an admin of the group it is private to"
         }
         "refused_not_team_writer" => {
-            "the target is not a team you may write (writer or admin, your own or your human's)"
+            "the target is not a team you may write (your own live writer or admin membership)"
+        }
+        // Migration 242 (spec ruling R1, backlog ecd842bf).
+        "refused_not_human" => {
+            "only a human moves existing work out of its group: you are an operated agent, and \
+             an operated agent does not share or publish work on its own authority, whatever \
+             memberships it holds; your human operator makes this call"
         }
         _ => "refused",
     }
@@ -857,5 +863,20 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// Migration 242's outcome is an AUTHORITY refusal (403 / INVALID_REQUEST),
+    /// never a state one, and its text names the reason rather than the
+    /// catch-all "refused".
+    #[test]
+    fn an_operated_agent_refusal_is_an_authority_refusal_that_says_why() {
+        let rows = vec![(g(1), "refused_not_human".to_string())];
+        match outcomes_or_refusal("share_claims_with_team", rows, &["shared"]) {
+            Err(DbError::Refused {
+                kind: RefusalKind::Authority,
+                message,
+            }) => assert!(message.contains("operated agent"), "{message}"),
+            other => panic!("expected an authority refusal, got {other:?}"),
+        }
     }
 }

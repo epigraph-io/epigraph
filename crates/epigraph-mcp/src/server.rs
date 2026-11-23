@@ -1744,7 +1744,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Make team or private claims PUBLIC (readable by every authenticated agent). Only a live ADMIN of each claim's owning group may do this; a plain writer, a reader or an operated agent acting for an admin is refused. Sealed (encrypted) claims are refused. All or nothing: if any claim is not found, not readable, sealed or not yours to publish, nothing changes and the error lists each refused claim. The owner group stays the same. The claims' unpinned evidence and reasoning traces become public with them, and edges between claims that are now public become public too. An edge someone declared group-only, and evidence an operator hid, stay as they were. Requires a reason, recorded with your identity in a claim.publicized audit event. Returns {results: [{claim_id, outcome: publicized | already_public}]}."
+        description = "Make team or private claims PUBLIC (readable by every authenticated agent). Only a live ADMIN of each claim's owning group may do this; a plain writer or a reader is refused, and so is an operated agent (an agent with an operator link or a client allowance), even one that is itself an admin: its human makes the call. Sealed (encrypted) claims are refused. All or nothing: if any claim is not found, not readable, sealed or not yours to publish, nothing changes and the error lists each refused claim. The owner group stays the same. The claims' unpinned evidence and reasoning traces become public with them, and edges between claims that are now public become public too. An edge someone declared group-only, and evidence an operator hid, stay as they were. Requires a reason, recorded with your identity in a claim.publicized audit event. Returns {results: [{claim_id, outcome: publicized | already_public}]}."
     )]
     async fn publicize_claims(
         &self,
@@ -1758,7 +1758,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Move PRIVATE claims (owned by your home group: your personal group, or your operator's) into a team you write, so the team's members can read them. Visibility stays group-only; publicize_claims publishes. You must have written each claim, or be an admin of your home group, and you (or your human operator) need a live writer or admin membership of the team. Public and team claims are refused. All or nothing, and audited (claim.shared_with_team, with your reason). Evidence and traces move with the claims. Returns {results: [{claim_id, outcome: shared}]}."
+        description = "Move PRIVATE claims (owned by your home group: your personal group, or your operator's) into a team you write, so the team's members can read them. Visibility stays group-only; publicize_claims publishes. You must have written each claim, or be an admin of your home group, and you need your own live writer or admin membership of the team. An operated agent (an agent with an operator link or a client allowance) is refused whatever memberships it holds: its human makes the call. Public and team claims are refused. All or nothing, and audited (claim.shared_with_team, with your reason). Evidence and traces move with the claims. Returns {results: [{claim_id, outcome: shared}]}."
     )]
     async fn share_claims_with_team(
         &self,

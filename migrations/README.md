@@ -3521,6 +3521,52 @@ restart.
   `epigraph-mcp` binary: it no longer creates the reader, so on an unmigrated database the
   read-only listener refuses every content call. **Applied to throwaway databases only, NOT
   to any deployed database.**
+- **242**: `share_publicize_operated_agent_and_fragment_hold` (backlog ecd842bf, fc33ef1a;
+  share-with-team spec ruling R1 and section 4.6). Re-states 215's
+  `epigraph_publicize_claims` and `epigraph_share_claims_with_team` (an md5 precondition
+  refuses to apply over any other body, 55000). (1) An operated agent, one whose
+  `epigraph_human_of(principal, false)` is another agent (an operator link of any state, or a
+  client allowance), is refused by both acts with the new outcome `refused_not_human`
+  (the spec's name for R1's refusal)
+  (403 / INVALID_REQUEST), whatever memberships it holds itself; before, an operated agent that
+  was itself a writer of the target team (share) or an admin of the owning team (publicize)
+  acted on its own authority. Share's target test names `via = 'own'` only. Not R1's whole
+  human gate: an agent with no operator link and no client allowance (for example a
+  role-attached agent that has neither) is still judged by its own memberships.
+  (2) Share holds a harvester fragment that a moved claim cites and a claim outside the call
+  also cites, unless that claim is already in the target team: the fragment keeps its pair
+  (its audit reports with it, 173) and 215's source rule then runs on the post-hold
+  fragments. A co-citer already in the team does not hold it, so co-citing claims shared in
+  separate calls end with the fragment and source in the team. Publicize adds no hold of its
+  own (218's arm (d) guard already keeps a group fragment another group claim cites; a
+  fragment whose other citers are all public goes public). Both audit rows count the held
+  fragments as `harvester_fragments_held`. 218's arm (d) is unchanged. Audit rows carry
+  `migration` 242. Pinned by
+  `epigraph-mcp/tests/claim_visibility_cascade_app_role.rs` (the operated agent with its own
+  writer / admin membership, a retired link, the human's control call; the share hold, the
+  share and publicize of co-citing claims in two calls, publicize with a group and with a
+  PUBLIC other citer) and
+  `epigraph-db/tests/share_publicize_operated_fragment_undo.rs` (the undo, run twice; the md5
+  precondition). Undo: `docs/runbooks/242-undo.sql` (re-states 215's two bodies). Slot 242
+  was assigned by the 2026-11-22 backlog triage (T21). **Deploy order:** none required; a
+  binary without the new refusal text answers the generic "refused". Operated agents that
+  share or publicize today start being refused. Before migrating, measure (on a role that
+  may execute `epigraph_live_memberships`, so role-derived memberships, 165, count; link and
+  membership state is read NOW, not as of each act; the client-allowance arm is not
+  counted): shares by an agent with a live operator link that is itself a member of the
+  target team, `SELECT count(*) FROM security_events s WHERE s.event_type =
+  'claim.shared_with_team' AND EXISTS (SELECT 1 FROM operator_links l WHERE l.agent_id =
+  s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM epigraph_live_memberships(s.agent_id)
+  m WHERE m.group_id = (s.details->>'to_group_id')::uuid)`; publicizes by such an agent that
+  is itself an admin of an owning group, `SELECT count(*) FROM security_events s WHERE
+  s.event_type = 'claim.publicized' AND EXISTS (SELECT 1 FROM operator_links l WHERE
+  l.agent_id = s.agent_id AND NOT l.retired) AND EXISTS (SELECT 1 FROM
+  epigraph_live_memberships(s.agent_id) m JOIN jsonb_array_elements_text(s.details->
+  'owner_group_ids') g(id) ON m.group_id = g.id::uuid WHERE m.role = 'admin')`; and every act
+  242 would now refuse, `SELECT s.event_type, count(*) FROM security_events s WHERE
+  s.event_type IN ('claim.shared_with_team', 'claim.publicized') AND EXISTS (SELECT 1 FROM
+  operator_links l WHERE l.agent_id = s.agent_id) GROUP BY 1`. **Applied to throwaway
+  databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

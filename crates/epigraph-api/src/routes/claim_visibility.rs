@@ -2,9 +2,11 @@
 //! migration 206):
 //!
 //! * `POST /api/v1/claims/publicize` `{claim_ids, reason}`: group → public,
-//!   team admins only (owner decision D-V2);
+//!   team admins only (owner decision D-V2), never an operated agent
+//!   (migration 242);
 //! * `POST /api/v1/claims/share-with-team` `{claim_ids, group_id, reason}`:
-//!   private → a team the caller writes;
+//!   private → a team the caller writes by its own membership, never by an
+//!   operated agent (migration 242);
 //! * `PUT /api/v1/agents/me/default-group` `{group_id}` | `{private: true}` |
 //!   `{}` / `null`: the caller's default (D-V1; private since migration 209);
 //! * `PUT /api/v1/agents/:id/default-group`, the same body: the default of an
@@ -158,8 +160,9 @@ fn act_error(e: epigraph_engine::visibility_act::VisibilityActError) -> ApiError
 /// `POST /api/v1/claims/publicize`
 ///
 /// # Errors
-/// 400 bad request, 404 a claim the caller cannot read, 403 not a team admin,
-/// 409 a sealed claim; nothing changes on any of them.
+/// 400 bad request, 404 a claim the caller cannot read, 403 not a team admin
+/// or an operated agent (migration 242), 409 a sealed claim; nothing changes
+/// on any of them.
 pub async fn publicize_claims(
     crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
