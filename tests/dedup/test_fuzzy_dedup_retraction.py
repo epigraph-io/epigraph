@@ -10,11 +10,13 @@ marks through `POST /api/v1/claims/{dup}/dedup` and reads the database only.
 These tests assert the RECALL CONSEQUENCE and the identity edge, and drive the
 real script end to end against a disposable database. The script reads as the
 maintenance login it uses in production when CI provides one
-(tests/db_roles.py); fixtures write as the superuser. The executed-mark test
-also needs an API serving that database (DEDUP_TEST_API_BASE) and a bearer
-token for it with `claims:write` (plus `claims:admin` for a cross-agent
-cluster) in DEDUP_TEST_TOKEN, and skips without them; the rest are
-database-only. The request shape and the read-only contract are pinned without
+(tests/db_roles.py); fixtures write as the superuser. The executed-mark tests
+also need an API serving that database (DEDUP_TEST_API_BASE) and bearer tokens
+for it (tests/ci/with_test_api.sh mints them), and skip without them: one with
+`claims:admin` marking another agent's cluster (DEDUP_TEST_TOKEN), and one with
+`claims:write` only, an author marking a duplicate of its own claim in a group
+it writes (DEDUP_TEST_WRITER_TOKEN, _AGENT, _GROUP; backlog 32905f60). The rest
+are database-only. The request shape and the read-only contract are pinned without
 a database in scripts/tests/test_fuzzy_dedup_claims.py.
 
 Uses a `_test`-suffixed DSN and skips the whole module when it is unavailable,
@@ -154,6 +156,9 @@ def seeded(db):
 
 API_BASE = os.environ.get("DEDUP_TEST_API_BASE")
 API_TOKEN = os.environ.get("DEDUP_TEST_TOKEN")
+WRITER_TOKEN = os.environ.get("DEDUP_TEST_WRITER_TOKEN")
+WRITER_AGENT = os.environ.get("DEDUP_TEST_WRITER_AGENT")
+WRITER_GROUP = os.environ.get("DEDUP_TEST_WRITER_GROUP")
 
 DUP_TEXT = "PEG brush spring constant is 21 pN/nm over a 40x40 nm tile"
 
@@ -187,6 +192,16 @@ def _drop_pair(db, ids: list[str]) -> None:
                     "OR target_id = ANY(%s::uuid[])", (ids, ids))
         cur.execute("DELETE FROM claims WHERE id = ANY(%s::uuid[])", (ids,))
     db.commit()
+
+
+@pytest.fixture
+def writer_pair(db):
+    """A canonical and its duplicate AUTHORED by the writer token's agent, in
+    the personal group that agent is admin of: the claim act's author arm
+    (`claim_act_arm`: writes the owning group AND is the author)."""
+    ids = _seed_pair(db, WRITER_AGENT, WRITER_GROUP, "group")
+    yield ids
+    _drop_pair(db, ids)
 
 
 @pytest.fixture
@@ -302,6 +317,45 @@ def test_executed_dedup_removes_the_duplicate_from_recall(db, seeded, tmp_path):
     assert emb_3072_null is True
     # The dedup record: what makes the mark reversible (32c01f7d).
     assert identity_edges == 1
+
+
+@pytest.mark.skipif(
+    not (API_BASE and WRITER_TOKEN and WRITER_AGENT and WRITER_GROUP),
+    reason="needs DEDUP_TEST_API_BASE and the DEDUP_TEST_WRITER_* token, agent and group",
+)
+def test_an_author_with_claims_write_only_removes_its_own_duplicate_from_recall(
+    db, writer_pair, tmp_path
+):
+    """The common case, backlog 32905f60: an author marks a duplicate of its own
+    claim with a `claims:write` token and no `claims:admin`. The endpoint admits
+    it on the author arm only (the token's agent wrote both claims and writes
+    their group), and the duplicate leaves recall exactly as on the admin path."""
+    canonical, dup = writer_pair
+
+    assert recallable(db, canonical) and recallable(db, dup)
+
+    run_script(
+        tmp_path, [{"rep": canonical, "members": [canonical, dup]}], execute=True,
+        token=WRITER_TOKEN,
+    )
+
+    assert recallable(db, canonical), "the canonical must survive the merge intact"
+    assert not recallable(db, dup), (
+        "the author's own duplicate still satisfies recall's predicate after a "
+        "claims:write mark"
+    )
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT supersedes::text, embedding_3072 IS NULL FROM claims WHERE id = %s::uuid",
+            (dup,),
+        )
+        assert cur.fetchone() == (canonical, True)
+        cur.execute(
+            "SELECT count(*) FROM edges WHERE source_id = %s::uuid AND target_id = %s::uuid "
+            "AND relationship = 'same_as' AND valid_to IS NULL AND properties ? 'dedup'",
+            (dup, canonical),
+        )
+        assert cur.fetchone()[0] == 1
 
 
 def test_another_groups_private_cluster_is_read_whole(db, other_groups_private_pair, tmp_path):

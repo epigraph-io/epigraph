@@ -821,13 +821,14 @@ jobs:
   # on any skip not named in its --allow list, which also covers skips the flag
   # does not govern (e.g. test_git_ingest_reconciler's integration arm when it
   # cannot find the ingest_git binary built above). No skip is allowed:
-  # test_executed_dedup_removes_the_duplicate_from_recall needs a running API
-  # and a bearer token (DEDUP_TEST_API_BASE / DEDUP_TEST_TOKEN), and
-  # tests/ci/with_test_api.sh provides both around that step: it serves
-  # epigraph_py_test with the `server` binary built above, mints a per-run
-  # claims:write + claims:admin token, and stops the server when pytest exits,
-  # so it cannot outlive the step into tests/theme's table wipes (backlog
-  # 03fd7e00).
+  # the executed-dedup arms need a running API and bearer tokens
+  # (DEDUP_TEST_API_BASE, DEDUP_TEST_TOKEN, DEDUP_TEST_WRITER_*), and
+  # tests/ci/with_test_api.sh provides them around that step: it serves
+  # epigraph_py_test with the `server` binary built above, mints two per-run
+  # tokens, claims:write + claims:admin for another agent's cluster and
+  # claims:write only for an author marking its own duplicate (backlog
+  # 32905f60), and stops the server when pytest exits, so it cannot outlive
+  # the step into tests/theme's table wipes (backlog 03fd7e00).
   #
   # FIXTURES connect as the service container's superuser. The SCRIPTS under
   # test connect as a non-superuser maintenance login, the role they use in
