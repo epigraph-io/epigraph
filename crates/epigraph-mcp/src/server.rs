@@ -980,7 +980,7 @@ impl EpiGraphMcpFull {
             return Ok(());
         };
         let writes = crate::scope_map::required_scope(tool_name)
-            .map_or(true, |scope| !scope.ends_with(":read"));
+            .is_none_or(|scope| !scope.ends_with(":read"));
         if !writes {
             return Ok(());
         }

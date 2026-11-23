@@ -3,6 +3,7 @@ name = "epigraph-engine"
 description = "Epistemic engine for EpiGraph: truth propagation, Bayesian updates, DAG validation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

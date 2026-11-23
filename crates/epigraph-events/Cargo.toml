@@ -3,6 +3,7 @@ name = "epigraph-events"
 description = "Event bus and pub/sub system for EpiGraph agentic framework"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

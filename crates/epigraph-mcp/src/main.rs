@@ -417,7 +417,7 @@ fn parse_hex32(raw: &str, name: &str) -> Result<[u8; 32], String> {
             "invalid {name}: it contains a non-hex character; {EXPECTED}"
         ));
     }
-    if key_hex.len() % 2 != 0 {
+    if !key_hex.len().is_multiple_of(2) {
         return Err(format!(
             "invalid {name}: odd number of hex chars ({}); {EXPECTED}",
             key_hex.len()

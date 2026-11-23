@@ -4,6 +4,7 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 # PR-02: AgentRepository::ensure_for_client derives the 32-byte placeholder

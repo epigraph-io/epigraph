@@ -31,13 +31,15 @@ members = [
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-# ADVISORY, not the build floor. The locked dependency graph already needs
-# Rust 1.88 (time 0.3.47, darling 0.23 and home 0.5.12 declare it; so does
-# webauthn-rs 0.5.5, which epigraph-passkey adds), so no toolchain older than
-# that builds this workspace whatever this line says. CI builds on `stable`.
-# Kept at 1.75 rather than raised because clippy reads it as the MSRV for its
-# version-gated lints; raising it is its own change, made with a clippy run.
-rust-version = "1.75"
+# The build floor (MSRV). Every member inherits it (`rust-version.workspace =
+# true`), so clippy reads it as the MSRV for its version-gated lints and its
+# `incompatible_msrv` lint on every crate. 1.88 is the highest `rust-version`
+# in the locked dependency graph (rmcp 3.9, time 0.3.47, jsonwebtoken 10.4,
+# webauthn-rs 0.5.5, serde_with 3.21, sha2 0.11, among others), and the
+# workspace's own code builds on it (`cargo +1.88 check --workspace
+# --all-targets --locked`). A lockfile update that needs a newer toolchain
+# must raise this line in the same change. CI builds and lints on `stable`.
+rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/epigraph-io/epigraph"
 
