@@ -204,6 +204,13 @@ name = "export_provenance"
 path = "src/bin/export_provenance.rs"
 required-features = ["db"]
 
+# Backlog 02612a76: the claim_frames write of `dekg migrate create-frames`,
+# driven with a fixed cluster assignment (lib module `dekg_frames`, db only).
+[[test]]
+name = "dekg_create_frames_assign"
+path = "tests/dekg_create_frames_assign.rs"
+required-features = ["db"]
+
 [[test]]
 name = "cross_source_sweep_smoke"
 path = "tests/cross_source_sweep_smoke.rs"
