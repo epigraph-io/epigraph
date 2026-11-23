@@ -59,7 +59,10 @@ PR). A package is affected when
     in one `source-scans` shard, unless a selected shard already runs that
     package in full. A scan that WALKS a directory it reaches by climbing out
     of its crate cannot be resolved from literals: it must be declared in
-    WALKERS, and `check` fails on one that is not.
+    WALKERS, and `check` fails on one that is not. A test that any deleted
+    path can break, wherever it is (doc_links: a link may target any file),
+    is declared in DELETION_READERS, and every path the change deletes or
+    renames away counts as a read of it.
 
 Every shard runs (FULL) when the change touches a path in FULL_PATHS (a
 migration changes every database test; the lock file, the toolchain or this
@@ -136,10 +139,11 @@ WALKERS = {
     # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
     "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
-    # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
-    # renamed is only caught by a full run (main, staging, `ci:full`).
+    # README.md and docs/intro/*.md. A link TARGET elsewhere can be anywhere
+    # in the tree; deleting or renaming one is DELETION_READERS' job.
     "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/intro/*"),
-    "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml",),
+    # Every member's manifest: crates/ and tests/engine-integration.
+    "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml", "tests/*/Cargo.toml"),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/belief_lint/mod.rs": ("crates/*/src/*", "scripts/*"),
     "crates/epigraph-db/tests/custodian_role.rs": ("crates/*/src/*",),
@@ -168,8 +172,11 @@ WALKERS = {
         "crates/*/src/*",
         "services/*/src/*",
     ),
-    # The shared walker behind calibration_single_loader_ratchet.rs and
-    # belief_mode_readers.rs (both `#[path]`-include it).
+    # Every environment read under crates/*/src (via support/rust_sources.rs)
+    # and services/*/src, against the docs it names and each service's README.
+    "crates/epigraph-engine/tests/env_var_docs.rs": ("services/*/src/*", "services/*/README.md"),
+    # The shared walker behind calibration_single_loader_ratchet.rs,
+    # belief_mode_readers.rs and env_var_docs.rs (each `#[path]`-includes it).
     "crates/epigraph-engine/tests/support/rust_sources.rs": (
         "crates/*/src/*",
         "crates/*/build.rs",
@@ -177,6 +184,16 @@ WALKERS = {
     "crates/epigraph-mcp/tests/plan_order_under_one_transaction.rs": ("crates/*/src/*",),
     "crates/epigraph-mcp/tests/raw_pool_register.rs": (),
     "crates/epigraph-mcp/tests/residual_unstamped_writes.rs": ("crates/*/src/*",),
+}
+
+# Tests that read files a change can only break by deleting or renaming them,
+# wherever they are: the change's deleted paths are reads of these (the value
+# says why). doc_links resolves every relative link in README.md and
+# docs/intro/, and a link can point anywhere in the tree, so a pull request
+# that deletes or renames a link target must run it. Narrower than a glob of
+# the whole tree: an added or edited file cannot break a link.
+DELETION_READERS = {
+    "crates/epigraph-core/tests/doc_links.rs": "a deleted path may be a link target",
 }
 
 # Jobs other than the shards that test or lint particular packages; each runs
@@ -571,6 +588,18 @@ def scan_reads(root, pkgs, dirs, files, read=None, gone=()):
         r, ts = reach(name, f, True)
         for g in globs:
             reads.append((name, "glob", g, r, ts, f))
+    # A path of the change that is not on disk is deleted or renamed away.
+    # The disk, not `files`: it is the tree under test both in CI (the
+    # checkout) and in a local run (the working tree, where an untracked new
+    # file is in the change but not in `git ls-files`).
+    deleted = sorted(p for p in set(gone) if not os.path.lexists(os.path.join(root, p)))
+    for f in sorted(DELETION_READERS):
+        name = owner(f, dirs)
+        if name is None or f not in tracked:
+            continue
+        r, ts = reach(name, f, True)
+        for p in deleted:
+            reads.append((name, "prefix", p, r, ts, f))
     return reads, walkers
 
 

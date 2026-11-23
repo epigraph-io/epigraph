@@ -107,13 +107,35 @@ class AffectedSelection(unittest.TestCase):
         self.assertLessEqual(shards_of("epigraph-api") | shards_of("epigraph-cli"), shard_ids(d))
 
     def test_docs_only_change_runs_no_shard_and_no_gated_job(self):
-        # A doc no Rust source reads (the runbooks, docs/intro and README.md
-        # are read by tests; see the next test).
-        d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/deploy.md"])
+        # A doc no Rust source reads (the runbooks, docs/intro, README.md and
+        # the configuration docs are read by tests; see the next tests).
+        d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/governance/release-policy.md"])
         self.assertEqual(d["mode"], "affected")
         self.assertEqual(d["ids"], [])
         self.assertEqual(d["matrix"], {"include": []})
         self.assertEqual(d["run"], {job: False for job in d["run"]})
+
+    def test_a_configuration_doc_change_runs_the_env_var_docs_lint(self):
+        # Deleting a variable's row from docs/deploy.md fails env_var_docs.
+        for path in ("docs/deploy.md", "README.md", "services/explorer/README.md"):
+            d = pr_plan([path])
+            self.assertIn("env_var_docs", d["partial"].get("epigraph-engine", {}), path)
+
+    def test_deleting_or_renaming_any_file_runs_doc_links(self):
+        # doc_links resolves README.md's and docs/intro's relative links, and
+        # a link can point anywhere in the tree. A path the change deletes or
+        # renames away (absent from the tree under test) may be a link
+        # target; an edited file that still exists cannot break a link.
+        # decide() computes the reads itself here, with the change's paths.
+        root, pkgs, shards = workspace()
+        env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_HEAD_REF": "feature/x"}
+        gone = "docs/governance/a-renamed-away-page.md"
+        self.assertFalse(os.path.lexists(os.path.join(root, gone)))
+        d = ts.decide(root, pkgs, shards, env, changed=[gone])
+        self.assertIn("doc_links", d["partial"].get("epigraph-core", {}), d["partial"])
+        self.assertEqual(d["ids"], [ts.SCANS])
+        kept = ts.decide(root, pkgs, shards, env, changed=["docs/governance/release-policy.md"])
+        self.assertNotIn("epigraph-core", kept["partial"])
 
     def test_python_outside_scripts_runs_no_shard(self):
         d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
@@ -317,6 +339,21 @@ class SourceScanDetection(unittest.TestCase):
         whole, partial = ts.affected(["docs/runbooks/2-undo.sql"], pkgs, dirs, reads)
         self.assertEqual(whole, {})
         self.assertEqual({p: set(ts_) for p, ts_ in partial.items()}, {"alpha": {"scan"}})
+
+    def test_a_deleted_path_is_a_read_of_every_deletion_reader(self):
+        from unittest import mock
+
+        files = dict(self.BASE)
+        files["crates/alpha/tests/scan.rs"] = "fn links() {}\n"
+        root, pkgs, dirs, names = self.tree(files)
+        with mock.patch.dict(ts.DELETION_READERS, {"crates/alpha/tests/scan.rs": "links"}, clear=True):
+            # calibration.toml is edited (still on disk); old/page.md is gone.
+            reads, _ = ts.scan_reads(root, pkgs, dirs, names, gone=["calibration.toml", "old/page.md"])
+        self.assertEqual({(r[0], r[2], r[3], r[4]) for r in reads}, {("alpha", "old/page.md", ts.TARGETS, ("scan",))})
+        whole, partial = ts.affected(["old/page.md"], pkgs, dirs, reads)
+        self.assertEqual((whole, {p: set(t) for p, t in partial.items()}), ({}, {"alpha": {"scan"}}))
+        whole, partial = ts.affected(["calibration.toml"], pkgs, dirs, reads)
+        self.assertEqual((whole, partial), ({}, {}))
 
     def test_the_real_tree_declares_every_walker(self):
         self.assertEqual(reads()[1], set(ts.WALKERS))
