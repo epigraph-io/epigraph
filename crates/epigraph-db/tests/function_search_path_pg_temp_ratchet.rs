@@ -498,6 +498,30 @@ async fn app_login(pool: &PgPool) -> (String, PgConnection) {
     (role, conn)
 }
 
+/// Drop the probe login once its backend has gone. `close()` returns when the
+/// Terminate message is sent; the backend then drops its temporary objects
+/// (the trap's table, function and domain, which the login owns) on its way
+/// out, and until it has, DROP ROLE fails with 2BP01. Wait for the login's
+/// session to leave `pg_stat_activity` (it does after the temp cleanup) first.
+async fn drop_login(pool: &PgPool, role: &str) {
+    for _ in 0..200 {
+        let live: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE usename = $1")
+                .bind(role)
+                .fetch_one(pool)
+                .await
+                .expect("read the login's sessions");
+        if live == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(pool)
+        .await
+        .expect("drop the login");
+}
+
 /// The session's trap: a temporary table it owns and lets anyone append to,
 /// and a temporary domain `text` whose CHECK appends `current_user` to it.
 /// Every name in the trap itself is qualified, so it does not recurse.
@@ -681,10 +705,7 @@ async fn an_application_login_cannot_run_its_own_type_as_the_definer_owner(pool:
     .expect("the owner un-retracts through the definer");
     let ran_as = trap_log(&mut app).await;
     app.close().await.expect("close the login");
-    sqlx::query(&format!("DROP ROLE {role}"))
-        .execute(&pool)
-        .await
-        .expect("drop the login");
+    drop_login(&pool, &role).await;
 
     let live: bool =
         sqlx::query_scalar("SELECT retracted_at IS NULL FROM mass_functions WHERE id = $1")
