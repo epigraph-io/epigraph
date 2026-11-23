@@ -1,0 +1,289 @@
+{
+  "_doc": "Fixture for perspectival_loader. 'masses' keys are hypothesis NAMES of the claim's frame plus 'theta'; the loader maps names to frame indices and reserves open-world mass out of theta. evidence_type is the key the observer perspectives' source_reliability maps discount by. All numbers are synthetic. Only the eff-treatment-a-symptom-1, eff-treatment-e-symptom-4 and saf-treatment-c masses are the ones epigraph-ds perspectival_seed_validation.rs and perspectival_demo_t2.rs pin; the other claims' masses are synthetic values in the same range.",
+  "claims": [
+    {
+      "key": "sym-symptom-1",
+      "frame": "symptom_membership",
+      "content": "The condition cluster manifests as symptom-1.",
+      "evidence": [
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "holds": 0.8,
+            "theta": 0.2
+          }
+        },
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "holds": 0.4,
+            "theta": 0.6
+          }
+        }
+      ]
+    },
+    {
+      "key": "sym-symptom-2",
+      "frame": "symptom_membership",
+      "content": "The condition cluster manifests as symptom-2.",
+      "evidence": [
+        {
+          "source_agent": "source-survey",
+          "evidence_type": "source_survey",
+          "masses": {
+            "holds": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "holds": 0.5,
+            "theta": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "key": "sym-symptom-3",
+      "frame": "symptom_membership",
+      "content": "The condition cluster manifests as symptom-3.",
+      "evidence": [
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "holds": 0.6,
+            "theta": 0.4
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "holds": 0.55,
+            "theta": 0.45
+          }
+        }
+      ]
+    },
+    {
+      "key": "sym-symptom-4",
+      "frame": "symptom_membership",
+      "content": "The condition cluster manifests as symptom-4.",
+      "evidence": [
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "holds": 0.65,
+            "theta": 0.35
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "holds": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "holds": 0.5,
+            "theta": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "key": "eff-treatment-a-symptom-1",
+      "frame": "treatment_efficacy",
+      "archetype": "consensus",
+      "content": "treatment-a is efficacious for symptom-1.",
+      "evidence": [
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "efficacious": 0.75,
+            "theta": 0.25
+          }
+        },
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "efficacious": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "efficacious": 0.4,
+            "theta": 0.6
+          }
+        }
+      ]
+    },
+    {
+      "key": "eff-treatment-b-symptom-3",
+      "frame": "treatment_efficacy",
+      "archetype": "tradition_only",
+      "content": "treatment-b is efficacious for symptom-3.",
+      "evidence": [
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "efficacious": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "efficacious": 0.4,
+            "theta": 0.6
+          }
+        },
+        {
+          "source_agent": "source-survey",
+          "evidence_type": "source_survey",
+          "masses": {
+            "efficacious": 0.5,
+            "theta": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "key": "eff-treatment-c-symptom-2",
+      "frame": "treatment_efficacy",
+      "archetype": "tradition_only",
+      "content": "treatment-c is efficacious for symptom-2.",
+      "evidence": [
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "efficacious": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "efficacious": 0.5,
+            "theta": 0.5
+          }
+        }
+      ]
+    },
+    {
+      "key": "eff-treatment-e-symptom-4",
+      "frame": "treatment_efficacy",
+      "archetype": "conflict",
+      "content": "treatment-e is efficacious for symptom-4.",
+      "evidence": [
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "efficacious": 0.55,
+            "theta": 0.45
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "efficacious": 0.45,
+            "theta": 0.55
+          }
+        },
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "no_effect": 0.6,
+            "theta": 0.4
+          }
+        }
+      ]
+    },
+    {
+      "key": "saf-treatment-a",
+      "frame": "treatment_safety",
+      "archetype": "consensus",
+      "content": "treatment-a is safe at therapeutic dose.",
+      "evidence": [
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "safe": 0.65,
+            "theta": 0.35
+          }
+        },
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "safe": 0.5,
+            "theta": 0.5
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "safe": 0.45,
+            "theta": 0.55
+          }
+        }
+      ]
+    },
+    {
+      "key": "saf-treatment-c",
+      "frame": "treatment_safety",
+      "archetype": "safety_divergence",
+      "content": "treatment-c is safe at therapeutic dose.",
+      "evidence": [
+        {
+          "source_agent": "source-clinical",
+          "evidence_type": "source_clinical",
+          "masses": {
+            "harmful": 0.7,
+            "theta": 0.3
+          }
+        },
+        {
+          "source_agent": "source-tradition",
+          "evidence_type": "source_tradition",
+          "masses": {
+            "safe": 0.5,
+            "theta": 0.5
+          }
+        },
+        {
+          "source_agent": "source-practitioner",
+          "evidence_type": "source_practitioner",
+          "masses": {
+            "safe": 0.45,
+            "theta": 0.55
+          }
+        }
+      ]
+    }
+  ]
+}

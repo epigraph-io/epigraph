@@ -16,7 +16,9 @@
 //!
 //! The production-scale tests are too slow for every CI run, so they are
 //! `#[ignore]`d AND gated by an environment variable (a bare `--ignored` run
-//! skips them):
+//! skips them). The advisory `.github/workflows/scale-advisory.yml` runs them
+//! weekly and on demand; `epigraph-core/tests/ignored_tests_have_a_lane.rs`
+//! fails if that step stops running them. By hand:
 //!
 //! ```text
 //! EPIGRAPH_BACKFILL_SCALE=1 cargo test -p epigraph-cli --locked \
@@ -261,7 +263,7 @@ async fn explain(
 /// [`STATEMENT_BUDGET`]); then one apply batch of each kind, analyzed and
 /// rolled back (within [`BATCH_BUDGET`], same plan rule); then the census as
 /// the binary runs it (within [`CENSUS_BUDGET`]).
-#[ignore = "production scale: set EPIGRAPH_BACKFILL_SCALE=1 and pass --ignored"]
+#[ignore = "production scale: runs in scale-advisory.yml; set EPIGRAPH_BACKFILL_SCALE=1 and pass --ignored"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_census_statement_finishes_at_production_scale(pool: PgPool) {
     let Some(scale) = scale() else { return };
@@ -458,7 +460,7 @@ fn scratch_manifest() -> PathBuf {
 /// The census (dry run), the apply in default-size batches and the
 /// reversal, each through the binary and within its budget; the apply stamps
 /// exactly the census's total and the reversal leaves no stamp and no record.
-#[ignore = "production scale: set EPIGRAPH_BACKFILL_SCALE=1 and pass --ignored"]
+#[ignore = "production scale: runs in scale-advisory.yml; set EPIGRAPH_BACKFILL_SCALE=1 and pass --ignored"]
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_backfill_and_its_reversal_finish_at_production_scale(pool: PgPool) {
     let Some(scale) = scale() else { return };

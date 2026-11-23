@@ -142,6 +142,13 @@ WALKERS = {
     # README.md and docs/intro/*.md. A link TARGET elsewhere can be anywhere
     # in the tree; deleting or renaming one is DELETION_READERS' job.
     "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/intro/*"),
+    # Every `#[ignore]` under a member's src/ or tests/. Not `crates/*/tests/*`:
+    # that would put source-scans on every test-only change. A new `#[ignore]`
+    # in a test file is caught by a full run (main, staging, `ci:full`).
+    "crates/epigraph-core/tests/ignored_tests_have_a_lane.rs": (
+        "crates/*/src/*",
+        "tests/engine-integration/*",
+    ),
     # Every member's manifest: crates/ and tests/engine-integration.
     "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml", "tests/*/Cargo.toml"),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),

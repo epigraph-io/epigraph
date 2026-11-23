@@ -1,0 +1,105 @@
+name: Scale (advisory)
+
+# TESTS TOO SLOW FOR EVERY CI RUN, ON A SCHEDULE.
+#
+# `crates/epigraph-cli/tests/operator_backfill_ingest_markers_scale.rs` has two
+# tests that seed a production-shaped corpus (~1.25M edges) and hold the
+# backfill-ingest-markers census, apply and reversal to a time budget and a
+# plan shape (no nested loop re-running a scan, an aggregate or a CTE per
+# outer row). They take tens of minutes, so they are `#[ignore]`d and gated by
+# EPIGRAPH_BACKFILL_SCALE, and until this workflow existed no CI run executed
+# them (backlog 4ae8f96c). A never-run test rots.
+#
+# ADVISORY: this workflow is not a `needs` of ci.yml's required `test` job, so
+# a red run does not block a merge; it is a weekly signal (and a manual one,
+# via workflow_dispatch, before merging a change to the backfill statements).
+# The budgets were measured on a build host; a GitHub-hosted runner is slower,
+# so a budget failure here is first a question about the runner, then about
+# the plan. The plan-shape assertions do not depend on the runner.
+#
+# `crates/epigraph-core/tests/ignored_tests_have_a_lane.rs` fails if this step
+# stops running `--ignored` for that target.
+on:
+  schedule:
+    # Mondays 09:17 UTC.
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scale-advisory
+  cancel-in-progress: false
+
+# Actions are pinned to the same full commit SHAs as ci.yml (see the note
+# there). dtolnay/rust-toolchain picks the channel from the ref name, which
+# pinning by SHA defeats, so the channel stays explicit via `toolchain`.
+jobs:
+  backfill-ingest-markers-scale:
+    name: backfill-ingest-markers at production scale
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: epigraph
+          POSTGRES_PASSWORD: epigraph
+          POSTGRES_DB: epigraph
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Same environment as ci.yml `test-shard`; the reasons for each value
+      # are there.
+      DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      MIGRATION_DATABASE_URL: postgres://epigraph:epigraph@localhost:5432/epigraph
+      EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
+      SQLX_OFFLINE: "true"
+      EPIGRAPH_TEST_DESTRUCTIVE_DB: "1"
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - name: Install mold (low-memory parallel linker)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y mold
+          mkdir -p .cargo
+          {
+            echo ""
+            echo "# CI-only: route the workspace through mold."
+            echo "[target.x86_64-unknown-linux-gnu]"
+            echo 'rustflags = ["-C", "link-arg=-fuse-ld=mold"]'
+          } >> .cargo/config.toml
+          mold --version
+      - name: Free disk space on /
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
+          df -h /
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: scale-advisory
+      - name: Build epigraph-migrate
+        run: cargo build --locked -p epigraph-api --bin epigraph-migrate
+      - name: Run migrations
+        # The tests are `#[sqlx::test]`s with their own databases; this
+        # creates the cluster-wide roles the migrations grant to, exactly as
+        # the test shards do before their first test.
+        run: ./target/debug/epigraph-migrate
+      - name: operator_backfill_ingest_markers_scale (EPIGRAPH_BACKFILL_SCALE=1)
+        env:
+          EPIGRAPH_BACKFILL_SCALE: "1"
+        run: >-
+          cargo test -p epigraph-cli --locked --no-fail-fast
+          --test operator_backfill_ingest_markers_scale
+          -- --ignored --nocapture --test-threads=1

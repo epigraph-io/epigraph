@@ -1,7 +1,7 @@
 //! #2 MERGE-AND-RECOMPUTE harness for the perspectival demo.
 //!
 //! Builds the condition-cluster discovery cluster into a fresh dev DB EXACTLY as
-//! `perspectival_discover_load.rs::discover_to_snapshot` does (same repo-layer
+//! the `perspectival_discover_load` example does (same repo-layer
 //! calls, same open-world BBA recording), snapshots the BEFORE per-perspective
 //! BetP for every claim, THEN merges a single practitioner's extracted
 //! efficacy/safety BBAs (from the interview-extracted JSON) onto the matching
@@ -24,9 +24,13 @@
 //!   SEED_DIR=$SEED_DIR \
 //!   SNAPSHOT_OUT=$SEED_DIR/gui/data/snapshot-with-interview.json \
 //!   DELTA_OUT=$SEED_DIR/data/interview-belief-delta.json \
-//!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_interview_merge -- --nocapture
+//!   SQLX_OFFLINE=true cargo run -p epigraph-engine --example perspectival_interview_merge
+//!
+//! An operator tool, run as a cargo example. It lived in `tests/` as an
+//! `#[ignore]`d test that no gate ran (backlog 4ae8f96c); it asserts nothing, so
+//! it is not a test. `cargo test` and `clippy --all-targets` still compile it.
 
-#[path = "viewer_fixture.rs"]
+#[path = "../tests/viewer_fixture.rs"]
 mod fixture;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -37,6 +41,14 @@ use epigraph_db::{
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
+
+/// An operator tool, not a test: a missing input is a usage error.
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("error: {name} is not set (see the run line at the top of this file)");
+        std::process::exit(2);
+    })
+}
 
 const OPEN_WORLD_FRACTION: f64 = 0.08;
 const PRACTITIONER_SOURCE_TYPE: &str = "source_practitioner";
@@ -83,8 +95,8 @@ async fn betp0(pool: &PgPool, claim: Uuid, frame: Uuid, persp: Uuid) -> f64 {
 
 /// Open-world BBA from an arbitrary masses map (hypothesis names + "theta");
 /// reserves OPEN_WORLD_FRACTION of theta onto the missing element and
-/// normalizes to sum 1. COPIED VERBATIM from perspectival_discover_load.rs (it is
-/// private to that test crate). The interview 3-key masses
+/// normalizes to sum 1. COPIED VERBATIM from the perspectival_discover_load example (it is
+/// private to that example crate). The interview 3-key masses
 /// (efficacious/no_effect/theta and safe/harmful/theta) map cleanly onto the
 /// frame hypotheses + literal "theta", so they pass through with no fourth
 /// open-world key and no renormalize distortion.
@@ -160,33 +172,14 @@ struct ClaimMeta {
     touched: bool,
 }
 
-#[tokio::test]
-#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
-async fn merge_interview_and_recompute() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP: DATABASE_URL not set");
-        return;
-    };
-    let Ok(pkg_path) = std::env::var("DISCOVERY_IN") else {
-        eprintln!("SKIP: DISCOVERY_IN not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(interview_path) = std::env::var("INTERVIEW_IN") else {
-        eprintln!("SKIP: INTERVIEW_IN not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(dir) = std::env::var("SEED_DIR") else {
-        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
-        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(delta_out) = std::env::var("DELTA_OUT") else {
-        eprintln!("SKIP: DELTA_OUT not set — this is an ops harness, not a regression test");
-        return;
-    };
+#[tokio::main]
+async fn main() {
+    let url = require_env("DATABASE_URL");
+    let pkg_path = require_env("DISCOVERY_IN");
+    let interview_path = require_env("INTERVIEW_IN");
+    let dir = require_env("SEED_DIR");
+    let out = require_env("SNAPSHOT_OUT");
+    let delta_out = require_env("DELTA_OUT");
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

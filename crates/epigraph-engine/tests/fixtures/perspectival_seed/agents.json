@@ -1,0 +1,17 @@
+{
+  "_doc": "Fixture for perspectival_loader: one source agent per evidence class; each authors that class's BBAs.",
+  "source_agents": [
+    {
+      "key": "source-clinical"
+    },
+    {
+      "key": "source-survey"
+    },
+    {
+      "key": "source-tradition"
+    },
+    {
+      "key": "source-practitioner"
+    }
+  ]
+}

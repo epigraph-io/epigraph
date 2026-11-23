@@ -7,22 +7,30 @@
 //! Run:
 //!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_anxiety_ingest_dev \
 //!   SQLX_OFFLINE=true \
-//!     cargo test -p epigraph-engine --test perspectival_divergence_check -- --ignored --nocapture
+//!     cargo run -p epigraph-engine --example perspectival_divergence_check
+//!
+//! An operator tool, run as a cargo example. It lived in `tests/` as an
+//! `#[ignore]`d test that no gate ran (backlog 4ae8f96c); it asserts nothing, so
+//! it is not a test. `cargo test` and `clippy --all-targets` still compile it.
 
-#[path = "viewer_fixture.rs"]
+#[path = "../tests/viewer_fixture.rs"]
 mod fixture;
 
 use epigraph_db::PgPool;
 use epigraph_engine::belief_query::get_perspective_belief;
 use uuid::Uuid;
 
-#[tokio::test]
-#[ignore = "operator-driven: needs DATABASE_URL pointed at a tagged ingest graph"]
-async fn perspective_divergence_is_real() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP: DATABASE_URL not set — this is an ops harness, not a regression test");
-        return;
-    };
+/// An operator tool, not a test: a missing input is a usage error.
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("error: {name} is not set (see the run line at the top of this file)");
+        std::process::exit(2);
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let url = require_env("DATABASE_URL");
     let pool = PgPool::connect(&url).await.expect("connect");
     let viewer = fixture::public_viewer(&pool).await;
 
@@ -33,10 +41,10 @@ async fn perspective_divergence_is_real() {
             .expect("perspectives");
     if perspectives.is_empty() {
         eprintln!(
-            "SKIP: no perspectives in this graph — run tag_ingest first. This harness \
-             reports on a specific tagged ingest, so an unrelated database is not a failure."
+            "error: no perspectives in this graph — run tag_ingest first. This tool \
+             reports on a specific tagged ingest; point DATABASE_URL at one."
         );
-        return;
+        std::process::exit(1);
     }
 
     // The native binary frame; BetP(TRUE) = P(the proposition holds).
@@ -57,10 +65,10 @@ async fn perspective_divergence_is_real() {
     .expect("propositions");
     if props.is_empty() {
         eprintln!(
-            "SKIP: no build_axis propositions in this graph — run build_axis first. \
-             Absence here means the database is not the tagged ingest, not a defect."
+            "error: no build_axis propositions in this graph — run build_axis first. \
+             Absence here means the database is not the tagged ingest."
         );
-        return;
+        std::process::exit(1);
     }
 
     println!("\n=========== BetP(holds) per perspective — binary propositions ===========");

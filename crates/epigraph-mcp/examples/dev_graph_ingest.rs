@@ -8,19 +8,22 @@
 //! task* by calling the exact same canonical entrypoint (`do_ingest_document`)
 //! over a `PgPool` connected to a DB of the operator's choosing.
 //!
-//! It is `#[ignore]` so it never runs in the normal suite. Drive it with:
+//! It is a cargo example, not a test: it lived in `tests/` as an `#[ignore]`d
+//! test that no gate ran (backlog 4ae8f96c), and it asserts nothing beyond the
+//! ingest succeeding on the operator's input. `cargo test` and
+//! `clippy --all-targets` still compile it. Drive it with:
 //!
 //! ```bash
 //! SQLX_OFFLINE=true \
 //! INGEST_TARGET_DB='postgres://epigraph:epigraph@localhost/epigraph_anxiety_ingest_dev' \
 //! EXTRACTION_PATH='/abs/path/to/anxiety-deep-research-extraction.json' \
-//!   cargo test -p epigraph-mcp --test dev_graph_ingest -- --ignored --nocapture
+//!   cargo run -p epigraph-mcp --example dev_graph_ingest
 //! ```
 //!
 //! Tracking the missing first-class capability: see the epigraph feature
 //! request for a configurable ingest target (per-call DB / document-ingest CLI).
 
-#[path = "viewer_fixture.rs"]
+#[path = "../tests/viewer_fixture.rs"]
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
@@ -32,8 +35,8 @@ use sqlx::PgPool;
 
 /// Built FROM A `ScopedPool`: the document ingest walk now runs in one
 /// transaction stamped from the ingesting agent and refuses (nothing written) on
-/// a server that cannot stamp one. `#[sqlx::test]` connects as a BYPASSRLS
-/// superuser, so the stamp is inert here — what this buys is that the fixture
+/// a server that cannot stamp one. Against a BYPASSRLS owner DSN (the usual
+/// scratch-graph login) the stamp is inert — what this buys is that the tool
 /// drives the PRODUCTION code path (`begin_author_stamped_tx`) rather than the
 /// refusal.
 async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
@@ -43,21 +46,18 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
     EpiGraphMcpFull::new(pool, signer, embedder, false).with_scoped_pool(scoped)
 }
 
-#[tokio::test]
-#[ignore = "operator-driven: needs INGEST_TARGET_DB + EXTRACTION_PATH"]
-async fn ingest_extraction_into_target_db() {
-    let Ok(db) = std::env::var("INGEST_TARGET_DB") else {
-        eprintln!(
-            "SKIP: INGEST_TARGET_DB not set — this is a dev ingest harness, not a regression test"
-        );
-        return;
-    };
-    let Ok(path) = std::env::var("EXTRACTION_PATH") else {
-        eprintln!(
-            "SKIP: EXTRACTION_PATH not set — this is a dev ingest harness, not a regression test"
-        );
-        return;
-    };
+/// An operator tool, not a test: a missing input is a usage error.
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("error: {name} is not set (see the run line at the top of this file)");
+        std::process::exit(2);
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let db = require_env("INGEST_TARGET_DB");
+    let path = require_env("EXTRACTION_PATH");
 
     let pool = PgPool::connect(&db).await.expect("connect to target DB");
 
