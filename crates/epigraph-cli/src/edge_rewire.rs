@@ -518,6 +518,22 @@ pub async fn restore_edge_rows(
     .await
 }
 
+/// The report [`restore_edge_rows_batched`] starts from: nothing done, out
+/// of the batches the same `records` and `batch_size` take (rows are
+/// planned per `mf_id`, so this is not `records.len()` / `batch_size`). A
+/// caller writes it before connecting, so a restore that fails before its
+/// first batch commits still leaves a parseable, visibly unfinished report.
+#[must_use]
+pub fn edge_row_restore_start(
+    records: &[EdgeRowRecord],
+    batch_size: usize,
+) -> EdgeRowRestoreReport {
+    EdgeRowRestoreReport {
+        batches_total: plan_edge_rows(records).len().div_ceil(batch_size.max(1)),
+        ..EdgeRowRestoreReport::default()
+    }
+}
+
 /// [`restore_edge_rows`] in transactions of `batch_size` rows, handing
 /// `on_batch` the cumulative report after EACH batch commits (or rolls back,
 /// on a dry run), so a caller can write its outcomes as it goes: a restore
@@ -538,10 +554,7 @@ pub async fn restore_edge_rows_batched(
 ) -> anyhow::Result<EdgeRowRestoreReport> {
     let plan = plan_edge_rows(records);
     let batch_size = batch_size.max(1);
-    let mut report = EdgeRowRestoreReport {
-        batches_total: plan.len().div_ceil(batch_size),
-        ..EdgeRowRestoreReport::default()
-    };
+    let mut report = edge_row_restore_start(records, batch_size);
     for chunk in plan.chunks(batch_size) {
         let mut tx = pool.begin().await?;
         for e in chunk {

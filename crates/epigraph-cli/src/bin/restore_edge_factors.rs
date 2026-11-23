@@ -17,8 +17,11 @@
 //! stamp>.outcomes.json`), which must not exist. The file is rewritten after
 //! EVERY batch (written beside it, then renamed over it), so a restore that
 //! stops part-way leaves the outcomes of the batches it committed;
-//! `batches_done` < `batches_total` says it did not finish. A re-run of the
-//! same `--edge-rows` finds the committed rows `already_restored`.
+//! `batches_done` < `batches_total` says it did not finish. The file holds
+//! the not-yet-started report (`batches_done` 0) before the database is
+//! reached, so a restore that fails before its first batch commits leaves
+//! that, not an empty file. A re-run of the same `--edge-rows` finds the
+//! committed rows `already_restored`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -27,7 +30,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use epigraph_cli::edge_rewire::{
-    read_edge_row_records, restore_edge_rows_batched, EdgeRowRestoreReport, EDGE_ROW_RESTORE_BATCH,
+    edge_row_restore_start, read_edge_row_records, restore_edge_rows_batched, EdgeRowRestoreReport,
+    EDGE_ROW_RESTORE_BATCH,
 };
 
 #[derive(Parser, Debug)]
@@ -44,6 +48,10 @@ struct Cli {
     dry_run: bool,
     #[arg(long)]
     outcomes_out: Option<PathBuf>,
+    /// Rows per restore transaction (at least 1).
+    #[arg(long, hide = true, default_value_t = EDGE_ROW_RESTORE_BATCH,
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    batch_size: usize,
 }
 
 #[tokio::main]
@@ -94,6 +102,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?;
         Ok(())
     };
+    write_outcomes(&edge_row_restore_start(&records, cli.batch_size))?;
 
     let maint = epigraph_cli::MaintenancePool::connect("restore_edge_factors")
         .await
@@ -103,14 +112,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         maint.pool(),
         &records,
         cli.dry_run,
-        EDGE_ROW_RESTORE_BATCH,
+        cli.batch_size,
         &mut on_batch,
     )
     .await?;
-    // An empty file has no batch; write its (empty, complete) report once.
-    if report.batches_total == 0 {
-        write_outcomes(&report)?;
-    }
     println!(
         "restore_edge_factors{}: restored={} already_restored={} superseded_since_rewire={} \
          retracted_since_rewire={} missing={} (outcomes: {})",

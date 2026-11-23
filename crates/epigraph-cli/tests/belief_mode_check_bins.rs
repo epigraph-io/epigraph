@@ -1612,3 +1612,156 @@ async fn backfill_factors_targeted_apply_and_restore_edge_factors_round_trip(poo
     assert_eq!(again, want, "{second:?}");
     assert!(second.restored.is_empty(), "{second:?}");
 }
+
+/// `restore_edge_factors` leaves every committed batch's outcomes on disk,
+/// through the binary (`--batch-size 1`, so the chain's two rows are two
+/// batches):
+/// * a restore that cannot reach the database leaves the not-yet-started
+///   report (`batches_done` 0 of 2, nothing restored), not an empty file;
+/// * a restore whose second batch fails (a row trigger raises on that row's
+///   UPDATE) exits 1 and leaves batch 1's outcome: `batches_done` 1 of 2,
+///   exactly the other row restored, the failing row untouched;
+/// * the re-run without the trigger finishes, finding batch 1's row
+///   already restored.
+///
+/// The restore is LIFO (the row rewritten last goes back first), so the
+/// first record's row is the second batch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn restore_edge_factors_leaves_each_committed_batch_on_disk(pool: PgPool) {
+    use epigraph_cli::edge_rewire::{read_edge_row_records, EdgeRowRestoreReport};
+    use rewire_fixture::edge_rows;
+
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "batches").await;
+    let rows_pre = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let list = dir.join("batches-accepted.txt");
+    std::fs::write(&list, format!("# accepted\n{}\n{}\n", ch.ab, ch.bc)).unwrap();
+    let rows_file = dir.join("batches-e-rows.jsonl");
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            path_str(&ch.wave_file),
+            "--edges-from",
+            path_str(&list),
+            "--snapshot",
+            path_str(&dir.join("batches-e-wave.jsonl")),
+            "--edge-rows",
+            path_str(&rows_file),
+            "--until-fixed",
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let records = read_edge_row_records(std::io::BufReader::new(
+        std::fs::File::open(&rows_file).expect("edge-rows file"),
+    ))
+    .expect("edge-rows parses");
+    assert_eq!(
+        records.iter().map(|r| r.edge_id).collect::<Vec<_>>(),
+        vec![ch.ab, ch.bc],
+        "PREMISE: both rows rewired, ab first"
+    );
+    let (ab_row, bc_row) = (rows_pre.0[0].0, rows_pre.1[0].0);
+    assert_eq!(records[0].mf_id, ab_row);
+    let rewired = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+
+    let restore = |name: &str, db: &str| -> (Run, Option<EdgeRowRestoreReport>) {
+        let out = dir.join(format!("{name}.outcomes.json"));
+        let r = run(
+            RESTORE_EDGE_FACTORS,
+            &[
+                "--edge-rows",
+                path_str(&rows_file),
+                "--outcomes-out",
+                path_str(&out),
+                "--batch-size",
+                "1",
+            ],
+            &[("DATABASE_URL", db)],
+        );
+        let text = std::fs::read_to_string(&out).expect("the outcomes file exists");
+        (r, serde_json::from_str(&text).ok())
+    };
+
+    let (r, unreached) = restore("unreached", "postgres://nobody@127.0.0.1:1/none");
+    assert_eq!(
+        r.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let unreached = unreached.expect("an unreached restore leaves a parseable report");
+    assert_eq!(
+        (unreached.batches_done, unreached.batches_total),
+        (0, 2),
+        "{unreached:?}"
+    );
+    assert!(!unreached.complete());
+    assert!(unreached.restored.is_empty(), "{unreached:?}");
+
+    sqlx::query(
+        "CREATE FUNCTION test_fail_restore() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN RAISE EXCEPTION 'test: batch 2 fails'; END $f$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failing trigger function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_fail_restore BEFORE UPDATE ON mass_functions \
+         FOR EACH ROW WHEN (OLD.id = '{ab_row}'::uuid) EXECUTE FUNCTION test_fail_restore()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("failing trigger");
+    let (r, partial) = restore("partial", &db);
+    assert_eq!(
+        r.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let partial = partial.expect("a part-way restore leaves a parseable report");
+    assert_eq!(
+        (partial.batches_done, partial.batches_total),
+        (1, 2),
+        "batch 1 committed and was written before batch 2 failed: {partial:?}"
+    );
+    assert_eq!(partial.restored, vec![bc_row], "{partial:?}");
+    assert_eq!(edge_rows(&pool, ch.bc).await, rows_pre.1, "bc restored");
+    assert_eq!(edge_rows(&pool, ch.ab).await, rewired.0, "ab untouched");
+
+    sqlx::query("DROP TRIGGER test_fail_restore ON mass_functions")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    let (r, rest) = restore("rest", &db);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let rest = rest.expect("outcomes parse");
+    assert!(rest.complete(), "{rest:?}");
+    assert_eq!(rest.restored, vec![ab_row], "{rest:?}");
+    assert_eq!(rest.already_restored, vec![bc_row], "{rest:?}");
+    assert_eq!(
+        (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await),
+        rows_pre
+    );
+}
