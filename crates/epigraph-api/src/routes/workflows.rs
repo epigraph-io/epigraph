@@ -397,11 +397,16 @@ pub async fn store_workflow(
 
     let plan = epigraph_ingest::workflow::builder::build_ingest_plan(&extraction);
     let mut tx = begin_caller_workflow_tx(&state, &viewer, "workflows").await?;
-    let mut decision = workflow_ingest_submitter(&mut tx, None, &viewer, &extraction).await?;
+    // The request's token reaches the gate, as on `ingest_workflow` (backlog
+    // 7d95803e): the provenance rows name it (client, token id, delegator),
+    // the delegate arm asks it for a live delegation, and the audited admin
+    // arm is reachable, exactly as on every other workflow write route.
+    let auth = Some(&auth);
+    let mut decision = workflow_ingest_submitter(&mut tx, auth, &viewer, &extraction).await?;
     let (mut tx, result) = execute_admitted_ingest(
         tx,
         state.edge_signing_key(),
-        None,
+        auth,
         &viewer,
         &plan,
         &extraction,
@@ -420,7 +425,7 @@ pub async fn store_workflow(
     .await?;
     record_workflow_submitter(
         &mut tx,
-        None,
+        auth,
         &viewer,
         &extraction,
         result.workflow_id,
@@ -2420,7 +2425,7 @@ pub struct IngestWorkflowRequest {
     request_body = serde_json::Value,
     responses(
         (status = 200, body = serde_json::Value),
-        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; InvalidContent: blank thesis, phase, step or operation content; or a source.authors[].agent_id: the shared AuthorEntry schema lists it for document ingest, but workflow authors are resolved by name only and an agent_id is refused"),
+        (status = 400, description = "EmptyGeneration: a step-less generation > 0 or a claim-less plan; GenerationZeroNamesParent: generation 0 with a parent_canonical_name (generation 0 links no parent); InvalidContent: blank thesis, phase, step or operation content; or a source.authors[].agent_id: the shared AuthorEntry schema lists it for document ingest, but workflow authors are resolved by name only and an agent_id is refused"),
         (status = 401, description = "no authenticated caller"),
         (status = 403, description = "the token lacks claims:write, or a declared or inherited group the caller does not write, or no principal to write as"),
         (status = 500),
@@ -2909,8 +2914,9 @@ pub struct DeleteStepRequest {
 /// refusals (`DbError::is_personal_group_refusal`), carried as
 /// `IngestExecutorError::Repository`, go through `From<DbError>`: 403 with the
 /// detail logged and kept out of the body. A content-less generation
-/// (`EmptyGeneration`, U032) and blank claim content (`InvalidContent`) are
-/// the caller's payload errors: 400. Everything else stays a 500.
+/// (`EmptyGeneration`, U032), blank claim content (`InvalidContent`) and a
+/// generation-0 payload naming a parent (`GenerationZeroNamesParent`) are the
+/// caller's payload errors: 400. Everything else stays a 500.
 ///
 /// These routes write as the caller: the personal-group refusals are the
 /// caller's own default declaration's (its personal group, or its
@@ -2934,6 +2940,13 @@ fn workflow_ingest_error(e: epigraph_ingest_executor::IngestExecutorError) -> Ap
         // operation), refused by the executor's pre-flight: 400 naming the
         // field.
         e @ epigraph_ingest_executor::IngestExecutorError::InvalidContent { .. } => {
+            ApiError::BadRequest {
+                message: format!("workflow ingest: {e}"),
+            }
+        }
+        // A generation-0 payload that names a parent it could never link
+        // (backlog 26a436c6): the caller's payload error, 400.
+        e @ epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent { .. } => {
             ApiError::BadRequest {
                 message: format!("workflow ingest: {e}"),
             }
@@ -3242,8 +3255,10 @@ async fn api_owner_group_arm(
 /// (the MCP twin's `record_caller_workflow_write`, the same
 /// `workflows.caller_write` row and fields), on the write's own transaction.
 /// A no-op for an admin grant, which records [`audit_api_admin_workflow_write`].
-/// The token fields are null on a route that carries no token
-/// (`store_workflow`, which names its caller through the viewer).
+/// Every row states `"transport": "http"` and the request's token: its
+/// client, its id and, for a delegated run token, its delegator
+/// (`delegated_by`). Every workflow write route passes its token; the token
+/// fields are null only for a call without one.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_arguments)]
 async fn record_api_caller_workflow_write(
@@ -3270,8 +3285,14 @@ async fn record_api_caller_workflow_write(
         "acting_agent": acting,
         "operator": operator,
         "owner_group": owner_group,
+        // Every row states its transport, as the MCP twin's rows do (backlog
+        // 26a436c6): a reader never infers "http" from an absent field.
+        "transport": "http",
         "client_id": auth.map(|a| a.client_id),
         "token_jti": auth.map(|a| a.jti),
+        // A delegated run token's delegator (`dlg`), the credential whose
+        // authority a delegate exercised (backlog 7d95803e); null otherwise.
+        "delegated_by": auth.and_then(|a| a.delegated_by),
         "write": details,
     });
     epigraph_db::SecurityEventRepository::workflow_caller_write(&mut *conn, &record)
@@ -3342,6 +3363,8 @@ async fn audit_api_admin_workflow_write(
         "action": action,
         "workflow_id": workflow_id,
         "submitter": submitter,
+        "transport": "http",
+        "delegated_by": auth.delegated_by,
         "write": details,
     });
     // Migration 112's definer: this transaction is stamped from the system
@@ -4029,6 +4052,26 @@ mod tests {
             ApiError::BadRequest { message } => assert!(
                 message.contains("empty workflow generation")
                     && message.contains("weekly-capability-audit"),
+                "{message}"
+            ),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    /// Backlog 26a436c6: a generation-0 payload naming a parent is the
+    /// caller's payload error, 400 with the executor's reason, not a 500.
+    #[test]
+    fn a_generation_zero_parent_is_a_bad_request() {
+        let e = workflow_ingest_error(
+            epigraph_ingest_executor::IngestExecutorError::GenerationZeroNamesParent {
+                canonical_name: "weekly-capability-audit-fork".to_string(),
+                parent_canonical_name: "weekly-capability-audit".to_string(),
+            },
+        );
+        match e {
+            ApiError::BadRequest { message } => assert!(
+                message.contains("generation 0 starts a lineage")
+                    && message.contains("weekly-capability-audit-fork"),
                 "{message}"
             ),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -5712,8 +5755,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, before + 1);
-        let submitter_kinds: Vec<Option<String>> = sqlx::query_scalar(
-            "SELECT jsonb_typeof(details->'submitter') FROM security_events \
+        let submitter_kinds: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT jsonb_typeof(details->'submitter'), details->>'transport' \
+               FROM security_events \
               WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
         )
         .bind(admin_agent)
@@ -5722,8 +5766,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             submitter_kinds,
-            vec![Some("null".to_string())],
-            "one audit row, \"submitter\": null"
+            vec![(Some("null".to_string()), Some("http".to_string()))],
+            "one audit row, \"submitter\": null, stating its transport"
         );
 
         // The ingester writes the row's owner group: admitted through the
@@ -5992,6 +6036,7 @@ mod tests {
         assert_eq!(d["operator"], serde_json::Value::Null);
         assert_eq!(d["client_id"], h_client.to_string());
         assert_eq!(d["token_jti"], auth.jti.to_string());
+        assert_eq!(d["transport"], "http", "the row states its transport");
         assert_eq!(d["write"]["step_claim_id"], step.as_str());
     }
 }

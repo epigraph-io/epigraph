@@ -567,7 +567,9 @@ impl WorkflowRepository {
     ///
     /// 1. `parent_canonical_name = Some(p)`: `(p, generation - 1)` with the
     ///    same saturating arithmetic as before (issue #51 semantics, forks
-    ///    included).
+    ///    included). At generation 0 that row cannot exist, so a named parent
+    ///    links nothing here; the executor refuses such an ingest before it
+    ///    writes anything (`GenerationZeroNamesParent`, backlog 26a436c6).
     /// 2. Otherwise — or when (1) finds nothing and `p` names this same
     ///    lineage — the PREDECESSOR: the highest generation of
     ///    `canonical_name` strictly BELOW `generation`. Not the lineage head:

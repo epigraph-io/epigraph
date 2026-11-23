@@ -179,6 +179,24 @@ pub enum IngestExecutorError {
         level2: usize,
         claims: usize,
     },
+
+    /// A generation-0 ingest that names a `parent_canonical_name` (backlog
+    /// 26a436c6). The parent is linked at `generation - 1`, which does not
+    /// exist for generation 0, so the named parent used to link NOTHING: the
+    /// row was stored parentless and inherited no parent link, tenancy or
+    /// submitter from the workflow it named. Raised before anything is
+    /// written. A re-ingest of an existing generation-0 row is still answered
+    /// as already ingested (it writes nothing either way).
+    #[error(
+        "{canonical_name} generation 0 names parent_canonical_name '{parent_canonical_name}', \
+         but generation 0 starts a lineage and links no parent (the parent is linked at \
+         generation - 1). Omit parent_canonical_name, or ingest the variant at generation 1 \
+         or above. Nothing was written"
+    )]
+    GenerationZeroNamesParent {
+        canonical_name: String,
+        parent_canonical_name: String,
+    },
 }
 
 impl IngestExecutorError {

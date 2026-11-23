@@ -288,15 +288,24 @@ fn ids(body: &serde_json::Value, key: &str) -> Vec<String> {
     v
 }
 
+/// The number of `workflows.admin_write` rows attributed to `admin`, every
+/// one of them asserted to state `"transport": "http"` (backlog 26a436c6). A
+/// row without the field is still counted, so a caller's "no audit yet"
+/// check sees it, and fails the transport assertion instead.
 async fn workflow_admin_audits(pool: &PgPool, admin: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM security_events \
+    let transports: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT details->>'transport' FROM security_events \
           WHERE event_type = 'workflows.admin_write' AND agent_id = $1",
     )
     .bind(admin)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
-    .expect("count audit rows")
+    .expect("read audit rows");
+    assert!(
+        transports.iter().all(|t| t.as_deref() == Some("http")),
+        "every admin_write row states its transport: {transports:?}"
+    );
+    i64::try_from(transports.len()).expect("row count")
 }
 
 /// THE DEFECT. The workflow's thesis, phase and step claims are retired with

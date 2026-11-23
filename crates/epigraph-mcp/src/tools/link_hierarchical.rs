@@ -384,6 +384,7 @@ pub async fn do_link_hierarchical(
             &mut tx,
             auth,
             actor,
+            viewer,
             workflow_id,
             "link_hierarchical",
             &not_found,

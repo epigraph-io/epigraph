@@ -184,7 +184,7 @@ pub async fn evolve_step(
         let mut tx =
             crate::claim_helper::begin_author_stamped_tx(server, identity, "evolve_step").await?;
         let grants =
-            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
+            require_lineage_authority(server, &mut tx, auth, identity, viewer, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
             Some(edge_key),
@@ -250,7 +250,7 @@ pub async fn evolve_step(
         // ScopedPool is not a way around it.
         let mut tx = server.pool.begin().await.map_err(internal_error)?;
         let grants =
-            require_lineage_authority(server, &mut tx, auth, identity, parent_uuid).await?;
+            require_lineage_authority(server, &mut tx, auth, identity, viewer, parent_uuid).await?;
         let r = epigraph_db::ClaimRepository::evolve_step_conn(
             &mut tx,
             Some(edge_key),
@@ -326,6 +326,7 @@ async fn require_lineage_authority(
     conn: &mut sqlx::PgConnection,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: WriteIdentity,
+    viewer: &epigraph_db::visibility::Viewer,
     parent: Uuid,
 ) -> Result<Vec<(Uuid, WorkflowGrant)>, McpError> {
     let workflows =
@@ -363,6 +364,7 @@ async fn require_lineage_authority(
             &mut *conn,
             auth,
             caller,
+            viewer,
             workflow,
             "evolve_step",
             &not_found,
@@ -380,6 +382,7 @@ async fn require_lineage_authority(
             &mut *conn,
             auth,
             caller,
+            viewer,
             workflow,
             "evolve_step",
             &not_found,

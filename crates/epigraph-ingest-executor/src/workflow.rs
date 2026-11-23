@@ -794,6 +794,28 @@ async fn execute_plan(
         }
     }
 
+    // ── 1b. A generation-0 ingest names no parent (backlog 26a436c6) ────
+    // The parent is linked at `generation - 1`
+    // (`WorkflowRepository::resolve_ingest_parent`), so at generation 0 a
+    // named parent linked nothing and the row was silently stored as a new,
+    // parentless lineage that inherited nothing from the workflow it named.
+    // Refused instead. After the idempotency gate, so a re-ingest of an
+    // existing generation-0 row (which writes nothing either way) keeps its
+    // `already_ingested` answer; before any write.
+    if generation == 0 {
+        if let Some(parent) = extraction
+            .source
+            .parent_canonical_name
+            .as_deref()
+            .filter(|p| !p.trim().is_empty())
+        {
+            return Err(IngestExecutorError::GenerationZeroNamesParent {
+                canonical_name: canonical_name.clone(),
+                parent_canonical_name: parent.to_string(),
+            });
+        }
+    }
+
     // ── 2. The author and the tenancy declaration ───────────────────────
     // One decision for the whole plan: every claim this walk creates is
     // authored by the same agent and owned the same way. With a caller, the

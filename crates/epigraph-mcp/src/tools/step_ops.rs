@@ -96,6 +96,7 @@ async fn require_authority_over(
     conn: &mut sqlx::PgConnection,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
+    viewer: &epigraph_db::visibility::Viewer,
     canonical_name: &str,
     tool_name: &'static str,
 ) -> Result<Option<(uuid::Uuid, crate::tools::workflow_authority::WorkflowGrant)>, McpError> {
@@ -118,7 +119,7 @@ async fn require_authority_over(
         ))
     };
     let grant = crate::tools::workflow_authority::require_workflow_authority(
-        server, conn, auth, caller, head, tool_name, &not_found,
+        server, conn, auth, caller, viewer, head, tool_name, &not_found,
     )
     .await?;
     Ok(Some((head, grant)))
@@ -160,6 +161,7 @@ pub async fn add_step(
         &mut tx,
         auth,
         caller,
+        viewer,
         &params.canonical_name,
         "add_step",
     )
@@ -264,6 +266,7 @@ pub async fn delete_step(
         &mut tx,
         auth,
         caller,
+        viewer,
         &params.canonical_name,
         "delete_step",
     )
