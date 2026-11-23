@@ -30,8 +30,11 @@
 --   * 267's `_sqlx_migrations` row. Re-introducing the slot is a NEW
 --     migration, never a re-run of 267.
 --
--- Roll the binary back FIRST: a 267 binary writes slot rows, which this file
--- would then move onto perspectives that the old binary expects.
+-- Roll the binaries back FIRST (every BBA-writing binary, the same set the
+-- README's 267 deploy order lists): a 267 binary writes slot rows, which this
+-- file would then move onto perspectives that the old binary expects, and
+-- its upserts name the six-column `mass_functions_unique_per_key` this file
+-- drops (42P10 on every BBA write).
 -- ===================================================================
 
 BEGIN;

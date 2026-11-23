@@ -99,9 +99,16 @@
 --   * `ds_combined_beliefs` rows scoped to a slot id as a perspective (none
 --     is written by any path; a lens read of a slot id now answers not
 --     found).
---   * The writers: a binary older than this file writes a slot perspective
---     first and is refused by the CHECK (23514), so deploy the binary with
---     the migration (README entry 267, deploy order).
+--   * The writers: EVERY BBA write of a binary older than this file fails
+--     here, not only its slot writes. Its upsert names `ON CONFLICT
+--     (claim_id, frame_id, source_agent_id, perspective_id)`, which no unique
+--     index matches once (3) drops `mass_functions_unique_per_perspective`
+--     (42P10, genuine-perspective and unscoped writes included), and its slot
+--     writers are also refused by the CHECK (23514). Deploy every
+--     BBA-writing binary (API, MCP server and the agent images and stdio
+--     clients that hold it, the CLI timers and operator bins) with the
+--     migration, writers stopped between them (README entry 267, deploy
+--     order).
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/267-undo.sql`.
