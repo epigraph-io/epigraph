@@ -3460,6 +3460,46 @@ restart.
   'public.epigraph_claims_block_widening()'::regprocedure` must be
   `7d9079127fe7ad6c7195047421e87c0e`. **Deploy order:** none; no binary depends on it.
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **239**: public `agent_keys_app_role_writes` (backlog 54018ca1). 118 kept the
+  application role's INSERT on `agent_keys` and granted it
+  `epigraph_agent_key_set_status` with no caller check; 161 closed only the attested types
+  (`signing`, `identity-legacy`). So an application session could still plant a key of any
+  other type for any agent, and rotate or revoke any agent's non-attested key, which the
+  HTTP routes refuse unless the caller is the agent or an admin. 239: (a) REVOKE INSERT on
+  `agent_keys` from `epigraph_app` (it now holds SELECT only); (b) re-states
+  `epigraph_agent_key_set_status` from 163's body on 172's path form (`pg_catalog,
+  pg_temp`) with one new gate for every key type: a privileged session, the key's own
+  agent (`epigraph_principal_id()`), or an admin (armed: elevated; unarmed: live instance
+  admin), else `AK03` / 42501; (c) adds `epigraph_agent_key_rotate(old key, new public
+  key)`, SECURITY DEFINER owned by `epigraph_maintenance`, EXECUTE to `epigraph_maintenance`
+  ONLY (an application grant would admit no legitimate call, since the one caller rotates a
+  `signing` key, and would let a DSN holder that stamps itself as the victim record a key
+  through the definer): under the same AK02 and AK03 gates it retires the active old key
+  (closing its window) and inserts the new 32-byte key with the old row's agent and type,
+  valid from where the old window closed, in one statement (`AK01` for a key no longer
+  active, `AK04` for a wrong-length key). The HTTP rotate and revoke routes now run on a
+  transaction stamped with the caller's viewer, and rotation is the one definer call; on the
+  application role the rotation is refused 42501 (no EXECUTE), as AK02 refused it before.
+  The status definer's AK03 gate reads the session principal GUC, which a holder of the
+  application DSN can set itself (so it can still retire or revoke a victim's non-attested
+  key); the INSERT revoke and the AK02 gates do not depend on it. The database cannot see
+  `claims:admin`: an unarmed admin token whose principal is not a live instance admin is now
+  refused AK03 at the database. Pinned by `epigraph-db/tests/agent_keys_app_role_writes.rs`
+  (insert refused for every type; another agent and an unstamped session refused, the agent,
+  an unarmed instance admin, an armed elevated custodian and a maintenance session admitted,
+  an armed non-elevated admin refused; no application EXECUTE on the rotation definer, and,
+  under a test-local grant standing in for a future grantee, its refusals, its admin arms
+  and its atomic success; the route's repository calls on
+  an application-role `ScopedPool`; the undo, run twice). The insert, status and rotation
+  tests were measured red on the series without 239; removing the REVOKE or forcing either
+  caller gate open each fails at least one of them. Also pinned by
+  `app_role_table_lockdown.rs` (`agent_keys` joins `NO_WRITE`). Undo:
+  `docs/runbooks/239-undo.sql`. Slot 239 was assigned by the 2026-11-22 backlog triage;
+  checked before claiming: no origin branch carries a `239`. **Deploy order:** migrate
+  before rolling out the 239 binary (its rotation calls the new definer). A pre-239 binary
+  on a migrated database still revokes through the status definer, unstamped, so it is
+  refused AK03 for every key: migrate and roll the binary out together. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 - **241**: `unauthenticated_reader_reserved` (backlogs 37844e1d, 14a38166). Creates the
   `--allow-unauthenticated-http` reader agent's row (`mcp-unauthenticated-reader`, public key
   the ASCII bytes `epigraph-mcp:unauthenticated-rdr`) if no row holds the key, adopting an

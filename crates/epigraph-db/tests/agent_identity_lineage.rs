@@ -2010,6 +2010,15 @@ async fn set_key_status_as(
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: PgPool) {
     let victim = plain_agent(&pool, "software_agent").await;
+    // Migration 239 revokes the application role's INSERT on `agent_keys`
+    // (`agent_keys_app_role_writes.rs`), which alone now refuses every row
+    // below with 42501. Granted back on this throwaway database so that what
+    // refuses an attested row here is still 161's guard trigger, which stays
+    // as defence in depth behind the privilege.
+    sqlx::query("GRANT INSERT ON public.agent_keys TO epigraph_app")
+        .execute(&pool)
+        .await
+        .expect("re-grant INSERT for this test only");
     let (signing, legacy, spelled, other) =
         as_app_stamped(&pool, victim, &[], |mut conn| async move {
             let ins =
@@ -2034,7 +2043,7 @@ async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: 
             (conn, (signing, legacy, spelled, other))
         })
         .await;
-    other.expect("CALIBRATION: the application role still records a key of another type");
+    other.expect("CALIBRATION: with INSERT re-granted, the guard admits a key of another type");
     for (what, r) in [
         ("signing", signing),
         ("identity-legacy", legacy),
@@ -2045,6 +2054,10 @@ async fn an_application_session_can_neither_bind_nor_move_an_attested_key(pool: 
             sqlstate(&err).as_deref(),
             Some(INSUFFICIENT_PRIVILEGE),
             "{what}: {err}"
+        );
+        assert!(
+            err.to_string().contains("AK02"),
+            "{what}: refused by the guard trigger, not the privilege: {err}"
         );
     }
 
@@ -2161,29 +2174,43 @@ async fn the_active_key_lookup_never_returns_a_legacy_identity_key(pool: PgPool)
 }
 
 /// A container that learns an identity's signing public key (it is on every
-/// claim the identity signs) and records it as a key of its own, of a type the
-/// application may still write, must not stop the host re-registering that
-/// identity with its own key (review CR4b). CALIBRATION: the squat itself
-/// lands, so the re-registration is not passing because nothing was planted.
+/// claim the identity signs) and records it as a key of its own, of a
+/// non-attested type, must not stop the host re-registering that identity
+/// with its own key (review CR4b). Since migration 239 the application role
+/// cannot record such a row at all (refused 42501 here); one written before
+/// 239, or by a maintenance session, is planted on the harness connection.
+/// CALIBRATION: that squat lands, so the re-registration is not passing
+/// because nothing was planted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_squatted_signing_key_does_not_block_re_registration(pool: PgPool) {
     let id = new_identity();
     let first = register(&pool, &id, None, "g-squat", snapshot("g v1", "l")).await;
     let squatter = plain_agent(&pool, "software_agent").await;
+    let squat = "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
+                 VALUES ($1, $2, 'encryption', 'active')";
     let signing = id.signing.clone();
-    as_app_stamped(&pool, squatter, &[], |mut conn| async move {
-        sqlx::query(
-            "INSERT INTO agent_keys (agent_id, public_key, key_type, status) \
-             VALUES ($1, $2, 'encryption', 'active')",
-        )
+    let refused = as_app_stamped(&pool, squatter, &[], |mut conn| async move {
+        let r = sqlx::query(squat)
+            .bind(squatter)
+            .bind(&signing)
+            .execute(&mut *conn)
+            .await
+            .map(|_| ());
+        (conn, r)
+    })
+    .await
+    .expect_err("an application session recorded a key (migration 239)");
+    assert_eq!(
+        sqlstate(&refused).as_deref(),
+        Some(INSUFFICIENT_PRIVILEGE),
+        "{refused}"
+    );
+    sqlx::query(squat)
         .bind(squatter)
-        .bind(&signing)
-        .execute(&mut *conn)
+        .bind(&id.signing)
+        .execute(&pool)
         .await
         .expect("CALIBRATION: the squat lands");
-        (conn, ())
-    })
-    .await;
     let again = try_register(&pool, &id, None, "g-squat", snapshot("g v2", "l"))
         .await
         .expect("a squatted copy of the bound key must not block the identity's own host");

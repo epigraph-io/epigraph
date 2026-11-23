@@ -102,7 +102,6 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_admin_scope_enforcement_guard()",
     "public.epigraph_admin_scopes_armed()",
     "public.epigraph_agent_is_retired(uuid)",
-    "public.epigraph_agent_key_set_status(uuid, text, text, uuid)",
     "public.epigraph_agent_prompt_history(uuid)",
     "public.epigraph_agents_refuse_registered_system_key()",
     "public.epigraph_allow_author_binding_client(uuid, uuid, text)",
@@ -289,7 +288,10 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 /// [`PUBLIC_PATH_REGISTER`]'s length, which must equal it. Raising it is a
 /// visible decision to add a definer that resolves through `public`; it falls
 /// by one each time a registered definer moves to 172's form.
-const HIGH_WATER: usize = 191;
+// 192 -> 190: 236 (live memberships) and 239 (`epigraph_agent_key_set_status`)
+// each re-state one registered definer on 172's form; each branch lowered
+// it by one on its own, and both are staged here.
+const HIGH_WATER: usize = 190;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.

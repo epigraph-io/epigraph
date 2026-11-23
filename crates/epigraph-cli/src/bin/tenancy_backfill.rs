@@ -2346,6 +2346,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // FAIL although its owner does not matter yet; apply 238 and re-run. The
     // same caveat `DEFINER_FUNCTIONS` records for its 070 bodies.
     ("epigraph_claims_block_widening", 238),
+    // 239 (backlog 54018ca1), agent-key rotation: retires a key and records
+    // its successor in one call, executed by maintenance sessions only (239
+    // revokes the application role's INSERT on `agent_keys` and grants it no
+    // EXECUTE here). Under an APP-owned body it would run with the
+    // application role's rights and fail CLOSED with 42501 on the INSERT
+    // (nothing written, loud); under the migration runner's superuser it
+    // keeps working with more authority than intended (083's case).
+    // `agent_keys` has no row security, so a non-member owner changes nothing
+    // else.
+    ("epigraph_agent_key_rotate", 239),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

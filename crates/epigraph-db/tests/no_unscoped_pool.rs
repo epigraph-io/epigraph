@@ -829,9 +829,14 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// `attributed_to` edge on the caller's `AppState::write_as` transaction
 /// (`routes/spans.rs` 6 -> 4; `close_span` and `list_spans` keep theirs).
 /// 182 -> 181 (backlog 761c2b05; 187 -> 186 on its own branch, staged after
-/// 1dea9589): `get_agent` holds a `Viewer` and reads its row and the profile-visibility check on the caller's stamped connection
+/// 1dea9589): `get_agent` holds a `Viewer` and reads its row and the
+/// profile-visibility check on the caller's stamped connection
 /// (`routes/agents.rs` 10 -> 9). No file reached zero.
-const HIGH_WATER: usize = 181;
+/// 181 -> 176 (backlog 54018ca1, migration 239; 187 -> 182 on its own
+/// branch): the key rotate and revoke routes run their reads and the key definers on the caller's stamped
+/// transaction (`routes/agent_keys.rs` 6 -> 1, the list read left). No file
+/// reached zero.
+const HIGH_WATER: usize = 176;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -913,7 +918,7 @@ const HIGH_WATER_FILES: usize = 34;
 const UNCONVERTED: &[(&str, usize)] = &[
     ("routes/activities.rs", 3),
     ("routes/admin.rs", 4),
-    ("routes/agent_keys.rs", 6),
+    ("routes/agent_keys.rs", 1),
     ("routes/agents.rs", 9),
     ("routes/assess.rs", 1),
     // `routes/audit.rs` was 1 and is GONE, not zeroed (backlog 8a168dd6):
