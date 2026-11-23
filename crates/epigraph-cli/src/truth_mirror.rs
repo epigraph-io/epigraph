@@ -48,17 +48,30 @@
 //! (`FOR UPDATE`, in id order), re-evaluates every rule on the locked values,
 //! and writes each eligible claim with [`cas_refresh`]: an `UPDATE` that
 //! matches only while `truth_value` and `pignistic_prob` still hold the exact
-//! values just read, the claim is current, and its role is still neither
-//! compound nor procedural. A write that matches no row is `raced`. Each
+//! values just read, the claim is current, its role is still neither
+//! compound nor procedural, and it is still not a workflow or step claim (all
+//! four arms, [`workflow_or_step_sql`]: an `executes` edge or a `workflows`
+//! row committed after the locked read is caught by the write itself). A
+//! write that matches no row is `raced`. Each
 //! write's [`TruthRecord`] is handed to the caller BEFORE the batch commits,
 //! so every committed write has a record. It writes `claims.truth_value` and
 //! nothing else: no cache column, no `mass_functions` row, no `workflows` row
 //! (the BEFORE UPDATE trigger bumps `updated_at`).
 //!
 //! [`dry_run`] evaluates the same rules in ONE `REPEATABLE READ, READ ONLY`
-//! transaction and writes nothing. [`restore`] is the reverse compare-and-set
+//! transaction and writes nothing; it reads the transaction's mode back and
+//! refuses to run in any other, and the report carries what it read
+//! ([`MirrorReport::transaction`]). [`restore`] is the reverse compare-and-set
 //! over a record file: `truth_before` goes back only where `truth_value` still
-//! holds exactly `truth_written`.
+//! holds exactly `truth_written`, current or not (a faithful undo, the
+//! counterpart of `restore_belief_cache`, which restores a retired row's cache
+//! too); a row restored while not current is reported apart
+//! (`restored_not_current`), so the counts say which restored rows are live.
+//!
+//! [`apply_into`] and [`restore_into`] fill a report the caller owns, so a run
+//! that stops on an error still has the outcomes of every batch confirmed
+//! committed (the binary writes them as a partial report). The records, not
+//! that report, are the superset to reconcile from (see [`apply`]).
 //!
 //! The SQL lives here rather than in `epigraph-db/src/repos/` for the same
 //! reason as `belief_cache`'s: an operator binary's maintenance statement on
@@ -197,7 +210,9 @@ pub struct Candidate {
     pub written: CacheColumns,
     /// The records do not chain: another writer landed between two waves.
     pub broken_chain: bool,
-    /// The names of the waves that wrote it, sorted.
+    /// The names of the waves that wrote it, each once, in chain order: by
+    /// record `at`, file order among equal `at` (as `plan_restore` chains
+    /// them), so the first is the wave whose `before` is [`Self::old`].
     pub waves: Vec<String>,
 }
 
@@ -206,10 +221,24 @@ pub struct Candidate {
 /// does) into one candidate per claim, in first-seen order.
 #[must_use]
 pub fn plan_candidates(records: &[WaveRecord]) -> Vec<Candidate> {
-    let mut waves: HashMap<Uuid, BTreeSet<String>> = HashMap::new();
+    let mut by_claim: HashMap<Uuid, Vec<&WaveRecord>> = HashMap::new();
     for r in records {
-        waves.entry(r.claim_id).or_default().insert(r.wave.clone());
+        by_claim.entry(r.claim_id).or_default().push(r);
     }
+    let mut waves: HashMap<Uuid, Vec<String>> = by_claim
+        .into_iter()
+        .map(|(id, mut group)| {
+            // Stable: records with equal `at` keep their file order.
+            group.sort_by_key(|r| r.at);
+            let mut seen = BTreeSet::new();
+            let names = group
+                .into_iter()
+                .filter(|r| seen.insert(r.wave.as_str()))
+                .map(|r| r.wave.clone())
+                .collect();
+            (id, names)
+        })
+        .collect();
     plan_restore(records, None)
         .entries
         .into_iter()
@@ -219,10 +248,7 @@ pub fn plan_candidates(records: &[WaveRecord]) -> Vec<Candidate> {
             new: e.written.pignistic_prob,
             written: e.written,
             broken_chain: e.partial,
-            waves: waves
-                .remove(&e.claim_id)
-                .map(|s| s.into_iter().collect())
-                .unwrap_or_default(),
+            waves: waves.remove(&e.claim_id).unwrap_or_default(),
         })
         .collect()
 }
@@ -301,6 +327,22 @@ pub fn classify(c: &Candidate, state: Option<&ClaimState>, include_round: bool) 
     Bucket::Refresh
 }
 
+/// The workflow-or-step rule's four arms over the claim aliased `c`, as one
+/// boolean SQL expression: a `workflows` row with the claim's id, a
+/// `step_lineage_id`, an `executes` in-edge, or a `workflow` label. The ONE
+/// spelling: [`read_states`] reads it and [`cas_refresh`] re-checks its
+/// negation in the write, so the two cannot drift.
+#[must_use]
+pub fn workflow_or_step_sql(c: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM workflows w WHERE w.id = {c}.id) \
+          OR {c}.step_lineage_id IS NOT NULL \
+          OR EXISTS (SELECT 1 FROM edges e \
+                      WHERE e.target_id = {c}.id AND e.relationship = 'executes') \
+          OR COALESCE('workflow' = ANY ({c}.labels), false))"
+    )
+}
+
 /// `(id, truth_value, belief, plausibility, pignistic_prob, mass_on_empty,
 /// mass_on_missing, belief_frame_id, classification, is_current,
 /// workflow_or_step, mirror_writer)`.
@@ -338,18 +380,15 @@ pub async fn read_states(
         "SELECT c.id, c.truth_value, c.belief, c.plausibility, c.pignistic_prob, \
                 c.mass_on_empty, c.mass_on_missing, c.belief_frame_id, c.classification, \
                 c.is_current, \
-                (EXISTS (SELECT 1 FROM workflows w WHERE w.id = c.id) \
-                 OR c.step_lineage_id IS NOT NULL \
-                 OR EXISTS (SELECT 1 FROM edges e \
-                             WHERE e.target_id = c.id AND e.relationship = 'executes') \
-                 OR COALESCE('workflow' = ANY (c.labels), false)) AS workflow_or_step, \
+                {wf} AS workflow_or_step, \
                 EXISTS (SELECT 1 FROM mass_functions mf \
                          WHERE mf.claim_id = c.id AND mf.retracted_at IS NULL \
                            AND mf.combination_method = $2) AS mirror_writer \
            FROM claims c \
           WHERE c.id = ANY($1) \
-          ORDER BY c.id{}",
-        if lock { " FOR UPDATE OF c" } else { "" }
+          ORDER BY c.id{lock}",
+        wf = workflow_or_step_sql("c"),
+        lock = if lock { " FOR UPDATE OF c" } else { "" }
     );
     let rows: Vec<StateTuple> = sqlx::query_as(&sql)
         .bind(ids)
@@ -384,8 +423,9 @@ pub async fn read_states(
 }
 
 /// The one write: set `truth_value` to `new` only while the row still holds
-/// `read_truth` and `read_cache` exactly, is current, and its role is still
-/// neither compound nor procedural. Returns whether a row matched.
+/// `read_truth` and `read_cache` exactly, is current, its role is still
+/// neither compound nor procedural, and it is still not a workflow or step
+/// claim ([`workflow_or_step_sql`], every arm). Returns whether a row matched.
 ///
 /// # Errors
 /// Any database error.
@@ -401,8 +441,10 @@ pub async fn cas_refresh(
           WHERE c.id = $1 AND c.is_current \
             AND c.truth_value = $2 AND c.pignistic_prob = $3 \
             AND {role} NOT IN ('compound', 'procedural') \
+            AND NOT {wf} \
          RETURNING c.id",
         role = claim_role::claim_role_sql("c"),
+        wf = workflow_or_step_sql("c"),
     );
     let hit: Option<Uuid> = sqlx::query_scalar(&sql)
         .bind(claim_id)
@@ -483,10 +525,22 @@ impl Default for RefreshOptions {
     }
 }
 
+/// The mode a dry run's transaction reported for itself, read inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TxMode {
+    /// `current_setting('transaction_read_only')`: `on` for a dry run.
+    pub read_only: String,
+    /// `current_setting('transaction_isolation')`: `repeatable read`.
+    pub isolation: String,
+}
+
 /// Every claim's outcome of one run.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MirrorReport {
     pub outcomes: Vec<Outcome>,
+    /// A dry run's transaction mode, as the transaction itself reported it;
+    /// `None` for an apply.
+    pub transaction: Option<TxMode>,
 }
 
 impl MirrorReport {
@@ -586,6 +640,7 @@ impl MirrorReport {
             })).collect::<Vec<_>>(),
             "delta_bins": bins,
             "crossings": crossings,
+            "transaction": self.transaction,
         })
     }
 }
@@ -618,9 +673,13 @@ pub async fn begin_dry_run_tx(
 
 /// Evaluate every rule for `candidates` and write nothing: one
 /// [`begin_dry_run_tx`] transaction (a write inside it fails), rolled back.
+/// The transaction's mode is read back inside it before the first claim
+/// read; anything but `READ ONLY` and `REPEATABLE READ` stops the run, and
+/// the report carries what was read.
 ///
 /// # Errors
-/// Any database error.
+/// Any database error, or a transaction that is not read-only and
+/// repeatable-read.
 pub async fn dry_run(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
@@ -628,7 +687,25 @@ pub async fn dry_run(
     opts: &RefreshOptions,
 ) -> anyhow::Result<MirrorReport> {
     let mut tx = begin_dry_run_tx(pool).await?;
-    let mut report = MirrorReport::default();
+    let (read_only, isolation): (String, String) = sqlx::query_as(
+        "SELECT current_setting('transaction_read_only'), \
+                current_setting('transaction_isolation')",
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if read_only != "on" || isolation != "repeatable read" {
+        anyhow::bail!(
+            "the dry run's transaction is read_only={read_only}, isolation={isolation}; \
+             it must be read-only and repeatable read"
+        );
+    }
+    let mut report = MirrorReport {
+        transaction: Some(TxMode {
+            read_only,
+            isolation,
+        }),
+        ..MirrorReport::default()
+    };
     for chunk in candidates.chunks(opts.batch_size.max(1)) {
         let ids: Vec<Uuid> = chunk.iter().map(|c| c.claim_id).collect();
         let states = read_states(&mut tx, viewer, &ids, false).await?;
@@ -647,26 +724,52 @@ pub async fn dry_run(
 ///
 /// `on_record` receives each write's record before its batch commits; an
 /// error from it rolls the batch back and stops the run, so no committed
-/// write lacks a record. A record whose commit then fails names a write that
-/// never landed, which [`restore`] reports `already_restored`.
+/// write lacks a record. The converse does not hold: a record handed out
+/// for a batch that then fails (a later statement in the batch, or the
+/// commit) names a write that never landed, which [`restore`] reports
+/// `already_restored`.
 ///
 /// # Errors
 /// Any database error, or `on_record`'s; batches already committed stay
-/// committed and their records were already handed out.
+/// committed and their records were already handed out. [`apply_into`] keeps
+/// their outcomes.
 pub async fn apply<F>(
     pool: &PgPool,
     viewer: &epigraph_db::visibility::Viewer,
     candidates: &[Candidate],
     opts: &RefreshOptions,
-    mut on_record: F,
+    on_record: F,
 ) -> anyhow::Result<MirrorReport>
+where
+    F: FnMut(&TruthRecord) -> anyhow::Result<()>,
+{
+    let mut report = MirrorReport::default();
+    apply_into(pool, viewer, candidates, opts, &mut report, on_record).await?;
+    Ok(report)
+}
+
+/// [`apply`], appending each batch's outcomes to `report` once its commit
+/// returns. On an error `report` holds the outcomes of the batches confirmed
+/// committed; the failed batch adds none, although its records were already
+/// handed out, and a batch whose commit itself errored may have landed
+/// without them. Reconcile from the records, not from `report`.
+///
+/// # Errors
+/// As [`apply`].
+pub async fn apply_into<F>(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    candidates: &[Candidate],
+    opts: &RefreshOptions,
+    report: &mut MirrorReport,
+    mut on_record: F,
+) -> anyhow::Result<()>
 where
     F: FnMut(&TruthRecord) -> anyhow::Result<()>,
 {
     // The run's stamp, from the database clock, in its own statement, before
     // the first write.
     let at: DateTime<Utc> = sqlx::query_scalar("SELECT now()").fetch_one(pool).await?;
-    let mut report = MirrorReport::default();
     for chunk in candidates.chunks(opts.batch_size.max(1)) {
         let ids: Vec<Uuid> = chunk.iter().map(|c| c.claim_id).collect();
         let mut tx = pool.begin().await?;
@@ -705,13 +808,18 @@ where
         tx.commit().await?;
         report.outcomes.extend(batch);
     }
-    Ok(report)
+    Ok(())
 }
 
 /// Per-claim outcome of a [`restore`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TruthRestoreReport {
+    /// Restored, and current.
     pub restored: Vec<Uuid>,
+    /// Restored, but no longer current (superseded or retired after the
+    /// refresh): the undo is faithful, as `restore_belief_cache` restores
+    /// such a row's cache, but the row is not served.
+    pub restored_not_current: Vec<Uuid>,
     /// Already holds `truth_before` (a second restore, or a refresh whose
     /// commit never landed).
     pub already_restored: Vec<Uuid>,
@@ -723,9 +831,10 @@ pub struct TruthRestoreReport {
 impl TruthRestoreReport {
     /// Every outcome bucket with its name, in report order.
     #[must_use]
-    pub fn buckets(&self) -> [(&'static str, &Vec<Uuid>); 4] {
+    pub fn buckets(&self) -> [(&'static str, &Vec<Uuid>); 5] {
         [
             ("restored", &self.restored),
+            ("restored_not_current", &self.restored_not_current),
             ("already_restored", &self.already_restored),
             ("superseded_since_refresh", &self.superseded_since_refresh),
             ("missing", &self.missing),
@@ -735,11 +844,14 @@ impl TruthRestoreReport {
 
 /// Undo a refresh: per record, last record first (so chained refreshes of
 /// one claim unwind in reverse), set `truth_before` back only where
-/// `truth_value` still holds exactly `truth_written`. One transaction per
-/// `batch_size` records; `dry_run` rolls each back.
+/// `truth_value` still holds exactly `truth_written`, whether or not the
+/// claim is still current (a non-current one is reported
+/// `restored_not_current`). One transaction per `batch_size` records;
+/// `dry_run` rolls each back.
 ///
 /// # Errors
-/// Any database error; batches already committed stay committed.
+/// Any database error; batches already committed stay committed, and
+/// [`restore_into`] keeps their outcomes.
 pub async fn restore(
     pool: &PgPool,
     records: &[TruthRecord],
@@ -747,22 +859,50 @@ pub async fn restore(
     dry_run: bool,
 ) -> anyhow::Result<TruthRestoreReport> {
     let mut report = TruthRestoreReport::default();
+    restore_into(pool, records, batch_size, dry_run, &mut report).await?;
+    Ok(report)
+}
+
+/// [`restore`], appending each batch's outcomes to `report` once the batch
+/// has committed (or, for `dry_run`, rolled back). On an error `report`
+/// holds the outcomes of the batches confirmed finished; a batch whose
+/// commit itself errored may have landed without them (re-running the
+/// restore reconciles: what landed is `already_restored`).
+///
+/// # Errors
+/// As [`restore`].
+pub async fn restore_into(
+    pool: &PgPool,
+    records: &[TruthRecord],
+    batch_size: usize,
+    dry_run: bool,
+    report: &mut TruthRestoreReport,
+) -> anyhow::Result<()> {
     let reversed: Vec<&TruthRecord> = records.iter().rev().collect();
     for chunk in reversed.chunks(batch_size.max(1)) {
+        let mut batch = TruthRestoreReport::default();
         let mut tx = pool.begin().await?;
         for r in chunk {
-            let hit: Option<Uuid> = sqlx::query_scalar(
+            // `is_current` as the write left it; NULL reads as not current.
+            let hit: Option<Option<bool>> = sqlx::query_scalar(
                 "UPDATE claims SET truth_value = $2 \
-                  WHERE id = $1 AND truth_value = $3 RETURNING id",
+                  WHERE id = $1 AND truth_value = $3 RETURNING is_current",
             )
             .bind(r.claim_id)
             .bind(r.truth_before)
             .bind(r.truth_written)
             .fetch_optional(&mut *tx)
             .await?;
-            if hit.is_some() {
-                report.restored.push(r.claim_id);
-                continue;
+            match hit {
+                Some(Some(true)) => {
+                    batch.restored.push(r.claim_id);
+                    continue;
+                }
+                Some(_) => {
+                    batch.restored_not_current.push(r.claim_id);
+                    continue;
+                }
+                None => {}
             }
             let now: Option<f64> =
                 sqlx::query_scalar("SELECT truth_value FROM claims WHERE id = $1")
@@ -770,9 +910,9 @@ pub async fn restore(
                     .fetch_optional(&mut *tx)
                     .await?;
             match now {
-                None => report.missing.push(r.claim_id),
-                Some(t) if t == r.truth_before => report.already_restored.push(r.claim_id),
-                Some(_) => report.superseded_since_refresh.push(r.claim_id),
+                None => batch.missing.push(r.claim_id),
+                Some(t) if t == r.truth_before => batch.already_restored.push(r.claim_id),
+                Some(_) => batch.superseded_since_refresh.push(r.claim_id),
             }
         }
         if dry_run {
@@ -780,8 +920,17 @@ pub async fn restore(
         } else {
             tx.commit().await?;
         }
+        report.restored.extend(batch.restored);
+        report
+            .restored_not_current
+            .extend(batch.restored_not_current);
+        report.already_restored.extend(batch.already_restored);
+        report
+            .superseded_since_refresh
+            .extend(batch.superseded_since_refresh);
+        report.missing.extend(batch.missing);
     }
-    Ok(report)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -843,6 +992,70 @@ mod tests {
         assert_eq!(classify(&c, Some(&s), true), Bucket::Refresh, "control");
         s.role = Some(ClaimRole::Procedural);
         assert_eq!(classify(&c, Some(&s), true), Bucket::Procedural);
+    }
+
+    #[test]
+    fn the_sentinel_tolerance_is_one_e_minus_nine_on_either_side() {
+        // Inside the tolerance: the sentinel, on the truth side and on the
+        // new-value side. Values chosen not round (1000 v is 5e-6 or more
+        // from an integer outside, 1e-6 or less inside), so only the
+        // sentinel rule can hold the "inside" ones.
+        for inside in [SENTINEL_005 + 0.9e-9, SENTINEL_005 - 0.9e-9] {
+            let c = cand(inside, 0.613_789_1);
+            assert_eq!(
+                classify(&c, Some(&state(inside, &c)), true),
+                Bucket::Sentinel005,
+                "truth {inside:e}"
+            );
+            let c = cand(0.613_789_1, inside);
+            assert_eq!(
+                classify(&c, Some(&state(0.613_789_1, &c)), true),
+                Bucket::Sentinel005,
+                "new {inside:e}"
+            );
+        }
+        // Just outside it: refreshed like any mirror.
+        for outside in [SENTINEL_005 + 5e-9, SENTINEL_005 - 5e-9] {
+            let c = cand(outside, 0.613_789_1);
+            assert_eq!(
+                classify(&c, Some(&state(outside, &c)), true),
+                Bucket::Refresh,
+                "truth {outside:e}"
+            );
+            let c = cand(0.613_789_1, outside);
+            assert_eq!(
+                classify(&c, Some(&state(0.613_789_1, &c)), true),
+                Bucket::Refresh,
+                "new {outside:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_candidates_waves_are_in_chain_order_not_name_order() {
+        let id = Uuid::new_v4();
+        let t0 = Utc::now();
+        let rec = |wave: &str, secs: i64, before: f64, written: f64| WaveRecord {
+            claim_id: id,
+            before: cache(before),
+            written: cache(written),
+            wave: wave.to_string(),
+            at: t0 + chrono::Duration::seconds(secs),
+        };
+        // File order is neither chain order nor name order; "Z-first" ran
+        // first, then "A-second", then "M-third" (and "Z-first" again: named
+        // once, where it first appears).
+        let records = vec![
+            rec("M-third", 20, 0.62, 0.63),
+            rec("Z-first", 0, 0.60, 0.61),
+            rec("A-second", 10, 0.61, 0.62),
+            rec("Z-first", 30, 0.63, 0.64),
+        ];
+        let c = &plan_candidates(&records)[0];
+        assert!(!c.broken_chain, "the records chain");
+        assert_eq!(c.old, Some(0.60));
+        assert_eq!(c.new, Some(0.64));
+        assert_eq!(c.waves, vec!["Z-first", "A-second", "M-third"]);
     }
 
     #[test]
@@ -951,6 +1164,7 @@ mod tests {
                 // Not refreshed: crosses everything upward, counted nowhere.
                 outcome_of(Bucket::NotAMirror, 0.1, 0.9),
             ],
+            ..MirrorReport::default()
         };
         let j = report.to_json(true, false, 5);
         let cross = |t: &str, dir: &str| j["crossings"][t][dir].as_u64().unwrap();
