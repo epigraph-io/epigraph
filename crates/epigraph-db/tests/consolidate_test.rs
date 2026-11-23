@@ -1,7 +1,7 @@
 //! `ClaimRepository::consolidate` — N→1 merge (backlog 44b19521 / design F1).
 //!
 //! The edge-collision cases below are taken from
-//! `docs/architecture/audit-edge-collision-mark-duplicate.md`, adapted to the
+//! `docs/audits/audit-edge-collision-mark-duplicate.md`, adapted to the
 //! cross-source class that only N→1 can produce:
 //!
 //! - `alternative_of` collisions are a HARD constraint violation

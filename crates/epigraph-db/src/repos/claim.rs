@@ -12802,7 +12802,7 @@ impl ClaimRepository {
     /// `T→[REL]→s1` and `T→[REL]→s2` both migrate onto `T→[REL]→merged`.
     ///
     /// That matters for two distinct reasons, confirmed by
-    /// `docs/architecture/audit-edge-collision-mark-duplicate.md`:
+    /// `docs/audits/audit-edge-collision-mark-duplicate.md`:
     /// - `alternative_of` carries a symmetric partial unique index
     ///   (`edges_alternative_of_symmetric_uniq`, migration 042), so a collision
     ///   is a HARD error that rolls the whole merge back. Because the index is

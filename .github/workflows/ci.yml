@@ -163,7 +163,8 @@ jobs:
   test-shard:
     name: test (${{ matrix.shard }})
     needs: plan
-    # An affected plan can hold no shard at all (a docs-only change). The job
+    # An affected plan can hold no shard at all (for example a Python change
+    # outside .github/scripts; a docs/ change selects the doc_links scan). The job
     # is then skipped rather than started with an empty matrix, which GitHub
     # rejects, and the `test` gate accepts the skip because the plan said so.
     if: ${{ fromJSON(needs.plan.outputs.run)['test-shard'] }}

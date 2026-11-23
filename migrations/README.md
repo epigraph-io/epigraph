@@ -1298,6 +1298,45 @@ restart.
   workflow-ingest identity is kept off the allowlist only by the operator's
   care (the allow command's agent-client warning). **Applied to throwaway databases only,
   NOT to any deployed database.**
+  **Correction (2026-11-23, backlog 38d9dc79).** Two sentences above, and the
+  same two in the applied file's header, are no longer true. The `.sql` file
+  is not edited (it is applied; a changed checksum breaks deploy).
+  - "Nothing on the token, bearer, viewer or webhook path reads the
+    registry" is false. The bearer layers (REST `bearer_auth_middleware`
+    and `optional_bearer_auth_middleware`, and MCP `call_tool`) read it on
+    every request that carries a delegated run token (`dlg`), and the
+    run-token grant reads it before it mints one. Both go through
+    `AgentRepository::delegated_principal_pool`, which calls
+    `epigraph_author_binding` and `epigraph_human_of`. The viewer can reach
+    it for any principal: `Viewer::resolve` reads
+    `epigraph_live_memberships`, which calls `epigraph_human_of` for
+    team-group rows (since 164) and reads `author_binding_clients` directly
+    for personal-group rows (since 235). Webhook delivery
+    resolves its subscriber through `Viewer::resolve`, so it reads it too.
+    The mint's operated-agent refusal (`refuse_operated_agent`) still does
+    not consult it.
+  - "Read only by `epigraph_author_binding` and `epigraph_human_of`" is
+    false too. The readers below are what a grep for
+    `author_binding_clients` and `epigraph_allowlisted_operator` under
+    `migrations/` and `crates/` found on 2026-11-23. The list is not a
+    maintained register: repeat that grep for the current set.
+    - Read the table directly: 165's `epigraph_group_role_roster`
+      (maintenance sessions only), 199's `epigraph_operator_bound_at`,
+      208's `epigraph_countersign_authorship`, and 235's
+      `epigraph_team_group_remove_member` and `epigraph_live_memberships`.
+    - On the request path, on the caller's own connection (149 grants
+      `epigraph_app` SELECT on the table): the agent card's operator field,
+      `epigraph-db` `repos/agent_lookup.rs::operator_binding_sql`, read by
+      `AgentLookupRepository::find` and `card`, so by MCP `find_agent` and
+      `get_agent` and the REST agent search.
+    - Call 149's `epigraph_allowlisted_operator`: role derivation
+      (`epigraph_role_derived_memberships`, 165, rewritten in 179 and 195,
+      which the viewer reaches through `epigraph_live_memberships`) and
+      207's `epigraph_bug_report_gate`.
+  Behaviour is pinned by `epigraph-api/tests/delegated_run_token_viewer.rs`,
+  `epigraph-mcp/tests/delegated_run_token_viewer.rs`,
+  `epigraph-db/tests/delegated_principal.rs` and
+  `epigraph-db/tests/personal_group_allowlisted_writer.rs`.
 - **150**: public `drop_uq_claims_content_hash_agent` (drain U044, backlog
   00f1a517) — `ALTER TABLE claims DROP CONSTRAINT IF EXISTS
   uq_claims_content_hash_agent`, so every database matches the long-lived one

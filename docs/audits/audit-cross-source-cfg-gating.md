@@ -1,5 +1,9 @@
 # Audit: `#[cfg(feature = "db")]` Gating Gaps — `cross_source::list_candidates` / `decide_candidate`
 
+**Status:** point-in-time audit, written 2026-07-19 (commit `e75f5a7c4`) and not maintained
+since. It records the code as it stood then; line numbers, branch names and
+findings may be out of date. Read the current source before acting on it.
+
 ## Scope
 
 Covers `crates/epigraph-api/src/routes/cross_source.rs` as introduced by the

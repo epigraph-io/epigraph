@@ -2482,9 +2482,17 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "claim.rs",
         "supersede_act_conn",
-        "WRITE. The supersession's act (retire, insert the replacement and the `supersedes` \
-         edge) on the caller's stamped transaction; authorised by claims_tenancy's / \
-         edges_tenancy's WITH CHECK. Its one read is the old claim's lock probe.",
+        "WRITE. The supersession's act on the caller's stamped transaction: ONE conditional \
+         `UPDATE claims … WHERE id = $1 AND is_current RETURNING` that retires the old claim \
+         (nulling both vectors) and returns what the replacement inherits, then the replacement \
+         INSERT, the `supersedes` edge and the actor's `AUTHORED` edge; authorised by \
+         claims_tenancy's / edges_tenancy's USING and WITH CHECK. Its one read runs only when \
+         that UPDATE matched no row: `SELECT is_current` of the old claim under the caller's \
+         row security, to classify the refusal. No row is NotFound, so a claim the caller \
+         cannot read refuses exactly as a missing one; a readable retired claim is the State \
+         refusal (already superseded) and a readable current one is WriteRefused, both about \
+         a row the caller can already read. It projects one boolean, never row content \
+         (supersede_concurrency.rs pins all three).",
     ),
     (
         "claim.rs",
