@@ -235,6 +235,12 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("hypothesis::create_hypothesis", Scope("claims:write")),
     ("hypothesis::promote_hypothesis", Scope("claims:write")),
     ("ingest::ingest_paper", Scope("claims:admin")),
+    // Pure computation over the body, gated anyway: it is MCP
+    // `structure_source`'s HTTP twin and carries that tool's scope.
+    (
+        "mcp_twins::structure_source",
+        Via("claims:read", "require_claims_read"),
+    ),
     ("papers::create_paper", Scope("claims:write")),
     ("perspective::create_perspective", Scope("claims:write")),
     ("perspective::set_source_reliability", Scope("claims:write")),

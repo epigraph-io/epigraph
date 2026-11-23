@@ -110,6 +110,9 @@ pub mod ingest;
 pub mod lineage;
 #[cfg(feature = "db")]
 pub mod mcp_tools;
+/// HTTP twins of MCP read tools that had no route (backlog fff61b9e).
+#[cfg(feature = "db")]
+pub mod mcp_twins;
 #[cfg(feature = "db")]
 pub mod methods;
 #[cfg(test)]
@@ -1227,7 +1230,27 @@ pub fn create_router_with_extensions(
         // MCP tool discovery. Moved behind auth: the same catalog is
         // available to an authenticated caller over MCP `list_tools`, so an
         // anonymous copy only gave a scanner a free capability map.
-        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools));
+        .route("/api/v1/mcp/tools", get(mcp_tools::list_mcp_tools))
+        // HTTP twins of MCP read tools (backlog fff61b9e): each runs the
+        // tool's own function on the caller's stamped read, under the tool's
+        // scope. See `routes/mcp_twins.rs`.
+        .route(
+            "/api/v1/ingest/structure-source",
+            post(mcp_twins::structure_source),
+        )
+        .route(
+            "/api/v1/ingest/already-ingested",
+            get(mcp_twins::check_already_ingested),
+        )
+        .route(
+            "/api/v1/claims/undecomposed",
+            get(mcp_twins::query_undecomposed_claims),
+        )
+        .route("/api/v1/claims/:id/verify", get(mcp_twins::verify_claim))
+        .route(
+            "/api/v1/alternative-sets/suggestions",
+            get(mcp_twins::suggest_alternative_sets),
+        );
 
     // Authentication for `protected`: OAuth2 Bearer, unconditionally.
     //

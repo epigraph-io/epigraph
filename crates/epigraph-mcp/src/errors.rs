@@ -451,6 +451,32 @@ pub fn executor_caller_error(
     }
 }
 
+/// How an HTTP twin of a tool answers one of its errors (`epigraph-api`'s
+/// `routes::mcp_twins`, backlog fff61b9e), decided by the JSON-RPC code alone
+/// so the two surfaces classify a refusal the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpClass {
+    /// `INVALID_PARAMS`: the caller's input is wrong; a 400.
+    BadRequest,
+    /// `INVALID_REQUEST`: this codebase's class for a denial of authority
+    /// ([`edge_not_owner`], [`claim_not_writer`], a missing principal); a 403.
+    Forbidden,
+    /// Every other code, `INTERNAL_ERROR` included: a server fault; a 500.
+    Internal,
+}
+
+/// The [`HttpClass`] of `e`.
+#[must_use]
+pub fn http_class(e: &McpError) -> HttpClass {
+    if e.code == ErrorCode::INVALID_PARAMS {
+        HttpClass::BadRequest
+    } else if e.code == ErrorCode::INVALID_REQUEST {
+        HttpClass::Forbidden
+    } else {
+        HttpClass::Internal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -864,5 +890,25 @@ mod tests {
         ] {
             assert!(!coded(rejected), "{rejected:?} must not be recognised");
         }
+    }
+
+    /// Each code an HTTP twin can see maps to its own class, and an unknown
+    /// code is a server fault, never a caller error.
+    #[test]
+    fn http_class_follows_the_json_rpc_code() {
+        assert_eq!(http_class(&invalid_params("bad")), HttpClass::BadRequest);
+        assert_eq!(
+            http_class(&claim_not_writer(uuid::Uuid::nil(), "supersede")),
+            HttpClass::Forbidden
+        );
+        assert_eq!(http_class(&internal_error_text("x")), HttpClass::Internal);
+        assert_eq!(
+            http_class(&McpError {
+                code: ErrorCode::METHOD_NOT_FOUND,
+                message: Cow::Borrowed("no such method"),
+                data: None,
+            }),
+            HttpClass::Internal
+        );
     }
 }
