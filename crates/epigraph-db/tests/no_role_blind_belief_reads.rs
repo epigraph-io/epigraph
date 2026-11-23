@@ -34,8 +34,9 @@
 //!
 //! * A unit whose CODE (not a comment, not a string) names
 //!   `IS_COMPOUND_SQL`, `CLAIM_ROLE_SQL`, `is_compound_sql`,
-//!   `claim_role_sql` or `claim_role::` dispatches on role: it is classified
-//!   and must NOT be registered.
+//!   `claim_role_sql`, `claim_role::` or `IS_COMPOUND_DEFINER_CALL` (migration
+//!   193's role definer) dispatches on role: it is classified and must NOT be
+//!   registered.
 //! * Every other reader must be in [`REGISTER`], an exact set keyed
 //!   `(path, unit)`. A reader is tagged with the plan PR that converts it
 //!   ([`Tag::Todo`]); a unit that only WRITES the columns is tagged
@@ -75,6 +76,10 @@ const ROLE_MARKERS: &[&str] = &[
     "is_compound_sql",
     "claim_role_sql",
     "claim_role::",
+    // Migration 193's definer (`public.epigraph_claim_is_compound`), the
+    // cache owner rule's own role test, decided on the whole graph with
+    // definer rights (backlog bbece56a).
+    "IS_COMPOUND_DEFINER_CALL",
 ];
 
 /// The claim row fields a field read names.
@@ -188,6 +193,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat_on", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility (the statement moved into the connection form, backlog 28b79b1e); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "sql_expr", Tag::Todo { pr: "PR-R3", why: "BeliefSort column for frame_claims_sorted; SPEC §7.2" }),
+    ("crates/epigraph-db/src/repos/claim_visibility.rs", "mirror_refolded_cache_into_truth_conn", Tag::Writer("one UPDATE copies a widened claim's refolded pignistic_prob into its own truth_value on the act's stamped transaction (backlog 0d9dfd24); it serves no belief")),
     ("crates/epigraph-db/src/repos/divergence.rs", "get_latest", Tag::Todo { pr: "PR-R1b", why: "divergence row BetP; SPEC §7.2 derived, see leaves" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "store", Tag::Writer("writes ds_bayesian_divergence.pignistic_prob; reads no claim belief")),
     ("crates/epigraph-db/src/repos/divergence.rs", "top_divergent", Tag::Todo { pr: "PR-R1b", why: "divergence rows ordered by BetP gap; SPEC §7.2" }),

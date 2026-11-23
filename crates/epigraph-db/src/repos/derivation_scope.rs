@@ -298,8 +298,11 @@ impl DerivationScopeRepository {
                      WHERE c.id = $1 \
                        AND (c.belief IS NOT NULL OR c.plausibility IS NOT NULL \
                             OR c.pignistic_prob IS NOT NULL) \
-                       AND NOT (SELECT {IS_COMPOUND_DEFINER_CALL}) \
+                       AND NOT (SELECT {is_compound}) \
                        /* {{VISIBILITY:c}} */)",
+                // Named in code, not only inside the format string, so the
+                // role-blind belief-read lint sees the role dispatch.
+                is_compound = IS_COMPOUND_DEFINER_CALL,
             ),
             2,
         );
