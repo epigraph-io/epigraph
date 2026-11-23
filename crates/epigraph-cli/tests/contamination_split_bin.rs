@@ -111,7 +111,17 @@ fn splits_fixture_files_without_a_database() {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
+    // The counts name their inputs: the ledger file's and the pairs file's
+    // sha256 as read, the snapshot's generated_at, and no run id.
+    let sha = |path: &Path| {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(std::fs::read(path).unwrap()))
+    };
     let expected_counts = json!({
+        "ledger_sha256": sha(&ledger),
+        "ledger_generated_at": "2026-11-22T00:00:00Z",
+        "pairs_sha256": sha(&pairs),
+        "run_id": null,
         "ledger_entries": 1, "pairs": 3, "clean": 2, "contaminated": 1,
         "clean_with_verifier_verdict": 1,
     });
@@ -267,6 +277,26 @@ async fn fetch_run_pairs_reads_only_the_runs_rows(pool: sqlx::PgPool) {
         ),
     ];
     want.sort_by_key(|w| (w.0, w.1));
+
+    // The binary's path refuses a run id that matches no row (a mistyped id
+    // must not archive an all-zero split), and for the real run returns the
+    // same rows with the run id and the hash of the bytes it will archive.
+    use epigraph_cli::contamination_split::fetch_run_pairs_nonempty;
+    let unknown = Uuid::new_v4();
+    let err = fetch_run_pairs_nonempty(&pool, unknown)
+        .await
+        .expect_err("an unknown run id is refused");
+    assert!(err.to_string().contains(&unknown.to_string()), "{err}");
+    let (checked, bytes) = fetch_run_pairs_nonempty(&pool, run)
+        .await
+        .expect("fetch checked");
+    assert_eq!(checked.pairs, got);
+    assert_eq!(checked.run_id, Some(run));
+    {
+        use sha2::Digest;
+        assert_eq!(checked.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+    }
+
     let got: Vec<(Uuid, Uuid, Value, Value)> = got
         .into_iter()
         .map(|p| {

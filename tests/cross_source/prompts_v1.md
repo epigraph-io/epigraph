@@ -134,7 +134,11 @@ after the sweep would therefore flag every pair the sweep just scored.
 
    It reads the run's rows (read-only), archives them as `run_pairs.json`,
    and writes `clean_pairs.json`, `contaminated_pairs.json` and
-   `split_counts.json` (refusing to overwrite), printing the counts. Given
+   `split_counts.json` (refusing to overwrite; all four files or none),
+   printing the counts. The counts record the ledger file's sha256 and its
+   `generated_at`, the sha256 of the pairs split and the run id: check that
+   `generated_at` predates the sweep. A run id that matches no row is
+   refused. Given
    `--pairs <file>` instead of `--run-id` it splits an already archived pairs
    file and never connects to a database. Record the binary's git sha in the
    report.

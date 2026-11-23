@@ -22,9 +22,9 @@
 use anyhow::Context;
 use epigraph_engine::matching::contamination::{partition_by_ledger, ClaimPair, LedgerEntry};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -40,9 +40,24 @@ pub struct SweepPair {
     pub rest: serde_json::Map<String, serde_json::Value>,
 }
 
-/// The counts the protocol's report (§7) records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The counts the protocol's report (§7) records, with what they were
+/// computed from: a counts file that does not name its ledger snapshot and
+/// its pairs cannot be audited (a stale ledger, or a mistyped run id, would
+/// leave no trace in it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SplitCounts {
+    /// SHA-256 (hex) of the ledger snapshot file exactly as read.
+    pub ledger_sha256: String,
+    /// The snapshot's own `generated_at` header (`None` when absent). It must
+    /// predate the sweep: a later snapshot counts this run's own verdicts as
+    /// contamination, an earlier one lets pairs decided in between count as
+    /// clean.
+    pub ledger_generated_at: Option<String>,
+    /// SHA-256 (hex) of the pairs that were split: the `--pairs` file as read,
+    /// or the `run_pairs.json` written next to the split.
+    pub pairs_sha256: String,
+    /// The `matcher_run_id` the pairs were read for (`None` with `--pairs`).
+    pub run_id: Option<Uuid>,
     /// Entries in the ledger snapshot.
     pub ledger_entries: usize,
     /// Pairs read from the sweep.
@@ -56,48 +71,89 @@ pub struct SplitCounts {
 }
 
 /// The ledger file `calibrate_matcher --contamination-ledger` writes. Only
-/// `entries` is read; the header fields are for the archive.
+/// `entries` and `generated_at` are read; the other header fields are for the
+/// archive.
 #[derive(Deserialize)]
 struct LedgerSnapshot {
     entries: Vec<LedgerEntry>,
+    #[serde(default)]
+    generated_at: Option<String>,
+}
+
+/// A ledger snapshot as read, with the identity [`SplitCounts`] records.
+#[derive(Debug, Clone)]
+pub struct Ledger {
+    pub entries: Vec<LedgerEntry>,
+    pub generated_at: Option<String>,
+    pub sha256: String,
+}
+
+/// The pairs to split, with their identity for [`SplitCounts`].
+#[derive(Debug, Clone)]
+pub struct SweepPairs {
+    pub pairs: Vec<SweepPair>,
+    pub sha256: String,
+    pub run_id: Option<Uuid>,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 /// Read a ledger snapshot written by `calibrate_matcher
 /// --contamination-ledger`. A file without an `entries` array is refused
 /// rather than read as an empty ledger: an empty ledger would mark every pair
 /// clean.
-pub fn read_ledger(path: &Path) -> anyhow::Result<Vec<LedgerEntry>> {
-    let file = File::open(path).with_context(|| format!("open ledger {}", path.display()))?;
-    let snap: LedgerSnapshot =
-        serde_json::from_reader(BufReader::new(file)).with_context(|| {
-            format!(
-                "parse ledger {} (expected an `entries` array)",
-                path.display()
-            )
-        })?;
-    Ok(snap.entries)
+pub fn read_ledger(path: &Path) -> anyhow::Result<Ledger> {
+    let bytes = std::fs::read(path).with_context(|| format!("open ledger {}", path.display()))?;
+    let snap: LedgerSnapshot = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parse ledger {} (expected an `entries` array)",
+            path.display()
+        )
+    })?;
+    Ok(Ledger {
+        entries: snap.entries,
+        generated_at: snap.generated_at,
+        sha256: sha256_hex(&bytes),
+    })
 }
 
 /// Read a sweep's pairs: a JSON array of objects, each with `claim_a` and
 /// `claim_b` (the shape [`fetch_run_pairs`] writes as `run_pairs.json`).
-pub fn read_pairs(path: &Path) -> anyhow::Result<Vec<SweepPair>> {
-    let file = File::open(path).with_context(|| format!("open pairs {}", path.display()))?;
-    serde_json::from_reader(BufReader::new(file)).with_context(|| {
+pub fn read_pairs(path: &Path) -> anyhow::Result<SweepPairs> {
+    let bytes = std::fs::read(path).with_context(|| format!("open pairs {}", path.display()))?;
+    let pairs = serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "parse pairs {} (expected a JSON array of objects with claim_a and claim_b)",
             path.display()
         )
+    })?;
+    Ok(SweepPairs {
+        pairs,
+        sha256: sha256_hex(&bytes),
+        run_id: None,
     })
+}
+
+/// Pretty JSON bytes, as every output file is written.
+pub fn to_json_bytes<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<Vec<u8>> {
+    Ok(serde_json::to_vec_pretty(value)?)
 }
 
 /// Split `pairs` into `(clean, contaminated, counts)` against `ledger` with
 /// [`partition_by_ledger`], keeping each row whole and in input order.
 pub fn split(
-    pairs: Vec<SweepPair>,
-    ledger: &[LedgerEntry],
+    pairs: SweepPairs,
+    ledger: &Ledger,
 ) -> (Vec<SweepPair>, Vec<SweepPair>, SplitCounts) {
+    let SweepPairs {
+        pairs,
+        sha256: pairs_sha256,
+        run_id,
+    } = pairs;
     let keys: Vec<ClaimPair> = pairs.iter().map(|p| (p.claim_a, p.claim_b)).collect();
-    let (_, dirty) = partition_by_ledger(&keys, ledger);
+    let (_, dirty) = partition_by_ledger(&keys, &ledger.entries);
     // `partition_by_ledger` returns pairs exactly as given, so a row is
     // contaminated iff its own (claim_a, claim_b) is among them.
     let dirty: HashSet<ClaimPair> = dirty.into_iter().collect();
@@ -110,7 +166,11 @@ pub fn split(
         .filter(|p| p.rest.get("verifier_verdict").is_some_and(|v| !v.is_null()))
         .count();
     let counts = SplitCounts {
-        ledger_entries: ledger.len(),
+        ledger_sha256: ledger.sha256.clone(),
+        ledger_generated_at: ledger.generated_at.clone(),
+        pairs_sha256,
+        run_id,
+        ledger_entries: ledger.entries.len(),
         pairs: total,
         clean: clean.len(),
         contaminated: contaminated.len(),
@@ -127,18 +187,36 @@ pub const COUNTS_FILE: &str = "split_counts.json";
 /// exactly what was split even after a later sweep re-stamps the rows.
 pub const RUN_PAIRS_FILE: &str = "run_pairs.json";
 
-/// Write `value` as pretty JSON to `dir/name`, refusing to overwrite an
-/// existing file (a re-run must not silently replace an archived result).
-pub fn write_new_json<T: Serialize>(dir: &Path, name: &str, value: &T) -> anyhow::Result<PathBuf> {
+/// Write every `(name, bytes)` under `dir` as ONE all-or-nothing batch: each
+/// file is created with `create_new` (a re-run never replaces an archived
+/// result), written in full and synced, and if any step fails every file
+/// THIS call created is removed again, so a failed run (disk full, a name
+/// that appeared meanwhile) leaves no partial archive that would then make
+/// every re-run refuse. Files that existed before the call are never touched.
+pub fn write_files(dir: &Path, files: &[(&str, Vec<u8>)]) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    let path = dir.join(name);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("create {} (refusing to overwrite)", path.display()))?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value)?;
-    Ok(path)
+    let mut created: Vec<PathBuf> = Vec::new();
+    let result = (|| -> anyhow::Result<()> {
+        for (name, bytes) in files {
+            let path = dir.join(name);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .with_context(|| format!("create {} (refusing to overwrite)", path.display()))?;
+            created.push(path.clone());
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        for path in &created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
 }
 
 /// Refuse when any of `names` already exists under `dir`, so a refused run
@@ -155,18 +233,50 @@ pub fn ensure_absent(dir: &Path, names: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Write the clean set, the contaminated set and the counts under `dir`.
+/// Write the clean set, the contaminated set and the counts under `dir`,
+/// plus `run_pairs` (the fetched pairs, as already serialized for their hash)
+/// when given, as one batch through [`write_files`].
 pub fn write_split(
     dir: &Path,
+    run_pairs: Option<Vec<u8>>,
     clean: &[SweepPair],
     contaminated: &[SweepPair],
     counts: &SplitCounts,
 ) -> anyhow::Result<()> {
-    ensure_absent(dir, &[CLEAN_FILE, CONTAMINATED_FILE, COUNTS_FILE])?;
-    write_new_json(dir, CLEAN_FILE, &clean)?;
-    write_new_json(dir, CONTAMINATED_FILE, &contaminated)?;
-    write_new_json(dir, COUNTS_FILE, counts)?;
-    Ok(())
+    let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+    if let Some(bytes) = run_pairs {
+        files.push((RUN_PAIRS_FILE, bytes));
+    }
+    files.push((CLEAN_FILE, to_json_bytes(clean)?));
+    files.push((CONTAMINATED_FILE, to_json_bytes(contaminated)?));
+    files.push((COUNTS_FILE, to_json_bytes(counts)?));
+    let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+    ensure_absent(dir, &names)?;
+    write_files(dir, &files)
+}
+
+/// [`fetch_run_pairs`], refusing a run id that matches no row. A mistyped
+/// `--run-id` (or one whose rows a later sweep already re-stamped) would
+/// otherwise archive an all-zero split and exit 0. Returns the pairs and the
+/// exact `run_pairs.json` bytes their `sha256` was computed over.
+#[cfg(feature = "db")]
+pub async fn fetch_run_pairs_nonempty(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+) -> anyhow::Result<(SweepPairs, Vec<u8>)> {
+    let pairs = fetch_run_pairs(pool, run_id).await?;
+    anyhow::ensure!(
+        !pairs.is_empty(),
+        "no match_candidates row carries matcher_run_id {run_id}: check the run id \
+         (a later sweep re-stamps the rows it touches); nothing written"
+    );
+    let bytes = to_json_bytes(&pairs)?;
+    let pairs = SweepPairs {
+        pairs,
+        sha256: sha256_hex(&bytes),
+        run_id: Some(run_id),
+    };
+    Ok((pairs, bytes))
 }
 
 /// The `match_candidates` rows stamped with `run_id` (§2 step 3), read-only.
@@ -229,6 +339,22 @@ mod tests {
         }
     }
 
+    fn ledger(entries: Vec<LedgerEntry>) -> Ledger {
+        Ledger {
+            entries,
+            generated_at: Some("2026-11-22T00:00:00Z".into()),
+            sha256: "ledger-hash".into(),
+        }
+    }
+
+    fn pairs(pairs: Vec<SweepPair>) -> SweepPairs {
+        SweepPairs {
+            pairs,
+            sha256: "pairs-hash".into(),
+            run_id: None,
+        }
+    }
+
     fn pair(a: Uuid, b: Uuid, verdict: Option<&str>) -> SweepPair {
         let mut rest = serde_json::Map::new();
         rest.insert("status".into(), json!("rejected"));
@@ -251,16 +377,16 @@ mod tests {
             Uuid::new_v4(),
             Uuid::new_v4(),
         );
-        let ledger = vec![entry(x, y)];
+        let ledger = ledger(vec![entry(x, y)]);
         let reversed = pair(x.max(y), x.min(y), Some("same"));
         let clean_answered = pair(x, z, Some("paraphrase"));
         let clean_unanswered = pair(z, w, None);
         let (clean, dirty, counts) = split(
-            vec![
+            pairs(vec![
                 clean_answered.clone(),
                 reversed.clone(),
                 clean_unanswered.clone(),
-            ],
+            ]),
             &ledger,
         );
         assert_eq!(dirty, vec![reversed]);
@@ -268,6 +394,10 @@ mod tests {
         assert_eq!(
             counts,
             SplitCounts {
+                ledger_sha256: "ledger-hash".into(),
+                ledger_generated_at: Some("2026-11-22T00:00:00Z".into()),
+                pairs_sha256: "pairs-hash".into(),
+                run_id: None,
                 ledger_entries: 1,
                 pairs: 3,
                 clean: 2,
@@ -295,14 +425,57 @@ mod tests {
     fn write_split_refuses_to_overwrite() {
         let dir = std::env::temp_dir().join(format!("contamination-split-{}", Uuid::new_v4()));
         let p = pair(Uuid::new_v4(), Uuid::new_v4(), None);
-        let (clean, dirty, counts) = split(vec![p], &[]);
-        write_split(&dir, &clean, &dirty, &counts).expect("first write");
+        let (clean, dirty, counts) = split(pairs(vec![p]), &ledger(vec![]));
+        write_split(&dir, None, &clean, &dirty, &counts).expect("first write");
         let before = std::fs::read_to_string(dir.join(CLEAN_FILE)).unwrap();
-        assert!(write_split(&dir, &[], &[], &counts).is_err());
+        assert!(write_split(&dir, None, &[], &[], &counts).is_err());
         assert_eq!(
             std::fs::read_to_string(dir.join(CLEAN_FILE)).unwrap(),
             before
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A batch that fails part-way removes the files it created and leaves a
+    /// file that was already there untouched, so a failed run never leaves a
+    /// partial archive that makes every re-run refuse (T95 review). The third
+    /// name exists already, so its `create_new` fails after two files were
+    /// written. (Mutation: drop the cleanup and the first two stay behind.)
+    #[test]
+    fn a_failed_batch_leaves_no_partial_archive() {
+        let dir = std::env::temp_dir().join(format!("contamination-split-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(COUNTS_FILE), "keep").unwrap();
+        let err = write_files(
+            &dir,
+            &[
+                (CLEAN_FILE, b"[]".to_vec()),
+                (CONTAMINATED_FILE, b"[]".to_vec()),
+                (COUNTS_FILE, b"{}".to_vec()),
+            ],
+        );
+        assert!(err.is_err());
+        assert!(!dir.join(CLEAN_FILE).exists());
+        assert!(!dir.join(CONTAMINATED_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(COUNTS_FILE)).unwrap(),
+            "keep"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The ledger's hash and `generated_at` are read from the file itself,
+    /// so the counts name exactly the snapshot they were computed against.
+    #[test]
+    fn read_ledger_records_the_snapshot_identity() {
+        let dir = std::env::temp_dir().join(format!("contamination-split-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.json");
+        let body = r#"{"generated_at": "2026-11-21T12:00:00Z", "entries": []}"#;
+        std::fs::write(&path, body).unwrap();
+        let ledger = read_ledger(&path).unwrap();
+        assert_eq!(ledger.generated_at.as_deref(), Some("2026-11-21T12:00:00Z"));
+        assert_eq!(ledger.sha256, hex::encode(Sha256::digest(body.as_bytes())));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
