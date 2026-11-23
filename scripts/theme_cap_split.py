@@ -43,16 +43,25 @@ What apply writes, per theme:
     marks it for the Atlas group naming (W8). The label is kept short and
     off label_themes_llm's placeholder patterns, so that script's default run,
     which samples member text, does not rename it.
+  * Current members WITHOUT an embedding (the off-box split cannot place
+    them) are placed on the box, in claim-id order, by
+    `theme_cap_core.unembedded_slots`: each part in turn (the kept part first)
+    is filled up to the cap, and any remainder becomes extra parts of at most
+    the cap. So a theme whose embedded members fit in one part, or that has
+    none, is still split under the cap. A part holding only unembedded members
+    has no centroid (NULL) and a `claim_count` of 0, as `claim_count` and the
+    centroid count embedded members only. They move with their part, so
+    `reverse` restores them too.
   * Refused, with nothing written, when the result no longer matches the live
     membership (claims assigned or moved since the plan), when any theme the
-    result names would end over the cap once current members without an
-    embedding (which stay with the kept part) are counted, including a theme
-    whose embedded members fit in one part or that has none, or when the
-    result's cap is over apply's `--cap` (default 2000).
+    result names would still end over the cap (a safety net: the placement
+    above keeps every part under it), or when the result's cap is over
+    apply's `--cap` (default 2000).
 
 The cap counts CURRENT members (`COALESCE(is_current, true)`), what the Atlas
 draws. Retired members (superseded or duplicate-marked) keep their theme_id and
-have no embedding; they stay with the kept part and do not count.
+have no embedding; they stay with the kept part and do not count. Only CURRENT
+unembedded members are placed as above.
 
 Member text: nothing here reads, prints or stores claim content, so the
 bug-report intake rule (`theme_lib.not_intake_owned`, which keeps intake text
@@ -262,13 +271,19 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
         conn.rollback()  # end the read transaction between themes
         result["themes"].append({"theme_id": theme_id, "parts": parts, **stats})
         unembedded = members - embedded
+        sizes = [len(p) for p in parts]
+        taken, extra = core.unembedded_slots(sizes, unembedded, cap)
+        final = [n + k for n, k in zip(sizes, taken)] + extra
         report.append({
             "theme_id": theme_id, "current": members, "embedded": embedded,
             "unembedded": unembedded, "retired": retired,
-            "part_sizes": [len(p) for p in parts],
+            "part_sizes": sizes,
             "id_chunk_cuts": stats["id_chunk_cuts"],
-            "kept_part_with_unembedded": (len(parts[0]) if parts else 0) + unembedded,
-            "reaches_cap": bool(parts) and len(parts[0]) + unembedded <= cap,
+            # Apply places the current unembedded members on the box (see the
+            # module docstring); these are the part sizes it will write.
+            "part_sizes_with_unembedded": final,
+            "unembedded_only_parts": len(extra),
+            "reaches_cap": bool(final) and max(final) <= cap,
         })
     return result, report
 
@@ -407,6 +422,11 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                 except ValueError as e:
                     raise ValueError(f"theme {parent}: the result no longer matches its live "
                                      f"members ({e}); re-run plan") from None
+                # Current members with no embedding: placed on the box, after
+                # the theme row is locked (core.unembedded_slots).
+                cur.execute(f"SELECT id::text FROM claims WHERE theme_id = %s "
+                            f"AND embedding IS NULL AND {CURRENT} ORDER BY id", (parent,))
+                parts = core.place_unembedded(parts, [r[0] for r in cur.fetchall()], cap)
                 if len(parts) < 2:
                     continue
                 props = snapshot.get("properties") or {}
@@ -443,10 +463,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                                            "kept_claim_ids": kept, "new_parts": new_parts})
             for theme_id, with_3072 in touched:
                 _recompute(cur, theme_id, with_3072)
-            # EVERY theme the result names, not only the ones written: a theme
-            # whose embedded members fit in one part (or that has none) is not
-            # split above, and would otherwise stay over the cap behind a
-            # successful apply.
+            # EVERY theme the result names, not only the ones written: a
+            # safety net behind the placement above, so no theme the result
+            # names can stay over the cap behind a successful apply.
             checked = sorted({t for t, _ in touched} | {str(e["theme_id"]) for e in result["themes"]})
             cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
                         f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
@@ -454,9 +473,8 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                         (checked, cap))
             over = cur.fetchall()
             if over:
-                raise ValueError(f"themes would end over the cap of {cap} (current members "
-                                 "without an embedding stay with the kept part, and cannot be "
-                                 f"split); drop them with --theme-id and re-plan: {over}")
+                raise ValueError(f"themes would end over the cap of {cap}; drop them with "
+                                 f"--theme-id and re-plan: {over}")
         if not manifest["themes"]:
             conn.rollback()
             return manifest
@@ -640,7 +658,10 @@ def main(argv=None):
             _write_json_new(out, result)
             labels = theme_labels(conn, [r["theme_id"] for r in report])
             for r in report:
-                flag = "" if r["reaches_cap"] else "  NOT UNDER CAP (unembedded members)"
+                flag = "" if r["reaches_cap"] else "  NOT UNDER CAP"
+                if r["unembedded"]:
+                    flag += (f"  UNEMBEDDED: {r['unembedded']} placed on apply -> "
+                             f"{r['part_sizes_with_unembedded']}")
                 if r["id_chunk_cuts"]:
                     flag += f"  ID-ORDER CUTS: {r['id_chunk_cuts']} (identical vectors)"
                 print(f"  {r['theme_id']}  {r['current']:>6} -> {r['part_sizes']}"

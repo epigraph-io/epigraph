@@ -32,6 +32,8 @@ CAP = 40
 RUN_ID = "33333333-3333-3333-3333-333333333333"
 PARENT_LABEL = "Parent Theme Name"
 TEXT_MARK = "capsplit-member-text-"
+A1, A2, A3, A4 = (f"0000000{i}-0000-4000-8000-000000000000" for i in range(1, 5))
+T1, T2 = "11111111-0000-4000-8000-000000000000", "22222222-0000-4000-8000-000000000000"
 
 
 def _claim(cur, agent_id, theme_id, seed, embedded=True, owner=None, current=True):
@@ -280,40 +282,90 @@ def test_apply_refuses_a_stale_result_and_writes_nothing(db, seed_agent, tmp_pat
     assert not (tmp_path / "m.json").exists()
 
 
-def test_apply_refuses_when_unembedded_members_push_kept_part_over_cap(db, seed_agent, tmp_path):
-    _theme(db, seed_agent, (30, 25, 20), unembedded=15)
+def _current_sizes(db):
+    with db.cursor() as cur:
+        cur.execute("SELECT theme_id::text, count(*) FROM claims WHERE theme_id IS NOT NULL "
+                    "AND COALESCE(is_current, true) GROUP BY theme_id")
+        out = dict(cur.fetchall())
+    db.rollback()
+    return out
+
+
+def test_apply_places_unembedded_members_under_the_cap(db, seed_agent, tmp_path):
+    """Current members without an embedding no longer stay in the kept part
+    whatever its size (029392cb): apply fills the parts up to the cap in part
+    order, and the theme ends under the cap with every member placed. Reverse
+    still restores everything."""
+    theme, groups, loose = _theme(db, seed_agent, (30, 25, 20), unembedded=15)
     result, report = S.plan(db, cap=CAP)
-    assert report[0]["reaches_cap"] is False
+    assert report[0]["reaches_cap"] is True
+    # kept part 30 + 10, part 2 25 + 5 (claim-id order), part 3 untouched
+    assert report[0]["part_sizes_with_unembedded"] == [40, 30, 20]
     before = _snapshot(db)
 
-    with pytest.raises(ValueError, match="over the cap"):
-        S.apply_result(db, result, tmp_path / "m.json")
+    manifest = S.apply_result(db, result, tmp_path / "m.json")
 
+    sizes = _current_sizes(db)
+    assert sorted(sizes.values(), reverse=True) == [40, 30, 20] and max(sizes.values()) <= CAP
+    assert _theme_of(db, groups[0]) == [theme]
+    placed = sorted(loose)
+    assert _theme_of(db, placed[:10]) == [theme], "the kept part fills first, in id order"
+    moved = manifest["themes"][0]["new_parts"][0]
+    assert set(placed[10:]) <= set(moved["claim_ids"]), "the rest is recorded for reverse"
+    _run(["reverse", "--database-url", TEST_DSN, "--manifest", str(tmp_path / "m.json")])
     assert _snapshot(db) == before
-    assert not (tmp_path / "m.json").exists()
 
 
-@pytest.mark.parametrize("embedded, unembedded", [
-    ((35,), 10),  # embedded members fit in ONE part; the theme is still over the cap
-    ((), 45),     # no embedded member at all: the result has no parts for it
+@pytest.mark.parametrize("embedded, unembedded, final", [
+    ((35,), 10, [40, 5]),  # embedded members fit in ONE part; the theme is still over the cap
+    ((), 45, [40, 5]),     # no embedded member at all: the result has no parts for it
 ], ids=["one-part", "no-embeddings"])
-def test_apply_refuses_an_over_cap_theme_it_cannot_split(db, seed_agent, tmp_path,
-                                                         embedded, unembedded):
-    """A theme the split leaves whole must not pass as applied: the apply would
-    report success and the theme would stay over the cap."""
-    stuck, _, _ = _theme(db, seed_agent, embedded, label="Unembedded Theme", seed0=40,
-                         unembedded=unembedded)
+def test_apply_splits_an_over_cap_theme_the_embeddings_cannot(db, seed_agent, tmp_path,
+                                                              embedded, unembedded, final):
+    """A theme the embedding split leaves whole used to refuse the WHOLE apply
+    (the W1 apply could not place its unembedded members). Now apply places
+    them into parts under the cap, the splittable theme in the same result is
+    split as before, and reverse restores both."""
+    stuck, _, loose = _theme(db, seed_agent, embedded, label="Unembedded Theme", seed0=40,
+                             unembedded=unembedded)
     _theme(db, seed_agent, (30, 25, 20))  # a splittable theme in the same result
     result, report = S.plan(db, cap=CAP)
     by_id = {r["theme_id"]: r for r in report}
-    assert by_id[stuck]["current"] == 45 and by_id[stuck]["reaches_cap"] is False
+    assert by_id[stuck]["current"] == 45 and by_id[stuck]["reaches_cap"] is True
+    assert by_id[stuck]["part_sizes_with_unembedded"] == final
     before = _snapshot(db)
 
-    with pytest.raises(ValueError, match=f"over the cap.*{stuck}"):
-        S.apply_result(db, result, tmp_path / "m.json")
+    S.apply_result(db, result, tmp_path / "m.json")
 
-    assert _snapshot(db) == before, "the whole apply is refused, the splittable theme too"
-    assert not (tmp_path / "m.json").exists()
+    sizes = _current_sizes(db)
+    assert max(sizes.values()) <= CAP
+    assert len(sizes) == 2 + 3, "both themes split: 2 parts and 3 parts"
+    assert sizes[stuck] == final[0], "the kept part keeps the theme id"
+    assert sum(sizes[t] for t in _theme_of(db, loose)) == 45, "every member is in some part"
+    _run(["reverse", "--database-url", TEST_DSN, "--manifest", str(tmp_path / "m.json")])
+    assert _snapshot(db) == before
+
+
+@pytest.mark.parametrize("sizes, n, taken, extra", [
+    ([30, 25, 20], 15, [10, 5, 0], []),
+    ([35], 10, [5], [5]),
+    ([], 45, [], [40, 5]),
+    ([], 80, [], [40, 40]),
+    ([40, 40], 3, [0, 0], [3]),
+    ([12], 0, [0], []),
+])
+def test_unembedded_slots_fill_parts_in_order_then_chunk(sizes, n, taken, extra):
+    assert core.unembedded_slots(sizes, n, CAP) == (taken, extra)
+
+
+def test_place_unembedded_is_input_order_free_and_covers_every_member():
+    parts = [[A3, A1], [A2]]
+    loose = [f"9{i:07d}-0000-4000-8000-000000000000" for i in range(5)]
+    a = core.place_unembedded(parts, loose, 3)
+    b = core.place_unembedded(parts, list(reversed(loose)), 3)
+    assert a == b
+    assert a == [[A1, A3, loose[0]], [A2, loose[1], loose[2]], [loose[3], loose[4]]]
+    assert sorted(c for p in a for c in p) == sorted([A1, A2, A3, *loose])
 
 
 def test_plan_and_parts_record_an_id_order_cut(db, seed_agent, tmp_path):
@@ -345,10 +397,6 @@ def test_apply_refuses_a_result_whose_cap_is_over_its_own():
 
     with pytest.raises(ValueError, match="over apply's cap of 2000"):
         S.apply_result(_NoDB(), result, "unused.json")
-
-
-A1, A2, A3, A4 = (f"0000000{i}-0000-4000-8000-000000000000" for i in range(1, 5))
-T1, T2 = "11111111-0000-4000-8000-000000000000", "22222222-0000-4000-8000-000000000000"
 
 
 def _result(themes, cap=CAP, seed=42):
@@ -460,7 +508,8 @@ def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
 def test_the_cap_counts_current_members_only(db, seed_agent, tmp_path):
     """Superseded and duplicate-marked members keep their theme_id but are not
     drawn and cannot be clustered: they neither trigger a split nor overflow the
-    kept part. (Current members without an embedding do; see the test above.)"""
+    kept part. (Current members without an embedding do count, and are placed;
+    see test_apply_places_unembedded_members_under_the_cap.)"""
     under, _, _ = _theme(db, seed_agent, (35,), label="Mostly Retired", seed0=30, retired=20)
     over, groups, retired = _theme(db, seed_agent, (30, 25, 20), retired=15)
 

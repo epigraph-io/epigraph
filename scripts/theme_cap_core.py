@@ -223,6 +223,44 @@ def parts_digest(result):
     return hashlib.sha256(blob).hexdigest()
 
 
+def unembedded_slots(part_sizes, n_unembedded, cap):
+    """Where a theme's current members WITHOUT an embedding go, by count.
+
+    The off-box split never sees them (it has no vector to place them by), so
+    apply places them on the box by this rule: in claim-id order, fill each
+    part in part order up to `cap` (part 0, the kept part, first), and put any
+    remainder in extra parts of at most `cap`. Returns (taken, extra): how
+    many each existing part takes, and the sizes of the extra parts. Every
+    resulting part is at most `cap` whenever the given parts are."""
+    if cap < 1:
+        raise ValueError("cap must be at least 1")
+    left = int(n_unembedded)
+    taken = []
+    for size in part_sizes:
+        k = min(left, max(0, cap - int(size)))
+        taken.append(k)
+        left -= k
+    extra = [min(cap, left - i) for i in range(0, left, cap)]
+    return taken, extra
+
+
+def place_unembedded(parts, unembedded, cap):
+    """`parts` with the current unembedded members placed by `unembedded_slots`:
+    returns the final parts (each existing part extended, extra parts
+    appended), members of each sorted. Pure and deterministic: the input
+    order of `unembedded` does not matter."""
+    rest = sorted(str(c) for c in unembedded)
+    taken, extra = unembedded_slots([len(p) for p in parts], len(rest), cap)
+    out, at = [], 0
+    for part, k in zip(parts, taken):
+        out.append(sorted([str(c) for c in part] + rest[at:at + k]))
+        at += k
+    for k in extra:
+        out.append(rest[at:at + k])
+        at += k
+    return out
+
+
 def validate_parts(members, parts, cap):
     """Raise ValueError unless `parts` cover `members` exactly once, each <= cap."""
     seen = set()
