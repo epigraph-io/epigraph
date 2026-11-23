@@ -29,7 +29,17 @@
 //!   viewer's own rule) of every identity the act can change, read before and
 //!   after it in the same transaction: the agent, every registered successor
 //!   of it (transitively), and every holder of a copy chained from one of its
-//!   rows for the role. Each is printed `GAINED`, `LOST` or `KEPT`.
+//!   rows for the role. Each is printed `GAINED`, `LOST` or `KEPT`. They are
+//!   read NOW, unless the window the act concerns opens later (an attach
+//!   `--valid-from` in the future; a detach whose latest un-detached row
+//!   starts in the future): then both are read at that opening, so a
+//!   future-dated grant is not previewed as "0 gained" (`EVALUATED-AT`);
+//! * a warning (`UNREGISTERED`) when the attached identity was never
+//!   registered by the host (no prompt snapshot, no recorded parent): a host
+//!   identity attached before its first registration makes that
+//!   registration abort `AID09` (166's "REGISTER, THEN ATTACH"). It warns
+//!   rather than refuses: a custodial attach of an identity the host never
+//!   registers is legitimate, and the database decides the rest;
 //! * checks that can be made before connecting: the role key's shape, a
 //!   non-blank reason, and a window that ends after it starts.
 //!
@@ -118,6 +128,12 @@ pub struct MembershipChange {
 /// What an attach or a detach did (rolled back unless `applied`).
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
+    /// The instant the memberships were read at when it is LATER than now
+    /// (the act's window opens then); `None`: read now.
+    pub evaluated_at: Option<String>,
+    /// Attach: the identity was never registered by the host (no prompt
+    /// snapshot and no recorded parent). Detach: unused.
+    pub unregistered: bool,
     /// Attach: the row made by name. Detach: unused.
     pub attachment: Option<Uuid>,
     /// Attach: every succession copy the follow wrote, chained. Detach:
@@ -168,22 +184,54 @@ async fn affected_agents(
 }
 
 /// `(agent, group, role)` of every role-derived membership of `agents` at
-/// this statement's clock (the viewer's rule; a membership the act
-/// started or ended at the transaction's `now()` is counted).
+/// `at` when given (a window opening later than now), else at this
+/// statement's clock (the viewer's rule; a membership the act started or
+/// ended at the transaction's `now()` is counted).
 async fn derived(
     conn: &mut PgConnection,
     agents: &[Uuid],
+    at: Option<DateTime<Utc>>,
 ) -> anyhow::Result<BTreeSet<(Uuid, Uuid, String)>> {
     let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
         "SELECT a.agent_id, d.group_id, d.role \
            FROM unnest($1::uuid[]) AS a(agent_id) \
           CROSS JOIN LATERAL public.epigraph_role_derived_memberships( \
-                   a.agent_id, clock_timestamp()) d",
+                   a.agent_id, COALESCE($2::timestamptz, clock_timestamp())) d",
     )
     .bind(agents)
+    .bind(at)
     .fetch_all(&mut *conn)
     .await?;
     Ok(rows.into_iter().collect())
+}
+
+/// `at` when it is later than the database's clock, else `None` (read now).
+/// Decided by the database, not this process's clock.
+async fn later_than_now(
+    conn: &mut PgConnection,
+    at: Option<DateTime<Utc>>,
+) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let later: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT CASE WHEN $1::timestamptz > clock_timestamp() THEN $1::timestamptz END",
+    )
+    .bind(at)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(later)
+}
+
+/// The identity was never registered by the host: no prompt snapshot and
+/// no recorded parent (161's test for "never registered"). Read on the
+/// maintenance session (both tables are FORCE RLS).
+async fn never_registered(conn: &mut PgConnection, agent: Uuid) -> anyhow::Result<bool> {
+    let never: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM public.agent_prompt_snapshots s WHERE s.agent_id = $1) \
+            AND NOT EXISTS (SELECT 1 FROM public.agent_succession s WHERE s.child_agent_id = $1)",
+    )
+    .bind(agent)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(never)
 }
 
 fn diff(
@@ -255,7 +303,12 @@ pub async fn attach(
     validate(role, reason, valid_from, valid_to)?;
     let mut tx = super::team_group::begin_audited(conn, "role-attach").await?;
     let agents = affected_agents(&mut tx, role, agent).await?;
-    let before = derived(&mut tx, &agents).await?;
+    let unregistered = never_registered(&mut tx, agent).await?;
+    // A future `--valid-from`: read both sides at the opening, where the
+    // grant takes effect (ROL02 refuses an overlapping window, so nothing
+    // else of this agent for this role covers that instant).
+    let at = later_than_now(&mut tx, valid_from).await?;
+    let before = derived(&mut tx, &agents, at).await?;
     let id: Uuid =
         sqlx::query_scalar("SELECT public.epigraph_attach_agent_to_role($1, $2, $3, $4, $5)")
             .bind(role)
@@ -281,9 +334,11 @@ pub async fn attach(
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    let after = derived(&mut tx, &agents).await?;
+    let after = derived(&mut tx, &agents, at).await?;
     finish(tx, apply).await?;
     Ok(Outcome {
+        evaluated_at: at.map(|t| t.to_rfc3339()),
+        unregistered,
         attachment: Some(id),
         rows: rows_of(raw),
         memberships: diff(&before, &after),
@@ -309,15 +364,19 @@ pub async fn detach(
     validate(role, reason, None, None)?;
     let mut tx = super::team_group::begin_audited(conn, "role-detach").await?;
     let agents = affected_agents(&mut tx, role, agent).await?;
-    let before = derived(&mut tx, &agents).await?;
-    let open: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM public.role_agents \
+    let open: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, valid_from FROM public.role_agents \
           WHERE role = $1 AND agent_id = $2 AND detached_at IS NULL ORDER BY valid_from, id",
     )
     .bind(role)
     .bind(agent)
     .fetch_all(&mut *tx)
     .await?;
+    // Rows that open only later grant nothing now: read both sides at the
+    // latest opening, so cutting off a future-dated grant shows as LOST.
+    let at = later_than_now(&mut tx, open.iter().map(|(_, f)| *f).max()).await?;
+    let open: Vec<Uuid> = open.into_iter().map(|(id, _)| id).collect();
+    let before = derived(&mut tx, &agents, at).await?;
     let n: i32 = sqlx::query_scalar("SELECT public.epigraph_detach_agent_from_role($1, $2, $3)")
         .bind(role)
         .bind(agent)
@@ -340,9 +399,11 @@ pub async fn detach(
     .bind(&open)
     .fetch_all(&mut *tx)
     .await?;
-    let after = derived(&mut tx, &agents).await?;
+    let after = derived(&mut tx, &agents, at).await?;
     finish(tx, apply).await?;
     Ok(Outcome {
+        evaluated_at: at.map(|t| t.to_rfc3339()),
+        unregistered: false,
         attachment: None,
         rows: rows_of(raw),
         memberships: diff(&before, &after),
@@ -364,18 +425,24 @@ fn row_line(kind: &str, r: &AttachmentRow) -> String {
 
 fn membership_lines(o: &Outcome) -> Vec<String> {
     let mut out: Vec<String> = o
-        .memberships
+        .evaluated_at
         .iter()
-        .map(|m| {
+        .map(|at| {
             format!(
-                "MEMBERSHIP\t{}\tagent={}\tgroup={}\trole={}",
-                m.change.label(),
-                m.agent,
-                m.group,
-                m.role
+                "EVALUATED-AT\t{at}\t(the window opens after now: the memberships below are \
+                 read as of its opening, not now)"
             )
         })
         .collect();
+    out.extend(o.memberships.iter().map(|m| {
+        format!(
+            "MEMBERSHIP\t{}\tagent={}\tgroup={}\trole={}",
+            m.change.label(),
+            m.agent,
+            m.group,
+            m.role
+        )
+    }));
     out.push(format!(
         "MEMBERSHIPS: {} gained, {} lost, {} kept (role-derived, every identity the act can \
          change)",
@@ -403,6 +470,13 @@ pub fn describe_attach(role: &str, agent: Uuid, o: &Outcome) -> Vec<String> {
         "{would}ATTACHED\tattachment={}\trole={role}\tagent={agent}",
         o.attachment.map_or_else(String::new, |i| i.to_string())
     )];
+    if o.unregistered {
+        out.push(format!(
+            "UNREGISTERED\tagent={agent}\t(the host has never registered this identity: if it is \
+             a host identity, register it FIRST; an identity attached before its first \
+             registration makes that registration abort AID09 and stays refused)"
+        ));
+    }
     out.extend(o.rows.iter().map(|r| row_line("COPY", r)));
     out.push(format!(
         "COPIES: {} (the attach follows the identity's registered successors)",

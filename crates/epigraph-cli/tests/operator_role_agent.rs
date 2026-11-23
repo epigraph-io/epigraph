@@ -24,6 +24,13 @@
 //!   keeps the group;
 //! * a second detach finds nothing to detach and changes nothing.
 //!
+//! And, in a world of its own: an attach whose `--valid-from` is in the
+//! future previews the grant as of its opening (`EVALUATED-AT`, `GAINED`
+//! for the identity and its successors), not as "0 gained" now, and a detach
+//! of that future-dated row previews it `LOST`; an identity the host never
+//! registered is attached with an `UNREGISTERED` warning (a registered one
+//! never shows it).
+//!
 //! The cluster-level maintenance login each DB test creates is removed by
 //! [`with_maintenance_login`] even when the test panics.
 
@@ -501,6 +508,11 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
         );
     }
     assert!(dry.stdout.contains("DRY RUN"), "{}", dry.show());
+    assert!(
+        dry.lines_starting("UNREGISTERED").is_empty() && !dry.stdout.contains("EVALUATED-AT"),
+        "P is registered and the window opens now: neither note is printed\n{}",
+        dry.show()
+    );
     assert_eq!(rows_after_dry, (0, 0), "a dry-run attach writes no row");
     assert_eq!(events_after_dry, 0, "a dry-run attach writes no audit row");
 
@@ -629,5 +641,146 @@ async fn a_panicking_body_still_drops_its_maintenance_login(pool: PgPool) {
     assert!(
         !role_exists(&pool, &login).await,
         "the login {login} is dropped although the body panicked"
+    );
+}
+
+/// Finding: a future `--valid-from` must not preview as "0 gained". The
+/// attach of `P` from tomorrow is read as of tomorrow (`EVALUATED-AT`), so
+/// `P`, `A` and `D` (their copies carry the window) show `GAINED`; once it is
+/// applied, a detach of `P` previews all three `LOST` as of that opening.
+/// An identity the host never registered (it only authored a claim) is
+/// attached with an `UNREGISTERED` warning.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_future_window_is_previewed_at_its_opening_and_an_unregistered_identity_is_flagged(
+    pool: PgPool,
+) {
+    let group = attached_group(&pool).await;
+    let (h, _) = fixture::seed_human_operator(&pool, "ra-future-holder").await;
+    grant(&pool, h).await;
+    let p = register(&pool, None).await;
+    {
+        let mut c = pool.acquire().await.expect("acquire");
+        let out = AgentRepository::link_operator(&mut c, p, h)
+            .await
+            .expect("link P to its human");
+        assert!(out.link_live, "PREMISE: a live link: {out:?}");
+    }
+    let a = register(&pool, Some(p)).await;
+    let d = register(&pool, Some(a)).await;
+    // Never registered by the host; it authored a claim, so the host's
+    // registration would refuse it anyway (AID05) and a register-first
+    // refusal in the attach definer would not apply to it either.
+    let (u, _) = fixture::seed_agent_with_group(&pool, "ra-unregistered").await;
+    fixture::seed_public_claim(&pool, u, "an unregistered identity's claim").await;
+    let tomorrow = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+    let (ps, us) = (p.to_string(), u.to_string());
+    let (t2, ps2, us2) = (tomorrow.clone(), ps.clone(), us.clone());
+    let (login, dry, applied, ddry, unreg) =
+        with_maintenance_login(&pool, |login, dsn| async move {
+            let attach = |apply: bool| {
+                let mut args = vec![
+                    "role-attach",
+                    "--role",
+                    ROLE,
+                    "--agent",
+                    ps2.as_str(),
+                    "--valid-from",
+                    t2.as_str(),
+                    "--reason",
+                    "future window test",
+                ];
+                if apply {
+                    args.push("--apply");
+                }
+                run_with(&args, Some(&dsn))
+            };
+            let dry = attach(false);
+            let applied = attach(true);
+            let ddry = run_with(
+                &[
+                    "role-detach",
+                    "--role",
+                    ROLE,
+                    "--agent",
+                    ps2.as_str(),
+                    "--reason",
+                    "future window detach test",
+                ],
+                Some(&dsn),
+            );
+            let unreg = run_with(
+                &[
+                    "role-attach",
+                    "--role",
+                    ROLE,
+                    "--agent",
+                    us2.as_str(),
+                    "--reason",
+                    "unregistered identity test",
+                ],
+                Some(&dsn),
+            );
+            (login, dry, applied, ddry, unreg)
+        })
+        .await;
+    assert!(!role_exists(&pool, &login).await, "the login is dropped");
+
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert_eq!(
+        dry.lines_starting("EVALUATED-AT\t").len(),
+        1,
+        "the preview says it is read at the opening\n{}",
+        dry.show()
+    );
+    for x in [p, a, d] {
+        assert!(
+            has_line(
+                &dry,
+                "MEMBERSHIP\tGAINED",
+                &[
+                    format!("agent={x}"),
+                    format!("group={group}"),
+                    "role=writer".into()
+                ]
+            ),
+            "agent {x} gains the group from tomorrow, and the preview shows it\n{}",
+            dry.show()
+        );
+    }
+    assert_eq!(applied.code, 0, "{}", applied.show());
+    assert!(
+        derived_in(&pool, p, group).await.is_empty(),
+        "CONTROL: the window has not opened, so nothing is derived now"
+    );
+
+    assert_eq!(ddry.code, 0, "{}", ddry.show());
+    assert_eq!(
+        ddry.lines_starting("EVALUATED-AT\t").len(),
+        1,
+        "{}",
+        ddry.show()
+    );
+    for x in [p, a, d] {
+        assert!(
+            has_line(
+                &ddry,
+                "MEMBERSHIP\tLOST",
+                &[format!("agent={x}"), format!("group={group}")]
+            ),
+            "cutting off the future-dated grant shows agent {x} losing it\n{}",
+            ddry.show()
+        );
+    }
+
+    assert_eq!(unreg.code, 0, "{}", unreg.show());
+    assert!(
+        has_line(&unreg, "UNREGISTERED\t", &[format!("agent={us}")]),
+        "an identity the host never registered is flagged\n{}",
+        unreg.show()
+    );
+    assert!(
+        dry.lines_starting("UNREGISTERED").is_empty(),
+        "CONTROL: a registered identity is not flagged\n{}",
+        dry.show()
     );
 }

@@ -483,10 +483,12 @@ enum Command {
     /// registered successor of the identity (the lineage follow, chained
     /// since migration 195): each is printed as a `COPY` line. Register the
     /// identity through the host's attestor FIRST: an identity attached
-    /// before its first registration is refused at that registration
-    /// (AID09). Prints the role-derived memberships of every identity the
-    /// act can change, before vs after. Without `--apply`, the attachment,
-    /// its copies and their audit rows roll back.
+    /// before its first registration makes that registration abort (AID09);
+    /// the verb prints `UNREGISTERED` for an identity the host never
+    /// registered. Prints the role-derived memberships of every identity the
+    /// act can change, before vs after (as of the window's opening when
+    /// `--valid-from` is later than now, `EVALUATED-AT`). Without `--apply`,
+    /// the attachment, its copies and their audit rows roll back.
     RoleAttach {
         /// The catalog role key (`role:<lowercase-key>`).
         #[arg(long)]
