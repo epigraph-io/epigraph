@@ -157,7 +157,9 @@ Quality bounds (all on the rounded output), in `force::tests`:
   group, beside an assertion on `LAYOUT_ALGO`. An arithmetic change fails it
   until the tag is bumped and the digests re-pinned, so stored positions are
   never reused under changed code. It is also the cross-host check to run on
-  another CPU architecture (not yet done).
+  another CPU architecture: CI's advisory `layout-digest-arm64` job (backlog
+  c7c6e7ce) runs it on a GitHub-hosted arm64 runner whenever the layout code
+  changes; the cross-architecture result is the first such run's log.
 
 In `fill::tests`: `filled_fixture_levels_validate_and_keep_the_layout_bounds`
 (the W10a fixture levels pass `to_stored_json` after the fill),
