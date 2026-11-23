@@ -25,6 +25,12 @@
 //! A read whose name is computed at run time cannot be resolved from the
 //! text. Each file holding one is listed in [`DYNAMIC_READERS`] with where its
 //! names come from, so a new one is a reviewed decision rather than a gap.
+//! Such a file usually wraps the environment in a lookup closure or
+//! parameter (`let var = |k| env::var(k).ok()`, `from_lookup(get)`); the
+//! entry names those lookups, and a call to one with a literal or a constant
+//! is a read like `env::var`. The entry also pins how many reads in the file
+//! compute their name, so a new computed read there (a new lookup, or a
+//! lookup called with a name from elsewhere) fails until it is reviewed.
 //! Build scripts are not scanned: their environment is Cargo's.
 //!
 //! A variable read only by a service under `services/<name>/` may instead be
@@ -73,49 +79,86 @@ const TEST_ONLY: &[(&str, &str)] = &[(
      into debug builds only, set by the resume tests",
 )];
 
-/// Files that read the environment through a name computed at run time:
-/// (file, where the names come from).
-const DYNAMIC_READERS: &[(&str, &str)] = &[
-    (
-        "crates/epigraph-api/src/oauth/providers/cloudflare_access.rs",
-        "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
-    ),
-    (
-        "crates/epigraph-api/src/oauth/providers/config.rs",
-        "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
-    ),
-    (
-        "crates/epigraph-api/src/oauth/providers/google.rs",
-        "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
-    ),
-    (
-        "crates/epigraph-api/src/security/rate_limit.rs",
-        "a `var` closure over the file's `*_ENV` constants",
-    ),
-    (
-        "crates/epigraph-api/src/serving.rs",
-        "a `var` closure over the file's `*_ENV` constants",
-    ),
-    (
-        "crates/epigraph-cli/src/operator/client_scope.rs",
-        "the OS user: SUDO_USER, USER, LOGNAME (platform variables)",
-    ),
-    (
-        "crates/epigraph-engine/src/belief_modes.rs",
-        "a lookup closure over each flag's `belief_mode!` `env = \"...\"`",
-    ),
-    (
-        "crates/epigraph-mcp/src/tools/label_dedup.rs",
-        "a lookup closure over the file's `*_ENV` constants",
-    ),
-    (
-        "crates/epigraph-passkey/src/config.rs",
-        "lookup closures over the file's `ENV_*` constants",
-    ),
-    (
-        "services/explorer/src/config.rs",
-        "a lookup closure over the file's `ENV_*` constants",
-    ),
+/// A file that reads the environment through a name computed at run time.
+struct DynamicReader {
+    file: &'static str,
+    /// The closures and parameters in the file that take a variable name
+    /// and look it up: a call to one with a literal or a constant is a read.
+    lookups: &'static [&'static str],
+    /// How many reads in the file compute their name at run time
+    /// (`env::var(k)`, or a lookup called with a non-constant), counted in
+    /// production code. Exact, so a new one is reviewed, not absorbed.
+    computed: usize,
+    /// Where the computed names come from.
+    why: &'static str,
+}
+
+/// Files that read the environment through a name computed at run time.
+const DYNAMIC_READERS: &[DynamicReader] = &[
+    DynamicReader {
+        file: "crates/epigraph-api/src/oauth/providers/cloudflare_access.rs",
+        lookups: &["resolve_env"],
+        computed: 2,
+        why: "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
+    },
+    DynamicReader {
+        file: "crates/epigraph-api/src/oauth/providers/config.rs",
+        lookups: &[],
+        computed: 1,
+        why: "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
+    },
+    DynamicReader {
+        file: "crates/epigraph-api/src/oauth/providers/google.rs",
+        lookups: &["resolve_env"],
+        computed: 5,
+        why: "the `*_env` keys of providers.toml name the variables (docs/deploy.md step 7)",
+    },
+    DynamicReader {
+        file: "crates/epigraph-api/src/security/rate_limit.rs",
+        lookups: &["var"],
+        computed: 1,
+        why: "the `var` closure itself; its calls pass the file's `*_ENV` constants",
+    },
+    DynamicReader {
+        file: "crates/epigraph-api/src/serving.rs",
+        lookups: &["var"],
+        computed: 1,
+        why: "the `var` closure itself; its calls pass the file's `*_ENV` constants",
+    },
+    DynamicReader {
+        file: "crates/epigraph-cli/src/operator/client_scope.rs",
+        lookups: &[],
+        computed: 1,
+        why: "the OS user: SUDO_USER, USER, LOGNAME (platform variables)",
+    },
+    DynamicReader {
+        file: "crates/epigraph-engine/src/belief_modes.rs",
+        lookups: &["lookup"],
+        computed: 2,
+        why: "`from_env`'s closure, and `read_flag`'s lookup of each flag's \
+              `belief_mode!` `env = \"...\"`",
+    },
+    DynamicReader {
+        file: "crates/epigraph-mcp/src/tools/label_dedup.rs",
+        lookups: &["lookup", "var"],
+        computed: 2,
+        why: "`from_env`'s closure and the `var` wrapper's call of `lookup`; \
+              `var`'s calls pass the file's `*_ENV` constants",
+    },
+    DynamicReader {
+        file: "crates/epigraph-passkey/src/config.rs",
+        lookups: &["get", "val"],
+        computed: 5,
+        why: "the two `from_env` closures, the `val` wrappers' calls of `get`, \
+              and the partial-configuration check over `ALL_ENV`",
+    },
+    DynamicReader {
+        file: "services/explorer/src/config.rs",
+        lookups: &["lookup", "get"],
+        computed: 2,
+        why: "`from_env`'s closure and the `get` wrapper's call of `lookup`; \
+              the other calls pass the file's `ENV_*` constants",
+    },
 ];
 
 /// What the scan found.
@@ -125,6 +168,10 @@ struct Measured {
     names: BTreeMap<String, BTreeSet<String>>,
     /// File -> how many reads there compute their name at run time.
     dynamic: BTreeMap<String, usize>,
+    /// File -> each registered lookup there and how often it is called.
+    lookup_calls: BTreeMap<String, BTreeMap<String, usize>>,
+    /// File -> the argument text of each computed read, for the message.
+    computed_args: BTreeMap<String, Vec<String>>,
     /// (file, argument): a constant passed as a variable name that no
     /// scanned `const` defines.
     unresolved: Vec<(String, String)>,
@@ -134,7 +181,7 @@ struct Measured {
 struct Registers<'a> {
     platform: &'a [(&'a str, &'a str)],
     test_only: &'a [(&'a str, &'a str)],
-    dynamic: &'a [(&'a str, &'a str)],
+    dynamic: &'a [DynamicReader],
 }
 
 const REGISTERS: Registers<'static> = Registers {
@@ -232,6 +279,34 @@ fn env_var_arguments(code: &str) -> Vec<&str> {
     out
 }
 
+/// The arguments of every call `name(…)` that is not a method call, a path
+/// call (`x::name(`) or the definition `fn name(`.
+fn calls_of<'c>(code: &'c str, name: &str) -> Vec<&'c str> {
+    let pat = format!("{name}(");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = code[from..].find(&pat) {
+        let start = from + at;
+        from = start + pat.len();
+        let before = &code[..start];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| is_ident_char(c) || c == '.' || c == ':')
+        {
+            continue;
+        }
+        let t = before.trim_end();
+        if t.strip_suffix("fn")
+            .is_some_and(|b| !b.chars().next_back().is_some_and(is_ident_char))
+        {
+            continue;
+        }
+        out.push(call_argument(code, from - 1));
+    }
+    out
+}
+
 /// The value of every `env = <value>` argument (`(` or `,` before `env`).
 fn env_assignments(code: &str) -> Vec<&str> {
     let mut out = Vec::new();
@@ -321,8 +396,9 @@ fn test_module_files(rel: &str, code: &str) -> Vec<String> {
     out
 }
 
-/// Scan `(repository-relative path, source)` pairs.
-fn measure(sources: &[(String, String)]) -> Measured {
+/// Scan `(repository-relative path, source)` pairs; `dynamic` names the
+/// lookups of the files that compute variable names.
+fn measure(sources: &[(String, String)], dynamic: &[DynamicReader]) -> Measured {
     let mut code: Vec<(String, String)> = sources
         .iter()
         .filter(|(rel, _)| !rel.ends_with("/build.rs") && rel != "build.rs")
@@ -370,7 +446,19 @@ fn measure(sources: &[(String, String)]) -> Measured {
     for (rel, c) in &code {
         let calls = env_var_arguments(c).into_iter().map(|a| (a, true));
         let assigns = env_assignments(c).into_iter().map(|a| (a, false));
-        for (arg, is_call) in calls.chain(assigns) {
+        let mut lookup_args = Vec::new();
+        for d in dynamic.iter().filter(|d| d.file == rel) {
+            for l in d.lookups {
+                let args = calls_of(c, l);
+                m.lookup_calls
+                    .entry(rel.clone())
+                    .or_default()
+                    .insert(l.to_string(), args.len());
+                lookup_args.extend(args);
+            }
+        }
+        let lookups = lookup_args.into_iter().map(|a| (a, true));
+        for (arg, is_call) in calls.chain(assigns).chain(lookups) {
             match classify(arg) {
                 Arg::Literal(v) => read(&mut m, &v, rel),
                 Arg::Const(k) => match literal_consts.get(&k) {
@@ -383,7 +471,13 @@ fn measure(sources: &[(String, String)]) -> Measured {
                     None => m.unresolved.push((rel.clone(), arg.trim().to_string())),
                 },
                 // `env = $env:literal` in a macro definition is not a read.
-                Arg::Dynamic if is_call => *m.dynamic.entry(rel.clone()).or_default() += 1,
+                Arg::Dynamic if is_call => {
+                    *m.dynamic.entry(rel.clone()).or_default() += 1;
+                    m.computed_args
+                        .entry(rel.clone())
+                        .or_default()
+                        .push(arg.split_whitespace().collect::<Vec<_>>().join(" "));
+                }
                 Arg::Dynamic => {}
             }
         }
@@ -453,21 +547,47 @@ fn findings(
             "{rel}: `{arg}` names a variable through a constant no scanned `const` defines"
         ));
     }
-    let registered: BTreeSet<&str> = reg.dynamic.iter().map(|(f, _)| *f).collect();
+    let none = Vec::new();
     for (rel, n) in &m.dynamic {
-        if !registered.contains(rel.as_str()) {
-            out.push(format!(
-                "{rel}: {n} environment read(s) with a name computed at run time; pass a \
-                 literal or a `const`, or list the file in DYNAMIC_READERS with where \
-                 its names come from (and make sure those are documented)"
-            ));
+        let args = m.computed_args.get(rel).unwrap_or(&none);
+        match reg.dynamic.iter().find(|d| d.file == rel) {
+            None => out.push(format!(
+                "{rel}: {n} environment read(s) with a name computed at run time \
+                 (arguments {args:?}); pass a literal or a `const`, or list the file in \
+                 DYNAMIC_READERS with its lookups and where its names come from (and \
+                 make sure those are documented)"
+            )),
+            Some(d) if d.computed != *n => out.push(format!(
+                "{rel}: {n} environment read(s) with a name computed at run time \
+                 (arguments {args:?}), but DYNAMIC_READERS pins {} ({}): a new computed \
+                 read must name a documented variable through a literal or a `const`, or \
+                 be reviewed and the pin changed",
+                d.computed, d.why
+            )),
+            Some(_) => {}
         }
     }
-    for f in &registered {
-        if !m.dynamic.contains_key(*f) {
+    for d in reg.dynamic {
+        if !m.dynamic.contains_key(d.file) {
             out.push(format!(
-                "{f} is listed in DYNAMIC_READERS but computes no variable name: remove it"
+                "{} is listed in DYNAMIC_READERS but computes no variable name: remove it",
+                d.file
             ));
+        }
+        for l in d.lookups {
+            let calls = m
+                .lookup_calls
+                .get(d.file)
+                .and_then(|c| c.get(*l))
+                .copied()
+                .unwrap_or(0);
+            if calls == 0 {
+                out.push(format!(
+                    "{}: DYNAMIC_READERS names the lookup `{l}`, which nothing there calls: \
+                     remove it",
+                    d.file
+                ));
+            }
         }
     }
     for (n, _) in reg.platform.iter().chain(reg.test_only) {
@@ -547,7 +667,7 @@ fn docs_text() -> String {
 #[test]
 fn every_environment_variable_the_code_reads_is_documented() {
     let (sources, service_docs) = tree();
-    let m = measure(&sources);
+    let m = measure(&sources, DYNAMIC_READERS);
 
     // Calibration: each kind of read was found in the real tree, so an empty
     // finding list means "documented", not "nothing was scanned".
@@ -561,6 +681,10 @@ fn every_environment_variable_the_code_reads_is_documented() {
             "an ENV_* constant behind a lookup closure",
         ),
         ("EPIGRAPH_EXPLORER_PORT", "a service's ENV_* constant"),
+        (
+            "EPIGRAPH_RATE_LIMIT_RPM",
+            "a constant passed to a registered lookup",
+        ),
     ] {
         assert!(
             m.names.contains_key(name),
@@ -594,13 +718,26 @@ const NO_REGISTERS: Registers<'static> = Registers {
     dynamic: &[],
 };
 
+fn scan(sources: &[(String, String)]) -> Measured {
+    measure(sources, &[])
+}
+
+fn reader(file: &'static str, lookups: &'static [&'static str], computed: usize) -> DynamicReader {
+    DynamicReader {
+        file,
+        lookups,
+        computed,
+        why: "why",
+    }
+}
+
 fn names(m: &Measured) -> Vec<&str> {
     m.names.keys().map(String::as_str).collect()
 }
 
 #[test]
 fn each_kind_of_read_is_found() {
-    let m = measure(&src(&[
+    let m = scan(&src(&[
         (
             "crates/a/src/lib.rs",
             r#"
@@ -645,7 +782,7 @@ fn each_kind_of_read_is_found() {
 
 #[test]
 fn test_code_and_build_scripts_are_not_production_reads() {
-    let m = measure(&src(&[
+    let m = scan(&src(&[
         (
             "crates/a/src/lib.rs",
             "#[cfg(test)]\nmod tests;\n#[cfg(test)]\nmod inline { fn t() { std::env::var(\"INLINE\"); } }\n",
@@ -661,7 +798,7 @@ fn test_code_and_build_scripts_are_not_production_reads() {
 
 #[test]
 fn an_undocumented_variable_fails_and_a_documented_one_passes() {
-    let m = measure(&src(&[(
+    let m = scan(&src(&[(
         "crates/a/src/lib.rs",
         r#"fn f() { std::env::var("EPIGRAPH_DOCUMENTED"); std::env::var("EPIGRAPH_NEW"); }"#,
     )]));
@@ -676,7 +813,7 @@ fn an_undocumented_variable_fails_and_a_documented_one_passes() {
 
 #[test]
 fn a_service_readme_documents_only_that_services_variables() {
-    let m = measure(&src(&[
+    let m = scan(&src(&[
         (
             "services/svc/src/config.rs",
             r#"const ENV_PORT: &str = "SVC_PORT"; const ENV_SHARED: &str = "SHARED";"#,
@@ -698,7 +835,7 @@ fn a_service_readme_documents_only_that_services_variables() {
 
 #[test]
 fn a_computed_name_needs_a_register_entry_and_an_unknown_constant_fails() {
-    let m = measure(&src(&[(
+    let m = scan(&src(&[(
         "crates/a/src/lib.rs",
         "fn f(k: &str) { std::env::var(k); std::env::var(other::MISSING_CONST); }",
     )]));
@@ -714,8 +851,9 @@ fn a_computed_name_needs_a_register_entry_and_an_unknown_constant_fails() {
         "{f:?}"
     );
 
+    let d = [reader("crates/a/src/lib.rs", &[], 1)];
     let reg = Registers {
-        dynamic: &[("crates/a/src/lib.rs", "why")],
+        dynamic: &d,
         ..NO_REGISTERS
     };
     let f = findings(&m, "", &BTreeMap::new(), &reg);
@@ -724,11 +862,12 @@ fn a_computed_name_needs_a_register_entry_and_an_unknown_constant_fails() {
 
 #[test]
 fn a_stale_register_entry_fails() {
-    let m = measure(&src(&[("crates/a/src/lib.rs", "fn f() {}")]));
+    let m = scan(&src(&[("crates/a/src/lib.rs", "fn f() {}")]));
+    let d = [reader("crates/a/src/lib.rs", &[], 1)];
     let reg = Registers {
         platform: &[("HOME", "why")],
         test_only: &[("A_TEST_HOOK", "why")],
-        dynamic: &[("crates/a/src/lib.rs", "why")],
+        dynamic: &d,
     };
     let f = findings(&m, "", &BTreeMap::new(), &reg);
     assert_eq!(f.len(), 3, "{f:?}");
@@ -736,7 +875,7 @@ fn a_stale_register_entry_fails() {
 
 #[test]
 fn an_allow_listed_variable_needs_no_doc() {
-    let m = measure(&src(&[(
+    let m = scan(&src(&[(
         "crates/a/src/lib.rs",
         r#"fn f() { std::env::var_os("HOME"); std::env::var("A_TEST_HOOK"); }"#,
     )]));
@@ -750,4 +889,87 @@ fn an_allow_listed_variable_needs_no_doc() {
         Vec::<String>::new()
     );
     assert_eq!(findings(&m, "", &BTreeMap::new(), &NO_REGISTERS).len(), 2);
+}
+
+/// A file with a `var` lookup closure, as `security/rate_limit.rs` has.
+const LOOKUP_FILE: &str = "crates/a/src/config.rs";
+const LOOKUP_SRC: &str = r#"
+pub const RATE_ENV: &str = "EPIGRAPH_RATE";
+const RATE_BURST: &str = "EPIGRAPH_RATE_BURST";
+fn from_env(cfg: Cfg, x: &str) {
+    let var = |name: &str| std::env::var(name).ok();
+    let _ = var(RATE_ENV);
+    let _ = var(RATE_BURST);
+    let _ = var("EPIGRAPH_RATE_WINDOW");
+    let _ = cfg.var(x);
+    let _ = other::var(x);
+}
+fn var(_: u8) {}
+"#;
+
+#[test]
+fn a_registered_lookup_is_a_reader_of_the_names_passed_to_it() {
+    let d = [reader(LOOKUP_FILE, &["var"], 1)];
+    let m = measure(&src(&[(LOOKUP_FILE, LOOKUP_SRC)]), &d);
+    // A literal and a constant (named like a variable or not) passed to the
+    // lookup are reads; the method and path calls and the definition are not.
+    assert_eq!(
+        names(&m),
+        [
+            "EPIGRAPH_RATE",
+            "EPIGRAPH_RATE_BURST",
+            "EPIGRAPH_RATE_WINDOW"
+        ]
+    );
+    assert_eq!(m.dynamic.get(LOOKUP_FILE), Some(&1), "{m:?}");
+    let reg = Registers {
+        dynamic: &d,
+        ..NO_REGISTERS
+    };
+    let f = findings(&m, "EPIGRAPH_RATE", &BTreeMap::new(), &reg);
+    assert_eq!(f.len(), 2, "{f:?}");
+    assert!(f[0].starts_with("EPIGRAPH_RATE_BURST "), "{f:?}");
+    assert!(f[1].starts_with("EPIGRAPH_RATE_WINDOW "), "{f:?}");
+    let docs = "EPIGRAPH_RATE EPIGRAPH_RATE_BURST EPIGRAPH_RATE_WINDOW";
+    assert_eq!(
+        findings(&m, docs, &BTreeMap::new(), &reg),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn a_new_computed_read_in_a_registered_file_breaks_its_pin() {
+    let docs = "EPIGRAPH_RATE EPIGRAPH_RATE_BURST EPIGRAPH_RATE_WINDOW";
+    // A name from elsewhere through the existing lookup, and a second
+    // lookup closure: each is one more computed read than the pin.
+    for added in [
+        "fn g(k: &str) { let _ = var(k); }",
+        "fn g() { let fetch = |k: &str| std::env::var(k).ok(); }",
+    ] {
+        let file = format!("{LOOKUP_SRC}\n{added}");
+        let d = [reader(LOOKUP_FILE, &["var"], 1)];
+        let m = measure(&src(&[(LOOKUP_FILE, &file)]), &d);
+        let reg = Registers {
+            dynamic: &d,
+            ..NO_REGISTERS
+        };
+        let f = findings(&m, docs, &BTreeMap::new(), &reg);
+        assert_eq!(f.len(), 1, "{added}: {f:?}");
+        assert!(f[0].contains("2 environment read(s)"), "{f:?}");
+        assert!(f[0].contains("pins 1"), "{f:?}");
+    }
+}
+
+#[test]
+fn a_registered_lookup_nothing_calls_is_stale() {
+    let d = [reader(LOOKUP_FILE, &["var", "get"], 1)];
+    let m = measure(&src(&[(LOOKUP_FILE, LOOKUP_SRC)]), &d);
+    let reg = Registers {
+        dynamic: &d,
+        ..NO_REGISTERS
+    };
+    let docs = "EPIGRAPH_RATE EPIGRAPH_RATE_BURST EPIGRAPH_RATE_WINDOW";
+    let f = findings(&m, docs, &BTreeMap::new(), &reg);
+    assert_eq!(f.len(), 1, "{f:?}");
+    assert!(f[0].contains("the lookup `get`"), "{f:?}");
 }
