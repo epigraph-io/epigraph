@@ -35,6 +35,7 @@
 //! security beneath, the edge splice in the statement), never a map's.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
@@ -444,9 +445,12 @@ impl AtlasServeRepository {
     ///   three;
     /// * it is in force (`valid_to` unset or in the future, as on every edge
     ///   read);
-    /// * each end matches a node of `nodes` by id AND kind
+    /// * each end matches a claim or evidence node of `nodes` by id AND kind
     ///   (`source_type`/`target_type`), so an id is never matched against a
-    ///   row of another kind;
+    ///   row of another kind. Agent nodes are not looked up: an agent edge
+    ///   carries no flow, the trigger never co-owns one (an agent meets as
+    ///   public), and a high-volume agent's edge list is the costly part of
+    ///   such a join;
     /// * the viewer's session reads it: the edge splice, with row security
     ///   beneath on the caller's stamped connection, admits a co-owned row
     ///   only to a session in both of its groups.
@@ -459,19 +463,57 @@ impl AtlasServeRepository {
     /// `team`'s) and by the viewer's session. So an overlay edge is weighed
     /// as the nightly weighs a leaf edge of that map, and one edge weighs the
     /// same for every viewer who gets it. No claim or belief column is read.
-    /// One statement, two with mass rows, whatever the leaf's size.
+    ///
+    /// Bounded and best-effort: both statements run in a nested transaction
+    /// (a savepoint inside the caller's transaction, a transaction on a
+    /// session-stamped connection) under a local `statement_timeout` of
+    /// `timeout`, and that nested transaction is always rolled back (it only
+    /// reads), which also ends the timeout. An error, a timeout included,
+    /// therefore leaves `conn` usable for the caller's remaining work.
     ///
     /// # Errors
-    /// `DbError::QueryFailed` if a statement fails.
+    /// `DbError::QueryFailed` if a statement fails or times out, with `conn`
+    /// rolled back to where it was.
     pub async fn co_owned_leaf_edges(
         conn: &mut PgConnection,
         viewer: &Viewer,
         team: Uuid,
         nodes: &[LeafNode],
+        timeout: Duration,
     ) -> Result<CoOwnedLeafEdges, DbError> {
+        let nodes: Vec<LeafNode> = nodes
+            .iter()
+            .copied()
+            .filter(|n| n.kind != LeafNodeKind::Agent)
+            .collect();
         if nodes.len() < 2 {
             return Ok(CoOwnedLeafEdges::empty());
         }
+        let mut sp = sqlx::Acquire::begin(&mut *conn).await?;
+        let ms = timeout.as_millis().max(1);
+        let read = match sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{ms}ms"))
+            .execute(&mut *sp)
+            .await
+        {
+            Ok(_) => Self::read_co_owned_leaf_edges(&mut sp, viewer, team, &nodes).await,
+            Err(e) => Err(e.into()),
+        };
+        // Read-only: never kept. The rollback also ends the local timeout.
+        let rolled_back = sp.rollback().await;
+        let out = read?;
+        rolled_back?;
+        Ok(out)
+    }
+
+    /// The two statements of [`Self::co_owned_leaf_edges`], on its nested
+    /// transaction. `nodes` holds no agent and at least two nodes.
+    async fn read_co_owned_leaf_edges(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        team: Uuid,
+        nodes: &[LeafNode],
+    ) -> Result<CoOwnedLeafEdges, DbError> {
         let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
         let sql = viewer.splice(

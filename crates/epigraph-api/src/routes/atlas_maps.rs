@@ -37,7 +37,9 @@
 //!   A member of one of the two teams gets the leaf as before. The public map,
 //!   group levels and `outgoing` are unchanged, and so is an edge whose two
 //!   ends no single map draws (a claim of each team): the overlay adds edges,
-//!   never nodes.
+//!   never nodes. The overlay is best-effort: bounded by
+//!   [`CO_OWNED_OVERLAY_TIMEOUT`], and a failed or refused overlay is logged
+//!   and the leaf served without it.
 //! * **Staleness.** A run is served while nothing LEFT its map's readable set
 //!   since the build (`nothing_left`), even when something arrived (`current`
 //!   false: the map is only incomplete until the next nightly). A run where a
@@ -62,6 +64,7 @@
 //! All SQL lives in `epigraph_db::{AtlasMapRepository, AtlasServeRepository}`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
@@ -464,7 +467,7 @@ pub async fn atlas_level(
         .await
         .map_err(|e| scoped_read_failed(e, "atlas_level"))?;
     let served = match served_level(&mut read, &viewer, map, hierarchy, id).await? {
-        Some((_, doc)) => Some(with_co_owned_edges(&mut read, &viewer, map, doc).await?),
+        Some((_, doc)) => Some(with_co_owned_edges(&mut read, &viewer, map, doc).await),
         None => None,
     };
     crate::routes::finish_scoped_read(read, "atlas_level").await?;
@@ -474,19 +477,27 @@ pub async fn atlas_level(
     }
 }
 
+/// How long the co-owned overlay's statements may run on one level request
+/// before the leaf is served without it (module documentation, "The
+/// co-owned overlay"). Well inside the leaf's latency budget; the overlay
+/// read is two indexed statements.
+pub const CO_OWNED_OVERLAY_TIMEOUT: Duration = Duration::from_millis(200);
+
 /// A served leaf of team `T`'s map with the co-owned edges the viewer's own
 /// session reads drawn on top (see the module documentation, "The co-owned
-/// overlay"). Any other document is returned as it is. An overlay that would
-/// make the document invalid is a fault: logged, and the leaf is served
-/// without it.
+/// overlay"). Any other document is returned as it is. The overlay never
+/// fails the request: a read error or timeout (which leaves the caller's
+/// connection usable; see `AtlasServeRepository::co_owned_leaf_edges`) or an
+/// overlay that would make the document invalid is logged, and the leaf is
+/// served without it.
 async fn with_co_owned_edges(
     conn: &mut PgConnection,
     viewer: &Viewer,
     map: AtlasMap,
     doc: LevelDocument,
-) -> Result<LevelDocument, ApiError> {
+) -> LevelDocument {
     let (AtlasMap::Team(team), LevelDocument::Leaf(leaf)) = (map, &doc) else {
-        return Ok(doc);
+        return doc;
     };
     let nodes: Vec<LeafNode> = leaf
         .nodes
@@ -497,9 +508,28 @@ async fn with_co_owned_edges(
             Node::Evidence(e) => LeafNode::evidence(e.id),
         })
         .collect();
-    let found = AtlasServeRepository::co_owned_leaf_edges(conn, viewer, team, &nodes).await?;
+    let found = match AtlasServeRepository::co_owned_leaf_edges(
+        conn,
+        viewer,
+        team,
+        &nodes,
+        CO_OWNED_OVERLAY_TIMEOUT,
+    )
+    .await
+    {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(
+                target: "atlas.serve",
+                level_id = %doc.level_id(),
+                error = %e,
+                "co-owned overlay read failed; serving the leaf without it"
+            );
+            return doc;
+        }
+    };
     if found.set.edges.is_empty() {
-        return Ok(doc);
+        return doc;
     }
     let extra = weigh_leaf_edges(&found.set, &found.inputs);
     let (merged, added, over_cap) = doc.with_viewer_edges(&extra);
@@ -512,10 +542,10 @@ async fn with_co_owned_edges(
         );
     }
     if added == 0 {
-        return Ok(doc);
+        return doc;
     }
     match merged.validate() {
-        Ok(()) => Ok(merged),
+        Ok(()) => merged,
         Err(v) => {
             tracing::error!(
                 target: "atlas.serve",
@@ -523,7 +553,7 @@ async fn with_co_owned_edges(
                 reason = %v,
                 "co-owned overlay refused; serving the leaf without it"
             );
-            Ok(doc)
+            doc
         }
     }
 }

@@ -58,9 +58,16 @@ use uuid::Uuid;
 /// on the superuser DSN `#[sqlx::test]` hands out, where no policy is
 /// evaluated.)
 async fn router(pool: &PgPool) -> Router {
+    router_in(pool, SessionGucMode::Session).await
+}
+
+/// [`router`] with the viewer stamp applied in `mode`: `Session` (the
+/// server's default) or `Transaction` (its transaction-pooler fallback, where
+/// every read is one transaction).
+async fn router_in(pool: &PgPool, mode: SessionGucMode) -> Router {
     let scoped = ScopedPool::connect_downgraded_for_tests(
         &fixture::database_url_for(pool).await,
-        SessionGucMode::Session,
+        mode,
         "epigraph_app",
     )
     .await
@@ -1673,7 +1680,8 @@ async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) 
 /// - a member of A alone gets none (the edge splice);
 /// - a member of all three does not get B and C's edge on A's map (the team
 ///   clause), and nobody gets the retracted edge (the in-force clause);
-/// - an end matched by id under another kind is no match.
+/// - an end matched by id under another kind is no match;
+/// - an agent node is not looked up, even for a co-owned edge at it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
     use epigraph_db::repos::atlas_leaf::LeafNode;
@@ -1700,9 +1708,15 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
         nodes: &[LeafNode],
     ) -> (Vec<Uuid>, usize) {
         let viewer = Viewer::resolve(pool, who).await.expect("a viewer");
-        let got = AtlasServeRepository::co_owned_leaf_edges(conn, &viewer, team, nodes)
-            .await
-            .expect("the overlay read");
+        let got = AtlasServeRepository::co_owned_leaf_edges(
+            conn,
+            &viewer,
+            team,
+            nodes,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .expect("the overlay read");
         let mut ids: Vec<Uuid> = got
             .set
             .edges
@@ -1736,13 +1750,17 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
         "A alone reads no co-owned edge"
     );
     let (tri_a, tri_mass) = ids(&mut conn, &pool, o.tri, o.a, &nodes).await;
-    assert_eq!((tri_a, tri_mass), (want, 1), "A, B and C on A's map");
+    assert_eq!(
+        (tri_a, tri_mass),
+        (want.clone(), 1),
+        "A, B and C on A's map"
+    );
     let (tri_b, _) = ids(&mut conn, &pool, o.tri, o.b, &nodes).await;
     assert!(tri_b.contains(&o.co_bc), "B and C's edge is on B's map");
     assert!(!tri_b.contains(&o.gone), "the retracted edge is never read");
-    // P1 named as an agent: no edge at P1 matches.
+    // P1 named as evidence: no edge at P1 matches.
     let wrong_kind = vec![
-        LeafNode::agent(o.p1),
+        LeafNode::evidence(o.p1),
         LeafNode::claim(o.p2),
         LeafNode::evidence(o.ev1),
         LeafNode::evidence(o.ev2),
@@ -1752,4 +1770,115 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
         (vec![o.ev2e], 0),
         "an id under another kind is no match"
     );
+    // A co-owned edge at an agent node (stamped as an operator narrowing
+    // would leave one): agents are not looked up.
+    let at_agent = insert_edge(
+        &pool,
+        ("agent", o.ma),
+        ("claim", o.p1),
+        "authored",
+        serde_json::json!({}),
+    )
+    .await;
+    force_co_owned(&pool, at_agent, o.a, o.b).await;
+    let mut with_agent = nodes.clone();
+    with_agent.push(LeafNode::agent(o.ma));
+    let (got, _) = ids(&mut conn, &pool, o.dual, o.a, &with_agent).await;
+    assert_eq!(got, want, "an agent node is not looked up");
+}
+
+/// The overlay never fails a leaf (review of backlog ff3b6046): with `edges`
+/// locked by another session, the overlay's statement times out under its
+/// own bound, its nested transaction is rolled back, and a member of both
+/// teams is served the stored leaf promptly, on a connection still usable to
+/// finish the read. Both stamp modes: on a session-stamped connection the
+/// nested transaction is what carries the local timeout, and in a
+/// transaction-stamped read it is the savepoint that keeps the read's own
+/// transaction from aborting. Once the lock is gone the same request draws
+/// the co-owned edges again (the control: the lock is what left them out).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_co_owned_overlay_serves_the_stored_leaf(pool: PgPool) {
+    let o = Overlay::seed(&pool).await;
+    let a = AtlasMap::Team(o.a);
+    for mode in [SessionGucMode::Session, SessionGucMode::Transaction] {
+        let r = router_in(&pool, mode).await;
+        let mut locker = pool.begin().await.expect("begin the locker");
+        sqlx::query("LOCK TABLE edges IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *locker)
+            .await
+            .expect("lock edges");
+        let started = std::time::Instant::now();
+        let held = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            served_edges(&r, &o, a, o.la, o.dual),
+        )
+        .await;
+        let took = started.elapsed();
+        locker.rollback().await.expect("release the lock");
+        let held = held
+            .unwrap_or_else(|_| panic!("{mode:?}: the leaf is held behind the lock, not served"));
+        assert_eq!(
+            held,
+            vec![],
+            "{mode:?}: the stored leaf, without the overlay"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "{mode:?}: the overlay is bounded, took {took:?}"
+        );
+
+        let freed = served_edges(&r, &o, a, o.la, o.dual).await;
+        assert!(
+            freed.len() == 4,
+            "{mode:?}: without the lock the overlay draws A's co-owned edges again: {freed:?}"
+        );
+    }
+}
+
+/// `AtlasServeRepository::co_owned_leaf_edges` leaves the caller's
+/// transaction as it found it (review of backlog ff3b6046): its local
+/// `statement_timeout` ends with its nested transaction, on success and on
+/// failure, and a statement that times out (here behind a lock on `edges`
+/// held by another session) is an `Err` with the caller's transaction still
+/// usable, not aborted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn co_owned_leaf_edges_leaves_the_callers_transaction_as_it_was(pool: PgPool) {
+    use epigraph_db::repos::atlas_leaf::LeafNode;
+    let o = Overlay::seed(&pool).await;
+    let viewer = Viewer::resolve(&pool, o.dual).await.expect("a viewer");
+    let nodes = vec![LeafNode::claim(o.p1), LeafNode::claim(o.p2)];
+    let bound = std::time::Duration::from_millis(150);
+    let mut tx = pool.begin().await.expect("the caller's transaction");
+    async fn timeout_of(tx: &mut sqlx::PgConnection) -> String {
+        sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(tx)
+            .await
+            .expect("the transaction is usable")
+    }
+    let before = timeout_of(&mut tx).await;
+    assert_ne!(before, "150ms", "calibration: the bound is not the default");
+
+    let got = AtlasServeRepository::co_owned_leaf_edges(&mut tx, &viewer, o.a, &nodes, bound)
+        .await
+        .expect("the overlay read");
+    assert_eq!(got.set.edges.len(), 2, "calibration: co_ab and co_ba");
+    assert_eq!(timeout_of(&mut tx).await, before, "after a read");
+
+    let mut locker = pool.begin().await.expect("begin the locker");
+    sqlx::query("LOCK TABLE edges IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *locker)
+        .await
+        .expect("lock edges");
+    let failed = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        AtlasServeRepository::co_owned_leaf_edges(&mut tx, &viewer, o.a, &nodes, bound),
+    )
+    .await;
+    locker.rollback().await.expect("release the lock");
+    let failed = failed.expect("the overlay read is bounded, not held behind the lock");
+    assert!(failed.is_err(), "a timed-out read is an error");
+    assert_eq!(timeout_of(&mut tx).await, before, "after a failed read");
+    tx.rollback()
+        .await
+        .expect("roll back the caller's transaction");
 }
