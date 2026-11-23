@@ -1544,11 +1544,24 @@ async fn require_privileged_session(
 /// canonical, and stays marked: its un-mark follows the supersession (or
 /// merge) to the current canonical and restores the duplicate against that one
 /// (operator ruling R-11, [`ClaimRepository::unmark_chain_conn`]).
+///
+/// `chain` is the recorded replacement first, then each claim that replaced it
+/// in turn ([`ClaimRepository::migrate_superseded_edges_to_head_conn`]); the
+/// edges move onto its LAST claim, the current head. The supersession's own
+/// rules (the step-lineage classification) read the recorded pair, and an edge
+/// between the retired claim and any claim of the chain is left where it is,
+/// as the self-loop guard leaves one with the replacement. Every other caller
+/// passes `&[new]`.
 async fn migrate_superseded_edges(
     conn: &mut sqlx::PgConnection,
     old_uuid: Uuid,
-    new_uuid: Uuid,
+    chain: &[Uuid],
 ) -> Result<SupersedeEdgeMigration, DbError> {
+    let (Some(&new_uuid), Some(&onto)) = (chain.first(), chain.last()) else {
+        return Err(DbError::InvalidData {
+            reason: format!("no replacement named for {old_uuid}; refusing to migrate its edges"),
+        });
+    };
     let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -1604,10 +1617,10 @@ async fn migrate_superseded_edges(
         .collect();
 
     // Migrate incoming edges: redirect edges pointing TO old claim to point
-    // to new claim. `NOT (source_type = 'claim' AND source_id = $1)` is
+    // to new claim. `NOT (source_type = 'claim' AND source_id = ANY($10))` is
     // mark_duplicate's self-loop guard, carried over so the two replacement
-    // paths share one rule; see the doc comment for the one shape that
-    // reaches it here.
+    // paths share one rule (over the whole chain: see the doc comment); see
+    // the doc comment for the one shape that reaches it here.
     let retargeted: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE edges SET target_id = $1 \
          WHERE target_id = $2 AND target_type = 'claim' \
@@ -1617,12 +1630,12 @@ async fn migrate_superseded_edges(
            AND NOT (relationship = ANY($4)) \
            AND NOT (source_type = 'agent' AND relationship = ANY($5)) \
            AND NOT COALESCE(properties->>$7 = ANY($6), false) \
-           AND NOT (source_type = 'claim' AND source_id = $1) \
+           AND NOT (source_type = 'claim' AND source_id = ANY($10)) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
            AND NOT (properties ? $8 OR labels @> ARRAY[$9]::text[]) \
          RETURNING id",
     )
-    .bind(new_uuid)
+    .bind(onto)
     .bind(old_uuid)
     .bind(&weakening)
     .bind(&frozen)
@@ -1631,6 +1644,7 @@ async fn migrate_superseded_edges(
     .bind(SUPERSEDE_ACT_PROPERTY)
     .bind(INGEST_WRITTEN_FROZEN)
     .bind(INGEST_WRITTEN_FROZEN_LABEL)
+    .bind(chain)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -1642,14 +1656,15 @@ async fn migrate_superseded_edges(
            AND lower(relationship) <> 'supersedes' \
            AND NOT (relationship = ANY($3)) \
            AND NOT (relationship = ANY($4)) \
-           AND NOT (target_type = 'claim' AND target_id = $1) \
+           AND NOT (target_type = 'claim' AND target_id = ANY($5)) \
            AND NOT (relationship = 'same_as' AND properties ? 'dedup') \
          RETURNING id",
     )
-    .bind(new_uuid)
+    .bind(onto)
     .bind(old_uuid)
     .bind(&weakening)
     .bind(&frozen)
+    .bind(chain)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -7558,7 +7573,7 @@ impl ClaimRepository {
             actor,
         )
         .await?;
-        migrate_superseded_edges(&mut *conn, old_uuid, new_uuid).await?;
+        migrate_superseded_edges(&mut *conn, old_uuid, &[new_uuid]).await?;
         Ok((new_uuid, old_uuid))
     }
 
@@ -7786,9 +7801,86 @@ impl ClaimRepository {
                 })
             }
         }
-        let migration = migrate_superseded_edges(&mut tx, old_id, new_id).await?;
+        let migration = migrate_superseded_edges(&mut tx, old_id, &[new_id]).await?;
         tx.commit().await?;
         Ok(migration)
+    }
+
+    /// [`Self::migrate_superseded_edges_conn`] for the administrative cascade
+    /// (`epigraph_engine::admin_cascade::apply_after_supersede`, live and
+    /// replayed): the edges move onto the CURRENT head of the supersedes chain
+    /// that starts at `new_id`, not onto `new_id` itself. Returns the migration
+    /// and that chain: `new_id`, then each claim that replaced it in turn,
+    /// ending with the head (`[new_id]` while `new_id` is current).
+    ///
+    /// A deferred cascade can be replayed after its recorded successor was
+    /// itself superseded (a group writer revising a group-owned custodial
+    /// successor before the replay, or a failed deferral overtaken): moved onto
+    /// the retired successor, the predecessor's edges would stay on a claim
+    /// that traversal and belief from the live head never reach (backlog
+    /// 6a670eab). The chain is read through `viewer` (the maintenance
+    /// session's bypass viewer) by the un-mark's own walk, with every claim of
+    /// it held `FOR SHARE` until this transaction ends, so the head cannot be
+    /// retired while the edges move onto it. Refused, with nothing moved, when
+    /// there is no single current head: a claim of the chain was marked a
+    /// duplicate, retired with no replacement, or replaced twice.
+    ///
+    /// # Errors
+    /// As [`Self::migrate_superseded_edges_conn`], and `DbError::InvalidData`
+    /// when the chain has no single current head.
+    pub async fn migrate_superseded_edges_to_head_conn(
+        conn: &mut sqlx::PgConnection,
+        viewer: &crate::visibility::Viewer,
+        old_id: Uuid,
+        new_id: Uuid,
+    ) -> Result<(SupersedeEdgeMigration, Vec<Uuid>), DbError> {
+        use sqlx::Acquire;
+        require_privileged_session(
+            &mut *conn,
+            "migrate_superseded_edges_to_head_conn (it re-points other writers' edges)",
+        )
+        .await?;
+        let mut tx = conn.begin().await?;
+        // The act's verification, as `migrate_superseded_edges_conn` reads it,
+        // through `viewer` like the chain walk below (the bypass viewer's
+        // fragments are empty).
+        let sql = viewer.splice(
+            "SELECT n.supersedes, COALESCE(o.is_current, true) \
+               FROM claims n LEFT JOIN claims o ON o.id = $2 /* {VISIBILITY:o} */ \
+              WHERE n.id = $1 /* {VISIBILITY:n} */",
+            3,
+        );
+        let mut q = sqlx::query_as::<_, (Option<Uuid>, bool)>(&sql)
+            .bind(new_id)
+            .bind(old_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        match q.fetch_optional(&mut *tx).await? {
+            Some((Some(sup), false)) if sup == old_id => {}
+            _ => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "claim {new_id} does not supersede a retired claim {old_id}; \
+                         refusing to migrate its edges"
+                    ),
+                })
+            }
+        }
+        let chain = match canonical_chain(&mut tx, viewer, new_id, ChainLock::ForShare).await? {
+            Ok(chain) => chain,
+            Err(why) => {
+                return Err(DbError::InvalidData {
+                    reason: format!(
+                        "claim {old_id} was replaced by {new_id}, whose supersedes chain has \
+                         no single current head ({why}); refusing to migrate its edges"
+                    ),
+                })
+            }
+        };
+        let migration = migrate_superseded_edges(&mut tx, old_id, &chain).await?;
+        tx.commit().await?;
+        Ok((migration, chain))
     }
 
     // ============================================================

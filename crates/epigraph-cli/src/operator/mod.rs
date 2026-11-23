@@ -243,6 +243,19 @@ impl OperatorDb {
     pub const fn pool(&self) -> &sqlx::PgPool {
         self.scoped.inner()
     }
+
+    /// One connection of this pool with its bypass viewer, as one
+    /// [`epigraph_db::MaintenanceSession`]: for a verb that needs a viewer
+    /// (`custodial-supersede` stores its successor's embedding through one).
+    ///
+    /// # Errors
+    /// The connection cannot be acquired.
+    pub async fn session(
+        &self,
+        reason: epigraph_db::visibility::SystemReason,
+    ) -> anyhow::Result<epigraph_db::MaintenanceSession<'_>> {
+        Ok(self.scoped.maintenance_session(reason).await?)
+    }
 }
 
 /// Connect on [`DSN_ENV`] and refuse a non-maintenance role.

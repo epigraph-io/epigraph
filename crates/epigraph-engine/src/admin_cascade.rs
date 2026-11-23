@@ -784,9 +784,11 @@ fn applied(
 }
 
 /// The supersede cascade: migrate the retired claim's edges onto the
-/// replacement and mint the moved edges' BP factors (with its audit row,
-/// atomically), then invalidate and re-derive the BBAs frozen from its
-/// interval ([`cascade_after_supersede`]).
+/// replacement (the current head of its supersedes chain, should the
+/// replacement have been superseded since:
+/// [`ClaimRepository::migrate_superseded_edges_to_head_conn`]) and mint the
+/// moved edges' BP factors (with its audit row, atomically), then invalidate
+/// and re-derive the BBAs frozen from its interval ([`cascade_after_supersede`]).
 ///
 /// `admin` must be the maintenance connection and `admin_viewer` its bypass
 /// viewer (`MaintenanceSession::split`): the cascade walks downstream claims of
@@ -805,24 +807,44 @@ pub async fn apply_after_supersede(
     // commit together with the applied row: the retirement deleted the
     // predecessor's factors, and the INSERT-only factor trigger never sees the
     // migration's re-points.
+    //
+    // The edges go to the CURRENT head of `new_id`'s supersedes chain (backlog
+    // 6a670eab): a replayed deferral's successor may have been superseded since
+    // it was recorded. The factors and the belief cascade key on that head.
+    // When the chain was followed, the claims after `new_id` are listed under
+    // `superseded_onto` (the applied row carries their count, its ids row the
+    // claims, the head last): they are other writers' claims.
     let repaired = repair_with_audit!(
         admin,
         trigger,
         |tx| async {
-            let m = ClaimRepository::migrate_superseded_edges_conn(&mut tx, old_id, new_id).await?;
+            let (m, chain) = ClaimRepository::migrate_superseded_edges_to_head_conn(
+                &mut tx,
+                admin_viewer,
+                old_id,
+                new_id,
+            )
+            .await?;
+            let head = chain.last().copied().unwrap_or(new_id);
             let moved: Vec<Uuid> = m.retargeted.iter().chain(&m.resourced).copied().collect();
             let slots =
-                ClaimRepository::regenerate_superseded_edge_factors_conn(&mut tx, new_id, &moved)
+                ClaimRepository::regenerate_superseded_edge_factors_conn(&mut tx, head, &moved)
                     .await?;
-            Ok::<_, DbError>((m, slots))
+            Ok::<_, DbError>((m, slots, chain))
         },
-        |m| serde_json::json!({
-            "edges_retargeted": m.0.retargeted,
-            "edges_resourced": m.0.resourced,
-            "factors_minted": m.1,
-        })
+        |m| {
+            let mut touched = serde_json::json!({
+                "edges_retargeted": m.0.retargeted,
+                "edges_resourced": m.0.resourced,
+                "factors_minted": m.1,
+            });
+            if m.2.len() > 1 {
+                touched["superseded_onto"] = serde_json::json!(&m.2[1..]);
+            }
+            touched
+        }
     );
-    let (_, applied_id, touched) = match repaired {
+    let ((_, _, chain), applied_id, touched) = match repaired {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -831,7 +853,8 @@ pub async fn apply_after_supersede(
             )
         }
     };
-    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, new_id).await;
+    let head = chain.last().copied().unwrap_or(new_id);
+    let report = cascade_after_supersede(&mut *admin, admin_viewer, old_id, head).await;
     let belief = record_belief(admin, trigger, applied_id, &report).await;
     let status = applied(applied_id, &touched, Some((&report, belief)));
     (status, report_for_caller(admin, caller, &report).await)

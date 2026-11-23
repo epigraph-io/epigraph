@@ -1860,12 +1860,22 @@ async fn main_inner() -> anyhow::Result<i32> {
                 act,
                 apply,
             };
-            match custodian::custodial_supersede(&mut conn, &req).await? {
+            // The act and the successor's embedding run on one maintenance
+            // session: the embedding is stored through its bypass viewer.
+            // The verb's plain connection is returned first, so the session
+            // is the only one this verb holds (the pool allows two).
+            drop(conn);
+            let mut session = db
+                .session(epigraph_db::visibility::SystemReason::EmbeddingBackfill)
+                .await?;
+            let (mconn, viewer) = session.split();
+            let embedder = epigraph_cli::embedding_service();
+            match custodian::custodial_supersede(mconn, viewer, embedder.as_deref(), &req).await? {
                 custodian::SupersedeOutcome::Done(r) => {
                     println!(
                         "{}SUPERSEDED\told={}\tnew={}\tauthor={}\towner={}\t\
                          cascade_deferral={}\tcustodial_act={}\tassignment={assignment}\t\
-                         actor={actor}{}",
+                         actor={actor}{}\tembedded={}",
                         if r.applied { "" } else { "WOULD BE " },
                         r.old,
                         r.new,
@@ -1874,17 +1884,21 @@ async fn main_inner() -> anyhow::Result<i32> {
                         r.cascade_deferral,
                         r.act_event,
                         r.admin_act
-                            .map_or_else(String::new, |a| format!("\tact={a}"))
+                            .map_or_else(String::new, |a| format!("\tact={a}")),
+                        r.embedded
                     );
                     if r.applied {
                         println!(
                             "NOTE: the edge migration and the belief cascade run from the \
                              cascade deferral, in the next replay_deferred_cascades run."
                         );
-                        println!(
-                            "NOTE: the successor has no embedding until the next embedding \
-                             backfill; it is a live_missing row until then."
-                        );
+                        if !r.embedded {
+                            println!(
+                                "NOTE: the successor was not embedded (no OPENAI_API_KEY, or the \
+                                 provider failed); it is a live_missing row until the next \
+                                 embedding backfill."
+                            );
+                        }
                     } else {
                         println!(
                             "DRY RUN: the supersede, its cascade deferral and its audit row were \

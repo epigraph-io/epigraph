@@ -46,6 +46,14 @@
 //! attributes it to the named actor; the act record names the deferral
 //! (`cascade_deferral_event_id`).
 //!
+//! Once the act has committed (`--apply` only), the successor is embedded,
+//! best-effort, on the same maintenance session through its bypass viewer
+//! (`store_embedding_if_unsealed`, as `unmark_duplicate` re-embeds a restored
+//! claim): the retirement nulled the predecessor's vector, so without it the
+//! live claim is invisible to recall until a backfill runs (backlog 5fd3e2b4).
+//! With no embedder configured, or a provider failure, the report says
+//! `embedded: false` and the backfill fills it later; the act stands.
+//!
 //! # `--act`: executing a confirmed admin act (migration 130)
 //!
 //! Once the acting custodian holds a live passkey (the grantor of a grant;
@@ -61,6 +69,7 @@
 //! write commits (a dry run rolls the consumption back with the write).
 
 use chrono::{DateTime, Utc};
+use epigraph_db::visibility::Viewer;
 use epigraph_db::{admin_act, AdminActRepository, RoleAssignmentRepository, RoleAssignmentRow};
 use serde_json::json;
 use sqlx::PgConnection;
@@ -331,6 +340,10 @@ pub struct SupersedeReport {
     /// The admin act the supersede executed, when one was named.
     pub admin_act: Option<Uuid>,
     pub applied: bool,
+    /// Whether the committed successor was embedded (never on a dry run).
+    /// `false` when no embedder is configured or the provider or the store
+    /// failed: the embedding backfill fills it later.
+    pub embedded: bool,
 }
 
 /// The three outcomes, mapped to the binary's exit codes 0 / 1 / 2.
@@ -346,6 +359,11 @@ pub enum SupersedeOutcome {
 
 /// Run one custodial supersede (module docs).
 ///
+/// `conn` and `viewer` are one maintenance session's halves
+/// (`MaintenanceSession::split`): the act runs on `conn`, and the committed
+/// successor's embedding is stored through `viewer` with `embedder`, when one
+/// is configured.
+///
 /// # Errors
 /// A statement failed or the database refused (CUS04 for an assignment that
 /// is not a live custodian assignment of `actor`, OPL0x from the binding
@@ -353,6 +371,8 @@ pub enum SupersedeOutcome {
 /// and nothing is written.
 pub async fn custodial_supersede(
     conn: &mut PgConnection,
+    viewer: &Viewer,
+    embedder: Option<&dyn epigraph_embeddings::EmbeddingService>,
     req: &SupersedeRequest,
 ) -> anyhow::Result<SupersedeOutcome> {
     use epigraph_core::{ClaimId, TruthValue};
@@ -533,11 +553,13 @@ pub async fn custodial_supersede(
             .await?
         }
     };
-    if req.apply {
+    let embedded = if req.apply {
         tx.commit().await?;
+        embed_successor(conn, viewer, embedder, new, &req.content).await
     } else {
         tx.rollback().await?;
-    }
+        false
+    };
     Ok(SupersedeOutcome::Done(SupersedeReport {
         old: old_id,
         new,
@@ -547,5 +569,42 @@ pub async fn custodial_supersede(
         act_event,
         admin_act: req.act,
         applied: req.apply,
+        embedded,
     }))
+}
+
+/// Embed a committed custodial successor, best-effort: `true` when stored;
+/// `false` with no embedder, or when the provider or the store failed, or the
+/// successor is no longer current or was sealed since (logged, never fatal:
+/// the act has committed).
+async fn embed_successor(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    embedder: Option<&dyn epigraph_embeddings::EmbeddingService>,
+    successor: Uuid,
+    content: &str,
+) -> bool {
+    let Some(embedder) = embedder else {
+        return false;
+    };
+    match embedder.generate(content).await {
+        Ok(v) => {
+            let pgvec = epigraph_db::pgvector_literal(&v);
+            match epigraph_db::ClaimRepository::store_embedding_if_unsealed(
+                conn, viewer, successor, &pgvec,
+            )
+            .await
+            {
+                Ok(stored) => stored,
+                Err(e) => {
+                    tracing::warn!(claim = %successor, error = %e, "custodial supersede: embedding not stored");
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(claim = %successor, error = %e, "custodial supersede: embedding failed");
+            false
+        }
+    }
 }
