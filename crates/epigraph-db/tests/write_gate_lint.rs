@@ -174,7 +174,7 @@ const UNGATED_REPO_WRITES: &[(&str, &str)] = &[
     ("claim.rs::update_trace_id_conn", "caller-supplied id"),
     ("claim.rs::update_truth_value_conn", "caller-supplied id"),
     ("edge.rs::retract", "caller-supplied id"),
-    ("frame.rs::set_property", "caller-supplied id"),
+    ("frame.rs::write_property", "caller-supplied id"),
     ("perspective.rs::set_reliability_map", "caller-supplied id"),
     ("semantic_link.rs::retract", "caller-supplied ids"),
     // ── derived-row writes keyed on a claim the caller named ────────────────

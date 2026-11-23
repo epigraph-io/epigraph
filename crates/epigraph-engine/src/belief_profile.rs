@@ -46,6 +46,10 @@
 //! removes a map entry. An override that names an unknown parameter, has the
 //! wrong type, or carries a number outside its range is REJECTED as a whole
 //! tier (with a warning) and the tier below stands; it never fails a read.
+//! The same check runs when a frame's object is WRITTEN
+//! ([`set_frame_overrides`]), which refuses it; the repo layer's generic
+//! frame-property setter refuses the key altogether. A perspective's object
+//! has no write path in code (only the fixed reliability maps do).
 //!
 //! # Where it applies
 //!
@@ -80,8 +84,10 @@ use crate::edge_factor::PerspectiveReliability;
 pub const DEFAULT_PROFILE_NAME: &str = "opinionated-v1";
 
 /// Key of the override object in `frames.properties` and
-/// `perspectives.properties`.
-pub const PROFILE_PROPERTY_KEY: &str = "belief_profile";
+/// `perspectives.properties`. The repo layer's generic frame-property setter
+/// refuses this key ([`epigraph_db::FrameRepository::BELIEF_PROFILE_KEY`]);
+/// [`set_frame_overrides`] is the validated write.
+pub const PROFILE_PROPERTY_KEY: &str = epigraph_db::FrameRepository::BELIEF_PROFILE_KEY;
 
 /// Domain separator for the profile hash; bump the version when the
 /// canonical encoding changes.
@@ -437,6 +443,54 @@ pub enum ProfileError {
         value: f64,
         range: &'static str,
     },
+}
+
+/// Why [`set_frame_overrides`] refused a write.
+#[derive(Debug, thiserror::Error)]
+pub enum OverrideWriteError {
+    /// The object is one the read path would reject (and ignore with a
+    /// warning); nothing was written.
+    #[error("belief_profile override refused: {0}")]
+    Invalid(#[from] ProfileError),
+    /// The frame write itself failed (unknown frame, refused write, ...).
+    #[error(transparent)]
+    Db(#[from] epigraph_db::DbError),
+}
+
+/// Check an override object exactly as the read path will apply it: as a
+/// merge patch over the served profile ([`BeliefProfile::served`], the base
+/// every frame and perspective tier is resolved over), rejected whole on an
+/// unknown parameter, a wrong type, a number out of range, `lens`, or a
+/// non-object. An object this accepts is one the read path applies.
+///
+/// # Errors
+/// The [`ProfileError`] the read path would log and ignore.
+pub fn validate_overrides(overrides: &Value) -> Result<(), ProfileError> {
+    BeliefProfile::served()
+        .with_overrides(overrides)
+        .map(|_| ())
+}
+
+/// Write a frame's `belief_profile` override object, refusing one the read
+/// path would ignore ([`validate_overrides`]) so an invalid object can no
+/// longer be stored and then silently skipped at every read (backlog
+/// dc32b884). The object is stored verbatim, replacing any previous one.
+///
+/// A frame override moves the frame tier of the SERVED cache, so changing it
+/// is a cache event: the frame's cached beliefs keep the old tier until they
+/// are recomputed.
+///
+/// # Errors
+/// [`OverrideWriteError::Invalid`] with nothing written, or
+/// [`OverrideWriteError::Db`] from the write.
+pub async fn set_frame_overrides(
+    pool: &epigraph_db::PgPool,
+    frame_id: uuid::Uuid,
+    overrides: &Value,
+) -> Result<(), OverrideWriteError> {
+    validate_overrides(overrides)?;
+    epigraph_db::FrameRepository::set_validated_belief_profile(pool, frame_id, overrides).await?;
+    Ok(())
 }
 
 /// The frame tier's inputs: the generic override object and the two

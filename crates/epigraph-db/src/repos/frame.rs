@@ -482,17 +482,65 @@ impl FrameRepository {
         Ok(raw.parse::<f64>().ok())
     }
 
+    /// The `frames.properties` key that holds the frame's belief-profile
+    /// override object (`epigraph_engine::belief_profile::PROFILE_PROPERTY_KEY`).
+    pub const BELIEF_PROFILE_KEY: &'static str = "belief_profile";
+
     /// Set a single key on `frames.properties`. Operator/admin use; the
     /// main intent is per-frame `intra_evidence_locality_factor` overrides.
     ///
     /// Uses `||` (JSONB merge) so existing keys are preserved.
     ///
+    /// Refuses [`Self::BELIEF_PROFILE_KEY`]: that object is a merge patch over
+    /// the engine's belief profile, and this layer cannot tell a valid one
+    /// from one the read path would ignore. Write it through
+    /// `epigraph_engine::belief_profile::set_frame_overrides`, which validates
+    /// it first (backlog dc32b884).
+    ///
     /// # Errors
+    /// `DbError::InvalidData` for the belief-profile key,
     /// `DbError::NotFound` for a frame this session cannot read,
     /// `DbError::WriteRefused` for one it can read but not update (migration
     /// 117), `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(pool, value))]
     pub async fn set_property(
+        pool: &PgPool,
+        frame_id: Uuid,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        if key == Self::BELIEF_PROFILE_KEY {
+            return Err(DbError::InvalidData {
+                reason: format!(
+                    "`{key}` is a belief-profile override and must be validated before it is \
+                     stored; write it with epigraph_engine::belief_profile::set_frame_overrides"
+                ),
+            });
+        }
+        Self::write_property(pool, frame_id, key, value).await
+    }
+
+    /// Store a belief-profile override object the CALLER HAS VALIDATED under
+    /// [`Self::BELIEF_PROFILE_KEY`]. Do not call this directly: use
+    /// `epigraph_engine::belief_profile::set_frame_overrides`, which runs the
+    /// same check the read path applies and refuses an object it would
+    /// ignore. It lives here only because the SQL must (the profile type is
+    /// the engine's, and the engine depends on this crate, not the reverse).
+    ///
+    /// # Errors
+    /// As [`Self::set_property`], without the key refusal.
+    #[instrument(skip(pool, overrides))]
+    pub async fn set_validated_belief_profile(
+        pool: &PgPool,
+        frame_id: Uuid,
+        overrides: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        Self::write_property(pool, frame_id, Self::BELIEF_PROFILE_KEY, overrides).await
+    }
+
+    /// The one `frames.properties` single-key write behind
+    /// [`Self::set_property`] and [`Self::set_validated_belief_profile`].
+    async fn write_property(
         pool: &PgPool,
         frame_id: Uuid,
         key: &str,
