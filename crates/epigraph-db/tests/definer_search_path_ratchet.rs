@@ -231,6 +231,9 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
     "public.epigraph_propagate_tenancy()",
     "public.epigraph_propose_admin_act(text, jsonb, text, text)",
     "public.epigraph_provision_oauth_agent(bytea, text, text)",
+    // 250: its delete fires 001's INVOKER `cascade_delete_edges`, whose
+    // unqualified `DELETE FROM edges` resolves on the definer's path.
+    "public.epigraph_prune_telemetry_events(integer)",
     "public.epigraph_record_admin_scope_would_strip(uuid, text, text[])",
     "public.epigraph_record_cascade_deferral(text, uuid, uuid, uuid, uuid[], jsonb, text)",
     "public.epigraph_record_custodial_act(uuid, uuid, text, text, uuid, jsonb)",
@@ -291,7 +294,10 @@ const PUBLIC_PATH_REGISTER: &[&str] = &[
 // 192 -> 190: 236 (live memberships) and 239 (`epigraph_agent_key_set_status`)
 // each re-state one registered definer on 172's form; each branch lowered
 // it by one on its own, and both are staged here.
-const HIGH_WATER: usize = 190;
+// 190 -> 191: 250 registers `epigraph_prune_telemetry_events(integer)` (its
+// delete fires 001's INVOKER `cascade_delete_edges`); 192 -> 193 on its own
+// branch.
+const HIGH_WATER: usize = 191;
 
 /// The family 190 re-states on 172's form, plus 172's own rotate definer.
 /// `(signature, the application role executes it)`.

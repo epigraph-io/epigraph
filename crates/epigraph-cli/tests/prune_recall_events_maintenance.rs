@@ -16,7 +16,11 @@
 //!
 //! * a maintenance login deletes exactly the expired `recall_events` row and
 //!   the expired TELEMETRY `events` row; the fresh rows and the expired
-//!   provenance event (`claim.created`, not in `PRUNABLE_EVENT_TYPES`) stay;
+//!   provenance event (`claim.created`, not in `PRUNABLE_EVENT_TYPES`) stay.
+//!   Since migration 250 the `events` half runs through the definer
+//!   `epigraph_prune_telemetry_events` (the maintenance role holds no DELETE
+//!   on `events` of its own), so this is also its end-to-end check on a
+//!   non-superuser login;
 //! * an application login is refused by the binary before it deletes
 //!   anything, and the application role's own DELETE on `recall_events`
 //!   (which it holds as a grant) matches no row under FORCE row security.

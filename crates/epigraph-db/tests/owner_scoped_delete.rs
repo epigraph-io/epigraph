@@ -2323,12 +2323,9 @@ fn no_application_path_deletes_a_non_tier_a_edge_node() {
             "AgentRepository::delete: `agents` has row security and no DELETE policy, \
              so a non-privileged session deletes nothing",
         ),
-        (
-            "epigraph-db/src/repos/recall_event.rs",
-            "events",
-            1,
-            "prune_telemetry_events: telemetry event rows are not edge endpoints",
-        ),
+        // `prune_telemetry_events` deletes from `events` through migration
+        // 250's definer `epigraph_prune_telemetry_events` since then, so it
+        // names no `events` DELETE in Rust any more.
     ];
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("read dir") {

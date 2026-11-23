@@ -2233,7 +2233,8 @@ restart.
   DELETE on `events`) is not added here; the maintenance role can still delete
   or rewrite any `events` row (follow-up, file header). Pinned by
   `app_role_table_lockdown.rs::the_app_role_cannot_delete_or_rewrite_events`,
-  `::the_maintenance_role_still_deletes_events_the_app_role_cannot`, the
+  `::the_maintenance_role_still_deletes_events_the_app_role_cannot` (renamed
+  `::neither_role_deletes_a_provenance_event_directly` and inverted by 250), the
   allowlist ratchet, and
   `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the retention job
   still prunes on a maintenance login; an application login's own DELETE on
@@ -3758,6 +3759,109 @@ restart.
   (restores 195's body byte for byte and drops the index; run it BEFORE `195-undo.sql`).
   **Deploy order:** after 195; no binary depends on it. The index is built inside the
   migration's transaction (writers of `role_agents` wait for it; the table is small).
+- **250**: public `events_write_guards` (two guards on the provenance record).
+  **Section 1** (backlog 062d7767): the maintenance role prunes `events` only
+  through the SECURITY DEFINER `epigraph_prune_telemetry_events(retention_days)`,
+  which deletes rows whose `event_type` is exactly one of
+  `epigraph_prunable_event_types()` (`{tool.invoked}`, equal to
+  `epigraph_db::PRUNABLE_EVENT_TYPES`) older than the window, and
+  `REVOKE DELETE, UPDATE, TRUNCATE ON public.events FROM epigraph_maintenance`
+  (it keeps SELECT and INSERT). Before this any maintenance session could
+  delete or rewrite any `events` row, provenance included, and UPDATE alone
+  could re-type a provenance row so the prune deleted it. The definer is owned
+  by the owner of `events` (read from `pg_class`), never by the maintenance
+  role, whose DELETE the revoke removes; the migration refuses (42501) if that
+  owner is or is a member of `epigraph_maintenance`. EXECUTE to
+  `epigraph_maintenance` only; the body also requires `epigraph_bypass()`. Its
+  path is `pg_catalog, public, pg_temp` because each delete fires 001's
+  INVOKER `cascade_delete_edges` (unqualified `DELETE FROM edges`); registered
+  in `definer_search_path_ratchet.rs`. `RecallEventRepository::
+  prune_telemetry_events` calls the definer and `count_prunable_events` reads
+  the same list. `AgentRepository::delete`'s `actor_id` detach now needs the
+  owner DSN (its callers are superuser test fixtures). Pinned by
+  `epigraph-db/tests/events_telemetry_prune_definer.rs` (a maintenance
+  session's DELETE / UPDATE / TRUNCATE of a `claim.created` row refused 42501;
+  the prune on a maintenance session deletes only the expired telemetry row and
+  its cascade still runs; the app role cannot execute it; the owner and
+  grants; the type list; the undo),
+  `app_role_table_lockdown.rs::neither_role_deletes_a_provenance_event_directly`
+  and `epigraph-cli/tests/prune_recall_events_maintenance.rs` (the real binary
+  on a non-superuser maintenance login). Undo: `docs/runbooks/250-undo.sql`.
+  **Deploy order (coupled):** apply 250 and deploy the binary that calls the
+  definer together, before the next `prune_recall_events` run; out of order
+  the job exits non-zero having deleted nothing from `events` (no data loss).
+  Before migrating, measure who owns `public.events` and whether that role is
+  a member of `epigraph_maintenance` (the migration refuses if so).
+  **Section 2** (backlog a278f16d): `claim.assessed` is reserved in the
+  database, not only at the REST and MCP publish surfaces. New table
+  `mass_function_masses_writes (mass_function_id PK, written_xact xid8)`: the
+  top-level transaction that last wrote each mass function's masses, upserted
+  by the maintenance-owned definer `epigraph_mass_function_masses_written()`
+  from two AFTER row triggers on `mass_functions` (`..._ins` on INSERT,
+  `..._upd` WHEN `OLD.masses IS DISTINCT FROM NEW.masses`). The application
+  role holds no privilege on it; maintenance holds SELECT, INSERT, UPDATE. A
+  side table rather than a column so `mass_functions` row images (stored and
+  compared byte for byte by the K10 undo and other restore tools) keep their
+  shape. The BEFORE INSERT
+  OR UPDATE row trigger `events_assessment_guard` (WHEN the lower-cased type
+  contains `claim.assessed`) runs the maintenance-owned definer
+  `epigraph_events_assessment_guard()` (172's path, EXECUTE revoked from
+  PUBLIC): a maintenance or superuser session (`epigraph_bypass()`) is
+  admitted; any other session is refused 42501 for a padded (Unicode
+  whitespace included, `epigraph_event_type_norm(text)` mirrors Rust's
+  `str::trim`) or re-cased spelling, and for the exact type unless the
+  payload's `mass_function_id`, `claim_id`, `frame_id`, `owner_agent_id` name a
+  `mass_functions` row for that claim, frame and `source_agent_id` whose
+  `mass_function_masses_writes.written_xact = pg_current_xact_id()`, and
+  `actor_id = assessed_by`.
+  So a record needs a masses write in the same transaction: a stranger's
+  self-stamped no-op UPDATE (`SET masses = masses`), a caller-written stamp, a
+  tenancy-only update, a savepoint rolled back, or a 32-bit xid match from
+  another epoch is refused; a write under a savepoint is admitted. A validating
+  trigger rather than a route-called definer: a definer the application role
+  calls with its own payload would admit the same forgery. `assess_claim` asks
+  `MassFunctionRepository::slot_holds_masses` (row locked) before its upsert
+  and files no record when the slot already holds those masses (that upsert
+  writes no masses, so its record would be refused). Residual: the tenancy
+  GUCs are session-settable, so any application-DSN holder can genuinely
+  rewrite a slot row's masses (or write them away and back) and hold a true
+  record of that write; the database binds the record to a masses write, not
+  to an authenticated identity. Pinned by
+  `epigraph-db/tests/assessment_event_reservation.rs` (forgeries, spellings
+  and malformed ids refused on a stamped `epigraph_app` session; the route's
+  shape admitted and each binding field mutated; the stranger's touch and
+  stamp write refused, a real rewrite admitted; savepoint and nested
+  writes admitted, a rolled-back one refused; the epoch-aware bind; identical
+  masses not recordable and detected; maintenance admitted, a pin) and
+  `epigraph-api/tests/assess_writer_recorded.rs` (the route; an identical
+  re-assessment on an application-role pool answers 200 with no second
+  record). Undo: `docs/runbooks/250-undo.sql` (drops the table and its
+  triggers too). Every masses write now costs one side-table upsert; rows of
+  deleted mass functions are not removed (they name finished transactions).
+  **Deploy order for section 2 (one way):** deploy the binary whose
+  `assess_claim` skips the record for identical masses before or with 250;
+  it runs on either side of it. The older binary on top of 250 answers 500 to
+  an identical re-assessment (rolled back, nothing changes).
+  **Operator data repair (not done by the migration):** rows of the type
+  written before 250 are unchecked. `events.created_at` and
+  `events.graph_version` are both caller-supplied, so neither is a trustworthy
+  cut-off: IMMEDIATELY BEFORE applying 250, snapshot the ids, on the owner
+  DSN, e.g. `CREATE TABLE ops_pre250_assessed AS SELECT id FROM events WHERE
+  strpos(lower(event_type), 'claim.assessed') > 0` (deliberately broad: the
+  guard's own WHEN test), then after migrating classify
+  exactly those ids with `SELECT e.id, e.event_type, e.created_at, e.actor_id,
+  CASE WHEN epigraph_event_type_norm(e.event_type) <> 'claim.assessed' THEN
+  'other_type' WHEN mf.id IS NULL THEN 'no_slot_row' WHEN
+  mf.claim_id::text IS DISTINCT FROM e.payload->>'claim_id' OR
+  mf.frame_id::text IS DISTINCT FROM e.payload->>'frame_id' OR
+  mf.source_agent_id::text IS DISTINCT FROM e.payload->>'owner_agent_id' THEN
+  'fields_mismatch' WHEN e.actor_id::text IS DISTINCT FROM
+  e.payload->>'assessed_by' THEN 'actor_not_assessed_by' ELSE 'consistent'
+  END FROM events e JOIN ops_pre250_assessed p ON p.id = e.id LEFT JOIN
+  mass_functions mf ON mf.id::text = e.payload->>'mass_function_id'`
+  (`consistent` is necessary, not sufficient, for a genuine record). Rows
+  outside the snapshot passed the guard, so the procedure can only
+  over-classify. Drop the snapshot table afterwards.
 - **252**: `admin_audit_agent_key_events` (backlog 6492de67). Re-states 112's
   `epigraph_admin_audit_write` (an md5 precondition refuses to apply over any other body)
   to accept two more event types, `agent_keys.admin_rotate` and `agent_keys.admin_revoke`,

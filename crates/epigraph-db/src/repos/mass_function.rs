@@ -774,6 +774,59 @@ impl MassFunctionRepository {
         Ok(row.0)
     }
 
+    /// Whether the slot row `(claim_id, frame_id, source_agent_id,
+    /// perspective_id)` exists and already holds exactly `masses_json` (jsonb
+    /// equality, the comparison migration 250's
+    /// `mass_functions_masses_written_upd` trigger makes), locking that row
+    /// `FOR UPDATE` on `executor` so the answer holds until its transaction
+    /// ends. Read as `viewer` (the same viewer the route reads the slot's
+    /// replaced assessments with); a row the viewer cannot see answers false.
+    ///
+    /// The assess route asks this inside its slot transaction, before the
+    /// upsert: an upsert of identical masses writes no masses, so migration
+    /// 250's `events_assessment_guard` would refuse a `claim.assessed` record
+    /// of it, and the route files none (the slot's last record still names
+    /// the writer of those masses). It is a plain jsonb comparison, so it
+    /// answers the same on a database before 250.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer, masses_json))]
+    pub async fn slot_holds_masses<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        frame_id: Uuid,
+        source_agent_id: Uuid,
+        perspective_id: Uuid,
+        masses_json: &serde_json::Value,
+    ) -> Result<bool, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT bool_or(s.same)
+              FROM (SELECT masses = $5::jsonb AS same
+                      FROM mass_functions
+                     WHERE claim_id = $1 AND frame_id = $2
+                       AND source_agent_id = $3 AND perspective_id = $4
+                       /* {VISIBILITY:mass_functions} */
+                       FOR UPDATE) s
+            "#,
+            6,
+        );
+        let mut q = sqlx::query_scalar(&sql)
+            .bind(claim_id)
+            .bind(frame_id)
+            .bind(source_agent_id)
+            .bind(perspective_id)
+            .bind(masses_json);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let held: Option<bool> = q.fetch_one(executor).await?;
+        Ok(held.unwrap_or(false))
+    }
+
     /// Retract ONE mass function (migration 184, ruling R-79): mark it
     /// retracted with `reason`, so every fold and belief read excludes it,
     /// and keep it for audit.

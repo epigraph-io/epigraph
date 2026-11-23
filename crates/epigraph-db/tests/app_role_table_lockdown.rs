@@ -122,6 +122,10 @@ const CLOSED: &[&str] = &[
     // Migration 165: an authority table (which role confers which group),
     // written only by maintenance definers or a guarded maintenance statement.
     "group_role_bindings",
+    // Migration 250: which transaction last wrote each mass function's masses,
+    // the `claim.assessed` guard's authority; written only by the masses-write
+    // trigger definer, and the application role holds no privilege on it.
+    "mass_function_masses_writes",
     // Migration 194 (H10): the retracted-BBA purge grants, written and cleared
     // only by `epigraph_purge_mass_functions`; the application role holds no
     // privilege on it.
@@ -173,6 +177,9 @@ const NO_WRITE: &[&str] = &[
     "harvester_audit_reports",
     "harvester_enriched_concepts",
     "harvester_sources",
+    // Migration 250: written only by the masses-write trigger definer; the
+    // application role holds no privilege at all, SELECT included.
+    "mass_function_masses_writes",
     // Migration 194: written only by the maintenance purge definer; the
     // application role holds no privilege at all, SELECT included.
     "mass_function_purge_grants",
@@ -1911,8 +1918,8 @@ async fn append_only_tables_keep_insert_and_cascades_still_clear_them(pool: PgPo
 /// `events` (077; `("events", OPERATIONAL)` was allowlisted), so the delete
 /// removes the event and its edge. The TRUNCATE refusal is a regression pin
 /// only: 077 never granted the application role TRUNCATE, so it passes on the
-/// base too. The maintenance half (186's DELETE still works) is
-/// `the_maintenance_role_still_deletes_events_the_app_role_cannot`.
+/// base too. The maintenance half (since 250 the maintenance role is refused
+/// too) is `neither_role_deletes_a_provenance_event_directly`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
     let app = app_pool(&pool, 2).await;
@@ -1968,22 +1975,21 @@ async fn the_app_role_cannot_delete_or_rewrite_events(pool: PgPool) {
     assert_eq!(kept, payload, "its payload is unchanged");
 }
 
-/// Migrations 186 and 189 together: the maintenance role (the retention job's
-/// `MaintenancePool`) still deletes an `events` row, and 024's INVOKER
-/// trigger `events_cascade_edges` still removes the edge naming it in the same
-/// statement, while the application role holds neither DELETE nor UPDATE.
-/// So 189 closed `events` to the application role only and left 186's
-/// maintenance DELETE intact.
+/// Migrations 186, 189 and 250 together: neither role deletes an `events`
+/// row directly any more. 189 took DELETE and UPDATE on `events` from the
+/// application role; 250 took them from the maintenance role too (backlog
+/// 062d7767), whose retention job now prunes telemetry only through
+/// `epigraph_prune_telemetry_events` (`events_telemetry_prune_definer.rs`).
 ///
 /// `role_pool` uses SET SESSION AUTHORIZATION, so `session_user` and
 /// `current_user` are both `epigraph_maintenance` (the superuser fixture does
-/// not mask the grant check, and `epigraph_bypass()` admits the cascade's
-/// `DELETE FROM edges` through `edges_delete_owner`).
+/// not mask the grant check).
 ///
-/// Fails if 189 (or any later file) also takes DELETE from the maintenance
-/// role: the delete is refused with 42501 and the event and its edge stay.
+/// Fails on 249 and earlier: 186's grant lets the maintenance role delete the
+/// provenance event, and 024's INVOKER trigger `events_cascade_edges` removes
+/// the edge naming it in the same statement.
 #[sqlx::test(migrations = "../../migrations")]
-async fn the_maintenance_role_still_deletes_events_the_app_role_cannot(pool: PgPool) {
+async fn neither_role_deletes_a_provenance_event_directly(pool: PgPool) {
     let (agent, _) = fixture::seed_agent_with_group(&pool, "b03-events-maint").await;
     let payload = serde_json::json!({ "claim_id": Uuid::new_v4() });
     let event = epigraph_db::EventRepository::insert(&pool, "claim.created", Some(agent), &payload)
@@ -2031,10 +2037,10 @@ async fn the_maintenance_role_still_deletes_events_the_app_role_cannot(pool: PgP
 
     assert_eq!(
         (deleted, events_left, edges_left, grants),
-        (Ok(1), 0, 0, (true, false, false)),
+        (Err("42501".to_string()), 1, 1, (false, false, false)),
         "(maintenance DELETE, events left, edges left, (maintenance DELETE grant, app DELETE \
-         grant, app UPDATE grant)): the maintenance role deletes the event and the cascade \
-         removes its edge; the application role holds neither DELETE nor UPDATE"
+         grant, app UPDATE grant)): the maintenance role is refused, the event and the edge \
+         naming it stay, and neither role holds DELETE"
     );
 }
 

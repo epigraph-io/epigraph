@@ -363,6 +363,51 @@ async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool)
     );
 }
 
+/// Re-assessing with the masses the slot already holds files no second
+/// record (backlog a278f16d, migration 250).
+///
+/// Migration 250's `events_assessment_guard` admits a record on an
+/// application session only when the same transaction wrote the slot row's
+/// masses, and an upsert of identical masses writes none, so a record of it
+/// would be refused and the call would answer 500 (that refusal is pinned at
+/// the database level by `epigraph-db/tests/assessment_event_reservation.rs::
+/// an_identical_reassessment_writes_no_masses_and_is_detected`). The route
+/// therefore files no record when `slot_holds_masses` says the slot already
+/// holds the masses. This runs on the harness pool, where the guard admits
+/// every record, so it isolates the route's decision: red with
+/// `assess_claim`'s `masses_unchanged` check removed (a second record lands).
+/// A third call with new masses is recorded again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identical_reassessment_files_no_second_record(pool: PgPool) {
+    let (author, _) = seed_agent_with_group(&pool, "assess-same-author").await;
+    let (caller, _) = seed_agent_with_group(&pool, "assess-same-caller").await;
+    let claim = seed_public_claim(&pool, author, "assess writer record: identical").await;
+
+    let first = assess(&pool, caller, claim, request(true, 0.9)).await;
+    assert_eq!(assessment_events(&pool, claim).await.len(), 1);
+
+    let second = assess(&pool, caller, claim, request(true, 0.9)).await;
+    assert_eq!(
+        second.mass_function_id, first.mass_function_id,
+        "PREMISE: the same slot row"
+    );
+    let events = assessment_events(&pool, claim).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "no record of a call that wrote no masses: {events:?}"
+    );
+
+    assess(&pool, caller, claim, request(false, 0.7)).await;
+    let events = assessment_events(&pool, claim).await;
+    assert_eq!(
+        events.len(),
+        2,
+        "a call that changes the masses is recorded"
+    );
+    assert_eq!(events[1].0, Some(caller));
+}
+
 /// The `claims:write` scope the write handlers now take as their first
 /// extractor (backlog f00d75ab). A direct handler call stands in for the
 /// bearer middleware, so it supplies the scope the route checks.
