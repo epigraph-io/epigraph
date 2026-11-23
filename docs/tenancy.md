@@ -834,11 +834,15 @@ human (`OPL02`).
   registered human that is not itself linked. Suspending or revoking the
   client, revoking the human, or creating a second client for the agent
   unbinds it at once.
-* **What it does not do.** It is not an operator link: nothing on the token
-  or webhook path reads it, so the client keeps minting tokens and keeps its
-  viewer, and an operated agent is still refused whether or not it is
-  allowlisted. The bearer layers read it only to check a DELEGATED run
-  token's delegator (below); an ordinary token never reaches that read. It is
+* **What it does not do.** It is not an operator link: the mint's
+  operated-agent refusal does not consult it, so the client keeps minting
+  tokens and keeps its viewer, and an operated agent is still refused whether
+  or not it is allowlisted. The registry is still read on the request path,
+  for other questions: the bearer layers read it to check a DELEGATED run
+  token's delegator, and the run-token grant before it mints one (below); and
+  viewer resolution (`epigraph_live_memberships`, so webhook delivery too)
+  reaches it through `epigraph_human_of` and, for personal-group rows, reads
+  it directly (migration 235). It is
   not an ownership relation (the human does not own the agent's claims). And
   it does not reach the membership door (`epigraph_require_operator_scope`
   reads links only).
