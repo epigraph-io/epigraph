@@ -45,9 +45,10 @@
 //!   a session that can see none of a compound's in-force decomposition
 //!   edges finds no compound. The cached-belief owner lookup
 //!   (`MassFunctionRepository::cache_owner_frame_for_claim`, backlog
-//!   0dc20fad) and the vacate gates' fold-cache test
+//!   0dc20fad), the vacate gates' fold-cache test
 //!   (`DerivationScopeRepository::claim_has_fold_cache`, backlog bbece56a)
-//!   close that gap with migration 193's definer-rights
+//!   and BP apply's compound guard (`factor::compound_ids_among_sql`,
+//!   backlog 77b605ce) close that gap with migration 193's definer-rights
 //!   `epigraph_claim_is_compound`, which decides [`IS_COMPOUND_SQL`] on the
 //!   whole graph. The templates here, and [`roles_batch`], still read on the
 //!   caller's connection.

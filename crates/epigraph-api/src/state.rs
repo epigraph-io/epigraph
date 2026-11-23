@@ -340,6 +340,14 @@ pub struct AppState {
     /// it from [`BP_APPLY_ENV`] at boot. Read-only BP runs are unaffected.
     #[cfg(feature = "db")]
     pub bp_apply: BpApply,
+    /// The permits that bound concurrent `POST /api/v1/bp/propagate` runs
+    /// (backlog b02347c6). A run is CPU-bound on tokio's blocking pool, whose
+    /// ceiling (512 threads by default) every other blocking user in the
+    /// process shares; a run that finds no permit is refused (503) rather
+    /// than queued. [`BP_MAX_CONCURRENT_DEFAULT`] in every constructor;
+    /// `bin/server.rs` sets it from [`BP_MAX_CONCURRENT_ENV`] at boot.
+    #[cfg(feature = "db")]
+    pub bp_runs: Arc<tokio::sync::Semaphore>,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -540,6 +548,39 @@ pub use epigraph_engine::belief_modes::BpApply;
 /// The environment variable that switches BP apply on: `EPIGRAPH_BP_APPLY`.
 pub const BP_APPLY_ENV: &str = BpApply::ENV;
 
+/// How many `POST /api/v1/bp/propagate` runs may be in flight at once when
+/// [`BP_MAX_CONCURRENT_ENV`] is unset ([`AppState::bp_runs`]).
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_DEFAULT: usize = 2;
+
+/// The environment variable `bin/server.rs` reads the BP concurrency limit
+/// from: a non-negative integer, read once at boot.
+#[cfg(feature = "db")]
+pub const BP_MAX_CONCURRENT_ENV: &str = "EPIGRAPH_BP_MAX_CONCURRENT";
+
+/// Parse a [`BP_MAX_CONCURRENT_ENV`] value: `Some(limit)` for a
+/// non-negative integer the runtime's semaphore can hold, `None` for
+/// anything else. A value above `tokio::sync::Semaphore::MAX_PERMITS`
+/// parses as a `usize` but would panic `Semaphore::new` at boot, so it is
+/// refused here like any other bad value and the caller uses the default.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn parse_bp_max_concurrent(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit <= tokio::sync::Semaphore::MAX_PERMITS)
+}
+
+/// The semaphore behind [`AppState::bp_runs`] for `limit` concurrent runs,
+/// clamped to `tokio::sync::Semaphore::MAX_PERMITS` so no limit panics.
+#[cfg(feature = "db")]
+fn bp_runs_semaphore(limit: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(
+        limit.min(tokio::sync::Semaphore::MAX_PERMITS),
+    ))
+}
+
 /// The environment variable that switches the guest reads on:
 /// `EPIGRAPH_GUEST_READS`.
 pub const GUEST_READS_ENV: &str = "EPIGRAPH_GUEST_READS";
@@ -584,6 +625,42 @@ impl GuestReads {
         raw.map(str::trim).is_some_and(|v| {
             !v.is_empty() && !v.eq_ignore_ascii_case("on") && !v.eq_ignore_ascii_case("off")
         })
+    }
+}
+
+#[cfg(all(test, feature = "db"))]
+mod bp_max_concurrent_tests {
+    use super::{bp_runs_semaphore, parse_bp_max_concurrent};
+    use tokio::sync::Semaphore;
+
+    #[test]
+    fn a_limit_the_semaphore_can_hold_parses() {
+        assert_eq!(parse_bp_max_concurrent("0"), Some(0));
+        assert_eq!(parse_bp_max_concurrent(" 2 "), Some(2));
+        let max = Semaphore::MAX_PERMITS.to_string();
+        assert_eq!(parse_bp_max_concurrent(&max), Some(Semaphore::MAX_PERMITS));
+    }
+
+    /// A value above the semaphore's limit is a valid `usize`, so a bare
+    /// `parse::<usize>()` accepted it and `Semaphore::new` panicked at boot
+    /// instead of the documented "warn and use the default".
+    #[test]
+    fn a_limit_above_the_semaphore_maximum_is_refused_not_a_boot_panic() {
+        let over = (Semaphore::MAX_PERMITS + 1).to_string();
+        assert_eq!(parse_bp_max_concurrent(&over), None, "{over}");
+        assert_eq!(parse_bp_max_concurrent(&usize::MAX.to_string()), None);
+        for bad in ["", "-1", "two", "2.0"] {
+            assert_eq!(parse_bp_max_concurrent(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `with_bp_max_concurrent` is public: a caller that skips the parser
+    /// gets the semaphore's maximum, not a panic.
+    #[test]
+    fn the_semaphore_clamps_an_oversized_limit() {
+        let sem = bp_runs_semaphore(usize::MAX);
+        assert_eq!(sem.available_permits(), Semaphore::MAX_PERMITS);
+        assert_eq!(bp_runs_semaphore(2).available_permits(), 2);
     }
 }
 
@@ -1373,6 +1450,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1491,6 +1569,15 @@ impl AppState {
     #[must_use]
     pub fn with_bp_apply(mut self, bp_apply: BpApply) -> Self {
         self.bp_apply = bp_apply;
+        self
+    }
+
+    /// Set how many `POST /api/v1/bp/propagate` runs may be in flight at
+    /// once; see [`Self::bp_runs`]. `0` refuses every run.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_bp_max_concurrent(mut self, limit: usize) -> Self {
+        self.bp_runs = bp_runs_semaphore(limit);
         self
     }
 
@@ -1966,6 +2053,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -2049,6 +2137,7 @@ impl AppState {
             token_exchange_audiences: crate::oauth::token_exchange::TokenExchangeAudiences::default(
             ),
             bp_apply: BpApply::Off,
+            bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,

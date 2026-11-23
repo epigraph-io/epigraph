@@ -409,16 +409,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "remove_member",
         &["CommunityRepository::remove_member"],
     ),
-    // open finding: F-SHARD4-A2.
-    (
-        "computation.rs",
-        "propagate_beliefs",
-        &[
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
-        ],
-    ),
     // narrows: an `apply` run keeps the cache-admissible rows of the BBAs it
     // read through the viewer (`get_for_claims`); a read-only run filters them
     // through the viewer instead (`retain_for_viewer`, viewed).
