@@ -855,7 +855,12 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// runs every read and write on the caller's `AppState::write_as`
 /// transaction; `routes/assess.rs` 1 -> 0, key DELETED (`HIGH_WATER_FILES`
 /// falls by one with it).
-const HIGH_WATER: usize = 169;
+/// 169 -> 165 (backlog b9c4e809; 187 -> 183 on its own branch):
+/// `promote_hypothesis` runs its two frame reads, its source-BBA read and
+/// every write on ONE transaction from the caller's `AppState::write_as`
+/// instead of `state.db_pool.begin()` (`routes/hypothesis.rs` 6 -> 2). No
+/// file reached zero.
+const HIGH_WATER: usize = 165;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1162,8 +1167,9 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 11 before the operator-binding delta review, which moved
     // `create_hypothesis`'s claim INSERT onto `AppState::begin_claim_write`;
     // 6 since its VOI cache moved onto that same stamped transaction (round 4
-    // COR-R4-3).
-    ("routes/hypothesis.rs", 6),
+    // COR-R4-3); 2 since `promote_hypothesis` runs on the caller's
+    // `AppState::write_as` transaction (backlog b9c4e809).
+    ("routes/hypothesis.rs", 2),
     // `routes/isomorphism.rs` was 3 and is GONE, not converted: the file was
     // DELETED with the `episcience` cargo feature that gated it (backlog
     // 54db73b5). It imported a crate that is not a dependency, so it was never

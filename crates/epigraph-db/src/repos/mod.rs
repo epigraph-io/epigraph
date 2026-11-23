@@ -176,7 +176,7 @@ pub use claim::{
     EmbeddingSeedScope, EvolveStepResult, FlatPage, FlatRanking, FrameClaimBeliefHit,
     GraphExpansionHit, GroundedNeighbor, HybridHit, LabelFamilyRow, LabelQuery, LevelAndSourceType,
     LineageHead, MarkedDuplicateRow, MarkedDuplicates, MovedBba, NearestClaimHit, PatchClaimDiff,
-    PatchClaimInput, SemanticFlatPage, SemanticSelectedClaim, SortDirection, SupersedeActor,
+    PatchClaimInput, PromotionStanding, SemanticFlatPage, SemanticSelectedClaim, SortDirection, SupersedeActor,
     SupersedeEdgeMigration, SupersedeTool, SweepCandidate, UnmarkedDuplicate,
     CONSOLIDATE_MAX_SOURCES, CONSOLIDATE_MIN_SOURCES, DEDUP_IDENTITY_KEY_RESERVED,
     DUPLICATE_IDENTITY_PROPERTY, DUPLICATE_IDENTITY_RELATIONSHIP, EXPANSION_RELATIONSHIPS,

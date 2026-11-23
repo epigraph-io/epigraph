@@ -147,15 +147,24 @@ fn admit(
     action: &str,
 ) -> Result<(), ApiError> {
     if access == HypothesisAccess::Write && !writable_groups.contains(&owner_group) {
-        return Err(ApiError::ClaimNotWritable {
-            claim_id: hypothesis_id,
-            message: format!(
-                "cannot {action}: the caller holds no admin or writer membership in the \
-                 group that owns hypothesis {hypothesis_id}; nothing was written"
-            ),
-        });
+        return Err(hypothesis_not_writable(hypothesis_id, action));
     }
     Ok(())
+}
+
+/// The `403 not_owner` a WRITE to hypothesis `hypothesis_id` answers when the
+/// hypothesis's owning group is outside the caller's writable set. One
+/// constructor for every hypothesis write route ([`admit`] here, and
+/// `hypothesis.rs::promote_hypothesis`), so their refusals stay one contract.
+#[cfg(feature = "db")]
+pub(crate) fn hypothesis_not_writable(hypothesis_id: Uuid, action: &str) -> ApiError {
+    ApiError::ClaimNotWritable {
+        claim_id: hypothesis_id,
+        message: format!(
+            "cannot {action}: the caller holds no admin or writer membership in the \
+             group that owns hypothesis {hypothesis_id}; nothing was written"
+        ),
+    }
 }
 
 /// Read the hypothesis `hypothesis_id` through `viewer` and admit `access`.

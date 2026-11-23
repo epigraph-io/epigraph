@@ -141,7 +141,7 @@ pub use repos::{
     NearestClaimHit, NeighbourhoodThemeCoverage, NewHierarchicalOutcomeReport, NewRecallEvent,
     NonceConsumption, OAuthClientRepository, OAuthClientRow, OperatorLink, OperatorLinkOutcome,
     PaperRepository, PaperRow, PatchClaimDiff, PatchClaimInput, PatternTemplateRepository,
-    PatternTemplateRow, PerspectiveRepository, ProvenanceChain, ProvenanceChainRepository,
+    PatternTemplateRow, PerspectiveRepository, PromotionStanding, ProvenanceChain, ProvenanceChainRepository,
     ProvenanceEdge, ProvenanceLogRow, ProvenanceNode, ProvenanceRepository,
     ReasoningTraceRepository, RecallEventRepository, RecallEventRow, RefreshCheck,
     RefreshRevokeReason, RefreshRotateOutcome, RefreshTokenRepository, RefreshTokenRow,

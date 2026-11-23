@@ -386,6 +386,32 @@ pub struct ClaimEmbeddingHit {
     pub similarity: f64,
 }
 
+/// Where one hypothesis stands for a promotion by a viewer
+/// ([`ClaimRepository::promotion_standing_of`]).
+///
+/// The refusals are ordered so the most fundamental answer wins: a claim the
+/// viewer cannot read is [`Self::NotFound`] whatever else is true of it, and a
+/// claim it may read but not write is [`Self::NotWritable`] whether or not it
+/// is promoted already. A caller without write authority is told "you may not",
+/// not "someone else already did".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionStanding {
+    /// The claim does not exist, or the viewer cannot read it. The two are
+    /// deliberately indistinguishable (`404`).
+    NotFound,
+    /// The viewer reads the claim, but its owning group is outside the
+    /// viewer's writable set (`403`).
+    NotWritable {
+        /// `claims.owner_group_id` of the hypothesis.
+        owner_group_id: Uuid,
+    },
+    /// The viewer may write the claim and its `hypothesis_status` is already
+    /// `promoted` (`409`).
+    AlreadyPromoted,
+    /// The viewer may write the claim and it is not promoted yet.
+    Promotable,
+}
+
 /// Which claims [`ClaimRepository::search_by_embedding_since`] draws its kNN
 /// candidates from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12243,6 +12269,54 @@ impl ClaimRepository {
             before_labels: labels("before_labels"),
             before_properties: out.get("before_properties").cloned().unwrap_or_default(),
             before_trace_id: trace("before_trace_id"),
+        })
+    }
+
+    /// Where hypothesis `claim_id` stands for a promotion by `viewer`, read
+    /// through `viewer` on `executor` (the promotion's own stamped transaction).
+    ///
+    /// The status test is the same predicate the promotion's conditional
+    /// status write uses (`hypothesis_status IS DISTINCT FROM 'promoted'`), so
+    /// [`PromotionStanding::Promotable`] here and a 0-row status write later
+    /// can only disagree because another transaction committed a promotion in
+    /// between, or because the database refused the write.
+    ///
+    /// The writable test is `owner_group_id = ANY(viewer.writable_groups())`,
+    /// the rule `claims_tenancy`'s `WITH CHECK` applies to a stamped UPDATE.
+    /// No row lock is taken: `FOR UPDATE` under row security would hide a row
+    /// the viewer may read but not update, turning a 403 into a 404. The
+    /// conditional write takes the lock.
+    ///
+    /// Read-only, and it mints nothing.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` on a database failure.
+    pub async fn promotion_standing_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+    ) -> Result<PromotionStanding, DbError> {
+        let sql = viewer.splice(
+            r#"
+            SELECT c.owner_group_id,
+                   (c.properties->>'hypothesis_status') IS NOT DISTINCT FROM 'promoted'
+            FROM claims c
+            WHERE c.id = $1
+              /* {VISIBILITY:c} */
+            "#,
+            2,
+        );
+        let mut q = sqlx::query_as::<_, (Uuid, bool)>(&sql).bind(claim_id);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        Ok(match q.fetch_optional(executor).await? {
+            None => PromotionStanding::NotFound,
+            Some((owner_group_id, _)) if !viewer.writable_groups().contains(&owner_group_id) => {
+                PromotionStanding::NotWritable { owner_group_id }
+            }
+            Some((_, true)) => PromotionStanding::AlreadyPromoted,
+            Some((_, false)) => PromotionStanding::Promotable,
         })
     }
 

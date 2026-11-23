@@ -4,9 +4,11 @@
 //! - GET  /api/v1/hypothesis/:id/status — Belief, evidence chains, promotion readiness
 //! - POST /api/v1/hypothesis/:id/promote — Promote to research_validity
 //!
-//! # Tenancy: 6 of this file's 17 raw-pool sites are converted
+//! # Tenancy: two raw-pool sites remain, both in `create_hypothesis`
 //!
-//! Conversion shard 6. `hypothesis_status` is the only wholly-convertible
+//! Conversion shard 6 converted the six sites of `hypothesis_status`;
+//! backlog b9c4e809 then moved `promote_hypothesis` off the raw pool (below).
+//! Shard 6: `hypothesis_status` is the only wholly-convertible
 //! handler here and it is the shard's densest: all six of its sites — two
 //! viewer-spliced repo reads, one viewer-less repo read, one viewer-spliced
 //! count and two inline `sqlx` statements — now run on one viewer-stamped
@@ -20,13 +22,19 @@
 //! uniformly restrictive. The `frames` lookup is the site; the same shape is
 //! already on record as `F-SHARD4-A5`.
 //!
-//! NOT converted: `create_hypothesis` and `promote_hypothesis` (11 sites) both
-//! WRITE, so [`AppState::read_as`] — which is read-only, and whose `ScopedRead`
-//! is rolled back on drop under `SessionGucMode::Transaction` — is the wrong
-//! instrument. `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still carries
-//! `("hypothesis.rs", 2)` for them, unchanged by this shard.
+//! NOT converted by that shard: `create_hypothesis` and `promote_hypothesis`
+//! both WRITE, so [`AppState::read_as`] — which is read-only, and whose
+//! `ScopedRead` is rolled back on drop under `SessionGucMode::Transaction` — is
+//! the wrong instrument. `viewer_route_table_lint.rs::ROUTE_LAYER_WRITES` still
+//! carries `("hypothesis.rs", 2)` for them. `create_hypothesis` writes on
+//! [`AppState::begin_claim_write`]; `promote_hypothesis` runs its frame reads,
+//! its source-BBA read and every write on ONE transaction from
+//! [`AppState::write_as`] (backlog b9c4e809), and answers 404 / 403 / 409 from
+//! `ClaimRepository::promotion_standing_of` read on that transaction.
 //!
 //! [`AppState::read_as`]: crate::AppState::read_as
+//! [`AppState::write_as`]: crate::AppState::write_as
+//! [`AppState::begin_claim_write`]: crate::AppState::begin_claim_write
 
 #[cfg(feature = "db")]
 use axum::{
@@ -480,6 +488,18 @@ pub async fn promote_hypothesis(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Authority before readiness (backlog b9c4e809): a hypothesis the caller
+    // cannot read is 404, one it may read but not write is 403, and only then
+    // is "already promoted" a 409. Decided again on the promotion's own
+    // stamped transaction below; this first answer keeps a caller without
+    // write authority from being told about readiness or a prior promotion.
+    {
+        let mut read = state.read_as(&viewer).await?;
+        let standing =
+            epigraph_db::ClaimRepository::promotion_standing_of(&mut *read, &viewer, id).await?;
+        refuse_unless_promotable(standing, id, false)?;
+    }
+
     // Re-check promotion gate. `hypothesis_status` is an axum handler, so its
     // viewer arrives BY VALUE through the extractor and this call needs a
     // second owned one while `viewer` is still live for the mass-function read
@@ -528,10 +548,17 @@ pub async fn promote_hypothesis(
         });
     }
 
+    // Execute promotion as ONE transaction stamped with the caller's viewer,
+    // all-or-nothing. Every statement below runs on it, so row security
+    // decides each read and write by the caller's own groups: an unstamped
+    // transaction on the application role sees only public rows, and refused
+    // the status write of every group-owned hypothesis as a "conflict".
+    let mut tx = state.write_as(&viewer, "promote_hypothesis").await?;
+
     // Get frame IDs
     let hyp_frame: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'hypothesis_assessment'")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("hypothesis_assessment frame not found: {e}"),
@@ -539,20 +566,17 @@ pub async fn promote_hypothesis(
 
     let rv_frame: (Uuid,) =
         sqlx::query_as("SELECT id FROM frames WHERE name = 'research_validity'")
-            .fetch_one(&state.db_pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("research_validity frame not found: {e}"),
             })?;
 
-    // Execute promotion as a transaction — all-or-nothing
-    let mut tx = state
-        .db_pool
-        .begin()
-        .await
-        .map_err(|e| ApiError::InternalError {
-            message: format!("Failed to begin transaction: {e}"),
-        })?;
+    // The standing, decided on THIS transaction (backlog b9c4e809): 404, 403
+    // or 409 before anything is written.
+    let standing =
+        epigraph_db::ClaimRepository::promotion_standing_of(&mut *tx, &viewer, id).await?;
+    refuse_unless_promotable(standing, id, false)?;
 
     // 0. The status write comes FIRST and is conditional, so the gate is
     //    atomic (backlog 03b1508f): the gate above read the status before this
@@ -567,24 +591,30 @@ pub async fn promote_hypothesis(
     .bind(id)
     .execute(&mut *tx)
     .await
-    .map_err(|e| ApiError::InternalError {
-        message: format!("Failed to update status: {e}"),
+    .map_err(|e| {
+        if crate::errors::is_insufficient_privilege(&e) {
+            status_write_refused(id)
+        } else {
+            ApiError::InternalError {
+                message: format!("Failed to update status: {e}"),
+            }
+        }
     })?
     .rows_affected();
     if flipped != 1 {
-        // The gate above read it unpromoted: a promotion that committed
-        // meanwhile flipped it (or the row is no longer writable here).
-        return Err(ApiError::Conflict {
-            reason: format!(
-                "hypothesis {id} is already promoted (a concurrent promotion committed first), \
-                 or its status could not be written; nothing was written"
-            ),
-        });
+        // The standing above read it promotable, so a 0-row write has exactly
+        // two causes, told apart by reading the row again (a new statement, so
+        // a new snapshot): a promotion that committed meanwhile (409), or a
+        // write the database would not let this caller make (403).
+        let now =
+            epigraph_db::ClaimRepository::promotion_standing_of(&mut *tx, &viewer, id).await?;
+        refuse_unless_promotable(now, id, true)?;
+        return Err(status_write_refused(id));
     }
 
     // 1. Copy the most recent mass function from hypothesis_assessment to research_validity
     let mass_rows = epigraph_db::MassFunctionRepository::get_for_claim_frame(
-        &state.db_pool,
+        &mut *tx,
         &viewer,
         id,
         hyp_frame.0,
@@ -666,6 +696,52 @@ pub async fn promote_hypothesis(
         "promoted": true,
         "research_validity_frame_id": rv_frame.0,
     })))
+}
+
+/// Answer a promotion's [`epigraph_db::PromotionStanding`]: `Ok` only for a
+/// promotable hypothesis. `concurrent` names the race in the 409, for the
+/// standing re-read after a 0-row status write.
+#[cfg(feature = "db")]
+fn refuse_unless_promotable(
+    standing: epigraph_db::PromotionStanding,
+    id: Uuid,
+    concurrent: bool,
+) -> Result<(), ApiError> {
+    use epigraph_db::PromotionStanding as S;
+    match standing {
+        S::Promotable => Ok(()),
+        S::NotFound => Err(ApiError::NotFound {
+            entity: "hypothesis".into(),
+            id: id.to_string(),
+        }),
+        S::NotWritable { .. } => Err(crate::routes::experiment_loop::hypothesis_not_writable(
+            id, "promote",
+        )),
+        S::AlreadyPromoted if concurrent => Err(ApiError::Conflict {
+            reason: format!(
+                "hypothesis {id} is already promoted (a concurrent promotion committed \
+                 first); nothing was written"
+            ),
+        }),
+        S::AlreadyPromoted => Err(ApiError::Conflict {
+            reason: format!("hypothesis {id} is already promoted; nothing was written"),
+        }),
+    }
+}
+
+/// The `403` for a status write the database refused this caller although the
+/// standing read it writable. The same `not_owner` / `not_claim_writer` shape
+/// as the standing's [`epigraph_db::PromotionStanding::NotWritable`] answer, so
+/// a client keyed on the rule reads both refusals alike.
+#[cfg(feature = "db")]
+fn status_write_refused(id: Uuid) -> ApiError {
+    ApiError::ClaimNotWritable {
+        claim_id: id,
+        message: format!(
+            "cannot promote: the database refused this caller's status write on \
+             hypothesis {id}; nothing was written"
+        ),
+    }
 }
 
 // ── Internal types ──

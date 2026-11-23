@@ -931,14 +931,15 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         ],
     ),
     // gated: the status re-check calls `hypothesis_status` with a scoped copy
-    // of the caller's own viewer (`detach_scoped`), then writes; the two
-    // SELECTs are frames by name.
+    // of the caller's own viewer (`detach_scoped`), then writes on ONE
+    // transaction stamped with that viewer (`write_as`, backlog b9c4e809), so
+    // row security decides every statement below; the two SELECTs are frames
+    // by name.
     (
         "hypothesis.rs",
         "promote_hypothesis",
         &[
             "MassFunctionRepository::copy_to_frame",
-            "db_pool.begin",
             "hypothesis_status",
             "sqlx::query(INSERT).execute",
             "sqlx::query(UPDATE).execute",
