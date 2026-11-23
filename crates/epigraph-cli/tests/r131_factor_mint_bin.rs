@@ -1285,10 +1285,13 @@ fn apply_refuses_a_record_whose_directory_cannot_be_synced() {
     let locked = dir.0.join("no-read");
     std::fs::create_dir(&locked).expect("dir");
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o300)).expect("chmod");
-    assert!(
-        std::fs::File::open(&locked).is_err(),
-        "PREMISE: a 0300 directory cannot be opened (not running as a privileged user)"
-    );
+    if std::fs::File::open(&locked).is_ok() {
+        // A privileged runner (root, CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH)
+        // opens a 0300 directory, so the sync cannot be made to fail here.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        eprintln!("running privileged: a 0300 directory opens, so the directory-sync refusal was not exercised");
+        return;
+    }
     let record = locked.join("record.jsonl");
 
     let r = run(
