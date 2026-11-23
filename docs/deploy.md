@@ -3958,10 +3958,11 @@ is elevated.
      - its HTTP pool is built by `connect_recording_elevated_access`. On
        stdio (no token, never elevated) it keeps the non-declaring pool.
 
-     Two known limits. The MCP read tools read on the unstamped pool, so an
-     elevated MCP read is not widened by the arms yet (it is still recorded).
-     And a FEDERATED tool is proxied under the caller's token before the
-     wrapper, so its reads are the extension's to record.
+     The MCP read tools read on a connection stamped from the request's
+     viewer, so an elevated MCP read is widened by 126's arms, as a REST read
+     is, and recorded. A FEDERATED tool is refused to an elevated request at
+     dispatch (`ELEVATED READ-ONLY`), before it would be proxied, so no
+     extension receives an elevated call and none has one to record.
    - A build without the recorder declares nothing and never elevates: it
      would serve an elevated token unelevated.
 

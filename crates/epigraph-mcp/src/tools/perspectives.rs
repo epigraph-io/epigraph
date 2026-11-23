@@ -164,7 +164,7 @@ pub async fn set_source_reliability(
         // A perspective with no owner has no author arm; only claims:admin
         // passes (the nil id matches no agent and no operator link).
         let owner = row.owner_agent_id.unwrap_or_else(uuid::Uuid::nil);
-        crate::tools::claims::require_owner_or_admin(server, auth, caller, owner)
+        crate::tools::claims::require_owner_or_admin(server, &mut tx, auth, caller, owner)
             .await
             .map_err(|e| {
                 invalid_params(format!(

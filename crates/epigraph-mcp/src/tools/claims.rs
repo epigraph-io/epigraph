@@ -1647,7 +1647,7 @@ pub async fn update_with_evidence(
     // batch H-b bar; the retirement label is gated on every transport below.
     // `claim` was read on THIS stamped tx; a refusal drops `tx` and rolls back.
     if auth.is_some() && !params.labels.is_empty() {
-        require_owner_or_admin(server, auth, author, claim.agent_id.as_uuid()).await?;
+        require_owner_or_admin(server, &mut tx, auth, author, claim.agent_id.as_uuid()).await?;
     }
 
     // ── THE RETIREMENT LABEL TAKES #374's GATE HERE TOO (drain U004, I253) ──
@@ -2096,8 +2096,27 @@ pub async fn update_with_evidence(
 /// claims are world-owned, and an agent's writable set would make it an owner
 /// of everything. `None == None` never matches — an unlinked caller and an
 /// unlinked target share no operator.
+///
+/// ## `conn` is the act's own transaction (backlog 9a5bc055)
+///
+/// The link arms read the operator link on `conn`, and the caller-side
+/// (acting) read takes migration 107's link advisory lock in shared mode
+/// first (`AgentRepository::operator_actor_for_act`). 191's retire verb takes
+/// that lock exclusively, so the act and a retire of the caller's link are
+/// serialised. Either the act waits for the retire and is refused here, or
+/// the retire waits for the act to commit. Before, the arms read on the
+/// server's pool, outside the act's transaction, and an act admitted on a
+/// link the operator retired before the act committed still landed.
+///
+/// So `conn` must be the transaction the act COMMITS on, and this must run
+/// before the act's first write on it (the lock-order note on
+/// `operator_actor_for_act`). A gate decided on a different transaction must
+/// be decided again on the write transaction when it admitted the caller
+/// through a link ([`OwnershipGrant::is_link`]), as `resolve_backlog_item`
+/// does. The author and admin arms read nothing, so they take no lock.
 pub(crate) async fn require_owner_or_admin(
     server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     auth: Option<&epigraph_auth::AuthContext>,
     caller: crate::write_identity::WriteIdentity,
     target_agent_id: uuid::Uuid,
@@ -2135,10 +2154,10 @@ pub(crate) async fn require_owner_or_admin(
         let allow_actor = crate::tools::viewer::live_delegation(server, Some(auth), caller_agent)
             .await?
             .is_some();
-        if operator_arm_allows(server, caller_agent, target_agent_id, allow_actor).await? {
+        if operator_arm_allows(&mut *conn, caller_agent, target_agent_id, allow_actor).await? {
             return Ok(OwnershipGrant::Operator);
         }
-        if allow_actor && delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+        if allow_actor && delegate_arm_allows(&mut *conn, caller_agent, target_agent_id).await? {
             return Ok(OwnershipGrant::Delegate);
         }
         return Err(McpError {
@@ -2182,10 +2201,10 @@ pub(crate) async fn require_owner_or_admin(
     // decision: an undeclared (random, per-process) signer can be neither
     // operated (`operator::check_operator_transport` refuses it) nor anyone's
     // operator.
-    if operator_arm_allows(server, caller_agent, target_agent_id, true).await? {
+    if operator_arm_allows(&mut *conn, caller_agent, target_agent_id, true).await? {
         return Ok(OwnershipGrant::Operator);
     }
-    if delegate_arm_allows(server, caller_agent, target_agent_id).await? {
+    if delegate_arm_allows(&mut *conn, caller_agent, target_agent_id).await? {
         return Ok(OwnershipGrant::Delegate);
     }
 
@@ -2229,6 +2248,16 @@ pub(crate) enum OwnershipGrant {
     Admin,
 }
 
+impl OwnershipGrant {
+    /// Whether this grant rests on an operator link that can be retired
+    /// while the act is in flight (`Operator`, `Delegate`). Such a grant
+    /// binds only on the transaction it was decided on; see
+    /// [`require_owner_or_admin`]'s "`conn` is the act's own transaction".
+    pub(crate) fn is_link(self) -> bool {
+        matches!(self, Self::Operator | Self::Delegate)
+    }
+}
+
 /// The operator arm of [`require_owner_or_admin`]; see its doc for the rule.
 ///
 /// The TARGET side reads `AgentRepository::operator_of_author` and the CALLER
@@ -2243,17 +2272,22 @@ pub(crate) enum OwnershipGrant {
 /// `allow_actor` is `false` on the HTTP transport: there only `caller ==
 /// author_op(target)` (the operator itself) is admitted, never the actor arm,
 /// except for a delegated run token whose delegation is live.
+///
+/// Both reads run on `conn`, the act's transaction. The actor read takes the
+/// link lock first (`AgentRepository::operator_actor_for_act`), so a retire
+/// of the caller's link cannot commit between this read and the act's commit.
+/// The author read needs no lock: it counts retired links too, and a link
+/// record is never deleted.
 pub(crate) async fn operator_arm_allows(
-    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     caller: uuid::Uuid,
     target: uuid::Uuid,
     allow_actor: bool,
 ) -> Result<bool, McpError> {
-    let Some(target_op) =
-        epigraph_db::AgentRepository::operator_of_author_pool(&server.pool, target)
-            .await
-            .map_err(internal_error)?
-            .map(|a| a.operator_id)
+    let Some(target_op) = epigraph_db::AgentRepository::operator_of_author(&mut *conn, target)
+        .await
+        .map_err(internal_error)?
+        .map(|a| a.operator_id)
     else {
         // An author with no link record has no operator for anyone to share.
         return Ok(false);
@@ -2261,7 +2295,7 @@ pub(crate) async fn operator_arm_allows(
     let reason = if caller == target_op {
         "caller is the operator of the claim's author"
     } else if allow_actor
-        && epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+        && epigraph_db::AgentRepository::operator_actor_for_act(&mut *conn, caller)
             .await
             .map_err(internal_error)?
             .is_some_and(|l| l.operator_id == target_op)
@@ -2285,13 +2319,14 @@ pub(crate) async fn operator_arm_allows(
 /// (`AgentRepository::operator_actor`, the caller-side definer read) names
 /// `target`, the claim's author. Never the author read on the caller side: a
 /// retired identity's key may be exposed. A lookup failure is an error, not a
-/// `false`.
+/// `false`. Read on `conn`, the act's transaction, under the link lock
+/// (`AgentRepository::operator_actor_for_act`), as the actor arm's read.
 pub(crate) async fn delegate_arm_allows(
-    server: &EpiGraphMcpFull,
+    conn: &mut sqlx::PgConnection,
     caller: uuid::Uuid,
     target: uuid::Uuid,
 ) -> Result<bool, McpError> {
-    let acting = epigraph_db::AgentRepository::operator_actor_pool(&server.pool, caller)
+    let acting = epigraph_db::AgentRepository::operator_actor_for_act(&mut *conn, caller)
         .await
         .map_err(internal_error)?;
     if !acting.is_some_and(|l| l.operator_id == target) {
@@ -2377,7 +2412,8 @@ pub async fn resolve_backlog_item(
     // fall back to the legacy agent-equality check against the server's
     // own signer agent — preserves backward compat for non-HTTP callers.
     let target_agent = original.agent_id.as_uuid();
-    let mut grant = require_owner_or_admin(server, auth, caller, target_agent).await?;
+    let mut grant =
+        require_owner_or_admin(server, &mut gate_tx, auth, caller, target_agent).await?;
 
     // The resolution claim takes the ORIGINAL's visibility
     // (docs/tenancy/claim-visibility-controls.md section 3.3), not the default
@@ -2512,9 +2548,22 @@ pub async fn resolve_backlog_item(
                 "claim {original_id} is no longer visible; nothing was written"
             ))
         })?;
-    if original_now.agent_id.as_uuid() != target_agent {
-        grant =
-            require_owner_or_admin(server, auth, caller, original_now.agent_id.as_uuid()).await?;
+    //
+    // A LINK grant is decided again here even when the author is unchanged:
+    // it rests on the caller's operator link, and the first decision's link
+    // lock went with `gate_tx`. Decided on THIS transaction, under the link
+    // lock, a retire of the link is serialised against the write (backlog
+    // 9a5bc055; `require_owner_or_admin`'s "`conn` is the act's own
+    // transaction").
+    if original_now.agent_id.as_uuid() != target_agent || grant.is_link() {
+        grant = require_owner_or_admin(
+            server,
+            &mut tx,
+            auth,
+            caller,
+            original_now.agent_id.as_uuid(),
+        )
+        .await?;
     }
     for basis_uuid in &basis_ids {
         ClaimRepository::get_by_id(&mut *tx, viewer, ClaimId::from_uuid(*basis_uuid))
@@ -2775,7 +2824,8 @@ async fn gate_retirement_label(
         .map_err(internal_error)?
         .ok_or_else(|| invalid_params(format!("claim {claim_id} not found")))?;
 
-    let grant = require_owner_or_admin(server, auth, caller, claim.agent_id.as_uuid()).await?;
+    let grant =
+        require_owner_or_admin(server, &mut *conn, auth, caller, claim.agent_id.as_uuid()).await?;
     // THE UNDECLARED-SIGNER ARM DOES NOT RETIRE (batch H-b review). That arm
     // admits a cross-agent mutation because ownership is UNDECIDABLE on a stdio
     // server with a per-process random signer, not because it is decided in
@@ -2962,7 +3012,10 @@ pub(crate) async fn relabel_claim(
             .await
             .map_err(internal_error)?
             .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
-        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+        Some(
+            require_owner_or_admin(server, &mut *tx, auth, caller, target.agent_id.as_uuid())
+                .await?,
+        )
     } else {
         None
     };
@@ -3068,7 +3121,10 @@ pub async fn patch_claim(
     // retirement label, which `gate_retirement_label` below now gates on every
     // transport, #374).
     let grant = if auth.is_some() {
-        Some(require_owner_or_admin(server, auth, caller, target.agent_id.as_uuid()).await?)
+        Some(
+            require_owner_or_admin(server, &mut tx, auth, caller, target.agent_id.as_uuid())
+                .await?,
+        )
     } else {
         None
     };

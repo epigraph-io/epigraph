@@ -374,18 +374,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         PRE_VIEWER,
     ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "operator_arm_allows",
-        2,
-        PRE_VIEWER,
-    ),
-    (
-        "epigraph-mcp/src/tools/claims.rs",
-        "delegate_arm_allows",
-        1,
-        PRE_VIEWER,
-    ),
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
         "epigraph-mcp/src/tools/ingestion.rs",
@@ -541,7 +529,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// `query_paper`) then moved onto the caller's stamped read: 72 -> 69.
 /// Migration 240 (backlog 88cf603b) moved `report_workflow_outcome`'s run row
 /// onto the author's stamp: 69 -> 68 (82 -> 81 on its own branch).
-const HIGH_WATER: usize = 68;
+/// The ownership gate's link arms (`operator_arm_allows`,
+/// `delegate_arm_allows`) then moved onto the act's own transaction (backlog
+/// 9a5bc055), removing three: 68 -> 65 (82 -> 79 on its own branch).
+const HIGH_WATER: usize = 65;
 
 // ===========================================================================
 // The scanner.

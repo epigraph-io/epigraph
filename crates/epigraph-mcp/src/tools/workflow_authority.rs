@@ -357,7 +357,7 @@ pub(crate) async fn require_workflow_authority(
     }
     // 2. The submitter's operator (#503; HTTP admits the operator itself, never
     //    the actor arm, exactly as `require_owner_or_admin` does).
-    if crate::tools::claims::operator_arm_allows(server, caller_agent, owner, false).await? {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(grant(WorkflowArm::Operator));
     }
     // 3. A delegate (R-183): the caller's acting link names the submitter,
@@ -612,18 +612,7 @@ async fn stdio_workflow_authority(
     if caller_agent == owner {
         return Ok(WorkflowArm::Submitter);
     }
-    // The upward operator arm, read on `conn` (the HTTP twin's own read; the
-    // pool read `claims::operator_arm_allows` makes would check out another
-    // connection while `conn` is held).
-    let submitter_op = epigraph_db::AgentRepository::operator_of_author(&mut *conn, owner)
-        .await
-        .map_err(|e| {
-            internal_error_logged(
-                format!("{tool_name}: could not read the submitter's operator"),
-                e,
-            )
-        })?;
-    if submitter_op.is_some_and(|l| l.operator_id == caller_agent) {
+    if crate::tools::claims::operator_arm_allows(&mut *conn, caller_agent, owner, false).await? {
         return Ok(WorkflowArm::Operator);
     }
     if let Some(operator) = delegate_arm(conn, caller_agent, owner, tool_name).await? {

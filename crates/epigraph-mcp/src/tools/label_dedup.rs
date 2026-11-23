@@ -883,7 +883,9 @@ async fn member_not_owned(
         return Ok(Some(format!("claim {id} is not readable by this identity")));
     };
     Ok(
-        match crate::tools::claims::require_owner_or_admin(server, auth, caller, author).await {
+        match crate::tools::claims::require_owner_or_admin(server, &mut *conn, auth, caller, author)
+            .await
+        {
             Ok(OwnershipGrant::UndeclaredSigner) => Some(format!(
                 "claim {id} is authored by agent {author}; this server has no declared signer, \
                  so whether it may act for that agent is undecided"
@@ -1115,9 +1117,11 @@ async fn write_check(
                     .map(|why| format!("not_owner: {why}"));
             let owned = reason.is_none();
             let grant = if auth.is_some() {
-                crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
-                    .await
-                    .ok()
+                crate::tools::claims::require_owner_or_admin(
+                    server, &mut read, auth, caller, author,
+                )
+                .await
+                .ok()
             } else {
                 None
             };
@@ -1127,8 +1131,10 @@ async fn write_check(
                 .chain(&w.remove)
                 .any(|l| l == crate::tools::claims::RETIREMENT_LABEL || retirement.contains(l));
             let (gate, retire_grant) = if touches {
-                match crate::tools::claims::require_owner_or_admin(server, auth, caller, author)
-                    .await
+                match crate::tools::claims::require_owner_or_admin(
+                    server, &mut read, auth, caller, author,
+                )
+                .await
                 {
                     Ok(OwnershipGrant::UndeclaredSigner) => {
                         reason.get_or_insert_with(|| {

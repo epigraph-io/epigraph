@@ -39,7 +39,7 @@ pub async fn supersede_claim(
     // The act's edges are attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, caller) = begin_claim_act(
+    let (mut tx, actor, caller, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -360,7 +360,15 @@ async fn begin_claim_act<'p>(
     canonical: Option<uuid::Uuid>,
     tool: &'static str,
     action: &str,
-) -> Result<(epigraph_db::ScopedTx<'p>, uuid::Uuid, uuid::Uuid), McpError> {
+) -> Result<
+    (
+        epigraph_db::ScopedTx<'p>,
+        uuid::Uuid,
+        uuid::Uuid,
+        Option<LinkAdmission>,
+    ),
+    McpError,
+> {
     let not_found = |id: uuid::Uuid| invalid_params(format!("claim {id} not found"));
 
     // The write identity (batch H-b, D1): the caller's own agent over HTTP,
@@ -374,8 +382,19 @@ async fn begin_claim_act<'p>(
             .await
             .map_err(internal_error)?
             .ok_or_else(|| not_found(claim))?;
-        crate::tools::claims::require_owner_or_admin(server, auth, caller, claim_author).await?;
-        return Ok((tx, caller.agent_id(), caller.agent_id()));
+        let grant = crate::tools::claims::require_owner_or_admin(
+            server,
+            &mut tx,
+            auth,
+            caller,
+            claim_author,
+        )
+        .await?;
+        let link = grant.is_link().then_some(LinkAdmission {
+            caller,
+            author: claim_author,
+        });
+        return Ok((tx, caller.agent_id(), caller.agent_id(), link));
     };
 
     let mut caller_tx = crate::claim_helper::begin_author_stamped_tx(server, caller, tool).await?;
@@ -428,7 +447,7 @@ async fn begin_claim_act<'p>(
     tracing::info!(tool, claim = %claim, arm = arm.as_str(), "claim act admitted");
 
     if viewer.writable_groups().contains(&owner_group) {
-        return Ok((caller_tx, caller.agent_id(), caller.agent_id()));
+        return Ok((caller_tx, caller.agent_id(), caller.agent_id(), None));
     }
     if arm != epigraph_auth::claim_act::ClaimActArm::Admin {
         // Not reachable through `claim_act_arm` (a non-admin arm requires the
@@ -444,7 +463,48 @@ async fn begin_claim_act<'p>(
         .await?;
     drop(caller_tx);
     let tx = crate::claim_helper::begin_author_stamped_tx(server, server_agent, tool).await?;
-    Ok((tx, server_agent.agent_id(), caller.agent_id()))
+    Ok((tx, server_agent.agent_id(), caller.agent_id(), None))
+}
+
+/// A claim act admitted through an operator link (`OwnershipGrant::is_link`):
+/// the caller and the claim author it was admitted over. Returned by
+/// [`begin_claim_act`] so an act that commits on ANOTHER transaction than the
+/// gate's (the un-mark, on the administrative connection) can decide the
+/// admission again there, under the link lock ([`LinkRecheck`]). An act that
+/// commits on the transaction `begin_claim_act` returns needs nothing more:
+/// the gate already read the link on it, under the lock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LinkAdmission {
+    caller: crate::write_identity::WriteIdentity,
+    author: uuid::Uuid,
+}
+
+/// [`LinkAdmission`] decided again on the un-mark's own (administrative)
+/// transaction, before its act: `require_owner_or_admin` on that transaction,
+/// whose link arms take the link lock (backlog 9a5bc055). The un-mark's gate
+/// ran on the caller's transaction and rolled it back, which released the lock;
+/// without this a link retire committed between that gate and the un-mark's
+/// commit did not stop the un-mark.
+struct LinkRecheck<'a> {
+    server: &'a EpiGraphMcpFull,
+    auth: Option<&'a epigraph_auth::AuthContext>,
+    link: LinkAdmission,
+}
+
+#[async_trait::async_trait]
+impl admin_cascade::UnmarkPrecondition for LinkRecheck<'_> {
+    async fn check(&self, tx: &mut sqlx::PgConnection) -> Result<(), String> {
+        crate::tools::claims::require_owner_or_admin(
+            self.server,
+            tx,
+            self.auth,
+            self.link.caller,
+            self.link.author,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{}; nothing was changed", e.message))
+    }
 }
 
 pub async fn mark_duplicate(
@@ -474,8 +534,10 @@ pub async fn mark_duplicate(
 /// and nothing else: the caller's authority over both claims, read through
 /// the caller ([`begin_claim_act`]). The transaction it opens is rolled back.
 /// Returns the principal the act would be stamped as (the caller, or this
-/// server's agent on a `claims:admin` borrow). [`mark_duplicates_onto`] asks
-/// it for every duplicate before it opens its one transaction.
+/// server's agent on a `claims:admin` borrow) and, for a grant through an
+/// operator link, the [`LinkAdmission`] to decide again on the transaction
+/// that commits. [`mark_duplicates_onto`] asks it for every duplicate before
+/// it opens its one transaction.
 async fn mark_duplicate_preflight(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -483,8 +545,8 @@ async fn mark_duplicate_preflight(
     dup: uuid::Uuid,
     canon: uuid::Uuid,
     tool: &'static str,
-) -> Result<uuid::Uuid, McpError> {
-    let (tx, actor, _) = begin_claim_act(
+) -> Result<(uuid::Uuid, Option<LinkAdmission>), McpError> {
+    let (tx, actor, _, link) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -495,7 +557,7 @@ async fn mark_duplicate_preflight(
     )
     .await?;
     drop(tx);
-    Ok(actor)
+    Ok((actor, link))
 }
 
 /// Several dedup acts onto ONE canonical, all or nothing
@@ -544,8 +606,11 @@ pub(crate) async fn mark_duplicates_onto(
 
     // 1. Every gate, before anything is written; each names its stamp.
     let mut stamp: Option<uuid::Uuid> = None;
+    let mut links: Vec<LinkAdmission> = Vec::new();
     for dup in dups {
-        let actor = mark_duplicate_preflight(server, viewer, auth, *dup, canon, tool).await?;
+        let (actor, link) =
+            mark_duplicate_preflight(server, viewer, auth, *dup, canon, tool).await?;
+        links.extend(link);
         match stamp {
             None => stamp = Some(actor),
             Some(s) if s == actor => {}
@@ -564,7 +629,7 @@ pub(crate) async fn mark_duplicates_onto(
     // 2. The one transaction. The identity edges are attested at INSERT with
     // the server's key (backlog `dae795f8`), resolved before it opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -579,6 +644,21 @@ pub(crate) async fn mark_duplicates_onto(
             "{tool}: the write identity for claim {first} changed while the call ran (a \
              membership change); nothing was written. Retry."
         )));
+    }
+    // Every grant the gates made through an operator link is decided again
+    // HERE, on the transaction that commits the marks, whose link arms take
+    // the link lock (backlog 9a5bc055): each gate ran on its own transaction
+    // and rolled it back, which released the lock, so a link retired since
+    // then must still refuse the batch before anything is written.
+    for link in &links {
+        crate::tools::claims::require_owner_or_admin(
+            server,
+            &mut tx,
+            auth,
+            link.caller,
+            link.author,
+        )
+        .await?;
     }
     let n = dups.len();
     let rolled_back = |e: epigraph_db::DbError| -> McpError {
@@ -729,7 +809,7 @@ pub(crate) async fn mark_duplicate_pair(
     // The identity edge is attested at INSERT with the server's key (backlog
     // `dae795f8`), resolved before the act's transaction opens.
     let edge_key = server.edge_signing_key().await?;
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, _) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -836,6 +916,9 @@ pub(crate) struct UnmarkGate {
     author: uuid::Uuid,
     content: String,
     actor: uuid::Uuid,
+    /// Set when the gate admitted the caller through an operator link: the
+    /// un-mark decides it again on its own transaction ([`LinkRecheck`]).
+    link: Option<LinkAdmission>,
 }
 
 /// Every check `unmark_duplicate` makes before it writes, and nothing else:
@@ -899,7 +982,7 @@ pub(crate) async fn unmark_gate(
              written"
         )));
     }
-    let (mut tx, actor, _) = begin_claim_act(
+    let (mut tx, actor, _, link) = begin_claim_act(
         server,
         viewer,
         auth,
@@ -926,7 +1009,7 @@ pub(crate) async fn unmark_gate(
     // The same gate over each claim that replaced the canonical: the reversal
     // moves the duplicate's rows off it as off the canonical.
     for replacement in chain.iter().flat_map(|c| c.iter().skip(1)) {
-        let (mut tx, _, _) = begin_claim_act(
+        let (mut tx, _, _, _) = begin_claim_act(
             server,
             viewer,
             auth,
@@ -957,6 +1040,7 @@ pub(crate) async fn unmark_gate(
         author,
         content,
         actor,
+        link,
     })
 }
 
@@ -976,6 +1060,7 @@ pub(crate) async fn unmark_duplicate_expecting(
         author,
         content,
         actor,
+        link,
     } = unmark_gate(server, viewer, auth, dup, expected).await?;
     let chain =
         chain.map_err(|why| invalid_params(format!("claim {dup} {why}; nothing was written")))?;
@@ -996,8 +1081,9 @@ pub(crate) async fn unmark_duplicate_expecting(
         dup,
         Some(canonical),
     );
+    let recheck = link.map(|link| LinkRecheck { server, auth, link });
     let (conn, admin_viewer) = session.split();
-    let (outcome, belief_cascade) = admin_cascade::apply_unmark_authorized(
+    let (outcome, belief_cascade) = admin_cascade::apply_unmark_checked(
         conn,
         admin_viewer,
         viewer,
@@ -1005,6 +1091,9 @@ pub(crate) async fn unmark_duplicate_expecting(
         dup,
         canonical,
         Some(&chain),
+        recheck
+            .as_ref()
+            .map(|r| r as &dyn admin_cascade::UnmarkPrecondition),
     )
     .await
     .map_err(|e| match e {
