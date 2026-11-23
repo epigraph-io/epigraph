@@ -394,3 +394,58 @@ async fn unauthenticated_unscoped_and_malformed_requests_write_nothing(pool: PgP
     assert_eq!(status, StatusCode::OK, "{out}");
     assert_eq!(out["changed"][0]["outcome"], json!("confirmed"), "{out}");
 }
+
+/// Two ingesters named the same person on the same paper. `ingested_by`
+/// confirms only that ingester's naming: the other stays pending (no label,
+/// in force), so the card still counts the paper as pending until the
+/// person acts on it too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingested_by_confirms_only_that_ingesters_naming(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (s1, _) = viewer_fixture::seed_agent_with_group(&pool, "countersign-ingester-1").await;
+    let (s2, _) = viewer_fixture::seed_agent_with_group(&pool, "countersign-ingester-2").await;
+    let h = human(&pool, "Juno Ashgrove").await;
+    let (third, _) = viewer_fixture::seed_agent_with_group(&pool, "countersign-third").await;
+    let p = paper(&pool, "10.9999/countersign-http-one-ingest").await;
+    let e1 = pending_naming(&pool, s1, h, p).await;
+    let e2 = pending_naming(&pool, s2, h, p).await;
+    let before2 = edge_state(&pool, e2).await;
+
+    let token = common::mint_token_with_agent(&["claims:write"], h);
+    let (status, out) = send(
+        &state,
+        Method::POST,
+        &format!("/api/v1/papers/{p}/authors/countersign"),
+        Some(token),
+        Some(json!({"decision": "confirm", "ingested_by": s1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(
+        out["changed"],
+        json!([{"edge_id": e1, "ingested_by": s1, "outcome": "confirmed"}]),
+        "only s1's naming: {out}"
+    );
+    assert!(edge_state(&pool, e1)
+        .await
+        .0
+        .contains(&format!("epigraph:countersigned_by:{h}")));
+    assert_eq!(
+        edge_state(&pool, e2).await,
+        before2,
+        "the other ingester's naming is untouched"
+    );
+    assert_eq!(
+        card_counts(&state, third, h, "Juno Ashgrove").await,
+        (json!(1), json!(0)),
+        "one confirmed row makes the paper authored"
+    );
+
+    let (status, rest) = countersign_as(&state, h, p, "confirm", None).await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    assert_eq!(
+        rest["changed"],
+        json!([{"edge_id": e2, "ingested_by": s2, "outcome": "confirmed"}]),
+        "the remaining naming is s2's: {rest}"
+    );
+}
