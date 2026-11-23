@@ -17,19 +17,16 @@
 //!   WITHHELD (named in [`PromptSnapshot::withheld_files`]), never returned as
 //!   someone else's text; and since blobs are shared across agents, one bad
 //!   blob withholds that one file, not every history that names it.
-//! * [`AgentIdentityRepository::prompt_history_index`] and
+//! * [`AgentIdentityRepository::prompt_history_page`] and
 //!   [`AgentIdentityRepository::prompt_history_blob`] split that read for a
-//!   server: the first projects only the hashes and metadata out of the same
-//!   definer, so no file content crosses the connection; the second fetches,
-//!   decompresses and verifies the ONE file a readable snapshot in that
-//!   history names. A server's memory then grows with the number of snapshots
-//!   and with one file, not with the sum of every file. (The definer itself
-//!   still builds its whole result, content included, inside the database.)
-//! * [`AgentIdentityRepository::prompt_history_page`] reads migration 268's
-//!   content-free definer `epigraph_agent_prompt_history_meta` (161's gate and
-//!   walk, hashes and metadata only, never `agent_prompt_blobs`), one keyset
-//!   page at a time, so no file content is built or crosses the connection
-//!   and a page is bounded in rows.
+//!   server. The first reads migration 268's content-free definer
+//!   `epigraph_agent_prompt_history_meta` (161's gate and walk, hashes and
+//!   metadata only, never `agent_prompt_blobs`), one keyset page at a time, so
+//!   no file content is built or crosses the connection for a listing and a
+//!   page is bounded in rows. The second fetches, decompresses and verifies
+//!   the ONE file a readable snapshot in that history names; it still reads
+//!   through 161's definer, which builds the whole lineage's content inside
+//!   the database for that one file.
 
 use std::borrow::Cow;
 
@@ -476,31 +473,6 @@ impl AgentIdentityRepository {
         .fetch_all(&mut *conn)
         .await?;
         Ok(rows.into_iter().map(history_entry).collect())
-    }
-
-    /// [`Self::prompt_history`] without any file content: the same definer,
-    /// the same gate and the same rows, each file named by its key only. No
-    /// blob crosses the connection.
-    ///
-    /// # Errors
-    /// As [`Self::prompt_history`]; and [`DbError::InvalidData`] for a stored
-    /// key that is not 32 bytes (the blob table's CHECK makes that
-    /// unreachable).
-    pub async fn prompt_history_index(
-        conn: &mut sqlx::PgConnection,
-        agent_id: Uuid,
-    ) -> Result<Vec<PromptHistoryIndexEntry>, DbError> {
-        let rows = sqlx::query_as::<_, IndexRow>(
-            "SELECT agent_id, relation, depth, readable, snapshot_id, group_folder, model, \
-                    prompt_hash, in_prompt, blob_refused, runner_version, host_sha, first_seen, \
-                    last_seen, identity_md_hash, global_claude_md_hash, group_claude_md_hash, \
-                    learned_md_hash \
-               FROM public.epigraph_agent_prompt_history($1)",
-        )
-        .bind(agent_id)
-        .fetch_all(&mut *conn)
-        .await?;
-        rows.into_iter().map(index_entry).collect()
     }
 
     /// One page of [`Self::prompt_history`] without any file content, through

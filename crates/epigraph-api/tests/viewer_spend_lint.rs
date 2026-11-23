@@ -147,7 +147,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "agent_prompt_history.rs",
         "get_prompt_history",
         &[
-            "AgentIdentityRepository::prompt_history_index",
+            "AgentIdentityRepository::prompt_history_page",
             "AgentRepository::get_by_id",
         ],
     ),
