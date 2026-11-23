@@ -107,13 +107,19 @@ class AffectedSelection(unittest.TestCase):
         self.assertLessEqual(shards_of("epigraph-api") | shards_of("epigraph-cli"), shard_ids(d))
 
     def test_docs_only_change_runs_no_shard_and_no_gated_job(self):
-        # A doc no Rust source reads (the runbooks, docs/intro and README.md
-        # are read by tests; see the next test).
-        d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/deploy.md"])
+        # A doc no Rust source reads (the runbooks, docs/intro, README.md and
+        # the configuration docs are read by tests; see the next tests).
+        d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/governance/release-policy.md"])
         self.assertEqual(d["mode"], "affected")
         self.assertEqual(d["ids"], [])
         self.assertEqual(d["matrix"], {"include": []})
         self.assertEqual(d["run"], {job: False for job in d["run"]})
+
+    def test_a_configuration_doc_change_runs_the_env_var_docs_lint(self):
+        # Deleting a variable's row from docs/deploy.md fails env_var_docs.
+        for path in ("docs/deploy.md", "README.md", "services/explorer/README.md"):
+            d = pr_plan([path])
+            self.assertIn("env_var_docs", d["partial"].get("epigraph-engine", {}), path)
 
     def test_python_outside_scripts_runs_no_shard(self):
         d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])

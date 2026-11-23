@@ -167,8 +167,11 @@ WALKERS = {
         "crates/*/src/*",
         "services/*/src/*",
     ),
-    # The shared walker behind calibration_single_loader_ratchet.rs and
-    # belief_mode_readers.rs (both `#[path]`-include it).
+    # Every environment read under crates/*/src (via support/rust_sources.rs)
+    # and services/*/src, against the docs it names and each service's README.
+    "crates/epigraph-engine/tests/env_var_docs.rs": ("services/*/src/*", "services/*/README.md"),
+    # The shared walker behind calibration_single_loader_ratchet.rs,
+    # belief_mode_readers.rs and env_var_docs.rs (each `#[path]`-includes it).
     "crates/epigraph-engine/tests/support/rust_sources.rs": (
         "crates/*/src/*",
         "crates/*/build.rs",
