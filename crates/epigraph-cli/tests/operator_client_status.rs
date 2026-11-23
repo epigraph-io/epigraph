@@ -513,7 +513,10 @@ async fn revoking_an_active_client_kills_its_live_refresh_chains(pool: PgPool) {
         StatusCode::OK,
         "the held refresh token is dead: {rt_body}"
     );
-    assert_eq!(cc_status, StatusCode::UNAUTHORIZED, "{cc_body}");
+    // A revoked client is not ACTIVE, so `client_credentials` refuses it as
+    // unknown: RFC 6749 `invalid_client`, 400 (backlog 31d799b3).
+    assert_eq!(cc_status, StatusCode::BAD_REQUEST, "{cc_body}");
+    assert_eq!(cc_body["error"], "invalid_client", "{cc_body}");
     assert_eq!(rows.len(), 1, "{rows:?}");
     let (kind, d) = &rows[0];
     assert_eq!(kind, "oauth.client_revoked");

@@ -335,10 +335,11 @@ async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
         post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "client_credentials minted for a seed-derived key: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 
     let (status, body) = post_token(
         &app,
@@ -347,10 +348,11 @@ async fn a_seed_derived_agent_key_cannot_authenticate(pool: PgPool) {
     .await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the refresh grant accepted a seed-derived key's assertion: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 }
 
 /// The refusal is "anything but `ed25519`", not `seed-derived` only: the
@@ -382,10 +384,11 @@ async fn a_derived_agent_key_cannot_authenticate(pool: PgPool) {
         post_token(&app, credentials_grant(&client_id, &fresh_assertion(&key))).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "client_credentials minted for a derived (non-verifier) key: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 }
 
 /// The refusal reads the kind of an agent that HOLDS the key; a key no agent

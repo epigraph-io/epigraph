@@ -1148,13 +1148,16 @@ async fn an_agent_assertion_mints_exactly_once_on_the_app_role(pool: PgPool) {
     statuses.sort();
     assert_eq!(
         statuses,
-        [StatusCode::OK, StatusCode::UNAUTHORIZED],
+        // A replay is refused as RFC 6749 `invalid_client`, 400 (backlog
+        // 31d799b3), so the sorted pair is 200, 400.
+        [StatusCode::OK, StatusCode::BAD_REQUEST],
         "two presentations of one assertion issued together mint exactly once: {} / {}",
         a.1,
         b.1
     );
     let (status, body) = post_token(app.clone(), grant(&captured)).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "a later replay: {body}");
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a later replay: {body}");
+    assert_eq!(body["error"], "invalid_client", "a later replay: {body}");
 
     let (status, body) = post_token(app.clone(), grant(&assertion())).await;
     assert_eq!(
