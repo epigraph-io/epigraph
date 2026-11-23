@@ -1015,6 +1015,9 @@ async fn serve_process(login: &AppLogin) -> (served::Server, Duration) {
         let mut cmd = served::base_command(&dsn);
         // Loopback only: the default binds every interface.
         cmd.env("EPIGRAPH_BIND_ADDR", "127.0.0.1");
+        // Each sample is stopped by SIGTERM once timed (to read what it
+        // answered): bound the drain.
+        cmd.env("EPIGRAPH_SHUTDOWN_GRACE_SECS", "5");
         if let Some(secret) = secret {
             cmd.env("EPIGRAPH_JWT_SECRET", secret);
         }
@@ -1197,6 +1200,30 @@ fn check_answer(ask: &Ask, h: &Hit, s: &Seeded) -> Option<Uuid> {
     }
 }
 
+/// The paths of the requests a server answered, in order, from its log after
+/// the serving line: one `request finished` line per request
+/// (`serving.rs::log_response`). The shutdown's "every in-flight request
+/// finished" is not a request.
+fn answered(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.contains("request finished") && !l.contains("in-flight"))
+        .collect()
+}
+
+/// Backlog 01d7e2ff: a fresh-process sample times the process's FIRST
+/// request (a switch's second, after its untimed flip-from). Anything the
+/// process answered before it, a warm-up or a readiness probe, would make
+/// the arm measure a warm process under the `process` label.
+fn assert_first_requests(log: &str, expect: &[String]) {
+    let got = answered(log);
+    assert!(
+        got.len() == expect.len() && got.iter().zip(expect).all(|(l, p)| l.contains(p.as_str())),
+        "a fresh process must answer exactly {expect:?}, in order, the timed one last; \
+         it answered:\n{}\nfull log after serving:\n{log}",
+        got.join("\n")
+    );
+}
+
 /// What one run measured: the samples, and each fresh process's start-up.
 struct Measured {
     samples: Samples,
@@ -1307,8 +1334,28 @@ async fn measure(
                 .entry((kind, Temp::Process))
                 .or_default()
                 .push(h.took);
+            // Close the client's connections (and the proxy's) first, so the
+            // drain has nothing in flight; stop the process off the runtime
+            // so those connection tasks can run meanwhile.
+            drop(c);
             drop(proxy);
-            drop(srv);
+            let expect: Vec<String> = before
+                .iter()
+                .map(|b| b.path(s.team))
+                .chain([ask.path(s.team)])
+                .collect();
+            let mut srv = srv;
+            let log = tokio::task::spawn_blocking(move || {
+                let (status, log) = srv.terminate(Duration::from_secs(15));
+                assert!(
+                    status.is_some(),
+                    "a fresh process did not stop within 15 s of SIGTERM:\n{log}"
+                );
+                log
+            })
+            .await
+            .expect("join the stop");
+            assert_first_requests(&log, &expect);
         }
     }
 
