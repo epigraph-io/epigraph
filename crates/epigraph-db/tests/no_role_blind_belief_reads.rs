@@ -29,12 +29,13 @@
 //!   the compound predicate) holds rows the role already filtered, so its
 //!   field reads are not role-blind. Files whose path names `belief_view`
 //!   are the sanctioned home of these reads and are not scanned for them.
-//! * **Column list** (Rust only, backlog 4e4d6ad4): the unit names a
-//!   `const` array of cache column names (`CACHE_COLUMN_NAMES`) that it
-//!   splices into SQL with `format!`, directly or through a text-returning
-//!   helper of its file (see Known limits for the exact shape). No SQL
-//!   literal names the column, so without this a unit that reads only
-//!   through such a list measures as write-only.
+//! * **Column list** (Rust only, backlog 4e4d6ad4): the unit uses a list of
+//!   cache column names (`CACHE_COLUMN_NAMES`, a `const COLS: &str =
+//!   "belief, pignistic_prob"`, a fn-local array) that it splices into SQL
+//!   with `format!`, directly or through a text-returning helper of its file
+//!   (see Known limits for the exact shapes). No SQL literal names the
+//!   column, so without this a unit that reads only through such a list
+//!   measures as write-only.
 //!
 //! # Classified, registered, or a finding
 //!
@@ -62,24 +63,31 @@
 //!   the row type or calls its producer; a row handed to a helper that names
 //!   neither is not seen. Units with the same name in one file share a key.
 //! * Lower-case SQL is not SQL to this scan; the tree has none today.
-//! * A column list assembled at runtime is measured only in one shape: a
-//!   module- or `impl`-level `const` / `static` holding a cache column name
-//!   as a whole string literal (`belief_cache.rs`'s `CACHE_COLUMN_NAMES`).
-//!   Every unit whose code names it reads, and so does every unit calling a
-//!   fn OF THE SAME FILE that names it and returns text (`String`, `&str`,
-//!   `Cow`), transitively; propagation stops at a fn returning anything
-//!   else, which ran the statement itself. Not seen: a list local to a fn (a
-//!   `let` array or a fn-local `const`), a list of `truth_value` (a belief
-//!   only in context), a list built from parts or read from elsewhere, a text
-//!   helper called from another file, or a helper that returns the array
-//!   itself rather than text. A whole `#[cfg(test)]` module file is out of
-//!   scope for this rule.
+//! * A column list assembled at runtime is measured in these shapes only.
+//!   The list is a string literal of identifiers, each optionally qualified,
+//!   separated by commas or whitespace, one naming a cache column
+//!   (`"belief"`, `"c.belief, c.pignistic_prob"`; SQL text is the SQL
+//!   rule's), held by a `const` / `static` (module-, `impl`- or fn-level) or
+//!   by a string-only array literal inside a fn (a `let` array, `vec![..]`).
+//!   A module- or `impl`-level list is read by every unit, in any file, whose
+//!   code names it or whose format string captures it (`"{COLS}"`); a
+//!   fn-level one by its fn. A unit calling a fn OF THE SAME FILE that reads
+//!   a list and returns text (`String`, `&str`, `Cow`) reads it too,
+//!   transitively; propagation stops at a fn returning anything else, which
+//!   ran the statement itself. Not seen: a bare literal in a fn outside a
+//!   `const` or array (`json!({"belief": x})` is not a list), a list of
+//!   `truth_value` (a belief only in context), a list built from parts
+//!   (`concat!`, pushed into a `Vec`) or read from elsewhere, a text helper
+//!   called from another file, or the callers of a helper that returns the
+//!   array itself rather than text. A whole `#[cfg(test)]` module file is
+//!   out of scope for this rule.
 
 mod belief_lint;
 
 use belief_lint::{
-    find_words, has_word, is_sql, is_write_sql, python_unit_at, python_view, rust_fns,
-    rust_sources, rust_view, script_sources, sql_without_comments, with_scratch, RustUnits, Source,
+    balanced_end, find_words, has_word, is_sql, is_write_sql, python_unit_at, python_view,
+    rust_fns, rust_sources, rust_view, script_sources, sql_without_comments, with_scratch,
+    RustUnits, Source, View,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -471,18 +479,45 @@ fn test_module_files(rust: &[Source]) -> BTreeSet<String> {
     out
 }
 
+/// Is `lit` a column list naming a cache column: one or more identifiers,
+/// each optionally qualified (`c.belief`), separated by commas or
+/// whitespace, one of them ending in a [`FIELDS`] name? `"belief"` and
+/// `"belief, pignistic_prob"` are; a statement is not (an UPPER-case
+/// keyword token: the SQL rule reads it, and a SQL `const` is registered as
+/// itself), nor is any other text.
+fn is_column_list_text(lit: &str) -> bool {
+    let keyword = |t: &str| t.chars().all(|c| c.is_ascii_uppercase());
+    let ident = |p: &str| {
+        p.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let toks: Vec<&str> = lit
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .collect();
+    !toks.is_empty()
+        && toks.iter().all(|t| !keyword(t) && t.split('.').all(ident))
+        && toks
+            .iter()
+            .any(|t| FIELDS.contains(&t.rsplit('.').next().unwrap_or(t)))
+}
+
 /// The column lists of `rust`: every module-level (or `impl`-level) `const` /
-/// `static` item holding a cache column name ([`FIELDS`]) as a whole string
-/// literal, such as `belief_cache.rs`'s `CACHE_COLUMN_NAMES`. Such a list is
-/// spliced into SQL at runtime (`format!` over the array), so no SQL literal
-/// names the column and the SQL scan cannot see the read.
+/// `static` item holding a column-list literal ([`is_column_list_text`]),
+/// such as `belief_cache.rs`'s `CACHE_COLUMN_NAMES` or a
+/// `const COLS: &str = "belief, pignistic_prob"`. Such a list is spliced into
+/// SQL at runtime (`format!` over the array, or `{COLS}` in the format
+/// string), so no SQL literal names the column and the SQL scan cannot see
+/// the read. A list local to a fn is [`local_column_lists`]'s.
 fn column_list_consts(rust: &[Source], test_files: &BTreeSet<String>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for s in rust.iter().filter(|s| !test_files.contains(&s.path)) {
         let view = rust_view(&s.text);
         let units = RustUnits::new(&view.code);
         for lit in &view.literals {
-            if !FIELDS.contains(&lit.text.trim()) {
+            if !is_column_list_text(&lit.text) {
                 continue;
             }
             if let Some(name) = units.unit_at(lit.start).0.strip_prefix("const ") {
@@ -491,6 +526,66 @@ fn column_list_consts(rust: &[Source], test_files: &BTreeSet<String>) -> BTreeSe
         }
     }
     out
+}
+
+/// Is the literal whose content starts at `at` an element of an array
+/// literal that holds string literals only (`["belief", "pignistic_prob"]`,
+/// `vec![..]`), and not an index (`row["belief"]`)? On a code view, where a
+/// literal's contents are blanked and its quotes kept.
+fn in_string_array(code: &str, at: usize) -> bool {
+    let filler = |c: char| matches!(c, ' ' | '\n' | '\t' | '\r' | ',' | '"');
+    let Some(open) = code[..at].rfind(|c: char| !filler(c)) else {
+        return false;
+    };
+    if code.as_bytes()[open] != b'[' {
+        return false;
+    }
+    let indexed = code[..open]
+        .trim_end()
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']');
+    let end = balanced_end(code, open, b'[', b']');
+    !indexed && end > open + 1 && code[open + 1..end - 1].chars().all(filler)
+}
+
+/// The column lists local to a fn of one Rust view: `(offset, label)` per
+/// column-list literal ([`is_column_list_text`]) inside a fn that is held by
+/// a fn-local `const` / `static` (labelled by its name) or is an element of
+/// a string-only array literal, such as a `let` array (labelled `fn-local
+/// array`). The enclosing fn reads it; [`column_list_readers`] credits it.
+/// A bare literal in a fn (`json!({"belief": x})`, `("belief", v)`) is not
+/// a list.
+fn local_column_lists(view: &View, units: &RustUnits) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for lit in &view.literals {
+        let Some(f) = units.fn_at(lit.start) else {
+            continue;
+        };
+        if !is_column_list_text(&lit.text) {
+            continue;
+        }
+        let local_const = units
+            .const_at(lit.start)
+            .filter(|(_, s, _)| *s > f.sig_start)
+            .map(|(name, _, _)| name.to_string());
+        if let Some(name) = local_const {
+            out.push((lit.start, name));
+        } else if in_string_array(&view.code, lit.start) {
+            out.push((lit.start, "fn-local array".to_string()));
+        }
+    }
+    out
+}
+
+/// Does format-string text `lit` capture `name` inline (`{name}`,
+/// `{name:?}`), not as an escaped `{{name}`?
+fn captures(lit: &str, name: &str) -> bool {
+    let pat = format!("{{{name}");
+    lit.match_indices(&pat).any(|(i, _)| {
+        let after = &lit[i + pat.len()..];
+        (after.starts_with('}') || after.starts_with(':')) && !lit[..i].ends_with('{')
+    })
 }
 
 /// Does a fn returning `ret` hand back text (`String`, `&str`, `Cow<str>`)?
@@ -523,17 +618,21 @@ fn is_call_at(code: &str, at: usize, name: &str) -> bool {
 /// One column-list reader: `(unit, its code span, the list it reads)`.
 type ColumnListReader = (String, Option<(usize, usize)>, String);
 
-/// The units of one Rust code view that read a column list: `(unit, span,
+/// The units of one Rust view that read a column list: `(unit, span,
 /// list)`. A unit reads one when its code names the list (or a `const` of the
-/// same file that names it), or calls a fn of the same file that names it and
-/// returns text (such as `belief_cache.rs`'s `cache_equals`), transitively.
-/// Propagation stops at the first fn that does not return text: that fn
-/// builds and runs the statement, so it is the reader, not its callers.
+/// same file that names it), when one of its format strings captures it
+/// inline (`"SELECT {COLS} FROM claims"`), when it holds a list local to it
+/// ([`local_column_lists`]), or when it calls a fn of the same file that
+/// reads one and returns text (such as `belief_cache.rs`'s `cache_equals`),
+/// transitively. Propagation stops at the first fn that does not return
+/// text: that fn builds and runs the statement, so it is the reader, not its
+/// callers.
 fn column_list_readers(
-    code: &str,
+    view: &View,
     units: &RustUnits,
     lists: &BTreeSet<String>,
 ) -> Vec<ColumnListReader> {
+    let code = view.code.as_str();
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     let mut done = BTreeSet::new();
@@ -542,14 +641,34 @@ fn column_list_readers(
         .iter()
         .map(|l| (l.clone(), false, l.clone()))
         .collect();
+    for (at, list) in local_column_lists(view, units) {
+        let Some(f) = units.fn_at(at) else {
+            continue;
+        };
+        if seen.insert(f.name.clone()) {
+            out.push((f.name.clone(), Some((f.sig_start, f.end)), list.clone()));
+        }
+        if returns_text(f.return_type(code)) {
+            queue.push((f.name.clone(), true, list));
+        }
+    }
     while let Some((name, is_fn, list)) = queue.pop() {
         if !done.insert((name.clone(), is_fn)) {
             continue;
         }
-        for at in find_words(code, &name) {
-            if is_fn && !is_call_at(code, at, &name) {
-                continue;
-            }
+        let mut hits: Vec<usize> = find_words(code, &name)
+            .into_iter()
+            .filter(|&at| !is_fn || is_call_at(code, at, &name))
+            .collect();
+        if !is_fn {
+            hits.extend(
+                view.literals
+                    .iter()
+                    .filter(|l| captures(&l.text, &name))
+                    .map(|l| l.start),
+            );
+        }
+        for at in hits {
             let (unit, span) = units.unit_at(at);
             if unit == "<module>" || unit == format!("const {name}") {
                 continue; // a `use`, or the item's own definition
@@ -597,16 +716,15 @@ fn measure(rust: &[Source], scripts: &[Source]) -> Measured {
             u.reads |= !is_write_sql(&sql);
             u.marked |= marked(span);
         }
-        let lists = if test_files.contains(&s.path) {
-            BTreeSet::new()
-        } else {
-            column_lists.clone()
-        };
-        for (unit, span, list) in column_list_readers(&view.code, &units, &lists) {
-            let u = out.entry((s.path.clone(), unit)).or_default();
-            u.kinds.insert(format!("column list {list}"));
-            u.reads = true;
-            u.marked |= marked(span);
+        // A whole `#[cfg(test)]` module file is out of scope: a unit test's
+        // fixture list, module-level or fn-local, is not a served read.
+        if !test_files.contains(&s.path) {
+            for (unit, span, list) in column_list_readers(&view, &units, &column_lists) {
+                let u = out.entry((s.path.clone(), unit)).or_default();
+                u.kinds.insert(format!("column list {list}"));
+                u.reads = true;
+                u.marked |= marked(span);
+            }
         }
         if s.path.contains("belief_view") {
             continue;
@@ -1365,4 +1483,141 @@ pub async fn scratch_outer(pool: &sqlx::PgPool) -> usize {
         !live.keys().any(|(p, _)| p == contract_tests),
         "{contract_tests} is out of scope"
     );
+}
+
+/// The other shapes a column list may take, each a new role-blind reader
+/// that must be a finding: an array or a `const` local to the fn, and a
+/// comma-separated list in one `const` string, spliced positionally or
+/// captured inline (`{COLS}`, which no code token names). The fn-local
+/// twin that splices the role predicate is classified.
+#[test]
+fn every_column_list_shape_fails_unless_registered() {
+    let rust = rust_sources();
+    let scripts = script_sources();
+    let new_reader = |label: &str, text: &str, unit: &str| {
+        let f = findings(&measure(
+            &with_scratch(&rust, SCRATCH_LIST_PATH, text),
+            &scripts,
+        ));
+        assert!(
+            f.iter()
+                .any(|l| l.contains(&format!("{SCRATCH_LIST_PATH}::{unit}: NEW"))),
+            "{label}: {unit} reads a column list and must be a finding; got {f:#?}"
+        );
+    };
+
+    new_reader(
+        "fn-local const array",
+        r#"
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    const COLS: [&str; 2] = ["belief", "pignistic_prob"];
+    let sql = format!("SELECT {} FROM claims c", COLS.join(", "));
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#,
+        "scratch_list_read",
+    );
+    new_reader(
+        "fn-local let array",
+        r#"
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    let cols = vec!["plausibility", "belief"];
+    let sql = format!("SELECT {} FROM claims c", cols.join(", "));
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#,
+        "scratch_list_read",
+    );
+    let inline = r#"
+const SCRATCH_COLS: &str = "belief, pignistic_prob";
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    let sql = format!("SELECT {SCRATCH_COLS} FROM claims c");
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    new_reader(
+        "module const string, inline capture",
+        inline,
+        "scratch_list_read",
+    );
+    new_reader(
+        "module const string, positional",
+        &inline.replace(
+            r#"format!("SELECT {SCRATCH_COLS} FROM claims c")"#,
+            r#"format!("SELECT {} FROM claims c", SCRATCH_COLS)"#,
+        ),
+        "scratch_list_read",
+    );
+    // A fn-local list in a text helper taints the helper's caller too.
+    let helper = r#"
+fn scratch_select() -> String {
+    const COLS: &str = "pignistic_prob";
+    format!("SELECT {COLS} FROM claims c")
+}
+pub async fn scratch_run(pool: &sqlx::PgPool) -> Vec<f64> {
+    sqlx::query_scalar(&scratch_select()).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    new_reader("fn-local list in a text helper", helper, "scratch_select");
+    new_reader("caller of that helper", helper, "scratch_run");
+
+    let spliced = r#"
+use epigraph_db::repos::claim_role::{render, IS_COMPOUND_SQL};
+pub async fn scratch_list_read(pool: &sqlx::PgPool) -> Vec<(f64, f64)> {
+    let cols = ["belief", "pignistic_prob"];
+    let sql = format!(
+        "SELECT {} FROM claims c WHERE NOT {}",
+        cols.join(", "),
+        render(IS_COMPOUND_SQL, "c")
+    );
+    sqlx::query_as(&sql).fetch_all(pool).await.unwrap_or_default()
+}
+"#;
+    let f = findings(&measure(
+        &with_scratch(&rust, SCRATCH_LIST_PATH, spliced),
+        &scripts,
+    ));
+    assert!(
+        !names(&f, SCRATCH_LIST_PATH),
+        "a fn-local column-list reader that splices IS_COMPOUND_SQL is classified; got {f:#?}"
+    );
+}
+
+/// The widened shapes stay bounded: a cache column name as a JSON key, a
+/// tuple element or an index, and a SQL `const` (the SQL rule's, registered
+/// as itself), are not column lists; the live tree gains no reader.
+#[test]
+fn a_bare_cache_column_literal_is_not_a_column_list() {
+    let rust = rust_sources();
+    let scripts = script_sources();
+    let quiet = r#"
+const SCRATCH_SQL: &str = "SELECT id FROM claims WHERE pignistic_prob IS NULL";
+pub fn scratch_report(bel: f64, row: &serde_json::Value) -> serde_json::Value {
+    let pairs = [("belief", bel), ("plausibility", bel)];
+    let old = &row["delta"]["belief"];
+    let sql = SCRATCH_SQL.to_string();
+    serde_json::json!({"belief": bel, "pairs": pairs.len(), "old": old, "sql": sql})
+}
+"#;
+    let measured = measure(&with_scratch(&rust, SCRATCH_LIST_PATH, quiet), &scripts);
+    let key = |u: &str| (SCRATCH_LIST_PATH.to_string(), u.to_string());
+    assert!(
+        !measured.contains_key(&key("scratch_report")),
+        "no column list is read here: {:?}",
+        measured.get(&key("scratch_report"))
+    );
+    assert!(
+        measured.contains_key(&key("const SCRATCH_SQL")),
+        "the SQL const is still the SQL rule's reader"
+    );
+    assert!(is_column_list_text("belief"));
+    assert!(is_column_list_text("c.belief, c.pignistic_prob"));
+    assert!(is_column_list_text("plausibility classification"));
+    assert!(!is_column_list_text("believe"));
+    assert!(!is_column_list_text("belief = $1"));
+    assert!(!is_column_list_text("SELECT belief FROM claims"));
+    assert!(captures("SELECT {COLS} FROM", "COLS"));
+    assert!(captures("SELECT {COLS:?} FROM", "COLS"));
+    assert!(!captures("SELECT {{COLS}} FROM", "COLS"));
+    assert!(!captures("SELECT {COLS_X} FROM", "COLS"));
 }

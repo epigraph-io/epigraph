@@ -556,7 +556,8 @@ pub fn rust_fns(code: &str) -> Vec<RustFn> {
     out
 }
 
-/// `const NAME: …;` / `static NAME: …;` items outside any fn: (name, span).
+/// `const NAME: …;` / `static NAME: …;` items, fn-local ones included:
+/// (name, span).
 fn rust_consts(code: &str) -> Vec<(String, usize, usize)> {
     let b = code.as_bytes();
     let mut out = Vec::new();
@@ -612,6 +613,17 @@ impl RustUnits {
             .iter()
             .filter(|f| f.sig_start <= offset && offset < f.end)
             .min_by_key(|f| f.end - f.sig_start)
+    }
+
+    /// The innermost `const` / `static` item containing `offset`, a fn-local
+    /// one included (which [`Self::unit_at`] reports as its fn): `(name,
+    /// start, end)`.
+    pub fn const_at(&self, offset: usize) -> Option<(&str, usize, usize)> {
+        self.consts
+            .iter()
+            .filter(|(_, s, e)| *s <= offset && offset < *e)
+            .min_by_key(|(_, s, e)| e - s)
+            .map(|(name, s, e)| (name.as_str(), *s, *e))
     }
 
     /// The unit name of `offset` and the code span it covers: the innermost
