@@ -3757,6 +3757,25 @@ restart.
   (restores 195's body byte for byte and drops the index; run it BEFORE `195-undo.sql`).
   **Deploy order:** after 195; no binary depends on it. The index is built inside the
   migration's transaction (writers of `role_agents` wait for it; the table is small).
+- **253**: `reown_legacy_edges_excludes_server_signers` (backlog 2f39eee7). Re-states 120's
+  `epigraph_reown_legacy_edges_to_signer` (an md5 precondition refuses to apply over any other
+  body; the path stays 190's `pg_catalog, public, pg_temp`). The function now excludes every
+  server signer itself, on every call, whatever `p_exclude_signers` says: (a) every agent named
+  `epigraph-api-signer` (the API's registered edge signer), (b) every agent that signed a claim
+  another agent authored (the MCP server signs its callers' claims), (c) every agent that signed
+  an edge whose `writer_group_id` is neither world nor the group the function would re-own that
+  signer to (an HTTP route's edge records its caller's group), (d) every agent with an attested
+  `signing` key row (any status) that has signed an edge and authored no claim (a server agent
+  provisioned with its own signing row). A wrong exclusion only leaves an
+  edge world-owned (administrative), the safe direction. `p_exclude_signers` stays mandatory
+  (RLE01) for the legacy bulk attestation keys, and for an API signing with another agent's bare
+  public key that no arm names (boot warns about that shape). The audit row gains
+  `auto_excluded_signers` (count) and `auto_excluded` (the excluded ids per arm) and says
+  `migration` 253. Arms (b) and (c) read `claims` and `edges` once per call. Owner and
+  grant unchanged. Pinned by `epigraph-db/tests/writer_owned_edges.rs`
+  (`the_legacy_reown_never_follows_a_server_signer_whatever_the_list`, each arm
+  mutation-tested; `the_253_undo_restores_120s_body_on_190s_path`). Undo:
+  `docs/runbooks/253-undo.sql`. **Deploy order:** none required; no binary calls the function.
 
 ## `-- no-transaction` migrations
 
