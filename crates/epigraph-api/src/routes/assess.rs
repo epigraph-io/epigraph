@@ -488,13 +488,7 @@ pub async fn assess_claim(
     let masses_unchanged = match owner {
         Some(o) => {
             epigraph_db::MassFunctionRepository::slot_holds_masses(
-                &mut *tx,
-                &viewer,
-                claim_id,
-                frame_id,
-                o,
-                slot,
-                &bba_json,
+                &mut *tx, &viewer, claim_id, frame_id, o, slot, &bba_json,
             )
             .await?
         }
