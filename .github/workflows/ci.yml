@@ -872,10 +872,11 @@ jobs:
       # in production they connect on MAINTENANCE_DATABASE_URL, a non-superuser,
       # NOBYPASSRLS login in epigraph_maintenance, so a missing grant or a forced
       # policy without a bypass arm must fail here too. The migrate step creates
-      # this login (tests/ci/provision_test_roles.py); tests/db_roles.py hands it
-      # to the scripts and, with EPIGRAPH_PYTEST_REQUIRE_DB=1, fails an arm that
-      # would fall back to the superuser. Fixtures keep the superuser.
-      EPIGRAPH_PYTEST_MAINTENANCE_DSN: postgres://epigraph_test_maintenance:epigraph_test_maintenance@localhost:5432/epigraph_py_test
+      # this login (tests/ci/provision_test_roles.py) with a random, masked,
+      # expiring password and exports EPIGRAPH_PYTEST_MAINTENANCE_DSN through
+      # $GITHUB_ENV; tests/db_roles.py hands it to the scripts and, with
+      # EPIGRAPH_PYTEST_REQUIRE_DB=1, fails an arm that would fall back to the
+      # superuser. Fixtures keep the superuser.
       SQLX_OFFLINE: "true"
       CARGO_BUILD_JOBS: "2"
     steps:
@@ -913,7 +914,7 @@ jobs:
           export DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export MIGRATION_DATABASE_URL="$DATABASE_URL"
           ./target/debug/epigraph-migrate
-          TEST_ROLES_DATABASE_URL="$DATABASE_URL" python3 tests/ci/provision_test_roles.py
+          TEST_ROLES_DATABASE_URL="$DATABASE_URL" python3 tests/ci/provision_test_roles.py --env-file "$GITHUB_ENV"
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
