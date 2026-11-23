@@ -15,9 +15,14 @@ use crate::repos::edge::EDGE_IN_FORCE;
 /// SQL predicate over a `factors` row aliased `f`: TRUE when belief
 /// propagation may read the row, FALSE for a `decomposes_to` factor (D3).
 ///
-/// The `edges_auto_factor` trigger mints a `directional_support` factor for
-/// every `decomposes_to` edge. Read by BP, it carries an atom's evidence up
-/// into its compound and back (an echo), so no BP run reads one:
+/// Until migration 262 the `edges_auto_factor` trigger minted a
+/// `directional_support` factor for every `decomposes_to` edge; since 262 it
+/// mints none (nor do the dedup / supersede cascades), and the operator's
+/// `decomposes_to_factor_sweep` (epigraph-cli, maintenance connection)
+/// exports and deletes the rows minted before. Read by BP, such a row carries
+/// an atom's evidence up into its compound and back (an echo), so until the
+/// sweep has run, and for any row restored from its manifest, no BP run
+/// reads one:
 ///
 /// * a KEYED row: `properties.relationship` is `decomposes_to` (any case);
 /// * a LEGACY row, minted before the trigger keyed its rows: no
@@ -39,21 +44,24 @@ use crate::repos::edge::EDGE_IN_FORCE;
 /// with a group the caller is not in), and such a legacy row stays readable
 /// for that caller. Deciding the match structurally needs a read past row
 /// security, which a request-serving process does not hold; the structural
-/// close is removing the rows themselves (SPEC §6.2's export-and-delete of
-/// `decomposes_to` factors and its sweep job, which run on the maintenance
-/// connection). A KEYED row needs no edge read and is excluded for everyone.
+/// close is removing the rows themselves (SPEC §6.2's export-and-delete):
+/// `decomposes_to_factor_sweep` selects exactly `NOT` this predicate on a
+/// session that bypasses row security, so after it has run no row is left
+/// for this arm to miss. A KEYED row needs no edge read and is excluded for
+/// everyone.
 ///
 /// # A directional edge parallel to a decomposition
 ///
-/// The trigger maps `decomposes_to`, `supports` and several other
+/// `edge_to_factor_type` maps `decomposes_to`, `supports` and several other
 /// relationships to `directional_support`, and `idx_factors_type_vars_frame`
 /// is unique on (type, sorted pair, frame), so a pair holds ONE trigger
-/// factor, keyed by the edge created first. If that is the `decomposes_to`
-/// edge, the parallel edge has no factor of its own and BP reads no coupling
-/// for it; created the other way round, BP reads the parallel edge's factor.
-/// A legacy row on a decomposition pair is excluded whichever edge minted it.
-/// Known and pinned (`bp_parallel_supports_and_decomposes_to`); a migration
-/// that stops the trigger minting `decomposes_to` factors removes it.
+/// factor, keyed by the edge created first. Since migration 262 a
+/// `decomposes_to` edge takes no slot, so a parallel edge created after it
+/// gets its own factor and BP reads it (`bp_parallel_supports_and_decomposes_to`).
+/// A `decomposes_to` row minted before 262 still holds its slot: the parallel
+/// edge created after it has no factor, and deleting the row (the sweep) does
+/// not mint one; the sweep's manifest counts such edges per row. A legacy row
+/// on a decomposition pair is excluded whichever edge minted it.
 #[must_use]
 pub fn bp_readable_factor_sql() -> String {
     format!(

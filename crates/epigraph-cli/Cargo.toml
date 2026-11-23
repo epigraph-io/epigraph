@@ -90,6 +90,20 @@ name = "r131_factor_mint_bin"
 path = "tests/r131_factor_mint_bin.rs"
 required-features = ["db"]
 
+# Export-and-delete of the BP factors of `decomposes_to` edges (atom-level
+# belief SPEC §6.2; migration 262 stops new ones). Dry run (a manifest) unless
+# --apply; --restore re-inserts a manifest's rows.
+[[bin]]
+name = "decomposes_to_factor_sweep"
+path = "src/bin/decomposes_to_factor_sweep.rs"
+required-features = ["db"]
+
+# Drives the library on a fresh database and spawns the `db`-gated binary.
+[[test]]
+name = "decomposes_to_factor_sweep"
+path = "tests/decomposes_to_factor_sweep.rs"
+required-features = ["db"]
+
 # The retroactive K10(3) sweep (OD-10; rulings R-178(2), R-179): applies exactly
 # the rows supersede_belief_delta measures as k10_retro, with a snapshot undo.
 [[bin]]

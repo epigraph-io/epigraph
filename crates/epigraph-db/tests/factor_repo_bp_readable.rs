@@ -5,9 +5,11 @@
 //! return `factors` rows in the shape `run_bp` / `run_cdst_bp` consume. No
 //! caller uses them today, and nothing stopped a future one (a job, an MCP
 //! diagnostic) from feeding BP the `directional_support` factor the
-//! `edges_auto_factor` trigger mints for every `decomposes_to` edge, the echo
-//! D3 forbids. They apply the same predicate as the API's factor load,
-//! `factor::bp_readable_factor_sql`.
+//! `edges_auto_factor` trigger minted for every `decomposes_to` edge before
+//! migration 262, the echo D3 forbids. They apply the same predicate as the
+//! API's factor load, `factor::bp_readable_factor_sql`. Since 262 the trigger
+//! mints no such row (pinned below), so the fixtures seed the row a database
+//! migrated before 262 holds.
 
 mod viewer_fixture;
 
@@ -30,12 +32,90 @@ async fn decomposes_to(pool: &PgPool, compound: Uuid, atom: Uuid) -> Uuid {
     .expect("seed a decomposes_to edge")
 }
 
+/// The factor 217's `edges_auto_factor` minted for the `decomposes_to` edge
+/// `edge` (a database migrated before 262 holds it; 262's trigger mints
+/// none), seeded as that trigger wrote it.
 async fn trigger_factor(pool: &PgPool, edge: Uuid) -> Uuid {
-    sqlx::query_scalar("SELECT id FROM factors WHERE properties->>'source_edge_id' = $1")
-        .bind(edge.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("the edges_auto_factor trigger mints one factor per decomposes_to edge")
+    let (source, target): (Uuid, Uuid) =
+        sqlx::query_as("SELECT source_id, target_id FROM edges WHERE id = $1")
+            .bind(edge)
+            .fetch_one(pool)
+            .await
+            .expect("read the edge");
+    let minted: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM factors WHERE properties->>'source_edge_id' = $1")
+            .bind(edge.to_string())
+            .fetch_one(pool)
+            .await
+            .expect("count the edge's factors");
+    assert_eq!(
+        minted, 0,
+        "since 262 the trigger mints no decomposes_to factor"
+    );
+    let mut vars = [source, target];
+    vars.sort();
+    sqlx::query_scalar(
+        "INSERT INTO factors (factor_type, variable_ids, potential, description, properties) \
+         VALUES ('directional_support', $1, $2, $3, $4) RETURNING id",
+    )
+    .bind(vars.to_vec())
+    .bind(
+        json!({"forward_strength": 0.0, "reverse_strength": 0.6, "source_var": source.to_string()}),
+    )
+    .bind(format!("Auto-generated from decomposes_to edge {edge}"))
+    .bind(json!({
+        "source_edge_id": edge, "relationship": "decomposes_to",
+        "edge_source_id": source, "edge_target_id": target
+    }))
+    .fetch_one(pool)
+    .await
+    .expect("seed the pre-262 decomposes_to factor")
+}
+
+/// Migration 262: the `edges_auto_factor` trigger mints no factor for a
+/// `decomposes_to` edge, and still mints one for an ordinary edge (control).
+/// Fails on 217's trigger body, which mapped `decomposes_to` to a keyed
+/// `directional_support` row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn trigger_mints_no_decomposes_to_factor(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "factor-trigger-262").await;
+    let k = seed_group_claim(&pool, agent, group, "trigger compound").await;
+    let a = seed_group_claim(&pool, agent, group, "trigger atom").await;
+    let s = seed_group_claim(&pool, agent, group, "trigger supporter").await;
+
+    let dec = decomposes_to(&pool, k, a).await;
+    let pair_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM factors \
+          WHERE properties->>'source_edge_id' = $1 OR variable_ids @> ARRAY[$2, $3]::uuid[]",
+    )
+    .bind(dec.to_string())
+    .bind(k)
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("count the decomposition's factors");
+    assert_eq!(
+        pair_rows, 0,
+        "the trigger minted a factor for decomposes_to edge {dec}"
+    );
+
+    let sup: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'supports') RETURNING id",
+    )
+    .bind(s)
+    .bind(k)
+    .fetch_one(&pool)
+    .await
+    .expect("seed a supports edge");
+    let rel: String = sqlx::query_scalar(
+        "SELECT properties->>'relationship' FROM factors WHERE properties->>'source_edge_id' = $1",
+    )
+    .bind(sup.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("control: the trigger still mints a supports edge's factor");
+    assert_eq!(rel, "supports");
 }
 
 /// `k` decomposes to `a` (the trigger's KEYED row) and to `c` (the trigger's
@@ -236,10 +316,11 @@ async fn legacy_arm_sees_the_callers_private_decomposition_only_when_stamped(poo
              decomposition and excludes the row"
         );
 
-        // KNOWN GAP, pinned so a structural fix shows up here: a caller who
-        // cannot see the decomposition cannot exclude its legacy row. The
-        // structural close is deleting such rows on the maintenance connection
-        // (SPEC §6.2), not this predicate.
+        // KNOWN GAP of the PREDICATE, pinned: a caller who cannot see the
+        // decomposition cannot exclude its legacy row. The structural close
+        // is deleting such rows on the maintenance connection (SPEC §6.2):
+        // `decomposes_to_factor_sweep`, pinned in epigraph-cli's
+        // `decomposes_to_factor_sweep` test.
         let (readable, bypass) = stamped_readable(&pool, mode, stranger, legacy).await;
         assert!(
             !bypass,
@@ -273,5 +354,74 @@ async fn legacy_arm_sees_the_callers_private_decomposition_only_when_stamped(poo
     assert!(
         !readable,
         "control: a keyed decomposes_to row is excluded without any edge read"
+    );
+}
+
+/// `docs/runbooks/262-undo.sql` re-states 217's mint body exactly (md5 of
+/// `prosrc`, as 262's precondition reads it), keeps the owner, and a new
+/// `decomposes_to` edge mints its factor again. A second run is refused by
+/// its own precondition and changes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_262_undo_restores_217s_mint(pool: PgPool) {
+    async fn mint(pool: &PgPool) -> (String, String) {
+        sqlx::query_as(
+            "SELECT md5(p.prosrc), pg_get_userbyid(p.proowner)::text FROM pg_proc p \
+              WHERE p.oid = to_regprocedure('public.auto_create_factor_from_edge()')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("pg_proc")
+    }
+    let (at_head, owner) = mint(&pool).await;
+    assert_ne!(
+        at_head, "b98f7326df4cc26924091dc61a8289f3",
+        "calibration: at head the body is 262's, not 217's"
+    );
+    let undo = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/runbooks/262-undo.sql"
+    ))
+    .expect("read the undo");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("apply the undo");
+    assert_eq!(
+        mint(&pool).await,
+        (
+            "b98f7326df4cc26924091dc61a8289f3".to_string(),
+            owner.clone()
+        ),
+        "the undo restores 217's body and keeps the owner"
+    );
+
+    let (agent, group) = seed_agent_with_group(&pool, "factor-trigger-262-undo").await;
+    let k = seed_group_claim(&pool, agent, group, "undo compound").await;
+    let a = seed_group_claim(&pool, agent, group, "undo atom").await;
+    let dec = decomposes_to(&pool, k, a).await;
+    let rel: String = sqlx::query_scalar(
+        "SELECT properties->>'relationship' FROM factors WHERE properties->>'source_edge_id' = $1",
+    )
+    .bind(dec.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("after the undo the trigger mints a decomposes_to factor again");
+    assert_eq!(rel, "decomposes_to");
+
+    let mut conn = pool.acquire().await.expect("acquire");
+    let err = sqlx::raw_sql(&undo)
+        .execute(&mut *conn)
+        .await
+        .expect_err("a second run is refused by the precondition");
+    assert!(format!("{err:?}").contains("262-undo"), "{err:?}");
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("end the refused run's transaction");
+    drop(conn);
+    assert_eq!(
+        mint(&pool).await,
+        ("b98f7326df4cc26924091dc61a8289f3".to_string(), owner),
+        "the refused run changed nothing"
     );
 }

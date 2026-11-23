@@ -14992,12 +14992,14 @@ async fn reverse_marked_duplicate(
 ///   ([`ClaimRepository::regenerate_superseded_edge_factors_conn`]).
 ///
 /// It is the body of migration 038's `auto_create_factor_from_edge` (re-stated
-/// by 217 as a maintenance-owned definer, unchanged in meaning), over a
-/// set, and must stay that: a migration that changes the trigger's mapping,
-/// potentials, description or properties changes this too (the
-/// `unmark_duplicate` tests compare the re-minted rows with the trigger's).
-/// Like the trigger it mints `decomposes_to` factors, on the duplicate's
-/// edges. A dedup identity edge is skipped (the act writes it after retiring
+/// by 217 as a maintenance-owned definer, unchanged in meaning, and by 262
+/// without `decomposes_to`), over a set, and must stay that: a migration that
+/// changes the trigger's mapping, potentials, description or properties
+/// changes this too (the `unmark_duplicate` tests compare the re-minted rows
+/// with the trigger's). Like the trigger since 262 it mints no factor for a
+/// `decomposes_to` edge (atom-level belief SPEC §6.2, D3: a decomposition is
+/// not a BP coupling), so a mark or a supersession that moves a decomposition
+/// does not put one back. A dedup identity edge is skipped (the act writes it after retiring
 /// the duplicate, so it never had one). One factor per `(factor_type, pair)`,
 /// from the earliest edge, and an existing one is kept
 /// (`idx_factors_type_vars_frame`), as the trigger's `ON CONFLICT DO NOTHING`.
@@ -15052,6 +15054,8 @@ const REGENERATE_EDGE_FACTORS_SQL: &str = r#"-- VISIBILITY-EXEMPT: WRITE path, o
                 AND ($4::uuid[] IS NULL OR e.id = ANY($4::uuid[]))
                 AND NOT (e.id = ANY($5::uuid[]))
                 AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                -- 262's trigger skip: no factor for a decomposition.
+                AND lower(e.relationship) <> 'decomposes_to'
                 AND COALESCE(s.is_current, true) AND COALESCE(t.is_current, true)
                 AND m.ft IS NOT NULL
            ) x
