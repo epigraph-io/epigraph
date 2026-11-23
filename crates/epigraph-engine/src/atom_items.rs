@@ -276,7 +276,7 @@ impl EvidencedInterval {
 
 /// The AEF input rows of each requested atom, as `viewer` sees them, in
 /// `mode`, under the lens `ctx`. Reads the process's
-/// [`modes`]`().compound_source_edges`; [`atom_axiom_rows_under`] takes it
+/// [`modes`]`().compound_source_edges()`; [`atom_axiom_rows_under`] takes it
 /// explicitly.
 ///
 /// # Errors
@@ -288,7 +288,15 @@ pub async fn atom_axiom_rows(
     mode: AxiomMode,
     ctx: &FramedBeliefContext,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
-    atom_axiom_rows_under(conn, viewer, ids, mode, ctx, modes().compound_source_edges).await
+    atom_axiom_rows_under(
+        conn,
+        viewer,
+        ids,
+        mode,
+        ctx,
+        modes().compound_source_edges(),
+    )
+    .await
 }
 
 /// [`atom_axiom_rows`] under an explicit [`CompoundSourceEdges`] setting.

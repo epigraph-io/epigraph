@@ -329,7 +329,7 @@ impl CompoundBeliefMode {
     #[must_use]
     pub fn current() -> Self {
         static WARNED: std::sync::Once = std::sync::Once::new();
-        let configured = crate::atom_items::modes().compound_belief;
+        let configured = crate::atom_items::modes().compound_belief();
         let serving = Self::serving(configured);
         if configured.as_str() != serving.as_str() {
             WARNED.call_once(|| {
