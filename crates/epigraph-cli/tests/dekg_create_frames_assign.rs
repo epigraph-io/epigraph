@@ -12,7 +12,10 @@
 //!   fails the call, and a bad row in the middle of a cluster stops the loop
 //!   there (the rows before it stay written, the rows after it are never
 //!   attempted);
-//! * a frame with no hypotheses is refused before anything is written.
+//! * a frame with no hypotheses is refused before anything is written;
+//! * the one call site in `src/bin/dekg.rs` adds the returned count to the
+//!   command's `claims_assigned` and propagates the error with `.await?`
+//!   (a source check, since the whole command cannot run end to end today).
 //!
 //! # Verified to fail
 //!
@@ -21,7 +24,11 @@
 //! `conflicting_binding_is_not_counted`; discarding a failed insert and
 //! continuing fails `missing_frame_aborts` and `bad_row_mid_cluster_stops_the_loop`;
 //! finishing the loop and only then returning the first error fails
-//! `bad_row_mid_cluster_stops_the_loop` alone (on the row-after assertion).
+//! `bad_row_mid_cluster_stops_the_loop` alone (on the row-after assertion);
+//! keeping only the last row's count (`=` instead of `+=`) fails
+//! `conflicting_binding_is_not_counted`. Swallowing the error at the call site
+//! (`.await.unwrap_or(0)`) or dropping the count there (`let _n = ...`) fails
+//! `create_frames_call_site_counts_and_propagates`.
 
 use epigraph_cli::dekg_frames::assign_claims_to_frame;
 use sqlx::PgPool;
@@ -83,13 +90,16 @@ async fn bindings_of_frame(pool: &PgPool, frame: Uuid) -> i64 {
 }
 
 /// (a) A claim already bound to the frame is not counted, and its binding is
-/// not overwritten; the new claim is written with `row_index % hypotheses`.
+/// not overwritten; the new claims are written with `row_index % hypotheses`
+/// and counted across the whole loop (two new rows, so a count that keeps only
+/// the last row's `rows_affected()` is caught too).
 #[sqlx::test(migrations = "../../migrations")]
 async fn conflicting_binding_is_not_counted(pool: PgPool) {
     let agent = seed_agent(&pool).await;
     let frame = seed_frame(&pool, "dekg-assign-conflict").await;
     let a = seed_claim(&pool, agent, "dekg assign claim A").await;
     let b = seed_claim(&pool, agent, "dekg assign claim B").await;
+    let c = seed_claim(&pool, agent, "dekg assign claim C").await;
 
     // A is already bound, with an index the call would never write.
     sqlx::query(
@@ -101,13 +111,13 @@ async fn conflicting_binding_is_not_counted(pool: PgPool) {
     .await
     .expect("pre-bind A");
 
-    let written = assign_claims_to_frame(&pool, frame, &[(0, a), (5, b)], 2)
+    let written = assign_claims_to_frame(&pool, frame, &[(0, a), (5, b), (2, c)], 2)
         .await
         .expect("assign");
 
     assert_eq!(
-        written, 1,
-        "only B was written; the conflicting A binding must not be counted"
+        written, 2,
+        "B and C were written; the conflicting A binding must not be counted"
     );
     assert_eq!(
         binding(&pool, a, frame).await,
@@ -119,7 +129,12 @@ async fn conflicting_binding_is_not_counted(pool: PgPool) {
         Some(Some(1)),
         "B is bound with hypothesis_index = 5 % 2"
     );
-    assert_eq!(bindings_of_frame(&pool, frame).await, 2);
+    assert_eq!(
+        binding(&pool, c, frame).await,
+        Some(Some(0)),
+        "C is bound with hypothesis_index = 2 % 2"
+    );
+    assert_eq!(bindings_of_frame(&pool, frame).await, 3);
 }
 
 /// (b) A frame id that does not exist fails the call; nothing is written.
@@ -184,4 +199,63 @@ async fn zero_hypotheses_is_refused(pool: PgPool) {
 
     assert!(got.is_err(), "zero hypotheses must be refused, got {got:?}");
     assert_eq!(bindings_of_frame(&pool, frame).await, 0);
+}
+
+/// The binary's one call of `assign_claims_to_frame` must add the returned
+/// count to `claims_assigned` and propagate the error with `?` to `main`
+/// (which returns `Result`, so the command exits non-zero). The tests above pin
+/// the library function; this pins the call site, which they cannot reach: the
+/// command needs the clustering pipeline's embeddings to get there. A source
+/// check, so it runs without a database.
+#[test]
+fn create_frames_call_site_counts_and_propagates() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/dekg.rs"))
+        .expect("read src/bin/dekg.rs");
+    let needle = "assign_claims_to_frame(";
+    let starts: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "dekg.rs calls assign_claims_to_frame exactly once; update this check if that changes"
+    );
+    let start = starts[0];
+
+    // The statement head: from the previous statement boundary to the call.
+    let head_from = src[..start].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+    let head: String = src[head_from..start]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        head, "claims_assigned+=epigraph_cli::dekg_frames::",
+        "the returned count must be added to claims_assigned"
+    );
+
+    // The statement tail: after the call's matching `)` up to the `;`.
+    let open = start + needle.len() - 1;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in src[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.expect("matching ) of the assign_claims_to_frame call");
+    let end = close + src[close..].find(';').expect("; ending the call statement");
+    let tail: String = src[close + 1..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        tail, ".await?",
+        "the insert error must propagate with `?`, not be swallowed or defaulted"
+    );
 }
