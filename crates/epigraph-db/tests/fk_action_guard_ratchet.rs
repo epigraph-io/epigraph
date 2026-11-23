@@ -238,8 +238,11 @@ const RATCHETED_TABLES: &[&str] = &["claims", "edges", "mass_functions"];
 /// `epigraph_definer_bypass()`. That is the guard an FK referential action
 /// defeats (it runs as the referencing table's owner, where the definer
 /// bypass can be true and the session's settings are in force). Measured on a
-/// fresh database migrated to head: `mass_functions` alone (184's
-/// `epigraph_mass_function_retract_guard`).
+/// fresh database migrated to head: none. Before migration 251 it was
+/// `mass_functions` alone (184's `epigraph_mass_function_retract_guard`, whose
+/// clear arm read `epigraph.mf_unretract_id`); 251 keys that arm on a consumed
+/// ledger grant and the guard reads no setting. The scan's calibration is
+/// [`the_guard_scan_reports_a_probe_setting_keyed_guard`].
 ///
 /// Not derived: a guard that reaches the setting through a helper function,
 /// rather than in its own body. A scan for any trigger function reading a
@@ -268,11 +271,9 @@ async fn setting_keyed_guard_tables(pool: &PgPool) -> BTreeSet<String> {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_table_with_a_setting_keyed_trigger_guard_is_ratcheted(pool: PgPool) {
+    // No calibration on a real table: since 251 none carries the shape (see
+    // `setting_keyed_guard_tables`); the probe test below proves the scan.
     let found = setting_keyed_guard_tables(&pool).await;
-    assert!(
-        found.contains("mass_functions"),
-        "CALIBRATION: 184's retract guard is found: {found:?}"
-    );
     let ratcheted: BTreeSet<String> = RATCHETED_TABLES.iter().map(|t| (*t).to_string()).collect();
     let unlisted: Vec<&String> = found.difference(&ratcheted).collect();
     assert!(

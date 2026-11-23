@@ -20,8 +20,9 @@
 //! batch.
 //!
 //! The test-lens follow-ups (backlog 129f99ad): T-N3, arms (c) and (d) as a
-//! real member login; T-N6, the guard's fail mode after the grant helper is
-//! re-owned; T-N7, every test that creates a cluster role removes it even
+//! real member login (since 251: the member's own grant is refused); T-N6,
+//! the guard's fail mode after the ledger consumer (194's grant helper
+//! before 251) is re-owned; T-N7, every test that creates a cluster role removes it even
 //! when it panics ([`with_cluster_role`]). T-N9 is in
 //! `fk_action_guard_ratchet.rs`.
 //!
@@ -57,6 +58,8 @@ const MD5_117: &str = "39f3eacd53e7717a323759ec91b5c2c0";
 const CASCADE_DEFINER: &str = "public.epigraph_cascade_delete_edge_bbas(uuid[], text)";
 const PURGE_DEFINER: &str = "public.epigraph_purge_mass_functions(uuid[], text)";
 const GRANT_HELPER: &str = "public.epigraph_mf_purge_granted(uuid)";
+/// Migration 251's ledger consumer, the one call the delete guard makes.
+const GRANT_CONSUMER: &str = "public.epigraph_mf_guard_consume(text, uuid, jsonb)";
 const GUARD_FN: &str = "public.mass_functions_retracted_delete_guard()";
 
 fn repo_file(rel: &str) -> String {
@@ -987,9 +990,11 @@ async fn f_a_grant_from_an_earlier_transaction_admits_no_delete(pool: PgPool) {
 /// membership (`epigraph_bypass()`'s `pg_has_role(session_user, ...)`, the
 /// inherited grants on the grant table and on `mass_functions`) is
 /// exercised as production runs it. (c): with no grant the delete is SR09
-/// and the row survives; (d): the documented residual holds for a member
-/// login too (a grant row it writes for its own transaction admits the
-/// delete).
+/// and the row survives; (d): the residual 194 documented (a grant row a
+/// maintenance login writes for its own transaction admitted the delete) is
+/// CLOSED for a member login since migration 251: the ledger is owned by
+/// `epigraph_bba_guard_owner` and the maintenance role holds no INSERT on
+/// it, so the login's own grant row is refused 42501 and nothing is deleted.
 #[sqlx::test(migrations = "../../migrations")]
 async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool) {
     grant_table_exists(&pool).await;
@@ -1000,7 +1005,7 @@ async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool
     let (_, host) = rest.split_once('@').expect("credentials");
     let dsn = format!("{scheme}://{login}:probe-only@{host}");
     let (retracted, live) = (w.retracted, w.live);
-    let (who, c_refusal, d_deleted) = with_cluster_role(
+    let (who, c_refusal, d_grant) = with_cluster_role(
         &pool,
         &login,
         &format!(
@@ -1035,25 +1040,30 @@ async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool
                 refusal(bulk, "a member login's bulk delete over a retracted row"),
                 "(c) bulk, member login",
             );
-            // (d) the residual: a grant row for this transaction admits it.
+            // (d) the residual, closed since 251: the login cannot write a
+            // grant row for its own transaction.
             let mut tx = conn.begin().await.expect("begin");
-            sqlx::query(
+            let d = sqlx::query(
                 "INSERT INTO public.mass_function_purge_grants (mf_id, reason) \
                  VALUES ($1, 'residual, member login')",
             )
             .bind(retracted)
             .execute(&mut *tx)
             .await
-            .expect("a member login inherits INSERT on the grant table");
-            let n = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
-                .bind(retracted)
-                .execute(&mut *tx)
-                .await
-                .expect("a grant for this transaction admits the delete")
-                .rows_affected();
+            .map(|d| d.rows_affected())
+            .map_err(|e| {
+                e.as_database_error()
+                    .map(|d| {
+                        (
+                            d.code().map(|c| c.to_string()).unwrap_or_default(),
+                            d.message().to_string(),
+                        )
+                    })
+                    .unwrap_or_default()
+            });
             tx.rollback().await.expect("rollback");
             conn.close().await.expect("close");
-            (who, c, n)
+            (who, c, d)
         },
     )
     .await;
@@ -1065,23 +1075,25 @@ async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool
         "fixture: a NOSUPERUSER member login, privileged through membership only"
     );
     assert_sr09(c_refusal, "(c), member login");
-    assert_eq!(
-        d_deleted, 1,
-        "(d), member login: the grant admits the delete"
+    let (code, message) = d_grant.expect_err("(d), member login: 251 closed the residual");
+    assert_eq!(code, "42501", "(d), member login: {message}");
+    assert!(
+        message.starts_with("permission denied for table mass_function_purge_grants"),
+        "(d), member login: the ledger refuses the login's own grant: {message}"
     );
     assert!(
         exists(&pool, "mass_functions", w.retracted).await,
-        "the retracted row survives (the residual delete was rolled back)"
+        "the retracted row survives"
     );
 }
 
-/// T-N6: the guard FAILS CLOSED after a later ownership change. Migration 194
-/// makes the grant helper `epigraph_mf_purge_granted` a definer owned by
-/// `epigraph_maintenance`. If it is later re-owned by another role (a
-/// careless `ALTER FUNCTION ... OWNER TO`, a `REASSIGN OWNED`), the old
-/// owner's privileges on it move to the new owner, so the maintenance
-/// session's guard can no longer call it (and the new owner could not read
-/// the grant table anyway). Pinned here: a maintenance delete of the
+/// T-N6: the guard FAILS CLOSED after a later ownership change. Since
+/// migration 251 the delete guard admits a retracted row's delete only
+/// through the ledger consumer `epigraph_mf_guard_consume`, a definer owned
+/// by `epigraph_bba_guard_owner` (194's helper `epigraph_mf_purge_granted`
+/// is no longer on the guard's path). If the consumer is later re-owned by
+/// another role (a careless `ALTER FUNCTION ... OWNER TO`, a `REASSIGN
+/// OWNED`), its body runs as a role that holds nothing on the ledger. Pinned here: a maintenance delete of the
 /// retracted row is then refused with a 42501 PERMISSION error (not SR09,
 /// and never an admission), and so is the audited purge, and the row
 /// survives both; a LIVE row still deletes (the guard fires only on
@@ -1089,7 +1101,7 @@ async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool
 /// test is what catches it. The ownership change is undone with the role.
 #[sqlx::test(migrations = "../../migrations")]
 async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) {
-    proc_exists(&pool, GRANT_HELPER).await;
+    proc_exists(&pool, GRANT_CONSUMER).await;
     let w = world(&pool).await;
     let role = format!("h10_reowner_{}", Uuid::new_v4().simple());
     let (r, retracted, live) = (role.clone(), w.retracted, w.live);
@@ -1098,14 +1110,14 @@ async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) 
         &role,
         &format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
         |pool| async move {
-            pool.execute(format!("ALTER FUNCTION {GRANT_HELPER} OWNER TO {r}").as_str())
+            pool.execute(format!("ALTER FUNCTION {GRANT_CONSUMER} OWNER TO {r}").as_str())
                 .await
-                .expect("re-own the grant helper");
+                .expect("re-own the ledger consumer");
             let helper_owner: String = sqlx::query_scalar(
                 "SELECT r.rolname::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
                   WHERE p.oid = $1::regprocedure",
             )
-            .bind(GRANT_HELPER)
+            .bind(GRANT_CONSUMER)
             .fetch_one(&pool)
             .await
             .expect("helper owner");
@@ -1155,7 +1167,10 @@ async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) 
         !role_exists(&pool, &role).await,
         "the re-owner role is gone"
     );
-    assert_eq!(helper_owner, role, "fixture: the helper was re-owned");
+    assert_eq!(
+        helper_owner, role,
+        "fixture: the ledger consumer was re-owned"
+    );
     let (code, message) = direct.expect_err("the direct delete must not be admitted");
     assert_eq!(code, "42501", "a privilege error, fail closed: {message}");
     assert!(
