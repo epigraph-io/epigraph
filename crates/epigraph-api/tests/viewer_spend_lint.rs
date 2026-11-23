@@ -45,6 +45,12 @@
 //!   constructor (`read_as`, `write_as`, `begin_claim_write`, `begin_as`,
 //!   `maintenance`, `Connection::begin`, `.begin()`, `.acquire()`), from
 //!   `state`, or from another connection;
+//! * a connection handed on BY VALUE as a bare argument (`Repo::finish(tx,
+//!   id)`): any of the bindings above, or a by-value `let x` / `if let
+//!   Ok(x)` whose right-hand side is a constructor call at bracket depth 0
+//!   (not a block or `match` that used one). Handing it to a
+//!   [`CONNECTION_FINISHERS`] callee (`drop`, `finish_scoped_read`), which
+//!   only ends it, is not a call;
 //! * `state` itself (`&state`, `state.clone()`): a helper handed the whole
 //!   `AppState` can reach the pool;
 //! * in a route helper, a parameter typed as a pool (`&PgPool`) or as a
@@ -1979,6 +1985,41 @@ const CONNECTION_CTORS: &[&str] = &[
     ".begin()",
     ".acquire()",
 ];
+/// Callees that take a connection by value only to END it: `drop`, and the
+/// route helpers that commit or roll back a stamped read or a savepoint and
+/// run no statement of their own (`routes::finish_scoped_read`,
+/// `belief.rs::finish_savepoint`). A connection handed to one of these is not
+/// a database call. Adding a name here is a review, like a [`REVIEWED`] entry:
+/// the helper must read and write nothing.
+const CONNECTION_FINISHERS: &[&str] = &["drop", "finish_scoped_read", "finish_savepoint"];
+
+/// Whether the whitespace-free right-hand side `flat` calls a connection
+/// constructor at bracket depth 0, i.e. the binding IS that connection rather
+/// than a value computed in a block or an argument that used one.
+fn ctor_at_depth_0(flat: &str) -> bool {
+    let s = flat.as_bytes();
+    let mut depth = 0i32;
+    for i in 0..s.len() {
+        match s[i] {
+            b'(' | b'[' | b'{' => {
+                if depth == 0 && CONNECTION_CTORS.iter().any(|c| flat[..=i].ends_with(c)) {
+                    return true;
+                }
+                depth += 1;
+            }
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                // `.begin()` / `.acquire()` close at depth 0.
+                if depth == 0 && CONNECTION_CTORS.iter().any(|c| flat[..=i].ends_with(c)) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 const STATE_DB_METHODS: &[&str] = &["read_as", "write_as", "begin_claim_write"];
 const TERMINALS: &[&str] = &[
     "fetch_one",
@@ -2238,6 +2279,8 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
     let mut pool_aliases: Vec<String> = h.pools.clone();
     let mut conns: Vec<String> = h.conns.clone();
     let mut repos: Vec<(String, String)> = Vec::new();
+    // The let-bound connections (not the parameters, measured below).
+    let mut let_conns: Vec<String> = Vec::new();
     for (name, is_mut, _, ra, rb) in &bindings {
         let rhs = &code[*ra..*rb];
         let flat: String = rhs.chars().filter(|c| !c.is_whitespace()).collect();
@@ -2257,13 +2300,22 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
                 continue;
             }
         }
-        if *is_mut
-            && (CONNECTION_CTORS.iter().any(|c| flat.contains(c))
+        let from_ctor = CONNECTION_CTORS.iter().any(|c| flat.contains(c));
+        // A `mut` binding is a connection when its right-hand side names one
+        // (a constructor, a deref, state or another connection). A by-value
+        // binding only when its right-hand side IS a constructor call (one
+        // at bracket depth 0): `let x = state.config..` stays a value, and so
+        // does `let owner = match .. { .. acquire() .. }`, whose connection
+        // lives and dies inside the block.
+        if (*is_mut
+            && (from_ctor
                 || flat.contains("&mut*")
                 || names_pool
-                || conns.iter().any(|c| has_word(rhs, c)))
+                || conns.iter().any(|c| has_word(rhs, c))))
+            || (!*is_mut && ctor_at_depth_0(&flat))
         {
             conns.push(name.clone());
+            let_conns.push(name.clone());
         }
     }
 
@@ -2345,6 +2397,28 @@ fn db_calls(code: &str, sql: &str, h: &Handler, nested: &[(usize, usize)]) -> Ve
         for p in words(code, alias, b, e) {
             if let Some((m, open)) = method_after(p + alias.len()) {
                 calls.entry(open).or_insert((format!("{ty}::{m}"), false));
+            }
+        }
+    }
+    // A let-bound connection handed on whole, as a bare argument
+    // (`Repo::finish(tx, id)`): the callee owns the connection. Not
+    // `drop(tx)`, and not a method on it (`tx.commit()`, not an argument).
+    for conn in &let_conns {
+        for p in words(code, conn, b, e) {
+            let mut k = p;
+            while k > b && s[k - 1].is_ascii_whitespace() {
+                k -= 1;
+            }
+            let after = skip_ws(s, p + conn.len());
+            let bare = k > b && matches!(s[k - 1], b'(' | b',') && matches!(s[after], b')' | b',');
+            if !bare {
+                continue;
+            }
+            if let Some((callee, open)) = enclosing_call(s, p, b) {
+                let last = callee.rsplit("::").next().unwrap_or(&callee);
+                if !CONNECTION_FINISHERS.contains(&last) {
+                    calls.entry(open).or_insert((callee, true));
+                }
             }
         }
     }
@@ -2919,5 +2993,70 @@ pub async fn if_let_err(
         vec!["Repo::write"],
         "a call handed `&mut tx` where `tx` is bound by `if let Err(mut tx) = <ctor>` is a \
          database call"
+    );
+}
+
+/// A connection bound BY VALUE, `if let Ok(tx) = <ctor>` or `let tx = <ctor>`,
+/// and handed on as a whole value (`Repo::finish(tx, id)`), is a database call:
+/// the callee owns the connection and can write through it. Before backlog
+/// d4890b22 only a `mut` binding became a connection and only `&mut x` was
+/// measured, so a by-value hand-off escaped the lint. Decoys: a by-value
+/// binding of a non-connection (or of a value computed in a block that used
+/// one) is not one, a [`CONNECTION_FINISHERS`] callee (`drop(tx)`,
+/// `finish_scoped_read(read, ..)`) only ends it, and a method on the
+/// connection (`tx.commit()`) is not an argument.
+#[test]
+fn the_scanner_sees_a_connection_handed_on_by_value() {
+    let src = r##"
+pub async fn by_value(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(tx) = state.write_as(&viewer, "by_value").await {
+        Repo::finish(tx, id).await?;
+    }
+    let read = state.read_as(&viewer).await?;
+    let row = Repo::get_owned(id, read).await?;
+    Ok(row)
+}
+
+pub async fn by_value_decoys(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Ok(guard) = lock.read() {
+        touch(guard, id);
+    }
+    let cfg = state.config.limits;
+    apply_limits(cfg, id);
+    // The connection lives and dies inside the block: `ok` is a value.
+    let ok = match id {
+        _ => state.read_as(&viewer).await.is_ok(),
+    };
+    label(ok, id);
+    let read = state.read_as(&viewer).await?;
+    finish_scoped_read(read, "by_value_decoys").await?;
+    if let Ok(tx) = state.write_as(&viewer, "decoy").await {
+        Ok(Some(tx.commit().await?))
+    } else {
+        let tx = state.read_as(&viewer).await?;
+        drop(tx);
+        Ok(None)
+    }
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "by_value"),
+        vec!["Repo::finish", "Repo::get_owned"],
+        "a connection bound by value and handed on whole is a database call"
+    );
+    assert_eq!(
+        labels(&m, "by_value_decoys"),
+        Vec::<String>::new(),
+        "a by-value binding of a non-connection or of a block's value, a finisher \
+         and a method on the connection are not database calls"
     );
 }
