@@ -520,6 +520,9 @@ fn is_call_at(code: &str, at: usize, name: &str) -> bool {
     after.starts_with('(')
 }
 
+/// One column-list reader: `(unit, its code span, the list it reads)`.
+type ColumnListReader = (String, Option<(usize, usize)>, String);
+
 /// The units of one Rust code view that read a column list: `(unit, span,
 /// list)`. A unit reads one when its code names the list (or a `const` of the
 /// same file that names it), or calls a fn of the same file that names it and
@@ -530,7 +533,7 @@ fn column_list_readers(
     code: &str,
     units: &RustUnits,
     lists: &BTreeSet<String>,
-) -> Vec<(String, Option<(usize, usize)>, String)> {
+) -> Vec<ColumnListReader> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     let mut done = BTreeSet::new();
