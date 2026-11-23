@@ -3,6 +3,7 @@ name = "epigraph-embeddings"
 description = "Vector embedding service for semantic claim similarity in EpiGraph"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

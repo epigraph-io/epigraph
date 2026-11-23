@@ -1,0 +1,76 @@
+name: MSRV
+
+# Builds the workspace with EXACTLY the toolchain the root Cargo.toml declares
+# as `rust-version` (inherited by every member), so the declared floor cannot
+# sit below what the lockfile and the code need. Every other cargo step in CI
+# runs on `stable`, which says nothing about the floor: the field stayed at
+# 1.75 for months while the locked graph needed 1.88.
+#
+# Between runs, clippy on `stable` (ci.yml) reads the same field as the MSRV
+# for its `incompatible_msrv` lint, which flags a std API newer than the floor
+# in any member. What that lint cannot see (a language feature, a dependency
+# bump) is what this build catches, so it runs when a manifest, the lockfile
+# or the toolchain config changes, and weekly on main for the rest.
+#
+# If this workflow is ever made a required status check, drop the paths
+# filter: a required check that never starts blocks the PR forever.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "rust-toolchain*"
+      - ".cargo/config.toml"
+      - ".github/workflows/msrv.yml"
+      - ".github/scripts/msrv.py"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "rust-toolchain*"
+      - ".cargo/config.toml"
+      - ".github/workflows/msrv.yml"
+      - ".github/scripts/msrv.py"
+  schedule:
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: msrv-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to the same full commit SHAs as ci.yml (see the note
+# there). dtolnay/rust-toolchain picks the channel from the ref name, which
+# pinning by SHA defeats, so the toolchain is passed explicitly.
+jobs:
+  msrv:
+    name: Build on the declared rust-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # The sqlx macros read the checked-in .sqlx cache; no database here.
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Read the declared floor (every member must carry it)
+        id: msrv
+        run: python3 .github/scripts/msrv.py floor >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Check the workspace on the floor
+        # `+<version>` so a rust-toolchain file, should one be added, cannot
+        # silently substitute another toolchain. The feature sets are the ones
+        # ci.yml's lint-features job checks; none is on by default.
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          cargo "+$MSRV" --version
+          cargo "+$MSRV" check --workspace --all-targets --locked
+          cargo "+$MSRV" check -p epigraph-api --features genai,tls --all-targets --locked
+          cargo "+$MSRV" check -p epigraph-cli --features genai --all-targets --locked

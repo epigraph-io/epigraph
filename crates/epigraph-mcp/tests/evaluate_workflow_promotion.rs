@@ -64,9 +64,8 @@ async fn insert_claim(pool: &PgPool, agent: Uuid, content: &str) -> Uuid {
 
 async fn seed_runs(pool: &PgPool, wf: Uuid, successes: usize, failures: usize) {
     let base = chrono::Utc::now();
-    for (i, succ) in std::iter::repeat(true)
-        .take(successes)
-        .chain(std::iter::repeat(false).take(failures))
+    for (i, succ) in std::iter::repeat_n(true, successes)
+        .chain(std::iter::repeat_n(false, failures))
         .enumerate()
     {
         let i = i as i64;

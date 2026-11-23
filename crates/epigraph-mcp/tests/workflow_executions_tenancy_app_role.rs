@@ -97,9 +97,8 @@ fn result_json(out: rmcp::model::CallToolResult) -> (serde_json::Value, String) 
 
 async fn seed_runs(pool: &PgPool, workflow_id: Uuid, successes: usize, failures: usize) {
     let base = chrono::Utc::now();
-    for (i, success) in std::iter::repeat(true)
-        .take(successes)
-        .chain(std::iter::repeat(false).take(failures))
+    for (i, success) in std::iter::repeat_n(true, successes)
+        .chain(std::iter::repeat_n(false, failures))
         .enumerate()
     {
         BehavioralExecutionRepository::create(

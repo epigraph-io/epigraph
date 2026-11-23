@@ -3,6 +3,7 @@ name = "epigraph-crypto"
 description = "Cryptographic primitives for EpiGraph: BLAKE3 hashing, Ed25519 signing, canonical serialization"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

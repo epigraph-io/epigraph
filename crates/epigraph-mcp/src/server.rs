@@ -1,7 +1,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::wildcard_imports)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use http::request::Parts;
@@ -18,6 +18,17 @@ use crate::tools;
 use crate::types::*;
 
 use epigraph_crypto::AgentSigner;
+
+/// How long a successful `OPERATED_BY` auth-lineage write short-circuits the
+/// next one for the same principal ([`EpiGraphMcpFull::record_auth_lineage`]).
+///
+/// The trade: within one TTL a principal's tool calls cost no lineage round
+/// trip (the memo exists because rmcp 3.x builds a server per stateless
+/// request); past it, the next call re-runs the idempotent upsert, so a lineage
+/// edge retracted or deleted after a success comes back within one TTL of the
+/// principal's next call rather than at the next process restart. Five
+/// minutes is one upsert per active principal per process per five minutes.
+pub const DEFAULT_AUTH_LINEAGE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct EpiGraphMcpFull {
@@ -103,17 +114,27 @@ pub struct EpiGraphMcpFull {
     /// means no embedding caller can widen the gate by omission.
     pub(crate) signer_identity_declared: bool,
     /// Memo of auth-lineage principals already linked via an `OPERATED_BY`
-    /// edge, so `call_tool` writes that edge at most once per distinct
-    /// `auth.agent_id` (a fast in-memory short-circuit; the DB
-    /// `create_if_not_exists` is the actual dedup authority). Empty at boot.
+    /// edge, each with the [`Instant`](std::time::Instant) its edge write last
+    /// succeeded, so `call_tool` writes that edge at most once per distinct
+    /// `auth.agent_id` per [`Self::auth_lineage_ttl`] (a fast in-memory
+    /// short-circuit; the DB `create_if_not_exists` is the actual dedup
+    /// authority). Empty at boot.
     ///
     /// Per PROCESS on the HTTP listener: [`SessionFactory::session`] shares it
     /// with every session, because rmcp 3.x runs the factory once per REQUEST
     /// on the stateless 2026-07-28 path, where a per-session memo would be
     /// empty on every call. A principal is inserted only after its edge
-    /// write succeeds, so a failed write is retried on the next call; an edge
-    /// deleted after a success is not rewritten until the process restarts.
-    pub(crate) seen_auth_lineage: Arc<Mutex<HashSet<uuid::Uuid>>>,
+    /// write succeeds, so a failed write is retried on the next call. An
+    /// entry older than the TTL is a miss, so an edge retracted or deleted
+    /// after a success (by any process: the HTTP route, the admin cascade,
+    /// another MCP server) is rewritten by the first call after the entry
+    /// expires, not left missing until this process restarts.
+    pub(crate) seen_auth_lineage: Arc<Mutex<HashMap<uuid::Uuid, std::time::Instant>>>,
+    /// How long a [`Self::seen_auth_lineage`] entry short-circuits the
+    /// `OPERATED_BY` write: [`DEFAULT_AUTH_LINEAGE_TTL`] unless a test sets it
+    /// with [`Self::with_auth_lineage_ttl`]. It bounds how long a retracted or
+    /// deleted lineage edge stays missing while its principal keeps calling.
+    pub(crate) auth_lineage_ttl: std::time::Duration,
     /// Write-authorization gate — the MCP twin of `epigraph_api::AppState`'s
     /// `policy_gate` field, and injected for the same reason.
     ///
@@ -400,9 +421,12 @@ impl EpiGraphMcpFull {
 /// 2026-07-28 request, so a per-session memo would be empty on every call and
 /// each tool call would first await the signer lookup, a pool connection and
 /// the `OPERATED_BY` upsert. Shared, that happens once per principal per
-/// process. Everything else a session server holds is either immutable
-/// configuration or an `Arc` the old constructor already shared (`signer`,
-/// `embedder`, `federation`, the `ScopedPool`).
+/// process per [`DEFAULT_AUTH_LINEAGE_TTL`]: an entry expires, so an edge
+/// retracted or deleted after a success is rewritten within one TTL of the
+/// principal's next call instead of staying missing until a restart.
+/// Everything else a session server holds is either immutable configuration
+/// or an `Arc` the old constructor already shared (`signer`, `embedder`,
+/// `federation`, the `ScopedPool`).
 ///
 /// # A cost, stated
 ///
@@ -630,10 +654,19 @@ impl EpiGraphMcpFull {
     /// Semantics:
     /// - `principal == None` -> no-op (nothing to attribute).
     /// - Memoized via `seen_auth_lineage` (per process on the HTTP listener, see
-    ///   its field doc): a principal already linked short-circuits before
-    ///   touching the DB. The DB
-    ///   `create_if_not_exists` is the true idempotency authority (exactly one
-    ///   edge across processes); the set is only a fast in-memory guard.
+    ///   its field doc): a principal linked less than `auth_lineage_ttl` ago
+    ///   short-circuits before touching the DB; an older entry is a miss, so
+    ///   an edge retracted or deleted since is re-asserted. The DB
+    ///   `create_if_not_exists` is the dedup authority; the memo is only a
+    ///   fast in-memory guard. That dedup is check-then-insert with no lock
+    ///   and no unique index on the triple, so it is not exactly-once: two
+    ///   calls that both miss the memo while NO in-force edge exists (a
+    ///   process's first call per principal, or the first calls after an
+    ///   entry expires following a retraction) can each insert one. The
+    ///   result is two in-force rows for the same pair: an edge listing shows
+    ///   both, and the operator-link shared-signer checks are unaffected
+    ///   because they count distinct principals. While the edge is in force
+    ///   an expired entry costs a probe, never a second row.
     /// - **Best-effort**: any failure (e.g. a stale `principal` that no longer
     ///   exists, which trips the `validate_edge_reference` existence trigger) is
     ///   logged at WARN and swallowed. The caller's tool result is NEVER affected.
@@ -648,7 +681,16 @@ impl EpiGraphMcpFull {
             return;
         };
         // Fast in-memory short-circuit (lock released before any await on the DB).
-        let already_seen = { self.seen_auth_lineage.lock().await.contains(&principal) };
+        // Only a FRESH entry counts: past the TTL the edge may have been
+        // retracted or deleted, so the write (a no-op when it is in force) runs.
+        let ttl = self.auth_lineage_ttl;
+        let already_seen = {
+            self.seen_auth_lineage
+                .lock()
+                .await
+                .get(&principal)
+                .is_some_and(|linked_at| linked_at.elapsed() < ttl)
+        };
         if already_seen {
             return;
         }
@@ -703,7 +745,11 @@ impl EpiGraphMcpFull {
         .await
         {
             Ok(_) => {
-                self.seen_auth_lineage.lock().await.insert(principal);
+                let mut memo = self.seen_auth_lineage.lock().await;
+                // Drop expired entries so the memo stays bounded by the
+                // principals seen within one TTL, not every principal ever.
+                memo.retain(|_, linked_at| linked_at.elapsed() < ttl);
+                memo.insert(principal, std::time::Instant::now());
             }
             Err(e) => {
                 tracing::warn!(
@@ -950,7 +996,7 @@ impl EpiGraphMcpFull {
             return Ok(());
         };
         let writes = crate::scope_map::required_scope(tool_name)
-            .map_or(true, |scope| !scope.ends_with(":read"));
+            .is_none_or(|scope| !scope.ends_with(":read"));
         if !writes {
             return Ok(());
         }
@@ -1152,6 +1198,19 @@ impl EpiGraphMcpFull {
         self
     }
 
+    /// Set how long a principal's `OPERATED_BY` lineage write short-circuits
+    /// after it succeeds (default [`DEFAULT_AUTH_LINEAGE_TTL`]). For tests that
+    /// retract a lineage edge and watch it come back without a restart.
+    ///
+    /// Consumed-self builder, like [`Self::with_admin_scope_arming_ttl`].
+    /// Sessions of a [`SessionFactory`] are clones of the template, so they
+    /// carry it.
+    #[must_use]
+    pub fn with_auth_lineage_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.auth_lineage_ttl = ttl;
+        self
+    }
+
     /// Return an error if the server is in read-only mode.
     pub(crate) fn reject_if_read_only(&self) -> Result<(), McpError> {
         if self.read_only {
@@ -1209,7 +1268,8 @@ impl EpiGraphMcpFull {
             federation,
             llm_identity,
             signer_identity_declared: true,
-            seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            seen_auth_lineage: Arc::new(Mutex::new(HashMap::new())),
+            auth_lineage_ttl: DEFAULT_AUTH_LINEAGE_TTL,
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
             run_tokens: epigraph_db::RunTokens::Off,
@@ -1370,7 +1430,8 @@ impl EpiGraphMcpFull {
             federation,
             llm_identity,
             signer_identity_declared: true,
-            seen_auth_lineage: Arc::new(Mutex::new(HashSet::new())),
+            seen_auth_lineage: Arc::new(Mutex::new(HashMap::new())),
+            auth_lineage_ttl: DEFAULT_AUTH_LINEAGE_TTL,
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             connector_elevation: false,
             run_tokens: epigraph_db::RunTokens::Off,
@@ -3462,7 +3523,8 @@ impl ServerHandler for EpiGraphMcpFull {
         // (`mcp_agent --OPERATED_BY--> auth.agent_id`, prov:actedOnBehalfOf).
         // `auth.agent_id == None`, or stdio (no `Parts` -> `auth_owned == None`),
         // writes NO edge. Best-effort + memoized inside the helper (per process
-        // on the HTTP listener; see `seen_auth_lineage`); borrow `auth_owned`
+        // on the HTTP listener, for `auth_lineage_ttl`; see
+        // `seen_auth_lineage`); borrow `auth_owned`
         // here (it is MOVED just below into `context`).
         //
         // A principal-less context (`auth::is_principal_less`, the
@@ -3865,7 +3927,7 @@ mod session_factory_tests {
             .seen_auth_lineage
             .lock()
             .await
-            .insert(principal);
+            .insert(principal, std::time::Instant::now());
 
         let next = sessions.session();
         tokio::time::timeout(
@@ -3874,6 +3936,72 @@ mod session_factory_tests {
         )
         .await
         .expect("an already-linked principal must short-circuit, not reach the database");
+        accepted.abort();
+    }
+
+    /// Behavioural, no database: a memo entry OLDER than the TTL is a miss, so
+    /// the call goes back to the database (and would re-assert a retracted or
+    /// deleted lineage edge) instead of short-circuiting for the life of the
+    /// process. The pool points at a listener that accepts and never answers,
+    /// so reaching the database hangs; the call must still be pending after
+    /// 2 s. `tests/llm_agent_identity_test.rs` proves the rewrite on a real
+    /// database.
+    ///
+    /// Mutation: make the memo hit ignore the entry's age -> the call returns
+    /// at once and this test fails.
+    #[tokio::test]
+    async fn an_expired_lineage_memo_entry_goes_back_to_the_database() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a silent listener");
+        let addr = silent.local_addr().expect("local addr");
+        let accepted = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = silent.accept().await {
+                held.push(conn);
+            }
+        });
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(30))
+            .connect_lazy(&format!("postgres://nobody:nothing@{addr}/none"))
+            .expect("a lazy pool never connects at construction");
+        let signer = Arc::new(AgentSigner::from_bytes(&[0x5Eu8; 32]).expect("signer"));
+        let embedder = Arc::new(McpEmbedder::new(pool.clone(), None));
+        let ttl = std::time::Duration::from_millis(200);
+        let server = EpiGraphMcpFull::new_shared_with_federation(
+            pool,
+            signer,
+            embedder,
+            false,
+            crate::federation::SharedFederation::empty(),
+            None,
+        )
+        .with_auth_lineage_ttl(ttl);
+
+        let principal = uuid::Uuid::new_v4();
+        server
+            .seen_auth_lineage
+            .lock()
+            .await
+            .insert(principal, std::time::Instant::now());
+        // Fresh entry: a hit, returns without the database.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.record_auth_lineage(Some(principal)),
+        )
+        .await
+        .expect("a fresh memo entry must short-circuit");
+
+        tokio::time::sleep(ttl + std::time::Duration::from_millis(100)).await;
+        let expired = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.record_auth_lineage(Some(principal)),
+        )
+        .await;
+        assert!(
+            expired.is_err(),
+            "an expired memo entry must go back to the database, not short-circuit"
+        );
         accepted.abort();
     }
 

@@ -3,6 +3,7 @@ name = "epigraph-atlas-contract"
 description = "The Atlas nested-level payload contract (schema v1): serde types, invariants, and a schema/budget checker for tests"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
