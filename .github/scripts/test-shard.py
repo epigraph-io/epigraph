@@ -139,7 +139,8 @@ WALKERS = {
     # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
     # renamed is only caught by a full run (main, staging, `ci:full`).
     "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/intro/*"),
-    "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml",),
+    # Every member's manifest: crates/ and tests/engine-integration.
+    "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml", "tests/*/Cargo.toml"),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/belief_lint/mod.rs": ("crates/*/src/*", "scripts/*"),
     "crates/epigraph-db/tests/custodian_role.rs": ("crates/*/src/*",),
