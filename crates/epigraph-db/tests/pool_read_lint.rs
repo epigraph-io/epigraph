@@ -85,6 +85,15 @@ const POOL_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "store_embedding",
+        "WRITE. `UPDATE claims SET embedding` for one claim id, only while it has no \
+         `claim_encryption` row. Its `SELECT 1 FROM claims ... FOR UPDATE` is a row LOCK taken as \
+         its own statement (backlog f9807254), so the guarded UPDATE's fresh snapshot sees a \
+         seal committed during the wait; it returns no row content, and the fn returns only \
+         whether a row was written.",
+    ),
+    (
+        "claim.rs",
         "update_labels",
         "WRITE. Read-modify-write of `claims.labels` for one claim id under the write-side \
          predicate; the `SELECT ... FROM claims` CTE feeds the UPDATE and carries an in-SQL \
