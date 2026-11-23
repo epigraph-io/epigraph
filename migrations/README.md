@@ -4191,6 +4191,48 @@ restart.
   --manifest-out <file>` (dry run; EXPLAIN its selection and pass `--statement-timeout-ms`
   on a large corpus), review, `--manifest-out <new file> --apply --expect <file>` (refused
   unless the live selection is exactly the reviewed one), and `--remaining` must print 0.
+- **263**: `person_team_groups_and_invitations` (backlog ee9e05b4). A Person (a registered
+  human operator, signed in as themselves) creates a keyless team group in 164's
+  `did:epigraph:group:` namespace and becomes its one admin
+  (`epigraph_person_create_team_group(name, reason)`; one active group per name PER CREATOR,
+  TGP06), recorded in the new `person_team_groups`; only those groups are invitable (an
+  operator-made 164 team group has the same shape and its admins get TGP07, so its roster
+  stays the operator's audited verbs'). A live admin invites another Person
+  (`epigraph_invite_to_team_group(group, invitee, role, reason)`), which writes a `pending`
+  row in the new `group_invitations` and NO membership; only the invitee accepts
+  (`epigraph_accept_group_invitation`: one new roster
+  row at the invited role, decided under the group row lock the 164 verbs take, refused
+  TGP05 once answered or when its sender is no longer a live admin) or declines
+  (`epigraph_decline_group_invitation`). Two reads: `epigraph_my_groups()` and
+  `epigraph_my_group_invitations()`. All SECURITY DEFINER on 172's path, owned by
+  `epigraph_maintenance`, EXECUTE to `epigraph_app` only; the caller is
+  `epigraph_principal_id()`; operated agents and delegated run tokens are refused TGP01.
+  **This reverses 164's boundary for Person-made groups:** 164 kept roster writes
+  maintenance-only because a holder of the application credential can stamp any principal;
+  263 keys them on that stamp, so such a holder can forge an invite and its acceptance (header
+  section 2). Detection only: every audit row carries `session_user`. Accepting also gives
+  the invitee's live-linked agents read access (234), and write access at writer/admin (206).
+  Re-states 176's two team-group guards (md5 precondition; the undo has one too, accepting
+  263's or 176's bodies) with one admission each, on
+  INSERT only: a row of the new `team_group_roster_grants` (194's purge-grant shape, keyed
+  on `pg_current_xact_id()`, no application privilege) that the definer writes for the one
+  row it inserts and deletes before it returns; every other path keeps 176's GRM05 / GRM06
+  text. One `group.` audit row per act (`team_created`, `invitation_created`,
+  `member_added` with `arm = 'invitation'`, `invitation_declined`), attributed to the
+  caller, without 164's caller-settable `actor`. `group_invitations` is FORCEd with
+  privileged policies only (166's shape). Refusal codes TGP01..TGP09 (header section 6).
+  Registered in `tenancy_backfill.rs` (both registers) and `elevation_arms_census.rs`.
+  Pinned by `epigraph-db/tests/person_team_groups.rs`,
+  `epigraph-db/tests/person_team_groups_undo.rs`, and the REST and MCP twins'
+  app-role tests. Undo: `docs/runbooks/263-undo.sql` (tested: run twice, it returns the
+  `public` catalog to below 263, restoring 176's guards byte for byte, and refuses 55000
+  over a guard a later migration re-bodied; it LOSES every invitation row and the
+  `person_team_groups` record, and keeps the groups and memberships). Checked before
+  claiming: slot 263 was assigned to this change. **Deploy order:** migrate, then roll out
+  the binary that
+  serves the routes and tools (a binary ahead of the migration answers 42883 on them); human
+  OAuth clients need `groups:write` / `groups:read` granted to reach them. **Applied to
+  throwaway databases only, NOT to any deployed database.**
 - **264**: public `role_successor_restore` (backlog 9073f0a5). Adds the maintenance-only
   SECURITY DEFINER `epigraph_restore_role_successor(role, root, successor, valid_to, reason)`:
   after a role's root identity was detached, re-attaching it by name did not give the group back

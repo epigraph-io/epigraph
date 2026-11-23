@@ -145,6 +145,12 @@ const EXCLUDED: &[(&str, &str)] = &[
         "role attachments (166): maintenance-written, read only through the role-agent \
          definers; an attachment confers no read and widens nothing",
     ),
+    (
+        "group_invitations",
+        "team-group invitations (263): written only by the person-facing team-group \
+         definers and read only through epigraph_my_group_invitations; the application role \
+         holds SELECT and its policies admit no application row",
+    ),
     ("person_authenticators", "passkey material (124)"),
     ("passkey_enrollments", "passkey enrollment state (124)"),
     (
