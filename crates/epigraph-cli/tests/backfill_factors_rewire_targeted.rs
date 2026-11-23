@@ -589,7 +589,10 @@ async fn targeted_rewire_holds_a_target_that_would_vacate(pool: PgPool) {
     let before = footprint(&pool, &w).await;
     assert!(before.1.belief.is_some(), "fixture: the target has a cache");
 
-    let o = TargetedRunOptions::default();
+    let o = TargetedRunOptions {
+        only_changed: false,
+        ..TargetedRunOptions::default()
+    };
     let predicted =
         predict_targeted_rewire(&pool, &viewer, &seed_from_waves(&w.wave, o.epsilon), &o)
             .await

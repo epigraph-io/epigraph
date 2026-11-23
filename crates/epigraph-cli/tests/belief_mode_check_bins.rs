@@ -1143,6 +1143,64 @@ async fn backfill_factors_targeted_dry_run_writes_its_predict_report_and_nothing
     );
 }
 
+/// Targeted mode leaves an unchanged row alone by DEFAULT: a predict run
+/// without `--only-changed` records `only_changed: true` (the apply must
+/// reuse the predict's options, so both default the same way), and
+/// `--rewrite-unchanged` is the one way to opt out. Naming both is an argv
+/// error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_runs_only_changed_by_default(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "default-only-changed").await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let wave = path_str(&ch.wave_file);
+    let predict = |name: &str, extra: &[&str]| -> (Run, std::path::PathBuf) {
+        let out = dir.join(format!("{name}.json"));
+        let mut args = vec![
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--predict-json",
+            path_str(&out),
+        ];
+        args.extend_from_slice(extra);
+        let r = run(
+            BACKFILL_FACTORS,
+            &args,
+            &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+        );
+        (r, out)
+    };
+
+    let (r, plain) = predict("plain", &[]);
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(
+        read_predict(&plain).run.only_changed,
+        "a targeted run without the flag leaves unchanged rows alone"
+    );
+    assert!(r.stdout.contains("only_changed=true"), "stdout: {}", r.stdout);
+
+    let (r, opted_out) = predict("opted-out", &["--rewrite-unchanged"]);
+    assert_eq!(r.code, Some(0), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(
+        !read_predict(&opted_out).run.only_changed,
+        "--rewrite-unchanged opts out"
+    );
+
+    let (r, both) = predict("both", &["--only-changed", "--rewrite-unchanged"]);
+    assert_eq!(r.code, Some(2), "stdout: {}\nstderr: {}", r.stdout, r.stderr);
+    assert!(
+        r.stderr.contains("--rewrite-unchanged") && r.stderr.contains("--only-changed"),
+        "the conflict names both flags; stderr: {}",
+        r.stderr
+    );
+    assert!(!both.exists(), "an argv error writes no report");
+}
+
 /// The operator's apply and undo, through the binaries. A real targeted run
 /// (`--edges-from`, `--snapshot`, `--edge-rows`, `--until-fixed`,
 /// `--only-changed`) rewires both listed edges of the chain and writes both

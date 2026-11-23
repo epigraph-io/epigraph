@@ -102,6 +102,8 @@ async fn apply(
 fn until_fixed(max_passes: usize) -> TargetedRunOptions {
     TargetedRunOptions {
         max_passes,
+        // These tests count every rewrite, unchanged rows included.
+        only_changed: false,
         ..TargetedRunOptions::default()
     }
 }

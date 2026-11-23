@@ -114,6 +114,10 @@ pub struct TargetedRunOptions {
     pub edges: Option<BTreeSet<Uuid>>,
     pub max_passes: usize,
     pub epsilon: f64,
+    /// Leave a row alone when a fresh wire equals it (on by default: a
+    /// rewrite of an unchanged row bumps its `created_at` and refolds its
+    /// target for nothing, and the fixed-point verify counts it as a
+    /// rewrite).
     pub only_changed: bool,
     /// Wave name prefix; pass k's records are `<prefix>-pass-<k>`.
     pub wave_prefix: String,
@@ -125,7 +129,7 @@ impl Default for TargetedRunOptions {
             edges: None,
             max_passes: DEFAULT_MAX_PASSES,
             epsilon: DEFAULT_EPSILON,
-            only_changed: false,
+            only_changed: true,
             wave_prefix: "r176e".to_string(),
         }
     }

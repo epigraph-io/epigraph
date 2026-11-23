@@ -36,9 +36,12 @@
 //! snapshot files (`--snapshot`, `--edge-rows`). The fixed-point verify after
 //! an apply is a predict over the L1 wave files AND the apply's `--snapshot`
 //! file (an L1 claim the rewire refolded holds neither L1 value; the E
-//! records chain onto the L1 ones), run WITH `--only-changed` (without it a
-//! row a fresh wire leaves identical is still counted as a rewrite), and must
-//! report nothing to rewrite. On a cycle, a finite `--epsilon` leaves each row
+//! records chain onto the L1 ones), and must report nothing to rewrite.
+//! Targeted mode leaves a row a fresh wire would write identically alone by
+//! default (`--only-changed`, kept as an explicit spelling of the default):
+//! a rewrite of an unchanged row bumps its `created_at` and refolds its
+//! target for nothing, and the verify would count it as a rewrite.
+//! `--rewrite-unchanged` opts out, for predict and apply alike. On a cycle, a finite `--epsilon` leaves each row
 //! within about epsilon of a fresh wire, so there the verify is bounded (no
 //! hold, every |d_edge| below the run's tolerance) rather than empty. Undo an
 //! apply with `restore_edge_factors --edge-rows` and then
@@ -104,8 +107,13 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_EPSILON)]
     epsilon: f64,
     /// rewire-edges, targeted: leave a row alone when a fresh wire equals it.
-    #[arg(long)]
+    /// The default; accepted as its explicit spelling.
+    #[arg(long, conflicts_with = "rewrite_unchanged")]
     only_changed: bool,
+    /// rewire-edges, targeted: rewrite every reached row, also one a fresh
+    /// wire would write identically (bumps its `created_at`).
+    #[arg(long)]
+    rewrite_unchanged: bool,
     /// rewire-edges, targeted: run passes until one moves nothing (else one
     /// pass).
     #[arg(long)]
@@ -129,10 +137,11 @@ fn targeted_argv_problem(cli: &Cli) -> Option<String> {
             || cli.snapshot.is_some()
             || cli.edge_rows.is_some()
             || cli.only_changed
+            || cli.rewrite_unchanged
             || cli.until_fixed;
         return targeted_only.then(|| {
-            "--edges-from, --predict-json, --snapshot, --edge-rows, --only-changed and \
-             --until-fixed need targeted mode (--sources-from-waves)"
+            "--edges-from, --predict-json, --snapshot, --edge-rows, --only-changed, \
+             --rewrite-unchanged and --until-fixed need targeted mode (--sources-from-waves)"
                 .to_string()
         });
     }
@@ -318,16 +327,18 @@ async fn run_targeted(
         edges: cli.edges_from.as_deref().map(read_edge_list).transpose()?,
         max_passes: if cli.until_fixed { cli.max_passes } else { 1 },
         epsilon: cli.epsilon,
-        only_changed: cli.only_changed,
+        only_changed: !cli.rewrite_unchanged,
         ..TargetedRunOptions::default()
     };
     println!(
-        "targeted rewire: {} wave record(s), {} moved source(s), accepted list: {}",
+        "targeted rewire: {} wave record(s), {} moved source(s), accepted list: {}, \
+         only_changed={}",
         records.len(),
         seed.moved.len(),
         opts.edges
             .as_ref()
-            .map_or_else(|| "none".to_string(), |e| e.len().to_string())
+            .map_or_else(|| "none".to_string(), |e| e.len().to_string()),
+        opts.only_changed
     );
     if cli.dry_run {
         let mut report = predict_targeted_rewire(pool, viewer, &seed, &opts).await?;
