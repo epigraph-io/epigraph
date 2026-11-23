@@ -25,9 +25,10 @@ It also owns the two files that cross the box boundary:
 `parts_digest(result)` is a result's fingerprint: what apply compares against
 the plan the operator reviewed. The split is deterministic on one host and set
 of library versions, but not promised across hosts or CPU architectures, so an
-off-box `compute` may not reproduce an on-box `plan`; apply's
-`--reviewed-plan` / `--expect-digest` refuse such a result instead of writing
-parts nobody reviewed.
+off-box `compute` may not reproduce an on-box `plan`. Apply refuses a result
+that is not itself a plan unless it is checked against the reviewed plan
+(`--reviewed-plan` / `--expect-digest`, refusing on a mismatch) or the
+operator opts out with `--unreviewed`.
 """
 import hashlib
 import json
@@ -203,10 +204,12 @@ def split_to_cap_with_stats(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED,
 
 
 def parts_digest(result):
-    """SHA-256 (hex) of what a result would write: its cap and seed, and per
-    theme (sorted by id) its parts IN ORDER (part 0 keeps the theme's id), each
-    part's claim ids sorted. Theme order, member order within a part and any
-    other field (`id_chunk_cuts`, a stored digest) do not change it.
+    """SHA-256 (hex) of the parts a result would write: its cap and seed, and
+    per theme (sorted by id) its parts IN ORDER (part 0 keeps the theme's id),
+    each part's claim ids sorted. Theme order, member order within a part and
+    any other field do not change it: `source`, a stored digest, and
+    `id_chunk_cuts` (bookkeeping apply copies into `split_id_chunk_cuts`; it
+    describes how the parts were cut, not which members they hold).
 
     Computed from the parts themselves, never read from the file, so a result
     cannot vouch for itself."""
@@ -306,4 +309,7 @@ def compute_export_dir(export_dir, cap=None, seed=None):
         ids, x = read_theme_npz(export_dir / f"{theme_id}.npz")
         parts, stats = split_to_cap_with_stats(ids, x, cap=cap, seed=seed)
         themes.append({"theme_id": theme_id, "parts": parts, **stats})
-    return {"format": RESULT_FORMAT, "cap": cap, "seed": seed, "themes": themes}
+    # `source` tells apply this result was not itself reviewed (see
+    # theme_cap_split.review_digest); it is not part of parts_digest.
+    return {"format": RESULT_FORMAT, "source": "compute", "cap": cap, "seed": seed,
+            "themes": themes}

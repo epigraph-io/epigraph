@@ -51,6 +51,16 @@ The off-box rule (design §2) allows ids and embeddings only.
 - `apply --from result.json` reads that file.
 - `plan` does export and compute in process and writes the same `result.json`. That file is
   the dry run's output and `apply`'s input, so what is applied is exactly what was reviewed.
+- The split is deterministic on one host and set of library versions, but not promised across
+  hosts or CPU architectures (backlog c7c6e7ce), so an off-box `compute` may not reproduce the
+  on-box plan. A plan file is tagged `"source": "plan"` and a compute result
+  `"source": "compute"`. Apply takes a plan file as it is. Any other result (a compute result,
+  or a file with no `source`) needs `--reviewed-plan PLAN` (the plan the operator reviewed) or
+  `--expect-digest HEX` (the `parts_digest` that plan printed): apply recomputes
+  `theme_cap_core.parts_digest` of both from the parts and refuses on a mismatch, before
+  connecting. `compute` prints its own result's digest, which always matches itself, so it is
+  not a review. `--unreviewed` applies such a result unchecked; the output and the manifest
+  record which check ran (`review`).
 
 ## Apply (one transaction)
 
@@ -105,10 +115,11 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
 | Criterion | Proven by |
 |-----------|-----------|
 | A dry run lists every theme over the cap with its proposed parts | `test_plan_lists_every_over_cap_theme_with_part_sizes` (DB) |
-| The apply leaves no theme over ~2,000 | `test_blobs_split_under_cap_without_cutting_a_blob`, `test_a_small_separated_cluster_stays_whole_just_over_the_cap`, `test_the_split_follows_umap_structure_not_raw_kmeans` and `test_degenerate_identical_embeddings_terminate_under_cap` (core); `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`, `test_apply_refuses_when_unembedded_members_push_kept_part_over_cap`, `test_apply_refuses_an_over_cap_theme_it_cannot_split` and `test_apply_refuses_a_result_whose_cap_is_over_its_own` (DB) |
+| The apply leaves no theme over ~2,000 | `test_blobs_split_under_cap_without_cutting_a_blob`, `test_a_small_separated_cluster_stays_whole_just_over_the_cap`, `test_the_split_follows_umap_structure_not_raw_kmeans` and `test_degenerate_identical_embeddings_terminate_under_cap` (core); `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`, `test_apply_places_unembedded_members_under_the_cap`, `test_apply_splits_an_over_cap_theme_the_embeddings_cannot` and `test_apply_refuses_a_result_whose_cap_is_over_its_own` (DB); `test_unembedded_slots_fill_parts_in_order_then_chunk` (no DB) |
 | Ids stay stable for kept parts | `test_apply_leaves_no_theme_over_cap_and_largest_keeps_id`; `test_split_is_deterministic_and_input_order_free` |
 | The split is reversible | `test_apply_then_reverse_is_byte_identical` (every `claim_themes` row in full, plus an md5 of the `(id, theme_id)` projection of `claims`); `test_reverse_refuses_drift_unless_allowed`; `test_reverse_keeps_a_column_added_after_the_apply` |
 | Off-box: ids and embeddings only | `test_compute_runs_without_db_driver` (subprocess with `psycopg2` and `theme_lib` blocked); `test_no_claim_text_reaches_any_output` |
+| Off-box parts that differ from the reviewed plan are not applied | `test_parts_digest_is_the_parts_and_nothing_else`, `test_apply_refuses_a_result_that_is_not_the_reviewed_plan`, `test_apply_cli_refuses_an_unreviewed_result_before_connecting`, `test_apply_cli_refuses_a_result_nobody_reviewed` (no DB); `test_apply_with_the_reviewed_digest_writes_and_records_it`, and `test_no_claim_text_reaches_any_output` (same-host compute applied against the plan) (DB) |
 
 ## Limits
 
@@ -120,8 +131,16 @@ The usage text names `MAINTENANCE_DATABASE_URL`.
   Atlas draws and what `list_summaries` counts. Superseded and duplicate-marked members keep their
   `theme_id` but have no embedding. They stay in the kept part and do not count
   (`test_the_cap_counts_current_members_only`).
-- **Unembedded current members.** These stay in the kept part. If they push it over the cap, the
-  apply refuses, and so does a theme whose embedded members fit in one part or that has none:
-  any theme the result names that would stay over the cap refuses the whole apply. Run plan and
-  apply in small `--theme-id` batches on a large corpus, and leave such themes out until they
-  are embedded.
+- **Unembedded current members** (backlog 029392cb). The off-box split cannot place them, so
+  apply places them on the box (`theme_cap_core.unembedded_slots`): in claim-id order, each part
+  in part order (the kept part first) is filled up to the cap, and any remainder becomes extra
+  parts of at most the cap. A theme whose embedded members fit in one part, or that has none, is
+  therefore still split under the cap, and plan reports the final sizes
+  (`part_sizes_with_unembedded`) and `unembedded_only_parts`. Two consequences:
+  - A part filled to exactly the cap goes over it at the next nightly assignment to it.
+  - A part of unembedded members only has a NULL centroid and a `claim_count` of 0. The Atlas
+    builds take only themes with an embedded member, so it is not drawn until its members are
+    embedded. Showing unembedded members on the Atlas (a fallback leaf) is still open under
+    029392cb.
+  Any theme the result names that would still end over the cap refuses the whole apply (a
+  safety net). Run plan and apply in small `--theme-id` batches on a large corpus.

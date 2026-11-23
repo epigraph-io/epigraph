@@ -210,8 +210,11 @@ def test_apply_then_reverse_is_byte_identical(db, seed_agent, tmp_path):
     for f in [export, export / "export.json", *npz]:
         assert f.stat().st_mode & 0o077 == 0, (f.name, oct(f.stat().st_mode))
     _run(["compute", "--from", str(export), "--out", str(result)])
-    _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
-          "--manifest", str(manifest)])
+    # no plan was reviewed here: a compute result needs the explicit opt-out
+    out, _ = _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
+                   "--unreviewed", "--manifest", str(manifest)])
+    assert json.loads(out)["review"] == "unreviewed"
+    assert json.loads(manifest.read_text())["review"] == "unreviewed"
     assert _snapshot(db) != before
     assert max(_sizes(db).values()) <= CAP
     _run(["reverse", "--database-url", TEST_DSN, "--manifest", str(manifest)])
@@ -243,9 +246,12 @@ def test_no_claim_text_reaches_any_output(db, seed_agent, tmp_path):
                   "--out", str(tmp_path / "p.json")]),
             _run(["export", "--database-url", TEST_DSN, "--cap", str(CAP), "--out", str(export)]),
             _run(["compute", "--from", str(export), "--out", str(result)]),
+            # the on-box plan is the reviewed plan; the same host's compute matches it
             _run(["apply", "--database-url", TEST_DSN, "--from", str(result),
-                  "--manifest", str(manifest)]),
+                  "--reviewed-plan", str(tmp_path / "p.json"), "--manifest", str(manifest)]),
         ]
+        applied = json.loads(outputs[-1][0])
+        assert applied["checked_against_review"] and applied["review"] == "reviewed-plan"
         blobs = [s.encode() for pair in outputs for s in pair]
         blobs += [f.read_bytes() for f in tmp_path.rglob("*") if f.is_file()]
         with db.cursor() as cur:
@@ -413,6 +419,7 @@ def test_parts_digest_is_the_parts_and_nothing_else():
     same = _result([(T2, [[A4]]), (T1, [[A2, A1], [A3]])])
     same["themes"][0]["id_chunk_cuts"] = 3
     same["parts_digest"] = "0" * 64  # a stored digest is never read
+    same["source"] = "compute"  # a plan and a matching compute result share a digest
     assert core.parts_digest(same) == base
     for other in (
         _result([(T1, [[A1], [A2, A3]]), (T2, [[A4]])]),   # one member moved
@@ -465,9 +472,48 @@ def test_apply_cli_refuses_an_unreviewed_result_before_connecting(tmp_path, monk
                 "--manifest", str(tmp_path / "m.json")])
 
 
+def test_apply_cli_refuses_a_result_nobody_reviewed(tmp_path, monkeypatch):
+    """A result that is not itself a plan (a compute result, or a file that does
+    not say what wrote it) is refused before connecting unless it is checked
+    against a reviewed plan or the operator passes --unreviewed (c7c6e7ce); a
+    plan file applies as before."""
+    parts = [(T1, [[A1, A2], [A3]])]
+    computed, untagged, planned = (tmp_path / n for n in ("c.json", "u.json", "p.json"))
+    computed.write_text(json.dumps({**_result(parts), "source": "compute"}))
+    untagged.write_text(json.dumps(_result(parts)))
+    planned.write_text(json.dumps({**_result(parts), "source": "plan"}))
+    manifest = tmp_path / "m.json"
+
+    def no_connect(*_a, **_k):
+        raise AssertionError("connected before checking the result was reviewed")
+
+    monkeypatch.setattr(S, "connect", no_connect)
+    for result_file in (computed, untagged):
+        with pytest.raises(ValueError, match="is not a plan"):
+            S.main(["apply", "--from", str(result_file), "--manifest", str(manifest)])
+    assert not manifest.exists()
+
+    class Connected(Exception):
+        pass
+
+    def connect(*_a, **_k):
+        raise Connected
+
+    monkeypatch.setattr(S, "connect", connect)
+    for argv in (["--from", str(computed), "--unreviewed"],
+                 ["--from", str(untagged), "--unreviewed"],
+                 ["--from", str(planned)],
+                 ["--from", str(computed), "--reviewed-plan", str(planned)]):
+        with pytest.raises(Connected):
+            S.main(["apply", *argv, "--manifest", str(manifest)])
+    assert S.review_digest({"source": "plan"}) == (None, S.REVIEW_IS_PLAN)
+    assert S.review_digest({}, unreviewed=True) == (None, S.REVIEW_NONE)
+
+
 def test_apply_with_the_reviewed_digest_writes_and_records_it(db, seed_agent, tmp_path):
     _theme(db, seed_agent, (30, 25, 20))
     result, _ = S.plan(db, cap=CAP)
+    assert result["source"] == "plan"
     digest = core.parts_digest(result)
 
     manifest = S.apply_result(db, result, tmp_path / "m.json", expect_digest=digest)
@@ -626,7 +672,7 @@ def test_compute_runs_without_db_driver(tmp_path):
     assert proc.returncode == 0, proc.stderr
 
     result = json.loads(out.read_text())
-    assert result["format"] == core.RESULT_FORMAT
+    assert result["format"] == core.RESULT_FORMAT and result["source"] == "compute"
     (entry,) = result["themes"]
     assert entry["theme_id"] == theme
     assert all(len(p) <= 50 for p in entry["parts"])

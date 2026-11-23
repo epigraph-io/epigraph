@@ -19,9 +19,14 @@ Commands:
             no DB driver: this is the step that may run off the box.
   apply     Writes a result file (`--from`, from `plan` or `compute`) in ONE
             transaction, and writes a manifest that `reverse` restores from.
-            With `--reviewed-plan PLAN` (or `--expect-digest HEX`, the
-            `parts_digest` plan and compute print) it first refuses, writing
-            nothing, a result whose parts are not exactly the reviewed plan's.
+            A result that is not itself a plan (a `compute` result, or a file
+            with no `source`) must be checked against the plan the operator
+            reviewed: `--reviewed-plan PLAN`, or `--expect-digest HEX` with
+            the `parts_digest` that PLAN printed. Apply refuses, before
+            connecting and writing nothing, a result whose parts differ, and
+            refuses an unchecked one unless `--unreviewed` is passed.
+            (`compute` prints the digest of its own result, which always
+            matches itself: it is not a review.)
   reverse   Restores exactly what a manifest's apply changed.
 
 What apply writes, per theme:
@@ -50,8 +55,11 @@ What apply writes, per theme:
     the cap. So a theme whose embedded members fit in one part, or that has
     none, is still split under the cap. A part holding only unembedded members
     has no centroid (NULL) and a `claim_count` of 0, as `claim_count` and the
-    centroid count embedded members only. They move with their part, so
-    `reverse` restores them too.
+    centroid count embedded members only; the Atlas builds take only themes
+    with an embedded member, so such a part is not drawn until its members
+    are embedded (plan reports `unembedded_only_parts`). A part filled to
+    exactly the cap goes over it at the next nightly assignment to it. The
+    placed members move with their part, so `reverse` restores them too.
   * Refused, with nothing written, when the result no longer matches the live
     membership (claims assigned or moved since the plan), when any theme the
     result names would still end over the cap (a safety net: the placement
@@ -84,11 +92,14 @@ would stay over the cap.
 
 Off-box compute and the reviewed plan: the split is deterministic on one host
 and set of library versions, but not promised across hosts or CPU
-architectures. When the parts applied come from an off-box `compute` and the
-operator reviewed an on-box `plan`, pass that plan to apply
-(`--reviewed-plan plan.json`): apply compares `theme_cap_core.parts_digest` of
-both and refuses on a mismatch, before connecting. The digest is recomputed
-from the parts, never read from either file.
+architectures. A `plan` result is tagged `"source": "plan"` and a `compute`
+result `"source": "compute"`. Applying a plan file applies what was reviewed.
+Applying any other result needs `--reviewed-plan plan.json` (the on-box plan
+the operator reviewed): apply compares `theme_cap_core.parts_digest` of both
+and refuses on a mismatch, before connecting. The digest is recomputed from
+the parts, never read from either file. `--unreviewed` applies such a result
+unchecked, and the output and manifest record which of these it was
+(`review`).
 
 After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
 of a split theme are stale until rebuilt. `reverse` deletes the new parts'
@@ -263,7 +274,10 @@ def plan(conn, cap=core.DEFAULT_CAP, seed=core.DEFAULT_SEED, theme_ids=None):
 
     Returns (result, report): the result document apply consumes, and one
     report row per theme with its proposed part sizes."""
-    result = {"format": core.RESULT_FORMAT, "cap": cap, "seed": seed, "themes": []}
+    # `source` marks the file as the plan itself (see review_digest); it is not
+    # part of parts_digest, so a matching compute result has the same digest.
+    result = {"format": core.RESULT_FORMAT, "source": "plan", "cap": cap, "seed": seed,
+              "themes": []}
     report = []
     for theme_id, members, embedded, retired in over_cap_themes(conn, cap, theme_ids):
         ids, x = load_members(conn, theme_id)
@@ -379,7 +393,38 @@ def check_reviewed(result, expect_digest):
             "result (or re-run plan and apply that file)")
 
 
-def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None):
+# How an apply's result was checked (recorded in the output and the manifest).
+REVIEW_PLAN_FILE = "reviewed-plan"
+REVIEW_DIGEST = "expect-digest"
+REVIEW_IS_PLAN = "result-is-the-plan"
+REVIEW_NONE = "unreviewed"
+
+
+def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=False):
+    """(expect_digest, review) for an apply of `result`, or ValueError.
+
+    `reviewed_plan` is the reviewed plan's document, `expect_digest` its
+    `parts_digest`. Without either, only a result that is itself a plan
+    (`"source": "plan"`) is accepted, unless `unreviewed` opts out: a compute
+    result, or a file that does not say what wrote it, may come from another
+    host whose parts nobody reviewed. Touches no database."""
+    if reviewed_plan is not None:
+        return core.parts_digest(reviewed_plan), REVIEW_PLAN_FILE
+    if expect_digest is not None:
+        return expect_digest.strip().lower(), REVIEW_DIGEST
+    if result.get("source") == "plan":
+        return None, REVIEW_IS_PLAN
+    if unreviewed:
+        return None, REVIEW_NONE
+    raise ValueError(
+        f"this result is not a plan (source {result.get('source')!r}) and nothing was given "
+        "to check it against: pass --reviewed-plan PLAN (the plan file you reviewed) or "
+        "--expect-digest HEX (the parts_digest that plan printed; compute's own digest is "
+        "not a review), or --unreviewed to apply it unchecked. Nothing was written")
+
+
+def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None,
+                 review=None):
     """Write a result document in one transaction; returns the manifest.
 
     The result's own cap is enforced, and a result whose cap exceeds `max_cap`
@@ -401,6 +446,7 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
     run = str(uuid.uuid4())
     manifest = {"format": MANIFEST_FORMAT, "split_run": run, "cap": cap,
                 "seed": result.get("seed"), "parts_digest": core.parts_digest(result),
+                "review": review,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "themes": []}
     touched = []
@@ -619,7 +665,11 @@ def main(argv=None):
                           help="the plan file the operator reviewed: refuse a result whose "
                                "parts differ from it (an off-box compute)")
     reviewed.add_argument("--expect-digest", default=None,
-                          help="the reviewed parts_digest: refuse a result whose parts differ")
+                          help="the parts_digest the reviewed plan printed (not compute's): "
+                               "refuse a result whose parts differ")
+    reviewed.add_argument("--unreviewed", action="store_true",
+                          help="apply a result that is not a plan without checking it against "
+                               "a reviewed plan")
 
     sp = sub.add_parser("reverse", help="restore what an apply changed")
     db_args(sp)
@@ -639,15 +689,14 @@ def main(argv=None):
                                      for t in result["themes"]]}))
         return 0
 
-    expect_digest = None
+    expect_digest = review = None
     if args.command == "apply":
         result = json.loads(pathlib.Path(args.src).read_text())
-        if args.reviewed_plan is not None:
-            expect_digest = core.parts_digest(
-                json.loads(pathlib.Path(args.reviewed_plan).read_text()))
-        elif args.expect_digest is not None:
-            expect_digest = args.expect_digest.strip().lower()
+        reviewed_plan = (None if args.reviewed_plan is None
+                         else json.loads(pathlib.Path(args.reviewed_plan).read_text()))
         # Before connecting: a result nobody reviewed never reaches the database.
+        expect_digest, review = review_digest(result, reviewed_plan, args.expect_digest,
+                                              args.unreviewed)
         check_reviewed(result, expect_digest)
 
     conn = connect(args.database_url)
@@ -676,12 +725,13 @@ def main(argv=None):
         elif args.command == "apply":
             mpath = args.manifest or f"theme-cap-manifest-{_stamp()}.json"
             manifest = apply_result(conn, result, mpath, max_cap=args.cap,
-                                    expect_digest=expect_digest)
+                                    expect_digest=expect_digest, review=review)
             print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
                               "manifest": mpath if manifest["themes"] else None,
                               "split_run": manifest["split_run"],
                               "parts_digest": manifest["parts_digest"],
                               "checked_against_review": expect_digest is not None,
+                              "review": review,
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],
