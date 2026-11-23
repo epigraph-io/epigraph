@@ -667,6 +667,23 @@ impl MassFunctionRepository {
     /// the copy lands under the (claim, frame, agent, NULL) key, so re-promoting
     /// re-states one row instead of adding another.
     ///
+    /// # This is a COPY; promotion is a MOVE
+    ///
+    /// The source row is left in place. A promotion must pair this call with
+    /// [`ExperimentRepository::retire_promoted_hypothesis_bba`] on the source
+    /// row, in the same transaction, and refuse (roll back) the promotion
+    /// when that returns `false` (backlog 846b808e). Both frames are binary,
+    /// so a copy left beside its source is read twice and, for a row without
+    /// an `evidence_id`, folded twice as independent evidence. The two
+    /// promotion call sites do exactly that: the API's `promote_hypothesis`
+    /// (`epigraph-api` `routes/hypothesis.rs`) and the hypothesis CLI's
+    /// `promote` (`epigraph-cli` `bin/hypothesis.rs`). A new caller that
+    /// promotes must do the same; a caller that really wants the BBA on both
+    /// frames is not a promotion.
+    ///
+    /// [`ExperimentRepository::retire_promoted_hypothesis_bba`]:
+    ///     crate::ExperimentRepository::retire_promoted_hypothesis_bba
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, row), fields(claim_id = %row.claim_id, from = %row.frame_id))]
