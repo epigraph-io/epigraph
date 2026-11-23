@@ -9062,11 +9062,27 @@ impl ClaimRepository {
     /// Keyed on `claim_encryption`, NEVER on `visibility`: a group-private
     /// claim is ordinary plaintext and must still be embedded.
     ///
+    /// # Why the row is locked first, in its own statement
+    ///
+    /// The predicate alone does not see a seal that commits while this UPDATE
+    /// waits on the row lock the seal's blanking `UPDATE` holds: READ COMMITTED
+    /// re-checks the qual on the new row version against the statement's
+    /// ORIGINAL snapshot for `claim_encryption`. Migration 212's row trigger
+    /// then sees the seal with a fresh snapshot and raises 42501, so a caller
+    /// iterating a corpus (`embed_backfill`) got an error, not the documented
+    /// `false`, for a row sealed mid-run (backlog f9807254). As in
+    /// [`store_embedding_if_unsealed`](Self::store_embedding_if_unsealed),
+    /// `SELECT … FOR UPDATE` runs first as a SEPARATE statement; the guarded
+    /// UPDATE then takes a fresh snapshot that includes any seal committed
+    /// during the wait. Pinned by
+    /// `epigraph-db/tests/claim_store_embedding_seal_race.rs`.
+    ///
     /// # Returns
     ///
     /// `true` when a row was updated; `false` for both "no such claim" and "the
-    /// claim is sealed", which this statement deliberately does not
-    /// distinguish. Callers treat a `false` as "nothing to store".
+    /// claim is sealed" (including sealed while this call waited), which this
+    /// call deliberately does not distinguish. Callers treat a `false` as
+    /// "nothing to store".
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -9076,6 +9092,14 @@ impl ClaimRepository {
         id: Uuid,
         embedding_pgvector: &str,
     ) -> Result<bool, DbError> {
+        let mut tx = pool.begin().await?;
+
+        // The lock, as its own statement (see the section above).
+        sqlx::query("SELECT 1 FROM claims WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+
         let result = sqlx::query(
             "UPDATE claims SET embedding = $1::vector \
               WHERE id = $2 \
@@ -9085,8 +9109,9 @@ impl ClaimRepository {
         )
         .bind(embedding_pgvector)
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }

@@ -240,7 +240,19 @@ async fn fetch_batch(
 /// Re-checks [`ReembedTarget::sealed_predicate`] for the same window: a row
 /// sealed after it was fetched would otherwise reach migration 212's row
 /// trigger, whose 42501 aborts the run (and before 212 the vector was written
-/// onto ciphertext). With the predicate it is a zero-row no-op too.
+/// onto ciphertext).
+///
+/// The predicate is enough only for a seal that committed BEFORE the UPDATE
+/// started. A seal that commits while the UPDATE waits on the row lock (the
+/// seal's own blanking `UPDATE … embedding = NULL` holds it) is invisible to
+/// it: READ COMMITTED re-checks the qual on the new row version against the
+/// statement's original snapshot for the encryption table, the 212 trigger
+/// then sees the seal with a fresh snapshot, and its 42501 ended the whole run
+/// (backlog f9807254). So the row is locked first, in a SEPARATE statement of
+/// the same transaction, and the guarded UPDATE takes a fresh snapshot that
+/// includes any seal committed during that wait: a zero-row no-op, as
+/// `ClaimRepository::store_embedding_if_unsealed` does. Pinned by
+/// `epigraph-cli/tests/reembed_concurrent_seal.rs`.
 ///
 /// Returns whether a row was written.
 async fn update_embedding_3072(
@@ -252,11 +264,24 @@ async fn update_embedding_3072(
     let table = target.table();
     let eligible = target.eligible_predicate();
     let sealed = target.sealed_predicate();
+    let mut tx = pool.begin().await?;
+
+    // The lock, as its own statement (see above).
+    sqlx::query(&format!("SELECT 1 FROM {table} WHERE id = $1 FOR UPDATE"))
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
     let sql = format!(
         "UPDATE {table} SET embedding_3072 = $1::vector \
           WHERE id = $2 AND {eligible} AND NOT {sealed}"
     );
-    let done = sqlx::query(&sql).bind(pgvec).bind(id).execute(pool).await?;
+    let done = sqlx::query(&sql)
+        .bind(pgvec)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(done.rows_affected() > 0)
 }
 
