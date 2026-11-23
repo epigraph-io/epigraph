@@ -2485,7 +2485,12 @@ Without `--apply`, each verb's writes and audit row roll back.
 print the rows the act writes or ends (`COPY` for each succession copy an
 attach follows onto, `DETACHED` for each row a detach ends) and the
 role-derived memberships of every identity the act can change, before vs
-after (`MEMBERSHIP GAINED|LOST|KEPT`).
+after (`MEMBERSHIP GAINED|LOST|KEPT`). When the window the act concerns
+opens later than now (an attach `--valid-from` in the future, or a detach
+of a row that has not opened yet), both sides are read as of that opening
+and an `EVALUATED-AT` line says so. `role-attach` prints `UNREGISTERED` for
+an identity the host never registered: register a host identity first (see
+"Order: REGISTER, THEN ATTACH" above).
 `group-roster` prints a `MEMBER` line per binding-derived member and a
 `DIRECT` line per live row of the group's own roster (what `group-member add`
 writes, and the admin a team group is created with); the last line counts both
@@ -2921,7 +2926,12 @@ was refused, and then nothing is written under `--apply`. It runs on a
 NOSUPERUSER maintenance login from migration 158 on. A `delete-frames`
 built for migration 194 purges retracted BBAs through the audited purge
 definer (`epigraph_purge_mass_functions`), so install it AFTER 194 is
-applied.
+applied. It refuses, before connecting, a `--reason` that is blank after
+trimming spaces or longer than 2000 characters (counted in characters, as
+the purge definer counts them): the definer's own bound, checked up front so
+the refusal comes before the dry run rather than at the apply. A blank reason
+was accepted before when nothing retracted was purged; it is now refused
+whatever the frames hold.
 
 ### The operator CLI at a glance
 

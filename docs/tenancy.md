@@ -1611,7 +1611,16 @@ by name. Re-attaching the old root alone does not bring back a successor
 whose old copy still covers the window (166's lineage follow copies only
 into gaps): detach the running identity's old copy first, then attach it by
 name. The copies its later identities inherit from that attachment count
-again.
+again. With the operator verbs, dry run each step first and check its
+`MEMBERSHIP` lines, then repeat it with `--apply`:
+
+```bash
+epigraph-operator role-detach --role <role> --agent <running identity> --reason "<why>"
+epigraph-operator role-attach --role <role> --agent <running identity> --reason "<why>"
+```
+
+The attach's dry run runs against the database as it is, so it previews the
+attach only after the detach has been applied.
 
 The lineage walk reads only recorded successions. A copy written by hand
 for an identity with no recorded parent is judged by its copy chain alone
@@ -1734,7 +1743,8 @@ new, non-elevating role that the same human holds, here
 4. Register the job's identity, through the host's identity attestor, in the
    group folder the job runs in, and link it to that human. Do this BEFORE
    step 5: an identity that already has an attachment when the host first
-   registers it is refused (`AID09`).
+   registers it is refused (`AID09`). `role-attach` prints `UNREGISTERED`
+   for an identity the host has never registered; do not apply it then.
 
 5. Attach the identity to the role (166). A dry run first:
 
