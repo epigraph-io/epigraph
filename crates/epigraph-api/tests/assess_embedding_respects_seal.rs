@@ -49,12 +49,14 @@ fn request() -> AssessClaimRequest {
     .expect("AssessClaimRequest deserializes")
 }
 
+/// The handler's state on the harness superuser, plus a `ScopedPool` over
+/// the same database: `assess_claim` writes on `AppState::write_as` (backlog
+/// 74feb76b), and the `EPIGRAPH_COMPOUND_WRITE_GUARD` decision (backlog
+/// 7435772c) reads on that same stamped transaction.
 async fn state(pool: &PgPool) -> AppState {
     let svc: Arc<dyn EmbeddingService> = Arc::new(MockProvider::new(EmbeddingConfig::openai(1536)));
     let mut state =
         AppState::with_db(pool.clone(), ApiConfig::default()).with_embedding_service(svc);
-    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
-    // state carries a `ScopedPool` (the harness superuser's, stamped).
     state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
     state
 }

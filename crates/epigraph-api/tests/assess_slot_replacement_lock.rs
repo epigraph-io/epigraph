@@ -69,7 +69,8 @@ async fn assess(
         .await
         .expect("resolve caller");
     // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
-    // state carries a `ScopedPool` (the harness superuser's, stamped).
+    // state carries a `ScopedPool` (the harness superuser's, stamped); the
+    // compound-guard decision (backlog 7435772c) reads on the same transaction.
     let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
     state.scoped = Some(viewer_fixture::scoped_pool(&pool).await);
     let Json(resp) = assess_claim(

@@ -3336,6 +3336,17 @@ pub struct DsEvidenceResponse {
     /// `unknown_keys`, which names evidence-type keys only. Omitted when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unknown_locality_tag: Option<String>,
+    /// Set when the claim is a COMPOUND and the server runs
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
+    /// the BBA was stored, but a compound's belief is derived from its atoms,
+    /// so it is never folded into the compound's cached belief (the derived
+    /// compound view reads its refutation mass, as for every compound row).
+    /// `visible_atoms` lists the atoms this caller can see (`{id, content}`, at most 50; `visible_atom_count` is
+    /// the full count): write there instead. A matching sentence is in
+    /// `warnings`. Under `refuse` the call is refused instead. Omitted for a
+    /// claim that is not a compound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated_compound_target: Option<epigraph_engine::compound_write_guard::CompoundTarget>,
 }
 
 #[derive(Debug, Serialize)]

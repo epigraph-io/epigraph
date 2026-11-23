@@ -48,6 +48,18 @@ fn request(supports: bool, confidence: f64) -> AssessClaimRequest {
     .expect("AssessClaimRequest deserializes")
 }
 
+/// The handler's state: the test pool plus a `ScopedPool` over the same
+/// database (the harness superuser's, stamped). `assess_claim` reads and
+/// writes on `AppState::write_as` (backlog 74feb76b), and the
+/// `EPIGRAPH_COMPOUND_WRITE_GUARD` decision (backlog 7435772c) reads on that
+/// same transaction. A state with no scoped pool refuses the call, as it
+/// should in production.
+async fn assess_state(pool: &PgPool) -> AppState {
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    state
+}
+
 async fn assess(
     pool: &PgPool,
     caller: Uuid,
@@ -55,10 +67,7 @@ async fn assess(
     req: AssessClaimRequest,
 ) -> AssessClaimResponse {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
-    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
-    // state carries a `ScopedPool` (the harness superuser's, stamped).
-    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
-    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    let state = assess_state(pool).await;
     let Json(resp) = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
@@ -342,10 +351,7 @@ async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool)
     let viewer = Viewer::resolve(&pool, caller)
         .await
         .expect("resolve caller");
-    // `assess_claim` writes on `AppState::write_as` (backlog 74feb76b), so the
-    // state carries a `ScopedPool` (the harness superuser's, stamped).
-    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
-    state.scoped = Some(viewer_fixture::scoped_pool(&pool).await);
+    let state = assess_state(&pool).await;
     let result = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),

@@ -130,6 +130,17 @@ pub struct AssessClaimResponse {
     /// The owner's earlier assessment this call replaced in place (the slot row
     /// keeps its id, `mass_function_id` above). Empty when the owner had none.
     pub replaced_assessments: Vec<ReplacedAssessment>,
+    /// Set when the claim is a COMPOUND and the server runs
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
+    /// the assessment was stored, but a compound's belief is derived from its
+    /// atoms, so it is never folded into the compound's cached belief (the
+    /// derived compound view reads its refutation mass, as for every compound
+    /// row). `visible_atoms` lists the atoms the caller can see (`{id, content}`, at most 50;
+    /// `visible_atom_count` is the full count): assess those instead. Under
+    /// `refuse` the request is refused with 422 (`compound_target`). Omitted
+    /// for a claim that is not a compound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated_compound_target: Option<epigraph_engine::compound_write_guard::CompoundTarget>,
 }
 
 /// The owner's earlier assessment a call replaced.
@@ -218,6 +229,39 @@ pub async fn assess_claim(
             id: claim_id.to_string(),
         })?;
     let claim_content = claim.content;
+
+    // ── 1b. EPIGRAPH_COMPOUND_WRITE_GUARD (backlog 7435772c, SPEC §4.1 W3) ─
+    //
+    // An assessment's masses carry no evidence text, so on a COMPOUND they
+    // could never be attributed to its atoms. The role is decided by
+    // structure (migration 193's definer), as the caller, before anything is
+    // written (the slot perspective below is the first write). `refuse`
+    // answers 422 with the atoms the caller can see; `warn` goes ahead (the
+    // row is inert: a compound has no cache-owner frame, so the cache
+    // refresh below and every later owner-rule recompute leave its cache
+    // alone), reports the atoms and, once the slot row commits, logs the caller.
+    let deprecated_compound_target = {
+        use epigraph_engine::compound_write_guard::{decide, GuardDecision};
+        match decide(
+            &mut tx,
+            &viewer,
+            claim_id,
+            state.compound_write_guard,
+            "assess",
+            viewer.principal(),
+        )
+        .await?
+        {
+            GuardDecision::NotCompound => None,
+            GuardDecision::Accept(target) => Some(target),
+            GuardDecision::Refuse(target) => {
+                return Err(ApiError::CompoundTarget {
+                    message: target.refusal(),
+                    data: target.refusal_data(),
+                });
+            }
+        }
+    };
 
     // ── 2. Load calibration config ───────────────────────────────────────
     //
@@ -730,6 +774,11 @@ pub async fn assess_claim(
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
         message: format!("Failed to commit the assessment: {e}"),
     })?;
+    // The compound assessment has landed: only now does it count in the
+    // guard's journal (a request refused above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("assess", caller);
+    }
 
     // ── 9. Generate embedding ────────────────────────────────────────────
     let embedded = if let Some(ref embedding_service) = state.embedding_service {
@@ -787,6 +836,7 @@ pub async fn assess_claim(
         owner_agent_id: owner,
         assessed_by: caller,
         replaced_assessments,
+        deprecated_compound_target,
     }))
 }
 

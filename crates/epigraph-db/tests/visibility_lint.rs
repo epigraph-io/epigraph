@@ -4389,6 +4389,18 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          stamped transaction, for `POST /api/v1/papers`'s response; the row security of \
          that transaction admits it because the caller wrote or reads it.",
     ),
+    // EPIGRAPH_COMPOUND_WRITE_GUARD's role test (backlog 7435772c).
+    (
+        "claim_role.rs",
+        "is_compound_by_definer",
+        "READ of one boolean, `public.epigraph_claim_is_compound($1)`, migration 193's SECURITY \
+         DEFINER role test over `edges` (an in-force `decomposes_to` out-edge), on the whole graph \
+         by design: role is structural, so a caller who cannot see a compound's decomposition must \
+         still be guarded. It returns no row, id or content. Its one caller, \
+         `compound_write_guard::decide`, first checks the claim is visible to the caller \
+         (`visible_claim_ids`, viewer-spliced) and answers an unreadable claim as not-a-compound, \
+         so the bit is never learned about a claim the caller cannot read.",
+    ),
 ];
 
 /// A generic-executor repo fn must spend a viewer, or say in writing why it has

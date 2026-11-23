@@ -411,6 +411,17 @@ pub struct EvidenceSubmissionResponse {
     /// `replaced`. Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Set when the claim is a COMPOUND and the server runs
+    /// `EPIGRAPH_COMPOUND_WRITE_GUARD=warn` (backlog 7435772c, SPEC §4.1 W3):
+    /// the BBA was stored, but a compound's belief is derived from its atoms,
+    /// so it is never folded into the compound's cached belief (the derived
+    /// compound view reads its refutation mass, as for every compound row).
+    /// `visible_atoms` lists the atoms the caller can see (`{id, content}`, at most 50; `visible_atom_count` is
+    /// the full count): submit there instead. A matching sentence is in
+    /// `warnings`. Under `refuse` the request is refused with 422
+    /// (`compound_target`). Omitted for a claim that is not a compound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deprecated_compound_target: Option<epigraph_engine::compound_write_guard::CompoundTarget>,
 }
 
 /// Simplified combination report for API response
@@ -1192,6 +1203,38 @@ pub async fn submit_evidence(
     };
     let frame_id = redirected.as_ref().map_or(frame_id, |f| f.id);
 
+    // 0c. EPIGRAPH_COMPOUND_WRITE_GUARD (backlog 7435772c, SPEC §4.1 W3):
+    //     these masses carry no evidence text, so on a COMPOUND they could
+    //     never be attributed to its atoms. The role is decided by structure
+    //     (migration 193's definer), as the caller, before anything is
+    //     written or announced. `refuse` answers 422 with the atoms the
+    //     caller can see; `warn` goes ahead (the row is inert: a compound has
+    //     no cache-owner frame, so neither step 13 nor any later owner-rule
+    //     recompute folds it), tells the caller and logs it once committed.
+    let deprecated_compound_target = {
+        use epigraph_engine::compound_write_guard::{decide, GuardDecision};
+        let mut read = state.read_as(&viewer).await?;
+        match decide(
+            &mut read,
+            &viewer,
+            request.claim_id,
+            state.compound_write_guard,
+            "frames_evidence",
+            Some(caller),
+        )
+        .await?
+        {
+            GuardDecision::NotCompound => None,
+            GuardDecision::Accept(target) => Some(target),
+            GuardDecision::Refuse(target) => {
+                return Err(ApiError::CompoundTarget {
+                    message: target.refusal(),
+                    data: target.refusal_data(),
+                });
+            }
+        }
+    };
+
     // 1. Load and validate frame
     let frame_row = epigraph_db::FrameRepository::get_by_id(pool, &viewer, frame_id)
         .await?
@@ -1765,6 +1808,9 @@ pub async fn submit_evidence(
             })?
             .flatten();
     let mut warnings = deprecated_parameter_warnings(&request);
+    if let Some(target) = &deprecated_compound_target {
+        warnings.push(target.warning());
+    }
     if redirected.is_some() {
         warnings.push(epigraph_engine::promotion::redirected_evidence_warning(
             request.claim_id,
@@ -2025,6 +2071,11 @@ pub async fn submit_evidence(
     }
 
     tx.commit().await?;
+    // The compound write has landed: only now does it count in the guard's
+    // journal (a request refused above added no line).
+    if let Some(target) = &deprecated_compound_target {
+        target.log_accepted("frames_evidence", Some(caller));
+    }
 
     // 13c. CDST residual mass analysis
     {
@@ -2465,6 +2516,7 @@ pub async fn submit_evidence(
             write_outcome: write_outcome.as_str().to_string(),
             deduplicated: write_outcome.deduplicated(),
             warnings,
+            deprecated_compound_target,
         }),
     ))
 }
@@ -3401,6 +3453,7 @@ mod tests {
             write_outcome: "inserted".to_string(),
             deduplicated: false,
             warnings: vec![],
+            deprecated_compound_target: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("pignistic_prob"));
@@ -3578,6 +3631,7 @@ mod tests {
             write_outcome: "inserted".to_string(),
             deduplicated: false,
             warnings: vec![],
+            deprecated_compound_target: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(

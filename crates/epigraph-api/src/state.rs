@@ -348,6 +348,15 @@ pub struct AppState {
     /// `bin/server.rs` sets it from [`BP_MAX_CONCURRENT_ENV`] at boot.
     #[cfg(feature = "db")]
     pub bp_runs: Arc<tokio::sync::Semaphore>,
+    /// What a textless BBA write aimed at a compound does
+    /// (`EPIGRAPH_COMPOUND_WRITE_GUARD`, `epigraph_engine::compound_write_guard`;
+    /// read by `POST /api/v1/frames/:id/evidence` and
+    /// `POST /api/v1/claims/:id/assess`). Every constructor takes the mode this
+    /// process read at startup (`belief_modes::current`), the value `/health`
+    /// reports, so no boot step can forget to set it;
+    /// [`Self::with_compound_write_guard`] overrides it (tests).
+    #[cfg(feature = "db")]
+    pub compound_write_guard: epigraph_engine::belief_modes::CompoundWriteGuard,
     /// Whether the anonymous guest reads under `/api/v1/guest/` answer
     /// (`routes/guest.rs`). OFF in every constructor, where each guest route
     /// answers a bare 404 as if it were not routed; `bin/server.rs` sets it
@@ -1462,6 +1471,7 @@ impl AppState {
             ),
             bp_apply: BpApply::Off,
             bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -1591,6 +1601,18 @@ impl AppState {
     #[must_use]
     pub fn with_bp_max_concurrent(mut self, limit: usize) -> Self {
         self.bp_runs = bp_runs_semaphore(limit);
+        self
+    }
+
+    /// Set what a textless BBA write aimed at a compound does; see
+    /// [`Self::compound_write_guard`].
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn with_compound_write_guard(
+        mut self,
+        guard: epigraph_engine::belief_modes::CompoundWriteGuard,
+    ) -> Self {
+        self.compound_write_guard = guard;
         self
     }
 
@@ -2067,6 +2089,7 @@ impl AppState {
             ),
             bp_apply: BpApply::Off,
             bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,
@@ -2153,6 +2176,7 @@ impl AppState {
             ),
             bp_apply: BpApply::Off,
             bp_runs: Arc::new(tokio::sync::Semaphore::new(BP_MAX_CONCURRENT_DEFAULT)),
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
             guest_reads: GuestReads::Off,
             guest_rate_limiter: None,
             config,

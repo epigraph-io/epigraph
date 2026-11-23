@@ -38,7 +38,7 @@
 //! |---|---|---|---|
 //! | `EPIGRAPH_ATOM_FOLD` | `legacy`, `aef_standalone`, `aef` | `legacy` | yes: the single atom-cache writer (`edge_factor::recompute_atom_cache`) folds with the AEF the atoms the mode covers; the CLI wave bins whose writers fold only legacy refuse a writing run under any other fold |
 //! | `EPIGRAPH_COMPOUND_BELIEF` | `legacy`, `shadow`, `progressive`, `strict` | `legacy` | `shadow` only: MCP `get_belief` adds the atom-level `shadow` view beside the served values. `progressive` and `strict` are not wired and serve `legacy` (logged once; `/health` still reports the configured mode) |
-//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | no: a textless BBA write on a compound is neither kept inert nor logged yet |
+//! | `EPIGRAPH_COMPOUND_WRITE_GUARD` | `warn`, `refuse` | `warn` | yes, on the textless BBA writers MCP `submit_ds_evidence`, REST `POST /api/v1/frames/:id/evidence` and REST `POST /api/v1/claims/:id/assess` (`compound_write_guard::decide`, role by migration 193's definer, a claim the caller cannot read left to the writer's not-found): on a compound, `warn` stores the BBA inert (a compound has no cache-owner frame, so no cache fold reads it; the per-frame side rows each writer keeps, such as its Beta track, are still written), returns `deprecated_compound_target` with the caller's visible atoms and logs the caller; `refuse` refuses it (MCP `invalid_params`, REST 422, `error: compound_target`) before anything is written. `update_with_evidence` carries evidence text and is not guarded |
 //! | `EPIGRAPH_COMPOUND_SOURCE_EDGES` | `frozen`, `excluded` | `frozen` | yes: the atom display fold (`atom_items`), the atom-cache writer, BBA retraction's cache vacate and the shadow report keep or drop edge-factor rows whose source is a compound |
 //! | `EPIGRAPH_ATOM_CACHE_MODE` | `display`, `pure` | `display` | no |
 //! | `EPIGRAPH_INFERENCE` | `off`, `shadow`, `on` | `off` | no |
@@ -46,8 +46,8 @@
 //!
 //! The value docs below say what each mode means. For a flag (or value) the
 //! table marks as not acted on, a reported mode is configuration, not
-//! behaviour: `compound_write_guard: refuse` on `/health` does not mean such
-//! a write is refused. Each flag is wired into its code path by the change
+//! behaviour: `inference: on` on `/health` does not mean an inference layer
+//! is served. Each flag is wired into its code path by the change
 //! that introduces the behaviour, which reads [`current`] rather than parsing
 //! the environment again, and updates the table.
 //!
@@ -147,9 +147,9 @@ belief_mode! {
 }
 
 belief_mode! {
-    /// What a textless BBA write aimed at a compound does. Reported only in
-    /// this build (see the module doc's table); the variants describe the
-    /// enforced meaning.
+    /// What a textless BBA write aimed at a compound does
+    /// ([`crate::compound_write_guard`]; the module doc's table names the
+    /// writers that act on it).
     CompoundWriteGuard, env = "EPIGRAPH_COMPOUND_WRITE_GUARD", default = Warn, {
         /// Accepted, kept inert, the caller warned and logged.
         Warn => "warn",
