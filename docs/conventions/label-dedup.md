@@ -31,7 +31,8 @@ it that way:
   `EPIGRAPH_LABEL_DEDUP_INDEX_FAMILIES` (comma-separated, read once at startup;
   empty refuses every family, `FAMILY_NOT_ALLOWED`).
 
-Both checks are decided from the profile alone, before any read.
+Both checks are decided from the profile alone, before any family is read.
+(A `profile_claim_id` profile is itself read first, as the caller; see below.)
 
 Not sure label dedup is the right tool? See
 [duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md).
@@ -54,8 +55,10 @@ How the profile reaches the tool depends on the transport:
 
 | Transport | Accepted | Refused |
 |---|---|---|
-| stdio | `profile_path`, resolved under `EPIGRAPH_MCP_PROFILE_ROOT` | `profile_json` (`PROFILE_JSON_REFUSED`) |
-| HTTP | `profile_json` | `profile_path` (`PROFILE_PATH_REFUSED`) |
+| stdio | `profile_path`, resolved under `EPIGRAPH_MCP_PROFILE_ROOT`; `profile_claim_id` only when `EPIGRAPH_MCP_PROFILE_PIN` is set | `profile_json` (`PROFILE_JSON_REFUSED`); `profile_claim_id` with no pin (`PROFILE_CLAIM_REFUSED`) |
+| HTTP | `profile_json`, `profile_claim_id` | `profile_path` (`PROFILE_PATH_REFUSED`) |
+
+Exactly one source per call (`PROFILE_SOURCE_REQUIRED`).
 
 On stdio:
 
@@ -72,8 +75,30 @@ On stdio:
 - A missing file and an unreadable file give the same answer
   (`PROFILE_NOT_FOUND`).
 
-`profile_claim_id` (a profile stored as a claim) is reserved and refused
-(`PROFILE_CLAIM_DEFERRED`).
+`profile_claim_id` names a profile stored in the graph: a claim whose
+`content` is the profile's exact bytes (store it with `submit_claim`, which
+keeps content verbatim; the claim content limit, 64 KiB, bounds a stored
+profile). Pass `novelty_threshold: 0.0` when storing it: at the default
+threshold the semantic novelty gate can answer with an existing near-identical
+claim (an earlier revision of the profile, possibly another author's) and
+write nothing, and the next plan then fails `PROFILE_HASH_MISMATCH`. Use the
+`claim_id` that call returns. Then:
+
+- The claim is read as the caller, on a connection stamped from the caller's
+  viewer. A claim the caller cannot read gives the same `PROFILE_NOT_FOUND`
+  answer as a missing one.
+- Its bytes must hash to `profile_hash`, like every other source. A
+  superseded claim still loads: the hash pins the bytes, not the claim's
+  currency.
+- On stdio it is read only when the process was started with a pin, and the
+  pin is checked before the claim is read. A claim is something the agent
+  talking to the process can write, so without a pin that agent could choose
+  its own profile, the reason inline JSON is refused there.
+- Every plan, apply and probe answer carries `profile_source`:
+  `{"kind": "path"}`, `{"kind": "inline"}` or
+  `{"kind": "claim", "claim_id": "<id>"}`. `plan_hash` covers the profile
+  hash, not the source, so the same bytes from a file, inline or a claim
+  plan to the same hash.
 
 Both variables are read once at startup. An empty value means unset.
 
@@ -382,7 +407,7 @@ Tool errors carry `data.code`:
 - `PROFILE_NOT_FOUND`
 - `PROFILE_TOO_LARGE`
 - `PROFILE_SOURCE_REQUIRED`
-- `PROFILE_CLAIM_DEFERRED`
+- `PROFILE_CLAIM_REFUSED` (stdio, `profile_claim_id` with no pin)
 - `PROFILE_HASH_MISMATCH`
 - `PROFILE_SCHEMA_INVALID`
 - `INVALID_ARGUMENT`
@@ -397,7 +422,7 @@ Tool errors carry `data.code`:
   refused here)
 - `TRUNCATED` (probe)
 - `FAMILY_NOT_INDEX`, `FAMILY_NOT_ALLOWED` (plan, apply and probe, before any
-  read; revert and the index view take no profile)
+  family read; revert and the index view take no profile)
 - `ADMIN_CONNECTION_REQUIRED`, `UNMARK_REFUSED` (revert)
 
 Apply's `TRUNCATED`, `RESOURCE_CAP` and `PLAN_DRIFT` are a `refused` status, not
