@@ -520,7 +520,9 @@ fn undo_sql() -> String {
 async fn the_246_undo_returns_the_catalog_below_246(pool: PgPool) {
     migrate(&pool, &up_to(245)).await;
     let before = catalog(&pool).await;
-    migrate(&pool, &MIGRATOR).await;
+    // Through 246 exactly: a later migration's own objects are not 246's to
+    // undo, and would show in the comparison.
+    migrate(&pool, &up_to(246)).await;
     let through = catalog(&pool).await;
     assert!(
         through
