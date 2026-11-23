@@ -1260,7 +1260,12 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "unmark_duplicate",
         &["ClaimRepository::session_may_unmark_conn"],
     ),
-    // gated (`get_by_id_with_labels`) then write.
+    // gated (`get_by_id_with_labels`) then write. `truth_value_of` reads the
+    // hierarchical row back on the same caller-stamped transaction when the
+    // `set_truth_value` mirror changed 0 rows (migration 237's owner-scoped
+    // UPDATE policy filters a non-writer's write silently), so a filtered
+    // write refuses the request instead of committing the claim's half alone;
+    // `workflows` row security (183) bounds that read like the write.
     (
         "workflows.rs",
         "deprecate_workflow",
@@ -1268,6 +1273,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::deprecate_claim",
             "EventRepository::insert",
             "WorkflowRepository::set_truth_value",
+            "WorkflowRepository::truth_value_of",
         ],
     ),
     // the existence check is the caller's viewed read (backlog 08061583);

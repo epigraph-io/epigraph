@@ -3431,6 +3431,59 @@ restart.
   `epigraph_readable_teams(agent)` still answer for any agent on the application role (an
   open residual for a separate change). **Applied to throwaway databases only, NOT to any
   deployed database.**
+- **237**: public `workflows_update_owner_scope` (backlog 524f89c1). 183's
+  `workflows_update` admitted an UPDATE of any row the session READS (public rows, and
+  group rows to readers), so any application-role session could rewrite a public
+  workflow's `truth_value`, counters or `metadata.epigraph_submitted_by` (the key the
+  workflow authority gate's submitter arm trusts) by a direct statement. Three parts:
+  (1) two SECURITY DEFINER functions for the hierarchical outcome report, which any
+  reader of the plan may make: `epigraph_workflow_lock_readable(uuid)` locks a row the
+  session reads (183's read predicate restated) and `epigraph_workflow_record_outcome(uuid,
+  boolean, double precision)` computes the four counters in SQL
+  (`HierarchicalOutcomeCounters::after_report`'s rule) and writes only those keys; both
+  refuse an elevated session, sit on 172's pinned path, are owned by
+  `epigraph_maintenance` and granted to `epigraph_app` only, and are registered in
+  `epigraph-tenancy-backfill`. `WorkflowRepository::record_hierarchical_outcome` now calls
+  them. (2) A RESTRICTIVE `workflows_update_owner` FOR UPDATE policy (117's shape): 077's
+  bypass arms OR `owner_group_id = ANY (epigraph_writable_groups())`, so a direct UPDATE or
+  row lock reaches a row only for a writer of its owner group (public rows included), a
+  maintenance session or a maintenance-owned body. (3) `workflows_submitter_immutable`, a
+  BEFORE UPDATE OF metadata trigger: an ordinary session may not change or remove a
+  recorded submitter (recording a first one is unchanged). (4) The audited admin path:
+  `epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)` (111's shape) re-checks
+  the session principal's live `claims:admin` grant through the token's client, refuses an
+  elevated session, sets `truth_value = 0.05` and nothing else, and writes the
+  `workflows.admin_write` audit row itself; the MCP `deprecate_workflow` admin arm calls it.
+  NOT backed by the database: the entry points' submitter, operator and delegate arms for a
+  caller that does not write the row's owner group; such a caller's `truth_value` UPDATE
+  matches no row, so both `deprecate_workflow` entry points (MCP hierarchical and flat, REST
+  flat mirror) now refuse the call, nothing written, unless the row already reads 0.05. The
+  plan lock (`add_step`) and a deprecation's lineage lock go through
+  `epigraph_workflow_lock_readable`, so they still hold every row the caller reads. The
+  admin's retirement of a plan's CLAIMS in a group it does not write was refused by
+  `claims_tenancy` before 237 and still is. Pinned by
+  `epigraph-db/tests/workflows_update_owner_scope.rs` (as `epigraph_app`: counter parity
+  on odd stored shapes, unreadable rows, the variance bound, non-writer UPDATEs and locks
+  refused, writer and maintenance admitted, the submitter guard, the lineage lock across
+  owner groups, the admin definer's grant check and audit, the undo; each part mutation-
+  or removal-tested), `epigraph-mcp/tests/deprecate_workflow_owner_scope_app_role.rs`,
+  `workflows_tenancy.rs` and `epigraph-api/tests/workflow_pin_read_contract.rs` (h). Undo:
+  `docs/runbooks/237-undo.sql` (tested: run twice). Slot 237 was assigned by the
+  2026-11-22 backlog triage. **Deploy order (binding): migrate and roll out the binary
+  TOGETHER.** A pre-237 binary on a 237 database answers every outcome report from a caller
+  that does not write the plan's owner group 404 (its `FOR UPDATE` sees no row), runs such a
+  caller's `add_step` without its plan lock, and commits such a caller's deprecation with
+  the row left live; a 237 binary on a pre-237 database fails every outcome report, every
+  `add_step` and every hierarchical deprecation 42883 (no definer). `embed_backfill` writes
+  `goal_embedding` on its maintenance connection (`MaintenancePool` refuses an
+  unprivileged one), so 237 does not narrow it. Before migrating,
+  measure the rows whose recorded submitter does not write the owner group (they lose the
+  identity arms' database writes): `SELECT w.visibility, count(*) FROM workflows w WHERE
+  w.metadata ? 'epigraph_submitted_by' AND NOT EXISTS (SELECT 1 FROM
+  epigraph_live_memberships((w.metadata->>'epigraph_submitted_by')::uuid) m WHERE
+  m.group_id = w.owner_group_id AND m.role IN ('writer','admin')) GROUP BY 1`, and the
+  rows with no recorded submitter. **Applied to throwaway databases only, NOT to any
+  deployed database.**
 - **238**: public `claims_block_widening_definer` (backlog b5f6883b). Re-states 074's
   `epigraph_claims_block_widening()` (the body of the `claims_block_widening` trigger) as
   SECURITY DEFINER, owned by `epigraph_maintenance`, on 172's form (`SET search_path =

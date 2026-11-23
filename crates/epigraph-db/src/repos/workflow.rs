@@ -152,6 +152,15 @@ const PLAN_INDEX_INT: &str = "(CASE WHEN jsonb_typeof(properties->'plan_index') 
 /// `workflows.metadata` (`use_count`, `success_count`, `failure_count`,
 /// `avg_variance`), as [`WorkflowRepository::record_hierarchical_outcome`]
 /// leaves them.
+///
+/// The WRITE is computed in SQL by migration 237's
+/// `epigraph_workflow_record_outcome` (a reader may not UPDATE the row, so it
+/// moves the counters through that definer); [`Self::after_report`] and
+/// [`Self::write_into`] are the rule it follows, and
+/// `epigraph-db/tests/workflows_update_owner_scope.rs` pins the two equal on
+/// the stored shapes the rule treats specially (missing, non-integer,
+/// negative and saturated counters, a non-numeric or out-of-range mean).
+/// Change both together.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HierarchicalOutcomeCounters {
     pub use_count: i64,
@@ -163,26 +172,33 @@ pub struct HierarchicalOutcomeCounters {
 
 impl HierarchicalOutcomeCounters {
     /// The counters after one more report on a row whose metadata is
-    /// `metadata`: a missing or non-numeric counter counts as zero.
+    /// `metadata`. A counter that is missing, is not a JSON integer that fits
+    /// an i64, or is negative counts as zero, and a counter saturates at
+    /// `i64::MAX` instead of overflowing. A stored `avg_variance` that is not
+    /// a JSON number in `[0, 1]` (every running mean of variances in `[0, 1]`
+    /// is) counts as zero. So no stored shape makes a report fail, or makes
+    /// every later report on the row fail.
     #[must_use]
     pub fn after_report(metadata: &serde_json::Value, success: bool, variance: f64) -> Self {
         let int = |k: &str| {
             metadata
                 .get(k)
                 .and_then(serde_json::Value::as_i64)
+                .filter(|n| *n >= 0)
                 .unwrap_or(0)
         };
-        let use_count = int("use_count") + 1;
+        let use_count = int("use_count").saturating_add(1);
         let prev_avg_var = metadata
             .get("avg_variance")
             .and_then(serde_json::Value::as_f64)
+            .filter(|v| (0.0..=1.0).contains(v))
             .unwrap_or(0.0);
         #[allow(clippy::cast_precision_loss)]
         let avg_variance = (prev_avg_var * (use_count - 1) as f64 + variance) / use_count as f64;
         Self {
             use_count,
-            success_count: int("success_count") + i64::from(success),
-            failure_count: int("failure_count") + i64::from(!success),
+            success_count: int("success_count").saturating_add(i64::from(success)),
+            failure_count: int("failure_count").saturating_add(i64::from(!success)),
             avg_variance,
         }
     }
@@ -455,9 +471,15 @@ impl WorkflowRepository {
     ///
     /// `add_step` takes it before it reads the plan it is about to extend, so
     /// two concurrent `add_step`s on one workflow cannot both compute the same
-    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction,
-    /// which `workflows`' row security (migration 183) bounds to the rows that
-    /// stamp reads.
+    /// next `plan_index`. It runs on `add_step`'s caller-stamped transaction
+    /// and locks a row that stamp READS (183's `workflows_read`).
+    ///
+    /// Through migration 237's `epigraph_workflow_lock_readable`, not a
+    /// `SELECT ... FOR UPDATE` on the stamp: since 237 a row lock on the stamp
+    /// reaches only a row whose owner group the session WRITES, and the entry
+    /// points admit callers that do not (the submitter, its operator, a
+    /// delegate, the audited admin) to a public plan. On the stamp their lock
+    /// would take nothing and two such appends could take the same index.
     ///
     /// # Errors
     /// Returns `sqlx::Error` if the query fails.
@@ -465,12 +487,10 @@ impl WorkflowRepository {
         executor: E,
         workflow_id: Uuid,
     ) -> Result<bool, sqlx::Error> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM workflows WHERE id = $1 FOR UPDATE")
-                .bind(workflow_id)
-                .fetch_optional(executor)
-                .await?;
-        Ok(row.is_some())
+        sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+            .bind(workflow_id)
+            .fetch_one(executor)
+            .await
     }
 
     /// Every LIVE (`valid_to IS NULL`) `executes` edge of `workflow_id` this
@@ -1425,12 +1445,15 @@ impl WorkflowRepository {
     ///
     /// # Visibility
     ///
-    /// Run it on the caller's STAMPED transaction. The lock read carries the
-    /// row predicate (`{VISIBILITY:w}`), which agrees with `workflows`' own row
-    /// security (migration 183); [`Self::viewer_reads_plan_structure`] then
-    /// requires a readable STEP. The `UPDATE` is by primary key on the row the
-    /// predicate just admitted, and the report rows are admitted by migration
-    /// 221's policies only through that same row.
+    /// Run it on the caller's STAMPED transaction. A reader of the plan may
+    /// report, but since migration 237 only a writer of the row's owner group
+    /// may UPDATE (or row-lock) a `workflows` row, so the lock and the counter
+    /// write go through 237's two definers, which admit the row exactly when
+    /// the session READS it (183's `workflows_read`, restated in the body).
+    /// [`Self::viewer_reads_plan_structure`] then requires a readable STEP, on
+    /// the stamp. The counter definer writes only the four counter keys, and
+    /// the report rows are admitted by migration 221's policies only through
+    /// that same row.
     ///
     /// # Errors
     /// Returns `DbError` if a query fails, and `DbError::InvalidData` for a
@@ -1443,19 +1466,18 @@ impl WorkflowRepository {
         variance: f64,
         idempotency_key: Option<&str>,
     ) -> Result<HierarchicalOutcomeRecord, DbError> {
-        let sql = viewer.splice(
-            "SELECT w.metadata FROM workflows w \
-             WHERE w.id = $1 /* {VISIBILITY:w} */ \
-             FOR UPDATE OF w",
-            2,
-        );
-        let mut q = sqlx::query_scalar::<_, serde_json::Value>(&sql).bind(workflow_id);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
-        }
-        let Some(mut metadata) = q.fetch_optional(&mut *conn).await? else {
+        // Migration 237's lock definer (`lock_for_plan_edit`'s too): the UPDATE
+        // policy admits only a writer of the row's owner group, and a row lock
+        // is checked against it, so a reader's `FOR UPDATE` on the stamp would
+        // see no row. The definer restates the READ predicate (183's
+        // `workflows_read`).
+        let locked: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+            .bind(workflow_id)
+            .fetch_one(&mut *conn)
+            .await?;
+        if !locked {
             return Ok(HierarchicalOutcomeRecord::NotFound);
-        };
+        }
         if !Self::viewer_reads_plan_structure(conn, viewer, workflow_id).await? {
             return Ok(HierarchicalOutcomeRecord::NotFound);
         }
@@ -1489,13 +1511,22 @@ impl WorkflowRepository {
             }
         }
 
-        let counters = HierarchicalOutcomeCounters::after_report(&metadata, success, variance);
-        counters.write_into(&mut metadata);
-        sqlx::query("UPDATE workflows SET metadata = $1 WHERE id = $2")
-            .bind(&metadata)
-            .bind(workflow_id)
-            .execute(&mut *conn)
-            .await?;
+        // Migration 237's counter definer computes the four counters from the
+        // stored ones (`HierarchicalOutcomeCounters::after_report`'s rules) and
+        // writes only those keys, so a reader moves no other part of the row.
+        let stored: serde_json::Value =
+            sqlx::query_scalar("SELECT public.epigraph_workflow_record_outcome($1, $2, $3)")
+                .bind(workflow_id)
+                .bind(success)
+                .bind(variance)
+                .fetch_one(&mut *conn)
+                .await?;
+        let counters: HierarchicalOutcomeCounters = serde_json::from_value(stored.clone())
+            .map_err(|e| DbError::InvalidData {
+                reason: format!(
+                    "workflow {workflow_id}: the recorded counters {stored} do not decode: {e}"
+                ),
+            })?;
         Ok(HierarchicalOutcomeRecord::Recorded(counters))
     }
 
@@ -2380,7 +2411,8 @@ impl WorkflowRepository {
     /// # The executor is generic for COHESION, not because `workflows` is protected
     ///
     /// Since migration 183 `workflows` has row security keyed on the plan's
-    /// tenancy (an UPDATE reaches only a row the session reads), so the
+    /// tenancy, and since 237 an UPDATE reaches only a row whose owner group
+    /// the session WRITES (any other row matches nothing), so the
     /// connection matters here as for the `claims` UPDATE this call cascades
     /// from. It is generic so that the two
     /// halves of one deprecation can share a transaction: a `claims` row flipped
@@ -2422,6 +2454,67 @@ impl WorkflowRepository {
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// The `truth_value` of `workflows` row `id` as this connection reads it,
+    /// `None` when it reads no such row (unknown, or hidden by row security).
+    ///
+    /// A deprecation asks it after a `truth_value` write that changed nothing,
+    /// to tell "already deprecated" (0.05) apart from "the database filtered
+    /// the write out": since migration 237 an UPDATE reaches only a row whose
+    /// owner group the session writes, so a caller the entry point admitted
+    /// by another arm can match no row without any error.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the query fails.
+    pub async fn truth_value_of<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<Option<f64>, sqlx::Error> {
+        sqlx::query_scalar("SELECT truth_value FROM workflows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+    }
+
+    /// The truth value a deprecation leaves on a `workflows` row.
+    pub const DEPRECATED_TRUTH: f64 = 0.05;
+
+    /// Deprecate `workflows` row `id` (`truth_value` to
+    /// [`Self::DEPRECATED_TRUTH`]) through migration 237's audited admin
+    /// definer, `epigraph_admin_deprecate_workflow_row`, on the caller's
+    /// stamped transaction. Returns the rows CHANGED (0 for a row already
+    /// deprecated).
+    ///
+    /// For the workflow authority gate's admin arm only: since 237 the
+    /// `workflows` UPDATE policy admits only a writer of the row's owner
+    /// group, and the admin arm admits a caller that writes none. The definer
+    /// re-checks the session principal's live `claims:admin` grant through
+    /// `client_id` (111's predicate) and writes the `workflows.admin_write`
+    /// audit row itself, with `details` under its own facts, on the same
+    /// transaction. It writes `truth_value` only, and only that one value.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` carrying the definer's refusal: `42501` (`ADM01`
+    /// no principal, `ADM02` no live grant, `WFO01` an elevated session) or
+    /// `P0002` (`ADM04`, no such row); nothing is written then.
+    pub async fn admin_deprecate_row(
+        conn: &mut sqlx::PgConnection,
+        client_id: Uuid,
+        token_jti: Uuid,
+        id: Uuid,
+        details: &serde_json::Value,
+    ) -> Result<u64, sqlx::Error> {
+        let changed: i64 = sqlx::query_scalar(
+            "SELECT public.epigraph_admin_deprecate_workflow_row($1, $2, $3, $4)",
+        )
+        .bind(client_id)
+        .bind(token_jti)
+        .bind(id)
+        .bind(details)
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(u64::try_from(changed).unwrap_or(0))
     }
 
     /// Whether a hierarchical `workflows` row with this id is visible on this
@@ -2675,22 +2768,42 @@ impl WorkflowRepository {
     /// statement takes a fresh snapshot that sees the first one's 0.05. Taking
     /// the locks in id order means two such calls cannot deadlock each other.
     ///
+    /// # Through the lock definer, one row at a time
+    ///
+    /// The rows are the ones the session READS (183's `workflows_read`), read
+    /// on the stamp with no lock, and each is then locked through migration
+    /// 237's `epigraph_workflow_lock_readable`, in id order from here (not
+    /// from a sort inside one statement, whose call order is the planner's).
+    /// A plain `SELECT ... FOR UPDATE` on the stamp would not do since 237: a
+    /// row lock is checked against the owner-scoped UPDATE policy, so it would
+    /// lock only the rows whose owner group the caller WRITES, and a PUBLIC
+    /// lineage may hold generations in different owner groups (a new
+    /// generation of a public lineage the caller does not write lands in the
+    /// caller's own group). Two deprecations of such a lineage would then each
+    /// lock only their own row, and the write skew above would be back.
+    ///
     /// # Errors
-    /// Returns `sqlx::Error` if the query fails.
-    pub async fn lock_lineages_for_deprecation<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn lock_lineages_for_deprecation(
+        conn: &mut sqlx::PgConnection,
         ids: &[Uuid],
     ) -> Result<(), sqlx::Error> {
-        sqlx::query_scalar::<_, Uuid>(
+        let rows: Vec<Uuid> = sqlx::query_scalar(
             "SELECT w.id FROM workflows w \
               WHERE w.canonical_name IN ( \
                     SELECT t.canonical_name FROM workflows t WHERE t.id = ANY($1::uuid[])) \
-              ORDER BY w.id \
-                FOR UPDATE",
+              ORDER BY w.id",
         )
         .bind(ids)
-        .fetch_all(executor)
+        .fetch_all(&mut *conn)
         .await?;
+        for row in rows {
+            // `false` is a row deleted since the read: nothing left to lock.
+            let _: bool = sqlx::query_scalar("SELECT public.epigraph_workflow_lock_readable($1)")
+                .bind(row)
+                .fetch_one(&mut *conn)
+                .await?;
+        }
         Ok(())
     }
 

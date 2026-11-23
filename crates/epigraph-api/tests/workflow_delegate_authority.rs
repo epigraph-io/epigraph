@@ -1783,11 +1783,12 @@ async fn workflow_truth(pool: &PgPool, wf: Uuid) -> f64 {
 /// delegate. Over `p`'s workflow private to `p_g` (which `d` writes through
 /// its link) it is admitted on stdio and MCP-HTTP and recorded as `delegate`
 /// naming `p`. Over `p`'s public workflow in team group `t` (which `d` does
-/// not write) the gate admits it but row security refuses the deprecation of
-/// `t`'s claims, so nothing is written or recorded (tenancy unchanged; the
-/// refusal surfaces as the tool's opaque internal error, the write path's
-/// existing answer to a row-security refusal there). Another principal's
-/// delegate is refused by the gate itself.
+/// not write) the gate admits it but the database does not: since migration
+/// 237 the `workflows` row's UPDATE matches nothing for a non-writer of `t`
+/// (and row security refuses the deprecation of `t`'s claims too), so the
+/// tool refuses the call by name before any claim is touched, and nothing is
+/// written or recorded. Another principal's delegate is refused by the gate
+/// itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let w = world(&pool).await;
@@ -1821,11 +1822,12 @@ async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let err = http
         .deprecate(in_t)
         .await
-        .expect_err("tenancy refuses the delegate's deprecation of t's claims");
-    assert_eq!(
-        err, "internal error; the detail is in the server log",
+        .expect_err("the database refuses the delegate's deprecation of t's row");
+    assert!(
+        err.contains("was not deprecated") && err.contains("owner group"),
         "admitted by the gate (not its refusal), refused below it: {err}"
     );
+    assert!(!err.contains(GATE_REFUSAL), "not the gate's refusal: {err}");
     assert_eq!(row_counts(&pool).await, before, "nothing written");
     assert_eq!(workflow_truth(&pool, in_t).await, truth_before);
     assert_eq!(truth(&pool, step).await, step_truth);

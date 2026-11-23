@@ -1842,6 +1842,23 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // and the gate admits an evolve of a step a hidden plan runs. That is the
     // stake this entry reports.
     ("epigraph_step_lineage_executors", 219),
+    // 237, the row lock (a hierarchical outcome report's and `add_step`'s plan
+    // lock) and the outcome counter write on a `workflows` row the caller
+    // READS (237 narrows the row's UPDATE policy to writers of its owner
+    // group). Both fail CLOSED under a non-member owner: the bodies' reads and
+    // UPDATE are then row-security filtered as the caller's would be, so the
+    // lock answers "no row" for a caller that does not write the owner group
+    // (every such reader's report is answered not-found, and such a caller's
+    // `add_step` runs unlocked) and the counter write raises WFO04 (loud).
+    // The owner is load-bearing.
+    ("epigraph_workflow_lock_readable", 237),
+    ("epigraph_workflow_record_outcome", 237),
+    // 237, the audited admin deprecation of a `workflows` row the admin does
+    // not write (the workflow authority gate's admin arm). Fails CLOSED under
+    // a non-member owner: its UPDATE is row-security filtered, so the
+    // deprecation is refused as unchanged-but-live, and its audit INSERT is
+    // refused by `security_events_append`. The owner is load-bearing.
+    ("epigraph_admin_deprecate_workflow_row", 237),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -3266,6 +3283,27 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_step_lineage_executors",
             "public.epigraph_step_lineage_executors(uuid)",
+            true,
+        ),
+        // 237: every hierarchical outcome report (REST and MCP) calls both on
+        // the request DSN, and every `add_step` the lock; without the grants
+        // each of those is 42501.
+        (
+            "epigraph_workflow_lock_readable",
+            "public.epigraph_workflow_lock_readable(uuid)",
+            true,
+        ),
+        (
+            "epigraph_workflow_record_outcome",
+            "public.epigraph_workflow_record_outcome(uuid, boolean, double precision)",
+            true,
+        ),
+        // 237: the MCP `deprecate_workflow` admin arm calls it on the request
+        // DSN; without the grant every admin deprecation of a row the admin
+        // does not write is 42501.
+        (
+            "epigraph_admin_deprecate_workflow_row",
+            "public.epigraph_admin_deprecate_workflow_row(uuid, uuid, uuid, jsonb)",
             true,
         ),
     ];

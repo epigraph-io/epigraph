@@ -2190,12 +2190,36 @@ pub async fn deprecate_workflow(
         // (no-op for flat-only workflows). Without this, deprecated
         // hierarchical workflows keep surfacing in
         // `GET /api/v1/workflows/hierarchical/search`. Zero rows is the normal
-        // answer for a flat workflow, so only an ERROR fails the request.
-        epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, *id, 0.05)
+        // answer for a flat workflow. But since migration 237 a `workflows`
+        // UPDATE reaches only a row whose owner group the caller WRITES, and a
+        // filtered row raises nothing: a row this caller READS that matched
+        // nothing and is not already deprecated refuses the whole request
+        // (nothing committed), rather than commit the claim's half alone. A
+        // row it cannot read was never written on this stamp, before 237
+        // either.
+        let mirrored = epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, *id, 0.05)
             .await
             .map_err(|e| ApiError::InternalError {
                 message: format!("Failed to mirror the deprecation onto workflow {id}: {e}"),
             })?;
+        if mirrored == 0 {
+            let truth = epigraph_db::WorkflowRepository::truth_value_of(&mut *tx, *id)
+                .await
+                .map_err(|e| ApiError::InternalError {
+                    message: format!("Failed to read back workflow {id}: {e}"),
+                })?;
+            if truth.is_some_and(|t| {
+                (t - epigraph_db::WorkflowRepository::DEPRECATED_TRUTH).abs() >= f64::EPSILON
+            }) {
+                tracing::warn!(
+                    target: "tenancy.scoped_write",
+                    handler = "deprecate_workflow",
+                    workflow = %id,
+                    "the database filtered the hierarchical row's deprecation out"
+                );
+                return Err(crate::errors::write_refused("hierarchical workflows row"));
+            }
+        }
     }
 
     tx.commit().await.map_err(|e| ApiError::DatabaseError {
