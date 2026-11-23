@@ -18,7 +18,11 @@
 //!
 //! * `orcid` / `ror_id`, and matching on them: only when the caller passes
 //!   [`AgentRepository::get_public_profile`]'s rule (profile public, the
-//!   caller is the agent, or shares a live group with it; or an admin). A
+//!   caller is the agent, or shares a live group with it; or an admin),
+//!   spelled again in the matcher and the card statements (the visibility lint
+//!   needs each statement's own predicate text) and kept one text with
+//!   `get_public_profile`'s by `visibility_lint.rs`'s
+//!   `the_agent_profile_rule_is_one_text_at_every_site`. A
 //!   private ORCID never matches, so it is not an oracle. `properties`
 //!   (`full_name`, `email`, `affiliations`) is never matched and never
 //!   returned. `display_name` is matched as written, so a display name that
@@ -38,12 +42,31 @@
 //!   (the legacy create path defaulted every row to `'human'`). Each evidence
 //!   arm is consulted only when the caller may see that evidence; a hidden arm
 //!   falls through, so an agent whose only evidence is hidden reads exactly as
-//!   one with no evidence (`unknown`). See [`AgentKind`].
+//!   one with no evidence (`unknown`). See [`AgentKind`]. One arm is the
+//!   reverse of `operator_human`: an agent some agent's binding names
+//!   (`operator_of_bound_agent`, [`bound_operator_sql`]) reads as a human to
+//!   every reader, because every reader already sees that binding on the
+//!   bound agent's card; it is derived from the same binding rule, so it
+//!   never disagrees with the forward field and reads no status.
 //! * `roles`: migration 198's `epigraph_disclosed_role_assignments`: for any
 //!   agent, the assignments of roles that neither elevate nor read the audit
 //!   trail whose window is open now (exactly what 123's public projection
 //!   shows, and decided by the window alone, so client or registration
 //!   status never moves it), plus the caller's own assignments of any role.
+//! * `role_attachments`: migration 269's `epigraph_disclosed_role_attachments`:
+//!   the roles an (LLM) agent is attached to (166 `role_agents`: the agents a
+//!   role runs) that are not detached and inside their window now (a
+//!   roster, not the set 179 admits: a succession copy of a detached root
+//!   still lists, a future-dated row does not), shown only to the agent
+//!   itself, its LIVE human (`epigraph_human_of(agent, true)`, the binding
+//!   `operator_human` shows; a retired link's former operator sees none) and
+//!   a privileged (maintenance) session; an elevated request viewer on the
+//!   application role is not one (as for 198's elevating roles). The two
+//!   principal arms trust the stamped principal setting, which any login
+//!   holding the application DSN can set (migration 269's header). No
+//!   outsider arm: 166 writes no public projection of an attachment, so to
+//!   everyone else an attached agent's card reads exactly as an unattached
+//!   one's.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
 //!   number. Only in-force edges carrying the ingest-written marker count
@@ -212,6 +235,28 @@ fn operator_binding_sql(agent: &str) -> String {
     )
 }
 
+/// SQL: true when some agent other than `{agent}` is CURRENTLY bound to it,
+/// i.e. some agent's [`operator_binding_sql`] names it: the reverse of the
+/// card's `operator_human`, derived from the forward rule itself so the two
+/// can never disagree. The candidates are every agent a 107 link names it the
+/// operator of (retired links included, through migration 269's
+/// `epigraph_agents_linked_to_operator`, the inverse of
+/// `epigraph_operator_of_author`) and every agent a 149 allowance row names it
+/// for (revoked included); the forward rule then keeps only a live link, or
+/// an unrevoked allowance of an unlinked agent. No status is read.
+fn bound_operator_sql(agent: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM ( \
+                   SELECT lk.agent_id FROM public.epigraph_agents_linked_to_operator({agent}) lk \
+                   UNION \
+                   SELECT al.agent_id FROM public.author_binding_clients al \
+                    WHERE al.operator_id = {agent}) cand \
+                  WHERE cand.agent_id <> {agent} \
+                    AND ({binding}) = {agent})",
+        binding = operator_binding_sql("cand.agent_id"),
+    )
+}
+
 /// The `authored -> paper` edge property a document ingest writes as `true`
 /// when it names an author it neither is nor operates: the authorship is the
 /// ingester's word until that person countersigns. The agent card reads it
@@ -300,7 +345,13 @@ pub enum AgentKind {
     /// to the human itself and admins (registration status is never shown to
     /// anyone else, the human's own agents included), and to every caller
     /// when the human holds a disclosed role (only registered humans are
-    /// granted roles; the window, not the current status, decides).
+    /// granted roles; the window, not the current status, decides) or when
+    /// some agent is currently bound to it (its card's `operator_human`, shown
+    /// to every reader; the binding record, not the current status, decides).
+    /// That arm TRUSTS the binding record as `operator_human` does: 122 refuses
+    /// a NEW link to an operator that is not a registered human (and 149 an
+    /// allowance), but a link recorded before 122 may name a non-human, which
+    /// then reads as `human` here (it outranks `llm_model_on_profile`).
     Human,
     /// An agent with an LLM model on its (visible) profile, or, failing a
     /// derived author key, an agent currently bound to a human
@@ -354,7 +405,8 @@ pub struct AgentRef {
     pub display_name: Option<String>,
 }
 
-/// One live role assignment shown on a card.
+/// One live role assignment (or, in `role_attachments`, one live role
+/// attachment) shown on a card.
 #[derive(Debug, Clone, Serialize)]
 pub struct CardRole {
     pub role: String,
@@ -433,10 +485,17 @@ pub struct AgentCard {
     /// The visible evidence `kind` was derived from (every arm the caller may
     /// see, not only the winning one): `role_node`, `system_registry`,
     /// `registered_human_operator`, `holds_disclosed_role`,
-    /// `llm_model_on_profile`, `bound_to_visible_human`, `name_derived_key`,
-    /// `orcid_derived_key`.
+    /// `operator_of_bound_agent`, `llm_model_on_profile`,
+    /// `bound_to_visible_human`, `name_derived_key`, `orcid_derived_key`.
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
+    /// The roles this agent is attached to (166 `role_agents`): rows not
+    /// detached and inside their window now, which is not the set 179 lets
+    /// in (a succession copy of a detached root still lists; a future-dated
+    /// row does not). Shown to the agent itself, its live human and a
+    /// privileged (maintenance) session; empty for everyone else, an
+    /// elevated application-role viewer included (migration 269).
+    pub role_attachments: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
     /// The human this agent is currently bound to (its live operator link,
@@ -702,6 +761,7 @@ impl AgentLookupRepository {
                     COALESCE(($4::bool OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)) \
                       AND public.epigraph_is_human_operator(a.id), false) AS human_visible, \
                     CASE WHEN h.human IS DISTINCT FROM a.id THEN h.human END AS operator_human, \
+                    {bound_operator} AS operates_bound_agent, \
                     u.ord \
                FROM unnest($1::uuid[]) WITH ORDINALITY AS u(id, ord) \
                JOIN agents a ON a.id = u.id \
@@ -713,6 +773,7 @@ impl AgentLookupRepository {
               CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
             binding = operator_binding_sql("a.id"),
+            bound_operator = bound_operator_sql("a.id"),
         );
         type Row = (
             Uuid,
@@ -726,6 +787,7 @@ impl AgentLookupRepository {
             Option<String>,
             bool,
             Option<Uuid>,
+            bool,
             i64,
         );
         let rows: Vec<Row> = sqlx::query_as(&sql)
@@ -736,8 +798,10 @@ impl AgentLookupRepository {
             .fetch_all(&mut *conn)
             .await?;
 
-        // 2. Disclosed roles (migration 198), for every carded agent at once.
+        // 2. Disclosed roles (migration 198) and role attachments (269), for
+        //    every carded agent at once.
         let roles = Self::disclosed_roles(conn, &ids).await?;
+        let attachments = Self::disclosed_attachments(conn, &ids).await?;
 
         // 3. The bound humans' names (agents are public).
         let humans: Vec<Uuid> = rows.iter().filter_map(|r| r.10).collect();
@@ -774,6 +838,7 @@ impl AgentLookupRepository {
             ror_id,
             human_visible,
             operator_human,
+            operates_bound_agent,
             _ord,
         ) in rows
         {
@@ -790,6 +855,9 @@ impl AgentLookupRepository {
             }
             if !roles.is_empty() {
                 evidence.push("holds_disclosed_role");
+            }
+            if operates_bound_agent {
+                evidence.push("operator_of_bound_agent");
             }
             if llm_model_visible {
                 evidence.push("llm_model_on_profile");
@@ -812,6 +880,7 @@ impl AgentLookupRepository {
                 kind,
                 kind_evidence: evidence,
                 roles,
+                role_attachments: attachments.get(&id).cloned().unwrap_or_default(),
                 orcid,
                 ror_id,
                 operator_human: operator_human.map(|h| AgentRef {
@@ -1074,6 +1143,32 @@ impl AgentLookupRepository {
         Ok(out)
     }
 
+    /// Migration 269's disclosed role attachments of `ids`, by agent. The
+    /// definer decides on the SESSION (the stamped principal, its human arm,
+    /// a privileged session); it confers nothing.
+    async fn disclosed_attachments(
+        conn: &mut PgConnection,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CardRole>>, DbError> {
+        type RoleRow = (Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>);
+        let rows: Vec<RoleRow> = sqlx::query_as(
+            "SELECT agent_id, role, valid_from, valid_to \
+               FROM public.epigraph_disclosed_role_attachments($1::uuid[])",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut out: HashMap<Uuid, Vec<CardRole>> = HashMap::new();
+        for (agent, role, valid_from, valid_to) in rows {
+            out.entry(agent).or_default().push(CardRole {
+                role,
+                valid_from,
+                valid_to,
+            });
+        }
+        Ok(out)
+    }
+
     /// Visible authored papers (not awaiting countersignature, and pending
     /// apart) and asserted claims of each of `ids`, capped. See
     /// [`CardCounts`] for what counts.
@@ -1217,7 +1312,10 @@ fn kind_from_evidence(evidence: &[&str]) -> AgentKind {
         AgentKind::Role
     } else if has("system_registry") {
         AgentKind::System
-    } else if has("registered_human_operator") || has("holds_disclosed_role") {
+    } else if has("registered_human_operator")
+        || has("holds_disclosed_role")
+        || has("operator_of_bound_agent")
+    {
         AgentKind::Human
     } else if has("llm_model_on_profile") {
         AgentKind::LlmAgent
@@ -1259,6 +1357,10 @@ mod tests {
         );
         assert_eq!(
             kind_from_evidence(&["holds_disclosed_role"]),
+            AgentKind::Human
+        );
+        assert_eq!(
+            kind_from_evidence(&["operator_of_bound_agent"]),
             AgentKind::Human
         );
         assert_eq!(

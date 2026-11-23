@@ -2819,6 +2819,17 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // the folder read sees no snapshot, so every successor is refused ROL04,
     // and the attach and detach writes are refused by the policies.
     ("epigraph_restore_role_successor", 264),
+    // 269, the agent-lookup card's reverse binding read (find_agent /
+    // get_agent): the agents whose operator link names an agent. Its read of
+    // the FORCEd `operator_links` is admitted by `epigraph_definer_bypass()`
+    // (the owner). Under a non-member owner it reads no link: fail CLOSED,
+    // fewer humans shown, never more.
+    ("epigraph_agents_linked_to_operator", 269),
+    // 269, the agent-lookup card's role attachments. Its read of the FORCEd
+    // `role_agents` is admitted by `epigraph_definer_bypass()` (the owner).
+    // Under a non-member owner it reads no row: fail CLOSED, no attachment
+    // shown.
+    ("epigraph_disclosed_role_attachments", 269),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4001,6 +4012,20 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_edges_reach",
         "public.epigraph_edges_reach(uuid, uuid, text[])",
+        true,
+    ),
+    // 269: the agent-lookup card's reverse binding read (find_agent /
+    // get_agent, on the request DSN); without the grant every card is
+    // 42501.
+    (
+        "epigraph_agents_linked_to_operator",
+        "public.epigraph_agents_linked_to_operator(uuid)",
+        true,
+    ),
+    // 269: the agent-lookup card's role attachments, same path.
+    (
+        "epigraph_disclosed_role_attachments",
+        "public.epigraph_disclosed_role_attachments(uuid[])",
         true,
     ),
 ];

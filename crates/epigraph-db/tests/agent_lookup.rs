@@ -524,6 +524,15 @@ async fn the_operator_human_does_not_move_with_client_or_registration_status(poo
     assert_eq!(shown(&before, 0), serde_json::json!(h1.to_string()));
     assert_eq!(shown(&before, 1), serde_json::json!(h2.to_string()));
     assert_eq!(shown(&before, 2), serde_json::json!(o3.to_string()));
+    // Each operator reads as human through the binding, so the events below
+    // also prove that evidence reads no client or registration status.
+    for i in 3..6 {
+        assert_eq!(before[i]["kind"], "human", "{}", before[i]);
+        assert_eq!(
+            before[i]["kind_evidence"],
+            serde_json::json!(["operator_of_bound_agent"])
+        );
+    }
 
     let check = |label: &'static str| {
         let pool = pool.clone();
@@ -585,7 +594,8 @@ async fn the_operator_human_does_not_move_with_client_or_registration_status(poo
 /// An operated agent learns nothing about its human that an outsider does
 /// not: its human is on every reader's card of the agent, and the human's
 /// own card reads to the agent exactly as it reads to an outsider (no
-/// registration status, so `kind=human` finds nobody for either).
+/// registration status: `kind=human` finds, for both, only the human some
+/// agent is bound to, which every reader already sees on that agent's card).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_operated_agent_sees_its_human_exactly_as_an_outsider_does(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
@@ -598,7 +608,7 @@ async fn an_operated_agent_sees_its_human_exactly_as_an_outsider_does(pool: PgPo
         let as_bot = find_as(&pool, bot, q, Some("human"), None, Some(25)).await;
         let as_out = find_as(&pool, outsider, q, Some("human"), None, Some(25)).await;
         assert_eq!(ids(&as_bot), ids(&as_out), "{q}");
-        assert!(ids(&as_bot).is_empty(), "{q}: {:?}", ids(&as_bot));
+        assert_eq!(ids(&as_bot), vec![h1], "{q}: only the bound human");
     }
     assert_eq!(
         whole(&cards_as(&pool, bot, &[h1, h2]).await),
@@ -658,30 +668,38 @@ async fn an_admin_sees_the_operator_human(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn human_operator_status_is_shown_only_to_those_who_may_know_it(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
-    let (human, _) = named_human(&pool, "Oren Lisle").await;
+    // A registered human no agent is bound to: only registration says human.
+    let (lone, _) = named_human(&pool, "Oren Lisle").await;
     let (plain, _) = named(&pool, "Oren Lisle").await;
+    // A registered human its agent is bound to: the binding says human, to
+    // every reader, and registration still to nobody else.
+    let (human, _) = named_human(&pool, "Oren Lisle").await;
     let (agent_of_human, _) = named(&pool, "oren-assistant").await;
     link(&pool, agent_of_human, human).await;
 
-    let out = cards_as(&pool, outsider, &[human, plain]).await;
+    let out = cards_as(&pool, outsider, &[lone, plain, human]).await;
     assert_eq!(
         shape(&out[0]),
         shape(&out[1]),
         "registration is hidden from an outsider"
     );
     assert_eq!(out[0].kind, AgentKind::Unknown);
+    assert_eq!(out[2].kind, AgentKind::Human);
+    assert_eq!(out[2].kind_evidence, vec!["operator_of_bound_agent"]);
 
-    assert_eq!(
-        card_as(&pool, human, human).await.kind,
-        AgentKind::Human,
-        "itself"
-    );
+    for h in [lone, human] {
+        let own = card_as(&pool, h, h).await;
+        assert_eq!(own.kind, AgentKind::Human, "itself");
+        assert!(own.kind_evidence.contains(&"registered_human_operator"));
+    }
     // Its own agent reads the human's card exactly as an outsider does: the
     // agent learns its human from its OWN card's operator_human (shown to
     // every reader), never registration status from the human's.
     let via_agent = card_as(&pool, agent_of_human, human).await;
-    assert_eq!(shape(&via_agent), shape(&out[0]));
-    assert_eq!(via_agent.kind, AgentKind::Unknown);
+    assert_eq!(shape(&via_agent), shape(&out[2]));
+    assert!(!via_agent
+        .kind_evidence
+        .contains(&"registered_human_operator"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1989,4 +2007,420 @@ async fn a_persons_own_authorship_outranks_a_strangers_pending_naming(pool: PgPo
              for {reader}: {k:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The three copies of the public-profile rule decide alike (backlog 0e419970)
+// ---------------------------------------------------------------------------
+
+/// Whether `viewer` may see `subject`'s profile details, as each copy of the
+/// rule decides it, on ONE connection: `get_public_profile` (its `orcid`),
+/// the card (`cards_inner`: its `orcid`) and the matcher (`match_ranked`:
+/// the ORCID tier).
+async fn profile_decisions(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    subject: Uuid,
+    orcid: &str,
+) -> [bool; 3] {
+    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, viewer, subject)
+        .await
+        .expect("get_public_profile")
+        .expect("subject exists");
+    let card = AgentLookupRepository::card(&mut *conn, viewer, subject)
+        .await
+        .expect("card")
+        .expect("subject exists");
+    let matched = AgentLookupRepository::match_by_name(&mut *conn, viewer, orcid, 25)
+        .await
+        .expect("match_by_name")
+        .iter()
+        .any(|m| m.agent_id == subject && m.tier == MatchTier::Orcid);
+    [profile.orcid.is_some(), card.orcid.is_some(), matched]
+}
+
+/// The agent public-profile rule is spelled in three statements
+/// (`get_public_profile`, the card, the matcher); `visibility_lint.rs` pins
+/// their TEXT. This pins their DECISIONS: for every arm of the rule (public
+/// profile; the agent itself; a live co-member; a co-member whose subject's
+/// membership is revoked; an outsider; an admin) the three agree, and agree
+/// with the expected truth table, so a copy whose binds or arms drift is seen
+/// at run time as well.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_three_copies_of_the_profile_rule_decide_alike(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (colleague, _) = named(&pool, "colleague").await;
+    let (former, _) = named(&pool, "former colleague").await;
+    let (private_p, _) = named(&pool, "Ivo Pellar").await;
+    let (public_p, _) = named(&pool, "Ama Quist").await;
+    let private_orcid = "0000-0002-0000-0011";
+    let public_orcid = "0000-0002-0000-0012";
+    sqlx::query("UPDATE agents SET orcid = $2, profile_visibility = 'group' WHERE id = $1")
+        .bind(private_p)
+        .bind(private_orcid)
+        .execute(&pool)
+        .await
+        .expect("private profile");
+    sqlx::query("UPDATE agents SET orcid = $2 WHERE id = $1")
+        .bind(public_p)
+        .bind(public_orcid)
+        .execute(&pool)
+        .await
+        .expect("public profile");
+    team_of(&pool, &[colleague, private_p]).await;
+    // A team the former colleague still holds, whose membership of the
+    // SUBJECT is revoked: the rule's `gm.revoked_at IS NULL` arm.
+    let old_team = team_of(&pool, &[former, private_p]).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(old_team)
+    .bind(private_p)
+    .execute(&pool)
+    .await
+    .expect("revoke the subject's membership");
+
+    let scoped = app_pool(&pool).await;
+    for (who, private_visible) in [
+        (outsider, false),
+        (former, false),
+        (colleague, true),
+        (private_p, true),
+    ] {
+        let v = viewer(&pool, who).await;
+        let mut read = scoped.read_as(&v).await.expect("read_as");
+        let got = profile_decisions(&mut read, &v, private_p, private_orcid).await;
+        assert_eq!(got, [private_visible; 3], "private profile, viewer {who}");
+        let got = profile_decisions(&mut read, &v, public_p, public_orcid).await;
+        assert_eq!(got, [true; 3], "public profile, viewer {who}");
+    }
+
+    // An admin (a bypass viewer) sees both.
+    let (bypass_pool, admin) = fixture::bypass(&pool).await;
+    let (mut conn, _lease) = bypass_pool
+        .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance connection");
+    assert_eq!(
+        profile_decisions(&mut conn, &admin, private_p, private_orcid).await,
+        [true; 3],
+        "admin, private profile"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A human some agent is bound to reads as a human (backlog 0e419970)
+// ---------------------------------------------------------------------------
+
+/// `operator_human` is shown to every reader, so "X is the human some agent
+/// is bound to" is public; the card used to show it only on the AGENT's card,
+/// and X itself read `unknown` to outsiders unless it held a disclosed role.
+/// Now X's own card says `human` (evidence `operator_of_bound_agent`) exactly
+/// when some agent's card names X as its `operator_human`: the reverse is
+/// derived from the forward binding rule, never from registration or client
+/// status, so a retired link, a revoked allowance and an allowance on an
+/// agent that also has a link name nobody, in either direction.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    // Bound by a live link.
+    let (h_link, _) = named_human(&pool, "Wenna Calloway").await;
+    let (bot, _) = named(&pool, "calloway-bot").await;
+    link(&pool, bot, h_link).await;
+    // Bound by a client allowance in force.
+    let (h_allow, _) = named_human(&pool, "Ruan Esterly").await;
+    let (svc, _) = allowance_bound(&pool, h_allow, "esterly-service").await;
+    // Named only by a retired link.
+    let (h_retired, _) = named_human(&pool, "Odile Varga").await;
+    let (old_bot, _) = named(&pool, "varga-bot").await;
+    link(&pool, old_bot, h_retired).await;
+    retire_link(&pool, old_bot).await;
+    // Named only by a revoked allowance.
+    let (h_revoked, _) = named_human(&pool, "Piet Lambrecht").await;
+    let (gone_svc, gone_client) = allowance_bound(&pool, h_revoked, "lambrecht-service").await;
+    let revoked: bool = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let r: bool = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_author_binding_client($1, \
+                                                                              'lookup test')",
+        )
+        .bind(gone_client)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("revoke the allowance");
+        (conn, r)
+    })
+    .await;
+    assert!(revoked, "CALIBRATION: the allowance was live");
+    // Named only by an unrevoked allowance on an agent that is now linked to
+    // someone else (a linked agent is bound by its link alone).
+    let (h_shadowed, _) = named_human(&pool, "Cleo Brandt").await;
+    let (h_other, _) = named_human(&pool, "Tamsin Holt").await;
+    let (moved_svc, moved_client) = allowance_bound(&pool, h_shadowed, "brandt-service").await;
+    set_client_status(&pool, moved_client, "revoked").await;
+    link(&pool, moved_svc, h_other).await;
+    // A registered human no agent is bound to.
+    let (h_lone, _) = named_human(&pool, "Ilka Dorne").await;
+    let (plain, _) = named(&pool, "Ilka Dorne").await;
+
+    let everyone = [
+        outsider, h_link, bot, h_allow, svc, h_retired, old_bot, h_revoked, gone_svc, h_shadowed,
+        h_other, moved_svc, h_lone, plain,
+    ];
+    let cards = cards_as(&pool, outsider, &everyone).await;
+    let card = |id: Uuid| cards.iter().find(|c| c.id == id).expect("carded");
+
+    for h in [h_link, h_allow, h_other] {
+        let c = card(h);
+        assert_eq!(c.kind, AgentKind::Human, "{c:?}");
+        assert_eq!(c.kind_evidence, vec!["operator_of_bound_agent"], "{c:?}");
+    }
+    for h in [h_retired, h_revoked, h_shadowed, h_lone] {
+        let c = card(h);
+        assert_eq!(c.kind, AgentKind::Unknown, "{c:?}");
+        assert_eq!(
+            shape(c),
+            shape(card(plain)),
+            "an unbound human reads as an unregistered look-alike"
+        );
+    }
+
+    // The reverse IS the forward rule: over every fixture agent, the agents
+    // carrying the evidence are exactly the humans some card names.
+    let mut reverse: Vec<Uuid> = cards
+        .iter()
+        .filter(|c| c.kind_evidence.contains(&"operator_of_bound_agent"))
+        .map(|c| c.id)
+        .collect();
+    let mut forward: Vec<Uuid> = cards
+        .iter()
+        .filter_map(|c| c.operator_human.as_ref().map(|h| h.id))
+        .collect();
+    reverse.sort();
+    forward.sort();
+    forward.dedup();
+    assert_eq!(reverse, forward);
+    assert_eq!(forward.len(), 3, "CALIBRATION: h_link, h_allow, h_other");
+
+    // Every reader sees it alike: the bound agent, another human.
+    for who in [bot, h_allow] {
+        let mut c = card_as(&pool, who, h_link).await;
+        c.kind_evidence
+            .retain(|e| *e != "registered_human_operator");
+        assert_eq!(c.kind, AgentKind::Human);
+        assert_eq!(c.kind_evidence, vec!["operator_of_bound_agent"]);
+    }
+
+    // And find_agent's kind filter finds the bound humans, never the others.
+    let r = find_as(&pool, outsider, "wenna calloway", Some("human"), None, None).await;
+    assert_eq!(ids(&r), vec![h_link]);
+    let r = find_as(&pool, outsider, "odile varga", Some("human"), None, None).await;
+    assert!(ids(&r).is_empty(), "a retired link's operator is no human");
+}
+
+/// Migration 269's definers: SECURITY DEFINER, maintenance-owned, on 172's
+/// path, executable by the app role and not by PUBLIC.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_269_definers_are_pinned_owned_and_granted(pool: PgPool) {
+    for sig in [
+        "public.epigraph_agents_linked_to_operator(uuid)",
+        "public.epigraph_disclosed_role_attachments(uuid[])",
+    ] {
+        let row: (bool, String, Option<Vec<String>>, bool, bool) = sqlx::query_as(
+            "SELECT p.prosecdef, r.rolname::text, p.proconfig, \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                    has_function_privilege('public', p.oid, 'EXECUTE') \
+               FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = to_regprocedure($1)",
+        )
+        .bind(sig)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sig} exists: {e}"));
+        assert!(row.0, "{sig}: SECURITY DEFINER");
+        assert_eq!(row.1, "epigraph_maintenance", "{sig}");
+        assert_eq!(
+            row.2,
+            Some(vec!["search_path=pg_catalog, pg_temp".to_string()]),
+            "{sig}"
+        );
+        assert!(row.3, "{sig}: the app role executes it");
+        assert!(!row.4, "{sig}: PUBLIC does not");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Role attachments (166 `role_agents`) on the card (backlog 0e419970)
+// ---------------------------------------------------------------------------
+
+/// Attach `agent` to `role` through 166's maintenance verb.
+async fn attach_to_role(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'lookup test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// The roles a card's `role_attachments` names, read from its JSON so the
+/// test fails at RUN time on a card without the field.
+fn attached_roles(card: &AgentCard) -> serde_json::Value {
+    let v = serde_json::to_value(card).expect("serialize card");
+    match v.get("role_attachments") {
+        Some(serde_json::Value::Array(a)) => serde_json::Value::Array(
+            a.iter()
+                .map(|r| r.get("role").cloned().unwrap_or_default())
+                .collect(),
+        ),
+        other => other.cloned().unwrap_or_default(),
+    }
+}
+
+/// An LLM agent's role attachments (166 `role_agents`, which the application
+/// role cannot read) are on its card for the agent itself, its LIVE human and
+/// a privileged maintenance session (`epigraph_bypass()`), through migration
+/// 269's `epigraph_disclosed_role_attachments`; undetached rows inside their
+/// window only. Everyone else reads the card exactly as an unattached
+/// look-alike's: attachments are shown to no outsider, of any role, until a
+/// ruling says which may be (the elevating roles' never). Once the agent's
+/// link is retired its former operator is no longer its human and sees none,
+/// not even an attachment made after the retire.
+#[sqlx::test(migrations = "../../migrations")]
+async fn role_attachments_are_shown_to_the_agent_its_live_human_and_maintenance_sessions_only(
+    pool: PgPool,
+) {
+    seed_role(&pool, "role:test-stewards", false).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (human, _) = named_human(&pool, "Hesper Lunde").await;
+    let (other_human, _) = named_human(&pool, "Bryn Asker").await;
+    let (bot, _) = named(&pool, "steward-bot").await;
+    let (lookalike, _) = named(&pool, "steward-bot").await;
+    link(&pool, bot, human).await;
+    link(&pool, lookalike, human).await;
+    attach_to_role(&pool, "role:test-stewards", bot).await;
+    // An elevating role too (123's custodian role).
+    attach_to_role(&pool, "role:platform-custodian", bot).await;
+
+    let both = serde_json::json!(["role:platform-custodian", "role:test-stewards"]);
+    for who in [bot, human] {
+        let c = card_as(&pool, who, bot).await;
+        assert_eq!(attached_roles(&c), both, "viewer {who}: {c:?}");
+    }
+    let (bypass_pool, admin) = fixture::bypass(&pool).await;
+    {
+        let (mut conn, _lease) = bypass_pool
+            .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+            .await
+            .expect("maintenance connection");
+        let c = AgentLookupRepository::card(&mut conn, &admin, bot)
+            .await
+            .expect("card")
+            .expect("exists");
+        assert_eq!(attached_roles(&c), both, "admin");
+    }
+
+    // Nobody else: an outsider, another human, the human's other agent.
+    for who in [outsider, other_human, lookalike] {
+        let out = cards_as(&pool, who, &[bot, lookalike]).await;
+        assert_eq!(
+            attached_roles(&out[0]),
+            serde_json::json!([]),
+            "viewer {who}"
+        );
+        assert_eq!(
+            shape(&out[0]),
+            shape(&out[1]),
+            "viewer {who} can tell the attached agent from its look-alike"
+        );
+    }
+
+    // A detached attachment is not shown to anyone.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role('role:platform-custodian', $1, 'done')",
+        )
+        .bind(bot)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("detach");
+        assert_eq!(n, 1, "CALIBRATION: one attachment detached");
+        (conn, ())
+    })
+    .await;
+    assert_eq!(
+        attached_roles(&card_as(&pool, bot, bot).await),
+        serde_json::json!(["role:test-stewards"])
+    );
+
+    // A RETIRED link's former operator is no longer the agent's human: it
+    // sees none of the agent's attachments, including one made after the
+    // retire (166's attach does not need a live link). The agent itself and
+    // a maintenance session still see both.
+    retire_link(&pool, bot).await;
+    assert_eq!(
+        human_of(&pool, bot).await,
+        Some(human),
+        "CALIBRATION: the link record still names the operator"
+    );
+    assert_eq!(
+        live_human_of(&pool, bot).await,
+        None,
+        "CALIBRATION: no binding is in force"
+    );
+    seed_role(&pool, "role:test-archivists", false).await;
+    attach_to_role(&pool, "role:test-archivists", bot).await;
+    let after = serde_json::json!(["role:test-archivists", "role:test-stewards"]);
+    assert_eq!(
+        attached_roles(&card_as(&pool, bot, bot).await),
+        after,
+        "the agent itself"
+    );
+    {
+        let (mut conn, _lease) = bypass_pool
+            .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+            .await
+            .expect("maintenance connection");
+        let c = AgentLookupRepository::card(&mut conn, &admin, bot)
+            .await
+            .expect("card")
+            .expect("exists");
+        assert_eq!(attached_roles(&c), after, "maintenance session");
+    }
+    assert_eq!(
+        attached_roles(&card_as(&pool, human, bot).await),
+        serde_json::json!([]),
+        "a retired link's former operator still reads the agent's attachments"
+    );
+    // The look-alike's link is still live: its human still reads it.
+    attach_to_role(&pool, "role:test-archivists", lookalike).await;
+    assert_eq!(
+        attached_roles(&card_as(&pool, human, lookalike).await),
+        serde_json::json!(["role:test-archivists"]),
+        "CALIBRATION: a live human reads its agent's attachments"
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_269_attachments_refuse_more_than_200_agents(pool: PgPool) {
+    let ids: Vec<Uuid> = (0..201).map(|_| Uuid::new_v4()).collect();
+    let err = sqlx::query("SELECT * FROM public.epigraph_disclosed_role_attachments($1)")
+        .bind(&ids)
+        .fetch_all(&pool)
+        .await
+        .expect_err("201 ids refused");
+    assert!(err.to_string().contains("at most 200"), "{err}");
+    let ok = sqlx::query("SELECT * FROM public.epigraph_disclosed_role_attachments($1)")
+        .bind(&ids[..200])
+        .fetch_all(&pool)
+        .await
+        .expect("200 ids accepted");
+    assert!(ok.is_empty());
 }

@@ -4317,6 +4317,29 @@ restart.
   depends on it and none sets the setting; apply whenever. Operator note: a value set on
   the role or database (`ALTER ROLE .. SET`) would apply to every revoke; clear it with
   `ALTER ROLE epigraph_maintenance RESET epigraph.compromised_revoke_max_passes`.
+- **269**: public `agent_card_disclosure_readers` (backlog 0e419970, the agent-lookup card
+  follow-ups of PR #774). Adds two SECURITY DEFINER reads. `epigraph_agents_linked_to_operator(operator)`:
+  the agents whose 107 operator link names an agent (retired links included), the inverse of
+  `epigraph_operator_of_author`. It decides nothing: the card feeds each such agent, and each agent
+  a 149 allowance names, to the same forward binding rule that fills `operator_human`, and shows
+  the operator as `kind = human` (`operator_of_bound_agent`) when some agent is currently bound to
+  it. No registration or client status is read. Second, `epigraph_disclosed_role_attachments(agents[])`:
+  the 166 `role_agents` attachments of up to 200 agents that are not detached and inside their
+  window now (a roster, not the set 179 admits: a succession copy of a detached root still lists,
+  a future-dated row does not), one per (agent, role), shown only when the session principal IS
+  the agent, is its LIVE human (`epigraph_human_of(agent, true)`, the binding the card's
+  `operator_human` shows), or the session is privileged (`epigraph_bypass()`; an elevated
+  application-role viewer is not); no outsider arm (166 writes no public projection of an
+  attachment, so wider disclosure is left to a ruling). The principal arms trust the stamped
+  `epigraph.principal_id`, which any application-DSN login can set: before 269 only a
+  maintenance session read `role_agents` (same trust class as 198's own-assignments arm). Both
+  on 172's form (`pg_catalog, pg_temp`), owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded;
+  `tenancy_backfill` registers both). Pinned by `epigraph-db/tests/agent_lookup.rs`
+  (`a_human_some_agent_is_bound_to_reads_as_human_to_every_reader`,
+  `role_attachments_are_shown_to_the_agent_its_live_human_and_maintenance_sessions_only`, the
+  catalog and 200-cap tests). Undo:
+  `docs/runbooks/269-undo.sql`. **Deploy order:** migrate BEFORE the binary: a binary built
+  against 269 calls it on every `find_agent` / `get_agent` card and answers 42883 without it.
 
 ## `-- no-transaction` migrations
 
