@@ -920,40 +920,83 @@ async fn serve(pool: &PgPool, delay: Option<&Delay>) -> Server {
 /// member of `epigraph_app` whose role default is `epigraph_app`, so a
 /// binary connecting as it acts as the application role from its first
 /// statement (and after any `RESET ALL`) and its RLS posture check is armed.
-/// Roles are cluster-wide: the name is unique and the gate drops it.
+/// Roles are cluster-wide and outlive the per-test database: the name is
+/// unique, and the login drops itself on every exit, a panic included.
 struct AppLogin {
     role: String,
     dsn: String,
+    /// The fixture's DSN, which created the role and drops it.
+    admin_url: String,
+}
+
+impl Drop for AppLogin {
+    /// `Drop` cannot await, and the test's runtime cannot be blocked on from
+    /// inside it, so the role is dropped on a thread with its own runtime and
+    /// connection. While unwinding, a failure is printed, not raised (a panic
+    /// in a panic aborts the test binary).
+    fn drop(&mut self) {
+        let (url, role) = (self.admin_url.clone(), self.role.clone());
+        let dropped = std::thread::spawn(move || -> Result<(), String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                use sqlx::Connection as _;
+                let mut conn = sqlx::PgConnection::connect(&url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _ = conn.close().await;
+                Ok(())
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Err("the drop thread panicked".into()));
+        if let Err(e) = dropped {
+            if std::thread::panicking() {
+                eprintln!("could not drop the app login {}: {e}", self.role);
+            } else {
+                panic!("drop the app login {}: {e}", self.role);
+            }
+        }
+    }
 }
 
 async fn app_login(pool: &PgPool) -> AppLogin {
-    let url = fixture::database_url_for(pool).await;
+    let admin_url = fixture::database_url_for(pool).await;
     let role = format!("atlas_latency_{}", Uuid::new_v4().simple());
     let password = format!("pw-{}", Uuid::new_v4().simple());
+    let (scheme, rest) = admin_url.split_once("://").expect("a DSN scheme");
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let dsn = format!("{scheme}://{role}:{password}@{host}");
     sqlx::query(&format!(
         "CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE \
          NOREPLICATION INHERIT PASSWORD '{password}' IN ROLE epigraph_app"
     ))
     .execute(pool)
     .await
-    .expect("create the app login");
-    sqlx::query(&format!("ALTER ROLE {role} SET role = 'epigraph_app'"))
-        .execute(pool)
-        .await
-        .expect("default the app login to the app role");
-    let (scheme, rest) = url.split_once("://").expect("a DSN scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
-    AppLogin {
-        dsn: format!("{scheme}://{role}:{password}@{host}"),
+    .expect(
+        "create the app login: the fresh-process arm needs a DATABASE_URL that may \
+         CREATE ROLE, on a cluster that accepts password logins over TCP",
+    );
+    // From here the guard owns the role: a failure below still drops it.
+    let login = AppLogin {
         role,
-    }
-}
-
-async fn drop_app_login(pool: &PgPool, login: &AppLogin) {
-    sqlx::query(&format!("DROP ROLE IF EXISTS {}", login.role))
-        .execute(pool)
-        .await
-        .expect("drop the app login");
+        dsn,
+        admin_url,
+    };
+    sqlx::query(&format!(
+        "ALTER ROLE {} SET role = 'epigraph_app'",
+        login.role
+    ))
+    .execute(pool)
+    .await
+    .expect("default the app login to the app role");
+    login
 }
 
 /// Logged by the binary when its connection is the application role under
@@ -1435,7 +1478,7 @@ async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
     let s = seed(&pool, scale).await;
     let login = app_login(&pool).await;
     let m = measure(&pool, &login, &s, scale, None).await;
-    drop_app_login(&pool, &login).await;
+    drop(login);
     let samples = m.samples;
     let breaches = verdict(&samples, &all_expected(), budget);
     let scaling = scaling_verdict(&samples, CLAIM_LEAF_OVER_LEAF);
@@ -1493,7 +1536,7 @@ async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
     let treated = measure(&pool, &login, &s, scale, Some(&delay))
         .await
         .samples;
-    drop_app_login(&pool, &login).await;
+    drop(login);
     let red: BTreeSet<(Kind, Temp)> = verdict(&treated, &all_expected(), budget)
         .into_iter()
         .map(|b| (b.kind, b.temp))
@@ -1518,4 +1561,31 @@ async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
             );
         }
     }
+}
+
+/// A run that panics mid-measure still drops its login. Roles are
+/// cluster-wide: a leaked one (a LOGIN member of `epigraph_app` with a
+/// password) outlives the per-test database and piles up on a shared test
+/// cluster.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_panicking_run_drops_its_app_login(pool: PgPool) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = pool.clone();
+    let run = tokio::spawn(async move {
+        let login = app_login(&p).await;
+        let _ = tx.send(login.role.clone());
+        panic!("a run fails mid-measure");
+    });
+    assert!(run.await.expect_err("the run panics").is_panic());
+    let role = rx.await.expect("the login's role name");
+    let left: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(&role)
+            .fetch_one(&pool)
+            .await
+            .expect("read pg_roles");
+    assert!(
+        !left,
+        "a panicking run left its login {role} on the cluster"
+    );
 }
