@@ -191,9 +191,10 @@ fn supporting_evidence_lifts_belief_on_the_f8cf28d0_set() {
 /// at `K >= 0.5` and parked the conflict on `(Omega, true)`. Now reserved
 /// missing mass is conflict against every positive element (including Theta)
 /// and is normalised away; it survives only as `missing ∩ missing`. Closed-world
-/// inputs keep none. The same numbers are re-checked in the `#[ignore]`d
-/// `epigraph-engine/tests/perspectival_loader.rs::load_and_validate_open_world`
-/// harness, which needs a seeded dev DB; this copy runs in every gate.
+/// inputs keep none. The same numbers are re-checked in
+/// `epigraph-engine/tests/perspectival_loader.rs::load_and_validate_open_world`,
+/// a `#[sqlx::test]` over a committed seed fixture; this copy keeps them in the
+/// DS crate's own gate, without a database.
 #[test]
 fn reserved_open_world_mass_survives_only_as_missing_intersect_missing() {
     let frame = FrameOfDiscernment::new("ow_proof", vec!["a".into(), "b".into()]).unwrap();

@@ -1,11 +1,12 @@
 //! perspectival-demo seed loader + T2-full validation (OPEN-WORLD).
 //!
-//! Reads the demo's seeds + perspectives JSON and loads the FULL cluster
-//! (entities, all claims, evidence BBAs, edges, perspectives) into a dev epigraph
-//! DB via the repo layer. Every BBA reserves OPEN-WORLD mass (a `~`/missing
-//! element) so the frame is not treated as exhaustive — genuine open-world CDST.
-//! Then validates the directional archetypes via the REAL `get_perspective_belief`,
-//! and checks how the reserved open-world mass behaves under high conflict.
+//! Loads the committed seed fixture (`tests/fixtures/perspectival_seed/`: frames,
+//! entities, source agents, claims with per-source BBAs, edges and the four
+//! observer perspectives) into a fresh database via the repo layer. Every BBA
+//! reserves OPEN-WORLD mass (a `~`/missing element) so the frame is not treated as
+//! exhaustive — genuine open-world CDST. Then validates the directional archetypes
+//! via the REAL `get_perspective_belief`, and checks how the reserved open-world
+//! mass behaves under high conflict.
 //!
 //! U025 (backlog 9d4821c1): `combine_multiple` no longer selects YagerOpen /
 //! Inagaki per step; every step is Dempster. Reserved `(Omega, true)` mass now
@@ -13,10 +14,10 @@
 //! evidence it is conflict and is normalised away. Whether that is the right
 //! open-world semantics is an operator ruling coupled to U028.
 //!
-//! Run (SEED_DIR supplied via env var; no hardcoded default):
-//!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_demo_dev \
-//!   SEED_DIR=$SEED_DIR SQLX_OFFLINE=true \
-//!   cargo test -p epigraph-engine --test perspectival_loader -- --nocapture
+//! A `#[sqlx::test]` over a committed fixture, so it runs in every gate. (It used
+//! to read an operator-supplied SEED_DIR against a dedicated dev database and was
+//! `#[ignore]`d, so no gate ran it; `epigraph-ds/tests/conflict_ratchet_regression.rs`
+//! carries a copy of the open-world numbers for that reason.)
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -32,10 +33,18 @@ use uuid::Uuid;
 
 const OPEN_WORLD_FRACTION: f64 = 0.08;
 
-fn read(dir: &str, file: &str) -> Value {
-    let path = format!("{dir}/{file}");
-    let s = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    serde_json::from_str(&s).unwrap_or_else(|e| panic!("parse {path}: {e}"))
+/// One file of the committed seed fixture, embedded at compile time so the test
+/// reads exactly what is checked in, whatever the working directory.
+macro_rules! seed {
+    ($file:literal) => {
+        parse(
+            $file,
+            include_str!(concat!("fixtures/perspectival_seed/", $file)),
+        )
+    };
+}
+fn parse(file: &str, text: &str) -> Value {
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("parse {file}: {e}"))
 }
 fn arr<'a>(v: &'a Value, key: &str) -> &'a Vec<Value> {
     v.get(key)
@@ -111,27 +120,15 @@ fn ow_bba_json(frame: &FrameOfDiscernment, hyps: &[String], masses: &Value) -> V
         .masses_to_json()
 }
 
-#[tokio::test]
-#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
-async fn load_and_validate_open_world() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP: DATABASE_URL not set");
-        return;
-    };
-    let Ok(dir) = std::env::var("SEED_DIR") else {
-        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let pool = PgPool::connect(&url).await.expect("connect");
-    sqlx::migrate!("../../migrations").run(&pool).await.ok();
-
+#[sqlx::test(migrations = "../../migrations")]
+async fn load_and_validate_open_world(pool: PgPool) {
     // ---- parse seed ----
-    let frames_j = read(&dir, "seeds/frames.json");
-    let entities_j = read(&dir, "seeds/entities.json");
-    let agents_j = read(&dir, "seeds/agents.json");
-    let claims_j = read(&dir, "seeds/claims.json");
-    let edges_j = read(&dir, "seeds/edges.json");
-    let obs_j = read(&dir, "perspectives/observers.json");
+    let frames_j = seed!("frames.json");
+    let entities_j = seed!("entities.json");
+    let agents_j = seed!("agents.json");
+    let claims_j = seed!("claims.json");
+    let edges_j = seed!("edges.json");
+    let obs_j = seed!("observers.json");
 
     let author = insert_agent(&pool).await;
     let mut key_id: HashMap<String, Uuid> = HashMap::new(); // entity/claim keys

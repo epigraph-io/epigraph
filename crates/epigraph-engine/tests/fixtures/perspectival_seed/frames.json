@@ -1,0 +1,29 @@
+{
+  "_doc": "Fixture for perspectival_loader: the cluster's binary frames. Index 0 of each frame is the target hypothesis.",
+  "frames": [
+    {
+      "key": "symptom_membership",
+      "name": "symptom_membership",
+      "hypotheses": [
+        "holds",
+        "refuted"
+      ]
+    },
+    {
+      "key": "treatment_efficacy",
+      "name": "treatment_efficacy",
+      "hypotheses": [
+        "efficacious",
+        "no_effect"
+      ]
+    },
+    {
+      "key": "treatment_safety",
+      "name": "treatment_safety",
+      "hypotheses": [
+        "safe",
+        "harmful"
+      ]
+    }
+  ]
+}

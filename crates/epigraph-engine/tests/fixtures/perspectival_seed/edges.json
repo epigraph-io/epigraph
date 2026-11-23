@@ -1,0 +1,103 @@
+{
+  "_doc": "Fixture for perspectival_loader: cluster structure; source/target are bundle keys of entities.json and claims.json.",
+  "edges": [
+    {
+      "relationship": "manifests_as",
+      "source": "condition-cluster",
+      "source_type": "entity",
+      "target": "sym-symptom-1",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "manifests_as",
+      "source": "condition-cluster",
+      "source_type": "entity",
+      "target": "sym-symptom-2",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "manifests_as",
+      "source": "condition-cluster",
+      "source_type": "entity",
+      "target": "sym-symptom-3",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "manifests_as",
+      "source": "condition-cluster",
+      "source_type": "entity",
+      "target": "sym-symptom-4",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "addresses",
+      "source": "eff-treatment-a-symptom-1",
+      "source_type": "claim",
+      "target": "sym-symptom-1",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "concerns",
+      "source": "eff-treatment-a-symptom-1",
+      "source_type": "claim",
+      "target": "treatment-a",
+      "target_type": "entity"
+    },
+    {
+      "relationship": "addresses",
+      "source": "eff-treatment-b-symptom-3",
+      "source_type": "claim",
+      "target": "sym-symptom-3",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "concerns",
+      "source": "eff-treatment-b-symptom-3",
+      "source_type": "claim",
+      "target": "treatment-b",
+      "target_type": "entity"
+    },
+    {
+      "relationship": "addresses",
+      "source": "eff-treatment-c-symptom-2",
+      "source_type": "claim",
+      "target": "sym-symptom-2",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "concerns",
+      "source": "eff-treatment-c-symptom-2",
+      "source_type": "claim",
+      "target": "treatment-c",
+      "target_type": "entity"
+    },
+    {
+      "relationship": "addresses",
+      "source": "eff-treatment-e-symptom-4",
+      "source_type": "claim",
+      "target": "sym-symptom-4",
+      "target_type": "claim"
+    },
+    {
+      "relationship": "concerns",
+      "source": "eff-treatment-e-symptom-4",
+      "source_type": "claim",
+      "target": "treatment-e",
+      "target_type": "entity"
+    },
+    {
+      "relationship": "concerns",
+      "source": "saf-treatment-a",
+      "source_type": "claim",
+      "target": "treatment-a",
+      "target_type": "entity"
+    },
+    {
+      "relationship": "concerns",
+      "source": "saf-treatment-c",
+      "source_type": "claim",
+      "target": "treatment-c",
+      "target_type": "entity"
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "_doc": "Fixture for perspectival_loader: four observer perspectives. source_reliability is the per-evidence_type alpha get_perspective_belief discounts every BBA by at query time.",
+  "perspectives": [
+    {
+      "key": "clinical_observer",
+      "name": "clinical_observer",
+      "perspective_type": "disciplinary",
+      "source_reliability": {
+        "source_clinical": 0.95,
+        "source_survey": 0.4,
+        "source_tradition": 0.15,
+        "source_practitioner": 0.1
+      }
+    },
+    {
+      "key": "tradition_observer",
+      "name": "tradition_observer",
+      "perspective_type": "disciplinary",
+      "source_reliability": {
+        "source_clinical": 0.6,
+        "source_survey": 0.7,
+        "source_tradition": 0.9,
+        "source_practitioner": 0.85
+      }
+    },
+    {
+      "key": "regulatory_observer",
+      "name": "regulatory_observer",
+      "perspective_type": "cultural",
+      "source_reliability": {
+        "source_clinical": 0.55,
+        "source_survey": 0.9,
+        "source_tradition": 0.75,
+        "source_practitioner": 0.35
+      }
+    },
+    {
+      "key": "skeptic_observer",
+      "name": "skeptic_observer",
+      "perspective_type": "analytical",
+      "source_reliability": {
+        "source_clinical": 0.7,
+        "source_survey": 0.1,
+        "source_tradition": 0.05,
+        "source_practitioner": 0.02
+      }
+    }
+  ]
+}
