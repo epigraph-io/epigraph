@@ -238,14 +238,6 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "refine_frame",
         &["FrameRepository::create_refinement"],
     ),
-    // narrows: the perspective / community rows its caller read through the
-    // viewer (`get_for_claim_frame_perspective(s)`), filtered to the rows a
-    // scoped belief may fold.
-    (
-        "belief.rs",
-        "scoped_belief_write",
-        &["derivation_scope::retain_for_cache"],
-    ),
     // gated (the claim is read through the viewer on the write transaction
     // first); the reads are the gated claim's own columns, its agent's
     // properties (agents), neighbour truth values for ids that came from
