@@ -327,9 +327,18 @@ async fn already_ingested_twin_answers_and_refuses_as_the_tool(pool: PgPool) {
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "ingest-stranger").await;
     let doi = "10.5555/twin-gate";
     let chapter = "hierarchical_extraction_v2:ch1";
-    let paper = epigraph_db::PaperRepository::get_or_create(&pool, doi, Some("t"), None)
-        .await
-        .expect("paper");
+    // A PUBLIC papers row (migration 246 gives `papers` row security and a
+    // declared scope): both callers can read the row, so only the
+    // group-private stamp below separates their answers.
+    let paper = epigraph_db::PaperRepository::get_or_create(
+        &pool,
+        doi,
+        Some("t"),
+        None,
+        epigraph_core::TenancyDecl::public(group),
+    )
+    .await
+    .expect("paper");
     let mut conn = pool.acquire().await.expect("conn");
     epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(
         &mut conn, paper, member, chapter, "test",
