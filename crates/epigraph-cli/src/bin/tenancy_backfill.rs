@@ -3261,8 +3261,10 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     ),
 ];
 
-/// Migration 107's EXECUTE grants to `epigraph_app`, which the ownership check
-/// above does not see. Returns the number of failing checks.
+/// The EXECUTE grants to `epigraph_app` of the definers in
+/// [`OPERATOR_FUNCTION_GRANTS`] (migration 107's first, then every deferred
+/// definer from 161 on that is not a trigger), which the ownership check above
+/// does not see. Returns the number of failing checks.
 ///
 /// # Why this is its own check
 ///
@@ -3284,6 +3286,10 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
 ///   `epigraph_link_retired_agent`, 116's `epigraph_link_retired_shared_signer`)
 ///   must NOT be. A grant there lets the request
 ///   DSN record operator links, which is the whole of 107's trust basis.
+/// * every later entry carries its own note in the register: a `true` one
+///   names the request path that calls it (and fails 42501 without the
+///   grant), a `false` one what an app grant would let the request DSN do.
+///   The FAIL lines below are worded for any entry, and point there.
 ///
 /// Each function is checked only when it exists (the same deferral as
 /// [`DEFERRED_DEFINER_FUNCTIONS`]), and the whole check only when the app role
@@ -3336,16 +3342,20 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             failures += 1;
             if *app_must_execute {
                 eprintln!(
-                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Migration 107 grants it only if \
-                     the role existed when 107 ran; without it every claim write on the app DSN \
-                     fails with 42501 (the authoring path calls it per write). Re-issue: GRANT \
+                    "FAIL: {APP_ROLE} cannot EXECUTE {signature}. Its migration grants it only \
+                     when the role exists, so a cluster where {APP_ROLE} was provisioned after \
+                     that migration ran carries no grant, and the request-DSN path that calls \
+                     it fails with 42501 (for 107's actor read, every claim write; the entry's \
+                     note in OPERATOR_FUNCTION_GRANTS names the caller). Re-issue: GRANT \
                      EXECUTE ON FUNCTION {signature} TO {APP_ROLE};"
                 );
             } else {
                 eprintln!(
-                    "FAIL: {APP_ROLE} CAN EXECUTE {signature}. The request DSN could then record \
-                     operator links itself, which is the whole of migration 107's trust basis. \
-                     Re-issue: REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
+                    "FAIL: {APP_ROLE} CAN EXECUTE {signature}, a definer only maintenance may \
+                     call. The request DSN could then perform its act itself (for 107's link \
+                     functions, record operator links, the whole of 107's trust basis; the \
+                     entry's note in OPERATOR_FUNCTION_GRANTS says what it allows). Re-issue: \
+                     REVOKE EXECUTE ON FUNCTION {signature} FROM PUBLIC, {APP_ROLE};"
                 );
             }
         }
