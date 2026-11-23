@@ -74,6 +74,11 @@ tracing-subscriber = { workspace = true }
 
 # HTTP client (federation client; embedding goes through epigraph-embeddings)
 reqwest = { workspace = true }
+# The reqwest rmcp's streamable-HTTP client transport is implemented for
+# (0.13, not the workspace's 0.12), named so `federation::client::connect` can
+# hand rmcp its own client (no proxy) instead of rmcp's default one. Adds no
+# features: rmcp already links it.
+reqwest_rmcp = { package = "reqwest", version = "0.13", default-features = false }
 
 # Crypto primitives
 hex = { workspace = true }

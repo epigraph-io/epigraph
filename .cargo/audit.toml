@@ -165,8 +165,8 @@ ignore = [
 #     API (the pipeline is a commented-out TODO). No crate constructs a
 #     BaggagePropagator or TextMapPropagator, or calls
 #     set_text_map_propagator / extract_with_context.
-#   - epigraph-mcp/src/otel.rs is not in the module tree (no `mod otel`), and
-#     it builds an exporter only, not a propagator.
+#   - epigraph-mcp has no OpenTelemetry code (its unwired otel.rs, an
+#     exporter only, was deleted; backlog e6ed6cc9).
 #   Fix = opentelemetry/opentelemetry_sdk/opentelemetry-otlp 0.27 -> >=0.32.1
 #   plus the matching tracing-opentelemetry. That is a breaking API move, not
 #   a lockfile bump. Revisit this entry when the `otel` pipeline is wired up,
