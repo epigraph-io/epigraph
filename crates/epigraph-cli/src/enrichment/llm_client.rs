@@ -475,6 +475,18 @@ impl LlmProvider for AnthropicClient {
                     message: format!("Failed to parse API response: {e}"),
                 })?;
 
+        // A refusal is decided by the prompt's content, so it is terminal for
+        // this prompt: report it as `Refusal`, not as a (retryable) parse
+        // failure. Check it before reading `content`: a refused answer may
+        // carry partial text, and that text must never be returned as `Ok`
+        // even when it happens to parse as JSON. The model's text is left out
+        // of the message on purpose. A missing `stop_reason` is not an error.
+        if resp_json["stop_reason"].as_str() == Some("refusal") {
+            return Err(LlmError::Refusal {
+                message: "anthropic stop_reason \"refusal\"".to_string(),
+            });
+        }
+
         // Extract text content from the response
         let text = resp_json["content"]
             .as_array()
@@ -983,6 +995,55 @@ mod tests {
                 matches!(err, LlmError::MalformedResponse { .. }),
                 "expected MalformedResponse, got {err:?}"
             );
+        }
+
+        fn assert_refusal(err: &LlmError) {
+            match err {
+                LlmError::Refusal { message } => assert!(
+                    message.contains("refusal"),
+                    "Refusal message should name the stop reason, got {message:?}"
+                ),
+                other => panic!("expected LlmError::Refusal, got {other:?}"),
+            }
+        }
+
+        /// A refusal with no content blocks is a `Refusal` (terminal for the
+        /// prompt), not a "no text content" `MalformedResponse`.
+        #[tokio::test]
+        async fn refusal_with_empty_content_is_refusal() {
+            let err = complete_against(messages_response("refusal", serde_json::json!([])))
+                .await
+                .unwrap_err();
+            assert_refusal(&err);
+        }
+
+        /// A refusal whose text is prose is a `Refusal`, not a JSON parse
+        /// failure.
+        #[tokio::test]
+        async fn refusal_with_prose_text_is_refusal() {
+            let err = complete_against(messages_response(
+                "refusal",
+                serde_json::json!([{"type": "text", "text": "I can't help with that."}]),
+            ))
+            .await
+            .unwrap_err();
+            assert_refusal(&err);
+        }
+
+        /// The stop reason outranks the text: a refusal that stopped after
+        /// emitting text that happens to parse as JSON (a partial answer) is
+        /// still a `Refusal`, never an `Ok` built from the partial output.
+        #[tokio::test]
+        async fn refusal_with_parseable_partial_text_is_refusal_not_ok() {
+            let result = complete_against(messages_response(
+                "refusal",
+                serde_json::json!([{"type": "text", "text": "[]"}]),
+            ))
+            .await;
+            match result {
+                Err(err) => assert_refusal(&err),
+                Ok(v) => panic!("a refused answer must not be returned as Ok, got {v}"),
+            }
         }
     }
 }
