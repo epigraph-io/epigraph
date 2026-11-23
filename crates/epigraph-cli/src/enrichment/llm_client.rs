@@ -317,7 +317,14 @@ pub struct AnthropicClient {
     auth: AuthMethod,
     model: String,
     http_client: reqwest::Client,
+    /// Scheme + host the Messages API is posted to. Always
+    /// [`ANTHROPIC_API_BASE`] outside tests; unit tests point it at a local
+    /// mock server so `complete_json`'s response handling runs end to end.
+    base_url: String,
 }
+
+/// Production Anthropic API origin (no trailing slash).
+const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 
 impl AnthropicClient {
     /// Create a new Anthropic client with an API key
@@ -338,6 +345,7 @@ impl AnthropicClient {
                     .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string())
             }),
             http_client: reqwest::Client::new(),
+            base_url: ANTHROPIC_API_BASE.to_string(),
         })
     }
 
@@ -359,7 +367,15 @@ impl AnthropicClient {
                     .unwrap_or_else(|_| "claude-sonnet-4-5-20250929".to_string())
             }),
             http_client: reqwest::Client::new(),
+            base_url: ANTHROPIC_API_BASE.to_string(),
         })
+    }
+
+    /// Point the client at another API origin (a local mock server).
+    #[cfg(test)]
+    fn with_base_url(mut self, base_url: &str) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
+        self
     }
 
     /// Returns `true` if this client is using OAuth authentication
@@ -416,7 +432,7 @@ impl LlmProvider for AnthropicClient {
 
         let request = self
             .http_client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json");
 
@@ -901,5 +917,72 @@ mod tests {
         let client = create_llm_client("mock").unwrap();
         assert_eq!(client.model_name(), "mock");
         assert_eq!(client.name(), "mock");
+    }
+
+    /// `AnthropicClient::complete_json` against a local mock of the Messages
+    /// API, so the response handling (status, `content`, JSON extraction) is
+    /// exercised exactly as it runs against the real endpoint.
+    mod messages_api {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// Serve `body` as the 200 answer to one `POST /v1/messages` and
+        /// return what `complete_json` makes of it.
+        async fn complete_against(body: serde_json::Value) -> Result<serde_json::Value, LlmError> {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = AnthropicClient::new("test-key".to_string(), Some("m".to_string()))
+                .unwrap()
+                .with_base_url(&server.uri());
+            client.complete_json("prompt").await
+        }
+
+        fn messages_response(stop_reason: &str, content: serde_json::Value) -> serde_json::Value {
+            serde_json::json!({
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "m",
+                "content": content,
+                "stop_reason": stop_reason,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+        }
+
+        /// Control: a normal `end_turn` answer whose text is JSON (fenced, as
+        /// models often return it) parses to that JSON.
+        #[tokio::test]
+        async fn end_turn_with_json_text_is_ok() {
+            let got = complete_against(messages_response(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "```json\n{\"a\": 1}\n```"}]),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(got, serde_json::json!({"a": 1}));
+        }
+
+        /// Control: an `end_turn` answer whose text is not JSON is still a
+        /// `MalformedResponse` (a parse failure, which a caller may retry).
+        #[tokio::test]
+        async fn end_turn_with_unparseable_text_is_malformed() {
+            let err = complete_against(messages_response(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "Here are my thoughts, no JSON."}]),
+            ))
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, LlmError::MalformedResponse { .. }),
+                "expected MalformedResponse, got {err:?}"
+            );
+        }
     }
 }
