@@ -215,6 +215,25 @@ async fn replay_now(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayRepo
     .expect("replay")
 }
 
+/// The cascade status a call reports on a server built with `inline`.
+fn status(inline: bool) -> &'static str {
+    if inline {
+        "applied"
+    } else {
+        "deferred"
+    }
+}
+
+/// On a deferred server, replay the one cascade the call just deferred, and
+/// check it applied (backlog 89a1d071 part 4: K1's transport tests ran the
+/// cascade inline only). Inline, nothing is deferred.
+async fn settle(pool: &PgPool, inline: bool) {
+    if !inline {
+        let report = replay_now(pool).await;
+        assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    }
+}
+
 /// Retract edge `id` (set `valid_to`) on the harness, and check it took.
 async fn retract(pool: &PgPool, id: Uuid) {
     let retracted: bool = sqlx::query_scalar(
@@ -253,16 +272,30 @@ async fn seed_authorship(pool: &PgPool, author: Uuid, group: Uuid, x: Uuid) -> A
 /// successor that carries the first act's REAL act edge. R-133 (SPEC SF-23).
 #[sqlx::test(migrations = "../../migrations")]
 async fn supersede_claim_leaves_agent_authorship_and_act_edges_on_the_retired_claim(pool: PgPool) {
-    let server = app_role_server(&pool, true).await;
+    supersede_claim_k1(&pool, true).await;
+}
+
+/// As above with no maintenance connection: each cascade is deferred, then
+/// replayed on the maintenance login.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_deferred_replay_leaves_agent_authorship_and_act_edges(pool: PgPool) {
+    supersede_claim_k1(&pool, false).await;
+}
+
+async fn supersede_claim_k1(pool: &PgPool, inline: bool) {
+    let pool = pool.clone();
+    let server = app_role_server(&pool, inline).await;
     let (author, group) = fixture::seed_agent_with_group(&pool, "k1-mcp-supersede").await;
     let first = claim_of(&pool, author, group, "k1 mcp first version").await;
-    let x = supersede_via_mcp(&server, &pool, author, first, "applied").await;
+    let x = supersede_via_mcp(&server, &pool, author, first, status(inline)).await;
+    settle(&pool, inline).await;
     let act_edge = act_edge_of(&pool, author, x).await;
     let a = seed_authorship(&pool, author, group, x).await;
     let kept = [a.authored, a.asserts, act_edge];
     let before = ends(&pool, &kept).await;
 
-    let n = supersede_via_mcp(&server, &pool, author, x, "applied").await;
+    let n = supersede_via_mcp(&server, &pool, author, x, status(inline)).await;
+    settle(&pool, inline).await;
 
     assert_eq!(
         ends(&pool, &[a.control]).await[0].1,
@@ -279,9 +312,23 @@ async fn supersede_claim_leaves_agent_authorship_and_act_edges_on_the_retired_cl
 /// `mark_duplicate`, cascade inline. A supersession successor cannot be
 /// marked (its `supersedes` is set), so the act edge on the duplicate is
 /// harness-written in the act's shape. R-133 (SPEC SF-23).
+///
+/// A claim-sourced act-marked edge whose triple the canonical already has
+/// (backlog 89a1d071 part 1) stays too: the collision guard leaves it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn mark_duplicate_leaves_agent_authorship_and_act_edges_on_the_duplicate(pool: PgPool) {
-    let server = app_role_server(&pool, true).await;
+    mark_duplicate_k1(&pool, true).await;
+}
+
+/// As above with no maintenance connection: deferred, then replayed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_duplicate_deferred_replay_leaves_agent_authorship_and_act_edges(pool: PgPool) {
+    mark_duplicate_k1(&pool, false).await;
+}
+
+async fn mark_duplicate_k1(pool: &PgPool, inline: bool) {
+    let pool = pool.clone();
+    let server = app_role_server(&pool, inline).await;
     let (author, group) = fixture::seed_agent_with_group(&pool, "k1-mcp-dedup").await;
     let dup = claim_of(&pool, author, group, "k1 mcp duplicate").await;
     let canonical = claim_of(&pool, author, group, "k1 mcp canonical").await;
@@ -294,7 +341,17 @@ async fn mark_duplicate_leaves_agent_authorship_and_act_edges_on_the_duplicate(p
         Some(act_marker()),
     )
     .await;
-    let kept = [a.authored, a.asserts, act_edge];
+    let z = claim_of(&pool, author, group, "k1 mcp marked supporter of both").await;
+    let colliding = edge(
+        &pool,
+        (z, "claim"),
+        (dup, "claim"),
+        "supports",
+        Some(act_marker()),
+    )
+    .await;
+    edge(&pool, (z, "claim"), (canonical, "claim"), "supports", None).await;
+    let kept = [a.authored, a.asserts, act_edge, colliding];
     let before = ends(&pool, &kept).await;
 
     let r = mark_duplicate(
@@ -310,7 +367,8 @@ async fn mark_duplicate_leaves_agent_authorship_and_act_edges_on_the_duplicate(p
     .await
     .expect("the author's dedup");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(body["cascade"]["status"], status(inline), "{body}");
+    settle(&pool, inline).await;
 
     let control = ends(&pool, &[a.control]).await[0];
     assert_eq!(
@@ -321,7 +379,8 @@ async fn mark_duplicate_leaves_agent_authorship_and_act_edges_on_the_duplicate(p
     assert_eq!(
         ends(&pool, &kept).await,
         before,
-        "agent AUTHORED, agent asserts and the act edge stay on the duplicate"
+        "agent AUTHORED, agent asserts, the act edge and the colliding marked edge stay \
+         in force on the duplicate"
     );
 }
 
@@ -329,7 +388,18 @@ async fn mark_duplicate_leaves_agent_authorship_and_act_edges_on_the_duplicate(p
 /// R-133 (SPEC SF-23).
 #[sqlx::test(migrations = "../../migrations")]
 async fn consolidate_claims_leaves_agent_authorship_and_act_edges_on_the_sources(pool: PgPool) {
-    let server = app_role_server(&pool, true).await;
+    consolidate_claims_k1(&pool, true).await;
+}
+
+/// As above with no maintenance connection: deferred, then replayed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consolidate_claims_deferred_replay_leaves_agent_authorship_and_act_edges(pool: PgPool) {
+    consolidate_claims_k1(&pool, false).await;
+}
+
+async fn consolidate_claims_k1(pool: &PgPool, inline: bool) {
+    let pool = pool.clone();
+    let server = app_role_server(&pool, inline).await;
     let (author, group) = fixture::seed_agent_with_group(&pool, "k1-mcp-merge").await;
     let s1 = claim_of(&pool, author, group, "k1 mcp source one").await;
     let s2 = claim_of(&pool, author, group, "k1 mcp source two").await;
@@ -362,7 +432,8 @@ async fn consolidate_claims_leaves_agent_authorship_and_act_edges_on_the_sources
     .await
     .expect("the author's merge");
     let body = first_text(&r);
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    assert_eq!(body["cascade"]["status"], status(inline), "{body}");
+    settle(&pool, inline).await;
     let merged = uuid_field(&body, "merged_claim_id");
 
     assert_eq!(

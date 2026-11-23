@@ -63,3 +63,33 @@ fn the_unmark_tool_the_description_names_is_served() {
         "mark_duplicate's description names unmark_duplicate, which tools/list must serve"
     );
 }
+
+/// The cascade the description promises must be the one the repair runs
+/// (backlog 89a1d071 part 3; supersede SPEC K9b). It used to say "the
+/// duplicate's edges move to the canonical" with no exception, while the
+/// repair leaves every edge that records the duplicate itself on it (K1,
+/// K2): an agent's authorship, a supersede act edge, retracted and lineage
+/// edges, the identity edge, the ingest's own edges and a non-public
+/// duplicate's `executes`. An agent reading the old text expected
+/// its authorship to follow the canonical.
+#[test]
+fn mark_duplicate_description_names_the_edges_that_stay_on_the_duplicate() {
+    let d = mark_duplicate_description();
+    assert!(
+        !d.contains("the duplicate's edges move to the canonical and"),
+        "the unqualified edge-move sentence is back: {d}"
+    );
+    for needle in [
+        "except the edges that record the duplicate itself, which stay on it",
+        "an agent's authorship of it",
+        "a supersede act edge",
+        "retracted edges",
+        "lineage (supersedes, in any case) edges",
+        "the same_as identity edge",
+        "the document ingest's own edges",
+        "a non-public duplicate's executes edges",
+        "retracted instead of moved",
+    ] {
+        assert!(d.contains(needle), "description lacks {needle:?}: {d}");
+    }
+}

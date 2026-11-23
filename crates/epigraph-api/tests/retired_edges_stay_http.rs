@@ -205,6 +205,25 @@ async fn replay_now(pool: &PgPool) -> epigraph_engine::admin_cascade::ReplayRepo
     .expect("replay")
 }
 
+/// The cascade status a route reports on a state built with `inline`.
+fn status(inline: bool) -> &'static str {
+    if inline {
+        "applied"
+    } else {
+        "deferred"
+    }
+}
+
+/// On a deferred state, replay the one cascade the route just deferred, and
+/// check it applied (backlog 89a1d071 part 4: K1's transport tests ran the
+/// cascade inline only). Inline, nothing is deferred.
+async fn settle(pool: &PgPool, inline: bool) {
+    if !inline {
+        let report = replay_now(pool).await;
+        assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    }
+}
+
 /// Retract edge `id` (set `valid_to`) on the harness, and check it took.
 async fn retract(pool: &PgPool, id: Uuid) {
     let retracted: bool = sqlx::query_scalar(
@@ -243,10 +262,23 @@ async fn seed_authorship(pool: &PgPool, author: Uuid, group: Uuid, x: Uuid) -> A
 /// successor carrying the first act's REAL act edge. R-133 (SPEC SF-23).
 #[sqlx::test(migrations = "../../migrations")]
 async fn http_supersede_leaves_agent_authorship_and_act_edges_on_the_retired_claim(pool: PgPool) {
-    let state = app_role_state(&pool, true).await;
+    http_supersede_k1(&pool, true).await;
+}
+
+/// As above with no maintenance connection: each cascade is deferred, then
+/// replayed on the maintenance login.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_supersede_deferred_replay_leaves_agent_authorship_and_act_edges(pool: PgPool) {
+    http_supersede_k1(&pool, false).await;
+}
+
+async fn http_supersede_k1(pool: &PgPool, inline: bool) {
+    let pool = pool.clone();
+    let state = app_role_state(&pool, inline).await;
     let (author, group) = seed_agent_with_group(&pool, "k1-http-supersede").await;
     let first = claim_of(&pool, author, group, "k1 http first version").await;
-    let x = supersede_via_http(&state, &pool, author, first, "applied").await;
+    let x = supersede_via_http(&state, &pool, author, first, status(inline)).await;
+    settle(&pool, inline).await;
     let act_edge: Uuid = sqlx::query_scalar(
         "SELECT id FROM edges WHERE source_id = $1 AND target_id = $2 \
            AND relationship = 'AUTHORED' AND properties ? $3",
@@ -261,7 +293,8 @@ async fn http_supersede_leaves_agent_authorship_and_act_edges_on_the_retired_cla
     let kept = [a.authored, a.asserts, act_edge];
     let before = ends(&pool, &kept).await;
 
-    let n = supersede_via_http(&state, &pool, author, x, "applied").await;
+    let n = supersede_via_http(&state, &pool, author, x, status(inline)).await;
+    settle(&pool, inline).await;
 
     assert_eq!(
         ends(&pool, &[a.control]).await[0].1,
@@ -280,7 +313,18 @@ async fn http_supersede_leaves_agent_authorship_and_act_edges_on_the_retired_cla
 /// shape. R-133 (SPEC SF-23).
 #[sqlx::test(migrations = "../../migrations")]
 async fn http_dedup_leaves_agent_authorship_and_act_edges_on_the_duplicate(pool: PgPool) {
-    let state = app_role_state(&pool, true).await;
+    http_dedup_k1(&pool, true).await;
+}
+
+/// As above with no maintenance connection: deferred, then replayed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_dedup_deferred_replay_leaves_agent_authorship_and_act_edges(pool: PgPool) {
+    http_dedup_k1(&pool, false).await;
+}
+
+async fn http_dedup_k1(pool: &PgPool, inline: bool) {
+    let pool = pool.clone();
+    let state = app_role_state(&pool, inline).await;
     let (author, group) = seed_agent_with_group(&pool, "k1-http-dedup").await;
     let dup = claim_of(&pool, author, group, "k1 http duplicate").await;
     let canonical = claim_of(&pool, author, group, "k1 http canonical").await;
@@ -309,7 +353,8 @@ async fn http_dedup_leaves_agent_authorship_and_act_edges_on_the_duplicate(pool:
     .await
     .expect("the author's dedup");
     let cascade = serde_json::to_value(&resp.cascade).expect("cascade");
-    assert_eq!(cascade["status"], "applied", "{cascade}");
+    assert_eq!(cascade["status"], status(inline), "{cascade}");
+    settle(&pool, inline).await;
 
     let control = ends(&pool, &[a.control]).await[0];
     assert_eq!(

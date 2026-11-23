@@ -83,8 +83,14 @@ deferred, and the replay timer applies it.
 
 - **Edges.** The duplicate's edges, incoming and outgoing, are re-pointed onto
   the canonical. An edge whose triple the canonical already has is retracted
-  instead. The identity edge itself is never moved. A non-public duplicate
-  keeps its `executes` edges.
+  instead. Edges that record the duplicate itself stay on it, neither moved
+  nor retracted:
+  - an agent's authorship of it (`AUTHORED` or `asserts` from an agent);
+  - a supersede act edge (one carrying the `supersede_act` marker);
+  - retracted edges, and lineage edges (`supersedes`, in either spelling);
+  - the identity edge;
+  - the document ingest's own edges;
+  - a non-public duplicate's `executes` edges.
 - **Belief inputs (mass functions).** They follow the edges and pool onto the
   canonical, except:
   - copies of a source the canonical already holds;

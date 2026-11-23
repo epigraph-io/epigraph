@@ -14,8 +14,11 @@ items, and signals that materialized.
 - Claim content is never rewritten, and one call undoes a whole apply
   (`revert_label_dedup`), but only on a server that holds the administrative
   (maintenance) connection. Request-serving servers hold none and refuse a
-  revert with marks, and no shipped surface runs one elsewhere, so today a
-  mark is one-way (see
+  revert with marks, so there no single call undoes an apply with marks, and
+  undoing a mark takes an operator: the `unmark_duplicate` CLI
+  (`--applied-marks <the apply response>`) on the maintenance DSN un-marks
+  the apply's marks, and `revert_label_dedup` with `applied_units` alone
+  reverses its label writes (see
   [duplicates-and-index-hygiene.md](duplicates-and-index-hygiene.md)).
 
 Label dedup is index bookkeeping. It is never a merge of knowledge claims: a

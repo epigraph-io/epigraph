@@ -7975,7 +7975,10 @@ impl ClaimRepository {
     /// `policies.rs::create_challenge`'s `'epigraph.policy_challenge'`.
     ///
     /// A caller that creates many claims in one transaction holds one lock per
-    /// distinct pair until it commits, in input order.
+    /// distinct pair until it commits. It takes them all FIRST, in key order,
+    /// with [`Self::lock_content_hash_agents`] (or, for the legacy creates,
+    /// [`Self::lock_new_content_hash_agents`]), before its first create and
+    /// before any row lock: see "Deadlocks and lock-table use".
     ///
     /// # Who takes it
     ///
@@ -8021,21 +8024,39 @@ impl ClaimRepository {
     /// already-committed atom with an unlocked find and takes the lock only
     /// on a MISS, so an ingest holds one lock per NEWLY INSERTED atom until it
     /// commits; atoms that already existed cost no lock and add no wait.
-    /// Ingest against ingest keeps the wait graph it had without the lock: a
-    /// miss is an atom some concurrent ingest may be inserting, and since an
-    /// atom's id is `atom_id(content_hash)` an overlapping same-author ingest
-    /// already waited on the other's uncommitted primary-key entry (and then
-    /// failed on that key instead of returning the first's row). New: a
-    /// same-author ingest against a multi-pair [`Self::create_or_get`]
-    /// transaction or a consolidation into the same content, meeting shared
-    /// NEW pairs in opposite orders, can now deadlock (40P01, retryable) where
-    /// it previously minted a duplicate.
     ///
-    /// Every lock held until commit takes a slot in the shared lock table
+    /// Taken one create at a time, in document order, those locks added wait
+    /// edges that could close a cycle (40P01, backlog 5b587ae8): two
+    /// transactions meeting shared NEW pairs in opposite orders, or an ingest
+    /// that holds a row lock (the label merge onto an existing claim it
+    /// resolved an earlier atom to) while it waits on a pair that a
+    /// consolidation holds while it waits on that row (`consolidate_act_conn` takes the pair
+    /// lock, then `FOR UPDATE` on its sources). So every writer that takes
+    /// more than one pair in a transaction takes ALL of them first, in one
+    /// statement and in key order, before any row lock of its own:
+    /// `ingest_document`'s atom walk through
+    /// [`Self::lock_new_content_hash_agents`] (the misses `create_conn` would
+    /// lock, by the same unlocked rule), and any multi-pair
+    /// [`Self::create_or_get`] caller through [`Self::lock_content_hash_agents`].
+    /// Two such writers then wait in one order, and neither waits on a pair
+    /// while holding a row lock. The per-create lock that follows re-takes a
+    /// lock the transaction already holds, which never waits. No shipped
+    /// transaction runs more than one `create_or_get`. A single-pair writer
+    /// (POST /claims, `create_or_get`, a consolidation, `method_search`) takes
+    /// its one pair before its row locks, so it closes no cycle either.
+    ///
+    /// Every lock held until commit takes an entry in the shared lock table
     /// (`max_locks_per_transaction` x (`max_connections` +
-    /// `max_prepared_transactions`)), which the primary-key waits did not. A
-    /// document with very many new atoms, or several concurrent large ones,
-    /// uses correspondingly many slots.
+    /// `max_prepared_transactions`)), which the primary-key waits did not:
+    /// one entry per distinct pair, so an ingest holds one per new atom. The
+    /// pre-lock does not change that count. Measured on a fresh test database
+    /// (`claim_dedup_lock_order.rs::a_large_prelock_holds_one_lock_table_entry_per_new_pair`):
+    /// pre-locking 2,000 new pairs adds exactly 2,000 advisory rows to
+    /// `pg_locks` for that backend, against the default table of 64 x (100 +
+    /// 0) = 6,400 entries shared by every session. A document with thousands
+    /// of new atoms, or several concurrent large ones, can therefore exhaust
+    /// it ("out of shared memory", for every session) unless
+    /// `max_locks_per_transaction` is sized for the largest ingest.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the lock statement fails.
@@ -8053,6 +8074,74 @@ impl ClaimRepository {
         .execute(&mut *conn)
         .await?;
         Ok(())
+    }
+
+    /// Take [`Self::lock_content_hash_agent`] for every `(content_hash,
+    /// agent_id)` in `pairs`, in ONE statement and in lock-key order, for the
+    /// rest of the caller's transaction. Returns how many distinct locks it
+    /// took.
+    ///
+    /// A writer that will take more than one pair in a transaction calls this
+    /// first, before its first create and before any row lock, so that every
+    /// such writer waits on the pairs in the same order (see "Deadlocks and
+    /// lock-table use" on [`Self::lock_content_hash_agent`]). The creates that
+    /// follow re-take locks the transaction already holds, which never wait.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the lock statement fails.
+    pub async fn lock_content_hash_agents(
+        conn: &mut sqlx::PgConnection,
+        pairs: &[(Vec<u8>, Uuid)],
+    ) -> Result<usize, DbError> {
+        Self::lock_pairs_in_key_order(conn, pairs, false).await
+    }
+
+    /// [`Self::lock_content_hash_agents`] for the pairs a run of legacy
+    /// creates ([`Self::create_conn`] and its siblings) would lock: only those
+    /// whose `content_hash` has no row this session can see, which is the
+    /// unlocked hit `create_conn` answers without a lock. An ingest therefore
+    /// pre-locks exactly its new atoms, as many as it held before.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the lock statement fails.
+    pub async fn lock_new_content_hash_agents(
+        conn: &mut sqlx::PgConnection,
+        pairs: &[(Vec<u8>, Uuid)],
+    ) -> Result<usize, DbError> {
+        Self::lock_pairs_in_key_order(conn, pairs, true).await
+    }
+
+    async fn lock_pairs_in_key_order(
+        conn: &mut sqlx::PgConnection,
+        pairs: &[(Vec<u8>, Uuid)],
+        skip_existing_content: bool,
+    ) -> Result<usize, DbError> {
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        let hashes: Vec<Vec<u8>> = pairs.iter().map(|(h, _)| h.clone()).collect();
+        let agents: Vec<Uuid> = pairs.iter().map(|(_, a)| *a).collect();
+        // The key is `lock_content_hash_agent`'s, so a later single-pair lock
+        // of the same pair re-takes the same lock. `ORDER BY` sorts the keys
+        // before the lock calls run: a volatile target-list function is
+        // evaluated after the sort below it (PostgreSQL postpones it past the
+        // Sort node), which `claim_dedup_lock_order.rs` measures.
+        let locked: Vec<(i32,)> = sqlx::query_as(
+            r#"-- VISIBILITY-EXEMPT: WRITE path. The probe is create_conn's unlocked dedup find (a hit takes no lock); it decides only which locks to take and discloses nothing to a caller.
+            SELECT k.key,
+                   pg_advisory_xact_lock(hashtext('epigraph.claim_dedup'), k.key)::text
+              FROM (SELECT DISTINCT hashtext(encode(p.h, 'hex') || p.a::text) AS key
+                      FROM unnest($1::bytea[], $2::uuid[]) AS p(h, a)
+                     WHERE NOT ($3 AND EXISTS (SELECT 1 FROM claims c
+                                                WHERE c.content_hash = p.h))) k
+             ORDER BY k.key"#,
+        )
+        .bind(&hashes)
+        .bind(&agents)
+        .bind(skip_existing_content)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(locked.len())
     }
 
     /// Insert a claim row unconditionally (no implicit dedup).
@@ -9918,6 +10007,23 @@ impl ClaimRepository {
                 ),
             });
         }
+        // The edge arm predicts the repair's incoming re-point, so it skips
+        // every edge that re-point leaves on the duplicate (backlog 89a1d071
+        // part 2): lineage in either spelling, a non-public duplicate's frozen
+        // `executes`, a dedup identity edge, an agent's authorship, an
+        // act-marked edge and the document ingest's own edges (K1, K2). It
+        // still counts an edge the incoming collision guard will retract, and
+        // the pooling arm counts every row, so it can still refuse where the
+        // repair would carry nothing; it never admits what the repair carries.
+        let frozen = non_public_frozen_relationships(&mut tx, dup_uuid).await?;
+        let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let act_tools: Vec<String> = SUPERSEDE_ACT_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let false_binding: bool = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
             SELECT NOT public.epigraph_session_is_privileged_writer()
@@ -9932,13 +10038,24 @@ impl ClaimRepository {
                AND (EXISTS (
                    SELECT 1 FROM edges e
                     WHERE e.target_id = $1 AND e.target_type = 'claim'
-                      AND e.relationship != 'supersedes' AND e.valid_to IS NULL
-                      AND NOT (e.source_type = 'claim' AND e.source_id = $2))
+                      AND lower(e.relationship) <> 'supersedes' AND e.valid_to IS NULL
+                      AND NOT (e.source_type = 'claim' AND e.source_id = $2)
+                      AND NOT (e.relationship = ANY($3))
+                      AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+                      AND NOT (e.source_type = 'agent' AND e.relationship = ANY($4))
+                      AND NOT COALESCE(e.properties->>$6 = ANY($5), false)
+                      AND NOT (e.properties ? $7 OR e.labels @> ARRAY[$8]::text[]))
                  -- The repair's pooling (part 3) copies the frame bindings too.
                  OR EXISTS (SELECT 1 FROM mass_functions m WHERE m.claim_id = $1))"#,
         )
         .bind(dup_uuid)
         .bind(canon_uuid)
+        .bind(&frozen)
+        .bind(&agent_authorship)
+        .bind(&act_tools)
+        .bind(SUPERSEDE_ACT_PROPERTY)
+        .bind(INGEST_WRITTEN_FROZEN)
+        .bind(INGEST_WRITTEN_FROZEN_LABEL)
         .fetch_one(&mut *tx)
         .await?;
         if false_binding {
@@ -13979,8 +14096,16 @@ async fn repair_marked_duplicate(
     // Agents' authorship of the duplicate and act-marked edges stay on it
     // (ruling R-133, as in `migrate_superseded_edges`), and so do the
     // document ingest's own edges (`INGEST_WRITTEN_FROZEN`). Both point AT the
-    // claim they record, so the incoming re-point tests them; the collision
-    // guards never meet an agent-sourced edge (they act on claim-sourced ones).
+    // claim they record, so the incoming re-point tests them. The incoming
+    // collision guards test the act marker too: an edge the re-point leaves on
+    // the duplicate never moves, so it cannot collide, and retracting it would
+    // drop exactly the record K1 keeps (a claim-sourced edge can carry the
+    // marker: MCP `link_epistemic` / `link_hierarchical` do not refuse it).
+    // They never meet an agent-sourced edge (they act on claim-sourced ones),
+    // nor an ingest-marked one (every `INGEST_WRITTEN_SHAPES` source is an
+    // agent or a paper, and migrations 198 / 208 reserve the marker). The
+    // outgoing re-point moves act-marked edges, so the outgoing guard still
+    // retracts a colliding one.
     let agent_authorship: Vec<String> = STEP_LINEAGE_AGENT_AUTHORSHIP_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -14026,6 +14151,7 @@ async fn repair_marked_duplicate(
          AND lower(e.relationship) <> 'supersedes' AND e.relationship != 'AUTHORED'
          AND NOT (e.relationship = ANY($3))
          AND NOT (e.relationship = 'same_as' AND e.properties ? 'dedup')
+         AND NOT COALESCE(e.properties->>$5 = ANY($4), false)
          AND e.source_type = 'claim' AND e.source_id != $1
          AND e.valid_to IS NULL
          AND EXISTS (
@@ -14042,6 +14168,8 @@ async fn repair_marked_duplicate(
     .bind(canon_uuid)
     .bind(dup_uuid)
     .bind(&frozen)
+    .bind(&act_tools)
+    .bind(SUPERSEDE_ACT_PROPERTY)
     .fetch_all(&mut *conn)
     .await?;
 
@@ -14093,7 +14221,10 @@ async fn repair_marked_duplicate(
     // Pre-delete the redundant dup-side `alternative_of` edge whenever
     // `canonical` already shares a symmetric `alternative_of` edge with the
     // same third claim.  Edges where `canonical` is itself an endpoint are
-    // left for the self-loop guards in the migration UPDATEs below.
+    // left for the self-loop guards in the migration UPDATEs below. An
+    // INCOMING (`T→dup`) edge carrying the act marker is left alone: the
+    // incoming re-point keeps it on the duplicate, so it cannot collide (as
+    // in the incoming guard above).
     deleted_edges.extend(
         sqlx::query_as::<_, (Uuid, Uuid)>(
             r#"-- VISIBILITY-EXEMPT: WRITE path. PR-16 owns the write-side predicate; this read is part of the mutation it guards, not a disclosure to a caller.
@@ -14103,6 +14234,7 @@ async fn repair_marked_duplicate(
              AND e.source_type = 'claim' AND e.target_type = 'claim'
              AND (e.source_id = $2 OR e.target_id = $2)
              AND e.source_id != $1 AND e.target_id != $1
+             AND NOT (e.target_id = $2 AND COALESCE(e.properties->>$4 = ANY($3), false))
              AND EXISTS (
              SELECT 1 FROM edges e2
              WHERE e2.relationship = 'alternative_of'
@@ -14118,6 +14250,8 @@ async fn repair_marked_duplicate(
         )
         .bind(canon_uuid)
         .bind(dup_uuid)
+        .bind(&act_tools)
+        .bind(SUPERSEDE_ACT_PROPERTY)
         .fetch_all(&mut *conn)
         .await?,
     );

@@ -1160,6 +1160,30 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "claim.rs",
+        "lock_content_hash_agents",
+        "NO ROW READ. lock_content_hash_agent for many pairs at once, in lock-key order \
+         (backlog 5b587ae8): it reads no table and returns only how many locks it took. Its \
+         caller follows it with the per-pair creates, whose finds take the caller's viewer \
+         (create_or_get) or are the existing VISIBILITY-EXEMPT write-path probes.",
+    ),
+    (
+        "claim.rs",
+        "lock_new_content_hash_agents",
+        "WRITE path, discloses nothing. As lock_content_hash_agents, skipping a pair whose \
+         content_hash has a row this session can see: that probe is create_conn's own unlocked \
+         VISIBILITY-EXEMPT dedup find, run on the caller's (ingest's) stamped transaction, and \
+         it decides only which locks to take; the function returns a lock count, never a row.",
+    ),
+    (
+        "claim.rs",
+        "lock_pairs_in_key_order",
+        "WRITE path, discloses nothing. The one statement behind lock_content_hash_agents and \
+         lock_new_content_hash_agents: the advisory locks in key order, and (for the latter) \
+         create_conn's VISIBILITY-EXEMPT content-hash probe on the caller's transaction, which \
+         decides only which locks to take. Returns a lock count, never a row.",
+    ),
+    (
+        "claim.rs",
         "update_trace_id_conn",
         "WRITE. Same argument as update_labels_conn: an UPDATE on an already-fetched claim, \
          authorised by claims_tenancy's WITH CHECK rather than by a spliced read predicate.",
