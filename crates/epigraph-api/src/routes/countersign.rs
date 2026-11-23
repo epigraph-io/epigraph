@@ -40,9 +40,6 @@ use axum::{
     Json,
 };
 
-/// The scope the route requires (the MCP tool's, `scope_map.rs`).
-pub const COUNTERSIGN_SCOPE: &str = "claims:write";
-
 /// The answer when no in-force authorship awaits a countersignature; the
 /// MCP tool's text, word for word.
 pub const NOTHING_PENDING_MESSAGE: &str =
@@ -110,7 +107,9 @@ pub async fn countersign_authorship(
             reason: "POST /api/v1/papers/:id/authors/countersign requires authentication".into(),
         })?
         .0;
-    crate::middleware::scopes::check_scopes(&auth, &[COUNTERSIGN_SCOPE])?;
+    // The MCP tool's scope (`scope_map.rs`), spelled as a literal so
+    // `mutating_route_scope_lint` reads it from this call.
+    crate::middleware::scopes::check_scopes(&auth, &["claims:write"])?;
     let decision = epigraph_db::CountersignDecision::parse(&body.decision).map_err(|e| {
         ApiError::ValidationError {
             field: "decision".to_string(),

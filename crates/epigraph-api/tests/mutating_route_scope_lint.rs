@@ -163,6 +163,7 @@ const ROUTE_GATES: &[(&str, Gate)] = &[
     ("crate::oauth::register_endpoint", Exempt(OAUTH)),
     ("crate::oauth::revoke_endpoint", Exempt(OAUTH)),
     ("crate::oauth::token_endpoint", Exempt(OAUTH)),
+    ("countersign::countersign_authorship", Scope("claims:write")),
     ("cross_source::decide_candidate", Scope("claims:write")),
     ("crud::assign_claim_to_frame", Scope("claims:admin")),
     ("crud::assign_unthemed", Scope("claims:admin")),
