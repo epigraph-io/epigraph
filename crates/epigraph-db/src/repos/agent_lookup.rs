@@ -55,9 +55,10 @@
 //!   status never moves it), plus the caller's own assignments of any role.
 //! * `role_attachments`: migration 269's `epigraph_disclosed_role_attachments`:
 //!   the roles an (LLM) agent is attached to (166 `role_agents`: the agents a
-//!   role runs), live now, shown only to the agent itself, its human
-//!   (`epigraph_human_of(agent, false)`) and a privileged (maintenance)
-//!   session; an elevated request viewer on the application role is not one
+//!   role runs), live now, shown only to the agent itself, its LIVE human
+//!   (`epigraph_human_of(agent, true)`, the binding `operator_human` shows;
+//!   a retired link's former operator sees none) and a privileged
+//!   (maintenance) session; an elevated request viewer on the application role is not one
 //!   (as for 198's elevating roles). No outsider arm: 166
 //!   writes no public projection of an attachment, so to everyone else an
 //!   attached agent's card reads exactly as an unattached one's.
@@ -484,8 +485,8 @@ pub struct AgentCard {
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
     /// The roles this agent is attached to (166 `role_agents`), live now:
-    /// shown to the agent itself, its human and a privileged (maintenance)
-    /// session; empty for everyone else (migration 269).
+    /// shown to the agent itself, its live human and a privileged
+    /// (maintenance) session; empty for everyone else (migration 269).
     pub role_attachments: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,

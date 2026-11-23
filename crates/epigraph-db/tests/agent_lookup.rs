@@ -2285,13 +2285,18 @@ fn attached_roles(card: &AgentCard) -> serde_json::Value {
 }
 
 /// An LLM agent's role attachments (166 `role_agents`, which the application
-/// role cannot read) are on its card for the agent itself, its human and an
-/// admin, through migration 269's `epigraph_disclosed_role_attachments`;
-/// live attachments only. Everyone else reads the card exactly as an
-/// unattached look-alike's: attachments are shown to no outsider, of any
-/// role, until a ruling says which may be (the elevating roles' never).
+/// role cannot read) are on its card for the agent itself, its LIVE human and
+/// a privileged maintenance session (`epigraph_bypass()`), through migration
+/// 269's `epigraph_disclosed_role_attachments`; undetached rows inside their
+/// window only. Everyone else reads the card exactly as an unattached
+/// look-alike's: attachments are shown to no outsider, of any role, until a
+/// ruling says which may be (the elevating roles' never). Once the agent's
+/// link is retired its former operator is no longer its human and sees none,
+/// not even an attachment made after the retire.
 #[sqlx::test(migrations = "../../migrations")]
-async fn role_attachments_are_shown_to_the_agent_its_human_and_admins_only(pool: PgPool) {
+async fn role_attachments_are_shown_to_the_agent_its_live_human_and_maintenance_sessions_only(
+    pool: PgPool,
+) {
     seed_role(&pool, "role:test-stewards", false).await;
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named_human(&pool, "Hesper Lunde").await;
@@ -2353,6 +2358,53 @@ async fn role_attachments_are_shown_to_the_agent_its_human_and_admins_only(pool:
     assert_eq!(
         attached_roles(&card_as(&pool, bot, bot).await),
         serde_json::json!(["role:test-stewards"])
+    );
+
+    // A RETIRED link's former operator is no longer the agent's human: it
+    // sees none of the agent's attachments, including one made after the
+    // retire (166's attach does not need a live link). The agent itself and
+    // a maintenance session still see both.
+    retire_link(&pool, bot).await;
+    assert_eq!(
+        human_of(&pool, bot).await,
+        Some(human),
+        "CALIBRATION: the link record still names the operator"
+    );
+    assert_eq!(
+        live_human_of(&pool, bot).await,
+        None,
+        "CALIBRATION: no binding is in force"
+    );
+    seed_role(&pool, "role:test-archivists", false).await;
+    attach_to_role(&pool, "role:test-archivists", bot).await;
+    let after = serde_json::json!(["role:test-archivists", "role:test-stewards"]);
+    assert_eq!(
+        attached_roles(&card_as(&pool, bot, bot).await),
+        after,
+        "the agent itself"
+    );
+    {
+        let (mut conn, _lease) = bypass_pool
+            .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+            .await
+            .expect("maintenance connection");
+        let c = AgentLookupRepository::card(&mut conn, &admin, bot)
+            .await
+            .expect("card")
+            .expect("exists");
+        assert_eq!(attached_roles(&c), after, "maintenance session");
+    }
+    assert_eq!(
+        attached_roles(&card_as(&pool, human, bot).await),
+        serde_json::json!([]),
+        "a retired link's former operator still reads the agent's attachments"
+    );
+    // The look-alike's link is still live: its human still reads it.
+    attach_to_role(&pool, "role:test-archivists", lookalike).await;
+    assert_eq!(
+        attached_roles(&card_as(&pool, human, lookalike).await),
+        serde_json::json!(["role:test-archivists"]),
+        "CALIBRATION: a live human reads its agent's attachments"
     );
 }
 

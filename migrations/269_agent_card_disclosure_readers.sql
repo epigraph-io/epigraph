@@ -62,11 +62,16 @@
 -- role), and ONLY when the session may see that agent's attachments:
 --
 --   (a) the agent IS the session principal (`epigraph_principal_id()`);
---   (b) the session principal is the agent's human
---       (`epigraph_human_of(agent, false)`, the prompt-history gate's D4 arm:
---       a human reads its own agents' state); or
+--   (b) the session principal is the agent's LIVE human
+--       (`epigraph_human_of(agent, true)`: the binding in force, the same
+--       one the card's `operator_human` shows; a retired link's former
+--       operator is no longer the agent's human and sees nothing, including
+--       attachments added after the retire, which 166 permits); or
 --   (c) a privileged session (`epigraph_bypass()`, which reads
 --       `session_user`).
+--
+-- Current attachments follow the binding in force; reads of an agent's
+-- PAST (the prompt-history gate) use `epigraph_human_of(agent, false)`.
 --
 -- NO OUTSIDER ARM, deliberately. 198 shows any reader the assignments of the
 -- non-elevating roles because 123 already writes a world-readable projection
@@ -138,7 +143,7 @@ BEGIN
        AND (   v_bypass
             OR (v_principal IS NOT NULL
                 AND (   ra.agent_id = v_principal
-                     OR public.epigraph_human_of(ra.agent_id, false) = v_principal)))
+                     OR public.epigraph_human_of(ra.agent_id, true) = v_principal)))
      ORDER BY ra.agent_id, ra.role, ra.valid_from, ra.id;
 END $$;
 REVOKE ALL ON FUNCTION public.epigraph_disclosed_role_attachments(uuid[]) FROM PUBLIC;

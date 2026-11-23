@@ -3411,14 +3411,15 @@ restart.
   the operator as `kind = human` (`operator_of_bound_agent`) when some agent is currently bound to
   it. No registration or client status is read. Second, `epigraph_disclosed_role_attachments(agents[])`:
   the live 166 `role_agents` attachments of up to 200 agents (22023 above), one per (agent, role),
-  shown only when the session principal IS the agent, is its human (`epigraph_human_of(agent,
-  false)`), or the session is privileged; no outsider arm (166 writes no public projection of an
+  shown only when the session principal IS the agent, is its LIVE human
+  (`epigraph_human_of(agent, true)`, the binding the card's `operator_human` shows), or the
+  session is privileged; no outsider arm (166 writes no public projection of an
   attachment, so wider disclosure is left to a ruling). Both on 172's form (`pg_catalog,
   pg_temp`), owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded;
   `tenancy_backfill` registers both). Pinned by `epigraph-db/tests/agent_lookup.rs`
   (`a_human_some_agent_is_bound_to_reads_as_human_to_every_reader`,
-  `role_attachments_are_shown_to_the_agent_its_human_and_admins_only`, the catalog and 200-cap
-  tests). Undo:
+  `role_attachments_are_shown_to_the_agent_its_live_human_and_maintenance_sessions_only`, the
+  catalog and 200-cap tests). Undo:
   `docs/runbooks/269-undo.sql`. **Deploy order:** migrate BEFORE the binary: a binary built
   against 269 calls it on every `find_agent` / `get_agent` card and answers 42883 without it.
 
