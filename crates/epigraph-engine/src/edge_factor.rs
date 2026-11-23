@@ -363,8 +363,18 @@ pub fn finish_edge_bba(
 }
 
 /// Whether the edge `source → target` is intra-source: the source claim has
-/// an evidence row whose `properties->>'doi'` matches the DOI of the paper
-/// that asserts the target claim. Read-only.
+/// an evidence row whose `properties->>'doi'` names the same document as the
+/// DOI of a paper that asserts the target claim. Read-only.
+///
+/// "Names the same document" is the same-source key both values give as a
+/// document identifier (`source_dependence::doi_field_key`: the shared
+/// case-folded DOI identity,
+/// [`epigraph_db::repos::paper::document_identity_key`], or for a document
+/// keyed on its URI, the normalized URL; backlog e34fd66e). `papers.doi`
+/// holds the canonical stored key while an evidence row's `doi` holds
+/// whatever its writer passed (a doi.org link, a `doi:` label, another case),
+/// so the exact string join this replaced silently missed the paper. A
+/// placeholder ("unknown", "n/a") names no document and matches nothing.
 ///
 /// Equivalent semantic: "the supporter is supported by data from the
 /// target's own paper", so its contribution is correlated with the target's
@@ -382,28 +392,33 @@ pub async fn edge_source_is_intra(
     source_id: Uuid,
     target_id: Uuid,
 ) -> Result<bool, String> {
-    sqlx::query_scalar::<_, bool>(
+    let (paper_dois, evidence_dois): (Vec<String>, Vec<String>) = sqlx::query_as(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-              FROM evidence e
-              JOIN edges ed_asserts
-                ON ed_asserts.target_id = $2
-               AND ed_asserts.relationship = 'asserts'
-               AND ed_asserts.source_type = 'paper'
-              JOIN papers p
-                ON p.id = ed_asserts.source_id
-               AND p.doi = e.properties->>'doi'
-             WHERE e.claim_id = $1
-               AND e.properties ? 'doi'
-        )
+        SELECT
+            ARRAY(SELECT p.doi
+                    FROM edges ed_asserts
+                    JOIN papers p ON p.id = ed_asserts.source_id
+                   WHERE ed_asserts.target_id = $2
+                     AND ed_asserts.relationship = 'asserts'
+                     AND ed_asserts.source_type = 'paper'
+                     AND p.doi IS NOT NULL),
+            ARRAY(SELECT e.properties->>'doi'
+                    FROM evidence e
+                   WHERE e.claim_id = $1
+                     AND e.properties->>'doi' IS NOT NULL)
         "#,
     )
     .bind(source_id)
     .bind(target_id)
     .fetch_one(&mut *conn)
     .await
-    .map_err(|e| format!("intra-source evidence lookup: {e}"))
+    .map_err(|e| format!("intra-source evidence lookup: {e}"))?;
+    let key = |d: &String| crate::source_dependence::doi_field_key(d);
+    let papers: std::collections::HashSet<_> = paper_dois.iter().filter_map(key).collect();
+    Ok(evidence_dois
+        .iter()
+        .filter_map(key)
+        .any(|k| papers.contains(&k)))
 }
 
 /// The intra-evidence locality factor an edge wire on `frame_id` composes.
@@ -2115,6 +2130,16 @@ pub async fn recompute_atom_cache(
 /// empty fold. Which viewer each lifecycle site writes as is chosen where the
 /// site is wired (PR-5b1), as `retraction_cascade` chooses it today.
 ///
+/// **Derivation scope.** Under the AEF the fold reads only the rows
+/// [`crate::atom_items::atom_cache_rows_under`] admits (every source at least
+/// as widely readable as the atom, decided before the seed rule), whoever
+/// `viewer` is: a group member's write never carries its group's sources into
+/// the one cache everyone reads. When the atom has AEF input and none of it
+/// is admitted, an atom with a fold cache gets the explicit vacuous value
+/// ([`AtomCacheOutcome::Vacated`], logged under target
+/// `epigraph::atom_cache::scope_vacate` when the cache took it, apart from
+/// the evidence-removal vacate list); one without a cache is left without.
+///
 /// **Row security.** The role is read without a splice, which makes "a
 /// compound is never written" hold on a connection that bypasses row
 /// security. On an application session `edges` row security can hide a
@@ -2133,7 +2158,7 @@ pub async fn recompute_atom_cache_with(
     legacy: LegacyFold,
     settings: AtomCacheSettings,
 ) -> Result<AtomCacheOutcome, String> {
-    use crate::atom_items::{atom_axiom_rows_under, atom_fold_under, AtomFoldMode, AxiomMode};
+    use crate::atom_items::{atom_cache_rows_under, atom_fold_under, AtomFoldMode};
     use epigraph_db::repos::claim_role::{roles_batch, ClaimRole};
 
     if let CacheWriteCause::EvidenceRemoved(before) = cause {
@@ -2183,17 +2208,71 @@ pub async fn recompute_atom_cache_with(
     let ctx = crate::belief_query::FramedBeliefContext::global();
     // The classifier reads the same profile the fold runs under.
     let thresholds = ctx.profile().classifier.thresholds();
-    let rows = atom_axiom_rows_under(
+    // The derivation-scope rule (backlog c2ef65a0, as the claim cache applies
+    // it in `compute_combined_belief_over`): the cache is served to everyone
+    // who can read the atom, so it folds only the rows whose every source is
+    // at least as widely readable as the atom. The read applies it BEFORE the
+    // seed rule, so a seed is never dropped for input the cache does not
+    // fold. Filtered before anything reads the rows: `has_opposing` below
+    // iterates them too. `had_input` is the input before the rule, as
+    // `aef_input_before` reads it.
+    let mut read = atom_cache_rows_under(
         &mut *conn,
         viewer,
         &[claim_id],
-        AxiomMode::Display,
         &ctx,
         settings.compound_source_edges,
     )
-    .await?
-    .remove(&claim_id)
-    .unwrap_or_default();
+    .await?;
+    let had_input = read.had_input.contains(&claim_id);
+    let rows = read.rows.remove(&claim_id).unwrap_or_default();
+    if had_input && rows.is_empty() {
+        // Input exists but none of it may enter the cache. The cache, if any,
+        // was folded from sources narrower than the atom (a source narrowed
+        // after the fact, or a cache written before the rule), so it is
+        // vacated. The gate is the claim cache's widening-act gate
+        // (`VacateGate::OwnerFrame`: any fold cache), stricter than its
+        // ordinary recompute gate (`VacateGate::ClaimWide`, which keeps the
+        // cache when an input on a frame this fold does not read is
+        // admissible), and it does not wait for `vacate_on_evidence_removal`:
+        // a cache this fold cannot reproduce from rows its readers may see is
+        // not kept. An atom with no cache gets none: a vacuous value written
+        // where there was none would tell its readers that an unseen BBA
+        // exists.
+        let has_cache =
+            epigraph_db::repos::derivation_scope::DerivationScopeRepository::claim_has_fold_cache(
+                &mut *conn, viewer, claim_id,
+            )
+            .await
+            .map_err(|e| format!("fold cache read: {e}"))?;
+        if !has_cache {
+            return Ok(AtomCacheOutcome::KeptEmpty);
+        }
+        let written = write_atom_cache(
+            conn,
+            viewer,
+            claim_id,
+            &crate::atom_items::EvidencedInterval::unproven(),
+            false,
+            &thresholds,
+        )
+        .await?;
+        if written {
+            tracing::warn!(
+                target: "epigraph::atom_cache::scope_vacate",
+                claim = %claim_id,
+                "derivation-scope vacate: no AEF input row may enter the atom's cache; \
+                 explicit vacuous cache (basis unproven)"
+            );
+        } else {
+            tracing::info!(
+                claim = %claim_id,
+                "derivation-scope vacate not taken by the cache (non-owner write on \
+                 another recorded frame); the cache is unchanged"
+            );
+        }
+        return Ok(AtomCacheOutcome::Vacated { written });
+    }
 
     if rows.is_empty() {
         let lost_input = matches!(cause, CacheWriteCause::EvidenceRemoved(b) if b.had_input);
@@ -2264,7 +2343,12 @@ pub enum VacateOutcome {
 /// The caller decides WHICH atoms (only ids on an operator-accepted list);
 /// this function refuses every claim the vacate is not for, whatever the
 /// list says ([`vacate_refusal`]). The PR-0 guard keeps every bulk recompute
-/// from writing this value, so this is the one bulk path to it.
+/// from writing this value to a residue atom, so this is the one bulk path to
+/// it for those. The single atom-cache writer writes it on its own in two
+/// cases only, neither of them residue: an atom that lost all its AEF input
+/// to a lifecycle act, and an atom that HAS AEF input of which the
+/// derivation-scope rule admits none to its cache (under the claim cache's
+/// widening-act gate: any fold cache); see [`recompute_atom_cache_with`].
 ///
 /// # Errors
 /// A database read or write.

@@ -29,8 +29,8 @@ use crate::edge_factor::{
 };
 use crate::sheaf::{restriction_kind_with_profile, RestrictionKind, RestrictionProfile};
 use crate::source_dependence::{
-    dempster_across_items, item_key, item_partition, ItemEvidence, ItemKey, KeyedBba,
-    EDGE_FACTOR_METHOD,
+    combine_with_owner_dependence, item_key, item_partition, BbaSource, ItemEvidence, ItemKey,
+    KeyedBba, EDGE_FACTOR_METHOD,
 };
 
 /// Which rows of an atom's input a read takes (SPEC §3.4, §11.4).
@@ -117,6 +117,8 @@ pub enum AxiomClass {
 ///     class: todo!(),
 ///     coarse: todo!(),
 ///     bba: todo!(),
+///     agent_id: todo!(),
+///     owner_id: todo!(),
 /// };
 /// ```
 #[derive(Debug, Clone)]
@@ -127,6 +129,8 @@ pub struct AxiomRow {
     class: AxiomClass,
     coarse: MassFunction,
     bba: MassFunction,
+    agent_id: Option<Uuid>,
+    owner_id: Option<Uuid>,
 }
 
 impl AxiomRow {
@@ -164,6 +168,20 @@ impl AxiomRow {
     #[must_use]
     pub const fn bba(&self) -> &MassFunction {
         &self.bba
+    }
+
+    /// The agent that wrote the row (`mass_functions.source_agent_id`).
+    #[must_use]
+    pub const fn agent_id(&self) -> Option<Uuid> {
+        self.agent_id
+    }
+
+    /// Who the row speaks for: the live human its agent acts for, else the
+    /// agent itself (`None` when the row names no agent). The same-human rule
+    /// of [`atom_fold`] groups items by it.
+    #[must_use]
+    pub const fn owner_id(&self) -> Option<Uuid> {
+        self.owner_id
     }
 }
 
@@ -299,6 +317,10 @@ pub async fn atom_axiom_rows(
 ///    reads.
 /// 4. **Mode**: [`AxiomMode::Pure`] keeps evidence and the seed only.
 ///
+/// No derivation-scope rule applies here: these are the rows `viewer` can
+/// see. The rows a CACHE folds are [`atom_cache_rows_under`]'s, which applies
+/// that rule between steps 2 and 3.
+///
 /// Each kept row is coarsened to `binary_truth` (a claim at hypothesis
 /// index 1 of a 2-hypothesis frame has its literals swapped;
 /// `claim_validity` maps supported → T, refuted → F, uncertain → Θ),
@@ -328,12 +350,87 @@ pub async fn atom_axiom_rows_under(
     ctx: &FramedBeliefContext,
     compound_source_edges: CompoundSourceEdges,
 ) -> Result<HashMap<Uuid, Vec<AxiomRow>>, String> {
-    let kept = select_atom_rows(&mut *conn, viewer, ids, mode, compound_source_edges).await?;
+    let kept = select_atom_rows(
+        &mut *conn,
+        viewer,
+        ids,
+        mode,
+        compound_source_edges,
+        RowScope::Viewer,
+    )
+    .await?
+    .rows;
     let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
     for row in key_and_discount(conn, viewer, kept, ctx).await? {
         out.entry(row.atom_id).or_default().push(row);
     }
     Ok(out)
+}
+
+/// Which rows a selection keeps: what the viewer can see, or what may enter
+/// the atom's cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowScope {
+    /// Every row the viewer can see ([`atom_axiom_rows_under`]).
+    Viewer,
+    /// Only the rows that may enter the atom's CACHED belief: those whose
+    /// every derivation source is at least as widely readable as the atom
+    /// (`epigraph_db::repos::derivation_scope::cache_admissible_predicate`,
+    /// the rule the claim cache folds under). Applied BEFORE the seed rule,
+    /// so a seed dropped only because of inadmissible input is kept.
+    Cache,
+}
+
+/// An atom's AEF input as the single atom-cache writer folds it
+/// ([`atom_cache_rows_under`]).
+#[derive(Debug, Clone, Default)]
+pub struct AtomCacheRows {
+    /// Per atom, the [`AxiomMode::Display`] rows that may enter its cache.
+    /// An atom with none is absent.
+    pub rows: HashMap<Uuid, Vec<AxiomRow>>,
+    /// The atoms with AEF input as `viewer` sees it, before the
+    /// derivation-scope rule: exactly those [`atom_axiom_rows_under`] returns
+    /// rows for in [`AxiomMode::Display`]. An atom here and absent from
+    /// `rows` has input, none of which may enter its cache.
+    pub had_input: BTreeSet<Uuid>,
+}
+
+/// The [`AxiomMode::Display`] rows of each atom that may enter its CACHED
+/// belief: [`atom_axiom_rows_under`]'s steps, with the derivation-scope rule
+/// applied after step 2 and BEFORE the seed rule (step 3). So the seed rule
+/// is decided over the admissible rows only: a seed beside input that may not
+/// enter the cache is the atom's sole cache input and is kept, never dropped
+/// for input the cache does not fold.
+///
+/// The scope rule does not depend on `viewer`: a group member's read and a
+/// public read admit the same rows to the one cache everyone reads.
+///
+/// # Errors
+/// A database read.
+pub async fn atom_cache_rows_under(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    ids: &[Uuid],
+    ctx: &FramedBeliefContext,
+    compound_source_edges: CompoundSourceEdges,
+) -> Result<AtomCacheRows, String> {
+    let Selected { rows, had_input } = select_atom_rows(
+        &mut *conn,
+        viewer,
+        ids,
+        AxiomMode::Display,
+        compound_source_edges,
+        RowScope::Cache,
+    )
+    .await?;
+    let mut out: HashMap<Uuid, Vec<AxiomRow>> = HashMap::new();
+    for row in key_and_discount(conn, viewer, rows, ctx).await? {
+        out.entry(row.atom_id).or_default().push(row);
+    }
+    Ok(AtomCacheRows {
+        rows: out,
+        had_input,
+    })
 }
 
 /// One row of an atom's AEF input as the drift decomposition reads it
@@ -384,8 +481,11 @@ impl DriftRow {
 }
 
 /// The [`AxiomMode::Display`] rows of each atom under no lens, exactly as
-/// the single atom-cache writer reads them under `compound_source_edges`, as
-/// [`DriftRow`]s. Writes nothing.
+/// the single atom-cache writer reads them under `compound_source_edges`
+/// (derivation-scope rule included, [`atom_cache_rows_under`]), as
+/// [`DriftRow`]s. Writes nothing. The wave's per-scope resync folds the
+/// `ds_combined_beliefs` rows it writes from these, so no scoped row takes a
+/// row the cache may not fold.
 ///
 /// # Errors
 /// A database read.
@@ -402,8 +502,10 @@ pub async fn atom_drift_rows(
         ids,
         AxiomMode::Display,
         compound_source_edges,
+        RowScope::Cache,
     )
-    .await?;
+    .await?
+    .rows;
     let stored: Vec<epigraph_db::MassFunctionRow> =
         kept.iter().map(|(r, _, _)| r.row.clone()).collect();
     // In input order, one per kept row: aligned with `stored`.
@@ -444,7 +546,10 @@ pub fn drift_legacy_grouping_betp(
     two_sided: bool,
     with_compound_source: bool,
 ) -> Result<f64, String> {
-    let items: Vec<(Option<crate::source_dependence::SourceKey>, MassFunction)> = rows
+    // Each row with its legacy source key AND who it speaks for: the legacy
+    // claim fold this models (`edge_factor::compute_combined_belief_over`)
+    // applies the same-human rule too, so the comparison does.
+    let items: Vec<(BbaSource, MassFunction)> = rows
         .iter()
         .filter(|r| !r.attributed)
         .filter(|r| with_compound_source || !r.is_compound_source())
@@ -454,7 +559,12 @@ pub fn drift_legacy_grouping_betp(
             } else {
                 r.axiom.bba.clone()
             };
-            (r.legacy_key.clone(), bba)
+            let source = BbaSource {
+                agent_id: r.axiom.agent_id,
+                owner_id: r.axiom.owner_id,
+                source: r.legacy_key.clone(),
+            };
+            (source, bba)
         })
         .collect();
     if items.is_empty() {
@@ -462,11 +572,11 @@ pub fn drift_legacy_grouping_betp(
     }
     // The legacy fold's conflict threshold, from the served profile as the
     // atom fold here takes it ([`atom_fold`]).
-    let (combined, _) = crate::source_dependence::combine_with_source_dependence(
+    let (combined, _) = combine_with_owner_dependence(
         items,
         BeliefProfile::served().combination.conflict_threshold,
     )
-    .map_err(|e| format!("combine_with_source_dependence: {e}"))?;
+    .map_err(|e| format!("combine_with_owner_dependence: {e}"))?;
     Ok(measures::pignistic_probability(&combined, 0))
 }
 
@@ -515,12 +625,23 @@ pub fn drift_scope_fold(
     atom_fold(&axioms).map(Some)
 }
 
+/// What [`select_atom_rows`] kept.
+struct Selected {
+    /// The kept rows, in row order.
+    rows: Vec<ReadRow>,
+    /// The atoms with input before the derivation-scope rule (under
+    /// [`RowScope::Viewer`], the atoms of `rows`).
+    had_input: BTreeSet<Uuid>,
+}
+
 /// Steps 1 to 4 of [`atom_axiom_rows_under`] (see there): the stored rows
 /// some fold of `ids` reads under `mode` and `compound_source_edges`, each
 /// classified and coarsened by [`read_rows`], in row order, not yet
-/// discounted or keyed. [`atom_axiom_rows_under`] and [`atom_drift_rows`]
-/// both select through this, so the drift decomposition reads exactly the
-/// rows the single atom-cache writer folds.
+/// discounted or keyed. Under [`RowScope::Cache`] the derivation-scope rule
+/// runs between steps 2 and 3. [`atom_cache_rows_under`] and
+/// [`atom_drift_rows`] both select through this under the cache scope, so
+/// the drift decomposition reads exactly the rows the single atom-cache
+/// writer folds.
 ///
 /// # Errors
 /// A database read.
@@ -530,12 +651,16 @@ async fn select_atom_rows(
     ids: &[Uuid],
     mode: AxiomMode,
     compound_source_edges: CompoundSourceEdges,
-) -> Result<Vec<ReadRow>, String> {
+    scope: RowScope,
+) -> Result<Selected, String> {
     let inputs = atom_input_rows(&mut *conn, viewer, ids, CLAIM_VALIDITY_FRAME_ID)
         .await
         .map_err(|e| format!("atom_input_rows: {e}"))?;
     if inputs.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Selected {
+            rows: Vec::new(),
+            had_input: BTreeSet::new(),
+        });
     }
 
     // Step 1, the class of each row, and its coarsening. A row that cannot be
@@ -577,6 +702,36 @@ async fn select_atom_rows(
             })
     });
 
+    if scope == RowScope::Viewer {
+        let rows = seed_then_mode(kept, mode);
+        let had_input = rows.iter().map(|(r, _, _)| r.row.claim_id).collect();
+        return Ok(Selected { rows, had_input });
+    }
+
+    // The atoms with input as the viewer reads them, before the scope rule.
+    let had_input: BTreeSet<Uuid> = seed_then_mode(kept.clone(), mode)
+        .iter()
+        .map(|(r, _, _)| r.row.claim_id)
+        .collect();
+    // The derivation-scope rule (the cache scope only), BEFORE the seed rule:
+    // a row the cache may not fold is no input to it, so it must not count
+    // against the atom's seed either.
+    let row_ids: Vec<Uuid> = kept.iter().map(|(r, _, _)| r.row.id).collect();
+    let admissible =
+        epigraph_db::repos::derivation_scope::DerivationScopeRepository::cache_admissible(
+            &mut *conn, &row_ids,
+        )
+        .await
+        .map_err(|e| format!("derivation scope read: {e}"))?;
+    kept.retain(|(r, _, _)| admissible.contains(&r.row.id));
+    Ok(Selected {
+        rows: seed_then_mode(kept, mode),
+        had_input,
+    })
+}
+
+/// Steps 3 and 4 of [`atom_axiom_rows_under`] over the rows still kept.
+fn seed_then_mode(mut kept: Vec<ReadRow>, mode: AxiomMode) -> Vec<ReadRow> {
     // Step 3: the seed, over the rows some fold still reads.
     let with_other_input: BTreeSet<Uuid> = kept
         .iter()
@@ -591,7 +746,7 @@ async fn select_atom_rows(
     if mode == AxiomMode::Pure {
         kept.retain(|(_, class, _)| matches!(class, AxiomClass::Evidence | AxiomClass::Seed));
     }
-    Ok(kept)
+    kept
 }
 
 /// A stored row read for a fold: the row, its class, and its BBA coarsened to
@@ -704,6 +859,19 @@ async fn key_and_discount_two_sided(
         .await
         .map_err(|e| format!("evidence source identity: {e}"))?;
 
+    // Who each row speaks for (the same-human rule of `atom_fold`): its
+    // agent's live human, read once for the batch, as
+    // `source_dependence::bba_sources_for_rows` reads it for the claim cache.
+    let agents: Vec<Uuid> = kept
+        .iter()
+        .filter_map(|(r, _, _)| r.row.source_agent_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let humans = epigraph_db::AgentRepository::humans_of(&mut *conn, &agents, true)
+        .await
+        .map_err(|e| format!("agent owners: {e}"))?;
+
     let mut out: Vec<(AxiomRow, MassFunction)> = Vec::with_capacity(kept.len());
     for (r, class, two_sided) in kept {
         let one_sided = matches!(
@@ -756,6 +924,11 @@ async fn key_and_discount_two_sided(
                 class,
                 coarse,
                 bba,
+                agent_id: r.row.source_agent_id,
+                owner_id: r
+                    .row
+                    .source_agent_id
+                    .map(|a| humans.get(&a).copied().unwrap_or(a)),
             },
             two_sided_bba,
         ));
@@ -930,6 +1103,15 @@ fn without_disbelief(m: &MassFunction) -> MassFunction {
 /// open-world semantics (`~` meets anything else as conflict, which the fold
 /// normalises away and reports as the conflict it saw).
 ///
+/// **Same-human rule.** Each item carries one row's BBA (the row
+/// [`crate::source_dependence::item_partition`] kept), so it speaks for that
+/// row's agent and its owner ([`AxiomRow::owner_id`]). Items of two or more
+/// distinct agents of ONE owner never multiply: they are reduced by
+/// [`crate::source_dependence::combine_with_owner_dependence`] (per agent a
+/// Dempster fold, then Denoeux's cautious rule across the agents) before the
+/// Dempster fold, as the claim cache folds them. Without sibling agents the
+/// fold is the plain Dempster fold across items.
+///
 /// No rows is the vacuous interval, [`EvidencedInterval::is_unproven`].
 ///
 /// At total conflict between dogmatic items (K = 1) the fold does not fail:
@@ -976,10 +1158,30 @@ pub fn atom_fold_under(
             })
             .collect(),
     );
-    let for_fold: Vec<MassFunction> = items.iter().filter_map(|it| it.on(atom).cloned()).collect();
+    // Each item's BBA is ONE row's (the kept row of its key and side), so the
+    // item speaks for that row's agent and owner. The same-human rule then
+    // reduces the items of sibling agents of one owner cautiously, exactly as
+    // the claim cache's fold does; with no siblings it is the Dempster fold
+    // across items unchanged.
+    let by_row: HashMap<Uuid, &AxiomRow> = rows.iter().map(|r| (r.row_id, r)).collect();
+    let for_fold: Vec<(BbaSource, MassFunction)> = items
+        .iter()
+        .filter_map(|it| {
+            let (kept, m) = it.kept_on(atom)?;
+            let row = by_row.get(&kept);
+            Some((
+                BbaSource {
+                    agent_id: row.and_then(|r| r.agent_id),
+                    owner_id: row.and_then(|r| r.owner_id),
+                    source: None,
+                },
+                m.clone(),
+            ))
+        })
+        .collect();
     let n = for_fold.len();
     let (combined, conflict) =
-        dempster_across_items(for_fold, profile.combination.conflict_threshold)
+        combine_with_owner_dependence(for_fold, profile.combination.conflict_threshold)
             .map_err(|e| format!("atom_fold: {e}"))?;
     let t = FocalElement::positive(BTreeSet::from([0]));
     Ok(EvidencedInterval {
@@ -1044,6 +1246,8 @@ mod tests {
                 class,
                 coarse: bba(one_sided),
                 bba: bba(one_sided),
+                agent_id: None,
+                owner_id: None,
             },
             two_sided_bba: bba(two_sided),
             legacy_key: None,
@@ -1115,6 +1319,31 @@ mod tests {
             );
         }
         assert_eq!(v(&[], true, true), 0.5, "no row is the vacuous .5");
+    }
+
+    /// Backlog c2ef65a0: the legacy-grouping comparison folds like the legacy
+    /// claim fold it models, so two agents of one owner keep the stronger
+    /// support (BetP .85 for .6 and .7) instead of Dempster's product (.94),
+    /// and agents of two owners still reinforce.
+    #[test]
+    fn the_legacy_grouping_comparison_applies_the_same_human_rule() {
+        let atom = Uuid::new_v4();
+        let frame = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        let by = |agent: Uuid, owner: Uuid, t: f64| {
+            let m = serde_json::json!({ "0": t, "0,1": 1.0 - t });
+            let mut r = drift_row(atom, frame, AxiomClass::Evidence, &m, &m, None, false);
+            r.axiom.agent_id = Some(agent);
+            r.axiom.owner_id = Some(owner);
+            r
+        };
+        let (a1, a2) = (Uuid::new_v4(), Uuid::new_v4());
+        let siblings = [by(a1, owner, 0.6), by(a2, owner, 0.7)];
+        let v = drift_legacy_grouping_betp(&siblings, false, true).expect("fold");
+        assert!((v - 0.85).abs() < 1e-9, "siblings: {v}");
+        let independent = [by(a1, a1, 0.6), by(a2, a2, 0.7)];
+        let v = drift_legacy_grouping_betp(&independent, false, true).expect("fold");
+        assert!((v - 0.94).abs() < 1e-9, "different owners: {v}");
     }
 
     /// The scoped resync's selection (SPEC §7.2 per-frame rows): the fold of

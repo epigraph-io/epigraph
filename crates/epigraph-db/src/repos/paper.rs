@@ -1333,10 +1333,17 @@ pub struct IngestAssertedClaimRow {
 // Pure functions, no SQL: they live here because this module owns the column
 // they key, and both transports already depend on this crate.
 //
-// Deliberately NOT the belief engine's `normalize_doi`
-// (`epigraph-engine` `source_dependence.rs`): that one lowercases, which is
-// right for a belief source key and wrong for this one (see
-// [`canonical_document_key`]).
+// Two forms of one key, built on one prefix list ([`DOI_KEY_PREFIXES`]) and one
+// bare-DOI test ([`is_bare_doi`]):
+//
+// - [`canonical_document_key`], the STORED spelling. It keeps the caller's
+//   case: existing `papers.doi` rows and their `doi:<key>` labels carry it, and
+//   folding it would re-key them.
+// - [`document_identity_key`], the case-folded IDENTITY, for deciding whether
+//   two spellings name one document: the belief engine's same-source key
+//   (`epigraph-engine` `source_dependence.rs`) and its edge-factor paper join
+//   (`edge_factor::edge_source_is_intra`) compare with it (backlog e34fd66e).
+//   Nothing stores it, so no row or label is re-keyed by it.
 
 /// Resolver prefixes a caller may put in front of a DOI. Matched
 /// case-insensitively; `doi:` also tolerates whitespace before the DOI.
@@ -1424,6 +1431,79 @@ pub fn document_key_spellings(raw: &str) -> Vec<String> {
     out
 }
 
+/// Strip one [`DOI_KEY_PREFIXES`] entry (case-insensitively), if `t` starts
+/// with one.
+fn strip_document_key_prefix(t: &str) -> Option<&str> {
+    DOI_KEY_PREFIXES.iter().find_map(|p| {
+        t.get(..p.len())
+            .filter(|head| head.eq_ignore_ascii_case(p))
+            .map(|_| &t[p.len()..])
+    })
+}
+
+/// A DOI resolver root with nothing behind it (`https://doi.org`,
+/// `dx.doi.org/`, ...).
+fn is_doi_resolver_root(t: &str) -> bool {
+    let t = t.trim().trim_end_matches('/');
+    DOI_KEY_PREFIXES
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .any(|p| t.eq_ignore_ascii_case(p.trim_end_matches('/')))
+}
+
+/// What is behind the DOI prefixes of `t` ([`DOI_KEY_PREFIXES`]), all of them
+/// peeled (`doi:https://doi.org/10.x` names `10.x`), trimmed; `""` for a
+/// resolver root with nothing behind it. `None` when `t` carries no DOI
+/// prefix. Unlike [`canonical_document_key`], this peels whatever follows the
+/// prefix, not only a bare DOI: `doi:<uri>` (the label ingest builds for a
+/// document identified by its URI) names that URI.
+#[must_use]
+pub fn peel_document_key_prefixes(t: &str) -> Option<&str> {
+    let mut rest = match strip_document_key_prefix(t.trim()) {
+        Some(r) => r,
+        None if is_doi_resolver_root(t) => "",
+        None => return None,
+    };
+    loop {
+        rest = rest.trim();
+        if is_doi_resolver_root(rest) {
+            return Some("");
+        }
+        match strip_document_key_prefix(rest) {
+            Some(r) => rest = r,
+            None => return Some(rest),
+        }
+    }
+}
+
+/// The case-folded identity of a document key, for deciding whether two
+/// spellings name ONE document (see the section comment): every
+/// [`DOI_KEY_PREFIXES`] spelling peeled ([`peel_document_key_prefixes`]),
+/// trimmed, trailing `/` removed, ASCII-lowercased (DOIs are
+/// case-insensitive). `None` for a blank result, a placeholder
+/// (`epigraph_core::domain::evidence::is_placeholder_id`: "unknown", "n/a",
+/// ...; an identity built on one would merge every DOI-less document) or
+/// anything that is still a URL once the prefixes are gone (a web page is not
+/// a DOI). Percent-encoded DOIs are not decoded, so one DOI written both ways
+/// stays two identities.
+///
+/// Every spelling [`canonical_document_key`] folds together has one identity
+/// here, so two values the stored key treats as one document are never two
+/// sources to the belief engine.
+#[must_use]
+pub fn document_identity_key(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    let t = peel_document_key_prefixes(t)
+        .unwrap_or(t)
+        .trim()
+        .trim_end_matches('/');
+    if t.is_empty() || t.contains("://") || epigraph_core::domain::evidence::is_placeholder_id(t) {
+        None
+    } else {
+        Some(t.to_ascii_lowercase())
+    }
+}
+
 #[cfg(test)]
 mod document_key_tests {
     use super::*;
@@ -1488,6 +1568,56 @@ mod document_key_tests {
         let s = document_key_spellings(raw);
         assert_eq!(s[0], BARE);
         assert_eq!(s[1], raw);
+    }
+
+    /// Backlog e34fd66e: one document, one identity, for every spelling the
+    /// stored key folds together (the scheme-less resolver spellings
+    /// included) and for case variants, which the stored key keeps apart.
+    #[test]
+    fn every_spelling_of_one_document_has_one_identity() {
+        let spellings = [
+            "10.1021/acsnano.9b05650",
+            "10.1021/ACSNANO.9B05650",
+            "https://doi.org/10.1021/acsnano.9b05650",
+            "HTTPS://WWW.DOI.ORG/10.1021/acsnano.9b05650/",
+            "http://dx.doi.org/10.1021/acsnano.9b05650",
+            "doi:10.1021/acsnano.9b05650",
+            " DOI: 10.1021/acsnano.9b05650 ",
+            "doi.org/10.1021/acsnano.9b05650",
+            "dx.doi.org/10.1021/acsnano.9b05650",
+            "WWW.DOI.ORG/10.1021/acsnano.9b05650",
+            "doi:https://doi.org/10.1021/acsnano.9b05650",
+        ];
+        for raw in spellings {
+            assert_eq!(document_identity_key(raw).as_deref(), Some(BARE), "{raw:?}");
+            // The identity is the stored key, case-folded.
+            assert_eq!(
+                document_identity_key(&canonical_document_key(raw)).as_deref(),
+                Some(BARE),
+                "{raw:?}"
+            );
+        }
+        // A document identified by its URI: the `doi:<uri>` label names it.
+        assert_eq!(
+            document_identity_key("doi:urn:epigraph:doc:Some-Title"),
+            document_identity_key("urn:epigraph:doc:some-title")
+        );
+        assert_ne!(
+            document_identity_key("10.5555/a"),
+            document_identity_key("10.5555/b")
+        );
+        for none in [
+            "",
+            "  ",
+            "doi:",
+            "https://doi.org",
+            "doi.org/",
+            "unknown",
+            "doi:n/a",
+            "https://example.org/articles/10.5555/x",
+        ] {
+            assert_eq!(document_identity_key(none), None, "{none:?}");
+        }
     }
 
     #[test]

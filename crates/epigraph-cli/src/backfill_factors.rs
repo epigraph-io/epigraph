@@ -376,15 +376,28 @@ async fn delete_edge_rows(
 /// Recompute `target` on every frame in `frames` (deduplicated, `last`
 /// recomputed last because the claim's cached scalars are last-writer-wins);
 /// clear its cache when it holds no BBA at all any more.
+///
+/// Every recompute goes through the single atom-cache writer
+/// (`epigraph_engine::edge_factor::recompute_atom_cache`, backlog 2be5efb8),
+/// never a claim-cache writer directly: a COMPOUND target is left exactly as
+/// it was (its belief is a query over its leaves, so neither a refold of its
+/// remaining rows nor the clear below may touch its cache), and any other
+/// target gets the fold its frame ran before (`LegacyFold::Frame`) while the
+/// process folds `legacy`. The clear runs only when every recompute took
+/// that legacy fold: the atom-cache writer never NULLs a cache.
+///
+/// `cause` is what the target's AEF input was before this edge's rows were
+/// deleted ([`aef_input_before_removal`]).
 async fn recompute_after_removal(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     target: Uuid,
     frames: &[Uuid],
     last: Uuid,
+    cause: epigraph_engine::edge_factor::CacheWriteCause,
 ) -> Result<(), String> {
     use epigraph_db::MassFunctionRepository;
-    use epigraph_engine::edge_factor::recompute_claim_belief_on_frame;
+    use epigraph_engine::edge_factor::{recompute_atom_cache, AtomCacheOutcome, LegacyFold};
 
     let mut ordered: Vec<Uuid> = Vec::new();
     for f in frames.iter().copied().filter(|f| *f != last) {
@@ -395,8 +408,15 @@ async fn recompute_after_removal(
     if frames.contains(&last) {
         ordered.push(last);
     }
+    let mut all_legacy = true;
     for frame in ordered {
-        recompute_claim_belief_on_frame(&mut *conn, viewer, target, frame).await?;
+        let outcome =
+            recompute_atom_cache(&mut *conn, viewer, target, cause, LegacyFold::Frame(frame))
+                .await?;
+        all_legacy &= matches!(outcome, AtomCacheOutcome::Legacy { .. });
+    }
+    if !all_legacy {
+        return Ok(());
     }
     let remaining = MassFunctionRepository::get_for_claim(&mut *conn, viewer, target)
         .await
@@ -407,6 +427,28 @@ async fn recompute_after_removal(
             .map_err(|e| format!("clear unbacked belief: {e}"))?;
     }
     Ok(())
+}
+
+/// The `cause` [`recompute_after_removal`] passes the atom-cache writer for
+/// `target`, read BEFORE any of the edge's rows is deleted: under an AEF fold,
+/// the target's AEF input as the writer reads it (so an atom whose last input
+/// this rewire removes is vacated, not left on its old value); under the
+/// `legacy` fold, which never reads it, `Organic` without the read.
+async fn aef_input_before_removal(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    target: Uuid,
+) -> Result<epigraph_engine::edge_factor::CacheWriteCause, String> {
+    use epigraph_engine::atom_items::AtomFoldMode;
+    use epigraph_engine::edge_factor::{aef_input_before, AtomCacheSettings, CacheWriteCause};
+
+    let settings = AtomCacheSettings::current();
+    if settings.fold == AtomFoldMode::Legacy {
+        return Ok(CacheWriteCause::Organic);
+    }
+    Ok(CacheWriteCause::EvidenceRemoved(
+        aef_input_before(conn, viewer, target, settings).await?,
+    ))
 }
 
 /// Targeted mode's inputs to [`rewire_one`]: the guards, and the callback
@@ -512,6 +554,7 @@ async fn rewire_one(
         }
     }
     let keep = (binary, edge.agent_id);
+    let cause = aef_input_before_removal(&mut tx, viewer, edge.target_id).await?;
     let others = delete_edge_rows(&mut tx, edge, Some(keep)).await?;
     if targeted.is_some() && !others.is_empty() {
         // The decision saw one live row at the key; a second appeared since.
@@ -575,7 +618,8 @@ async fn rewire_one(
             if other_frames.iter().any(|f| *f != binary) {
                 let mut frames = other_frames.clone();
                 frames.push(binary);
-                recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
+                recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary, cause)
+                    .await?;
             }
             if let (Some((target_before, row_before, predicted)), Some((_, on_capture))) =
                 (proceed.take(), targeted.as_mut())
@@ -620,7 +664,8 @@ async fn rewire_one(
                     .map(|(_, f)| f),
             );
             frames.push(binary);
-            recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary).await?;
+            recompute_after_removal(&mut tx, viewer, edge.target_id, &frames, binary, cause)
+                .await?;
             if outcome == EdgeFactorOutcome::Vacuous {
                 EdgeRewrite::RemovedVacuous
             } else {
