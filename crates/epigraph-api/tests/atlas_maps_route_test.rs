@@ -1256,7 +1256,8 @@ async fn evidence_mass(pool: &PgPool, claim: Uuid, ev: Uuid, agent: Uuid, masses
 /// * `ev1e`   EV1 -supports-> P1, owner A, co-owner B, with a public mass
 ///   row (m({h0}) = 0.6);
 /// * `ev2e`   EV2 -refutes-> P2, owner A, co-owner B, whose only mass row
-///   (m({h1}) = 0.5) is C's.
+///   (m({h1}) = 0.5) is B's: on B's map it weighs the edge, on A's map the
+///   map's audience cannot read it, so the edge has no flow there.
 struct Overlay {
     a: Uuid,
     b: Uuid,
@@ -1394,10 +1395,10 @@ impl Overlay {
                                        writer_owned = true WHERE id = $1",
         )
         .bind(m2)
-        .bind(c)
+        .bind(b)
         .execute(pool)
         .await
-        .expect("force the mass row to C")
+        .expect("force the mass row to B")
         .rows_affected();
         assert_eq!(n, 1);
 
@@ -1573,10 +1574,11 @@ async fn served_edges(r: &Router, o: &Overlay, map: AtlasMap, leaf: Uuid, who: U
 
 /// DONE for backlog ff3b6046: a member of BOTH teams that co-own an edge sees
 /// it on the leaf, on either team's map, weighed as the nightly weighs a
-/// leaf's edges; a member of only one team does not. An edge of two other
-/// teams stays off a map, even for a member of all three; a retracted
+/// leaf edge of that map; a member of only one team does not. An edge of two
+/// other teams stays off a map, even for a member of all three; a retracted
 /// co-owned edge is never drawn; the public map gets nothing; an evidence
-/// edge whose mass the viewer cannot read is served `none`.
+/// edge whose only mass row is another team's is served `none` on this
+/// team's map, whoever asks.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) {
     use epigraph_engine::atlas_flow::link_strength;
@@ -1618,26 +1620,27 @@ async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) 
         "B alone, B's map"
     );
 
-    // Both teams: the co-owned edges, on either team's map.
-    let both = sorted(vec![co_ab.clone(), co_ba.clone(), ev1.clone(), ev2_hidden]);
+    // Both teams: the co-owned edges, on either team's map. EV2's mass row is
+    // B's, so it weighs EV2's edge on B's map only, as the nightly would.
+    let on_a = sorted(vec![co_ab.clone(), co_ba.clone(), ev1.clone(), ev2_hidden]);
     assert_eq!(
         served_edges(&r, &o, a, o.la, o.dual).await,
-        both,
+        on_a,
         "A and B, A's map"
     );
     assert_eq!(
         served_edges(&r, &o, b, o.lb, o.dual).await,
-        both,
+        sorted(vec![
+            co_ab.clone(),
+            co_ba.clone(),
+            ev1.clone(),
+            ev2_read.clone()
+        ]),
         "A and B, B's map"
     );
 
-    // All three teams: B and C's edge is on B's map only; C's mass row is read.
-    let on_a = sorted(vec![
-        co_ab.clone(),
-        co_ba.clone(),
-        ev1.clone(),
-        ev2_read.clone(),
-    ]);
+    // All three teams: B and C's edge is on B's map only; the weights are the
+    // map's, the same as for a member of A and B.
     assert_eq!(
         served_edges(&r, &o, a, o.la, o.tri).await,
         on_a,
@@ -1665,7 +1668,8 @@ async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) 
 /// `#[sqlx::test]` hands out, asserted below), so the route test above cannot
 /// pass on row security alone:
 /// - a member of both teams gets exactly the live co-owned edges of team A
-///   among the nodes (the positive control), with C's mass row left out;
+///   among the nodes (the positive control); B's mass row is read on B's map
+///   and left out on A's (the map clause on the mass rows);
 /// - a member of A alone gets none (the edge splice);
 /// - a member of all three does not get B and C's edge on A's map (the team
 ///   clause), and nobody gets the retracted edge (the in-force clause);
@@ -1718,7 +1722,13 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
     assert_eq!(
         ids(&mut conn, &pool, o.dual, o.a, &nodes).await,
         (want.clone(), 1),
-        "A and B: A's live co-owned edges; EV1's public mass row only"
+        "A and B on A's map: A's live co-owned edges; EV1's public mass row only"
+    );
+    let (dual_b, dual_b_mass) = ids(&mut conn, &pool, o.dual, o.b, &nodes).await;
+    assert_eq!(
+        (dual_b, dual_b_mass),
+        (want.clone(), 2),
+        "A and B on B's map: B's mass row is read"
     );
     assert_eq!(
         ids(&mut conn, &pool, o.ma, o.a, &nodes).await,
@@ -1726,7 +1736,7 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
         "A alone reads no co-owned edge"
     );
     let (tri_a, tri_mass) = ids(&mut conn, &pool, o.tri, o.a, &nodes).await;
-    assert_eq!((tri_a, tri_mass), (want, 2), "A, B and C on A's map");
+    assert_eq!((tri_a, tri_mass), (want, 1), "A, B and C on A's map");
     let (tri_b, _) = ids(&mut conn, &pool, o.tri, o.b, &nodes).await;
     assert!(tri_b.contains(&o.co_bc), "B and C's edge is on B's map");
     assert!(!tri_b.contains(&o.gone), "the retracted edge is never read");
@@ -1739,7 +1749,7 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
     ];
     assert_eq!(
         ids(&mut conn, &pool, o.tri, o.a, &wrong_kind).await,
-        (vec![o.ev2e], 1),
+        (vec![o.ev2e], 0),
         "an id under another kind is no match"
     );
 }

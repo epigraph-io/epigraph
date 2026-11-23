@@ -453,9 +453,13 @@ impl AtlasServeRepository {
     ///
     /// The mass rows are read only when an evidence-to-claim row is
     /// returned: live (`retracted_at` unset) rows keyed by that evidence and
-    /// claim, with the frame's size and the claim's hypothesis index, each
-    /// table filtered by the viewer's session. No claim or belief column is
-    /// read. One statement, two with mass rows, whatever the leaf's size.
+    /// claim, with the frame's size and the claim's hypothesis index, each of
+    /// the three tables filtered by the MAP's audience as
+    /// `AtlasFlowRepository::read_flow_inputs` filters them (public, or
+    /// `team`'s) and by the viewer's session. So an overlay edge is weighed
+    /// as the nightly weighs a leaf edge of that map, and one edge weighs the
+    /// same for every viewer who gets it. No claim or belief column is read.
+    /// One statement, two with mass rows, whatever the leaf's size.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if a statement fails.
@@ -549,18 +553,25 @@ impl AtlasServeRepository {
                    JOIN unnest($1::uuid[], $2::uuid[]) AS p(ev, claim) \
                      ON p.ev = mf.evidence_id AND p.claim = mf.claim_id \
                    JOIN frames f ON f.id = mf.frame_id \
+                    AND (f.visibility = 'public' \
+                         OR (f.visibility = 'group' AND f.owner_group_id = $3)) \
                     /* {VISIBILITY:f} */ \
                    LEFT JOIN claim_frames cf \
                      ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id \
+                    AND (cf.visibility = 'public' \
+                         OR (cf.visibility = 'group' AND cf.owner_group_id = $3)) \
                     /* {VISIBILITY:cf} */ \
                   WHERE mf.retracted_at IS NULL \
+                    AND (mf.visibility = 'public' \
+                         OR (mf.visibility = 'group' AND mf.owner_group_id = $3)) \
                     /* {VISIBILITY:mf} */ \
                   ORDER BY mf.id",
-                3,
+                4,
             );
             let mut q = sqlx::query_as::<_, OverlayMassRow>(&sql)
                 .bind(&evidence)
-                .bind(&claims);
+                .bind(&claims)
+                .bind(team);
             if let Some(g) = viewer.group_bind() {
                 q = q.bind(g);
             }
