@@ -3771,6 +3771,16 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "workflow.rs",
+        "list_hierarchical_lineage_heads",
+        "Enumerates `workflows` lineage heads with no text filter (backlog 039ef40a); the \
+         statement's FROM is `workflows` alone, the same relation and posture as \
+         `search_hierarchical_by_text`: the row carries its plan's tenancy under FORCEd row \
+         security, and its one production caller (MCP `list_workflows`) runs it on the CALLER's \
+         viewer-stamped read, so the policy returns exactly the rows the caller may read, the \
+         head pick and the per-lineage generation count included.",
+    ),
+    (
+        "workflow.rs",
         "find_hierarchical_by_embedding",
         "Cosine-similarity search over `workflows.goal_embedding`; the statement's FROM is \
          `workflows` alone (cross-joined to a one-row `q` CTE holding the query vector). Same \

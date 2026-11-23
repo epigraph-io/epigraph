@@ -281,9 +281,10 @@ async fn evolve_step_supersede_whose_retire_is_refused_is_invalid_request_on_the
 
 /// MCP twin of the HTTP route's 403 for a readable step the caller cannot
 /// write (backlog 50aa4027): `supersedes` and `revises` of another group's
-/// PUBLIC step, and of a WORLD-owned public step, are refused by the claims
-/// tenancy policy's WITH CHECK (SQLSTATE 42501), or for a `revises` possibly
-/// first by migration 122's OPL02. The refusal reaches the caller as
+/// PUBLIC step, and of a WORLD-owned public step (with a lineage, and without
+/// one, so that a `revises` meets the lineage back-fill UPDATE first), are
+/// refused by the claims tenancy policy's WITH CHECK (SQLSTATE 42501), or, for
+/// a `revises` that reaches the successor INSERT, by migration 122's OPL02. The refusal reaches the caller as
 /// INVALID_REQUEST naming the denial, the code a WriteRefused gets, not
 /// INTERNAL_ERROR, with nothing written.
 #[sqlx::test(migrations = "../../migrations")]
@@ -319,9 +320,18 @@ async fn evolve_step_of_a_readable_step_the_caller_cannot_write_is_invalid_reque
         .execute(&pool)
         .await
         .expect("give the world-owned step a lineage");
+    let lineageless = fixture::seed_public_claim(
+        &pool,
+        owner,
+        &format!(
+            "a world-owned public step with no lineage {}",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
     bind_and_arm(&pool, caller).await;
 
-    for parent in [group_owned, world_owned] {
+    for parent in [group_owned, world_owned, lineageless] {
         for edge_type in ["supersedes", "revises"] {
             let content = format!("{edge_type} by a reader {}", Uuid::new_v4());
             let err = evolve(&server, params(parent, edge_type, &content))
@@ -338,13 +348,31 @@ async fn evolve_step_of_a_readable_step_the_caller_cannot_write_is_invalid_reque
             // INSERT, where migration 122's claims trigger may refuse first
             // (OPL02: the caller's operator does not write the parent's
             // group), already a coded denial; either way not INTERNAL_ERROR.
-            let wc = err.message.contains("no write authority")
-                && err.message.contains("Nothing was written");
-            assert!(
-                wc || (edge_type == "revises" && err.message.contains("OPL02")),
-                "{edge_type} of {parent}: the refusal says what happened: {}",
-                err.message
-            );
+            // Which refusal answers is deterministic (PR #738 test-lens
+            // follow-up (g): no disjunction). `supersedes` retires the parent
+            // first, and a parent with NO lineage is back-filled first (the
+            // lineage-less 42501 case, follow-up (f)): either UPDATE is the
+            // claims tenancy policy's WITH CHECK refusal. A `revises` of a
+            // parent that already has a lineage reaches the successor INSERT,
+            // where migration 122's claims trigger refuses first: OPL02, the
+            // caller's operator does not write the parent's group.
+            let reaches_insert = edge_type == "revises" && parent != lineageless;
+            if reaches_insert {
+                assert!(
+                    err.message.contains("OPL02") && !err.message.contains("no write authority"),
+                    "{edge_type} of {parent}: the successor INSERT's OPL02 refusal: {}",
+                    err.message
+                );
+            } else {
+                assert!(
+                    err.message
+                        .contains("no write authority over the group that owns this step")
+                        && err.message.contains("Nothing was written")
+                        && !err.message.contains("OPL02"),
+                    "{edge_type} of {parent}: the WITH CHECK refusal of the parent's UPDATE: {}",
+                    err.message
+                );
+            }
             assert_eq!(
                 claims_with_content(&pool, &content).await,
                 0,
@@ -361,6 +389,15 @@ async fn evolve_step_of_a_readable_step_the_caller_cannot_write_is_invalid_reque
                 still_current,
                 "{edge_type} of {parent}: the parent is untouched"
             );
+            if parent == lineageless {
+                let lineage: Option<Uuid> =
+                    sqlx::query_scalar("SELECT step_lineage_id FROM claims WHERE id = $1")
+                        .bind(parent)
+                        .fetch_one(&pool)
+                        .await
+                        .expect("parent lineage");
+                assert_eq!(lineage, None, "{edge_type}: no lineage was back-filled");
+            }
         }
     }
 }

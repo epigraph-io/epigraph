@@ -295,6 +295,14 @@ async fn a_legacy_workflow_with_no_record_is_refused_to_a_non_writer_http_caller
         "the refusal names the legacy rule: {}",
         err.message
     );
+    // The positive twin of `workflow_hidden_id_masking.rs`'s group-row pin: a
+    // PUBLIC row with no record IS the platform corpus, and is called that
+    // (PR #738 test-lens follow-up (a)).
+    assert!(
+        err.message.contains("legacy platform workflow"),
+        "a public row with no record is called a legacy platform workflow: {}",
+        err.message
+    );
     assert!(
         err.message.contains("audited claims:admin path"),
         "the refusal names the one arm that admits: {}",

@@ -76,6 +76,9 @@ pub const SCOPE_MAP: &[(&str, &str)] = &[
     ("list_my_bug_reports", "claims:read"),
     ("list_mcp_tools", "claims:read"),
     ("list_perspectives", "claims:read"),
+    // Enumerates the workflows the caller reads (backlog 039ef40a): SELECTs
+    // only, on the caller's viewer-stamped read.
+    ("list_workflows", "claims:read"),
     ("query_claims", "claims:read"),
     ("query_claims_by_evidence", "claims:read"),
     ("query_claims_by_label", "claims:read"),

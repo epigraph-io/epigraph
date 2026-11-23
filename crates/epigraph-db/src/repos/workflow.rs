@@ -89,6 +89,38 @@ pub struct HierarchicalWorkflowRow {
     pub truth_value: f64,
 }
 
+/// One lineage of [`WorkflowRepository::list_hierarchical_lineage_heads`]:
+/// its head row (highest generation the connection reads) and how many
+/// generations of it the connection reads.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HierarchicalLineageHeadRow {
+    pub id: Uuid,
+    pub canonical_name: String,
+    pub generation: i32,
+    pub goal: String,
+    pub parent_id: Option<Uuid>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub truth_value: f64,
+    /// Generations of this `canonical_name` the connection reads.
+    pub generations: i64,
+    /// The highest generation the connection reads whose truth is at least
+    /// the live threshold (the head itself when the head is live); `None`
+    /// when every generation it reads is below the threshold.
+    pub live_id: Option<Uuid>,
+    /// [`Self::live_id`]'s generation.
+    pub live_generation: Option<i32>,
+}
+
+/// One row of [`WorkflowRepository::list_flat_page`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FlatWorkflowPageRow {
+    pub id: Uuid,
+    pub content: String,
+    pub truth_value: f64,
+    pub labels: Vec<String>,
+    pub is_current: bool,
+}
+
 /// Per-step resolution result for `find_workflow_hierarchical(resolve_to_latest=true)`.
 ///
 /// `frozen_claim_id` is the original step claim attached to the workflow via
@@ -2170,6 +2202,127 @@ impl WorkflowRepository {
             .bind(limit)
             .fetch_all(executor)
             .await
+    }
+
+    /// One page of the hierarchical workflow LINEAGES the connection may read:
+    /// one row per `canonical_name`, its lineage head (highest generation),
+    /// with no text filter. Keyset-paginated on `canonical_name`: pass the
+    /// last `canonical_name` of the previous page as `after` (exclusive), or
+    /// `None` for the first page.
+    ///
+    /// This is the enumeration [`Self::search_hierarchical_by_text`] is not:
+    /// that one is an ILIKE substring match, so a lineage whose goal and name
+    /// lack the query text is never returned however many pages a caller
+    /// walks (backlog 039ef40a).
+    ///
+    /// * **The head is the head.** It is picked over every row the connection
+    ///   reads, before any truth test, so a deprecated head is reported as the
+    ///   head (its truth shows it), never replaced by an older live generation
+    ///   posing as the head.
+    /// * **A rolled-back lineage stays listed.** `live_id` / `live_generation`
+    ///   name the highest generation with truth at least `live_min_truth`
+    ///   (picked in the head's order, under the same row security). A lineage
+    ///   whose head is deprecated but which still has a live generation is
+    ///   returned (agents still find and run that generation through
+    ///   `find_workflow*`, so an enumeration that dropped it would undercount
+    ///   what is in use). Only a lineage with NO live generation is omitted,
+    ///   unless `include_without_live` is set.
+    /// * **Keyed on the lineage, not on time.** A lineage that gains a
+    ///   generation while a caller pages keeps its `canonical_name`, so it is
+    ///   returned exactly once; a `(created_at, id)` key would move it past the
+    ///   cursor and return it again.
+    /// * **`generations` counts only rows this connection reads.** The window
+    ///   count runs under the same row security as the head pick; a generation
+    ///   the caller cannot read is neither counted nor picked as head.
+    ///
+    /// Generic over the executor and viewer-less for the same reason as
+    /// [`Self::search_hierarchical_by_text`] (recorded in
+    /// `visibility_lint.rs::EXECUTOR_WITHOUT_VIEWER`): the statement reads
+    /// `workflows` alone, whose row security returns exactly the rows the
+    /// caller's stamp may read, so the caller MUST run it on a viewer-stamped
+    /// read.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn list_hierarchical_lineage_heads<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        after: Option<&str>,
+        live_min_truth: f64,
+        include_without_live: bool,
+        limit: i64,
+    ) -> Result<Vec<HierarchicalLineageHeadRow>, sqlx::Error> {
+        sqlx::query_as::<_, HierarchicalLineageHeadRow>(
+            "WITH heads AS ( \
+                 SELECT DISTINCT ON (canonical_name) \
+                        id, canonical_name, generation, goal, parent_id, created_at, \
+                        truth_value, \
+                        count(*) OVER (PARTITION BY canonical_name) AS generations \
+                 FROM workflows \
+                 WHERE ($1::text IS NULL OR canonical_name > $1::text) \
+                 ORDER BY canonical_name, generation DESC, created_at DESC, id ASC \
+             ) \
+             SELECT h.id, h.canonical_name, h.generation, h.goal, h.parent_id, h.created_at, \
+                    h.truth_value, h.generations, \
+                    live.id AS live_id, live.generation AS live_generation \
+             FROM heads h \
+             LEFT JOIN LATERAL ( \
+                 SELECT w.id, w.generation \
+                 FROM workflows w \
+                 WHERE w.canonical_name = h.canonical_name \
+                   AND w.truth_value >= $2 \
+                 ORDER BY w.generation DESC, w.created_at DESC, w.id ASC \
+                 LIMIT 1 \
+             ) live ON true \
+             WHERE $3 OR live.id IS NOT NULL \
+             ORDER BY h.canonical_name \
+             LIMIT $4",
+        )
+        .bind(after)
+        .bind(live_min_truth)
+        .bind(include_without_live)
+        .bind(limit)
+        .fetch_all(executor)
+        .await
+    }
+
+    /// One page of the FLAT workflow store: `workflow`-labelled claims the
+    /// viewer may read, keyset-paginated on the claim id (pass the last id of
+    /// the previous page as `after`, exclusive). No text filter and no truth
+    /// filter: `include_retired = false` omits only the claims that are not
+    /// current (`deprecate_workflow` sets `is_current = false`).
+    ///
+    /// The flat-store half of the MCP `list_workflows` enumeration; [`Self::list`]
+    /// orders by truth and has no cursor, so it cannot enumerate past one page.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if the database query fails.
+    pub async fn list_flat_page<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        after: Option<Uuid>,
+        include_retired: bool,
+        limit: i64,
+    ) -> Result<Vec<FlatWorkflowPageRow>, sqlx::Error> {
+        let sql = viewer.splice(
+            "SELECT c.id, c.content, c.truth_value, c.labels, \
+                    COALESCE(c.is_current, true) AS is_current \
+             FROM claims c \
+             WHERE 'workflow' = ANY(c.labels) \
+               AND ($1::uuid IS NULL OR c.id > $1::uuid) \
+               AND ($2 OR c.is_current IS NULL OR c.is_current = true) \
+               /* {VISIBILITY:c} */ \
+             ORDER BY c.id \
+             LIMIT $3",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, FlatWorkflowPageRow>(&sql)
+            .bind(after)
+            .bind(include_retired)
+            .bind(limit);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        q.fetch_all(executor).await
     }
 
     /// Cosine-similarity search over `workflows.goal_embedding`.

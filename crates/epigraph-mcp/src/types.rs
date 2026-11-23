@@ -1290,6 +1290,22 @@ pub struct ImproveWorkflowHierarchyParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListWorkflowsParams {
+    #[schemars(description = "Maximum number of entries in this page (default 50, max 200).")]
+    pub limit: Option<i64>,
+
+    #[schemars(
+        description = "Opaque cursor from the previous page's `next_cursor`; omit it for the first page. Walk pages until `next_cursor` is null."
+    )]
+    pub cursor: Option<String>,
+
+    #[schemars(
+        description = "When true, also list deprecated workflows: a hierarchical lineage none of whose generations you can read has truth 0.3 or above (deprecate_workflow writes 0.05) and a flat workflow claim that is no longer current. A lineage whose head is deprecated but which still has a live generation is listed either way. Defaults to false."
+    )]
+    pub include_deprecated: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindWorkflowHierarchicalParams {
     #[schemars(
         description = "Free-text search over hierarchical workflow goal and canonical_name (ILIKE). The canonical_name slug is hyphen-normalized to spaces before matching so a goal-text query still matches the slug across generations whose goals have diverged from the lineage's canonical phrase."

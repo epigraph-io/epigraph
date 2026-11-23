@@ -2572,7 +2572,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps. With resolve_to_latest=true the true lineage head (highest generation of each matched canonical_name) is always present and flagged `is_lineage_head`, even when its goal no longer matches the query or it is deprecated (`lineage_head_deprecated`)."
+        description = "Search hierarchical workflows by free-text over goal and canonical_name (ILIKE). Returns rows from the `workflows` table ONLY, with canonical_name/generation/parent_id and optional resolve_to_latest step-head resolution — narrower and more detailed than `find_workflow`, which now also covers this table but merges it with flat workflow claims and returns frozen steps. With resolve_to_latest=true the true lineage head (highest generation of each matched canonical_name) is always present and flagged `is_lineage_head`, even when its goal no longer matches the query or it is deprecated (`lineage_head_deprecated`). A keyword search, not an enumeration: a workflow whose goal and canonical_name lack the query words is never returned; use list_workflows to walk every workflow you can read."
     )]
     async fn find_workflow_hierarchical(
         &self,
@@ -2582,6 +2582,19 @@ impl EpiGraphMcpFull {
         let auth = extensions.get::<epigraph_auth::AuthContext>();
         let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
         tools::workflow_hierarchical::find_workflow_hierarchical(self, viewer, params).await
+    }
+
+    #[tool(
+        description = "Enumerate every workflow you can read, page by page, with no text filter: the exhaustive walk find_workflow and find_workflow_hierarchical (similarity / keyword search, which miss workflows whose goal and name lack the query words) are not. One entry per hierarchical LINEAGE (store \"hierarchical\": its head, the highest generation you can read, with canonical_name, generation, `generations` = how many generations of it you can read, goal, parent_id, created_at, truth_value, `head_deprecated` = the head's truth is below 0.3, and `live_workflow_id` / `live_generation` = the highest generation you can read whose truth is at least 0.3, which is the generation find_workflow and find_workflow_hierarchical still return when a newer one was deprecated, null when none is), ordered by canonical_name; then one entry per flat `workflow`-labelled claim (store \"flat\": workflow_id, content, truth_value, labels, is_current), ordered by id. Pass the returned `next_cursor` back as `cursor` until it is null; each lineage is listed once even if it gains a generation while you page. A walk is not a snapshot: a lineage or flat workflow created while you page is missed if it sorts before your cursor (by canonical_name, or by its random claim id). By default deprecated workflows are left out (a lineage with no generation at truth 0.3 or above, a flat claim that is not current); a lineage whose head is deprecated but which still has a live generation IS listed by default, flagged `head_deprecated`. include_deprecated=true lists the deprecated ones too, flagged `deprecated`. Group-private workflows are listed only to readers of their group. Steps are not included: read a workflow's plan with get_workflow_plan."
+    )]
+    async fn list_workflows(
+        &self,
+        Parameters(params): Parameters<ListWorkflowsParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        tools::workflow_hierarchical::list_workflows(self, viewer, params).await
     }
 
     #[tool(

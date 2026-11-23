@@ -404,6 +404,32 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
         "MCP new generation by a non-member is refused: {m:?}"
     );
     assert_names_nothing_hidden(&w, "MCP new generation", &text_of(&m));
+    // Positive text and code pins (PR #738 test-lens follow-up (c)): the
+    // refusal is the hidden-lineage rule itself, the same text on both
+    // transports, coded as a conflict (409 / INVALID_REQUEST), not a fault.
+    let rule = format!(
+        "workflow lineage \"{}\" has generations this caller cannot read, so it may not \
+         write to it. Nothing was written",
+        w.name
+    );
+    assert!(
+        out["message"].as_str().is_some_and(|t| t.contains(&rule)),
+        "REST new generation names the hidden-lineage rule: {out}"
+    );
+    match &m {
+        Err((code, text)) => {
+            assert_eq!(
+                *code,
+                rmcp::model::ErrorCode::INVALID_REQUEST.0,
+                "MCP new generation is a refusal, not a fault: {text}"
+            );
+            assert!(
+                text.contains(&rule),
+                "MCP new generation names the hidden-lineage rule: {text}"
+            );
+        }
+        Ok(v) => panic!("refused above: {v}"),
+    }
     let generations: i64 =
         sqlx::query_scalar("SELECT count(*) FROM workflows WHERE canonical_name = $1")
             .bind(&w.name)
@@ -433,6 +459,27 @@ async fn step_and_ingest_answers_to_a_non_member_do_not_name_the_hidden_workflow
         .post("/api/v1/workflows/steps", &token(w.member), &step(&w.name))
         .await;
     assert_eq!(s, StatusCode::OK, "the member adds a step: {out}");
+    // MCP control (PR #738 test-lens follow-up (d)): the same gate admits the
+    // member over the authenticated MCP transport, so the outsider's refusal
+    // above is the mask and not a tool that refuses everyone.
+    let member_step = format!("{} a member's MCP step", w.name);
+    let auth = auth_for(w.member);
+    let viewer = epigraph_mcp::tools::viewer::request_viewer(&w.server, Some(&auth))
+        .await
+        .expect("viewer");
+    let params: epigraph_mcp::tools::step_ops::AddStepParams =
+        serde_json::from_value(json!({"canonical_name": w.name, "step_text": member_step}))
+            .expect("params");
+    let added = tool_answer(
+        epigraph_mcp::tools::step_ops::add_step(&w.server, &viewer, params, Some(&auth)).await,
+    );
+    assert!(added.is_ok(), "the member adds a step over MCP: {added:?}");
+    let written: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE content = $1")
+        .bind(&member_step)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(written, 1, "the member's MCP step was written");
 }
 
 /// `evolve_step` of a PUBLIC step that only a group workflow executes: the
@@ -672,6 +719,52 @@ async fn store_workflow_re_ingest_by_a_non_member_leaves_the_id_out(pool: PgPool
     )
     .expect("the member's MCP store_workflow");
     assert_eq!(out["workflow_id"], json!(w.workflow.to_string()), "{out}");
+
+    // The event's positive control (PR #738 test-lens follow-up (e)): a
+    // workflow the member CREATES as public is announced, and its
+    // `workflow.created` event carries the id the member's answer carries, so
+    // the outsider's eventless refusal above is the mask, not an event stream
+    // that never names a workflow.
+    let public_goal = format!("{} public sibling", w.name);
+    let (s, out) = w
+        .api
+        .post(
+            "/api/v1/workflows",
+            &token(w.member),
+            &json!({
+                "goal": public_goal,
+                "steps": ["a public stored step"],
+                "tenancy": {"visibility": "public", "owner_group_id": w.member_group},
+            }),
+        )
+        .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the member stores a public workflow: {out}"
+    );
+    let created = out["workflow_id"].clone();
+    assert!(
+        created.is_string(),
+        "the member's answer carries the id: {out}"
+    );
+    let events: Vec<Value> = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE event_type = 'workflow.created' \
+           AND payload->>'canonical_name' = $1",
+    )
+    .bind(out["canonical_name"].as_str().expect("canonical_name"))
+    .fetch_all(&pool)
+    .await
+    .expect("events");
+    assert_eq!(
+        events.len(),
+        1,
+        "one event announces the creation: {events:?}"
+    );
+    assert_eq!(
+        events[0]["workflow_id"], created,
+        "the member's event carries the workflow id: {events:?}"
+    );
 }
 
 /// A REST token for `agent` minted on OAuth client `client`, so a test can

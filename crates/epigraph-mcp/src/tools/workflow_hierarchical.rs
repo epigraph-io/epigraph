@@ -7,6 +7,9 @@
 //! - `find_workflow_hierarchical` — ILIKE search over goal and a
 //!   hyphen-normalized canonical_name; filters by `min_truth` so deprecated
 //!   rows (truth=0.05) drop out by default.
+//! - `list_workflows` — keyset-paginated enumeration of every hierarchical
+//!   lineage head and flat workflow claim the caller reads, with no text
+//!   filter.
 //! - `report_hierarchical_outcome` — updates `workflows.metadata` counters
 //!   and writes per-step `behavioral_executions` rows with `step_claim_id`
 //!   resolved from the workflow's `executes` edges in plan order.
@@ -21,7 +24,8 @@ use uuid::Uuid;
 use crate::errors::{internal_error, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{
-    FindWorkflowHierarchicalParams, HierarchicalStepExecution, ReportHierarchicalOutcomeParams,
+    FindWorkflowHierarchicalParams, HierarchicalStepExecution, ListWorkflowsParams,
+    ReportHierarchicalOutcomeParams,
 };
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -182,6 +186,180 @@ pub async fn find_workflow_hierarchical(
         "resolve_to_latest": resolve_to_latest,
         "min_truth": min_truth,
         "search_path": search_path,
+    }))
+}
+
+// ── list_workflows ─────────────────────────────────────────────────────────
+
+/// The truth below which a hierarchical generation counts as deprecated:
+/// `find_workflow_hierarchical`'s default `min_truth` (`deprecate_workflow`
+/// writes 0.05).
+const LIVE_MIN_TRUTH: f64 = 0.3;
+
+/// Where a `list_workflows` page starts. The enumeration walks the
+/// hierarchical lineages (keyed on `canonical_name`) and then the flat
+/// workflow claims (keyed on claim id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListWorkflowsCursor {
+    /// The first page.
+    Start,
+    /// After this `canonical_name` in the hierarchical store.
+    Hierarchical(String),
+    /// In the flat store, after this claim id (`None`: from its start).
+    Flat(Option<Uuid>),
+}
+
+impl ListWorkflowsCursor {
+    /// Parse a cursor a previous page returned. Anything else is refused.
+    ///
+    /// # Errors
+    /// `invalid_params` for a cursor this tool did not issue.
+    pub fn parse(cursor: Option<&str>) -> Result<Self, McpError> {
+        let bad = || {
+            crate::errors::invalid_params(
+                "list_workflows: `cursor` is not one this tool issued; pass the previous page's \
+                 `next_cursor` unchanged, or omit it for the first page"
+                    .to_string(),
+            )
+        };
+        match cursor {
+            None | Some("") => Ok(Self::Start),
+            Some(c) => {
+                if let Some(name) = c.strip_prefix("h:") {
+                    if name.is_empty() {
+                        return Err(bad());
+                    }
+                    Ok(Self::Hierarchical(name.to_string()))
+                } else if let Some(id) = c.strip_prefix("f:") {
+                    if id.is_empty() {
+                        return Ok(Self::Flat(None));
+                    }
+                    Uuid::parse_str(id)
+                        .map(|u| Self::Flat(Some(u)))
+                        .map_err(|_| bad())
+                } else {
+                    Err(bad())
+                }
+            }
+        }
+    }
+
+    /// The wire form [`Self::parse`] reads back.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        match self {
+            Self::Start => String::new(),
+            Self::Hierarchical(name) => format!("h:{name}"),
+            Self::Flat(None) => "f:".to_string(),
+            Self::Flat(Some(id)) => format!("f:{id}"),
+        }
+    }
+}
+
+/// Enumerate every workflow the caller may read, page by page, with no text
+/// filter (backlog 039ef40a): one entry per hierarchical LINEAGE (its head,
+/// the highest generation the caller reads), then one per flat workflow
+/// claim. Runs as the caller on one viewer-stamped read, so a group-private
+/// lineage is listed to its group's readers only.
+pub async fn list_workflows(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: ListWorkflowsParams,
+) -> Result<CallToolResult, McpError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let include_deprecated = params.include_deprecated.unwrap_or(false);
+    let cursor = ListWorkflowsCursor::parse(params.cursor.as_deref())?;
+
+    let mut read = server.read_as(viewer, "list_workflows").await?;
+    let mut workflows: Vec<serde_json::Value> = Vec::new();
+    let mut next: Option<ListWorkflowsCursor> = None;
+
+    // ── 1. Hierarchical lineages, unless the cursor is already past them. ──
+    let flat_after = match &cursor {
+        ListWorkflowsCursor::Flat(after) => *after,
+        ListWorkflowsCursor::Start | ListWorkflowsCursor::Hierarchical(_) => {
+            let after = match &cursor {
+                ListWorkflowsCursor::Hierarchical(name) => Some(name.as_str()),
+                _ => None,
+            };
+            let mut rows = epigraph_db::WorkflowRepository::list_hierarchical_lineage_heads(
+                &mut *read,
+                after,
+                LIVE_MIN_TRUTH,
+                include_deprecated,
+                limit + 1,
+            )
+            .await
+            .map_err(internal_error)?;
+            if rows.len() as i64 > limit {
+                rows.truncate(limit as usize);
+                if let Some(last) = rows.last() {
+                    next = Some(ListWorkflowsCursor::Hierarchical(
+                        last.canonical_name.clone(),
+                    ));
+                }
+            }
+            for r in rows {
+                workflows.push(serde_json::json!({
+                    "store": "hierarchical",
+                    "workflow_id": r.id,
+                    "canonical_name": r.canonical_name,
+                    "generation": r.generation,
+                    "generations": r.generations,
+                    "goal": r.goal,
+                    "parent_id": r.parent_id,
+                    "created_at": r.created_at,
+                    "truth_value": r.truth_value,
+                    "head_deprecated": r.truth_value < LIVE_MIN_TRUTH,
+                    "live_workflow_id": r.live_id,
+                    "live_generation": r.live_generation,
+                    "deprecated": r.live_id.is_none(),
+                }));
+            }
+            None
+        }
+    };
+
+    // ── 2. Flat workflow claims, with whatever room the page has left. ──
+    if next.is_none() {
+        let room = limit - workflows.len() as i64;
+        // A full page of lineages still needs to know whether flat rows
+        // follow: probe one, so the last page is the one with a null cursor.
+        let fetch = room.max(0) + 1;
+        let mut rows = epigraph_db::WorkflowRepository::list_flat_page(
+            &mut *read,
+            viewer,
+            flat_after,
+            include_deprecated,
+            fetch,
+        )
+        .await
+        .map_err(internal_error)?;
+        if rows.len() as i64 > room {
+            rows.truncate(room.max(0) as usize);
+            next = Some(ListWorkflowsCursor::Flat(
+                rows.last().map(|r| r.id).or(flat_after),
+            ));
+        }
+        for r in rows {
+            workflows.push(serde_json::json!({
+                "store": "flat",
+                "workflow_id": r.id,
+                "content": r.content,
+                "truth_value": r.truth_value,
+                "labels": r.labels,
+                "is_current": r.is_current,
+                "deprecated": !r.is_current,
+            }));
+        }
+    }
+    read.commit().await.map_err(internal_error)?;
+
+    success_json(&serde_json::json!({
+        "workflows": workflows,
+        "count": workflows.len(),
+        "next_cursor": next.map(|c| c.encode()),
+        "include_deprecated": include_deprecated,
     }))
 }
 
