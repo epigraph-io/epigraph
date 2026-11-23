@@ -2221,7 +2221,10 @@ async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader(pool: PgP
 /// path, executable by the app role and not by PUBLIC.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_269_definers_are_pinned_owned_and_granted(pool: PgPool) {
-    for sig in ["public.epigraph_agents_linked_to_operator(uuid)"] {
+    for sig in [
+        "public.epigraph_agents_linked_to_operator(uuid)",
+        "public.epigraph_disclosed_role_attachments(uuid[])",
+    ] {
         let row: (bool, String, Option<Vec<String>>, bool, bool) = sqlx::query_as(
             "SELECT p.prosecdef, r.rolname::text, p.proconfig, \
                     has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
@@ -2243,4 +2246,129 @@ async fn migration_269_definers_are_pinned_owned_and_granted(pool: PgPool) {
         assert!(row.3, "{sig}: the app role executes it");
         assert!(!row.4, "{sig}: PUBLIC does not");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Role attachments (166 `role_agents`) on the card (backlog 0e419970)
+// ---------------------------------------------------------------------------
+
+/// Attach `agent` to `role` through 166's maintenance verb.
+async fn attach_to_role(pool: &PgPool, role: &str, agent: Uuid) {
+    let role = role.to_string();
+    fixture::as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let _: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_attach_agent_to_role($1, $2, now() - interval '5 seconds', \
+                                                         NULL, 'lookup test attach')",
+        )
+        .bind(&role)
+        .bind(agent)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the maintenance role attaches");
+        (conn, ())
+    })
+    .await;
+}
+
+/// The roles a card's `role_attachments` names, read from its JSON so the
+/// test fails at RUN time on a card without the field.
+fn attached_roles(card: &AgentCard) -> serde_json::Value {
+    let v = serde_json::to_value(card).expect("serialize card");
+    match v.get("role_attachments") {
+        Some(serde_json::Value::Array(a)) => serde_json::Value::Array(
+            a.iter()
+                .map(|r| r.get("role").cloned().unwrap_or_default())
+                .collect(),
+        ),
+        other => other.cloned().unwrap_or_default(),
+    }
+}
+
+/// An LLM agent's role attachments (166 `role_agents`, which the application
+/// role cannot read) are on its card for the agent itself, its human and an
+/// admin, through migration 269's `epigraph_disclosed_role_attachments`;
+/// live attachments only. Everyone else reads the card exactly as an
+/// unattached look-alike's: attachments are shown to no outsider, of any
+/// role, until a ruling says which may be (the elevating roles' never).
+#[sqlx::test(migrations = "../../migrations")]
+async fn role_attachments_are_shown_to_the_agent_its_human_and_admins_only(pool: PgPool) {
+    seed_role(&pool, "role:test-stewards", false).await;
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (human, _) = named_human(&pool, "Hesper Lunde").await;
+    let (other_human, _) = named_human(&pool, "Bryn Asker").await;
+    let (bot, _) = named(&pool, "steward-bot").await;
+    let (lookalike, _) = named(&pool, "steward-bot").await;
+    link(&pool, bot, human).await;
+    link(&pool, lookalike, human).await;
+    attach_to_role(&pool, "role:test-stewards", bot).await;
+    // An elevating role too (123's custodian role).
+    attach_to_role(&pool, "role:platform-custodian", bot).await;
+
+    let both = serde_json::json!(["role:platform-custodian", "role:test-stewards"]);
+    for who in [bot, human] {
+        let c = card_as(&pool, who, bot).await;
+        assert_eq!(attached_roles(&c), both, "viewer {who}: {c:?}");
+    }
+    let (bypass_pool, admin) = fixture::bypass(&pool).await;
+    {
+        let (mut conn, _lease) = bypass_pool
+            .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+            .await
+            .expect("maintenance connection");
+        let c = AgentLookupRepository::card(&mut conn, &admin, bot)
+            .await
+            .expect("card")
+            .expect("exists");
+        assert_eq!(attached_roles(&c), both, "admin");
+    }
+
+    // Nobody else: an outsider, another human, the human's other agent.
+    for who in [outsider, other_human, lookalike] {
+        let out = cards_as(&pool, who, &[bot, lookalike]).await;
+        assert_eq!(
+            attached_roles(&out[0]),
+            serde_json::json!([]),
+            "viewer {who}"
+        );
+        assert_eq!(
+            shape(&out[0]),
+            shape(&out[1]),
+            "viewer {who} can tell the attached agent from its look-alike"
+        );
+    }
+
+    // A detached attachment is not shown to anyone.
+    fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+        let n: i32 = sqlx::query_scalar(
+            "SELECT public.epigraph_detach_agent_from_role('role:platform-custodian', $1, 'done')",
+        )
+        .bind(bot)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("detach");
+        assert_eq!(n, 1, "CALIBRATION: one attachment detached");
+        (conn, ())
+    })
+    .await;
+    assert_eq!(
+        attached_roles(&card_as(&pool, bot, bot).await),
+        serde_json::json!(["role:test-stewards"])
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_269_attachments_refuse_more_than_200_agents(pool: PgPool) {
+    let ids: Vec<Uuid> = (0..201).map(|_| Uuid::new_v4()).collect();
+    let err = sqlx::query("SELECT * FROM public.epigraph_disclosed_role_attachments($1)")
+        .bind(&ids)
+        .fetch_all(&pool)
+        .await
+        .expect_err("201 ids refused");
+    assert!(err.to_string().contains("at most 200"), "{err}");
+    let ok = sqlx::query("SELECT * FROM public.epigraph_disclosed_role_attachments($1)")
+        .bind(&ids[..200])
+        .fetch_all(&pool)
+        .await
+        .expect("200 ids accepted");
+    assert!(ok.is_empty());
 }

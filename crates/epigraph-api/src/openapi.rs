@@ -458,7 +458,8 @@ async fn get_claim_doc() {}
 /// the caller may see the profile), ranked `orcid`/`ror` > `exact` > `prefix` >
 /// `trigram`. The body is `{results: [...], candidates_truncated}`; each result
 /// is an agent card (`id`, `display_name`, `kind`, `kind_evidence`, `roles`,
-/// `orcid`, `ror_id`, `operator_human`, `created_at`, `counts`) plus `tier`
+/// `role_attachments`, `orcid`, `ror_id`, `operator_human`, `created_at`,
+/// `counts`) plus `tier`
 /// and `score`. `operator_human` (the human the agent is currently bound
 /// to: its live operator link, else its unrevoked client allowance; null
 /// once the link is retired) is shown to every reader; every other field is

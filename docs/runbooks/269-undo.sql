@@ -3,3 +3,4 @@
 -- such a binary calls these functions on every find_agent / get_agent card and fails
 -- (SQLSTATE 42883) without them. Idempotent. No rows, tables or policies change.
 DROP FUNCTION IF EXISTS public.epigraph_agents_linked_to_operator(uuid);
+DROP FUNCTION IF EXISTS public.epigraph_disclosed_role_attachments(uuid[]);

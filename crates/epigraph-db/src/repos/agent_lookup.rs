@@ -53,6 +53,12 @@
 //!   trail whose window is open now (exactly what 123's public projection
 //!   shows, and decided by the window alone, so client or registration
 //!   status never moves it), plus the caller's own assignments of any role.
+//! * `role_attachments`: migration 269's `epigraph_disclosed_role_attachments`:
+//!   the roles an (LLM) agent is attached to (166 `role_agents`: the agents a
+//!   role runs), live now, shown only to the agent itself, its human
+//!   (`epigraph_human_of(agent, false)`) and admins. No outsider arm: 166
+//!   writes no public projection of an attachment, so to everyone else an
+//!   attached agent's card reads exactly as an unattached one's.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
 //!   number. Only in-force edges carrying the ingest-written marker count
@@ -389,7 +395,8 @@ pub struct AgentRef {
     pub display_name: Option<String>,
 }
 
-/// One live role assignment shown on a card.
+/// One live role assignment (or, in `role_attachments`, one live role
+/// attachment) shown on a card.
 #[derive(Debug, Clone, Serialize)]
 pub struct CardRole {
     pub role: String,
@@ -472,6 +479,10 @@ pub struct AgentCard {
     /// `bound_to_visible_human`, `name_derived_key`, `orcid_derived_key`.
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
+    /// The roles this agent is attached to (166 `role_agents`), live now:
+    /// shown to the agent itself, its human and admins; empty for everyone
+    /// else (migration 269).
+    pub role_attachments: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
     /// The human this agent is currently bound to (its live operator link,
@@ -774,8 +785,10 @@ impl AgentLookupRepository {
             .fetch_all(&mut *conn)
             .await?;
 
-        // 2. Disclosed roles (migration 198), for every carded agent at once.
+        // 2. Disclosed roles (migration 198) and role attachments (269), for
+        //    every carded agent at once.
         let roles = Self::disclosed_roles(conn, &ids).await?;
+        let attachments = Self::disclosed_attachments(conn, &ids).await?;
 
         // 3. The bound humans' names (agents are public).
         let humans: Vec<Uuid> = rows.iter().filter_map(|r| r.10).collect();
@@ -854,6 +867,7 @@ impl AgentLookupRepository {
                 kind,
                 kind_evidence: evidence,
                 roles,
+                role_attachments: attachments.get(&id).cloned().unwrap_or_default(),
                 orcid,
                 ror_id,
                 operator_human: operator_human.map(|h| AgentRef {
@@ -1101,6 +1115,32 @@ impl AgentLookupRepository {
         let rows: Vec<RoleRow> = sqlx::query_as(
             "SELECT agent_id, role, valid_from, valid_to \
                FROM public.epigraph_disclosed_role_assignments($1::uuid[])",
+        )
+        .bind(ids)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut out: HashMap<Uuid, Vec<CardRole>> = HashMap::new();
+        for (agent, role, valid_from, valid_to) in rows {
+            out.entry(agent).or_default().push(CardRole {
+                role,
+                valid_from,
+                valid_to,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Migration 269's disclosed role attachments of `ids`, by agent. The
+    /// definer decides on the SESSION (the stamped principal, its human arm,
+    /// a privileged session); it confers nothing.
+    async fn disclosed_attachments(
+        conn: &mut PgConnection,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Vec<CardRole>>, DbError> {
+        type RoleRow = (Uuid, String, DateTime<Utc>, Option<DateTime<Utc>>);
+        let rows: Vec<RoleRow> = sqlx::query_as(
+            "SELECT agent_id, role, valid_from, valid_to \
+               FROM public.epigraph_disclosed_role_attachments($1::uuid[])",
         )
         .bind(ids)
         .fetch_all(&mut *conn)

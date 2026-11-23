@@ -2091,6 +2091,16 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_lookup.rs",
+        "disclosed_attachments",
+        "READ through migration 269's `epigraph_disclosed_role_attachments` SECURITY DEFINER \
+         function, the agent-lookup card's only reader of `role_agents` (FORCE RLS, privileged \
+         or definer only). The function decides in its body, on the SESSION: the attachments of \
+         the session principal itself, of an agent whose human is the session principal, \
+         everything on a privileged session, and nothing for anyone else. No tenancy columns; \
+         nothing for a Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
         "exact_name_candidates",
         "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
          equality, excluding migration 148's `system_agents` rows (no row security): the \

@@ -1,7 +1,10 @@
--- 269: the agent-lookup card's reverse binding read (backlog 0e419970).
+-- 269: two reads for the agent-lookup card (find_agent / get_agent), the
+-- follow-ups PR #774 recorded (backlog 0e419970): the reverse binding read
+-- (sections 1-3) and the role attachments an LLM agent's card may show
+-- (section 4).
 --
 -- ===================================================================
--- 1. WHAT THIS ADDS
+-- 1. WHAT THIS ADDS: THE REVERSE BINDING READ
 --
 --   public.epigraph_agents_linked_to_operator(p_operator uuid)
 --     RETURNS TABLE (agent_id uuid)
@@ -42,6 +45,48 @@
 -- (the card runs on the request DSN). The guarded owner and grant blocks can
 -- silently no-op; `tenancy_backfill.rs`'s registers report it.
 --
+-- ===================================================================
+-- 4. THE ROLE ATTACHMENTS A CARD MAY SHOW
+--
+--   public.epigraph_disclosed_role_attachments(p_agents uuid[])
+--     RETURNS TABLE (agent_id uuid, role text, valid_from timestamptz,
+--                    valid_to timestamptz)
+--
+-- 166's `role_agents` records which agents a role runs (its curator, the
+-- fleet identities of its schedules). It is FORCE RLS and admits a read only
+-- to a privileged session or a maintenance-owned definer, so the application
+-- role reads no row and the card showed no attachment. For each agent of
+-- `p_agents` this returns, per role, the attachment LIVE now (not detached,
+-- `valid_from <= now() < valid_to`, `valid_to` NULL: open-ended), the
+-- earliest by (`valid_from`, `id`) when several are; one row per (agent,
+-- role), and ONLY when the session may see that agent's attachments:
+--
+--   (a) the agent IS the session principal (`epigraph_principal_id()`);
+--   (b) the session principal is the agent's human
+--       (`epigraph_human_of(agent, false)`, the prompt-history gate's D4 arm:
+--       a human reads its own agents' state); or
+--   (c) a privileged session (`epigraph_bypass()`, which reads
+--       `session_user`).
+--
+-- NO OUTSIDER ARM, deliberately. 198 shows any reader the assignments of the
+-- non-elevating roles because 123 already writes a world-readable projection
+-- of each grant; 166 writes no projection of an attachment (its attach and
+-- lineage-follow write `role_agents` and `security_events` only), so an
+-- outsider arm would publish a roster no public surface shows today. That
+-- is left to a ruling; until then the card of an attached agent reads to
+-- everyone else exactly as an unattached look-alike's.
+--
+-- It is NOT read for authority and confers none (an attachment never grants
+-- in itself; 179's attached mode reads `role_agents` directly). Bounded: at
+-- most 200 agents per call (SQLSTATE 22023 above that); no role -> agents
+-- direction.
+--
+-- Same shape as section 3: 172's form, owner `epigraph_maintenance` (whose
+-- `epigraph_definer_bypass()` admits the read of the FORCEd table, and who
+-- holds SELECT on it, 166), EXECUTE revoked from PUBLIC and granted to
+-- `epigraph_app`. Under a NON-member owner the read returns no row: fail
+-- CLOSED (fewer attachments shown).
+--
 -- UNDO: `docs/runbooks/269-undo.sql`. No rows, tables or policies change.
 SET LOCAL lock_timeout = '3s';
 
@@ -61,6 +106,51 @@ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
         EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_agents_linked_to_operator(uuid) '
+                'TO epigraph_app';
+    END IF;
+END $$;
+
+-- ===================================================================
+-- 4. THE ROLE ATTACHMENTS A CARD MAY SHOW (see the header, section 4)
+-- ===================================================================
+CREATE OR REPLACE FUNCTION public.epigraph_disclosed_role_attachments(p_agents uuid[])
+RETURNS TABLE (agent_id uuid, role text, valid_from timestamptz, valid_to timestamptz)
+LANGUAGE plpgsql STABLE SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp AS $$
+#variable_conflict use_column
+DECLARE
+    v_principal uuid := public.epigraph_principal_id();
+    v_bypass boolean := public.epigraph_bypass();
+BEGIN
+    IF pg_catalog.cardinality(p_agents) > 200 THEN
+        RAISE EXCEPTION 'epigraph_disclosed_role_attachments: at most 200 agents per call (got %)',
+                        pg_catalog.cardinality(p_agents)
+            USING ERRCODE = '22023';
+    END IF;
+    RETURN QUERY
+    SELECT DISTINCT ON (ra.agent_id, ra.role)
+           ra.agent_id, ra.role, ra.valid_from, ra.valid_to
+      FROM public.role_agents ra
+     WHERE ra.agent_id = ANY (p_agents)
+       AND ra.detached_at IS NULL
+       AND ra.valid_from <= pg_catalog.now()
+       AND (ra.valid_to IS NULL OR pg_catalog.now() < ra.valid_to)
+       AND (   v_bypass
+            OR (v_principal IS NOT NULL
+                AND (   ra.agent_id = v_principal
+                     OR public.epigraph_human_of(ra.agent_id, false) = v_principal)))
+     ORDER BY ra.agent_id, ra.role, ra.valid_from, ra.id;
+END $$;
+REVOKE ALL ON FUNCTION public.epigraph_disclosed_role_attachments(uuid[]) FROM PUBLIC;
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_maintenance') THEN
+        EXECUTE 'ALTER FUNCTION public.epigraph_disclosed_role_attachments(uuid[]) '
+                'OWNER TO epigraph_maintenance';
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'epigraph_app') THEN
+        EXECUTE 'GRANT EXECUTE ON FUNCTION public.epigraph_disclosed_role_attachments(uuid[]) '
                 'TO epigraph_app';
     END IF;
 END $$;

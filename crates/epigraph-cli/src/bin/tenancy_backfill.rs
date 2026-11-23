@@ -2328,6 +2328,11 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // (the owner). Under a non-member owner it reads no link: fail CLOSED,
     // fewer humans shown, never more.
     ("epigraph_agents_linked_to_operator", 269),
+    // 269, the agent-lookup card's role attachments. Its read of the FORCEd
+    // `role_agents` is admitted by `epigraph_definer_bypass()` (the owner).
+    // Under a non-member owner it reads no row: fail CLOSED, no attachment
+    // shown.
+    ("epigraph_disclosed_role_attachments", 269),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that
@@ -3238,6 +3243,12 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
         (
             "epigraph_agents_linked_to_operator",
             "public.epigraph_agents_linked_to_operator(uuid)",
+            true,
+        ),
+        // 269: the agent-lookup card's role attachments, same path.
+        (
+            "epigraph_disclosed_role_attachments",
+            "public.epigraph_disclosed_role_attachments(uuid[])",
             true,
         ),
     ];
