@@ -458,7 +458,7 @@ pub async fn store_workflow(
             &viewer,
             embedder.as_ref(),
             "workflows",
-            &result.inserted,
+            &result.claims_to_embed(),
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
@@ -1090,8 +1090,10 @@ pub async fn report_outcome(
         };
 
     // Embed goal text for affinity matching. Best-effort: a missing vector is a
-    // NULL column, not a failed report.
-    let goal_embedding_pgvec = if let Some(embedder) = state.embedding_service() {
+    // NULL column, not a failed report. STORED on the behavioral row, so only
+    // the provider that owns the vector columns may produce it (backlog
+    // 21b7319a): `storing_embedding_service`, not `embedding_service`.
+    let goal_embedding_pgvec = if let Some(embedder) = state.storing_embedding_service() {
         match embedder.generate(&behavioral_goal).await {
             Ok(vec) => {
                 let pgvec = epigraph_db::pgvector_literal(&vec);
@@ -1548,7 +1550,10 @@ pub async fn report_hierarchical_outcome(
     // Embed the goal for affinity matching, best-effort and BEFORE the
     // transaction so embedder latency stays out of the row lock. Blank goals and
     // the "hierarchical" placeholder are not goals. Mirrors the MCP tool's
-    // `do_report_hierarchical_outcome_with_embedder`.
+    // `do_report_hierarchical_outcome_with_embedder`. The vector is STORED on
+    // every step row, so it comes from `storing_embedding_service` (backlog
+    // 21b7319a): a non-owning provider's vector would put a second vector
+    // space into `behavioral_executions.goal_embedding`.
     let goal_text = request
         .goal_text
         .clone()
@@ -1558,7 +1563,7 @@ pub async fn report_hierarchical_outcome(
         .as_deref()
         .map(str::trim)
         .filter(|g| !g.is_empty() && *g != "hierarchical");
-    let goal_embedding_pgvec = match (goal_to_embed, state.embedding_service()) {
+    let goal_embedding_pgvec = match (goal_to_embed, state.storing_embedding_service()) {
         (Some(goal), Some(embedder)) => match embedder.generate(goal).await {
             Ok(vec) => Some(epigraph_db::pgvector_literal(&vec)),
             Err(e) => {
@@ -2314,10 +2319,11 @@ pub async fn record_behavioral_execution(
         }
     }
 
-    // Attempt to generate a goal embedding if an embedder is available
+    // Attempt to generate a goal embedding if an embedder that owns the stored
+    // vector columns is available (backlog 21b7319a).
     let mut embedding_pgvec: Option<String> = None;
     let mut embedded = false;
-    if let Some(embedder) = state.embedding_service() {
+    if let Some(embedder) = state.storing_embedding_service() {
         if let Ok(vec) = embedder.generate(&body.goal_text).await {
             embedding_pgvec = Some(epigraph_db::pgvector_literal(&vec));
             embedded = true;
@@ -2545,7 +2551,7 @@ pub async fn ingest_workflow(
             &viewer,
             embedder.as_ref(),
             "workflows/ingest",
-            &result.inserted,
+            &result.claims_to_embed(),
         )
         .await;
         // Also embed into workflows.goal_embedding for find_workflow_hierarchical,
@@ -3925,6 +3931,24 @@ pub async fn add_step(
     tx.commit().await.map_err(|e| ApiError::InternalError {
         message: format!("add_step: could not commit: {e}"),
     })?;
+
+    // Post-commit, best-effort, on the caller's stamp (CLAUDE.md "Embedding
+    // policy"), as the MCP twin does: the step this call put into the plan,
+    // new or revived from a workflow deprecation (backlog 1767f2ae), is a
+    // current claim with no vector.
+    if let (Some(content), Some(embedder)) = (
+        r.inserted_content.clone(),
+        state.storing_embedding_service(),
+    ) {
+        embed_inserted_workflow_claims(
+            &state,
+            &viewer,
+            embedder.as_ref(),
+            "workflows/steps",
+            &[(r.step_claim_id, content)],
+        )
+        .await;
+    }
 
     Ok(Json(serde_json::json!({
         "workflow_id": r.workflow_id,

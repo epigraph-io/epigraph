@@ -1087,34 +1087,6 @@ impl ClaimThemeRepository {
         })
     }
 
-    /// Delete all themes and unassign all claims (for re-clustering).
-    ///
-    /// Returns the number of deleted theme rows.
-    pub async fn delete_all(pool: &PgPool) -> Result<u64, DbError> {
-        let mut tx = pool.begin().await.map_err(DbError::from)?;
-        let n = Self::delete_all_conn(&mut tx).await?;
-        tx.commit().await.map_err(DbError::from)?;
-        Ok(n)
-    }
-
-    /// [`Self::delete_all`] on a connection the caller owns, so a re-cluster
-    /// can wipe and rebuild in ONE transaction: a wipe that commits before a
-    /// rebuild that fails leaves the corpus with no themes at all.
-    pub async fn delete_all_conn(conn: &mut sqlx::PgConnection) -> Result<u64, DbError> {
-        // Unassign claims first to satisfy the foreign-key constraint
-        sqlx::query("UPDATE claims SET theme_id = NULL WHERE theme_id IS NOT NULL")
-            .execute(&mut *conn)
-            .await
-            .map_err(DbError::from)?;
-
-        let result = sqlx::query("DELETE FROM claim_themes")
-            .execute(&mut *conn)
-            .await
-            .map_err(DbError::from)?;
-
-        Ok(result.rows_affected())
-    }
-
     /// Find claims with high boundary_ratio and centroid_distance from claim_clusters.
     ///
     /// These are candidates for theme reassignment — they sit on cluster boundaries

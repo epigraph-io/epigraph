@@ -277,7 +277,7 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **MCP `workflow_ingest`** — embeds executor output; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
 - **MCP `store_workflow`** — embeds executor output via `execute_workflow_ingest_with_inserted`; `crates/epigraph-mcp/src/tools/workflows.rs::store_workflow`
 - **MCP `improve_workflow_hierarchy`** — embeds executor output (claims) AND calls `set_goal_embedding` for the new `workflows` row; `crates/epigraph-mcp/src/tools/workflow_ingest.rs`
-- **MCP `add_step`** — embeds when `AddStepResult::inserted_content` is `Some`
+- **MCP `add_step`** and **HTTP `POST /api/v1/workflows/steps`** — embed when `AddStepResult::inserted_content` is `Some` (a new step, or a reused one revived from a workflow deprecation)
 - **HTTP `POST /api/v1/claims`** — `crates/epigraph-api/src/routes/claims.rs` (after `tx.commit()` in `create_claim`)
 - **HTTP `POST /api/v1/claims/batch`** — delegates each item to `create_claim_core` in `crates/epigraph-api/src/routes/claims.rs`
 - **HTTP `POST /api/v1/conventions`** and **`POST /api/v1/skills/share`** — embed the convention / shared-copy claim after the handler's last write, stored through `ClaimRepository::store_embedding` on the raw pool these handlers write everything on; `crates/epigraph-api/src/routes/conventions.rs::embed_created_claim`
@@ -292,8 +292,10 @@ best-effort (warn on failure, never block the write). Current call-sites:
 - **CLI `method_search`** — `crates/epigraph-cli/src/bin/method_search.rs` (embedding included directly in INSERT, matches `hypothesis` pattern)
 
 `epigraph-ingest-executor` is pure-DB and does **not** embed itself; it returns
-`inserted: Vec<(Uuid, String)>` / `AddStepResult::inserted_content` so each
-caller embeds with its own configured embedder.
+`WorkflowIngestExecutionResult::claims_to_embed()` (the claims it `inserted`
+plus the ones it `revived` from a workflow deprecation) /
+`AddStepResult::inserted_content` so each caller embeds with its own configured
+embedder.
 
 ### Cleanup paths (must null on `is_current = false`)
 
@@ -313,6 +315,7 @@ The retirement paths, all in `crates/epigraph-db/src/repos/claim.rs`:
 - **`ClaimRepository::supersede_act_conn`** — `"UPDATE claims SET is_current = false, embedding = NULL, embedding_3072 = NULL"`
 - **`ClaimRepository::evolve_step_conn`** — same statement, under `if edge_type == "supersedes"`
 - **`ClaimRepository::deprecate_claim`** — `SET truth_value = 0.05, is_current = false, embedding = NULL,`
+- **`ClaimRepository::retire_for_workflow_deprecation`** — the same `SET` list plus a `workflow_deprecation_retired` marker in `properties` (the hierarchical `deprecate_workflow`); `revive_workflow_deprecation_retired` undoes a marked retirement when a later generation or `add_step` reuses the claim, and the caller re-embeds it
 - **`ClaimRepository::consolidate_act_conn`** — `SET supersedes = $1, is_current = false, embedding = NULL, embedding_3072 = NULL` (mode `merge` only: `abstract` retires nothing, and `identity` goes through `mark_duplicate_act` below)
 - **`mark_duplicate_act`** (free fn behind `ClaimRepository::mark_duplicate_act_conn` / `mark_duplicate_with_repair_conn`) — `SET supersedes = $1, is_current = false, embedding = NULL,`
 

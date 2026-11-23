@@ -2002,15 +2002,15 @@ async fn refuse_a_live_row_left_behind(
 ///   transaction.
 /// * Only what changed is reported.
 ///
-/// KNOWN LIMITATION (follow-up, not fixed here): a retired level 0-2 claim is
-/// not revived when a later generation (`improve_workflow_hierarchy`) or
-/// `add_step` reuses its exact text. The claim id depends only on the text and
-/// the `canonical_name`, the executor's dedup-by-id skips an existing row, and
-/// `add_step` inserts with `ON CONFLICT (id) DO NOTHING`. So the new live
-/// workflow executes a claim that has `is_current = false` and no embeddings.
-/// A correct revival has to tell this deprecation's retirements apart from an
-/// `evolve_step` supersede, which also sets `is_current = false` on purpose,
-/// so it needs a retirement marker and touches the shared executor.
+/// A retired claim is MARKED (`ClaimRepository::retire_for_workflow_deprecation`
+/// records the truth value it had), because the claim id depends only on the
+/// text and the `canonical_name`: a later generation
+/// (`improve_workflow_hierarchy`) or `add_step` that reuses the exact text
+/// reuses this row. The shared executor and `add_step` revive a marked claim
+/// they reuse (current again, its truth value back, re-embedded by the
+/// caller), so the new live workflow does not execute a retired, unembedded
+/// step (backlog 1767f2ae). An `evolve_step` supersede leaves no marker and
+/// is never revived.
 async fn deprecate_hierarchical_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -2137,7 +2137,7 @@ async fn deprecate_hierarchical_workflow(
                 row_kept.push(c.id.to_string());
                 continue;
             }
-            let n = ClaimRepository::deprecate_claim_if_current(
+            let n = ClaimRepository::retire_for_workflow_deprecation(
                 &mut *tx,
                 epigraph_core::ClaimId::from_uuid(c.id),
             )

@@ -11235,7 +11235,10 @@ impl ClaimRepository {
     /// nulled in the same statement, CLAUDE.md "Cleanup paths"), restricted to
     /// a row that is still current, so `rows_affected` means "this call retired
     /// it". `deprecate_workflow` reports only claims whose state changed
-    /// (U017; backlog fe874d2a): a re-run must report nothing.
+    /// (U017; backlog fe874d2a): a re-run must report nothing. Its flat
+    /// (claim-id) path calls this; the hierarchical path calls
+    /// [`Self::retire_for_workflow_deprecation`], which also marks the
+    /// retirement for a later revival.
     ///
     /// # Errors
     /// Returns `DbError` if the statement fails, including a `42501` refusal
@@ -11255,6 +11258,78 @@ impl ClaimRepository {
         .execute(executor)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    /// The `properties` key [`Self::retire_for_workflow_deprecation`] writes
+    /// and [`Self::revive_workflow_deprecation_retired`] reads and removes.
+    pub const WORKFLOW_DEPRECATION_RETIRED_KEY: &'static str = "workflow_deprecation_retired";
+
+    /// [`Self::deprecate_claim_if_current`] for a hierarchical workflow's
+    /// deprecation, which also MARKS the retirement: `properties` gains
+    /// [`Self::WORKFLOW_DEPRECATION_RETIRED_KEY`] holding the truth value the
+    /// claim had, so a later generation (or `add_step`) that reuses the claim's
+    /// exact text can tell this retirement apart from an `evolve_step`
+    /// supersede (which also sets `is_current = false`, on purpose, with no
+    /// marker) and revive it (backlog 1767f2ae).
+    ///
+    /// # Errors
+    /// As [`Self::deprecate_claim_if_current`].
+    pub async fn retire_for_workflow_deprecation<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: ClaimId,
+    ) -> Result<u64, DbError> {
+        let uuid: Uuid = id.into();
+        let result = sqlx::query(
+            "UPDATE claims \
+             SET truth_value = 0.05, is_current = false, embedding = NULL, \
+                 embedding_3072 = NULL, updated_at = NOW(), \
+                 properties = COALESCE(properties, '{}'::jsonb) \
+                     || jsonb_build_object($2::text, \
+                                           jsonb_build_object('truth_value', truth_value)) \
+             WHERE id = $1 AND is_current",
+        )
+        .bind(uuid)
+        .bind(Self::WORKFLOW_DEPRECATION_RETIRED_KEY)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Undo [`Self::retire_for_workflow_deprecation`] for a claim a live
+    /// workflow is about to execute again: `is_current = true`, the recorded
+    /// truth value back, the marker removed. `true` when this call revived it.
+    ///
+    /// Only a MARKED, non-current claim that names no claim it was retired
+    /// into (its own `supersedes` is NULL) and has no successor (no claim
+    /// `supersedes` it) is revived, so a claim an `evolve_step` superseded,
+    /// one a later `mark_duplicate` or consolidation folded into another claim
+    /// (both write the target into the retired row's own `supersedes`, and
+    /// leave the marker in place), or one retired by any other path, stays
+    /// retired. The vectors were nulled at retirement; the caller re-embeds
+    /// the revived claim.
+    ///
+    /// # Errors
+    /// Returns `DbError` if the statement fails, including a `42501` refusal
+    /// by `claims_tenancy`'s `WITH CHECK` on a session that may not write it.
+    pub async fn revive_workflow_deprecation_retired<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        id: Uuid,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE claims c \
+             SET is_current = true, \
+                 truth_value = (c.properties -> $2::text ->> 'truth_value')::float8, \
+                 properties = c.properties - $2::text, \
+                 updated_at = NOW() \
+             WHERE c.id = $1 AND NOT c.is_current AND c.supersedes IS NULL \
+               AND (c.properties -> $2::text ->> 'truth_value') IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM claims s WHERE s.supersedes = c.id)",
+        )
+        .bind(id)
+        .bind(Self::WORKFLOW_DEPRECATION_RETIRED_KEY)
+        .execute(executor)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Update labels on a claim by adding and/or removing labels atomically.

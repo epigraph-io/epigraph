@@ -1,7 +1,8 @@
 //! Step manipulation primitives for hierarchical workflows.
 //!
 //! - [`add_step`] appends or middle-inserts a step claim under an existing
-//!   workflow. Idempotent on `(canonical_name, step_text)`.
+//!   workflow. Idempotent on `(canonical_name, step_text)`; a reused text a
+//!   workflow deprecation retired is revived.
 //! - [`delete_step`] soft-deletes a step lineage by setting the head claim's
 //!   `truth_value` to 0.05.
 //!
@@ -52,9 +53,11 @@ pub struct AddStepResult {
     /// re-add); the existing position/lineage_id are returned and the chain
     /// is not rewired.
     pub already_present: bool,
-    /// Content of the step claim if this call inserted a new row;
-    /// `None` if the step was already present (idempotent re-add). The
-    /// caller embeds when `Some(_)`; see CLAUDE.md "Embedding policy".
+    /// Content of the step claim when this call put it into the plan: a new
+    /// row, or an existing one (a reused text, revived if a workflow
+    /// deprecation had retired it). `None` if the step was already present
+    /// (idempotent re-add). The caller embeds when `Some(_)`; see CLAUDE.md
+    /// "Embedding policy".
     pub inserted_content: Option<String>,
     /// `true` only when THIS call's INSERT created the step claim row. `false`
     /// for an idempotent re-add, and also when the step was spliced into the
@@ -323,6 +326,89 @@ fn plan_placement(append: bool, plan: &PlanEdges) -> Option<u32> {
         .filter(|k| *k <= PLAN_INDEX_MAX)
 }
 
+/// Whether a workflow other than `workflow_id` executes both `prev` and
+/// `next` (retracted `executes` edges included), so that the `prev -> next`
+/// `step_follows` edge is part of that workflow's chain too.
+async fn pair_executed_elsewhere(
+    conn: &mut sqlx::PgConnection,
+    workflow_id: Uuid,
+    prev: Uuid,
+    next: Uuid,
+) -> Result<bool, StepOpError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM edges p \
+             JOIN edges n ON n.source_id = p.source_id \
+                         AND n.source_type = 'workflow' \
+                         AND n.relationship = 'executes' \
+                         AND n.target_id = $3 \
+             WHERE p.source_type = 'workflow' AND p.relationship = 'executes' \
+               AND p.target_id = $2 AND p.source_id <> $1)",
+    )
+    .bind(workflow_id)
+    .bind(prev)
+    .bind(next)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Remove every `prev -> next` `step_follows` edge for a mid-chain insert, or
+/// refuse with [`StepOpError::ChainRewireRefused`] when row security let the
+/// session remove fewer of them than it can see.
+async fn remove_follows_pair(
+    conn: &mut sqlx::PgConnection,
+    prev: Uuid,
+    next: Uuid,
+) -> Result<(), StepOpError> {
+    // Every prev -> next row the session can see, RETRACTED ones included:
+    // `ordered_steps` (and every plan-order reader) counts a retracted
+    // `step_follows` too (no `valid_to` filter), so a surviving retracted
+    // row would still fork the chain and send the order back to plan_index.
+    let existing_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM edges \
+         WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
+    )
+    .bind(prev)
+    .bind(next)
+    .fetch_all(&mut *conn)
+    .await?;
+    let existing = i64::try_from(existing_ids.len()).unwrap_or(i64::MAX);
+    // Migration 120: the rewire DELETEs these rows, so it withdraws them.
+    // Their edge-keyed BBA cleanup (the session's own now, any other
+    // writer's deferred to the maintenance replay) is recorded BEFORE the
+    // DELETE, while the rows still exist. A row the session does not own is
+    // left to the refusal below, which rolls the whole act back.
+    for id in &existing_ids {
+        epigraph_db::EdgeRepository::withdraw_edge_bbas_conn(
+            &mut *conn,
+            *id,
+            epigraph_db::EdgeWithdrawal::BeingDeleted,
+            None,
+            epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
+        )
+        .await?;
+    }
+    let removable = sqlx::query(
+        "DELETE FROM edges \
+         WHERE source_id = $1 AND target_id = $2 \
+           AND relationship = 'step_follows'",
+    )
+    .bind(prev)
+    .bind(next)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    if i64::try_from(removable).unwrap_or(i64::MAX) < existing {
+        return Err(StepOpError::ChainRewireRefused {
+            prev,
+            next,
+            existing,
+            removable,
+        });
+    }
+    Ok(())
+}
+
 // ── add_step ────────────────────────────────────────────────────────────────
 
 /// Append (`position` `None` or past the end) or insert a step at slot
@@ -437,53 +523,19 @@ pub async fn add_step(
     // forks the chain. The count is of the edges the session can SEE (it walked
     // the chain through them); a chain inferred from orphan order has none, and
     // then nothing needs removing.
+    //
+    // Unless ANOTHER workflow row executes both `prev` and `next`. Step claims
+    // are content-addressed per `canonical_name`, not per generation, so two
+    // generations that keep the same adjacent steps share their one
+    // `prev -> next` edge, and deleting it here broke the other generation's
+    // chain (backlog 14335111): its readers saw the two steps unlinked and
+    // could reorder its plan. Then the edge is KEPT: the readers drop a pair
+    // implied by a longer path (`order_by_step_follows`), so this generation
+    // reads `prev -> step -> next` and the other still reads `prev -> next`.
     let rewire = if !chain.is_empty() && position > 0 && position < chain.len() {
         let (prev, next) = (chain[position - 1], chain[position]);
-        // Every prev -> next row the session can see, RETRACTED ones included:
-        // `ordered_steps` (and every plan-order reader) counts a retracted
-        // `step_follows` too (no `valid_to` filter), so a surviving retracted
-        // row would still fork the chain and send the order back to plan_index.
-        let existing_ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM edges \
-             WHERE source_id = $1 AND target_id = $2 AND relationship = 'step_follows'",
-        )
-        .bind(prev)
-        .bind(next)
-        .fetch_all(&mut *conn)
-        .await?;
-        let existing = i64::try_from(existing_ids.len()).unwrap_or(i64::MAX);
-        // Migration 120: the rewire DELETEs these rows, so it withdraws them.
-        // Their edge-keyed BBA cleanup (the session's own now, any other
-        // writer's deferred to the maintenance replay) is recorded BEFORE the
-        // DELETE, while the rows still exist. A row the session does not own is
-        // left to the refusal below, which rolls the whole act back.
-        for id in &existing_ids {
-            epigraph_db::EdgeRepository::withdraw_edge_bbas_conn(
-                &mut *conn,
-                *id,
-                epigraph_db::EdgeWithdrawal::BeingDeleted,
-                None,
-                epigraph_db::EDGE_RETRACT_DEFERRAL_REASON,
-            )
-            .await?;
-        }
-        let removable = sqlx::query(
-            "DELETE FROM edges \
-             WHERE source_id = $1 AND target_id = $2 \
-               AND relationship = 'step_follows'",
-        )
-        .bind(prev)
-        .bind(next)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
-        if i64::try_from(removable).unwrap_or(i64::MAX) < existing {
-            return Err(StepOpError::ChainRewireRefused {
-                prev,
-                next,
-                existing,
-                removable,
-            });
+        if !pair_executed_elsewhere(&mut *conn, workflow_id, prev, next).await? {
+            remove_follows_pair(&mut *conn, prev, next).await?;
         }
         Some((prev, next))
     } else {
@@ -552,6 +604,23 @@ pub async fn add_step(
     .rows_affected()
         == 1;
 
+    // The claim already existed (its id is content-addressed per workflow
+    // name): its own `step_lineage_id` is the step's, not the fresh one the
+    // INSERT did not write, and a claim a workflow deprecation retired is
+    // revived, so the plan does not execute a retired, unembedded step
+    // (backlog 1767f2ae). The caller embeds `inserted_content` either way.
+    let step_lineage = if claim_created {
+        step_lineage
+    } else {
+        crate::workflow::revive_deprecation_retired(&mut *conn, step_claim_id).await?;
+        sqlx::query_scalar::<_, Option<Uuid>>("SELECT step_lineage_id FROM claims WHERE id = $1")
+            .bind(step_claim_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .flatten()
+            .unwrap_or(step_lineage)
+    };
+
     let executes_properties = match plan_index {
         Some(k) => serde_json::json!({"level": 2, "plan_index": k}),
         None => serde_json::json!({"level": 2}),
@@ -613,7 +682,8 @@ pub async fn add_step(
             )
             .await?;
         } else if let Some((prev, next)) = rewire {
-            // `prev -> next` was removed (and verified) above.
+            // `prev -> next` was removed (and verified) above, or kept for
+            // another generation that still executes both.
             epigraph_db::EdgeRepository::create_if_not_exists_signed_conn(
                 &mut *conn,
                 key,
