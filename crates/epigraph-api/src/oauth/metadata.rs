@@ -1,7 +1,10 @@
-//! OAuth 2.0 discovery documents: RFC 8414 (authorization server metadata)
-//! and RFC 9728 (protected resource metadata). Pure functions of public_base_url.
+//! OAuth 2.0 discovery documents: RFC 8414 (authorization server metadata),
+//! RFC 9728 (protected resource metadata) and the RFC 7517 JWK Set of the
+//! kernel's token-signing key. Pure functions of public_base_url and the
+//! JWT config.
 
 use axum::{extract::State, response::Json};
+use jsonwebtoken::jwk::JwkSet;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -9,7 +12,7 @@ use crate::state::AppState;
 /// RFC 8414 — GET /.well-known/oauth-authorization-server
 pub async fn authorization_server_metadata(State(state): State<AppState>) -> Json<Value> {
     let base = state.config.public_base_url.trim_end_matches('/');
-    Json(json!({
+    let mut doc = json!({
         "issuer": base,
         "authorization_endpoint": format!("{base}/oauth/authorize"),
         "token_endpoint": format!("{base}/oauth/token"),
@@ -38,7 +41,22 @@ pub async fn authorization_server_metadata(State(state): State<AppState>) -> Jso
             "edges:read", "edges:write", "agents:read", "analysis:belief",
             "analysis:propagation", "ingest:write"
         ]
-    }))
+    });
+    // Only a kernel that signs EdDSA has a key to publish; an HS256 kernel's
+    // shared secret never is.
+    if !state.jwt_config.jwks().keys.is_empty() {
+        doc["jwks_uri"] = json!(format!("{base}/.well-known/jwks.json"));
+    }
+    Json(doc)
+}
+
+/// RFC 7517 — GET /.well-known/jwks.json: the PUBLIC half of the kernel's
+/// Ed25519 token-signing key (and any other key it verifies with), so a
+/// federation extension verifies kernel tokens without holding anything that
+/// can mint one (`epigraph_auth::JwtConfig::verifier_from_jwks`). Empty
+/// `keys` while the kernel still signs HS256.
+pub async fn jwks_document(State(state): State<AppState>) -> Json<JwkSet> {
+    Json(state.jwt_config.jwks())
 }
 
 /// RFC 9728 — GET /.well-known/oauth-protected-resource

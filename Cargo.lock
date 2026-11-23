@@ -1486,9 +1486,13 @@ dependencies = [
 name = "epigraph-auth"
 version = "0.3.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
+ "hex",
  "jsonwebtoken",
  "serde",
+ "serde_json",
  "toml",
  "uuid",
 ]

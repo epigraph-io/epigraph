@@ -36,6 +36,13 @@ closed set by design.
   forwarding the bearer gives it no authority it does not already have. The
   rule that follows: **mount only an extension you operate and would trust
   with the kernel's signing secret**, and never mount a third-party one.
+  Backlog `7b834860` adds the asymmetric path: with
+  `EPIGRAPH_JWT_SIGNING_KEY` the kernel signs EdDSA and serves
+  `/.well-known/jwks.json`, and an extension built on
+  `JwtConfig::verifier_from_jwks` verifies without being able to mint. The
+  caveat holds until a deployment has set the key and removed
+  `EPIGRAPH_JWT_SECRET` from every extension (`docs/deploy.md`, "Token
+  signing keys").
   The fix (backlog `c9b82fae`; design
   `docs/superpowers/specs/2026-09-26-episcience-operator-authority-design.md`
   section 2 and section 6 item 6) is an RFC 8693 token-exchange grant at

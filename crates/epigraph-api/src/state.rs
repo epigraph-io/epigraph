@@ -2025,16 +2025,24 @@ impl AppState {
         }
     }
 
-    /// Default JWT config from env var or dev fallback.
+    /// Default JWT config from the environment
+    /// ([`epigraph_auth::JwtConfig::from_kernel_env`]): EdDSA when
+    /// `EPIGRAPH_JWT_SIGNING_KEY` is set (with `EPIGRAPH_JWT_SECRET`, if set,
+    /// as the accept-only HS256 window), else HS256 from the secret or the
+    /// dev fallback.
     fn default_jwt_config() -> Arc<crate::oauth::JwtConfig> {
-        // NOTE: intentionally NOT fail-closed. This is called by test/builder
-        // constructors; the production gate lives in bin/server.rs::main behind
-        // EPIGRAPH_ALLOW_INSECURE_SECRET. See epigraph_auth::assert_production_secret.
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_else(|_| {
-            String::from_utf8(epigraph_auth::DEV_JWT_SECRET.to_vec())
-                .expect("DEV_JWT_SECRET is valid UTF-8")
-        });
-        Arc::new(crate::oauth::JwtConfig::from_secret(secret.as_bytes()))
+        // NOTE: the dev fallback is intentionally NOT fail-closed. This is
+        // called by test/builder constructors; the production gate lives in
+        // bin/server.rs::main (`epigraph_auth::check_kernel_jwt_keys`), which
+        // refuses a malformed signing key before any state is built, so the
+        // panic below is unreachable from the server binary. A malformed key
+        // must never fall back to shared-secret signing.
+        let signing_key = std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR).ok();
+        let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
+        let config =
+            crate::oauth::JwtConfig::from_kernel_env(signing_key.as_deref(), secret.as_deref())
+                .unwrap_or_else(|reason| panic!("FATAL: {reason}"));
+        Arc::new(config)
     }
 
     /// The admin-scope switch for one request (elevation plan EL-10): read on

@@ -101,7 +101,7 @@ const PUBLIC_ALLOWLIST: &[&str] = &["/health", "/api/v1/openapi.json"];
 /// server started with `EPIGRAPH_GUEST_READS=on` (a bare 404 otherwise).
 /// Their own tests are `tests/guest_public_reads.rs`.
 ///
-/// Eighteen application routes + the 11 OAuth/discovery routes = 29 paths
+/// Eighteen application routes + the 12 OAuth/discovery routes = 30 paths
 /// reachable with no `Authorization` header.
 const PUBLIC_ALLOWLIST_DB: &[&str] = &[
     "/health",
@@ -138,9 +138,12 @@ const OAUTH_ALLOWLIST_DB: &[&str] = &[
     "/oauth/:provider/exchange",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
+    // The PUBLIC half of the kernel's token-signing key (backlog 7b834860):
+    // a federation extension verifies kernel tokens with it and cannot mint.
+    "/.well-known/jwks.json",
 ];
 
-/// The OAuth router of the `not(db)` variant is **9** routes, not 11: it lacks
+/// The OAuth router of the `not(db)` variant is **10** routes, not 12: it lacks
 /// `/oauth/callback` and `/oauth/authorize/consent`. That divergence predates
 /// PR-03 and is asserted rather than fixed — closing it would mean adding
 /// handlers to a configuration that is check-only (ruling R-39).
@@ -154,6 +157,9 @@ const OAUTH_ALLOWLIST_NO_DB: &[&str] = &[
     "/oauth/:provider/exchange",
     "/.well-known/oauth-authorization-server",
     "/.well-known/oauth-protected-resource",
+    // The PUBLIC half of the kernel's token-signing key (backlog 7b834860):
+    // a federation extension verifies kernel tokens with it and cannot mint.
+    "/.well-known/jwks.json",
 ];
 
 // ---------------------------------------------------------------------------
@@ -725,6 +731,7 @@ async fn discovery_endpoints_still_answer_anonymously() {
     for path in [
         "/.well-known/oauth-authorization-server",
         "/.well-known/oauth-protected-resource",
+        "/.well-known/jwks.json",
     ] {
         let resp = client
             .get(format!("http://{addr}{path}"))

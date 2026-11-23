@@ -290,6 +290,7 @@ The minimum production environment for `server`:
 ```ini
 DATABASE_URL=postgres://epigraph_api_login:<secret>@<host>:5432/epigraph
 EPIGRAPH_JWT_SECRET=<at least 32 random bytes>
+# EPIGRAPH_JWT_SIGNING_KEY=<64 hex characters>  # Ed25519; see "Token signing keys" below
 EPIGRAPH_PUBLIC_BASE_URL=https://<your-host>
 EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
 # OPENAI_API_KEY=<key>            # semantic search and embedding on write
@@ -339,7 +340,39 @@ EPIGRAPH_PROVIDERS_CONFIG=<path to providers.toml>
   application port. See section 7.
 - **The JWT secret is shared** by the API and every HTTP MCP unit (`--jwt-secret`
   / `EPIGRAPH_JWT_SECRET`): one signs, both verify. To rotate it, restart
-  both with the new value.
+  both with the new value. Whoever holds it can mint any kernel token, so a
+  federation extension should not; see "Token signing keys".
+- **Token signing keys.** With `EPIGRAPH_JWT_SIGNING_KEY` (an Ed25519 seed,
+  64 hex characters, e.g. `openssl rand -hex 32`) the API signs every token
+  EdDSA and serves the public key at `GET /.well-known/jwks.json` (also
+  `jwks_uri` in `/.well-known/oauth-authorization-server`). The HTTP MCP
+  units and any extension verify with that document (`--jwt-jwks` /
+  `EPIGRAPH_JWT_JWKS` here, `epigraph_auth::JwtConfig::verifier_from_jwks`
+  in an extension) and hold nothing that can mint. Beside the key,
+  `EPIGRAPH_JWT_SECRET` is only an accept window for HS256 tokens minted
+  before the switch; it never signs. A malformed key refuses boot, even
+  under `EPIGRAPH_ALLOW_INSECURE_SECRET`. To move an HS256 deployment:
+  1. Deploy every verifier able to read a JWKS first (the HTTP MCP units
+     with `--jwt-jwks` beside `--jwt-secret`; each extension with its JWKS
+     verifier plus the HS256 window), with the JWKS of the key you are about
+     to set (start a scratch API with the key and read
+     `/.well-known/jwks.json`).
+  2. Set `EPIGRAPH_JWT_SIGNING_KEY` on the API, keeping `EPIGRAPH_JWT_SECRET`
+     as the window, and restart it. New tokens are EdDSA.
+  3. After the longest access-token lifetime (one hour), remove
+     `EPIGRAPH_JWT_SECRET` from the API, every MCP unit and every extension,
+     and restart them. Only now can an extension no longer mint a kernel
+     token. Rotate the old secret out of every store that held it.
+
+  To rotate the Ed25519 key, first give every verifier a JWKS holding BOTH
+  keys (join the two documents' `keys` arrays; a verifier accepts any key
+  in its set), then restart the API on the new key, and drop the old key
+  from the verifiers an hour later. A verifier holding only the new key
+  while the API still signs with the old one refuses every fresh token. The
+  API itself verifies only its current key, so tokens it signed with the old
+  one stop working on its own routes when it restarts; clients refresh.
+  In a systemd `EnvironmentFile`, wrap the JWKS value in single quotes:
+  bare double quotes are stripped, and the mangled value then refuses boot.
 - **Never set `MAINTENANCE_DATABASE_URL`** in this unit's environment. Watch
   out for a `.env` file in its working directory too: the server loads one if
   it exists.
@@ -382,7 +415,9 @@ EPIGRAPH_PUBLIC_BASE_URL=https://<your-host> \
     --allowed-host <public MCP host name>
 ```
 
-- A TCP `--listen` address requires `--jwt-secret`. A `unix:/abs/path`
+- A TCP `--listen` address requires `--jwt-secret`, or `--jwt-jwks`
+  (`EPIGRAPH_JWT_JWKS`, the API's `/.well-known/jwks.json`) when the API
+  signs EdDSA; see "Token signing keys". A `unix:/abs/path`
   listener may use `--allow-unauthenticated-http` instead, because its file
   permissions are the trust gate; TCP may not.
 - An `--allow-unauthenticated-http` listener reads PUBLIC rows only. No
@@ -483,7 +518,8 @@ For the others, anything else is off.
 |---|---|---|
 | `DATABASE_URL` | — (required) | The application DSN. A missing value panics with `DATABASE_URL must be set when running with db feature`. |
 | `MAINTENANCE_DATABASE_URL` | must be unset | Set (and non-blank) → exit 1 before anything else. |
-| `EPIGRAPH_JWT_SECRET` | — | HMAC secret for access tokens, at least 32 bytes and not the committed development literal, or the server exits 1 with `FATAL: ...`. |
+| `EPIGRAPH_JWT_SECRET` | — | HMAC secret for access tokens, at least 32 bytes and not the committed development literal, or the server exits 1 with `FATAL: ...`. Beside `EPIGRAPH_JWT_SIGNING_KEY` it only ACCEPTS HS256 tokens (the migration window) and may be unset. |
+| `EPIGRAPH_JWT_SIGNING_KEY` | unset | Ed25519 seed, 64 hex characters. Set → every token is signed EdDSA and the public key is served at `/.well-known/jwks.json`. Malformed → exit 1, even with `EPIGRAPH_ALLOW_INSECURE_SECRET`. See "Token signing keys". |
 | `EPIGRAPH_ALLOW_INSECURE_SECRET` | off | `1`/`true`/`yes` skips the JWT secret check. Local development and CI only. |
 | `EPIGRAPH_PROVIDERS_CONFIG` | `./providers.toml` | Path to the identity-provider file. Missing → startup panic. |
 | `EPIGRAPH_ENV` | unset = production | `development`, `dev`, `test`, `testing`, `local` or `ci` turn the empty-allowlist refusal into a warning. |
@@ -538,7 +574,8 @@ For the others, anything else is off.
 | `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY` (environment only) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. |
 | `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
-| `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | Required for a TCP `--listen`. At least 32 bytes. The same secret as the API. |
+| `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | A TCP `--listen` needs this or `--jwt-jwks`. At least 32 bytes. The same secret as the API. Beside `--jwt-jwks` it is the HS256 accept window. |
+| `--jwt-jwks` / `EPIGRAPH_JWT_JWKS` | unset | The API's `/.well-known/jwks.json`, for an API that signs EdDSA: verify-only by public key. A set that is not all Ed25519 keys is a boot error. |
 | `--allow-unauthenticated-http`, `--allow-unauthenticated-writes` | off | Unix-socket listeners only. Without `--allow-unauthenticated-writes` the listener is read-only and public-only (a zero-membership reader agent). With it, writes are authored by the listener's own unlinked signer, whose groups its callers also read. |
 | `--allowed-host` / `EPIGRAPH_MCP_ALLOWED_HOSTS` | — | Extra `Host`/`Origin` names for the HTTP listener. |
 | `--read-only` | off | Query tools only. |
@@ -4632,7 +4669,8 @@ Do not improvise it against a live database without that entry's context.
 | Symptom (exact text where the code emits one) | Cause and fix |
 |---|---|
 | `ERROR: MAINTENANCE_DATABASE_URL is set; a request-serving process never holds the maintenance DSN (operator decision D9). ...` | The API or an MCP unit has the maintenance DSN in its environment (an EnvironmentFile, `.env`, or an MCP client's env block). Remove it. |
-| `FATAL: EPIGRAPH_JWT_SECRET is empty. ...` / `... is N bytes; minimum is 32` / `... is the committed dev literal; refusing to start in production` | Set a real secret of at least 32 bytes. `EPIGRAPH_ALLOW_INSECURE_SECRET=1` is for development and CI only. |
+| `FATAL: EPIGRAPH_JWT_SECRET is empty. ...` / `... is N bytes; minimum is 32` / `... is the committed dev literal; refusing to start in production` | Set a real secret of at least 32 bytes, or `EPIGRAPH_JWT_SIGNING_KEY`. `EPIGRAPH_ALLOW_INSECURE_SECRET=1` is for development and CI only. |
+| `FATAL: EPIGRAPH_JWT_SIGNING_KEY is not hex. ...` / `... is N bytes; an Ed25519 seed is 32 (64 hex characters)` | Fix the key: 64 hex characters. The opt-out does not skip this check. |
 | `failed to build providers registry: "providers.toml not found at ..."` | Create `providers.toml` (empty is valid) or set `EPIGRAPH_PROVIDERS_CONFIG`. The template is `providers.toml.example`. |
 | `failed to build providers registry: "provider '...': auto_provision is enabled with no allowed_emails/allowed_domains ..."` | Populate the allowlists, or set `EPIGRAPH_ALLOW_ALL_IDENTITIES=true`. `EPIGRAPH_ENV` unset counts as production. |
 | `failed to build providers registry: ... env var GOOGLE_CLIENT_ID not set` | A configured provider names environment variables that are unset. |

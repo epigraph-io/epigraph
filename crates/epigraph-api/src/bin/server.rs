@@ -136,22 +136,31 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Fail-closed JWT secret gate. Prod refuses to boot with an unset/dev
-    // secret; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. The dev
+    // Fail-closed JWT key gate (`epigraph_auth::check_kernel_jwt_keys`).
+    // Prod refuses to boot with neither EPIGRAPH_JWT_SIGNING_KEY (Ed25519,
+    // EdDSA tokens) nor a real EPIGRAPH_JWT_SECRET (HS256, or the accept-only
+    // window beside a signing key), and with an unset/dev secret when it is
+    // the only key; dev/CI opt out with EPIGRAPH_ALLOW_INSECURE_SECRET=1. A
+    // malformed signing key refuses boot even under the opt-out. The dev
     // fallback in AppState::default_jwt_config is unchanged so the suite still
     // compiles and runs.
     let allow_insecure = std::env::var("EPIGRAPH_ALLOW_INSECURE_SECRET")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    if !allow_insecure {
-        let secret = std::env::var("EPIGRAPH_JWT_SECRET").unwrap_or_default();
-        if let Err(reason) = epigraph_auth::assert_production_secret(secret.as_bytes()) {
-            eprintln!(
-                "FATAL: {reason}. Set a real EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), \
-                 or set EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI."
-            );
-            std::process::exit(1);
-        }
+    if let Err(reason) = epigraph_auth::check_kernel_jwt_keys(
+        std::env::var(epigraph_auth::JWT_SIGNING_KEY_VAR)
+            .ok()
+            .as_deref(),
+        std::env::var("EPIGRAPH_JWT_SECRET").ok().as_deref(),
+        allow_insecure,
+    ) {
+        eprintln!(
+            "FATAL: {reason}. Set {} (64 hex characters, an Ed25519 seed) or a real \
+             EPIGRAPH_JWT_SECRET (>= 32 bytes, not the dev literal), or set \
+             EPIGRAPH_ALLOW_INSECURE_SECRET=1 for local dev/CI.",
+            epigraph_auth::JWT_SIGNING_KEY_VAR
+        );
+        std::process::exit(1);
     }
 
     // Rate limiting (backlog 966164c8), read once. Until this block the
