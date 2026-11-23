@@ -837,3 +837,93 @@ async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless_after_the_
         "without the trigger the decision proceeds and the edge rewires: {control:?}"
     );
 }
+
+/// The post-delete duplicate arm of the targeted rewire: a second live row
+/// on the edge that appears AFTER the decision counted one row at the key
+/// (`edge_shape`'s single statement) is found by the delete, which returns
+/// it, and the rewire rolls back: held `off_key_or_duplicate`, the edge's
+/// rows and the target's cache exactly as before, and the late row gone
+/// with the rolled-back transaction (it never committed).
+///
+/// The late row is planted by a wrapper around `epigraph_claim_is_compound`,
+/// which `edge_shape` calls: it inserts the row once, and only inside a
+/// transaction that already holds an xid (the rewire's `FOR SHARE` / `FOR
+/// UPDATE`), never on an autocommit read. `edge_shape`'s count subqueries
+/// read the statement's snapshot, so the decision does not see it; the
+/// DELETE, a later statement, does. The row is on a second frame, so the
+/// decision's binary-frame folds are unchanged and it proceeds. The control
+/// restores the function and the same edge rewires.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_holds_a_row_that_appeared_between_the_decision_and_the_delete(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-shape-dup", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    let other_frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("cal4-late-dup-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("second frame");
+    sqlx::query(
+        "ALTER FUNCTION public.epigraph_claim_is_compound(uuid) \
+         RENAME TO test_orig_claim_is_compound",
+    )
+    .execute(&pool)
+    .await
+    .expect("set the definer aside");
+    sqlx::query(&format!(
+        "CREATE FUNCTION public.epigraph_claim_is_compound(p_claim_id uuid) RETURNS boolean \
+         LANGUAGE plpgsql VOLATILE AS $f$ \
+         BEGIN \
+           IF pg_catalog.pg_current_xact_id_if_assigned() IS NOT NULL \
+              AND pg_catalog.current_setting('test.late_dup', true) IS DISTINCT FROM 'planted' THEN \
+             PERFORM pg_catalog.set_config('test.late_dup', 'planted', true); \
+             INSERT INTO public.mass_functions (claim_id, frame_id, source_agent_id, \
+                 perspective_id, masses, combination_method, source_strength, evidence_type, \
+                 locality_tag) \
+             VALUES ('{target}'::uuid, '{other_frame}'::uuid, '{author}'::uuid, '{edge}'::uuid, \
+                     '{masses}'::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross'); \
+           END IF; \
+           RETURN public.test_orig_claim_is_compound(p_claim_id); \
+         END $f$",
+        target = w.target,
+        author = w.author,
+        edge = w.edge,
+        masses = STALE_PRE_401,
+    ))
+    .execute(&pool)
+    .await
+    .expect("planting wrapper");
+    let before = footprint(&pool, &w).await;
+    assert_eq!(before.0.len(), 1, "PREMISE: one row on the edge");
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row, target cache and updated_at unchanged; the late row rolled back"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::OffKeyOrDuplicate);
+
+    sqlx::query("DROP FUNCTION public.epigraph_claim_is_compound(uuid)")
+        .execute(&pool)
+        .await
+        .expect("drop the wrapper");
+    sqlx::query(
+        "ALTER FUNCTION public.test_orig_claim_is_compound(uuid) \
+         RENAME TO epigraph_claim_is_compound",
+    )
+    .execute(&pool)
+    .await
+    .expect("restore the definer");
+    let (control, _) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the late row the decision proceeds and the edge rewires: {control:?}"
+    );
+}
