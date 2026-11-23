@@ -782,18 +782,321 @@ async fn http_refuses_profile_path_and_reads_inline_json(pool: PgPool) {
     assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
 }
 
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_profile_claim_id_is_refused_as_deferred(pool: PgPool) {
-    let bytes = profile_bytes();
-    let server = superuser_server(&pool, config(None, None, 5000)).await;
-    let (_caller, auth, viewer) = seed_caller(&pool, &["claims:read"]).await;
-    let mut p = plan_params_json(&bytes, DEDUP);
-    plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
-    p.profile_claim_id = Some(Uuid::new_v4().to_string());
-    let err = plan_label_dedup(&server, &viewer, p, Some(&auth))
+/// [`plan_params_json`]'s call, reading the profile from the stored claim `id`.
+fn plan_params_claim(id: &str, hash: &str, sections: &[&str]) -> PlanLabelDedupParams {
+    PlanLabelDedupParams {
+        profile_path: None,
+        profile_json: None,
+        profile_claim_id: Some(id.to_string()),
+        profile_hash: hash.to_string(),
+        run_tag: RUN_TAG.to_string(),
+        as_of: Some(AS_OF.to_string()),
+        sections: s(sections),
+        max_claims: None,
+    }
+}
+
+/// Store `bytes` as a claim through `submit_claim` itself (the server's own
+/// identity, public), so the stored content is exactly what the real write
+/// path keeps. Returns the claim id.
+async fn store_profile_claim(server: &EpiGraphMcpFull, pool: &PgPool, bytes: &[u8]) -> String {
+    let viewer = fixture::public_viewer(pool).await;
+    let out = first_text(
+        &epigraph_mcp::tools::claims::submit_claim(
+            server,
+            &viewer,
+            epigraph_mcp::types::SubmitClaimParams {
+                content: String::from_utf8(bytes.to_vec()).expect("utf8"),
+                methodology: "direct_observation".into(),
+                evidence_data: "label-dedup profile fixture".into(),
+                evidence_type: "logical".into(),
+                confidence: 0.8,
+                source_url: None,
+                reasoning: None,
+                labels: s(&["label-dedup-profile"]),
+                novelty_threshold: None,
+                visibility: Some("public".to_string()),
+                group_id: None,
+                dataset: None,
+            },
+            None,
+        )
         .await
-        .expect_err("deferred");
-    assert_eq!(code(&err), "PROFILE_CLAIM_DEFERRED", "{err:?}");
+        .expect("store the profile claim"),
+    );
+    out["claim_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no claim_id: {out}"))
+        .to_string()
+}
+
+/// Over HTTP, `profile_claim_id` loads the profile stored in a claim the
+/// caller can read, stored through `submit_claim` (backlog 2f1671b1): the
+/// same bytes give the same profile hash and the same plan hash as inline
+/// `profile_json`, and the plan records the claim it came from. The claim's
+/// bytes are pinned by `profile_hash` like every other source; a malformed
+/// id, two sources, a missing claim and another group's private claim are
+/// each refused with their own code, and missing and unreadable read alike.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_reads_a_profile_stored_as_a_claim_pinned_by_its_hash(pool: PgPool) {
+    let bytes = profile_bytes();
+    let hash = profile_hash(&bytes);
+    let server = superuser_server(&pool, config(None, None, 5000)).await;
+    let (caller, auth, viewer) = seed_caller(&pool, &["claims:write"]).await;
+    let caller_group = personal_group_of(&pool, caller).await;
+    let stored = store_profile_claim(&server, &pool, &bytes).await;
+    for (content, created) in [
+        (PUMP_A, "2026-10-01T00:00:00Z"),
+        (PUMP_C, "2026-09-01T00:00:00Z"),
+    ] {
+        seed(
+            &pool,
+            caller,
+            caller_group,
+            "public",
+            content,
+            &[FAMILY],
+            created,
+        )
+        .await;
+    }
+
+    let inline = plan_ok(
+        &server,
+        &viewer,
+        plan_params_json(&bytes, DEDUP),
+        Some(&auth),
+    )
+    .await;
+    let p = plan_params_claim(&stored, &hash, DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), Some(&auth)).await;
+    assert_eq!(plan["profile_hash"], hash, "{plan}");
+    assert_eq!(
+        plan["plan_hash"], inline["plan_hash"],
+        "the stored bytes plan exactly as the same bytes inline: {plan}"
+    );
+    assert_eq!(
+        plan["profile_source"],
+        json!({"kind": "claim", "claim_id": stored}),
+        "{plan}"
+    );
+    assert_eq!(
+        inline["profile_source"],
+        json!({"kind": "inline"}),
+        "{inline}"
+    );
+    assert_eq!(plan["clusters"].as_array().map(Vec::len), Some(1), "{plan}");
+
+    // Apply re-reads the claim and writes, recording the same source.
+    let out = apply_ok(
+        &server,
+        &viewer,
+        apply_params(&p, &plan_hash(&plan)),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(out["status"], "applied", "{out}");
+    assert_eq!(out["counts"]["marks"], 1, "{out}");
+    assert_eq!(out["profile_source"], plan["profile_source"], "{out}");
+
+    // Probe takes the same source.
+    let probe = first_text(
+        &probe_label_dedup(
+            &server,
+            &viewer,
+            ProbeLabelDedupParams {
+                profile_path: None,
+                profile_json: None,
+                profile_claim_id: Some(stored.clone()),
+                profile_hash: hash.clone(),
+                candidates: vec![LabelDedupCandidateParam {
+                    key: "same".into(),
+                    content: PUMP_B.into(),
+                    labels: s(&[FAMILY]),
+                }],
+                include_closed_signals: false,
+                max_claims: None,
+            },
+            Some(&auth),
+        )
+        .await
+        .expect("probe from a stored profile"),
+    );
+    assert_eq!(probe["verdicts"][0]["verdict"], "match", "{probe}");
+
+    // The stored bytes are checked against profile_hash.
+    let err = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_claim(&stored, &profile_hash(&profile_bytes_respaced()), DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("a stored profile that does not hash to profile_hash");
+    assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
+
+    // Exactly one source.
+    let mut both = plan_params_json(&bytes, DEDUP);
+    both.profile_claim_id = Some(stored.clone());
+    let err = plan_label_dedup(&server, &viewer, both, Some(&auth))
+        .await
+        .expect_err("two sources");
+    assert_eq!(code(&err), "PROFILE_SOURCE_REQUIRED", "{err:?}");
+
+    let err = plan_label_dedup(
+        &server,
+        &viewer,
+        plan_params_claim("not-a-uuid", &hash, DEDUP),
+        Some(&auth),
+    )
+    .await
+    .expect_err("a malformed claim id");
+    assert_eq!(code(&err), "INVALID_ARGUMENT", "{err:?}");
+
+    // Missing, and another group's private claim with the very same bytes:
+    // one answer, indistinguishable but for the id.
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "profile-owner").await;
+    let private = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "group",
+        std::str::from_utf8(&bytes).expect("utf8"),
+        &["label-dedup-profile"],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let missing = Uuid::new_v4();
+    let not_found = |id: Uuid| {
+        let (server, viewer, auth, hash) = (&server, &viewer, &auth, &hash);
+        async move {
+            plan_label_dedup(
+                server,
+                viewer,
+                plan_params_claim(&id.to_string(), hash, DEDUP),
+                Some(auth),
+            )
+            .await
+            .expect_err("no readable profile claim")
+        }
+    };
+    let (gone, hidden) = (not_found(missing).await, not_found(private).await);
+    assert_eq!(code(&gone), "PROFILE_NOT_FOUND", "{gone:?}");
+    assert_eq!(code(&hidden), "PROFILE_NOT_FOUND", "{hidden:?}");
+    assert_eq!(
+        gone.message.replace(&missing.to_string(), "X"),
+        hidden.message.replace(&private.to_string(), "X"),
+        "an unreadable profile claim is indistinguishable from a missing one"
+    );
+}
+
+/// On stdio the agent talking to the process must not choose its own
+/// profile, which is why inline JSON is refused there; a claim is something
+/// that agent can write. So `profile_claim_id` is read on stdio only when the
+/// process was started with a pin, and the pin is checked BEFORE the claim is
+/// read (backlog 2f1671b1). On an application-role server, the server agent's
+/// own GROUP-PRIVATE profile claim loads (only a stamped read sees it) and
+/// applies; a stranger's private claim with the same bytes is not found.
+#[sqlx::test(migrations = "../../migrations")]
+async fn stdio_reads_a_stored_profile_only_under_a_pin_and_as_its_own_viewer(pool: PgPool) {
+    let bytes = profile_bytes();
+    let hash = profile_hash(&bytes);
+    let (pinned, agent, group, viewer) =
+        app_role_server(&pool, config(None, Some(hash.as_str()), 5000)).await;
+    let (unpinned, _, _, _) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (other_pin, _, _, _) = app_role_server(
+        &pool,
+        config(
+            None,
+            Some(profile_hash(&profile_bytes_respaced()).as_str()),
+            5000,
+        ),
+    )
+    .await;
+    let text = std::str::from_utf8(&bytes).expect("utf8");
+    let mine = seed(
+        &pool,
+        agent,
+        group,
+        "group",
+        text,
+        &["label-dedup-profile"],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let (stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "profile-owner").await;
+    let theirs = seed(
+        &pool,
+        stranger,
+        stranger_group,
+        "group",
+        text,
+        &["label-dedup-profile"],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let survivor = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_A,
+        &[FAMILY],
+        "2026-10-01T00:00:00Z",
+    )
+    .await;
+    let loser = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        PUMP_C,
+        &[FAMILY],
+        "2026-09-01T00:00:00Z",
+    )
+    .await;
+
+    // No pin: refused, though the claim exists, is readable and matches.
+    let p = plan_params_claim(&mine.to_string(), &hash, DEDUP);
+    let err = plan_label_dedup(&unpinned, &viewer, p.clone(), None)
+        .await
+        .expect_err("stdio without a pin");
+    assert_eq!(code(&err), "PROFILE_CLAIM_REFUSED", "{err:?}");
+
+    // A pin that is not profile_hash: refused before any read, so even a
+    // claim id that names nothing answers HASH_MISMATCH, not NOT_FOUND.
+    let err = plan_label_dedup(
+        &other_pin,
+        &viewer,
+        plan_params_claim(&Uuid::new_v4().to_string(), &hash, DEDUP),
+        None,
+    )
+    .await
+    .expect_err("profile_hash is not the pin");
+    assert_eq!(code(&err), "PROFILE_HASH_MISMATCH", "{err:?}");
+
+    // Pinned: the server agent's own private profile claim loads and applies.
+    let plan = plan_ok(&pinned, &viewer, p.clone(), None).await;
+    assert_eq!(plan["profile_hash"], hash, "{plan}");
+    assert_eq!(
+        plan["profile_source"],
+        json!({"kind": "claim", "claim_id": mine.to_string()}),
+        "{plan}"
+    );
+    let out = apply_ok(&pinned, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    assert_eq!(out["status"], "applied", "{out}");
+    assert!(is_marked_onto(&pool, loser, survivor).await, "{out}");
+
+    // A stranger's private claim with the same bytes is not found.
+    let err = plan_label_dedup(
+        &pinned,
+        &viewer,
+        plan_params_claim(&theirs.to_string(), &hash, DEDUP),
+        None,
+    )
+    .await
+    .expect_err("a stranger's private profile claim");
+    assert_eq!(code(&err), "PROFILE_NOT_FOUND", "{err:?}");
 }
 
 // ── Visibility ──────────────────────────────────────────────────────────────

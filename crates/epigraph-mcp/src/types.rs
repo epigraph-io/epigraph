@@ -4384,15 +4384,15 @@ pub struct LabelDedupCandidateParam {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct PlanLabelDedupParams {
     #[schemars(
-        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json."
+        description = "STDIO ONLY. Path of the dedup profile file: absolute under, or relative to, the profile root this server was started with (EPIGRAPH_MCP_PROFILE_ROOT). Refused over HTTP, when no root is set, outside the root, through a symlink, or when it is not a regular file. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_path: Option<String>,
     #[schemars(
-        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v1). Refused on stdio. Exactly one of profile_path / profile_json."
+        description = "HTTP ONLY. The dedup profile as inline JSON text (schema label-dedup-profile/v2). Refused on stdio. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_json: Option<String>,
     #[schemars(
-        description = "Reserved: reading the profile from a stored claim is not available yet; a call that sets it is refused (PROFILE_CLAIM_DEFERRED)."
+        description = "Id of a claim whose content is the dedup profile's exact bytes (a profile stored in the graph). Read as you: a claim you cannot read is PROFILE_NOT_FOUND, like a missing one. Its bytes must hash to profile_hash. Over HTTP always accepted; on stdio only when this server was started with a pin (EPIGRAPH_MCP_PROFILE_PIN), else PROFILE_CLAIM_REFUSED. The plan reports it in profile_source. Exactly one of profile_path / profile_json / profile_claim_id."
     )]
     pub profile_claim_id: Option<String>,
     #[schemars(
@@ -4422,7 +4422,7 @@ pub struct ApplyLabelDedupParams {
     pub profile_path: Option<String>,
     #[schemars(description = "As plan_label_dedup (HTTP only)")]
     pub profile_json: Option<String>,
-    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    #[schemars(description = "As plan_label_dedup")]
     pub profile_claim_id: Option<String>,
     #[schemars(description = "As plan_label_dedup")]
     pub profile_hash: String,
@@ -4447,7 +4447,7 @@ pub struct ProbeLabelDedupParams {
     pub profile_path: Option<String>,
     #[schemars(description = "As plan_label_dedup (HTTP only)")]
     pub profile_json: Option<String>,
-    #[schemars(description = "Reserved; refused (PROFILE_CLAIM_DEFERRED)")]
+    #[schemars(description = "As plan_label_dedup")]
     pub profile_claim_id: Option<String>,
     #[schemars(description = "As plan_label_dedup")]
     pub profile_hash: String,
