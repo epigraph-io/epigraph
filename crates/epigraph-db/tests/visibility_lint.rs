@@ -4870,6 +4870,15 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "get_public_profile",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
+    // untenanted: as `get_public_profile`; returns which of the given `agents` ids the viewer
+    // may see the details of, the gate (`profile_visibility`, self, a shared live membership,
+    // bypass) computed IN the statement from the viewer's principal, groups and bypass binds.
+    // It returns ids it was handed, never a detail.
+    (
+        "agent.rs",
+        "profile_details_visible",
+        &["sqlx::query_as(SELECT).fetch_all"],
+    ),
     // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
     // viewer's principal, groups and bypass binds, as in `get_public_profile`),
     // `disclosed_roles` (the role-assignment definer) and the operator humans' `agents`
@@ -4974,29 +4983,62 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "find_claims_needing_embeddings",
         &["sqlx::query_as(dynamic).fetch_all"],
     ),
-    // session: the `hnsw.*` `set_config` before the spliced search.
+    // privileged: refuses unless the session is the privileged maintenance session, then
+    // re-points the superseded claim's edges to the head of the chain the spliced read admitted.
+    (
+        "claim.rs",
+        "migrate_superseded_edges_to_head_conn",
+        &["migrate_superseded_edges", "require_privileged_session"],
+    ),
+    // session: `begin_iterative_hnsw` / `begin_exact_vector_scan` open the transaction and set
+    // the vector scan (`repos/vector_scan.rs`); the two `?.fetch_all` are `build!()` runs of the
+    // viewer-spliced `sql`, which binds `viewer.group_bind()` inside the macro (the scanner does
+    // not see through it): the iterative scan, then the exact retry of a short dense leg.
     (
         "claim.rs",
         "search_by_embedding_scoped",
-        &["sqlx::query(SELECT).execute"],
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
     // session: as `search_by_embedding_scoped`.
     (
         "claim.rs",
         "search_by_embedding_since_conn",
-        &["sqlx::query(SELECT).execute"],
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
     // session: as `search_by_embedding_scoped`.
     (
         "claim.rs",
         "search_hybrid_scoped_since_in_theme_conn",
-        &["sqlx::query(SELECT).execute"],
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
-    // session: as `search_by_embedding_scoped`.
+    // session: as `search_by_embedding_scoped`, plus a third `build!()` run of the same spliced
+    // `sql` on the caller's connection for the unranked path (`semantic_search_flat` delegates
+    // here).
     (
         "claim.rs",
-        "semantic_search_flat",
-        &["sqlx::query(SELECT).execute"],
+        "semantic_search_flat_on",
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
     // write: the `FOR UPDATE` row lock before the `{WRITABLE}` update; it returns nothing.
     (
@@ -5017,18 +5059,29 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "assign_unthemed_batch",
         &["sqlx::query(dynamic).fetch_all"],
     ),
-    // session: `begin_iterative_hnsw` opens the transaction and sets the HNSW scan; the read on
-    // it is spliced.
+    // session: `begin_iterative_hnsw` / `begin_exact_vector_scan` open the transaction and set
+    // the vector scan; the two `?.fetch_all` are `build!()` runs of the viewer-spliced `sql`
+    // (the macro binds `viewer.group_bind()`), the iterative scan and its exact retry.
     (
         "claim_theme.rs",
         "claims_in_themes_at_dim_since",
-        &["begin_iterative_hnsw"],
+        &[
+            "?.fetch_all",
+            "?.fetch_all",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
-    // session: as `claims_in_themes_at_dim_since`.
+    // session: as `claims_in_themes_at_dim_since` (`fetch_one`).
     (
         "claim_theme.rs",
         "nearest_theme_coverage_since",
-        &["begin_iterative_hnsw"],
+        &[
+            "?.fetch_one",
+            "?.fetch_one",
+            "begin_exact_vector_scan",
+            "begin_iterative_hnsw",
+        ],
     ),
     // exempt: corpus-wide centroid maintenance, in EXPECTED_EXEMPTIONS.
     (
@@ -5064,21 +5117,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "verify_conn",
         &[
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_scalar(SELECT).fetch_optional",
+            "sqlx::query_as(SELECT).fetch_optional",
         ],
     ),
     // untenanted: `untenanted_entity_types`, a catalog read of the entity-type registry.
     ("ego.rs", "edges", &["Self::untenanted_entity_types"]),
-    // untenanted: `agents` display names and `papers` titles (bibliographic records, no
-    // tenancy); the claim, evidence and trace reads are spliced.
-    (
-        "ego.rs",
-        "hydrate",
-        &[
-            "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
-        ],
-    ),
+    // untenanted: `agents` display names; the claim, evidence, trace and (since migration 246
+    // gave `papers` tenancy) paper reads are spliced.
+    ("ego.rs", "hydrate", &["sqlx::query_as(SELECT).fetch_all"]),
     // exempt: a write path in EXPECTED_EXEMPTIONS.
     ("evidence.rs", "delete", &["sqlx::query!(WITH).fetch_one"]),
     // write: the evidence insert, its tenancy dedup probe and its link edge, all for a parent
@@ -5170,11 +5216,17 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "frozen_plan",
         &["sqlx::query_as(SELECT).fetch_optional"],
     ),
-    // write: the counter update on a `workflows` row the spliced `FOR UPDATE` read locked.
+    // write: migration 237's two definers, `epigraph_workflow_lock_readable` (locks the
+    // `workflows` row only if the session reads it, 183's read predicate restated) and
+    // `epigraph_workflow_record_outcome` (writes only the four counters of that locked row);
+    // the outcome-report read between them is spliced.
     (
         "workflow.rs",
         "record_hierarchical_outcome",
-        &["sqlx::query(UPDATE).execute"],
+        &[
+            "sqlx::query_scalar(SELECT).fetch_one",
+            "sqlx::query_scalar(SELECT).fetch_one",
+        ],
     ),
     // stamped: the `workflows` lineage lookups (max generation, root) on the caller's
     // connection under forced row security; the steps are then resolved with the viewer.
