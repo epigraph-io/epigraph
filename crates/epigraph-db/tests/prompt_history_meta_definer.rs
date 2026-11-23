@@ -9,8 +9,10 @@
 //! * content-free in fact: with the owner's SELECT on `agent_prompt_blobs`
 //!   revoked, 161 can no longer answer (CALIBRATION) and 268 still returns
 //!   161's rows, keys and all;
-//! * the gate is 161's: the admin assignment is the same text, and on every
-//!   caller shape built here 268 refuses (AID06) exactly when 161 does;
+//! * the gate is 161's: the admin assignment and the per-member readable mark
+//!   are the same text as 161's current body, on every caller shape built
+//!   here 268 refuses (AID06) exactly when 161 does, and as an operator (and
+//!   a custodian) on an application session it lists exactly 161's rows;
 //! * paging: at every page size the pages, followed by their cursors, are the
 //!   unpaged listing in order, once each, across a tie in `first_seen` and a
 //!   row with no snapshot; a half cursor is refused 22023.
@@ -158,30 +160,48 @@ type Key = (
     Option<Vec<u8>>,
 );
 
-async fn rows_161(pool: &PgPool, agent: Uuid) -> Vec<Key> {
-    let mut rows: Vec<Key> = sqlx::query_as(
-        "SELECT agent_id, relation, depth, readable, snapshot_id, group_claude_md_hash, \
-                learned_md_hash \
-           FROM public.epigraph_agent_prompt_history($1)",
-    )
-    .bind(agent)
-    .fetch_all(pool)
-    .await
-    .expect("161 reads");
+const ROWS_161: &str = "SELECT agent_id, relation, depth, readable, snapshot_id, \
+                                group_claude_md_hash, learned_md_hash \
+                           FROM public.epigraph_agent_prompt_history($1)";
+const ROWS_268: &str = "SELECT agent_id, relation, depth, readable, snapshot_id, \
+                                group_claude_md_hash, learned_md_hash \
+                           FROM public.epigraph_agent_prompt_history_meta(\
+                                $1, NULL, NULL, NULL, NULL, NULL)";
+
+/// Every row of `sql` (161's or 268's listing) on the superuser connection,
+/// where `epigraph_bypass()` makes the caller an admin.
+async fn rows_admin(pool: &PgPool, sql: &'static str, agent: Uuid) -> Vec<Key> {
+    let mut rows: Vec<Key> = sqlx::query_as(sql)
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
     rows.sort();
     rows
 }
 
+async fn rows_161(pool: &PgPool, agent: Uuid) -> Vec<Key> {
+    rows_admin(pool, ROWS_161, agent).await
+}
+
 async fn rows_268(pool: &PgPool, agent: Uuid) -> Vec<Key> {
-    let mut rows: Vec<Key> = sqlx::query_as(
-        "SELECT agent_id, relation, depth, readable, snapshot_id, group_claude_md_hash, \
-                learned_md_hash \
-           FROM public.epigraph_agent_prompt_history_meta($1, NULL, NULL, NULL, NULL, NULL)",
-    )
-    .bind(agent)
-    .fetch_all(pool)
+    rows_admin(pool, ROWS_268, agent).await
+}
+
+/// Every row of `sql` as `principal` on an `epigraph_app` session, where the
+/// per-member `readable` mark (and any per-snapshot filter) actually applies.
+async fn rows_as(pool: &PgPool, sql: &'static str, principal: Uuid, agent: Uuid) -> Vec<Key> {
+    let mut rows = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        sqlx::query("SELECT set_config('epigraph.principal_id', $1, false)")
+            .bind(principal.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("set principal");
+        let r: Result<Vec<Key>, _> = sqlx::query_as(sql).bind(agent).fetch_all(&mut *conn).await;
+        (conn, r)
+    })
     .await
-    .expect("268 reads");
+    .unwrap_or_else(|e| panic!("{sql}: {e}"));
     rows.sort();
     rows
 }
@@ -342,11 +362,80 @@ async fn the_gate_is_the_text_of_161s(pool: PgPool) {
                    ISDISTINCTFROMv_principal)THEN";
     assert!(history.contains(refusal), "CALIBRATION: 161's refusal");
     assert!(meta.contains(refusal), "268's refusal is 161's");
-    let readable =
-        "COALESCE(w.id=p_agentORv_adminORpublic.epigraph_human_of(w.id,false)=v_principal,false)";
+    // The per-member readable mark, taken from 161's CURRENT body (a later
+    // re-statement of 161 is what this guards against): 161 names its walk
+    // `l`, 268 names it `w`, so only the alias is renamed.
+    let mark_start = history
+        .find("COALESCE(l.id=p_agent")
+        .expect("CALIBRATION: 161 marks each member `l` readable");
+    let mark_len = history[mark_start..]
+        .find("ASok")
+        .expect("CALIBRATION: 161 names the mark `ok`")
+        + "ASok".len();
+    let mark_161 = &history[mark_start..mark_start + mark_len];
     assert!(
-        meta.contains(readable),
-        "268's per-member readable mark is 161's"
+        mark_161.contains("public.epigraph_human_of(l.id,false)=v_principal"),
+        "CALIBRATION: the extracted text is the operator test: {mark_161}"
+    );
+    let mark_268 = mark_161.replace("l.id", "w.id");
+    assert!(
+        meta.contains(&mark_268),
+        "268's per-member readable mark is 161's: {mark_268}"
+    );
+}
+
+/// As the agent's operator (and as an unarmed custodian), on an
+/// `epigraph_app` session, 268 lists exactly 161's rows: the same members
+/// marked readable, and none of the unreadable member's snapshots. On the
+/// superuser connection every member is readable, so only here is the mark,
+/// or any per-snapshot filter a later re-statement of 161 adds, compared.
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_the_operator_268_lists_and_marks_exactly_161s_rows(pool: PgPool) {
+    let operator = human_operator(&pool).await;
+    let other = human_operator(&pool).await;
+    let custodian = human_operator(&pool).await;
+    fixture::make_custodian(&pool, custodian).await;
+    // Link after both registrations: a child registered under a linked
+    // parent inherits the parent's link.
+    let (parent, _) = register(&pool, "g-mark", None).await;
+    let (agent, _) = register(&pool, "g-mark", Some(parent)).await;
+    link(&pool, agent, operator).await;
+    link(&pool, parent, other).await;
+    let (_child, _) = register(&pool, "g-mark", Some(agent)).await;
+    let hidden = snapshot_row(&pool, parent, "hidden", Utc::now() - Duration::days(2)).await;
+
+    let as_operator = rows_as(&pool, ROWS_161, operator, agent).await;
+    assert!(
+        as_operator
+            .iter()
+            .any(|r| r.0 == parent && !r.3 && r.4.is_none()),
+        "CALIBRATION: 161 lists the other operator's parent by id only: {as_operator:?}"
+    );
+    assert!(
+        as_operator
+            .iter()
+            .any(|r| r.0 == agent && r.3 && r.4.is_some()),
+        "CALIBRATION: 161 lists the agent's own snapshot: {as_operator:?}"
+    );
+    assert!(
+        as_operator.iter().all(|r| r.4 != Some(hidden)),
+        "CALIBRATION: 161 hides the parent's snapshot: {as_operator:?}"
+    );
+    assert_eq!(
+        rows_as(&pool, ROWS_268, operator, agent).await,
+        as_operator,
+        "268 as the operator"
+    );
+
+    let as_custodian = rows_as(&pool, ROWS_161, custodian, agent).await;
+    assert!(
+        as_custodian.iter().any(|r| r.4 == Some(hidden)),
+        "CALIBRATION: the unarmed custodian reads the parent's snapshot: {as_custodian:?}"
+    );
+    assert_eq!(
+        rows_as(&pool, ROWS_268, custodian, agent).await,
+        as_custodian,
+        "268 as the custodian"
     );
 }
 
