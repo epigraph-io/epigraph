@@ -21,7 +21,15 @@ It also owns the two files that cross the box boundary:
     cannot run code when it is read;
   * a result: JSON naming each theme's parts as lists of claim ids, and
     `id_chunk_cuts` (see split_to_cap_with_stats).
+
+`parts_digest(result)` is a result's fingerprint: what apply compares against
+the plan the operator reviewed. The split is deterministic on one host and set
+of library versions, but not promised across hosts or CPU architectures, so an
+off-box `compute` may not reproduce an on-box `plan`; apply's
+`--reviewed-plan` / `--expect-digest` refuse such a result instead of writing
+parts nobody reviewed.
 """
+import hashlib
 import json
 import math
 import pathlib
@@ -192,6 +200,27 @@ def split_to_cap_with_stats(ids, embeddings, cap=DEFAULT_CAP, seed=DEFAULT_SEED,
         min_part = max(1, cap // 20)
     parts = _split(x, cap, seed, min_part, stats)
     return order_parts([[ids[i] for i in p] for p in parts]), stats
+
+
+def parts_digest(result):
+    """SHA-256 (hex) of what a result would write: its cap and seed, and per
+    theme (sorted by id) its parts IN ORDER (part 0 keeps the theme's id), each
+    part's claim ids sorted. Theme order, member order within a part and any
+    other field (`id_chunk_cuts`, a stored digest) do not change it.
+
+    Computed from the parts themselves, never read from the file, so a result
+    cannot vouch for itself."""
+    canon = {
+        "format": result.get("format"),
+        "cap": int(result["cap"]),
+        "seed": None if result.get("seed") is None else int(result["seed"]),
+        "themes": sorted(
+            ([str(t["theme_id"]), [sorted(str(c) for c in p) for p in t["parts"]]]
+             for t in result["themes"]),
+            key=lambda t: t[0]),
+    }
+    blob = json.dumps(canon, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(blob).hexdigest()
 
 
 def validate_parts(members, parts, cap):

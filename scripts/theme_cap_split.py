@@ -19,6 +19,9 @@ Commands:
             no DB driver: this is the step that may run off the box.
   apply     Writes a result file (`--from`, from `plan` or `compute`) in ONE
             transaction, and writes a manifest that `reverse` restores from.
+            With `--reviewed-plan PLAN` (or `--expect-digest HEX`, the
+            `parts_digest` plan and compute print) it first refuses, writing
+            nothing, a result whose parts are not exactly the reviewed plan's.
   reverse   Restores exactly what a manifest's apply changed.
 
 What apply writes, per theme:
@@ -70,6 +73,14 @@ theme whose membership changed since its plan (a supersede, a dedup, a new
 assignment) refuses the whole apply, as does any theme the result names that
 would stay over the cap.
 
+Off-box compute and the reviewed plan: the split is deterministic on one host
+and set of library versions, but not promised across hosts or CPU
+architectures. When the parts applied come from an off-box `compute` and the
+operator reviewed an on-box `plan`, pass that plan to apply
+(`--reviewed-plan plan.json`): apply compares `theme_cap_core.parts_digest` of
+both and refuses on a mismatch, before connecting. The digest is recomputed
+from the parts, never read from either file.
+
 After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
 of a split theme are stale until rebuilt. `reverse` deletes the new parts'
 rows, and rows that reference them cascade.
@@ -84,7 +95,7 @@ Usage:
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py export --out export-dir/
     python3 scripts/theme_cap_split.py compute --from export-dir/ --out result.json
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py apply --from result.json \\
-        --manifest manifest.json
+        --reviewed-plan plan.json --manifest manifest.json
 """
 import argparse
 import datetime
@@ -339,25 +350,42 @@ def _recompute(cur, theme_id, with_3072):
         )
 
 
-def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP):
+def check_reviewed(result, expect_digest):
+    """Refuse `result` unless its `parts_digest` is `expect_digest` (when one
+    is given). Touches no database."""
+    if expect_digest is None:
+        return
+    got = core.parts_digest(result)
+    if got != expect_digest:
+        raise ValueError(
+            f"the result's parts are not the reviewed plan's (parts digest {got}, reviewed "
+            f"{expect_digest}): an off-box compute on another host, architecture or library "
+            "version need not reproduce the on-box plan. Nothing was written; review this "
+            "result (or re-run plan and apply that file)")
+
+
+def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None):
     """Write a result document in one transaction; returns the manifest.
 
     The result's own cap is enforced, and a result whose cap exceeds `max_cap`
     (apply's `--cap`) is refused: the file may come back from off the box,
-    and its cap must not be what decides how large a part may be.
+    and its cap must not be what decides how large a part may be. With
+    `expect_digest` (the reviewed plan's `parts_digest`), a result whose parts
+    differ is refused before anything is read or written.
 
     The manifest is written and fsynced BEFORE the commit, so a committed
     apply always has one. A manifest whose apply did not commit reverses as a
     no-op."""
     if result.get("format") != core.RESULT_FORMAT:
         raise ValueError(f"not a {core.RESULT_FORMAT} result: {result.get('format')!r}")
+    check_reviewed(result, expect_digest)
     cap = int(result["cap"])
     if cap > int(max_cap):
         raise ValueError(f"the result's cap of {cap} is over apply's cap of {max_cap}; refusing "
                          "(pass --cap to apply to raise it deliberately)")
     run = str(uuid.uuid4())
     manifest = {"format": MANIFEST_FORMAT, "split_run": run, "cap": cap,
-                "seed": result.get("seed"),
+                "seed": result.get("seed"), "parts_digest": core.parts_digest(result),
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "themes": []}
     touched = []
@@ -568,6 +596,12 @@ def main(argv=None):
                     help="refuse a result whose cap is larger (default %(default)s)")
     sp.add_argument("--manifest", default=None,
                     help="manifest to create (default theme-cap-manifest-<UTC>.json)")
+    reviewed = sp.add_mutually_exclusive_group()
+    reviewed.add_argument("--reviewed-plan", default=None,
+                          help="the plan file the operator reviewed: refuse a result whose "
+                               "parts differ from it (an off-box compute)")
+    reviewed.add_argument("--expect-digest", default=None,
+                          help="the reviewed parts_digest: refuse a result whose parts differ")
 
     sp = sub.add_parser("reverse", help="restore what an apply changed")
     db_args(sp)
@@ -580,11 +614,23 @@ def main(argv=None):
         result = core.compute_export_dir(args.src, cap=args.cap, seed=args.seed)
         _write_json_new(args.out, result)
         print(json.dumps({"status": "computed", "result_file": args.out, "cap": result["cap"],
+                          "parts_digest": core.parts_digest(result),
                           "themes": [{"theme_id": t["theme_id"],
                                       "part_sizes": [len(x) for x in t["parts"]],
                                       "id_chunk_cuts": t.get("id_chunk_cuts", 0)}
                                      for t in result["themes"]]}))
         return 0
+
+    expect_digest = None
+    if args.command == "apply":
+        result = json.loads(pathlib.Path(args.src).read_text())
+        if args.reviewed_plan is not None:
+            expect_digest = core.parts_digest(
+                json.loads(pathlib.Path(args.reviewed_plan).read_text()))
+        elif args.expect_digest is not None:
+            expect_digest = args.expect_digest.strip().lower()
+        # Before connecting: a result nobody reviewed never reaches the database.
+        check_reviewed(result, expect_digest)
 
     conn = connect(args.database_url)
     try:
@@ -600,19 +646,21 @@ def main(argv=None):
                 print(f"  {r['theme_id']}  {r['current']:>6} -> {r['part_sizes']}"
                       f"  ({labels.get(r['theme_id'], '?')}){flag}", file=sys.stderr)
             print(json.dumps({"status": "dry-run", "cap": args.cap, "result_file": out,
-                              "themes": report}))
+                              "parts_digest": core.parts_digest(result), "themes": report}))
         elif args.command == "export":
             index = export(conn, args.out, args.cap, args.seed, args.theme_id)
             size = sum(f.stat().st_size for f in pathlib.Path(args.out).iterdir())
             print(json.dumps({"status": "exported", "dir": args.out, "bytes": size,
                               "themes": index["themes"]}))
         elif args.command == "apply":
-            result = json.loads(pathlib.Path(args.src).read_text())
             mpath = args.manifest or f"theme-cap-manifest-{_stamp()}.json"
-            manifest = apply_result(conn, result, mpath, max_cap=args.cap)
+            manifest = apply_result(conn, result, mpath, max_cap=args.cap,
+                                    expect_digest=expect_digest)
             print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
                               "manifest": mpath if manifest["themes"] else None,
                               "split_run": manifest["split_run"],
+                              "parts_digest": manifest["parts_digest"],
+                              "checked_against_review": expect_digest is not None,
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],

@@ -347,6 +347,87 @@ def test_apply_refuses_a_result_whose_cap_is_over_its_own():
         S.apply_result(_NoDB(), result, "unused.json")
 
 
+A1, A2, A3, A4 = (f"0000000{i}-0000-4000-8000-000000000000" for i in range(1, 5))
+T1, T2 = "11111111-0000-4000-8000-000000000000", "22222222-0000-4000-8000-000000000000"
+
+
+def _result(themes, cap=CAP, seed=42):
+    return {"format": core.RESULT_FORMAT, "cap": cap, "seed": seed,
+            "themes": [{"theme_id": t, "parts": parts, "id_chunk_cuts": 0}
+                       for t, parts in themes]}
+
+
+def test_parts_digest_is_the_parts_and_nothing_else():
+    """The digest a reviewed plan is compared by: theme order, member order and
+    bookkeeping fields do not move it; a moved member, a swapped kept part, the
+    cap or the seed do."""
+    base = core.parts_digest(_result([(T1, [[A1, A2], [A3]]), (T2, [[A4]])]))
+    same = _result([(T2, [[A4]]), (T1, [[A2, A1], [A3]])])
+    same["themes"][0]["id_chunk_cuts"] = 3
+    same["parts_digest"] = "0" * 64  # a stored digest is never read
+    assert core.parts_digest(same) == base
+    for other in (
+        _result([(T1, [[A1], [A2, A3]]), (T2, [[A4]])]),   # one member moved
+        _result([(T1, [[A3], [A1, A2]]), (T2, [[A4]])]),   # the kept part swapped
+        _result([(T1, [[A1, A2], [A3]]), (T2, [[A4]])], cap=CAP + 1),
+        _result([(T1, [[A1, A2], [A3]]), (T2, [[A4]])], seed=7),
+        _result([(T1, [[A1, A2], [A3]])]),                 # a theme dropped
+    ):
+        assert core.parts_digest(other) != base
+
+
+def test_apply_refuses_a_result_that_is_not_the_reviewed_plan():
+    """An off-box compute whose parts differ from the on-box plan the operator
+    reviewed is refused before the database is touched (c7c6e7ce)."""
+    reviewed = _result([(T1, [[A1, A2], [A3]])])
+    off_box = _result([(T1, [[A1], [A2, A3]])])
+
+    with pytest.raises(ValueError, match="not the reviewed plan's"):
+        S.apply_result(_NoDB(), off_box, "unused.json",
+                       expect_digest=core.parts_digest(reviewed))
+
+
+def test_apply_cli_refuses_an_unreviewed_result_before_connecting(tmp_path, monkeypatch):
+    """`apply --reviewed-plan` (and `--expect-digest`) refuse a differing result
+    before any connection is made, and let the reviewed one through to connect."""
+    plan_file, result_file = tmp_path / "plan.json", tmp_path / "result.json"
+    plan_file.write_text(json.dumps(_result([(T1, [[A1, A2], [A3]])])))
+    result_file.write_text(json.dumps(_result([(T1, [[A1], [A2, A3]])])))
+
+    def no_connect(*_a, **_k):
+        raise AssertionError("connected before checking the reviewed plan")
+
+    monkeypatch.setattr(S, "connect", no_connect)
+    for flag in (["--reviewed-plan", str(plan_file)],
+                 ["--expect-digest", core.parts_digest(json.loads(plan_file.read_text()))]):
+        with pytest.raises(ValueError, match="not the reviewed plan's"):
+            S.main(["apply", "--from", str(result_file), *flag,
+                    "--manifest", str(tmp_path / "m.json")])
+    assert not (tmp_path / "m.json").exists()
+
+    class Connected(Exception):
+        pass
+
+    def connect(*_a, **_k):
+        raise Connected
+
+    monkeypatch.setattr(S, "connect", connect)
+    with pytest.raises(Connected):
+        S.main(["apply", "--from", str(plan_file), "--reviewed-plan", str(plan_file),
+                "--manifest", str(tmp_path / "m.json")])
+
+
+def test_apply_with_the_reviewed_digest_writes_and_records_it(db, seed_agent, tmp_path):
+    _theme(db, seed_agent, (30, 25, 20))
+    result, _ = S.plan(db, cap=CAP)
+    digest = core.parts_digest(result)
+
+    manifest = S.apply_result(db, result, tmp_path / "m.json", expect_digest=digest)
+
+    assert manifest["themes"] and manifest["parts_digest"] == digest
+    assert json.loads((tmp_path / "m.json").read_text())["parts_digest"] == digest
+
+
 def test_reverse_keeps_a_column_added_after_the_apply(db, seed_agent, tmp_path):
     """A claim_themes column added between apply and reverse (a later Atlas item
     may add one) is not in the snapshot. Reverse leaves it as it is, rather
