@@ -42,7 +42,20 @@
 //!   of every type. Samples cycle over distinct levels.
 //! - **Cold:** a fresh `ScopedPool`, `AppState`, listener and client for
 //!   EVERY sample (no pooled HTTP connection, an empty statement cache), and
-//!   a level not asked for before. Not a fresh process: see the plan.
+//!   a level not asked for before, inside the test's own process.
+//! - **Process:** the first request after a deploy or restart. A fresh
+//!   `server` binary for EVERY sample (`common/served.rs`), so process
+//!   start-up, lazy statics and first-use allocation are inside the sample,
+//!   and a fresh client. The binary logs in the way the production login
+//!   does: a NOSUPERUSER member of `epigraph_app` whose role default is
+//!   `epigraph_app`, so its RLS posture check is armed (asserted per boot)
+//!   and every read runs under row security. Its first request is timed (a
+//!   switch's is its second: the level flipped from is shown first, untimed)
+//!   on a level neither earlier arm asked for, and held to the cold budget.
+//!   Start-up itself (spawn to listening) is reported, not gated: nothing is
+//!   served before the listener binds. Not covered by any arm: a cold
+//!   Postgres buffer cache or OS page cache (the seed has just written the
+//!   rows).
 //!
 //! # The scaling rule
 //!
@@ -58,6 +71,9 @@ mod common;
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
+
+#[path = "common/served.rs"]
+mod served;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -75,6 +91,7 @@ use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, LevelDoc, NewMapRu
 use epigraph_db::{AtlasMapRepository, ScopedPool, SessionGucMode};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 // ---- the budget -------------------------------------------------------------------
@@ -171,13 +188,18 @@ impl Kind {
 enum Temp {
     Warm,
     Cold,
+    /// The first request of a freshly started `server` binary.
+    Process,
 }
+
+const TEMPS: [Temp; 3] = [Temp::Warm, Temp::Cold, Temp::Process];
 
 impl Temp {
     fn name(self) -> &'static str {
         match self {
             Temp::Warm => "warm",
             Temp::Cold => "cold",
+            Temp::Process => "process",
         }
     }
 }
@@ -187,7 +209,7 @@ fn budget(kind: Kind, temp: Temp) -> Duration {
     match (kind, temp) {
         (Kind::Themes | Kind::Maps, _) => PAGE_LOAD,
         (_, Temp::Warm) => KERNEL_WARM,
-        (_, Temp::Cold) => KERNEL_COLD,
+        (_, Temp::Cold | Temp::Process) => KERNEL_COLD,
     }
 }
 
@@ -268,10 +290,7 @@ fn scaling_verdict(samples: &Samples, max_ratio: f64) -> Option<ScalingBreach> {
 }
 
 fn all_expected() -> Vec<(Kind, Temp)> {
-    KINDS
-        .iter()
-        .flat_map(|&k| [(k, Temp::Warm), (k, Temp::Cold)])
-        .collect()
+    KINDS.iter().flat_map(|&k| TEMPS.map(|t| (k, t))).collect()
 }
 
 fn ms(d: Duration) -> f64 {
@@ -357,6 +376,104 @@ fn the_kernel_budget_is_the_design_budget_less_the_other_shares() {
     assert_eq!(budget(Kind::Themes, Temp::Warm), PAGE_LOAD);
 }
 
+/// Backlog 01d7e2ff: the first request after a deploy or restart is gated.
+/// Every type has a fresh-process arm, held to the cold budget, and that
+/// arm alone can turn the verdict red: over budget, or never measured.
+#[test]
+fn a_fresh_process_is_gated_on_every_type_at_the_cold_budget() {
+    let expected = all_expected();
+    for k in KINDS {
+        assert!(
+            expected.contains(&(k, Temp::Process)),
+            "{k:?} has no fresh-process arm in the gate"
+        );
+        assert_eq!(budget(k, Temp::Process), budget(k, Temp::Cold), "{k:?}");
+    }
+    let d = Duration::from_millis;
+    let over = KERNEL_COLD + d(1);
+    let mut s: Samples = BTreeMap::new();
+    for k in KINDS {
+        s.insert((k, Temp::Warm), vec![d(1); 20]);
+        s.insert((k, Temp::Cold), vec![d(1); 20]);
+        if k != Kind::Maps {
+            s.insert((k, Temp::Process), vec![d(1); 20]);
+        }
+    }
+    // Two of twenty fresh-process leaves over the cold budget: p95 is over,
+    // though every in-process sample is fast.
+    s.insert(
+        (Kind::Leaf, Temp::Process),
+        (0..20).map(|i| if i < 18 { d(1) } else { over }).collect(),
+    );
+    let got: Vec<(Kind, Temp, Option<Duration>)> = verdict(&s, &expected, budget)
+        .into_iter()
+        .map(|b| (b.kind, b.temp, b.p95))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (Kind::Leaf, Temp::Process, Some(over)),
+            // No fresh-process sample is a breach, not a pass.
+            (Kind::Maps, Temp::Process, None),
+        ]
+    );
+}
+
+/// The report carries the fresh-process p50 and p95 per type beside the
+/// in-process cold numbers, and the process start-up times.
+#[test]
+fn the_report_carries_the_fresh_process_arm_per_type() {
+    let d = Duration::from_millis;
+    let mut samples: Samples = BTreeMap::new();
+    for (i, k) in KINDS.into_iter().enumerate() {
+        let base = 10 * (i as u64 + 1);
+        samples.insert((k, Temp::Cold), vec![d(base); 4]);
+        samples.insert(
+            (k, Temp::Process),
+            vec![d(base + 1), d(base + 3), d(base + 2)],
+        );
+    }
+    let s = Seeded {
+        team: Uuid::nil(),
+        viewer: Uuid::nil(),
+        themes: 1,
+        claims: 1,
+        levels: Vec::new(),
+        leaf_of: BTreeMap::new(),
+        probe_claims: Vec::new(),
+        seed_time: Duration::ZERO,
+    };
+    let scale = Scale {
+        themes: 1,
+        claims_per_theme: 1,
+        warm: 0,
+        cold: 4,
+        process: 3,
+    };
+    let boots = [d(700), d(900), d(800)];
+    let breaches = verdict(&samples, &all_expected(), budget);
+    let r = report(scale, &s, &samples, &boots, &breaches, None);
+    let rows = r["results"].as_array().expect("rows");
+    for (i, k) in KINDS.into_iter().enumerate() {
+        let base = 10.0 * (i as f64 + 1.0);
+        let row = |t: &str| {
+            rows.iter()
+                .find(|row| row["type"] == json!(k.name()) && row["temp"] == json!(t))
+                .unwrap_or_else(|| panic!("no {t} row for {k:?}: {r}"))
+        };
+        let p = row("process");
+        assert_eq!(p["n"], json!(3), "{k:?}");
+        assert_eq!(p["p50_ms"], json!(base + 2.0), "{k:?}");
+        assert_eq!(p["p95_ms"], json!(base + 3.0), "{k:?}");
+        assert_eq!(p["budget_ms"], row("cold")["budget_ms"], "{k:?}");
+        assert_eq!(p["pass"], json!(true), "{k:?}");
+    }
+    assert_eq!(r["scale"]["process_samples_per_type"], json!(3));
+    assert_eq!(r["process_start"]["n"], json!(3));
+    assert_eq!(r["process_start"]["p50_ms"], json!(800.0));
+    assert_eq!(r["process_start"]["max_ms"], json!(900.0));
+}
+
 // ---- the seeded map ---------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
@@ -365,6 +482,8 @@ struct Scale {
     claims_per_theme: usize,
     warm: usize,
     cold: usize,
+    /// Fresh-process samples per type: one `server` binary each.
+    process: usize,
 }
 
 impl Scale {
@@ -387,6 +506,7 @@ impl Scale {
             claims_per_theme: CLAIMS_PER_THEME,
             warm: n("ATLAS_LATENCY_WARM_SAMPLES", 60),
             cold: n("ATLAS_LATENCY_COLD_SAMPLES", 8),
+            process: n("ATLAS_LATENCY_PROCESS_SAMPLES", 3),
         }
     }
 }
@@ -654,16 +774,89 @@ struct Delay {
     by: Duration,
 }
 
+impl Delay {
+    fn applies_to(&self, path: &str) -> bool {
+        self.suffixes.iter().any(|s| path.ends_with(s.as_str()))
+    }
+}
+
 async fn delay_layer(
     axum::extract::State(delay): axum::extract::State<Delay>,
     req: Request,
     next: Next,
 ) -> Response {
-    let path = req.uri().path().to_string();
-    if delay.suffixes.iter().any(|s| path.ends_with(s.as_str())) {
+    if delay.applies_to(req.uri().path()) {
         tokio::time::sleep(delay.by).await;
     }
     next.run(req).await
+}
+
+/// The fresh-process arm's [`Delay`]: a spawned binary cannot take a test
+/// layer, so the treated run puts this loopback proxy in front of it. Every
+/// chunk the client sends that starts a request line whose path the delay
+/// applies to is held for `by`, then forwarded; the answer is piped back
+/// untouched. A test-only instrument: nothing under `src/` changes.
+struct DelayProxy {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DelayProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The path of an HTTP/1 request line at the start of `chunk`, if any.
+fn request_path(chunk: &[u8]) -> Option<&str> {
+    let line = chunk.split(|b| *b == b'\n').next()?;
+    let mut parts = std::str::from_utf8(line).ok()?.split_whitespace();
+    let method = parts.next()?;
+    let target = parts.next()?;
+    let version = parts.next()?;
+    (method.bytes().all(|b| b.is_ascii_uppercase()) && version.starts_with("HTTP/"))
+        .then(|| target.split('?').next().unwrap_or(target))
+}
+
+async fn delay_proxy(upstream: u16, delay: Delay) -> DelayProxy {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the delay proxy");
+    let port = listener.local_addr().expect("proxy addr").port();
+    let task = tokio::spawn(async move {
+        while let Ok((down, _)) = listener.accept().await {
+            let delay = delay.clone();
+            tokio::spawn(async move {
+                let Ok(up) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await else {
+                    return;
+                };
+                let (mut down_r, mut down_w) = down.into_split();
+                let (mut up_r, mut up_w) = up.into_split();
+                let to_server = async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    loop {
+                        let n = match down_r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if request_path(&buf[..n]).is_some_and(|p| delay.applies_to(p)) {
+                            tokio::time::sleep(delay.by).await;
+                        }
+                        if up_w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = up_w.shutdown().await;
+                };
+                let to_client = async move {
+                    let _ = tokio::io::copy(&mut up_r, &mut down_w).await;
+                    let _ = down_w.shutdown().await;
+                };
+                tokio::join!(to_server, to_client);
+            });
+        }
+    });
+    DelayProxy { port, task }
 }
 
 /// A kernel on a loopback listener with a fresh scoped pool.
@@ -721,6 +914,125 @@ async fn serve(pool: &PgPool, delay: Option<&Delay>) -> Server {
         base: format!("http://{addr}"),
         task,
     }
+}
+
+/// A database login shaped like production's: NOSUPERUSER, NOBYPASSRLS, a
+/// member of `epigraph_app` whose role default is `epigraph_app`, so a
+/// binary connecting as it acts as the application role from its first
+/// statement (and after any `RESET ALL`) and its RLS posture check is armed.
+/// Roles are cluster-wide and outlive the per-test database: the name is
+/// unique, and the login drops itself on every exit, a panic included.
+struct AppLogin {
+    role: String,
+    dsn: String,
+    /// The fixture's DSN, which created the role and drops it.
+    admin_url: String,
+}
+
+impl Drop for AppLogin {
+    /// `Drop` cannot await, and the test's runtime cannot be blocked on from
+    /// inside it, so the role is dropped on a thread with its own runtime and
+    /// connection. While unwinding, a failure is printed, not raised (a panic
+    /// in a panic aborts the test binary).
+    fn drop(&mut self) {
+        let (url, role) = (self.admin_url.clone(), self.role.clone());
+        let dropped = std::thread::spawn(move || -> Result<(), String> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            rt.block_on(async {
+                use sqlx::Connection as _;
+                let mut conn = sqlx::PgConnection::connect(&url)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+                    .execute(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let _ = conn.close().await;
+                Ok(())
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Err("the drop thread panicked".into()));
+        if let Err(e) = dropped {
+            if std::thread::panicking() {
+                eprintln!("could not drop the app login {}: {e}", self.role);
+            } else {
+                panic!("drop the app login {}: {e}", self.role);
+            }
+        }
+    }
+}
+
+async fn app_login(pool: &PgPool) -> AppLogin {
+    let admin_url = fixture::database_url_for(pool).await;
+    let role = format!("atlas_latency_{}", Uuid::new_v4().simple());
+    let password = format!("pw-{}", Uuid::new_v4().simple());
+    let (scheme, rest) = admin_url.split_once("://").expect("a DSN scheme");
+    let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let dsn = format!("{scheme}://{role}:{password}@{host}");
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE \
+         NOREPLICATION INHERIT PASSWORD '{password}' IN ROLE epigraph_app"
+    ))
+    .execute(pool)
+    .await
+    .expect(
+        "create the app login: the fresh-process arm needs a DATABASE_URL that may \
+         CREATE ROLE, on a cluster that accepts password logins over TCP",
+    );
+    // From here the guard owns the role: a failure below still drops it.
+    let login = AppLogin {
+        role,
+        dsn,
+        admin_url,
+    };
+    sqlx::query(&format!(
+        "ALTER ROLE {} SET role = 'epigraph_app'",
+        login.role
+    ))
+    .execute(pool)
+    .await
+    .expect("default the app login to the app role");
+    login
+}
+
+/// Logged by the binary when its connection is the application role under
+/// row security (`AppState::assert_rls_posture`).
+const RLS_ARMED: &str = "RLS posture armed";
+
+/// Start a fresh `server` binary on `login` and wait until it serves.
+/// Returns it with the time from spawn to the serving line (to
+/// `served::boot`'s 100 ms poll).
+async fn serve_process(login: &AppLogin) -> (served::Server, Duration) {
+    let dsn = login.dsn.clone();
+    // `base_command` clears the environment; the bearer the test mints must
+    // verify in the child.
+    let secret = std::env::var("EPIGRAPH_JWT_SECRET").ok();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = served::base_command(&dsn);
+        // Loopback only: the default binds every interface.
+        cmd.env("EPIGRAPH_BIND_ADDR", "127.0.0.1");
+        // Each sample is stopped by SIGTERM once timed (to read what it
+        // answered): bound the drain.
+        cmd.env("EPIGRAPH_SHUTDOWN_GRACE_SECS", "5");
+        if let Some(secret) = secret {
+            cmd.env("EPIGRAPH_JWT_SECRET", secret);
+        }
+        let started = Instant::now();
+        let srv = served::boot(cmd).serving();
+        let took = started.elapsed();
+        assert!(
+            srv.boot_log.contains(RLS_ARMED),
+            "the fresh process must serve as the application role under row security:\n{}",
+            srv.boot_log
+        );
+        (srv, took)
+    })
+    .await
+    .expect("join the boot")
 }
 
 fn client() -> reqwest::Client {
@@ -888,9 +1200,45 @@ fn check_answer(ask: &Ask, h: &Hit, s: &Seeded) -> Option<Uuid> {
     }
 }
 
-/// Measure every type, warm then cold. Every answer is checked; each
-/// distinct level body once against the contract.
-async fn measure(pool: &PgPool, s: &Seeded, scale: Scale, delay: Option<&Delay>) -> Samples {
+/// The paths of the requests a server answered, in order, from its log after
+/// the serving line: one `request finished` line per request
+/// (`serving.rs::log_response`). The shutdown's "every in-flight request
+/// finished" is not a request.
+fn answered(log: &str) -> Vec<&str> {
+    log.lines()
+        .filter(|l| l.contains("request finished") && !l.contains("in-flight"))
+        .collect()
+}
+
+/// Backlog 01d7e2ff: a fresh-process sample times the process's FIRST
+/// request (a switch's second, after its untimed flip-from). Anything the
+/// process answered before it, a warm-up or a readiness probe, would make
+/// the arm measure a warm process under the `process` label.
+fn assert_first_requests(log: &str, expect: &[String]) {
+    let got = answered(log);
+    assert!(
+        got.len() == expect.len() && got.iter().zip(expect).all(|(l, p)| l.contains(p.as_str())),
+        "a fresh process must answer exactly {expect:?}, in order, the timed one last; \
+         it answered:\n{}\nfull log after serving:\n{log}",
+        got.join("\n")
+    );
+}
+
+/// What one run measured: the samples, and each fresh process's start-up.
+struct Measured {
+    samples: Samples,
+    starts: Vec<Duration>,
+}
+
+/// Measure every type, warm, cold, then on a fresh process. Every answer is
+/// checked; each distinct level body once against the contract.
+async fn measure(
+    pool: &PgPool,
+    login: &AppLogin,
+    s: &Seeded,
+    scale: Scale,
+    delay: Option<&Delay>,
+) -> Measured {
     let token = common::mint_token_with_agent(&["claims:read"], s.viewer);
     let p = plan(s);
     let mut samples: Samples = BTreeMap::new();
@@ -950,11 +1298,72 @@ async fn measure(pool: &PgPool, s: &Seeded, scale: Scale, delay: Option<&Delay>)
         }
     }
 
+    // Process: a fresh `server` binary and client per sample, on levels
+    // neither arm above asked for where the map has them. One binary at a
+    // time; each is killed and reaped before the next starts.
+    let mut starts = Vec::new();
+    let mut pids = BTreeSet::new();
+    for kind in KINDS {
+        let list = &p.asks[&kind];
+        for i in 0..scale.process {
+            let (before, ask) = &list[(scale.warm + scale.cold + i) % list.len()];
+            let (srv, started) = serve_process(login).await;
+            assert!(
+                pids.insert(srv.child.id()),
+                "a fresh-process sample reused a server"
+            );
+            starts.push(started);
+            let proxy = match delay {
+                Some(d) => Some(delay_proxy(srv.port, d.clone()).await),
+                None => None,
+            };
+            let base = format!(
+                "http://127.0.0.1:{}",
+                proxy.as_ref().map_or(srv.port, |p| p.port)
+            );
+            let c = client();
+            if let Some(b) = before {
+                // As in the cold arm: the level flipped from was on screen.
+                let h = hit(&c, &base, &b.path(s.team), &token).await;
+                check_answer(b, &h, s);
+            }
+            let h = hit(&c, &base, &ask.path(s.team), &token).await;
+            let id = check_answer(ask, &h, s);
+            keep(id, &h.body, &mut bodies);
+            samples
+                .entry((kind, Temp::Process))
+                .or_default()
+                .push(h.took);
+            // Close the client's connections (and the proxy's) first, so the
+            // drain has nothing in flight; stop the process off the runtime
+            // so those connection tasks can run meanwhile.
+            drop(c);
+            drop(proxy);
+            let expect: Vec<String> = before
+                .iter()
+                .map(|b| b.path(s.team))
+                .chain([ask.path(s.team)])
+                .collect();
+            let mut srv = srv;
+            let log = tokio::task::spawn_blocking(move || {
+                let (status, log) = srv.terminate(Duration::from_secs(15));
+                assert!(
+                    status.is_some(),
+                    "a fresh process did not stop within 15 s of SIGTERM:\n{log}"
+                );
+                log
+            })
+            .await
+            .expect("join the stop");
+            assert_first_requests(&log, &expect);
+        }
+    }
+
     for (id, body) in &bodies {
         check_level_body(body, &Expected::team(s.team, *id))
             .unwrap_or_else(|e| panic!("level {id} fails the contract: {e:?}"));
     }
-    samples
+    Measured { samples, starts }
 }
 
 // ---- the report -------------------------------------------------------------------
@@ -963,6 +1372,7 @@ fn report(
     scale: Scale,
     s: &Seeded,
     samples: &Samples,
+    starts: &[Duration],
     breaches: &[Breach],
     scaling: Option<&ScalingBreach>,
 ) -> Value {
@@ -995,6 +1405,7 @@ fn report(
             "levels": s.levels.len(),
             "warm_samples_per_type": scale.warm,
             "cold_samples_per_type": scale.cold,
+            "process_samples_per_type": scale.process,
             "seed_seconds": (s.seed_time.as_secs_f64() * 10.0).round() / 10.0,
         },
         "budget_ms": {
@@ -1007,6 +1418,14 @@ fn report(
             "page_load": ms(PAGE_LOAD),
         },
         "results": rows,
+        // Spawn to the serving line, per fresh process: reported, not gated
+        // (nothing is served before the listener binds).
+        "process_start": {
+            "n": starts.len(),
+            "p50_ms": quantile(starts, 0.5).map(ms),
+            "p95_ms": quantile(starts, 0.95).map(ms),
+            "max_ms": starts.iter().max().copied().map(ms),
+        },
         "scaling_rule": {
             "rule": "claim_leaf warm p95 <= max_ratio x leaf warm p95",
             "max_ratio": CLAIM_LEAF_OVER_LEAF,
@@ -1033,12 +1452,12 @@ fn print_table(r: &Value) {
         r["profile"], r["scale"]["claims"], r["scale"]["levels"]
     );
     eprintln!(
-        "  {:<11} {:<5} {:>4} {:>9} {:>9} {:>9} {:>9}",
+        "  {:<11} {:<7} {:>4} {:>9} {:>9} {:>9} {:>9}",
         "type", "temp", "n", "p50 ms", "p95 ms", "max ms", "budget"
     );
     for row in r["results"].as_array().into_iter().flatten() {
         eprintln!(
-            "  {:<11} {:<5} {:>4} {:>9} {:>9} {:>9} {:>9} {}",
+            "  {:<11} {:<7} {:>4} {:>9} {:>9} {:>9} {:>9} {}",
             row["type"].as_str().unwrap_or(""),
             row["temp"].as_str().unwrap_or(""),
             row["n"],
@@ -1064,6 +1483,13 @@ fn print_table(r: &Value) {
                     .flatten()
             })
     };
+    eprintln!(
+        "  process start-up (spawn to serving, not gated): n {} p50 {} p95 {} max {}",
+        r["process_start"]["n"],
+        r["process_start"]["p50_ms"],
+        r["process_start"]["p95_ms"],
+        r["process_start"]["max_ms"]
+    );
     if let (Some(c), Some(l)) = (warm_p95("claim_leaf"), warm_p95("leaf")) {
         eprintln!(
             "  claim_leaf / leaf, warm p95: {:.2} (max {CLAIM_LEAF_OVER_LEAF}) {}",
@@ -1097,10 +1523,13 @@ async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
         "the gate must time the application role"
     );
     let s = seed(&pool, scale).await;
-    let samples = measure(&pool, &s, scale, None).await;
+    let login = app_login(&pool).await;
+    let m = measure(&pool, &login, &s, scale, None).await;
+    drop(login);
+    let samples = m.samples;
     let breaches = verdict(&samples, &all_expected(), budget);
     let scaling = scaling_verdict(&samples, CLAIM_LEAF_OVER_LEAF);
-    let r = report(scale, &s, &samples, &breaches, scaling.as_ref());
+    let r = report(scale, &s, &samples, &m.starts, &breaches, scaling.as_ref());
     print_table(&r);
     if let Ok(path) = std::env::var("ATLAS_LATENCY_REPORT") {
         if !path.is_empty() {
@@ -1118,10 +1547,11 @@ async fn the_kernel_meets_the_latency_budget(pool: PgPool) {
 
 /// A deliberately slow route turns the gate red, and only for the types it
 /// serves. Control: the same map and plan with no delay is green. Treated:
-/// a test-only layer sleeps past the cold budget on every LEAF level path;
-/// leaf (warm and cold) is then in breach, and no type that never asks for
-/// a leaf (root, group, claim to leaf, themes, maps) is. A switch sample
-/// may land on a leaf, so the switch may go red too.
+/// a test-only layer (in process) and a loopback proxy (in front of the
+/// fresh process) sleep past the cold budget on every LEAF level path; leaf
+/// (warm, cold and fresh process) is then in breach, and no type that never
+/// asks for a leaf (root, group, claim to leaf, themes, maps) is. A switch
+/// sample may land on a leaf, so the switch may go red too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
     // 600 claims: 10 leaves under 2 groups per hierarchy, so every type has
@@ -1131,10 +1561,12 @@ async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
         claims_per_theme: 600,
         warm: 6,
         cold: 2,
+        process: 1,
     };
     let s = seed(&pool, scale).await;
+    let login = app_login(&pool).await;
 
-    let control = measure(&pool, &s, scale, None).await;
+    let control = measure(&pool, &login, &s, scale, None).await.samples;
     let green = verdict(&control, &all_expected(), budget);
     assert!(green.is_empty(), "the control run is red: {green:?}");
 
@@ -1148,15 +1580,20 @@ async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
         suffixes: Arc::new(leaves),
         by: KERNEL_COLD + Duration::from_millis(100),
     };
-    let treated = measure(&pool, &s, scale, Some(&delay)).await;
+    let treated = measure(&pool, &login, &s, scale, Some(&delay))
+        .await
+        .samples;
+    drop(login);
     let red: BTreeSet<(Kind, Temp)> = verdict(&treated, &all_expected(), budget)
         .into_iter()
         .map(|b| (b.kind, b.temp))
         .collect();
-    assert!(
-        red.contains(&(Kind::Leaf, Temp::Warm)) && red.contains(&(Kind::Leaf, Temp::Cold)),
-        "a slow leaf route did not turn the gate red: {red:?}"
-    );
+    for t in TEMPS {
+        assert!(
+            red.contains(&(Kind::Leaf, t)),
+            "a slow leaf route did not turn the {t:?} gate red: {red:?}"
+        );
+    }
     for k in [
         Kind::Root,
         Kind::Group,
@@ -1164,11 +1601,38 @@ async fn a_deliberately_slow_route_turns_the_gate_red(pool: PgPool) {
         Kind::Themes,
         Kind::Maps,
     ] {
-        for t in [Temp::Warm, Temp::Cold] {
+        for t in TEMPS {
             assert!(
                 !red.contains(&(k, t)),
                 "{k:?} {t:?} is red though it asks for no leaf: {red:?}"
             );
         }
     }
+}
+
+/// A run that panics mid-measure still drops its login. Roles are
+/// cluster-wide: a leaked one (a LOGIN member of `epigraph_app` with a
+/// password) outlives the per-test database and piles up on a shared test
+/// cluster.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_panicking_run_drops_its_app_login(pool: PgPool) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = pool.clone();
+    let run = tokio::spawn(async move {
+        let login = app_login(&p).await;
+        let _ = tx.send(login.role.clone());
+        panic!("a run fails mid-measure");
+    });
+    assert!(run.await.expect_err("the run panics").is_panic());
+    let role = rx.await.expect("the login's role name");
+    let left: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(&role)
+            .fetch_one(&pool)
+            .await
+            .expect("read pg_roles");
+    assert!(
+        !left,
+        "a panicking run left its login {role} on the cluster"
+    );
 }
