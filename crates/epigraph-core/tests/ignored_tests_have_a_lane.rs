@@ -26,6 +26,10 @@
 //! the next `fn` name. Comment lines start with `//`, so a doc comment that
 //! mentions `#[ignore]` is not an attribute.
 //!
+//! A registered lane must still run: its workflow keeps the triggers the lane
+//! names, and no `if:` in it is a literal `false` that would switch the job or
+//! step off while its text stays in place.
+//!
 //! CI selection: test-shard.py runs this target on a change to any member's
 //! `src/` (WALKERS), not on every test-only change; a new `#[ignore]` in a test
 //! file is caught by the next full run (main, staging, `ci:full`).
@@ -41,6 +45,8 @@ struct Lane {
     /// Substrings that ONE step of that workflow (its `- name:` block,
     /// environment and `run:` included) must all contain.
     step_contains: &'static [&'static str],
+    /// Events that must each be a key of the workflow's `on:` block.
+    triggers: &'static [&'static str],
 }
 
 /// One registered ignored test: (file relative to the root, test fn, lane).
@@ -58,6 +64,7 @@ const SCALE_LANE: Lane = Lane {
         "--test operator_backfill_ingest_markers_scale",
         "--ignored",
     ],
+    triggers: &["schedule", "workflow_dispatch"],
 };
 
 /// Every `#[ignore]`d test in the workspace and the lane that runs it.
@@ -230,6 +237,89 @@ fn steps(workflow: &str) -> Vec<&str> {
     workflow.split("- name:").skip(1).collect()
 }
 
+/// The event keys of a workflow's block-form `on:` (the lines indented under
+/// a top-level `on:`, each up to its `:`). Empty for an inline `on: [...]`,
+/// which the lane check then reports as missing triggers.
+fn trigger_keys(workflow: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut in_on = false;
+    for line in workflow.lines() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let indented = line.starts_with(' ');
+        if !indented {
+            in_on = line.trim_end() == "on:";
+            continue;
+        }
+        if in_on {
+            let t = line.trim_start();
+            // Direct children only: the shallowest indentation under `on:`.
+            if line.len() - t.len() == 2 {
+                if let Some(key) = t.split(':').next() {
+                    keys.push(key.trim());
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// The `if:` lines of a workflow whose condition is the literal `false`
+/// (`if: false`, `if: 'false'`, `if: ${{ false }}`): a job or step switched off
+/// while its text stays in place.
+fn disabled_conditions(workflow: &str) -> Vec<&str> {
+    workflow
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start().trim_start_matches("- ");
+            let Some(cond) = t.strip_prefix("if:") else {
+                return false;
+            };
+            let cond = cond.split(" #").next().unwrap_or("").trim();
+            let cond = cond
+                .strip_prefix("${{")
+                .and_then(|c| c.strip_suffix("}}"))
+                .unwrap_or(cond)
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"');
+            cond == "false"
+        })
+        .collect()
+}
+
+/// Why `lane` would not run in `workflow`, or `Ok` when it still does.
+fn lane_runs(lane: &Lane, workflow: &str) -> Result<(), String> {
+    if !steps(workflow)
+        .iter()
+        .any(|step| lane.step_contains.iter().all(|s| step.contains(s)))
+    {
+        return Err(format!(
+            "no step contains all of {:?}; the step is gone",
+            lane.step_contains
+        ));
+    }
+    let keys = trigger_keys(workflow);
+    let missing: Vec<&str> = lane
+        .triggers
+        .iter()
+        .copied()
+        .filter(|t| !keys.contains(t))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "its `on:` block no longer has {missing:?} (has {keys:?}); nothing starts the lane"
+        ));
+    }
+    let off = disabled_conditions(workflow);
+    if !off.is_empty() {
+        return Err(format!(
+            "it has an always-false condition {off:?}; the job or step never runs"
+        ));
+    }
+    Ok(())
+}
+
 #[test]
 fn every_ignored_test_is_registered_with_a_lane() {
     let root = PathBuf::from(ROOT);
@@ -277,16 +367,12 @@ fn every_registered_lane_still_runs_its_tests() {
         let path = root.join(e.lane.workflow);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("{}::{}: read {}: {err}", e.file, e.test, path.display()));
-        assert!(
-            steps(&text)
-                .iter()
-                .any(|step| e.lane.step_contains.iter().all(|s| step.contains(s))),
-            "{}::{}: no step of {} contains all of {:?}; the lane that ran this ignored test is gone",
-            e.file,
-            e.test,
-            e.lane.workflow,
-            e.lane.step_contains
-        );
+        if let Err(why) = lane_runs(&e.lane, &text) {
+            panic!(
+                "{}::{}: the lane in {} that runs this ignored test no longer does: {why}",
+                e.file, e.test, e.lane.workflow
+            );
+        }
     }
 }
 
@@ -330,4 +416,46 @@ fn the_scan_sees_attributes_and_not_comments() {
             "wrapped_conditional_ignore"
         ]
     );
+}
+
+#[test]
+fn the_lane_check_sees_a_lane_that_cannot_run() {
+    const LANE: Lane = Lane {
+        workflow: "probe.yml",
+        step_contains: &["--test probe", "--ignored"],
+        triggers: &["schedule", "workflow_dispatch"],
+    };
+    let live = "name: probe\n\
+                on:\n  schedule:\n    - cron: \"17 9 * * 1\"\n  workflow_dispatch:\n\
+                jobs:\n  probe:\n    runs-on: ubuntu-latest\n    steps:\n\
+                \x20     - name: run it\n        run: cargo test --test probe -- --ignored\n";
+    assert_eq!(lane_runs(&LANE, live), Ok(()));
+
+    // Each of these leaves the step's text in place but stops it running.
+    let job_off = live.replace("    runs-on:", "    if: false\n    runs-on:");
+    let step_off = live.replace("        run:", "        if: ${{ false }}\n        run:");
+    let quoted_off = live.replace("    runs-on:", "    if: 'false'\n    runs-on:");
+    let no_schedule = live.replace("  schedule:\n    - cron: \"17 9 * * 1\"\n", "");
+    let push_only = live.replace(
+        "  schedule:\n    - cron: \"17 9 * * 1\"\n  workflow_dispatch:\n",
+        "  push:\n",
+    );
+    let step_gone = live.replace("-- --ignored", "");
+    for (what, wf) in [
+        ("job if: false", &job_off),
+        ("step if: ${{ false }}", &step_off),
+        ("job if: 'false'", &quoted_off),
+        ("schedule trigger removed", &no_schedule),
+        ("triggers replaced", &push_only),
+        ("--ignored dropped", &step_gone),
+    ] {
+        assert!(lane_runs(&LANE, wf).is_err(), "{what}: not reported\n{wf}");
+    }
+
+    // A real condition is not a disabled one.
+    let conditional = live.replace(
+        "    runs-on:",
+        "    if: github.repository == 'o/r'\n    runs-on:",
+    );
+    assert_eq!(lane_runs(&LANE, &conditional), Ok(()));
 }
