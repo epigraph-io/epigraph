@@ -5,28 +5,34 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Provenance identity of a claim. Two claims are "same source" iff they share
-/// an asserting paper, share a derivation root, or are both non-paper claims
-/// by the same agent — see [`is_same_source`].
+/// a paper, share a derivation root, or are both non-paper claims by the same
+/// agent — see [`is_same_source`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SourceKey {
-    /// DOIs of EVERY paper that asserts the claim or one of its
-    /// `decomposes_to` ancestors, sorted and deduplicated. A claim asserted
-    /// by several papers carries all of them, so a shared paper is never
-    /// hidden behind an arbitrary single pick. Empty = non-paper claim.
+    /// DOIs of EVERY paper the claim belongs to, sorted and deduplicated: the
+    /// papers that assert the claim or one of its `decomposes_to` ancestors,
+    /// plus, for a claim with no paper `asserts` edge of its own, the papers
+    /// reached through the intra-source closure (see [`derive_source_key`]).
+    /// A claim asserted by several papers carries all of them, so a shared
+    /// paper is never hidden behind an arbitrary single pick. Empty = the
+    /// claim reaches no paper at all.
     pub paper_dois: Vec<String>,
+    /// True when a paper asserts the claim itself or one of its
+    /// `decomposes_to` ancestors, i.e. when `paper_dois` would be non-empty
+    /// WITHOUT the intra-source closure. This, not `paper_dois.is_empty()`,
+    /// is what makes a claim a "paper claim" for the same-agent rule of
+    /// [`is_same_source`]: a claim that reaches a paper only through the
+    /// closure keeps the non-paper same-agent rule it had before the closure
+    /// was added, so folding the closure in only ever ADDS same-source pairs.
+    #[serde(default)]
+    pub paper_anchored: bool,
     pub agent_id: Uuid,
     /// Root of the claim's `derived_from` chain (`None` when it has no
     /// `derived_from` parent). SCOPE: this is claim-to-claim derivation
-    /// lineage only. It does NOT model the intra-source closure that
-    /// migration 041's `same_source_papers()` walks (`same_source`,
-    /// `section_follows`, `continues_argument`, `decomposes_to`, in either
-    /// direction): paper siblings are caught by `paper_dois` (asserting
-    /// papers over the `decomposes_to` ancestry), and a claim reachable from
-    /// a paper only through `section_follows` / `continues_argument` /
-    /// `same_source` edges, with no `asserts` edge on it or an ancestor, is
-    /// NOT seen as same-source here. The matcher derives one key per
-    /// candidate endpoint, so the undirected closure walk is deliberately
-    /// not repeated per claim.
+    /// lineage only. The intra-source closure of migration 041's
+    /// `same_source_papers()` (`same_source`, `section_follows`,
+    /// `continues_argument`, `decomposes_to`) is folded into `paper_dois`
+    /// instead, see [`derive_source_key`].
     pub derivation_root: Option<Uuid>,
 }
 
@@ -43,19 +49,27 @@ pub struct SourceFilterConfig {
     pub include_agent_id: bool,
 }
 
-/// True when `a` and `b` share any asserting paper DOI or another non-null
-/// source component, when both are
+/// True when `a` and `b` share any paper DOI (asserting, ancestry or
+/// intra-source closure) or another non-null source component, when both are
 /// non-paper claims written by the same agent, or (if `cfg.include_agent_id`)
 /// when they share an `agent_id` at all.
 ///
-/// A non-paper claim (memorize, telemetry, RFP, ...) has no asserting paper,
-/// so `paper_dois` is empty (`papers.doi` is NOT NULL, so empty means "no
-/// `paper -asserts->` edge on the claim or on any `decomposes_to` ancestor",
-/// never "a paper without a DOI"; see [`derive_source_key`]). For such a
-/// claim the authoring agent is the only source signal besides the derivation
-/// root, so two of them by one agent are a restatement,
-/// not independent corroboration. A pair with a paper claim on either side
-/// keeps the paper rule: same agent alone does not make it same-source.
+/// A non-paper claim (memorize, telemetry, RFP, ...) has no `paper -asserts->`
+/// edge on itself or its `decomposes_to` ancestry, so `paper_anchored` is
+/// false (`papers.doi` is NOT NULL, so an anchored claim always has a DOI;
+/// see [`derive_source_key`]). For such a claim the authoring agent is the
+/// only source signal besides the derivation root and the closure DOIs, so
+/// two of them by one agent are a restatement, not independent corroboration.
+/// A pair with a paper-anchored claim on either side keeps the paper rule:
+/// same agent alone does not make it same-source.
+///
+/// The same-agent rule deliberately reads `paper_anchored`, not
+/// `paper_dois.is_empty()`: a non-paper claim that gains a closure DOI (say,
+/// through a `same_source` edge to a paper's claim) must not thereby escape
+/// the same-agent rule against its author's other non-paper claims. So the
+/// result is exactly the pre-closure rule OR a shared closure DOI. Its cost:
+/// two unanchored claims of one agent whose closures reach DIFFERENT papers
+/// stay same-source, as they were before the closure existed.
 pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> bool {
     fn both_eq<T: PartialEq>(x: &Option<T>, y: &Option<T>) -> bool {
         matches!((x, y), (Some(xv), Some(yv)) if xv == yv)
@@ -68,13 +82,66 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
     if both_eq(&a.derivation_root, &b.derivation_root) {
         return true;
     }
-    let both_non_paper = a.paper_dois.is_empty() && b.paper_dois.is_empty();
+    let both_non_paper = !a.paper_anchored && !b.paper_anchored;
     (both_non_paper || cfg.include_agent_id) && a.agent_id == b.agent_id
 }
 
-/// Look up a claim's [`SourceKey`] by querying its row, resolving the paper
-/// that asserts it or its nearest `decomposes_to` ancestor, and chasing the
-/// `derived_from` edge chain to a root (acyclic, capped at depth 32).
+/// Look up a claim's [`SourceKey`] by querying its row, resolving the papers
+/// the claim belongs to, and chasing the `derived_from` edge chain to a root
+/// (acyclic, capped at depth 32).
+///
+/// # Paper resolution
+///
+/// A claim's papers are the papers with a `paper -asserts->` edge on any claim
+/// in the union of two walks:
+///
+/// 1. its `decomposes_to` ancestry (child -> parent, depth 32), and
+/// 2. the intra-source closure (9da3cf2b): from a claim that has NO paper
+///    `asserts` edge, follow `section_follows`, `continues_argument` and
+///    `same_source` in either direction and `decomposes_to` child -> parent,
+///    through claims that also have no paper `asserts` edge, and stop at the
+///    first paper-asserted claim on each path.
+///
+/// `paper_anchored` is true iff walk 1 alone finds a paper (see
+/// [`SourceKey::paper_anchored`]).
+///
+/// Walk 2 is what catches a claim that reaches a paper only through
+/// `section_follows` / `continues_argument` / `same_source` edges. Its edge set
+/// is migration 041's `same_source_papers()`, but it deliberately differs from
+/// 041 in two ways, both so the matcher never merges two papers' hierarchies:
+///
+/// - It never walks `decomposes_to` parent -> child. Atoms dedupe on content
+///   hash, so one atom can sit under compounds of two papers; 041's undirected
+///   walk goes down into such an atom and up into the other paper, which would
+///   mark every pair across the two papers same-source and drop exactly the
+///   cross-paper corroborations the matcher exists to find.
+/// - It stops at paper-asserted claims. Canonical ingest writes a
+///   `paper -asserts->` edge on every claim it plans, so a paper-asserted
+///   claim's own papers are authoritative and a lateral edge to a claim of
+///   another paper does not add that paper. Only `source_type = 'paper'`
+///   anchors: the `agent -asserts->` attribution edge ingest also writes is
+///   not a source.
+///
+/// Walk 2 follows a lateral edge (`section_follows`, `continues_argument`,
+/// `same_source`) only while it is in force (`valid_to IS NULL OR valid_to >
+/// now()`). `same_source` in particular is a claim-to-claim edge any writer
+/// can create (and retract) through `POST /edges`; a retracted one must stop
+/// suppressing matches. `decomposes_to` and the paper `asserts` anchor are
+/// lineage and stay unfiltered, like walk 1.
+///
+/// Walk 2 has no hop cap, unlike walk 1: canonical ingest writes long
+/// `section_follows` chains, and a cap would cut a claim deep in a chain off
+/// from its paper. It still terminates and stays linear in the component's
+/// size, because the recursive `UNION` dedupes on the claim id alone (adding a
+/// depth column would defeat that dedup on an undirected walk).
+///
+/// Cost (measured on a migrated test database, `measure_intra_source_walk_cost`
+/// in `tests/source_key_derivation.rs`): a paper-asserted claim, which is
+/// every claim canonical ingest writes, stops walk 2 at hop zero, so its cost
+/// is the ancestry walk alone. An unanchored claim costs one walk over its
+/// unanchored component, linear in the component's size; the figures are in
+/// that test's doc. The matcher already caches one key per candidate
+/// endpoint per run.
 pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKey, sqlx::Error> {
     // `properties->>'ingestion_run_id'` used to be read here as a third
     // provenance component, but no write path ever set it, so the branch was
@@ -111,7 +178,7 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
     // claim asserted by several papers look independent of a claim sharing
     // any of the papers it did not keep. The `decomposes_to` edges are
     // lineage too, so they are not filtered on `valid_to` either.
-    let paper_dois = sqlx::query_scalar::<_, String>(
+    let papers = sqlx::query_as::<_, (String, bool)>(
         "WITH RECURSIVE ancestry(id, depth) AS ( \
              SELECT $1::uuid, 0 \
              UNION \
@@ -120,16 +187,50 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
              WHERE d.relationship = 'decomposes_to' \
                AND d.source_type = 'claim' AND d.target_type = 'claim' \
                AND a.depth < 32 \
+         ), \
+         closure(id) AS ( \
+             SELECT $1::uuid \
+             UNION \
+             SELECT n.id FROM closure c \
+             CROSS JOIN LATERAL ( \
+                 SELECT e.target_id AS id FROM edges e \
+                 WHERE e.source_id = c.id \
+                   AND e.relationship IN \
+                       ('section_follows', 'continues_argument', 'same_source') \
+                   AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                   AND e.source_type = 'claim' AND e.target_type = 'claim' \
+                 UNION ALL \
+                 SELECT e.source_id FROM edges e \
+                 WHERE e.target_id = c.id \
+                   AND (e.relationship = 'decomposes_to' \
+                        OR (e.relationship IN \
+                                ('section_follows', 'continues_argument', \
+                                 'same_source') \
+                            AND (e.valid_to IS NULL OR e.valid_to > now()))) \
+                   AND e.source_type = 'claim' AND e.target_type = 'claim' \
+             ) n \
+             WHERE NOT EXISTS ( \
+                 SELECT 1 FROM edges pa \
+                 WHERE pa.target_id = c.id AND pa.source_type = 'paper' \
+                   AND pa.relationship = 'asserts' \
+             ) \
+         ), \
+         members(id, in_ancestry) AS ( \
+             SELECT id, true FROM ancestry \
+             UNION ALL SELECT id, false FROM closure \
          ) \
-         SELECT DISTINCT p.doi FROM ancestry a \
-         JOIN edges e ON e.target_id = a.id AND e.source_type = 'paper' \
+         SELECT p.doi, bool_or(m.in_ancestry) FROM members m \
+         JOIN edges e ON e.target_id = m.id AND e.source_type = 'paper' \
               AND e.relationship = 'asserts' \
          JOIN papers p ON p.id = e.source_id \
+         GROUP BY p.doi \
          ORDER BY p.doi",
     )
     .bind(claim_id)
     .fetch_all(pool)
     .await?;
+    let paper_anchored = papers.iter().any(|(_, in_ancestry)| *in_ancestry);
+    let paper_dois = papers.into_iter().map(|(doi, _)| doi).collect();
 
     // Walk the derived_from chain. Stop when there's no parent, when we
     // detect a cycle (parent == current), or when we hit the depth cap.
@@ -164,6 +265,7 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
 
     Ok(SourceKey {
         paper_dois,
+        paper_anchored,
         agent_id,
         derivation_root,
     })
@@ -175,6 +277,7 @@ mod tests {
 
     fn k(p: Option<&str>, a: Uuid, dr: Option<Uuid>) -> SourceKey {
         SourceKey {
+            paper_anchored: p.is_some(),
             paper_dois: p.into_iter().map(str::to_string).collect(),
             agent_id: a,
             derivation_root: dr,
@@ -196,6 +299,7 @@ mod tests {
     fn any_shared_doi_in_a_multi_paper_key_is_same_source() {
         let l = SourceKey {
             paper_dois: vec!["10.1/only-a".into(), "10.2/shared".into()],
+            paper_anchored: true,
             agent_id: Uuid::new_v4(),
             derivation_root: None,
         };
@@ -258,6 +362,47 @@ mod tests {
         let r = k(None, a, None);
         assert!(!is_same_source(&l, &r, SourceFilterConfig::default()));
         assert!(!is_same_source(&r, &l, SourceFilterConfig::default()));
+    }
+
+    /// A non-paper claim whose DOI comes only from the intra-source closure
+    /// (`paper_anchored == false`) keeps the same-agent rule against its
+    /// author's other non-paper claims (9da3cf2b review): reading
+    /// `paper_dois.is_empty()` instead would let a `same_source` edge to a
+    /// paper's claim turn a same-agent restatement into "corroboration".
+    #[test]
+    fn closure_only_doi_keeps_the_same_agent_rule() {
+        let a = Uuid::new_v4();
+        let closure_only = SourceKey {
+            paper_dois: vec!["10.1/x".into()],
+            paper_anchored: false,
+            agent_id: a,
+            derivation_root: None,
+        };
+        let bare = k(None, a, None);
+        assert!(is_same_source(
+            &closure_only,
+            &bare,
+            SourceFilterConfig::default()
+        ));
+        assert!(is_same_source(
+            &bare,
+            &closure_only,
+            SourceFilterConfig::default()
+        ));
+        // Different agent, no shared DOI: still cross-source.
+        let other = k(None, Uuid::new_v4(), None);
+        assert!(!is_same_source(
+            &closure_only,
+            &other,
+            SourceFilterConfig::default()
+        ));
+        // A paper-anchored claim of the same agent keeps the paper rule.
+        let anchored = k(Some("10.1/y"), a, None);
+        assert!(!is_same_source(
+            &closure_only,
+            &anchored,
+            SourceFilterConfig::default()
+        ));
     }
 
     #[test]

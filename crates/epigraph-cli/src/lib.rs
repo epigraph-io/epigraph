@@ -22,6 +22,7 @@ pub mod bootstrap;
 pub mod bridge;
 #[cfg(feature = "db")]
 pub mod cache_owner_audit;
+pub mod contamination_split;
 pub mod decompose;
 #[cfg(feature = "db")]
 pub mod decomposes_to_factor_sweep;
