@@ -594,6 +594,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for problem in epigraph_engine::calibration::CalibrationConfig::startup_problems() {
         tracing::error!("calibration: {problem}");
     }
+    for warning in epigraph_engine::calibration::CalibrationConfig::startup_warnings() {
+        tracing::warn!("calibration: {warning}");
+    }
 
     // Operator decision D9: a request-serving process never holds the
     // maintenance DSN, and this binary is one on every transport (`--listen`

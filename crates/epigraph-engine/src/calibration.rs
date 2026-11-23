@@ -352,6 +352,78 @@ impl CalibrationConfig {
         Self::problems(Self::cached(), Self::cached_source())
     }
 
+    /// The cross-source matcher's `[matcher]` section, from the same source as
+    /// [`Self::cached`] (backlog 26a12f41: it was read from a cwd-relative
+    /// `calibration.toml`).
+    ///
+    /// No section-level fallback: a `CALIBRATION_PATH` file without a valid
+    /// `[matcher]` is an error naming the file, not a silent switch to the
+    /// compiled-in matcher settings.
+    ///
+    /// # Errors
+    /// When the served source has no valid `[matcher]` section.
+    pub fn served_matcher() -> anyhow::Result<crate::matching::calibration::MatcherConfig> {
+        Self::matcher_from(Self::cached_source())
+    }
+
+    fn matcher_from(
+        source: &CalibrationSource,
+    ) -> anyhow::Result<crate::matching::calibration::MatcherConfig> {
+        use crate::matching::calibration::MatcherConfig;
+        use anyhow::Context as _;
+        match source {
+            CalibrationSource::Path(p) => MatcherConfig::load_from(p),
+            CalibrationSource::Embedded { .. } => {
+                MatcherConfig::from_toml_str(EMBEDDED_CALIBRATION)
+            }
+        }
+        .with_context(|| format!("[matcher] of the served calibration ({source})"))
+    }
+
+    /// Evidence-type keys the calibration compiled into this binary resolves to
+    /// a calibrated weight but `cfg` does not, when `cfg` came from a
+    /// `CALIBRATION_PATH` file (backlog 88791b82). An operator's override file
+    /// is a full copy taken at some point in time, so an alias added to the
+    /// workspace file later (`dataset`, `figure`) is missing from it and every
+    /// row stored under that tag weighs at the 0.5 unknown-type fallback.
+    ///
+    /// Empty for the compiled-in calibration. A warning, not a
+    /// [`Self::problems`] entry: those make the targeted `backfill_factors`
+    /// rewire and the R-173 guard refuse, and an override may leave a key out
+    /// on purpose.
+    #[must_use]
+    pub fn override_gaps(cfg: &Self, source: &CalibrationSource) -> Vec<String> {
+        if !matches!(source, CalibrationSource::Path(_)) {
+            return Vec::new();
+        }
+        let shipped = Self::embedded();
+        let mut keys: Vec<&String> = shipped
+            .evidence_type_weights
+            .keys()
+            .chain(shipped.evidence_type_aliases.keys())
+            .filter(|k| shipped.evidence_type_weight_present(k))
+            .filter(|k| !cfg.evidence_type_weight_present(k))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        vec![format!(
+            "{source} does not resolve evidence type(s) {keys:?} that the calibration \
+             compiled into this binary does; rows stored under them weigh at the 0.5 \
+             unknown-type fallback (add the missing [evidence_type_aliases] / \
+             [evidence_type_weights] lines to the override)"
+        )]
+    }
+
+    /// [`Self::override_gaps`] for the process-wide calibration, for the
+    /// binaries to log at WARN at boot.
+    #[must_use]
+    pub fn startup_warnings() -> Vec<String> {
+        Self::override_gaps(Self::cached(), Self::cached_source())
+    }
+
     /// Resolve a methodology string to its `(base_support, base_against, base_ignorance)` profile.
     ///
     /// Resolution order:
@@ -788,6 +860,18 @@ mod tests {
                 < f64::EPSILON,
             "dataset → empirical"
         );
+        // A stored `figure` row likewise weighs as the engine maps it
+        // (`map_evidence_type`: Figure → Empirical), not at the 0.5 fallback.
+        assert!(
+            cfg.evidence_type_weight_present("figure"),
+            "figure must resolve through the alias table"
+        );
+        assert!(
+            (cfg.get_evidence_type_weight("figure") - cfg.get_evidence_type_weight("empirical"))
+                .abs()
+                < f64::EPSILON,
+            "figure → empirical"
+        );
     }
 
     #[test]
@@ -878,6 +962,119 @@ mod tests {
             }
         );
         assert!(CalibrationConfig::problems(&cfg, &src).is_empty());
+    }
+
+    /// An override file taken before an alias was added to the workspace file
+    /// (backlog 88791b82: `figure`) is named at boot with the missing key; the
+    /// compiled-in calibration and a current copy report nothing.
+    #[test]
+    fn an_override_missing_a_shipped_alias_is_warned_about() {
+        let path = PathBuf::from("/etc/epigraph/calibration.toml");
+        let mut stale = CalibrationConfig::embedded();
+        assert!(stale.evidence_type_aliases.remove("figure").is_some());
+        let warnings =
+            CalibrationConfig::override_gaps(&stale, &CalibrationSource::Path(path.clone()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("\"figure\"")
+                && warnings[0].contains("/etc/epigraph/calibration.toml")
+                && !warnings[0].contains("\"dataset\""),
+            "{}",
+            warnings[0]
+        );
+        // Not a problem: the guards that refuse on problems are unaffected.
+        assert!(
+            CalibrationConfig::problems(&stale, &CalibrationSource::Path(path.clone())).is_empty()
+        );
+
+        // A canonical weight key missing from the override is a gap too.
+        let mut no_weight = CalibrationConfig::embedded();
+        assert!(no_weight
+            .evidence_type_weights
+            .remove("testimonial")
+            .is_some());
+        let warnings =
+            CalibrationConfig::override_gaps(&no_weight, &CalibrationSource::Path(path.clone()));
+        assert!(
+            warnings.len() == 1
+                && warnings[0].contains("\"testimonial\"")
+                && warnings[0].contains("\"testimony\""),
+            "{warnings:?}"
+        );
+
+        let (current, src) = CalibrationConfig::resolve(Some(calibration_path()));
+        assert!(CalibrationConfig::override_gaps(&current, &src).is_empty());
+        let embedded = CalibrationSource::Embedded {
+            failed_override: None,
+        };
+        assert!(CalibrationConfig::override_gaps(&stale, &embedded).is_empty());
+    }
+
+    /// `[matcher]` follows the resolved source: the `CALIBRATION_PATH` file's
+    /// own section when it loads, the compiled-in one otherwise, and an
+    /// override without the section is an error naming the file.
+    #[test]
+    fn the_matcher_section_comes_from_the_resolved_source() {
+        let shipped =
+            crate::matching::calibration::MatcherConfig::load_from(&calibration_path()).unwrap();
+        let embedded = CalibrationConfig::matcher_from(&CalibrationSource::Embedded {
+            failed_override: None,
+        })
+        .expect("the compiled-in calibration has a [matcher]");
+        assert_eq!(
+            embedded.fan_out.max_per_claim,
+            shipped.fan_out.max_per_claim
+        );
+        assert!((embedded.bands.high - shipped.bands.high).abs() < 1e-6);
+
+        let dir = std::env::temp_dir().join(format!(
+            "26a12f41-matcher-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = std::fs::read_to_string(calibration_path()).unwrap();
+        let variant = dir.join("variant.toml");
+        let replaced = text.replace(
+            &format!("max_per_claim = {}", shipped.fan_out.max_per_claim),
+            "max_per_claim = 7",
+        );
+        assert_ne!(replaced, text, "the workspace file carries max_per_claim");
+        std::fs::write(&variant, replaced).unwrap();
+        let got = CalibrationConfig::matcher_from(&CalibrationSource::Path(variant))
+            .expect("the override's [matcher]");
+        assert_eq!(got.fan_out.max_per_claim, 7);
+
+        // The same file with every `[matcher.*]` table dropped.
+        let mut in_matcher = false;
+        let no_matcher: String = text
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                if t.starts_with('[') {
+                    in_matcher = t.starts_with("[matcher");
+                }
+                !in_matcher
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!no_matcher.contains("[matcher"));
+        let without = dir.join("no-matcher.toml");
+        std::fs::write(&without, &no_matcher).unwrap();
+        assert!(
+            CalibrationConfig::load(&without).is_ok(),
+            "the evidence-type calibration still loads without [matcher]"
+        );
+        let err = CalibrationConfig::matcher_from(&CalibrationSource::Path(without.clone()))
+            .expect_err("an override without [matcher] is an error");
+        assert!(
+            format!("{err:#}").contains(&without.display().to_string()),
+            "the error names the file: {err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An explicit calibration whose vocabulary is empty is the one way left

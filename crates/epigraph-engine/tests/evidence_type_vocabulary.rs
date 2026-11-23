@@ -82,3 +82,25 @@ fn an_unknown_verdict_means_the_combine_uses_the_unknown_type_weight() {
         );
     }
 }
+
+/// Every tag the `evidence.evidence_type` CHECK admits
+/// (`epigraph_core::STORED_EVIDENCE_TYPES`) resolves to a calibrated weight,
+/// so a path that weighs by the stored tag (e.g. `backfill_factors`' evidence
+/// phase) never lands on the 0.5 unknown-type fallback for a tag the database
+/// can hold. `figure` had no alias (only `dataset` was added with migration
+/// 229), so a stored figure row weighed 0.5 where the engine maps `Figure` to
+/// `Empirical`.
+#[test]
+fn every_stored_evidence_tag_resolves_to_a_calibrated_weight() {
+    let c = cfg();
+    let unresolved: Vec<&str> = epigraph_core::STORED_EVIDENCE_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !c.evidence_type_weight_present(t))
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "stored evidence tags with no calibrated weight (add an [evidence_type_aliases] \
+         entry in calibration.toml): {unresolved:?}"
+    );
+}
