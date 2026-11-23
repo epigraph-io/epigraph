@@ -124,7 +124,9 @@ pub use agent::{
     CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
     SpeaksFor,
 };
-pub use agent::{DelegationLive, RunTokens, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV};
+pub use agent::{
+    DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,
+};
 pub use agent::{CLIENT_ALLOWLIST_BINDING, HUMAN_OPERATOR_BINDING, LIVE_LINK_BINDING};
 pub use agent_identity::{
     AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob, PromptBlobRead,

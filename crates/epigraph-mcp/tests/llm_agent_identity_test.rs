@@ -236,6 +236,73 @@ async fn absent_llm_identity_leaves_agent_properties_clean(pool: PgPool) {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// AGENT TYPE (backlog 9d4673a0)
+// ────────────────────────────────────────────────────────────────────────────
+
+async fn agent_type_of(pool: &PgPool, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT agent_type::text FROM agents WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("read agent_type")
+}
+
+/// The server's own signer row is never created as a person. Before the fix
+/// `agent_id()` created it through `AgentRepository::create`, which names no
+/// `agent_type`, so migration 001's default `'human'` applied, and the
+/// lineage-parent (161/166/195) and role-attach (166 ROL02) gates read that
+/// row as a human. An LLM-configured server's row is `'llm'`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn llm_configured_signer_is_created_with_agent_type_llm(pool: PgPool) {
+    let server = llm_server(pool.clone());
+    server.emit_tool_invoked("query_claims").await;
+    let id = resolve_mcp_agent_id(&pool).await;
+    assert_eq!(agent_type_of(&pool, id).await, "llm");
+}
+
+/// A server with no LLM identity (a generated or `--agent-key` signer) is a
+/// `'software_agent'`, not a `'human'`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unconfigured_signer_is_created_with_agent_type_software_agent(pool: PgPool) {
+    let signer = AgentSigner::from_bytes(&[0x6Du8; 32]).expect("signer");
+    let pk = signer.public_key();
+    let embedder = McpEmbedder::new(pool.clone(), None);
+    let scoped = epigraph_db::ScopedPool::connect_lazy_for_tests(
+        (*pool.connect_options()).clone(),
+        epigraph_db::SessionGucMode::Session,
+    );
+    let server =
+        EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped);
+    server.emit_tool_invoked("query_claims").await;
+    let id = epigraph_db::AgentRepository::get_by_public_key(&pool, &pk)
+        .await
+        .expect("query agent")
+        .expect("agent row exists")
+        .id
+        .as_uuid();
+    assert_eq!(agent_type_of(&pool, id).await, "software_agent");
+}
+
+/// The FOUND branch does not retype a row it did not create: an existing
+/// row for the signer's key keeps the type it has (retyping existing rows is
+/// a separate, operator-ruled backfill).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_existing_signer_row_is_reused_and_not_retyped(pool: PgPool) {
+    let pk = keypair_from_llm_agent(MODEL, PROMPT).public_key();
+    let existing: Uuid = sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name) VALUES ($1, 'mcp-agent') RETURNING id",
+    )
+    .bind(pk.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("seed legacy row");
+    let server = llm_server(pool.clone());
+    server.emit_tool_invoked("query_claims").await;
+    assert_eq!(resolve_mcp_agent_id(&pool).await, existing);
+    assert_eq!(agent_type_of(&pool, existing).await, "human");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // LINEAGE
 // ────────────────────────────────────────────────────────────────────────────
 

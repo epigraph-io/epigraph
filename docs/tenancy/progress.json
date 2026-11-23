@@ -1623,7 +1623,7 @@
           "remaining": 10,
           "outcome": "OPEN -- partially converted; classified A met exactly",
           "evidence": "Only 3 of the 5 change what a caller can see: the two `AgentRepository::get_by_id` sites narrow nothing, because migration 077 section 9 gives `agents` the policy `agents_identity FOR SELECT USING (true)` -- measured, not inferred. Arms over get_agent_reputation and agent_claims; agent_claims carries a stranger arm asserting both the page and `total` exactly, and the land-phase mutation proof failed it on its own assert_eq! at left 3 / right 2.",
-          "blocker": "HANDLER for all 10: create_agent 2 and update_agent 3 WRITE; get_agent 1 and list_agents 4 are routed GETs that hold no Viewer, which is the residual owned by `F-TAILRLS-P1` and not by this shard."
+          "blocker": "HANDLER for all 10: create_agent 2 and update_agent 3 WRITE; get_agent 1 and list_agents 4 are routed GETs that hold no Viewer, which is the residual owned by `F-TAILRLS-P1` and not by this shard. UPDATE (backlog 8946be59): `list_agents` now takes a `ViewerExtractor` for its `?public_key=` lookup, which reads on a `read_as` connection; its 4 remaining `state.db_pool` sites (the label and unfiltered arms) are blocked by the `&PgPool` signatures of `AgentRepository::list`, `count`, `list_by_label` and `count_by_label`, not by a missing Viewer. Since backlog 761c2b05 `get_agent` also takes a Viewer (its one row read is on a `read_as` connection) and both handlers, the `?public_key=` arm included, null `orcid` / `ror_id` for a profile the caller may not see. The shard-6 disposition above is the 2026-09-17 record and is not rewritten."
         },
         "routes/experiments.rs": {
           "sites": 11,

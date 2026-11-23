@@ -2405,8 +2405,18 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent.rs",
+        "create_signer_conn",
+        "WRITE. `create_conn`'s INSERT INTO `agents` with `agent_type` bound from the closed \
+         `SignerAgentType` ('llm' | 'software_agent', backlog 9d4673a0) for a process's own \
+         signer. `agents` is not tenant-partitioned (as `create_conn`), so there is no read \
+         predicate to splice; `key_kind` keeps its default, which 077's `agents_provision` \
+         WITH CHECK admits.",
+    ),
+    (
+        "agent.rs",
         "registered",
-        "WRITE. The shared tail of `create_conn` and `create_seed_derived_conn`: the best-effort \
+        "WRITE. The shared tail of `create_conn`, `create_seed_derived_conn` and \
+         `create_signer_conn`: the best-effort \
          `agent.registered` event on the caller's connection (through `publish_or_log_conn`'s \
          SAVEPOINT) and the returned `Agent`. Reads no row.",
     ),
