@@ -10,6 +10,8 @@
 //!   visible leaf that is itself a compound (its decomposition hidden from
 //!   the caller) is not listed either.
 //! - An atom and a standalone claim are not compounds, in either mode.
+//! - A compound the caller cannot read is not decided (no existence oracle:
+//!   the writer's own not-found answers it).
 //! - `warn` logs the caller and the writer, never the claim's content.
 //!
 //! Fixtures are seeded on the harness superuser pool.
@@ -92,6 +94,12 @@ async fn the_guard_decides_role_on_the_whole_graph_and_lists_only_the_callers_at
     decomposes_to(&pool, mid, mid_child, "group", theirs).await;
 
     let standalone = claim(&pool, caller, mine, "public", "standalone").await;
+
+    // A compound private to another group: the caller cannot read it, so the
+    // guard does not decide it (the writer answers not-found first).
+    let secret = claim(&pool, other, theirs, "group", "unreadable compound").await;
+    let secret_child = claim(&pool, other, theirs, "group", "unreadable child").await;
+    decomposes_to(&pool, secret, secret_child, "group", theirs).await;
 
     let viewer = Viewer::resolve(&pool, caller)
         .await
@@ -180,6 +188,17 @@ async fn the_guard_decides_role_on_the_whole_graph_and_lists_only_the_callers_at
                 .expect("decide non-compound");
             assert_eq!(d, GuardDecision::NotCompound, "{what} under {mode}");
         }
+    }
+    // Not an existence oracle: an unreadable compound is not reported as one.
+    for mode in [CompoundWriteGuard::Warn, CompoundWriteGuard::Refuse] {
+        let d = decide(&mut tx, &viewer, secret, mode, "test_writer", Some(caller))
+            .await
+            .expect("decide unreadable");
+        assert_eq!(
+            d,
+            GuardDecision::NotCompound,
+            "a compound the caller cannot read must not be reported as one (under {mode})"
+        );
     }
     tx.commit().await.expect("commit");
 

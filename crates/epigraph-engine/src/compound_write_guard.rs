@@ -184,7 +184,9 @@ pub async fn visible_atoms(
 /// under [`LOG_TARGET`] (writer, claim id, caller, mode; never content).
 ///
 /// `conn` should carry the caller's tenancy stamp, so the listed atoms are
-/// the ones the caller can read; the compound test itself ignores it.
+/// the ones the caller can read; the compound test itself ignores it. A
+/// claim `viewer` cannot read is [`GuardDecision::NotCompound`]: the writer's
+/// own not-found check answers it, exactly as for a missing id.
 ///
 /// # Errors
 /// [`DbError`] when a query fails.
@@ -196,6 +198,15 @@ pub async fn decide(
     writer: &'static str,
     caller: Option<Uuid>,
 ) -> Result<GuardDecision, DbError> {
+    // A claim the caller cannot read is left to the writer's own not-found
+    // answer, so the guard is no existence oracle: deciding it here would
+    // answer "a compound" for a claim the writer then reports as missing.
+    if !epigraph_db::ClaimRepository::visible_claim_ids(&mut *conn, viewer, &[claim_id])
+        .await?
+        .contains(&claim_id)
+    {
+        return Ok(GuardDecision::NotCompound);
+    }
     if !is_compound(&mut *conn, claim_id).await? {
         return Ok(GuardDecision::NotCompound);
     }
