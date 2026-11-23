@@ -2918,6 +2918,10 @@ async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_
     let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
     let node = seed_node(&pool, "context", fx.dst, "group").await;
     let e = typed_edge(&pool, node, "context", c, "claim").await;
+    // Since migration 258 the trigger meets the context with its own row, so
+    // only an edge stamped before 258 (its prior wider than the node) is
+    // irreversible: see `an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds`.
+    stamp_before_258(&pool, e, fx.src).await;
     let dir = scratch_dir();
     let ids = ids_file(&dir, "ids.txt", &[c, fx.b]);
     let flag: &[&str] = &["--refuse-irreversible"];
