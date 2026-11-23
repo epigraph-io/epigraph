@@ -78,11 +78,18 @@ async fn a_signer_is_stored_with_its_declared_type_on_the_app_role(pool: PgPool)
             .expect("events")
         }
     };
-    assert_eq!(
-        events(llm_id).await,
-        events(plain_id).await,
-        "agent.registered fires exactly as it does for create_conn"
-    );
+    // Exactly one each, not merely "equal": two zeros would also be equal.
+    for (id, path) in [
+        (plain_id, "create_conn"),
+        (llm_id, "create_signer_conn(Llm)"),
+        (sw_id, "create_signer_conn(SoftwareAgent)"),
+    ] {
+        assert_eq!(
+            events(id).await,
+            1,
+            "{path} publishes exactly one agent.registered event"
+        );
+    }
 
     // Calibration: the type cannot be corrected after the insert on this
     // role, which is why it is bound at INSERT.
