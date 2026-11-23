@@ -5071,12 +5071,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
     // viewer's principal, groups and bypass binds, as in `get_public_profile`),
-    // `disclosed_roles` (the role-assignment definer) and the operator humans' `agents`
-    // display names, for the carded agents.
+    // `disclosed_roles` (the role-assignment definer), `disclosed_attachments` (269's
+    // role-attachment definer, which decides on the session in its body) and the operator
+    // humans' `agents` display names, for the carded agents.
     (
         "agent_lookup.rs",
         "cards_inner",
         &[
+            "Self::disclosed_attachments",
             "Self::disclosed_roles",
             "sqlx::query_as(SELECT).fetch_all",
             "sqlx::query_as(SELECT).fetch_all",
@@ -5781,7 +5783,7 @@ pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
 }
 
 // ---------------------------------------------------------------------------
-// The agent public-profile rule, spelled in three statements (backlog 0e419970)
+// The agent public-profile rule, spelled in four statements (backlog 0e419970)
 // ---------------------------------------------------------------------------
 
 /// The statements that spell the agent public-profile rule
@@ -5796,6 +5798,9 @@ pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
 /// [`the_agent_profile_rule_is_one_text_at_every_site`].
 const PROFILE_RULE_SITES: &[(&str, &str)] = &[
     ("agent.rs", "get_public_profile"),
+    // Backlog 761c2b05: the ORCID / ROR redaction of `GET /api/v1/agents`
+    // and `GET /api/v1/agents/:id`.
+    ("agent.rs", "profile_details_visible"),
     ("agent_lookup.rs", "cards_inner"),
     ("agent_lookup.rs", "match_ranked"),
 ];
@@ -5826,7 +5831,7 @@ fn squash(s: &str) -> String {
         .collect()
 }
 
-/// The three copies of the agent public-profile rule are one text with one
+/// The copies of the agent public-profile rule are one text with one
 /// bind order, and no fourth copy exists. Editing any one copy (an arm
 /// dropped or added, a placeholder moved, a bind reordered), or spelling the
 /// rule in a new statement without registering it in [`PROFILE_RULE_SITES`],
