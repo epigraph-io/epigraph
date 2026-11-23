@@ -156,14 +156,14 @@ async fn a_declared_seed_derived_key_is_no_signer_and_gets_no_client(pool: PgPoo
     let (status, body) = post(
         &pool,
         &auth,
-        serde_json::json!({ "public_key": control, "display_name": "a real signer" }),
+        serde_json::json!({ "public_key": control, "display_name": "a real signer", "login": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         stored(&pool, &control).await,
         ("ed25519".to_string(), 1),
-        "the undeclared control must stay an ed25519 signer with its client"
+        "an undeclared control asking for a login stays a signer with a client"
     );
 }
 
@@ -194,9 +194,15 @@ async fn a_key_kind_declaration_is_checked_and_never_rewrites_a_row(pool: PgPool
         .unwrap();
     assert_eq!(agents_after, agents_before, "a refused request inserted");
 
-    // First registered undeclared (an ed25519 signer with a client), then
-    // declared: the find-hit returns the row as it is.
-    let (status, _) = post(&pool, &auth, serde_json::json!({ "public_key": key })).await;
+    // First registered undeclared with a login (an ed25519 signer with a
+    // client; a client is provisioned only on request, backlog 2f87eb08),
+    // then declared: the find-hit returns the row as it is.
+    let (status, _) = post(
+        &pool,
+        &auth,
+        serde_json::json!({ "public_key": key, "login": true }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = post(&pool, &auth, declared(seed, "Bo Example")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
