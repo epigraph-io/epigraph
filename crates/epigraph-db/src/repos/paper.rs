@@ -105,8 +105,15 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(pool))]
-    pub async fn find_by_doi(pool: &PgPool, doi: &str) -> Result<Option<PaperRow>, DbError> {
+    ///
+    /// Generic over the executor so a caller holding a viewer-stamped
+    /// connection can run it there (`papers` carries no tenancy, so the answer
+    /// is the same on any connection of the application role).
+    #[instrument(skip(executor))]
+    pub async fn find_by_doi<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+    ) -> Result<Option<PaperRow>, DbError> {
         // Use `as "title?"` to override sqlx introspection: the migration
         // declares `title` nullable; the dev DB has historical NOT NULL drift.
         let row = sqlx::query!(
@@ -117,7 +124,7 @@ impl PaperRepository {
             "#,
             doi
         )
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await?;
         Ok(row.map(|r| PaperRow {
             id: r.id,

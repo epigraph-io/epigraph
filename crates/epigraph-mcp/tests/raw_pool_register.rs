@@ -389,12 +389,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "check_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
         "paper_already_ingested",
         1,
         NO_ROW_SECURITY,
@@ -601,8 +595,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. The MCP/HTTP twin
+/// refactor moved `check_already_ingested`'s `papers` lookup onto the caller's
+/// stamped read: 82 -> 81.
+const HIGH_WATER: usize = 81;
 
 // ===========================================================================
 // The scanner.

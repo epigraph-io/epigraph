@@ -1324,14 +1324,38 @@ pub async fn verify_claim(
     params: VerifyClaimParams,
 ) -> Result<CallToolResult, McpError> {
     let id = parse_uuid(&params.claim_id)?;
-    let claim_id = ClaimId::from_uuid(id);
-    // Every read below on ONE connection stamped with the caller's viewer
-    // (the plain pool's session sees public rows only).
+    // Every read on ONE connection stamped with the caller's viewer (the plain
+    // pool's session sees public rows only).
     let mut read = server.read_as(viewer, "verify_claim").await?;
-    let claim = ClaimRepository::get_by_id(&mut *read, viewer, claim_id)
+    let report = verify_claim_report(&mut read, viewer, id).await?;
+    read.commit().await.map_err(internal_error)?;
+    let report = report.ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+    success_json(&report)
+}
+
+/// The report `verify_claim` gives, read on `conn`, the caller's viewer-stamped
+/// read: the ONE implementation the MCP tool and its HTTP twin
+/// (`GET /api/v1/claims/:id/verify`, in `epigraph-api`'s `routes::mcp_twins`)
+/// both run, so the two cannot drift. The caller commits.
+///
+/// `Ok(None)` when no claim `id` exists or the viewer may not read it: the
+/// same answer for both, so it is no existence oracle. The MCP tool reports
+/// it as `invalid_params` ("claim … not found"), the HTTP route as a 404.
+///
+/// # Errors
+/// A redacted internal error when a read fails.
+pub async fn verify_claim_report(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    id: Uuid,
+) -> Result<Option<VerifyResponse>, McpError> {
+    let claim_id = ClaimId::from_uuid(id);
+    let Some(claim) = ClaimRepository::get_by_id(&mut *conn, viewer, claim_id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| invalid_params(format!("claim {id} not found")))?;
+    else {
+        return Ok(None);
+    };
 
     // Integrity: BLAKE3 over the body vs. the digest STORED on the row.
     //
@@ -1350,7 +1374,7 @@ pub async fn verify_claim(
         //
         // Second query, on this branch only: the matching case needs no
         // `properties` read at all, so the common path is unchanged.
-        let properties = ClaimRepository::get_properties(&mut *read, viewer, claim_id)
+        let properties = ClaimRepository::get_properties(&mut *conn, viewer, claim_id)
             .await
             .map_err(internal_error)?
             .unwrap_or(serde_json::Value::Null);
@@ -1360,7 +1384,7 @@ pub async fn verify_claim(
             // On the caller's read: the executing `workflows` rows carry
             // their plan's tenancy (migration 183, ruling R-74).
             let names =
-                epigraph_db::WorkflowRepository::executing_canonical_names(&mut *read, viewer, id)
+                epigraph_db::WorkflowRepository::executing_canonical_names(&mut *conn, viewer, id)
                     .await
                     .map_err(internal_error)?;
             match epigraph_ingest::workflow::builder::canonical_name_scoped_hash_matches(
@@ -1393,13 +1417,12 @@ pub async fn verify_claim(
     // present and rejected" — both of which report `signature_valid = false`.
     let signed = claim.signature.is_some();
     let keys = if signed {
-        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *read, viewer, id)
+        epigraph_db::AgentKeyRepository::attested_keys_for_claim(&mut *conn, viewer, id)
             .await
             .map_err(internal_error)?
     } else {
         Vec::new()
     };
-    read.commit().await.map_err(internal_error)?;
     let binding = crate::signing_identity::bind_signature(
         &claim.content_hash,
         claim.signature.as_ref(),
@@ -1410,7 +1433,7 @@ pub async fn verify_claim(
     );
     let signature_valid = binding.signature_valid;
 
-    success_json(&VerifyResponse {
+    Ok(Some(VerifyResponse {
         claim_id: id.to_string(),
         signature_valid,
         signed,
@@ -1425,7 +1448,7 @@ pub async fn verify_claim(
             HashCheck::NotApplicable => None,
         },
         truth_value: claim.truth_value.value(),
-    })
+    }))
 }
 
 /// The steps of `ds_auto::auto_wire_ds_update` (and the helpers it calls)
@@ -3117,11 +3140,28 @@ pub async fn query_undecomposed_claims(
     viewer: &epigraph_db::visibility::Viewer,
     params: crate::types::QueryUndecomposedClaimsParams,
 ) -> Result<CallToolResult, McpError> {
+    let mut read = server.read_as(viewer, "query_undecomposed_claims").await?;
+    let results = undecomposed_claims_page(&mut read, viewer, params).await?;
+    read.commit().await.map_err(internal_error)?;
+    success_json(&results)
+}
+
+/// The page `query_undecomposed_claims` answers with, read on `conn`, the
+/// caller's viewer-stamped read: the ONE implementation the MCP tool and its
+/// HTTP twin (`GET /api/v1/claims/undecomposed`, in `epigraph-api`'s
+/// `routes::mcp_twins`) both run, so the two cannot drift. The caller commits.
+///
+/// # Errors
+/// A redacted internal error when a read fails.
+pub async fn undecomposed_claims_page(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: crate::types::QueryUndecomposedClaimsParams,
+) -> Result<Vec<crate::types::UndecomposedClaimResponse>, McpError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 1000);
     let offset = params.offset.unwrap_or(0).max(0);
 
-    let mut read = server.read_as(viewer, "query_undecomposed_claims").await?;
-    let claims = ClaimRepository::list_undecomposed(&mut *read, viewer, limit, offset)
+    let claims = ClaimRepository::list_undecomposed(&mut *conn, viewer, limit, offset)
         .await
         .map_err(internal_error)?;
 
@@ -3134,10 +3174,9 @@ pub async fn query_undecomposed_claims(
     // does — not a hardcoded `[]` (drain unit U008, backlog `1e6efd2d`
     // residual).
     let ids: Vec<uuid::Uuid> = claims.iter().map(|c| c.id.as_uuid()).collect();
-    let labels_map = ClaimRepository::labels_by_ids(&mut *read, viewer, &ids)
+    let labels_map = ClaimRepository::labels_by_ids(&mut *conn, viewer, &ids)
         .await
         .map_err(internal_error)?;
-    read.commit().await.map_err(internal_error)?;
 
     // `looks_atomic`: the same heuristic `decompose_claims` skips on, so an
     // agent can tell the terminal-by-policy rows (U073, backlog `5e1debbc`)
@@ -3176,7 +3215,7 @@ pub async fn query_undecomposed_claims(
         })
         .collect();
 
-    success_json(&results)
+    Ok(results)
 }
 
 #[cfg(test)]
