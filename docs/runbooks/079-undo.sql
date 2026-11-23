@@ -148,6 +148,9 @@ DECLARE t text;
           -- ---- a workflow's recorded runs (240) ---------------------------
           -- FORCEd by 240 with its tenancy columns, same precedent and reason.
           'behavioral_executions',
+          -- ---- team-group invitations (263) ------------------------------
+          -- FORCEd by 263 at creation, same precedent and reason.
+          'group_invitations',
           -- ---- paper rows (246) ------------------------------------------
           -- FORCEd by 246 with its tenancy columns, same precedent and reason.
           'papers'];

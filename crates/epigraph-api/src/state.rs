@@ -873,6 +873,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // workflow's tenancy columns and FORCEd by that migration, on the same
     // precedent. Apply 240 before or with a binary carrying this name.
     "behavioral_executions",
+    // Team-group invitations (263, backlog triage T75), FORCEd by the
+    // migration that creates them, on the same precedent; privileged
+    // policies only, read through `epigraph_my_group_invitations`.
+    "group_invitations",
     // Paper rows (246, backlog 34864fb5): given tenancy columns and FORCEd by
     // that migration, on the same precedent. Apply 246 before or with a binary
     // carrying this name.

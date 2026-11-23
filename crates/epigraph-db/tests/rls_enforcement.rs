@@ -365,6 +365,14 @@ const DELIBERATELY_UNCOVERED: &[(&str, &str, &str)] = &[
          nobody, and its guards refuse DELETE and TRUNCATE for every role, a superuser \
          included, short of disabling triggers.",
     ),
+    (
+        "group_invitations",
+        "DELETE",
+        "A team-group invitation (263) is answered, never deleted: an accepted or declined \
+         row is the record of who invited whom and what was decided. Under FORCE the absent \
+         DELETE policy default-denies every non-superuser role, and 263 grants DELETE to \
+         nobody.",
+    ),
 ];
 
 /// Every relation the migrations FORCE.
@@ -446,6 +454,7 @@ const PROTECTED: &[&str] = &[
     "atlas_map_levels",
     "workflow_outcome_reports",
     "behavioral_executions",
+    "group_invitations",
 ];
 
 // ===========================================================================
@@ -2112,6 +2121,18 @@ const NO_APP_SELECT: &[(&str, &str)] = &[
         "mass_function_purge_grants",
         "migration 194 (H10): the purge definer's grant rows; REVOKE ALL from epigraph_app \
          (SPEC 2.8), read only through the epigraph_mf_purge_granted definer",
+    ),
+    (
+        "person_team_groups",
+        "migration 263 (backlog triage T75): which keyless team groups a Person made and may \
+         invite to; REVOKE ALL from epigraph_app, so it cannot mark a group invitable, written \
+         by epigraph_person_create_team_group and read through the 263 definers only",
+    ),
+    (
+        "team_group_roster_grants",
+        "migration 263 (backlog triage T75): per-transaction admissions of one roster row for \
+         the 164 groups guards; REVOKE ALL from epigraph_app, so it cannot grant itself a \
+         roster row, written and read only by the 263 definers",
     ),
 ];
 
