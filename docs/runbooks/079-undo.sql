@@ -145,6 +145,9 @@ DECLARE t text;
           -- ---- hierarchical outcome reports (221) ------------------------
           -- FORCEd by 221 at creation, same precedent and reason.
           'workflow_outcome_reports',
+          -- ---- a workflow's recorded runs (240) ---------------------------
+          -- FORCEd by 240 with its tenancy columns, same precedent and reason.
+          'behavioral_executions',
           -- ---- paper rows (246) ------------------------------------------
           -- FORCEd by 246 with its tenancy columns, same precedent and reason.
           'papers'];

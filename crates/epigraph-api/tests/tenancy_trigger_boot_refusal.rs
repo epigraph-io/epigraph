@@ -256,3 +256,72 @@ async fn a_database_with_210_undone_still_boots(pool: PgPool) {
         "210's triggers must be required only where one of 210's functions says 210 ran"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Migration 240's tier: a workflow's runs take, and follow, its tenancy
+// ---------------------------------------------------------------------------
+//
+// A dropped follow trigger errors nowhere: a workflow is narrowed and its
+// recorded runs stay readable to its old readers. 240 has three functions,
+// and any one present means 240 ran.
+
+/// 240's triggers, spelled here for the same reason as [`TRIGGER`].
+const TRIGGERS_240: &[(&str, &str)] = &[
+    (
+        "behavioral_executions",
+        "behavioral_executions_inherit_tenancy",
+    ),
+    (
+        "workflows",
+        "workflows_behavioral_executions_inherit_tenancy",
+    ),
+    ("claims", "claims_behavioral_executions_inherit_tenancy"),
+];
+
+/// Dropped 240 triggers are refused, each one named, even with one of 240's
+/// three functions dropped alongside.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dropped_240_triggers_are_refused(pool: PgPool) {
+    for (rel, tg) in TRIGGERS_240 {
+        sqlx::query(&format!("DROP TRIGGER {tg} ON public.{rel}"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop 240 trigger {tg}: {e}"));
+    }
+    sqlx::query("DROP FUNCTION public.epigraph_claim_behavioral_executions_follow()")
+        .execute(&pool)
+        .await
+        .expect("drop one 240 function");
+
+    let state = AppState::with_db(pool, ApiConfig::default());
+    let msg = state
+        .assert_tenancy_triggers_armed()
+        .await
+        .expect_err("a database at 240 without its tenancy triggers must not serve")
+        .to_string();
+    for (rel, tg) in TRIGGERS_240 {
+        assert!(
+            msg.contains(&format!("{rel}.{tg}")),
+            "the refusal must name {rel}.{tg}; got: {msg}"
+        );
+    }
+}
+
+/// The discriminator: a database with 240 undone by its documented runbook is
+/// behind, not broken, and boots.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_database_with_240_undone_still_boots(pool: PgPool) {
+    let undo = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/runbooks/240-undo.sql"),
+    )
+    .expect("240-undo.sql");
+    sqlx::raw_sql(&undo)
+        .execute(&pool)
+        .await
+        .expect("run 240's undo");
+    let state = AppState::with_db(pool, ApiConfig::default());
+    assert!(
+        state.assert_tenancy_triggers_armed().await.is_ok(),
+        "240's triggers must be required only where one of 240's functions says 240 ran"
+    );
+}

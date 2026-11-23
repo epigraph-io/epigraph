@@ -83,6 +83,10 @@ const ARMED_REFUSE_ONLY: &[(&str, &str)] = &[
     // inherit its row's tenancy; an elevated session reads them as its plain
     // viewer does and writes none.
     ("workflow_outcome_reports", "T-PLAN"),
+    // T-PLAN (migration 240, backlog 88cf603b): a workflow's recorded runs
+    // carry its tenancy; an elevated session reads them as its plain viewer
+    // does and writes none.
+    ("behavioral_executions", "T-PLAN"),
     // T-PAPER (migration 246, backlog 34864fb5): a paper row carries its
     // ingest's tenancy; an elevated session reads it as its plain viewer does
     // and writes none, as for workflow rows.
@@ -91,7 +95,12 @@ const ARMED_REFUSE_ONLY: &[(&str, &str)] = &[
 
 /// Tables armed by a migration AFTER 126, with the same policy shapes; listed
 /// in the census arrays above like every other table.
-const ARMED_AFTER_126: &[&str] = &["workflows", "workflow_outcome_reports", "papers"];
+const ARMED_AFTER_126: &[&str] = &[
+    "workflows",
+    "workflow_outcome_reports",
+    "behavioral_executions",
+    "papers",
+];
 
 /// No elevated policy, each for a reason. None grants the application a write
 /// (`no_excluded_or_read_only_table_lets_the_application_write_unrefused`).

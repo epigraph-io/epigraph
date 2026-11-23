@@ -492,10 +492,11 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/workflows.rs",
         "report_workflow_outcome",
-        2,
+        1,
         "One NO_SCOPED_POOL_FALLBACK (WorkflowRepository::exists without a ScopedPool; with one \
-         the existence check is viewer_reads_row on read_as) and one REGISTERED_WRITE \
-         (BehavioralExecutionRepository::create, a table with no tenancy).",
+         the existence check is viewer_reads_row on read_as). The run row \
+         (BehavioralExecutionRepository::create) moved onto the author's stamp when migration \
+         240 gave behavioral_executions its workflow's tenancy (backlog 88cf603b).",
     ),
     (
         "epigraph-mcp/src/unauthenticated_reader.rs",
@@ -538,7 +539,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// removing four rows (six sites): 78 -> 72 (82 -> 76 on its own branch).
 /// Their `papers` reads (`check_already_ingested`, `paper_already_ingested`,
 /// `query_paper`) then moved onto the caller's stamped read: 72 -> 69.
-const HIGH_WATER: usize = 69;
+/// Migration 240 (backlog 88cf603b) moved `report_workflow_outcome`'s run row
+/// onto the author's stamp: 69 -> 68 (82 -> 81 on its own branch).
+const HIGH_WATER: usize = 68;
 
 // ===========================================================================
 // The scanner.

@@ -839,7 +839,13 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// 176 -> 173 (backlog 34864fb5, migration 246; 187 -> 184 on its own
 /// branch): `create_paper` writes and reads back on the caller's stamped
 /// transaction (`routes/papers.rs` 4 -> 1). No file reached zero.
-const HIGH_WATER: usize = 173;
+/// Companion ceiling on the file count. See [`HIGH_WATER`].
+/// 173 -> 172 (backlog 88cf603b, migration 240; 187 -> 186 on its own
+/// branch): `record_behavioral_execution`'s insert moved onto the caller's
+/// stamped transaction, because `behavioral_executions` now carries its
+/// workflow's tenancy under FORCEd row security (`routes/workflows.rs`
+/// 3 -> 2). No file reached zero.
+const HIGH_WATER: usize = 172;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1320,9 +1326,11 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // the caller's stamped read, and both post-commit goal embeds to the
     // system-agent stamp (`store_workflow_goal_embedding`).
     // 4 -> 3 (backlog 08061583): `record_behavioral_execution`'s workflow
-    // existence check moved to the caller's stamped read. Its insert stays on
-    // the pool: `behavioral_executions` has no row security.
-    ("routes/workflows.rs", 3),
+    // existence check moved to the caller's stamped read.
+    // 3 -> 2 (backlog 88cf603b, migration 240): its insert followed, onto the
+    // caller's stamped transaction: `behavioral_executions` now has row
+    // security keyed on its workflow's tenancy.
+    ("routes/workflows.rs", 2),
 ];
 
 /// Repo root. `CARGO_MANIFEST_DIR` is `crates/epigraph-db`; two parents up is

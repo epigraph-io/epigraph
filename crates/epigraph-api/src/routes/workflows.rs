@@ -2347,14 +2347,25 @@ pub async fn record_behavioral_execution(
         run_label: None,
     };
 
+    // On the CALLER's stamped transaction (migration 240): the row takes its
+    // workflow's tenancy, and its INSERT policy admits it only for a session
+    // that reads that workflow. On the raw pool (an unstamped session, which
+    // reads public rows only) a member's run of its own group-private
+    // workflow was refused, a 500.
+    let mut tx = state
+        .write_as(&viewer, "record_behavioral_execution")
+        .await?;
     let created = epigraph_db::BehavioralExecutionRepository::create(
-        &state.db_pool,
+        &mut *tx,
         row,
         embedding_pgvec.as_deref(),
     )
     .await
     .map_err(|e| ApiError::InternalError {
         message: format!("Failed to record behavioral execution: {e}"),
+    })?;
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the behavioral execution: {e}"),
     })?;
 
     Ok(Json(serde_json::json!({

@@ -3368,8 +3368,10 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "behavioral_execution.rs",
         "create",
-        "INSERT INTO `behavioral_executions` (no row security). Widened so HTTP report_outcome \
-         writes it on the same transaction as the counters it records, all or nothing.",
+        "INSERT INTO `behavioral_executions`, whose row takes its workflow's tenancy at INSERT \
+         and is admitted only for a session that reads that workflow (migration 240), so a \
+         Viewer parameter would have nothing to add. Widened so HTTP report_outcome writes it \
+         on the same transaction as the counters it records, all or nothing.",
     ),
     (
         "claim_theme.rs",

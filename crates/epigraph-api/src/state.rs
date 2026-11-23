@@ -792,6 +792,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them, on the same precedent; their policies
     // inherit the workflow row's tenancy.
     "workflow_outcome_reports",
+    // A workflow's recorded runs (240, backlog 88cf603b): given their
+    // workflow's tenancy columns and FORCEd by that migration, on the same
+    // precedent. Apply 240 before or with a binary carrying this name.
+    "behavioral_executions",
     // Paper rows (246, backlog 34864fb5): given tenancy columns and FORCEd by
     // that migration, on the same precedent. Apply 246 before or with a binary
     // carrying this name.
@@ -1272,6 +1276,38 @@ const MIGRATION_210_MARKERS: &[&str] = &[
     "epigraph_atlas_map_bump",
     "epigraph_atlas_map_stale",
     "epigraph_atlas_map_stale_row",
+];
+
+/// The tenancy triggers **migration 240** (backlog 88cf603b) adds, as
+/// `(relation, trigger)`: the stamp that gives a `behavioral_executions` run
+/// its workflow's pair at INSERT, and the two triggers that re-stamp the runs
+/// when their `workflows` row or flat workflow claim changes its pair. A
+/// dropped follow trigger is the silent case: the runs of a narrowed workflow
+/// stay readable to its old readers, and nothing errors.
+///
+/// Required **only when one of [`MIGRATION_240_MARKERS`] exists**, for the
+/// reasons [`TENANCY_TRIGGERS_089`] gives.
+#[cfg(feature = "db")]
+const TENANCY_TRIGGERS_240: &[(&str, &str)] = &[
+    (
+        "behavioral_executions",
+        "behavioral_executions_inherit_tenancy",
+    ),
+    (
+        "workflows",
+        "workflows_behavioral_executions_inherit_tenancy",
+    ),
+    ("claims", "claims_behavioral_executions_inherit_tenancy"),
+];
+
+/// The markers that migration 240 has run: the three functions its triggers
+/// use. Any one present means 240 ran; its documented undo
+/// (`docs/runbooks/240-undo.sql`) drops all three.
+#[cfg(feature = "db")]
+const MIGRATION_240_MARKERS: &[&str] = &[
+    "epigraph_behavioral_execution_inherit_tenancy",
+    "epigraph_workflow_behavioral_executions_follow",
+    "epigraph_claim_behavioral_executions_follow",
 ];
 
 impl AppState {
@@ -2181,6 +2217,9 @@ impl AppState {
     ///     same reasoning.
     ///   * [`TENANCY_TRIGGERS_210`] is required only once any of
     ///     [`MIGRATION_210_MARKERS`] — 210's staleness functions — is present.
+    ///   * [`TENANCY_TRIGGERS_240`] is required only once any of
+    ///     [`MIGRATION_240_MARKERS`] — 240's stamp and follow functions — is
+    ///     present.
     ///
     /// A trigger whose *table* does not exist is not required — 070 and 074
     /// both guard their `CREATE TRIGGER` with `IF EXISTS (… relkind = 'r')`, so
@@ -2232,6 +2271,7 @@ impl AppState {
                 .chain(TENANCY_TRIGGERS_089.iter())
                 .chain(TENANCY_TRIGGERS_173.iter())
                 .chain(TENANCY_TRIGGERS_210.iter())
+                .chain(TENANCY_TRIGGERS_240.iter())
                 .map(|(rel, _)| (*rel).to_string())
                 .collect::<Vec<_>>(),
         )
@@ -2246,7 +2286,7 @@ impl AppState {
         // can never fire. `pg_proc`, not `_sqlx_migrations`: the catalog is what
         // the trigger actually lives in, and a hand-edited migrations table
         // would otherwise decide a safety check.
-        // One read for every marker-gated tier (089's, 173's and 210's), so the boot
+        // One read for every marker-gated tier (089's, 173's, 210's and 240's), so the boot
         // check keeps a single catalog probe.
         let markers: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT p.proname::text FROM pg_proc p \
@@ -2257,6 +2297,7 @@ impl AppState {
             std::iter::once(MIGRATION_089_MARKER)
                 .chain(MIGRATION_173_MARKERS.iter().copied())
                 .chain(MIGRATION_210_MARKERS.iter().copied())
+                .chain(MIGRATION_240_MARKERS.iter().copied())
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
         )
@@ -2269,6 +2310,9 @@ impl AppState {
         let migration_210_applied = markers
             .iter()
             .any(|m| MIGRATION_210_MARKERS.contains(&m.as_str()));
+        let migration_240_applied = markers
+            .iter()
+            .any(|m| MIGRATION_240_MARKERS.contains(&m.as_str()));
 
         // 074 ran iff `claims_block_widening` is installed. It is created in
         // section 4, ahead of section 5's `DROP DEFAULT`, so this marker cannot
@@ -2287,6 +2331,9 @@ impl AppState {
         }
         if migration_210_applied {
             required.extend_from_slice(TENANCY_TRIGGERS_210);
+        }
+        if migration_240_applied {
+            required.extend_from_slice(TENANCY_TRIGGERS_240);
         }
 
         let mut missing: Vec<String> = Vec::new();
@@ -2344,6 +2391,7 @@ impl AppState {
             migration_089_applied,
             migration_173_applied,
             migration_210_applied,
+            migration_240_applied,
             "tenancy triggers armed"
         );
         Ok(())

@@ -125,13 +125,15 @@ async fn a1_no_tier_a_tenancy_column_has_a_default_or_is_nullable(pool: PgPool) 
     // 25 -> 26 (ruling R-74): migration 183's `workflows`.
     // 28 -> 31 (Atlas W2, backlog 77f4bf09): migration 210's three
     // `atlas_map_*` tables.
-    // 31 -> 32 (backlog 34864fb5): migration 246's `papers`.
+    // 31 -> 32 (backlog 88cf603b): migration 240's `behavioral_executions`.
+    // 32 -> 33 (backlog 34864fb5): migration 246's `papers`.
     assert_eq!(
-        covered, 32,
+        covered, 33,
         "expected the 25 tier-A tables from migration 062's tier_a array, plus the two \
          harvester neighbours migration 173 brings under tenancy (ruling R-66), \
          migration 183's workflows (ruling R-74), migration 210's three atlas_map_* \
-         tables and migration 246's papers, to carry owner_group_id; found \
+         tables, migration 240's behavioral_executions and migration 246's papers, to \
+         carry owner_group_id; found \
          {covered}. A different number means the tier-A set \
          moved, which is a D1 change and needs a decision, not a silent edit — and \
          it means A1 above was measured over the wrong population."

@@ -3553,6 +3553,23 @@ restart.
   on a migrated database still revokes through the status definer, unstamped, so it is
   refused AK03 for every key: migrate and roll the binary out together. **Applied to
   throwaway databases only, NOT to any deployed database.**
+- **240**: `behavioral_executions_tenancy` (backlog 88cf603b). A workflow's recorded runs had
+  no tenancy and no row security (069 ledgered the table in `tenancy_exempt`), so every
+  application session read every run (goal text and embedding, step beliefs, tool pattern) of
+  every workflow, group-private plans included. Adds `owner_group_id` and `visibility` (062's
+  shape and constraints, NOT NULL, no default), backfilled from each run's workflow (the
+  `workflows` row, else the flat workflow claim; an orphan run refuses the migration, `BEX01`),
+  a BEFORE INSERT stamp from the workflow over any declaration (a run of no workflow is
+  `23503`), and two follow triggers that re-stamp a workflow's runs when its `workflows` row or
+  flat workflow claim changes its pair. Row security ENABLEd and FORCEd: read is public or a
+  session group; INSERT uses the same READ predicate (a reader of a public plan records a run
+  of it, a non-reader is refused `42501`); UPDATE only by the maintenance session and its
+  definers; 115's `_delete_owner` and owner guard; 126's three refusal-only elevated policies
+  (T-PLAN). The `tenancy_exempt` row goes. Pinned by
+  `epigraph-db/tests/behavioral_executions_tenancy.rs` (the app-role leak test, the follow on
+  narrowing and restore, the stamp, the orphan refusal, the write rule, the undo) and the
+  tenancy ratchets. Undo: `docs/runbooks/240-undo.sql`. **Deploy order:** migrate before, or
+  with, the binary built with it (see `docs/deploy.md`).
 - **241**: `unauthenticated_reader_reserved` (backlogs 37844e1d, 14a38166). Creates the
   `--allow-unauthenticated-http` reader agent's row (`mcp-unauthenticated-reader`, public key
   the ASCII bytes `epigraph-mcp:unauthenticated-rdr`) if no row holds the key, adopting an
