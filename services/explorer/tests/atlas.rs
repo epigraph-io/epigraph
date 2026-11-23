@@ -2718,6 +2718,10 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
         .expect("then the claim-to-leaf route");
     assert!(fetched < lookup, "the free answer comes first");
     assert!(nested[lookup..].contains("cfg.claimLeaf, NS.map, NS.hierarchy, claimId"));
+    let no_url = nested
+        .find("if (!doc && !cfg.claimLeaf) {")
+        .expect("a page without the lookup does not claim the claim is off the map");
+    assert!(fetched < no_url && no_url < lookup);
     let leaf = nested
         .find("fetchLevel(place.level_id, 'leaf', NS.hierarchy)")
         .expect("the named leaf is fetched as a leaf");

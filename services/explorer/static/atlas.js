@@ -2836,6 +2836,12 @@
     for (const [k, d] of NS.resolved) if (k.startsWith(prefix) && d.theme_id === theme.id) leaves.push(d);
     let doc = NESTED.findClaimLeaf(leaves, claimId);
     let home = theme;
+    if (!doc && !cfg.claimLeaf) {
+      // A page without the lookup (the fixture preview) cannot ask.
+      select(theme, true);
+      setNotice('That claim is in this theme, in a group that is not open yet: zoom in to find it.');
+      return;
+    }
     if (!doc) {
       let place;
       try {
