@@ -3203,6 +3203,62 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_step_lineage_executors(uuid)",
         true,
     ),
+    // The deferred definers from 161 on that the register missed until its
+    // completeness ratchet (backlog a2b079a1); each expectation is the grant
+    // its migration makes. 168: MCP `resolve_challenge` resolves through it
+    // on the request DSN.
+    (
+        "epigraph_resolve_challenge",
+        "public.epigraph_resolve_challenge(uuid, text, jsonb)",
+        true,
+    ),
+    // 184: `retract_bba` / `unretract_bba` call them on the request DSN; each
+    // decides the caller's own authority over the BBA.
+    (
+        "epigraph_retract_mass_function",
+        "public.epigraph_retract_mass_function(uuid, text, uuid, uuid)",
+        true,
+    ),
+    (
+        "epigraph_unretract_mass_function",
+        "public.epigraph_unretract_mass_function(uuid, text, uuid, uuid)",
+        true,
+    ),
+    // 193: the claim-role read (`claim_role`) calls it on the request DSN;
+    // 193 grants it to the application role.
+    (
+        "epigraph_claim_is_compound",
+        "public.epigraph_claim_is_compound(uuid)",
+        true,
+    ),
+    // 194: the retracted-row delete guard asks the grant helper as the
+    // deleting session (the application role included); the purge itself is
+    // a maintenance act the request DSN must never call.
+    (
+        "epigraph_mf_purge_granted",
+        "public.epigraph_mf_purge_granted(uuid)",
+        true,
+    ),
+    (
+        "epigraph_purge_mass_functions",
+        "public.epigraph_purge_mass_functions(uuid[], text)",
+        false,
+    ),
+    // 202: `WorkflowRepository` calls it on the request DSN; 202 grants it
+    // to the application role.
+    (
+        "epigraph_workflow_name_has_hidden_rows",
+        "public.epigraph_workflow_name_has_hidden_rows(text)",
+        true,
+    ),
+    // 210: the atlas map's epoch bump is reached only from its maintenance-
+    // owned stale triggers; an app grant would let the request DSN mark any
+    // team's map stale.
+    (
+        "epigraph_atlas_map_bump",
+        "public.epigraph_atlas_map_bump(uuid[], uuid[])",
+        false,
+    ),
 ];
 
 /// Migration 107's EXECUTE grants to `epigraph_app`, which the ownership check
@@ -3876,7 +3932,7 @@ async fn print_offenders(pool: &PgPool, table: &str) -> anyhow::Result<()> {
 /// or an unqualified `epigraph_<f>(` (resolved on `search_path` public).
 #[cfg(test)]
 mod definer_register_tests {
-    use super::{DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS};
+    use super::{DEFERRED_DEFINER_FUNCTIONS, DEFINER_FUNCTIONS, OPERATOR_FUNCTION_GRANTS};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
@@ -4566,6 +4622,225 @@ mod definer_register_tests {
                     .expect("check"),
                 n + 1,
                 "a stray app grant on {signature} is reported"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The EXECUTE register's completeness (backlog a2b079a1)
+    // -----------------------------------------------------------------------
+
+    /// From this migration on, every [`DEFERRED_DEFINER_FUNCTIONS`] entry has
+    /// an EXECUTE expectation in [`OPERATOR_FUNCTION_GRANTS`] or is a named
+    /// exemption below. 161 is where the register was last audited complete;
+    /// the earlier deferred definers predate it and are not held to it.
+    const GRANT_REGISTER_COMPLETE_FROM: i64 = 161;
+
+    /// Deferred definers from [`GRANT_REGISTER_COMPLETE_FROM`] on with no
+    /// EXECUTE expectation, because each is a TRIGGER function: PostgreSQL
+    /// refuses to call one directly ("trigger functions can only be called as
+    /// triggers"), and does not check EXECUTE when its trigger fires, so a
+    /// grant to the application role on one opens nothing and checking it
+    /// would test nothing. `grant_exemptions_are_trigger_functions_and_not_stale`
+    /// holds each entry to that reason: a later body that is no longer
+    /// `RETURNS trigger` fails it, and the function must then be registered
+    /// with its expectation.
+    const GRANT_EXEMPT_TRIGGERS: &[&str] = &[
+        // 164: the team-group roster guard.
+        "epigraph_team_group_roster_verbs_only",
+        // 165: the role-binding guards and audit.
+        "epigraph_group_role_bindings_guard_insert",
+        "epigraph_group_role_bindings_guard_update",
+        "epigraph_group_role_bindings_refuse_delete",
+        "epigraph_group_role_bindings_audit",
+        // 166: the role-agent guards, audit and lineage follow.
+        "epigraph_role_agents_guard_insert",
+        "epigraph_role_agents_guard_update",
+        "epigraph_role_agents_audit",
+        "epigraph_role_agents_follow_lineage",
+        // 173: the audit-report tenancy inheritance and follow.
+        "epigraph_audit_report_inherit_tenancy",
+        "epigraph_fragment_audit_reports_follow",
+        // 197: the atlas layout narrowing guard.
+        "epigraph_atlas_layout_narrowed",
+        // 200: the passkey act-confirmer guard and the anchored revoke.
+        "epigraph_person_authenticators_guard_act_confirmer",
+        "epigraph_person_authenticators_revoke_anchored",
+        // 210: the atlas map's statement and row stale markers (the bump
+        // they call, `epigraph_atlas_map_bump`, is a plain function and is
+        // registered).
+        "epigraph_atlas_map_stale",
+        "epigraph_atlas_map_stale_row",
+        // 212: the sealed-row vector guards.
+        "epigraph_refuse_sealed_claim_vector",
+        "epigraph_refuse_sealed_evidence_vector",
+        // 217: the factor triggers on edges and claims.
+        "auto_create_factor_from_edge",
+        "deactivate_superseded_factors",
+    ];
+
+    /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each
+    /// entry's SIGNATURE (`public.<name>(..)`), not its presence key: the
+    /// act-taking overloads are keyed on another function's name.
+    fn granted_function_names() -> BTreeSet<&'static str> {
+        OPERATOR_FUNCTION_GRANTS
+            .iter()
+            .map(|(_, signature, _)| {
+                let name = signature
+                    .strip_prefix("public.")
+                    .expect("a register signature is public-qualified");
+                &name[..name
+                    .find('(')
+                    .expect("a register signature has an argument list")]
+            })
+            .collect()
+    }
+
+    /// The `CREATE [OR REPLACE] FUNCTION` header (up to the body's ` as `) of
+    /// the LAST migration that creates `public.<name>`, normalised.
+    fn latest_create_header(migs: &[Migration], name: &str) -> Option<(String, String)> {
+        let mut found = None;
+        for m in migs {
+            for (i, n) in function_refs(&m.sql) {
+                if n != name {
+                    continue;
+                }
+                let before = m.sql[..i].trim_end();
+                if before.ends_with("create or replace function")
+                    || before.ends_with("create function")
+                {
+                    let tail = &m.sql[i..];
+                    let end = tail.find(" as ").unwrap_or(tail.len());
+                    found = Some((m.file.clone(), tail[..end].to_string()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The deferred definers from [`GRANT_REGISTER_COMPLETE_FROM`] on that
+    /// `granted` lacks and no exemption covers.
+    fn deferred_definers_without_an_execute_expectation(granted: &BTreeSet<&str>) -> Vec<String> {
+        DEFERRED_DEFINER_FUNCTIONS
+            .iter()
+            .filter(|(name, version)| {
+                *version >= GRANT_REGISTER_COMPLETE_FROM
+                    && !granted.contains(name)
+                    && !GRANT_EXEMPT_TRIGGERS.contains(name)
+            })
+            .map(|(name, version)| format!("{name} (migration {version})"))
+            .collect()
+    }
+
+    /// Commit 8737e31e found the grant register missing migration 180's two
+    /// definers, so an application-role EXECUTE grant on either was invisible
+    /// to `verify`. Every deferred definer from 161 on must carry an EXECUTE
+    /// expectation (or be an exempt trigger function), so the next migration
+    /// that adds a definer to the deferred list must also decide whether the
+    /// request DSN may call it.
+    #[test]
+    fn every_deferred_definer_from_161_has_an_execute_expectation() {
+        let missing = deferred_definers_without_an_execute_expectation(&granted_function_names());
+        assert!(
+            missing.is_empty(),
+            "deferred definers with no EXECUTE expectation in OPERATOR_FUNCTION_GRANTS: \
+             {missing:?}. Add each with its signature and whether epigraph_app must \
+             EXECUTE it (read the migration's GRANT/REVOKE), so `verify` reports a stray \
+             or a missing application-role grant; a trigger function goes in \
+             GRANT_EXEMPT_TRIGGERS instead"
+        );
+    }
+
+    /// MUTATION PROBE: the ratchet is not vacuous. Dropping any one non-exempt
+    /// deferred definer from the granted set is reported, by name.
+    #[test]
+    fn dropping_a_grant_expectation_is_reported() {
+        let granted = granted_function_names();
+        let mut probed = 0;
+        for (name, version) in DEFERRED_DEFINER_FUNCTIONS {
+            if *version < GRANT_REGISTER_COMPLETE_FROM || GRANT_EXEMPT_TRIGGERS.contains(name) {
+                continue;
+            }
+            let mut without = granted.clone();
+            without.remove(name);
+            let missing = deferred_definers_without_an_execute_expectation(&without);
+            assert_eq!(
+                missing,
+                vec![format!("{name} (migration {version})")],
+                "removing {name}'s expectation must be reported, alone"
+            );
+            probed += 1;
+        }
+        assert!(probed > 50, "only {probed} deferred definers were probed");
+    }
+
+    /// Each exemption holds its reason: it is a deferred definer from 161 on,
+    /// it has no grant expectation (an overlap would hide which rule applies),
+    /// and the last migration that creates it declares it `RETURNS trigger`.
+    #[test]
+    fn grant_exemptions_are_trigger_functions_and_not_stale() {
+        let migs = migrations();
+        let granted = granted_function_names();
+        let mut bad = Vec::new();
+        for name in GRANT_EXEMPT_TRIGGERS {
+            let deferred = DEFERRED_DEFINER_FUNCTIONS
+                .iter()
+                .any(|(n, v)| n == name && *v >= GRANT_REGISTER_COMPLETE_FROM);
+            if !deferred {
+                bad.push(format!(
+                    "{name}: not a deferred definer from {GRANT_REGISTER_COMPLETE_FROM} on"
+                ));
+            }
+            if granted.contains(name) {
+                bad.push(format!("{name}: exempt AND in OPERATOR_FUNCTION_GRANTS"));
+            }
+            match latest_create_header(&migs, name) {
+                None => bad.push(format!("{name}: no migration creates it")),
+                Some((file, header)) if !header.contains(" returns trigger") => bad.push(format!(
+                    "{name}: {file} creates it as `{header}`, not a trigger function"
+                )),
+                Some(_) => {}
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "GRANT_EXEMPT_TRIGGERS entries that no longer hold their reason:\n{}",
+            bad.join("\n")
+        );
+    }
+
+    /// The expectations the completeness ratchet added (backlog a2b079a1) are
+    /// checked by `verify`: at head they all pass; a stray application-role
+    /// grant on a maintenance-only one (194's purge, 210's epoch bump) is
+    /// reported, and so is a revoked grant on an app-callable one (193's role
+    /// read).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_grant_check_reports_drift_on_the_ratchet_added_definers(pool: sqlx::PgPool) {
+        assert_eq!(
+            super::verify_operator_function_grants(&pool)
+                .await
+                .expect("check at head"),
+            0,
+            "a database migrated to head passes"
+        );
+        for (n, stmt) in [
+            "GRANT EXECUTE ON FUNCTION public.epigraph_purge_mass_functions(uuid[], text) \
+             TO epigraph_app",
+            "GRANT EXECUTE ON FUNCTION public.epigraph_atlas_map_bump(uuid[], uuid[]) \
+             TO epigraph_app",
+            "REVOKE EXECUTE ON FUNCTION public.epigraph_claim_is_compound(uuid) \
+             FROM PUBLIC, epigraph_app",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlx::query(stmt).execute(&pool).await.expect(stmt);
+            assert_eq!(
+                super::verify_operator_function_grants(&pool)
+                    .await
+                    .expect("check"),
+                n + 1,
+                "drift is reported after: {stmt}"
             );
         }
     }
