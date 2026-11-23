@@ -43,10 +43,10 @@ def _seed_run(db, agent_id):
     return run_id, claim_ids
 
 
-def test_project_run_materialises_themes(db, seed_agent):
+def test_project_run_materialises_themes(db, script_db, seed_agent):
     run_id, claim_ids = _seed_run(db, seed_agent)
 
-    P.project_run(db, run_id)
+    P.project_run(script_db, run_id)
 
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM claim_themes")

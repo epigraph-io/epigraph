@@ -78,12 +78,13 @@ def _cleanup(db, ids, group):
         cur.execute("DELETE FROM cluster_labels")
         cur.execute("DELETE FROM claim_clusters")
         cur.execute("DELETE FROM claims WHERE id::text = ANY(%s)", (ids,))
+        cur.execute("DELETE FROM claim_themes")
         cur.execute("SET LOCAL epigraph.allow_group_delete = 'yes'")
         cur.execute("DELETE FROM groups WHERE id = %s", (group,))
     db.commit()
 
 
-def test_the_theme_label_sample_leaves_out_intake_reports(db, seed_agent):
+def test_the_theme_label_sample_leaves_out_intake_reports(db, script_db, seed_agent):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         cur.execute(
@@ -92,22 +93,30 @@ def test_the_theme_label_sample_leaves_out_intake_reports(db, seed_agent):
             (make_embedding(3),),
         )
         theme = cur.fetchone()[0]
-        _claim(cur, seed_agent, PUBLIC_TEXT, theme_id=theme)
-        _claim(cur, seed_agent, REPORT_TEXT, theme_id=theme, owner=group)
+        ids = [
+            _claim(cur, seed_agent, PUBLIC_TEXT, theme_id=theme),
+            _claim(cur, seed_agent, REPORT_TEXT, theme_id=theme, owner=group),
+        ]
+    # Committed: the sampler reads on its own connection, as the script's login.
+    db.commit()
 
     def sampled():
-        [t] = [t for t in L.load_themes_with_samples(db) if t["id"] == str(theme)]
+        [t] = [t for t in L.load_themes_with_samples(script_db) if t["id"] == str(theme)]
+        script_db.rollback()
         return [s["content"] for s in t["samples"]]
 
-    # CALIBRATION: no intake configured, so the group's claim is an ordinary one.
-    assert sorted(sampled()) == sorted([PUBLIC_TEXT, REPORT_TEXT])
-    with db.cursor() as cur:
-        _configure(cur, group)
-    assert sampled() == [PUBLIC_TEXT]
-    db.rollback()  # nothing above was committed
+    try:
+        # CALIBRATION: no intake configured, so the group's claim is an ordinary one.
+        assert sorted(sampled()) == sorted([PUBLIC_TEXT, REPORT_TEXT])
+        with db.cursor() as cur:
+            _configure(cur, group)
+        db.commit()
+        assert sampled() == [PUBLIC_TEXT]
+    finally:
+        _cleanup(db, ids, group)
 
 
-def test_cluster_labels_leave_out_intake_reports(db, seed_agent):
+def test_cluster_labels_leave_out_intake_reports(db, script_db, seed_agent):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         ids = [
@@ -121,7 +130,7 @@ def test_cluster_labels_leave_out_intake_reports(db, seed_agent):
         centroids = np.zeros((1, 2), dtype=np.float32)
 
         def label(run_id):
-            C.label_clusters(db, ids, reduced, labels, centroids, 1, run_id)
+            C.label_clusters(script_db, ids, reduced, labels, centroids, 1, run_id)
             with db.cursor() as cur:
                 cur.execute(
                     "SELECT label FROM cluster_labels WHERE cluster_run_id = %s", (run_id,)
@@ -133,7 +142,7 @@ def test_cluster_labels_leave_out_intake_reports(db, seed_agent):
                 cid: {0: {"belief": 0.9, "plausibility": 0.95, "ignorance": 0.05}}
                 for cid in ids
             }
-            E.store_results(db, ids, beliefs, {}, 1, {}, {}, run_id)
+            E.store_results(script_db, ids, beliefs, {}, 1, {}, {}, run_id)
             with db.cursor() as cur:
                 cur.execute(
                     "SELECT label FROM cluster_labels WHERE cluster_run_id = %s", (run_id,)
@@ -206,7 +215,7 @@ def _split(db):
     return parts, labels
 
 
-def test_auto_refine_labels_leave_out_intake_reports(db, seed_agent, monkeypatch):
+def test_auto_refine_labels_leave_out_intake_reports(db, script_db, seed_agent, monkeypatch):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         public, reports = _refine_members(cur, seed_agent, group)
@@ -222,7 +231,7 @@ def test_auto_refine_labels_leave_out_intake_reports(db, seed_agent, monkeypatch
     try:
         # CALIBRATION: unconfigured, the reports' text reaches the labeller.
         _place_in_cluster_0(db, ids)
-        before = R.auto_refine(db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
+        before = R.auto_refine(script_db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
         assert before["split"] is True, before
         assert any(REPORT_TEXT in s for call in asked for s in call), asked
         parts_before, _ = _split(db)
@@ -232,7 +241,7 @@ def test_auto_refine_labels_leave_out_intake_reports(db, seed_agent, monkeypatch
         db.commit()
         asked.clear()
         _place_in_cluster_0(db, ids)
-        after = R.auto_refine(db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
+        after = R.auto_refine(script_db, cluster_id=0, run_id=REFINE_RUN, min_sub_size=5)
         parts, labels = _split(db)
 
         # The split itself is unchanged: reports still cluster and are reassigned.
@@ -253,7 +262,7 @@ def test_auto_refine_labels_leave_out_intake_reports(db, seed_agent, monkeypatch
         _cleanup(db, ids, group)
 
 
-def test_interactive_refinement_never_shows_an_intake_report(db, seed_agent, monkeypatch, capsys):
+def test_interactive_refinement_never_shows_an_intake_report(db, script_db, seed_agent, monkeypatch, capsys):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
         public, reports = _refine_members(cur, seed_agent, group)
@@ -270,14 +279,14 @@ def test_interactive_refinement_never_shows_an_intake_report(db, seed_agent, mon
         _place_in_cluster_0(db, ids)
         # CALIBRATION: unconfigured, the operator is shown the reports' text.
         answers[:] = ["x,y"]
-        R.interactive_label(db, 0, REFINE_RUN)
+        R.interactive_label(script_db, 0, REFINE_RUN)
         assert REPORT_TEXT in capsys.readouterr().err
 
         with db.cursor() as cur:
             _configure(cur, group)
         db.commit()
         answers[:] = ["x,y"]
-        labeled, _, names = R.interactive_label(db, 0, REFINE_RUN)
+        labeled, _, names = R.interactive_label(script_db, 0, REFINE_RUN)
         shown = capsys.readouterr().err
         assert REPORT_TEXT not in shown
         assert PUBLIC_TEXT in shown

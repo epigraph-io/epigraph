@@ -47,11 +47,11 @@ def _theme_of(db, ids):
         return [r[0] for r in cur.fetchall()]
 
 
-def test_split_moves_each_group_to_its_own_theme(db, seed_agent):
+def test_split_moves_each_group_to_its_own_theme(db, script_db, seed_agent):
     theme_id, (big, small) = _seed_theme(db, seed_agent)
 
-    parts = S.plan_split(db, theme_id, k=2, min_part=2)
-    result = S.apply_split(db, theme_id, {"source": "cluster_run", "cluster_run_id": RUN_ID,
+    parts = S.plan_split(script_db, theme_id, k=2, min_part=2)
+    result = S.apply_split(script_db, theme_id, {"source": "cluster_run", "cluster_run_id": RUN_ID,
                                           "cluster_id": 7}, parts)
 
     assert [n for _, n in result] == [6, 4]
@@ -73,10 +73,10 @@ def test_split_moves_each_group_to_its_own_theme(db, seed_agent):
         assert (props["cluster_run_id"], props["cluster_id"]) == (RUN_ID, 7)
 
 
-def test_kept_part_centroid_is_the_mean_of_its_own_members(db, seed_agent):
+def test_kept_part_centroid_is_the_mean_of_its_own_members(db, script_db, seed_agent):
     theme_id, (big, small) = _seed_theme(db, seed_agent)
 
-    S.apply_split(db, theme_id, {}, S.plan_split(db, theme_id, k=2, min_part=2))
+    S.apply_split(script_db, theme_id, {}, S.plan_split(script_db, theme_id, k=2, min_part=2))
 
     with db.cursor() as cur:
         cur.execute(
@@ -87,11 +87,11 @@ def test_kept_part_centroid_is_the_mean_of_its_own_members(db, seed_agent):
         assert cur.fetchone()[0] < 1e-6, "kept part's centroid still averages the moved members"
 
 
-def test_lopsided_split_is_refused_before_any_write(db, seed_agent):
+def test_lopsided_split_is_refused_before_any_write(db, script_db, seed_agent):
     theme_id, (big, small) = _seed_theme(db, seed_agent)
 
     with pytest.raises(ValueError, match="smallest part"):
-        S.plan_split(db, theme_id, k=2, min_part=5)   # the 4-claim group is too small
+        S.plan_split(script_db, theme_id, k=2, min_part=5)   # the 4-claim group is too small
 
     with db.cursor() as cur:
         cur.execute("SELECT count(*), min(label) FROM claim_themes")

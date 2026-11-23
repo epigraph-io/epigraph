@@ -14,7 +14,7 @@ import uuid
 import pytest
 
 from scripts import label_themes_llm as L
-from tests.theme.conftest import TEST_DSN
+from tests.theme.conftest import script_dsn
 from tests.theme.test_label_excludes_intake import PUBLIC_TEXT, _claim, _group
 
 PRIVATE_TEXT = "neighbourhood-label private member heron-garnet"
@@ -71,7 +71,7 @@ def _run_labeller(monkeypatch, *extra):
     monkeypatch.setattr(L, "call_claude_cli", fake_cli)
     monkeypatch.delenv("MAINTENANCE_DATABASE_URL", raising=False)
     monkeypatch.setattr(
-        sys, "argv", ["label_themes_llm.py", "--database-url", TEST_DSN, "--neighborhoods", *extra]
+        sys, "argv", ["label_themes_llm.py", "--database-url", script_dsn(), "--neighborhoods", *extra]
     )
     L.main()
     return prompts
