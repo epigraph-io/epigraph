@@ -75,6 +75,17 @@
 //! It also cannot see a function that delegates its SQL to another function —
 //! those have no `sqlx::query` in their own body and are correctly skipped,
 //! because the callee is itself subject to this lint.
+//!
+//! # Since backlog ada8ee55: which statement, not only whether
+//!
+//! "The body spends its viewer" passes a fn that spends it on one statement
+//! while another, the one whose rows it returns, runs without it.
+//! [`REVIEWED_CALLS`] names every statement and repo call in a viewer-taking
+//! repo fn that does not spend the viewer, with a reason class, as an exact
+//! register: the per-call shape `epigraph-api/tests/viewer_spend_lint.rs`
+//! gives the routes. The scanner (`viewer_calls/mod.rs`) is shared with
+//! `epigraph-mcp/tests/tool_viewer_is_spent.rs`, which keeps the same register
+//! for the MCP tools.
 
 mod lint_text;
 
@@ -4789,4 +4800,729 @@ fn last_binding(window: &str, alias: &str) -> Option<String> {
         }
     }
     found
+}
+
+// ── the per-call register (backlog ada8ee55) ────────────────────────────────
+
+mod viewer_calls;
+
+use viewer_calls::{Measured, Population, Surface};
+
+/// The repo layer's database handles, for the per-call scanner: its pool,
+/// connection, transaction and executor PARAMETERS (by type), and the
+/// connections a body opens on them.
+const REPOS: Surface = Surface {
+    state_types: &[],
+    pool_fields: &[],
+    state_db_methods: &[],
+    viewer_ctors: &["Viewer::resolve("],
+    conn_ctors: &[],
+    marker_spend: call_spends_viewer,
+};
+
+/// The per-call marker spend: the statement's live SQL (comments removed) puts
+/// `visibility = 'public'` in predicate position. See
+/// [`viewer_calls::predicate_spend`].
+fn call_spends_viewer(region: &str) -> bool {
+    let (_, live_sql) = spend_views(region);
+    viewer_calls::predicate_spend(&live_sql)
+}
+
+/// Every database call in a viewer-taking repo fn that does not spend the
+/// fn's viewer, as measured and reviewed on **2026-11-22** (backlog ada8ee55):
+/// the per-call register `epigraph-api/tests/viewer_spend_lint.rs` keeps for
+/// the routes, for the repo layer. [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`]
+/// passes a fn that spends its viewer ONCE; this names every other statement
+/// and repo call in it, so a content read beside the spend cannot pass unseen.
+///
+/// Asserted as an exact multiset per fn. The comment above each entry is the
+/// review, by reason class:
+///
+/// * **untenanted** — the table has no tenancy columns (`agents`,
+///   `agent_keys`, `papers`, the `atlas_layout_*` tables, `claim_themes`,
+///   `graph_cluster_runs`, the entity-type catalog), or the read is a definer
+///   that applies its own audience; keyed on ids a viewed statement produced.
+/// * **session** — a session or transaction setting (isolation level,
+///   statement timeout, the HNSW scan settings): it reads no row.
+/// * **write** — writes or locks a row, or reads inside the write's own
+///   transaction a value it only compares. Write authority is the
+///   `{WRITABLE}` predicate and the write registers.
+/// * **stamped** — a `workflows` read on the caller's stamped connection,
+///   where forced row security (migration 183) carries the tenancy, as the
+///   fn's own doc states.
+/// * **lifecycle** — the privatization plan's own rows, written or read for a
+///   selection the caller's viewer produced.
+/// * **privileged** — refuses unless the session is the privileged
+///   maintenance session.
+/// * **exempt** — the fn is in [`EXPECTED_EXEMPTIONS`], reviewed there.
+///
+/// No entry reads content into a response without the viewer: the review
+/// found nothing to fix. Do not add an entry to make the build pass.
+const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
+    // untenanted: `agents` has no tenancy columns (`agents_identity` is USING (true)). The
+    // profile details (`profile_visibility`, ORCID, ROR, properties) are gated IN the
+    // statement by `may_see_details`, computed from the viewer's principal, groups and
+    // bypass binds: a hidden detail never leaves the database. That gate sits in a
+    // projection, not a filter, so the per-call marker (rightly) does not count it.
+    (
+        "agent.rs",
+        "get_public_profile",
+        &["sqlx::query_as(SELECT).fetch_optional"],
+    ),
+    // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
+    // viewer's principal, groups and bypass binds, as in `get_public_profile`),
+    // `disclosed_roles` (the role-assignment definer) and the operator humans' `agents`
+    // display names, for the carded agents.
+    (
+        "agent_lookup.rs",
+        "cards_inner",
+        &[
+            "Self::disclosed_roles",
+            "sqlx::query_as(SELECT).fetch_all",
+            "sqlx::query_as(SELECT).fetch_all",
+        ],
+    ),
+    // untenanted: ranks `agents` by name, returning only the public identity columns (id,
+    // display name, created_at); the ORCID / ROR tiers match only where `details_ok`
+    // (viewer's principal, groups and bypass binds) admits the agent's details.
+    (
+        "agent_lookup.rs",
+        "match_ranked",
+        &["sqlx::query_as(WITH).fetch_all"],
+    ),
+    // untenanted: `atlas_layout_regions` and the region bundle rows; each is kept only where
+    // `visible_themes` (spliced) admits a theme.
+    (
+        "atlas_layout.rs",
+        "overview",
+        &["Self::region_bundle_rows", "Self::region_rows"],
+    ),
+    // untenanted: `Self::run` reads the `atlas_layout_runs` row; the placement itself is
+    // spliced.
+    ("atlas_layout.rs", "placement_layout", &["Self::run"]),
+    // session: the REPEATABLE READ setting; untenanted: the one-row `atlas_layout_epoch`
+    // counter and the latest `graph_cluster_runs` row.
+    (
+        "atlas_layout.rs",
+        "read_public_inputs",
+        &[
+            "ClusterRunRepository::latest",
+            "sqlx::query(SET).execute",
+            "sqlx::query_scalar(SELECT).fetch_one",
+        ],
+    ),
+    // untenanted: region, link and theme-label rows of `atlas_layout_*` / `claim_themes`, for
+    // regions and themes `visible_themes` admitted.
+    (
+        "atlas_layout.rs",
+        "region_detail",
+        &[
+            "Self::region_link_rows",
+            "Self::region_rows",
+            "Self::theme_rows",
+        ],
+    ),
+    // untenanted: `claim_themes` labels for the themes `visible_themes` admitted.
+    ("atlas_layout.rs", "unplaced_themes", &["Self::theme_rows"]),
+    // untenanted: `agents` display names; the evidence labels are spliced.
+    (
+        "atlas_leaf.rs",
+        "node_labels",
+        &["sqlx::query_as(SELECT).fetch_all"],
+    ),
+    // untenanted: which of the agent ids the spliced claim and edge reads produced exist in
+    // `agents`.
+    (
+        "atlas_leaf.rs",
+        "read_leaf_rows",
+        &["sqlx::query_scalar(SELECT).fetch_all"],
+    ),
+    // session: `fix_repeatable_read` sets and checks the isolation level.
+    (
+        "atlas_map.rs",
+        "begin_build_snapshot",
+        &["Self::fix_repeatable_read"],
+    ),
+    // untenanted: the operator binding at a time (`epigraph_operator_bound_at`), `agents`
+    // display names, and the prompt snapshot definer (which applies its own audience), all
+    // keyed on agents the viewed ingest read returned.
+    (
+        "authored_by.rs",
+        "for_claim",
+        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+    ),
+    // untenanted: as `for_claim`.
+    (
+        "authored_by.rs",
+        "for_paper_ingests",
+        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+    ),
+    // write: the advisory lock on (content hash, agent) and the strict insert; the existing-row
+    // probe takes the viewer.
+    (
+        "claim.rs",
+        "create_or_get_serialized",
+        &[
+            "Self::create_strict_signed",
+            "Self::lock_content_hash_agent",
+        ],
+    ),
+    // exempt: a corpus-wide maintenance enumerator in EXPECTED_EXEMPTIONS.
+    (
+        "claim.rs",
+        "find_claims_needing_embeddings",
+        &["sqlx::query_as(dynamic).fetch_all"],
+    ),
+    // session: the `hnsw.*` `set_config` before the spliced search.
+    (
+        "claim.rs",
+        "search_by_embedding_scoped",
+        &["sqlx::query(SELECT).execute"],
+    ),
+    // session: as `search_by_embedding_scoped`.
+    (
+        "claim.rs",
+        "search_by_embedding_since_conn",
+        &["sqlx::query(SELECT).execute"],
+    ),
+    // session: as `search_by_embedding_scoped`.
+    (
+        "claim.rs",
+        "search_hybrid_scoped_since_in_theme_conn",
+        &["sqlx::query(SELECT).execute"],
+    ),
+    // session: as `search_by_embedding_scoped`.
+    (
+        "claim.rs",
+        "semantic_search_flat",
+        &["sqlx::query(SELECT).execute"],
+    ),
+    // write: the `FOR UPDATE` row lock before the `{WRITABLE}` update; it returns nothing.
+    (
+        "claim.rs",
+        "store_embedding_if_unsealed",
+        &["sqlx::query(SELECT).fetch_optional"],
+    ),
+    // privileged: refuses unless the session is the privileged maintenance session, then
+    // reverses the repair recorded for the mark the viewed un-mark just undid.
+    (
+        "claim.rs",
+        "unmark_duplicate_with_reversal_conn",
+        &["require_privileged_session", "reverse_marked_duplicate"],
+    ),
+    // exempt: corpus-wide maintenance, in EXPECTED_EXEMPTIONS.
+    (
+        "claim_theme.rs",
+        "assign_unthemed_batch",
+        &["sqlx::query(dynamic).fetch_all"],
+    ),
+    // session: `begin_iterative_hnsw` opens the transaction and sets the HNSW scan; the read on
+    // it is spliced.
+    (
+        "claim_theme.rs",
+        "claims_in_themes_at_dim_since",
+        &["begin_iterative_hnsw"],
+    ),
+    // session: as `claims_in_themes_at_dim_since`.
+    (
+        "claim_theme.rs",
+        "nearest_theme_coverage_since",
+        &["begin_iterative_hnsw"],
+    ),
+    // exempt: corpus-wide centroid maintenance, in EXPECTED_EXEMPTIONS.
+    (
+        "claim_theme.rs",
+        "recompute_all_centroids",
+        &[
+            "sqlx::query(dynamic).execute",
+            "sqlx::query(dynamic).fetch_all",
+        ],
+    ),
+    // exempt: as `recompute_all_centroids`.
+    (
+        "claim_theme.rs",
+        "recompute_centroid_for_theme",
+        &[
+            "sqlx::query(dynamic).execute",
+            "sqlx::query(dynamic).fetch_optional",
+        ],
+    ),
+    // untenanted: the latest `graph_cluster_runs` row, after the claim was read through the
+    // viewer.
+    ("cluster_run.rs", "claim_placement", &["Self::latest"]),
+    // exempt: corpus cardinality over `agents`, in EXPECTED_EXEMPTIONS.
+    (
+        "corpus_stats.rs",
+        "agent_count",
+        &["sqlx::query_as(dynamic).fetch_one"],
+    ),
+    // untenanted: the signer's `agent_keys` and `agents.public_key`, for an edge read through
+    // the viewer.
+    (
+        "edge_signature.rs",
+        "verify_conn",
+        &[
+            "sqlx::query_as(SELECT).fetch_all",
+            "sqlx::query_scalar(SELECT).fetch_optional",
+        ],
+    ),
+    // untenanted: `untenanted_entity_types`, a catalog read of the entity-type registry.
+    ("ego.rs", "edges", &["Self::untenanted_entity_types"]),
+    // untenanted: `agents` display names and `papers` titles (bibliographic records, no
+    // tenancy); the claim, evidence and trace reads are spliced.
+    (
+        "ego.rs",
+        "hydrate",
+        &[
+            "sqlx::query_as(SELECT).fetch_all",
+            "sqlx::query_as(SELECT).fetch_all",
+        ],
+    ),
+    // exempt: a write path in EXPECTED_EXEMPTIONS.
+    ("evidence.rs", "delete", &["sqlx::query!(WITH).fetch_one"]),
+    // write: the evidence insert, its tenancy dedup probe and its link edge, all for a parent
+    // the spliced read admitted (public only).
+    (
+        "evidence.rs",
+        "record_derivation_conn",
+        &[
+            "Self::link_to_claims_signed_conn",
+            "Self::same_tenancy_duplicate",
+            "sqlx::query_scalar(INSERT).fetch_one",
+        ],
+    ),
+    // write: the `FOR UPDATE` row lock before the `{WRITABLE}` update; it returns nothing.
+    (
+        "evidence.rs",
+        "store_embedding_as",
+        &["sqlx::query(SELECT).fetch_optional"],
+    ),
+    // write: the previous content hash, read inside the write's own transaction and only
+    // compared; and the tenancy dedup probe after the `{WRITABLE}` update.
+    (
+        "evidence.rs",
+        "update_raw_content",
+        &[
+            "Self::same_tenancy_duplicate",
+            "sqlx::query_scalar(SELECT).fetch_optional",
+        ],
+    ),
+    // exempt: a corpus-wide enumerator in EXPECTED_EXEMPTIONS.
+    (
+        "mass_function.rs",
+        "list_claim_ids",
+        &["sqlx::query_scalar(dynamic).fetch_all"],
+    ),
+    // lifecycle: writes the follow-up plan and freezes its items, from a selection the caller's
+    // viewer produced.
+    (
+        "privatization.rs",
+        "create_followup_drift_plan_conn",
+        &["Self::create_previewed_plan", "freeze_into"],
+    ),
+    // lifecycle: the `claim_versions` of the claims the spliced head read returned, and their
+    // evidence under the seal's own owner predicate.
+    (
+        "privatization.rs",
+        "seal_manifest_page_conn",
+        &[
+            "sqlx::query_as(SELECT).fetch_all",
+            "sqlx::query_as(SELECT).fetch_all",
+        ],
+    ),
+    // session: the statement-timeout save, set and restore around the spliced selection.
+    (
+        "privatization.rs",
+        "select",
+        &[
+            "pool::apply_statement_timeout",
+            "pool::read_statement_timeout",
+            "pool::restore_statement_timeout",
+        ],
+    ),
+    // exempt: a write path in EXPECTED_EXEMPTIONS.
+    (
+        "semantic_link.rs",
+        "retract",
+        &["sqlx::query_as(WITH).fetch_one"],
+    ),
+    // session: as `privatization.rs::select`.
+    (
+        "sources.rs",
+        "page_bounded",
+        &[
+            "pool::apply_statement_timeout",
+            "pool::read_statement_timeout",
+            "pool::restore_statement_timeout",
+        ],
+    ),
+    // exempt: corpus cardinality, in EXPECTED_EXEMPTIONS.
+    (
+        "triple.rs",
+        "index_counts",
+        &["sqlx::query!(dynamic).fetch_one"],
+    ),
+    // stamped: the `workflows` row, on the viewer's stamped connection under the table's forced
+    // row security (migration 183), as the fn's doc states; the edges and claims are spliced.
+    (
+        "workflow.rs",
+        "frozen_plan",
+        &["sqlx::query_as(SELECT).fetch_optional"],
+    ),
+    // write: the counter update on a `workflows` row the spliced `FOR UPDATE` read locked.
+    (
+        "workflow.rs",
+        "record_hierarchical_outcome",
+        &["sqlx::query(UPDATE).execute"],
+    ),
+    // stamped: the `workflows` lineage lookups (max generation, root) on the caller's
+    // connection under forced row security; the steps are then resolved with the viewer.
+    (
+        "workflow.rs",
+        "resolve_step_claim_conn",
+        &[
+            "Self::find_root_by_canonical",
+            "Self::max_generation_by_canonical",
+        ],
+    ),
+];
+
+fn measure_repos() -> (Measured, usize, usize, Population) {
+    let mut out = Measured::new();
+    let mut pop = Population::new();
+    let (mut n_fns, mut n_calls) = (0, 0);
+    for (file, src) in repo_files() {
+        let (f, c) = viewer_calls::measure_source(&file, &src, &REPOS, &mut out, &mut pop);
+        n_fns += f;
+        n_calls += c;
+    }
+    (out, n_fns, n_calls, pop)
+}
+
+/// In a repo fn that takes a `&Viewer`, every database call whose arguments
+/// and statement do not spend that viewer is named in [`REVIEWED_CALLS`]
+/// (backlog ada8ee55). See the register's doc for the reason classes and
+/// `viewer_calls/mod.rs` for what the scanner counts.
+#[test]
+fn every_unviewed_database_call_in_a_viewer_repo_fn_is_reviewed() {
+    let (measured, _, _, _) = measure_repos();
+    let report = viewer_calls::drift(&measured, &viewer_calls::register(REVIEWED_CALLS));
+    assert!(
+        report.is_empty(),
+        "viewer-taking repo fns' unviewed database calls drifted from REVIEWED_CALLS.\n\
+         A NEW call is a statement or repo call in a fn that holds a viewer, with neither \
+         the viewer in its arguments nor a spend marker in its statement: give it the \
+         viewer, or read it and register it with a reason class. A GONE call must be \
+         removed from REVIEWED_CALLS.\n{report}"
+    );
+}
+
+/// The population is the repo layer's viewer surface, not a corner of it. A
+/// scanner that stopped recognising fns or calls would pass the exact-set test
+/// above with an empty register.
+#[test]
+fn the_per_call_scanner_sees_the_whole_repo_viewer_surface() {
+    let (measured, fns, calls, pop) = measure_repos();
+    eprintln!(
+        "population: {fns} viewer-taking repo fns, {calls} database calls, {} with an \
+         unviewed call, {} unviewed calls",
+        measured.len(),
+        measured.values().map(Vec::len).sum::<usize>()
+    );
+    for (file, f) in [
+        // A generic executor bound in a `where` clause.
+        ("conflict_density.rs", "high_conflict_claims"),
+        // A `sqlx::Acquire` parameter.
+        ("evidence.rs", "update_raw_content"),
+        // A `&mut ScopedRead` parameter.
+        ("authored_by.rs", "for_claim"),
+        // A `&mut PgConnection` parameter.
+        ("ego.rs", "hydrate"),
+    ] {
+        assert!(
+            pop.contains(&(file.to_string(), f.to_string())),
+            "{file}::{f} takes a `&Viewer` and must be in the measured population"
+        );
+    }
+    // Floors about 2% under the measurement: a scanner regression that drops
+    // fns with no unviewed call (which the register cannot see) fails here.
+    // Removing real repo code can trip them too; re-measure and lower them in
+    // the same change, with the new numbers.
+    assert!(
+        fns >= 447,
+        "found {fns} viewer-taking repo fns; measured 456 on 2026-11-22"
+    );
+    assert!(
+        calls >= 570,
+        "found {calls} database calls in them; measured 582 on 2026-11-22"
+    );
+}
+
+/// A real repo fn whose statement is made unviewed by a one-word edit is
+/// reported: the scanner reads the tree's own executor-in-`where` shape, not
+/// only the synthetic fixtures below.
+#[test]
+fn the_per_call_scanner_reports_a_real_fn_whose_splice_is_removed() {
+    let src = std::fs::read_to_string(repos_dir().join("conflict_density.rs"))
+        .expect("read conflict_density.rs");
+    let mut clean = Measured::new();
+    viewer_calls::measure_source(
+        "conflict_density.rs",
+        &src,
+        &REPOS,
+        &mut clean,
+        &mut Population::new(),
+    );
+    let key = (
+        "conflict_density.rs".to_string(),
+        "high_conflict_claims".to_string(),
+    );
+    assert!(
+        !clean.contains_key(&key),
+        "high_conflict_claims splices its one statement: {:?}",
+        clean.get(&key)
+    );
+    let at = src
+        .find("pub async fn high_conflict_claims")
+        .expect("the fn is in the file");
+    let splice = at
+        + src[at..]
+            .find("viewer.splice(")
+            .expect("its statement is spliced");
+    let mutated = format!(
+        "{}String::from({}",
+        &src[..splice],
+        &src[splice + "viewer.splice(".len()..]
+    );
+    let mut broken = Measured::new();
+    viewer_calls::measure_source(
+        "conflict_density.rs",
+        &mutated,
+        &REPOS,
+        &mut broken,
+        &mut Population::new(),
+    );
+    assert_eq!(
+        broken.get(&key).cloned().unwrap_or_default(),
+        vec!["sqlx::query_as(SELECT).fetch_all".to_string()],
+        "the same statement with its splice removed is unviewed"
+    );
+}
+
+fn repo_unviewed(src: &str) -> Measured {
+    let mut out = Measured::new();
+    viewer_calls::measure_source("fixture.rs", src, &REPOS, &mut out, &mut Population::new());
+    out
+}
+
+fn repo_labels(m: &Measured, f: &str) -> Vec<String> {
+    m.get(&("fixture.rs".to_string(), f.to_string()))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The defect this register exists for, which the fn-level check above cannot
+/// see: a viewer spent on one statement while the content read beside it runs
+/// without it.
+#[test]
+fn the_per_call_register_sees_a_viewer_spent_on_the_wrong_statement() {
+    let src = r##"
+pub async fn content_beside_a_count(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    id: Uuid,
+) -> Result<String, DbError> {
+    let sql = viewer.splice("SELECT count(*) FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+    if let Some(g) = viewer.group_bind() {
+        q = q.bind(g);
+    }
+    let _n = q.fetch_one(&mut *conn).await?;
+    let content: String = sqlx::query_scalar("SELECT content FROM claims WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(content)
+}
+"##;
+    assert!(
+        unspent_offenders(&viewer_taking_fns_in("fixture.rs", src)).is_empty(),
+        "the fn-level check passes this fn: it spends its viewer once"
+    );
+    assert_eq!(
+        repo_labels(&repo_unviewed(src), "content_beside_a_count"),
+        vec!["sqlx::query_scalar(SELECT).fetch_one"],
+        "the per-call scan reports exactly the unviewed content read"
+    );
+}
+
+/// The repo layer's handle and spend shapes.
+#[test]
+fn the_per_call_scanner_reads_the_repo_layer_shapes() {
+    let src = r##"
+pub async fn where_executor<'e, E>(executor: E, viewer: &'e Viewer) -> R
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    Ok(sqlx::query_scalar("SELECT content FROM claims").fetch_all(executor).await?)
+}
+
+pub async fn impl_executor(executor: impl sqlx::PgExecutor<'_>, viewer: &Viewer) -> R {
+    Ok(sqlx::query("DELETE FROM claims").execute(executor).await?)
+}
+
+pub async fn bind_is_not_a_spend(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    Ok(sqlx::query_scalar("SELECT content FROM claims c WHERE c.owner_group_id = ANY($1)")
+        .bind(viewer.group_bind())
+        .fetch_all(&mut *conn)
+        .await?)
+}
+
+pub async fn macro_three_bind(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let rows = sqlx::query_scalar!(
+        "SELECT c.content FROM claims c WHERE ($1::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($2::uuid[]))",
+        viewer.bypass_bind(),
+        &viewer.group_bind().unwrap_or(&[])
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let bare = sqlx::query_scalar!("SELECT c.content FROM claims c", )
+        .fetch_all(&mut *conn)
+        .await?;
+    Ok((rows, bare))
+}
+
+pub async fn helpers_and_transactions(pool: &PgPool, viewer: &Viewer, id: Uuid) -> R {
+    let mut tx = pool.begin().await?;
+    let a = Self::get_as(&mut tx, viewer, id).await?;
+    let b = Self::get_raw(&mut tx, id).await?;
+    let mut rows = sqlx::query_scalar(&viewer.splice("SELECT 1 /* {VISIBILITY:c} */", 1))
+        .fetch_all(&mut *tx)
+        .await?;
+    rows.push(Vec::with_capacity(rows.len()));
+    tracing::debug!(?tx, "not a statement");
+    drop(tx);
+    Ok((a, b, rows))
+}
+"##;
+    let m = repo_unviewed(src);
+    assert_eq!(
+        repo_labels(&m, "where_executor"),
+        vec!["sqlx::query_scalar(SELECT).fetch_all"],
+        "a generic executor bound in a `where` clause is a database handle, and a \
+         lifetime on the viewer's reference does not hide the viewer parameter"
+    );
+    assert_eq!(
+        repo_labels(&m, "impl_executor"),
+        vec!["sqlx::query(DELETE).execute"],
+        "an `impl PgExecutor` parameter is a database handle"
+    );
+    assert_eq!(
+        repo_labels(&m, "bind_is_not_a_spend"),
+        vec!["sqlx::query_scalar(SELECT).fetch_all"],
+        "binding the group array proves a parameter was supplied, not that the SQL \
+         reads it: it is not a spend"
+    );
+    assert_eq!(
+        repo_labels(&m, "macro_three_bind"),
+        vec!["sqlx::query_scalar!(SELECT).fetch_all"],
+        "a `query!` macro is viewed by the three-bind predicate in its literal, and the \
+         same macro without it is not"
+    );
+    assert_eq!(
+        repo_labels(&m, "helpers_and_transactions"),
+        vec!["Self::get_raw"],
+        "a call on a transaction opened from the pool is measured; the open itself, a \
+         drop, a logging macro and the result of a statement bound `let mut` are not \
+         calls"
+    );
+}
+
+/// The per-call marker counts `visibility = 'public'` only where it filters
+/// rows (after `AND`, `OR`, `WHERE` or `ON`), and `.splice(` only on one of the
+/// fn's own viewers. The fn-level check counts both anywhere, which is right
+/// for "does this fn spend its viewer at all" and wrong for one statement.
+#[test]
+fn the_per_call_marker_counts_only_a_filtering_predicate() {
+    let src = r##"
+pub async fn projected(conn: &mut PgConnection, viewer: &Viewer, id: Uuid) -> R {
+    let _ = viewer;
+    sqlx::query_as("SELECT c.content, c.visibility = 'public' FROM claims c WHERE c.id = $1")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await
+}
+
+pub async fn ordered(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT c.content FROM claims c ORDER BY c.visibility = 'public' DESC")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn case_when(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT CASE WHEN c.visibility = 'public' THEN c.content END FROM claims c")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn another_column(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let _ = viewer;
+    sqlx::query_scalar("SELECT a.bio FROM agents a WHERE a.profile_visibility = 'public'")
+        .fetch_all(&mut *conn)
+        .await
+}
+
+pub async fn spliced_by_another(conn: &mut PgConnection, viewer: &Viewer, ctx: &Ctx) -> R {
+    let _ = viewer;
+    let sql = ctx.viewer.splice("SELECT content FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    sqlx::query_scalar(&sql).fetch_all(&mut *conn).await
+}
+
+pub async fn filtered(conn: &mut PgConnection, viewer: &Viewer, id: Uuid) -> R {
+    let _ = viewer;
+    sqlx::query_scalar(
+        "SELECT c.content FROM claims c WHERE c.id = $1 \
+         AND ($2::bool OR c.visibility = 'public' OR c.owner_group_id = ANY($3))",
+    )
+    .fetch_one(&mut *conn)
+    .await
+}
+
+pub async fn continued(conn: &mut PgConnection, viewer: &Viewer, mf: &str) -> R {
+    let _ = viewer;
+    let sql = format!(
+        "SELECT {mf}.content FROM claims {mf} WHERE {mf}.id = $1 AND \
+         ({mf}.visibility = 'public' OR {mf}.owner_group_id = ANY($2))"
+    );
+    sqlx::query_scalar(&sql).fetch_one(&mut *conn).await
+}
+
+pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
+    let sql = viewer.splice("SELECT content FROM claims c WHERE true /* {VISIBILITY:c} */", 1);
+    sqlx::query_scalar(&sql).fetch_all(&mut *conn).await
+}
+"##;
+    let m = repo_unviewed(src);
+    for (f, label) in [
+        ("projected", "sqlx::query_as(SELECT).fetch_one"),
+        ("ordered", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("case_when", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("another_column", "sqlx::query_scalar(SELECT).fetch_all"),
+        ("spliced_by_another", "sqlx::query_scalar(SELECT).fetch_all"),
+    ] {
+        assert_eq!(
+            repo_labels(&m, f),
+            vec![label],
+            "{f}: the marker is not a filter on this fn's viewer, so the read is unviewed"
+        );
+    }
+    for f in ["filtered", "continued", "spliced"] {
+        assert_eq!(
+            repo_labels(&m, f),
+            Vec::<String>::new(),
+            "{f}: a filtering predicate, or a splice on the fn's own viewer, is a spend"
+        );
+    }
 }

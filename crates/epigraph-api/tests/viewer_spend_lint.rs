@@ -29,9 +29,10 @@
 //! passes `&viewer` to a helper counts that call as viewed, so the helper's own
 //! body is measured as well; its `&PgPool` and connection parameters are
 //! database handles there. A helper declared inside a handler is measured once,
-//! as itself. Viewer-holding code outside `src/routes/` (the MCP tools, the
-//! repo layer) is not in this population; `visibility_lint.rs` covers the
-//! repo layer's SQL.
+//! as itself. Viewer-holding code outside `src/routes/` is not in this
+//! population: the repo layer and the MCP tools keep the same per-call
+//! register in `epigraph-db/tests/visibility_lint.rs` and
+//! `epigraph-mcp/tests/tool_viewer_is_spent.rs` (backlog ada8ee55).
 //!
 //! # What counts as a database call
 //!
