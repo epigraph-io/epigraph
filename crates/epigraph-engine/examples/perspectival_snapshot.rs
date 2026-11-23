@@ -7,9 +7,13 @@
 //! Run (against a freshly (re)created DB; paths supplied via env vars, no defaults):
 //!   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_demo_dev \
 //!   SEED_DIR=$SEED_DIR SNAPSHOT_OUT=$SEED_DIR/data/snapshot.json \
-//!   SQLX_OFFLINE=true cargo test -p epigraph-engine --test perspectival_snapshot -- --nocapture
+//!   SQLX_OFFLINE=true cargo run -p epigraph-engine --example perspectival_snapshot
+//!
+//! An operator tool, run as a cargo example. It lived in `tests/` as an
+//! `#[ignore]`d test that no gate ran (backlog 4ae8f96c); it asserts nothing, so
+//! it is not a test. `cargo test` and `clippy --all-targets` still compile it.
 
-#[path = "viewer_fixture.rs"]
+#[path = "../tests/viewer_fixture.rs"]
 mod fixture;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -20,6 +24,14 @@ use epigraph_db::{
 use epigraph_ds::{FocalElement, FrameOfDiscernment, MassFunction};
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+/// An operator tool, not a test: a missing input is a usage error.
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("error: {name} is not set (see the run line at the top of this file)");
+        std::process::exit(2);
+    })
+}
 
 const OPEN_WORLD_FRACTION: f64 = 0.08;
 
@@ -111,21 +123,11 @@ struct ClaimMeta {
     frame_uuid: Uuid,
 }
 
-#[tokio::test]
-#[ignore = "requires SEED_DIR + dedicated dev DB; run manually with --ignored"]
-async fn generate_snapshot() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP: DATABASE_URL not set");
-        return;
-    };
-    let Ok(dir) = std::env::var("SEED_DIR") else {
-        eprintln!("SKIP: SEED_DIR not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(out) = std::env::var("SNAPSHOT_OUT") else {
-        eprintln!("SKIP: SNAPSHOT_OUT not set — this is an ops harness, not a regression test");
-        return;
-    };
+#[tokio::main]
+async fn main() {
+    let url = require_env("DATABASE_URL");
+    let dir = require_env("SEED_DIR");
+    let out = require_env("SNAPSHOT_OUT");
     let pool = PgPool::connect(&url).await.expect("connect");
     sqlx::migrate!("../../migrations").run(&pool).await.ok();
 

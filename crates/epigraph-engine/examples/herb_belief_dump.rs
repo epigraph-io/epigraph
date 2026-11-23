@@ -12,9 +12,13 @@
 //! Run:
 //!   MODE=demo   DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_anxiety_dev \
 //!   MODE=ingest DATABASE_URL=postgres://epigraph:epigraph@localhost/epigraph_anxiety_ingest_dev \
-//!     SQLX_OFFLINE=true cargo test -p epigraph-engine --test herb_belief_dump -- --ignored --nocapture
+//!     SQLX_OFFLINE=true cargo run -p epigraph-engine --example herb_belief_dump
+//!
+//! An operator tool, run as a cargo example. It lived in `tests/` as an
+//! `#[ignore]`d test that no gate ran (backlog 4ae8f96c); it asserts nothing, so
+//! it is not a test. `cargo test` and `clippy --all-targets` still compile it.
 
-#[path = "viewer_fixture.rs"]
+#[path = "../tests/viewer_fixture.rs"]
 mod fixture;
 
 use std::collections::BTreeMap;
@@ -23,17 +27,18 @@ use epigraph_db::PgPool;
 use epigraph_engine::belief_query::get_perspective_belief;
 use uuid::Uuid;
 
-#[tokio::test]
-#[ignore = "operator-driven: needs DATABASE_URL + MODE"]
-async fn herb_belief_dump() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("SKIP: DATABASE_URL not set — this is an ops harness, not a regression test");
-        return;
-    };
-    let Ok(mode) = std::env::var("MODE") else {
-        eprintln!("SKIP: MODE not set — this is an ops harness, not a regression test");
-        return;
-    };
+/// An operator tool, not a test: a missing input is a usage error.
+fn require_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("error: {name} is not set (see the run line at the top of this file)");
+        std::process::exit(2);
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let url = require_env("DATABASE_URL");
+    let mode = require_env("MODE");
     let pool = PgPool::connect(&url).await.expect("connect");
     let viewer = fixture::public_viewer(&pool).await;
 
@@ -86,9 +91,6 @@ async fn herb_belief_dump() {
                 e.0 += bi.pignistic_prob;
                 e.1 += 1;
             }
-            // NOTE: redirect stdout to a file (`> out 2>&1`) rather than piping
-            // through `grep` under --nocapture; the test-harness pipe can drop a
-            // line when stdout/stderr interleave.
         }
         for ((herb, persp), (sum, n)) in &acc {
             println!(
