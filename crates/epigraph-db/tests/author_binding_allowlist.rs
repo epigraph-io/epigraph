@@ -2123,8 +2123,17 @@ fn every_149_object_is_registered() {
         "public.epigraph_revoke_author_binding_client(uuid, text)",
         "public.epigraph_allowlisted_operator(uuid)",
     ] {
+        // The register's layout (indentation, whether it is fn-local or
+        // module-scope) is not the contract: the entry is the quoted
+        // signature followed, after whitespace, by `false,`.
+        let quoted = format!("\"{callable}\",");
+        let not_app_callable = backfill.match_indices(&quoted).any(|(at, _)| {
+            backfill[at + quoted.len()..]
+                .trim_start()
+                .starts_with("false,")
+        });
         assert!(
-            backfill.contains(&format!("\"{callable}\",\n            false,")),
+            not_app_callable,
             "{callable} must be on tenancy_backfill.rs's grant register as not app-callable"
         );
     }
