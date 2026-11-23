@@ -5157,6 +5157,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "begin_build_snapshot",
         &["Self::fix_repeatable_read"],
     ),
+    // session: the `SET LOCAL`-scoped `statement_timeout` (`set_config(.., true)`) that
+    // bounds the viewer-spliced co-owned edge read after it; it reads no row.
+    (
+        "atlas_serve.rs",
+        "read_co_owned_leaf_edges",
+        &["sqlx::query(SELECT).execute"],
+    ),
     // untenanted: the operator binding at a time (`epigraph_operator_bound_at`), `agents`
     // display names, and the prompt snapshot definer (which applies its own audience), all
     // keyed on agents the viewed ingest read returned.
