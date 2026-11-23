@@ -147,7 +147,16 @@ const ACTED_ON_BY: &[(&str, &[&str])] = &[
         "compound_belief",
         &["crates/epigraph-engine/src/belief_view.rs"],
     ),
-    ("compound_write_guard", &[]),
+    (
+        "compound_write_guard",
+        &[
+            // Each AppState constructor takes the process's guard mode
+            // (`POST /api/v1/frames/:id/evidence`, `POST .../assess`).
+            "crates/epigraph-api/src/state.rs",
+            // Each server constructor, for MCP `submit_ds_evidence`.
+            "crates/epigraph-mcp/src/server.rs",
+        ],
+    ),
     (
         "compound_source_edges",
         &[

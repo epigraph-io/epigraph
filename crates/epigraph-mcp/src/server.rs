@@ -1289,7 +1289,7 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
-            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
         }
     }
 
@@ -1451,7 +1451,7 @@ impl EpiGraphMcpFull {
             public_base_url: None,
             label_dedup: Arc::new(crate::tools::label_dedup::LabelDedupConfig::default()),
             centroid_population: Arc::default(),
-            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard,
+            compound_write_guard: epigraph_engine::belief_modes::current().compound_write_guard(),
         }
     }
 
