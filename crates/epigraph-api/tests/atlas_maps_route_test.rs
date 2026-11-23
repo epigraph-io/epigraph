@@ -1159,3 +1159,587 @@ async fn the_largest_documents_are_served_within_budget(pool: PgPool) {
         );
     }
 }
+
+// ---- the co-owned overlay (backlog ff3b6046) --------------------------------------
+
+/// A stored edge, tenancy as 070/072's trigger stamps it from the endpoints,
+/// with `props` as its properties.
+async fn insert_edge(
+    pool: &PgPool,
+    source: (&str, Uuid),
+    target: (&str, Uuid),
+    rel: &str,
+    props: Value,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties) \
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+    )
+    .bind(source.1)
+    .bind(source.0)
+    .bind(target.1)
+    .bind(target.0)
+    .bind(rel)
+    .bind(props)
+    .fetch_one(pool)
+    .await
+    .expect("seed edge")
+}
+
+/// Force an edge co-owned by `owner` and `co_owner` (as 072's meet stamps an
+/// edge across two groups, or a regroup leaves one).
+async fn force_co_owned(pool: &PgPool, id: Uuid, owner: Uuid, co_owner: Uuid) {
+    let n = sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = $3 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(owner)
+    .bind(co_owner)
+    .execute(pool)
+    .await
+    .expect("force co-owned edge")
+    .rows_affected();
+    assert_eq!(n, 1);
+}
+
+/// A public frame of two hypotheses, `claim` at index 0 on it.
+async fn binary_frame(pool: &PgPool, claim: Uuid) -> Uuid {
+    let frame: Uuid =
+        sqlx::query_scalar("INSERT INTO frames (name, hypotheses) VALUES ($1, $2) RETURNING id")
+            .bind(format!("atlas-overlay-{}", Uuid::new_v4()))
+            .bind(vec!["h0".to_string(), "h1".to_string()])
+            .fetch_one(pool)
+            .await
+            .expect("seed frame");
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 0)",
+    )
+    .bind(claim)
+    .bind(frame)
+    .execute(pool)
+    .await
+    .expect("seed claim_frames");
+    frame
+}
+
+/// An evidence-keyed mass row on `claim`; tenancy inherited from the claim.
+async fn evidence_mass(pool: &PgPool, claim: Uuid, ev: Uuid, agent: Uuid, masses: Value) -> Uuid {
+    let frame = binary_frame(pool, claim).await;
+    sqlx::query_scalar(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses, evidence_id, \
+                                     source_strength) \
+         VALUES ($1, $2, $3, $4, $5, 0.5) RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(masses)
+    .bind(ev)
+    .fetch_one(pool)
+    .await
+    .expect("seed mass row")
+}
+
+/// The overlay's world. Teams A, B and C; MA is in A, MB in B, DUAL in A and
+/// B, TRI in A, B and C. Public claims P1 and P2 and public evidence EV1 (on
+/// P1) and EV2 (on P2) are drawn by one meaning leaf on A's map (LA), on B's
+/// map (LB) and on the public map (LP), each storing the same three edges a
+/// whole audience reads.
+///
+/// In the database (all seeded before the runs are built):
+/// * `co_ab`  P1 -contradicts-> P2, strength 0.7, owner A, co-owner B;
+/// * `co_ba`  P2 -SUPPORTS-> P1, no strength, owner B, co-owner A;
+/// * `co_bc`  P1 -corroborates-> P2, owner B, co-owner C (not A's);
+/// * `gone`   P2 -refutes-> P1, owner A, co-owner B, retracted;
+/// * `ev1e`   EV1 -supports-> P1, owner A, co-owner B, with a public mass
+///   row (m({h0}) = 0.6);
+/// * `ev2e`   EV2 -refutes-> P2, owner A, co-owner B, whose only mass row
+///   (m({h1}) = 0.5) is C's.
+struct Overlay {
+    a: Uuid,
+    b: Uuid,
+    ma: Uuid,
+    mb: Uuid,
+    dual: Uuid,
+    tri: Uuid,
+    p1: Uuid,
+    p2: Uuid,
+    ev1: Uuid,
+    ev2: Uuid,
+    co_ab: Uuid,
+    co_ba: Uuid,
+    co_bc: Uuid,
+    gone: Uuid,
+    ev1e: Uuid,
+    ev2e: Uuid,
+    la: Uuid,
+    lb: Uuid,
+    lp: Uuid,
+    stored: Vec<Edge>,
+}
+
+impl Overlay {
+    async fn seed(pool: &PgPool) -> Overlay {
+        let a = team(pool, "Overlay A").await;
+        let b = team(pool, "Overlay B").await;
+        let c = team(pool, "Overlay C").await;
+        let mut members = Vec::new();
+        for (label, groups) in [
+            ("overlay-a", vec![a]),
+            ("overlay-b", vec![b]),
+            ("overlay-ab", vec![a, b]),
+            ("overlay-abc", vec![a, b, c]),
+        ] {
+            let (agent, _) = fixture::seed_agent_with_group(pool, label).await;
+            for g in groups {
+                add_member(pool, g, agent, "writer").await;
+            }
+            members.push(agent);
+        }
+        let (ma, mb, dual, tri) = (members[0], members[1], members[2], members[3]);
+        let world = fixture::world_group(pool).await;
+        let theme = seed_theme(pool).await;
+        let p1 = fixture::seed_public_claim(pool, ma, "overlay public one").await;
+        let p2 = fixture::seed_public_claim(pool, ma, "overlay public two").await;
+        for p in [p1, p2] {
+            set_theme(pool, p, theme).await;
+        }
+        let ev1 = fixture::seed_evidence(pool, p1, "document").await;
+        let ev2 = fixture::seed_evidence(pool, p2, "observation").await;
+
+        let co_ab = insert_edge(
+            pool,
+            ("claim", p1),
+            ("claim", p2),
+            "contradicts",
+            serde_json::json!({"strength": 0.7}),
+        )
+        .await;
+        force_co_owned(pool, co_ab, a, b).await;
+        let co_ba = insert_edge(
+            pool,
+            ("claim", p2),
+            ("claim", p1),
+            "SUPPORTS",
+            serde_json::json!({}),
+        )
+        .await;
+        force_co_owned(pool, co_ba, b, a).await;
+        let co_bc = insert_edge(
+            pool,
+            ("claim", p1),
+            ("claim", p2),
+            "corroborates",
+            serde_json::json!({}),
+        )
+        .await;
+        force_co_owned(pool, co_bc, b, c).await;
+        let gone = insert_edge(
+            pool,
+            ("claim", p2),
+            ("claim", p1),
+            "refutes",
+            serde_json::json!({}),
+        )
+        .await;
+        force_co_owned(pool, gone, a, b).await;
+        let n = sqlx::query(
+            "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                              valid_to = now() - interval '1 hour' WHERE id = $1",
+        )
+        .bind(gone)
+        .execute(pool)
+        .await
+        .expect("retract")
+        .rows_affected();
+        assert_eq!(n, 1);
+        let ev1e = insert_edge(
+            pool,
+            ("evidence", ev1),
+            ("claim", p1),
+            "supports",
+            serde_json::json!({}),
+        )
+        .await;
+        force_co_owned(pool, ev1e, a, b).await;
+        let ev2e = insert_edge(
+            pool,
+            ("evidence", ev2),
+            ("claim", p2),
+            "refutes",
+            serde_json::json!({}),
+        )
+        .await;
+        force_co_owned(pool, ev2e, a, b).await;
+        evidence_mass(
+            pool,
+            p1,
+            ev1,
+            ma,
+            serde_json::json!({"0": 0.6, "1": 0.1, "0,1": 0.3}),
+        )
+        .await;
+        let m2 = evidence_mass(
+            pool,
+            p2,
+            ev2,
+            ma,
+            serde_json::json!({"0": 0.2, "1": 0.5, "0,1": 0.3}),
+        )
+        .await;
+        let n = sqlx::query(
+            "UPDATE mass_functions SET visibility = 'group', owner_group_id = $2, \
+                                       writer_owned = true WHERE id = $1",
+        )
+        .bind(m2)
+        .bind(c)
+        .execute(pool)
+        .await
+        .expect("force the mass row to C")
+        .rows_affected();
+        assert_eq!(n, 1);
+
+        // Calibration: the stamps the test rests on.
+        let stamps: Vec<(Uuid, String, Uuid, Option<Uuid>, bool)> = sqlx::query_as(
+            "SELECT id, visibility::text, owner_group_id, co_owner_group_id, \
+                    (valid_to IS NULL OR valid_to > now()) \
+               FROM edges WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(vec![co_ab, co_ba, co_bc, gone, ev1e, ev2e])
+        .fetch_all(pool)
+        .await
+        .expect("edge stamps");
+        assert_eq!(stamps.len(), 6);
+        for (id, vis, owner, co, live) in stamps {
+            let want = if id == co_ba {
+                (b, Some(a))
+            } else if id == co_bc {
+                (b, Some(c))
+            } else {
+                (a, Some(b))
+            };
+            assert_eq!(vis, "group", "edge {id}");
+            assert_eq!((owner, co), want, "edge {id}");
+            assert_eq!(live, id != gone, "edge {id}");
+        }
+        let public: Vec<(String, Uuid)> = sqlx::query_as(
+            "SELECT visibility::text, owner_group_id FROM claims WHERE id = ANY($1) \
+             UNION ALL \
+             SELECT visibility::text, owner_group_id FROM evidence WHERE id = ANY($2) \
+             UNION ALL \
+             SELECT visibility::text, owner_group_id FROM mass_functions \
+              WHERE evidence_id = $3",
+        )
+        .bind(vec![p1, p2])
+        .bind(vec![ev1, ev2])
+        .bind(ev1)
+        .fetch_all(pool)
+        .await
+        .expect("node stamps");
+        assert_eq!(public.len(), 5);
+        for (vis, owner) in public {
+            assert_eq!((vis.as_str(), owner), ("public", world));
+        }
+
+        let stored = vec![
+            edge(ev1, p1, "cites", FlowBasis::None),
+            edge(ev2, p2, "cites", FlowBasis::None),
+            edge(p1, p2, "supports", FlowBasis::Proxy),
+        ];
+        let nodes = vec![
+            claim_node(p1, "overlay public one", -0.5),
+            claim_node(p2, "overlay public two", 0.5),
+            Node::Evidence(PlainNode {
+                id: ev1,
+                label: "evidence one".into(),
+                x: -0.5,
+                y: -0.5,
+            }),
+            Node::Evidence(PlainNode {
+                id: ev2,
+                label: "evidence two".into(),
+                x: 0.5,
+                y: -0.5,
+            }),
+        ];
+        let mut leaves = Vec::new();
+        for map in [AtlasMap::Team(a), AtlasMap::Team(b), AtlasMap::Public] {
+            let (root_id, leaf_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let other = Uuid::new_v4();
+            build_run(pool, map, |run| {
+                let ctx = Ctx { map, theme, run };
+                vec![
+                    root(
+                        &ctx,
+                        AtlasHierarchy::Meaning,
+                        root_id,
+                        "Overlay",
+                        leaf_id,
+                        2,
+                        other,
+                    ),
+                    leaf(
+                        &ctx,
+                        AtlasHierarchy::Meaning,
+                        leaf_id,
+                        root_id,
+                        other,
+                        nodes.clone(),
+                        stored.clone(),
+                    ),
+                ]
+            })
+            .await;
+            leaves.push(leaf_id);
+        }
+        Overlay {
+            a,
+            b,
+            ma,
+            mb,
+            dual,
+            tri,
+            p1,
+            p2,
+            ev1,
+            ev2,
+            co_ab,
+            co_ba,
+            co_bc,
+            gone,
+            ev1e,
+            ev2e,
+            la: leaves[0],
+            lb: leaves[1],
+            lp: leaves[2],
+            stored,
+        }
+    }
+}
+
+fn flow(
+    source: Uuid,
+    target: Uuid,
+    rel: &str,
+    sign: i8,
+    flow_weight: f64,
+    flow_basis: FlowBasis,
+) -> Edge {
+    Edge {
+        source,
+        target,
+        relationship: rel.into(),
+        sign,
+        flow_weight,
+        flow_basis,
+    }
+}
+
+fn sorted(mut edges: Vec<Edge>) -> Vec<Edge> {
+    edges.sort_by(|x, y| {
+        (x.source, x.target, &x.relationship).cmp(&(y.source, y.target, &y.relationship))
+    });
+    edges
+}
+
+/// The edges of a leaf the route serves `who`: every stored edge first, in
+/// stored order, then what the overlay added, sorted.
+async fn served_edges(r: &Router, o: &Overlay, map: AtlasMap, leaf: Uuid, who: Uuid) -> Vec<Edge> {
+    let got = get(r, &level_path(map, "meaning", leaf), who).await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.text());
+    assert_private(&got, "an overlaid leaf");
+    let want = match map {
+        AtlasMap::Team(g) => Expected::team(g, leaf),
+        AtlasMap::Public => Expected::public(leaf),
+    };
+    let doc = check_level_body(&got.body, &want).unwrap_or_else(|e| panic!("{leaf}: {e:?}"));
+    let LevelDocument::Leaf(l) = doc else {
+        panic!("a leaf")
+    };
+    assert_eq!(
+        node_ids(&LevelDocument::Leaf(l.clone())),
+        vec![o.p1, o.p2, o.ev1, o.ev2],
+        "the overlay adds no node"
+    );
+    assert_eq!(
+        &l.edges[..o.stored.len()],
+        &o.stored[..],
+        "stored edges first, unchanged"
+    );
+    sorted(l.edges[o.stored.len()..].to_vec())
+}
+
+/// DONE for backlog ff3b6046: a member of BOTH teams that co-own an edge sees
+/// it on the leaf, on either team's map, weighed as the nightly weighs a
+/// leaf's edges; a member of only one team does not. An edge of two other
+/// teams stays off a map, even for a member of all three; a retracted
+/// co-owned edge is never drawn; the public map gets nothing; an evidence
+/// edge whose mass the viewer cannot read is served `none`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) {
+    use epigraph_engine::atlas_flow::link_strength;
+    let o = Overlay::seed(&pool).await;
+    let r = router(&pool).await;
+    let (a, b) = (AtlasMap::Team(o.a), AtlasMap::Team(o.b));
+
+    let co_ab = flow(o.p1, o.p2, "contradicts", -1, 0.7, FlowBasis::Proxy);
+    let co_ba = flow(
+        o.p2,
+        o.p1,
+        "supports",
+        1,
+        link_strength(None, "supports"),
+        FlowBasis::Proxy,
+    );
+    let co_bc = flow(
+        o.p1,
+        o.p2,
+        "corroborates",
+        1,
+        link_strength(None, "corroborates"),
+        FlowBasis::Proxy,
+    );
+    let ev1 = flow(o.ev1, o.p1, "supports", 1, 0.6, FlowBasis::Exact);
+    let ev2_hidden = flow(o.ev2, o.p2, "refutes", 0, 0.0, FlowBasis::None);
+    let ev2_read = flow(o.ev2, o.p2, "refutes", -1, 0.5, FlowBasis::Exact);
+    assert!(co_ba.flow_weight > 0.0 && co_bc.flow_weight > 0.0);
+
+    // One team only: the leaf as stored.
+    assert_eq!(
+        served_edges(&r, &o, a, o.la, o.ma).await,
+        vec![],
+        "A alone, A's map"
+    );
+    assert_eq!(
+        served_edges(&r, &o, b, o.lb, o.mb).await,
+        vec![],
+        "B alone, B's map"
+    );
+
+    // Both teams: the co-owned edges, on either team's map.
+    let both = sorted(vec![co_ab.clone(), co_ba.clone(), ev1.clone(), ev2_hidden]);
+    assert_eq!(
+        served_edges(&r, &o, a, o.la, o.dual).await,
+        both,
+        "A and B, A's map"
+    );
+    assert_eq!(
+        served_edges(&r, &o, b, o.lb, o.dual).await,
+        both,
+        "A and B, B's map"
+    );
+
+    // All three teams: B and C's edge is on B's map only; C's mass row is read.
+    let on_a = sorted(vec![
+        co_ab.clone(),
+        co_ba.clone(),
+        ev1.clone(),
+        ev2_read.clone(),
+    ]);
+    assert_eq!(
+        served_edges(&r, &o, a, o.la, o.tri).await,
+        on_a,
+        "A, B and C, A's map"
+    );
+    let on_b = sorted(vec![co_ab, co_ba, co_bc, ev1, ev2_read]);
+    assert_eq!(
+        served_edges(&r, &o, b, o.lb, o.tri).await,
+        on_b,
+        "A, B and C, B's map"
+    );
+
+    // The public map draws public edges only, whoever asks.
+    for who in [o.ma, o.dual, o.tri] {
+        assert_eq!(
+            served_edges(&r, &o, AtlasMap::Public, o.lp, who).await,
+            vec![],
+            "the public map"
+        );
+    }
+}
+
+/// `AtlasServeRepository::co_owned_leaf_edges` refuses on its own in-query
+/// predicates, with no row policy behind them (the superuser connection
+/// `#[sqlx::test]` hands out, asserted below), so the route test above cannot
+/// pass on row security alone:
+/// - a member of both teams gets exactly the live co-owned edges of team A
+///   among the nodes (the positive control), with C's mass row left out;
+/// - a member of A alone gets none (the edge splice);
+/// - a member of all three does not get B and C's edge on A's map (the team
+///   clause), and nobody gets the retracted edge (the in-force clause);
+/// - an end matched by id under another kind is no match.
+#[sqlx::test(migrations = "../../migrations")]
+async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
+    use epigraph_db::repos::atlas_leaf::LeafNode;
+    let o = Overlay::seed(&pool).await;
+    let mut conn = pool.acquire().await.expect("a connection");
+    let bypasses: bool = sqlx::query_scalar(
+        "SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the session's role");
+    assert!(bypasses, "this arm needs a session no row policy filters");
+    let nodes = vec![
+        LeafNode::claim(o.p1),
+        LeafNode::claim(o.p2),
+        LeafNode::evidence(o.ev1),
+        LeafNode::evidence(o.ev2),
+    ];
+    async fn ids(
+        conn: &mut sqlx::PgConnection,
+        pool: &PgPool,
+        who: Uuid,
+        team: Uuid,
+        nodes: &[LeafNode],
+    ) -> (Vec<Uuid>, usize) {
+        let viewer = Viewer::resolve(pool, who).await.expect("a viewer");
+        let got = AtlasServeRepository::co_owned_leaf_edges(conn, &viewer, team, nodes)
+            .await
+            .expect("the overlay read");
+        let mut ids: Vec<Uuid> = got
+            .set
+            .edges
+            .iter()
+            .flat_map(|e| match &e.origin {
+                epigraph_db::repos::atlas_leaf::LeafEdgeOrigin::Stored { edge_ids } => {
+                    edge_ids.clone()
+                }
+                other => panic!("an overlay edge is stored, not {other:?}"),
+            })
+            .collect();
+        ids.sort_unstable();
+        (ids, got.inputs.evidence_masses.len())
+    }
+    let mut want = vec![o.co_ab, o.co_ba, o.ev1e, o.ev2e];
+    want.sort_unstable();
+    assert_eq!(
+        ids(&mut conn, &pool, o.dual, o.a, &nodes).await,
+        (want.clone(), 1),
+        "A and B: A's live co-owned edges; EV1's public mass row only"
+    );
+    assert_eq!(
+        ids(&mut conn, &pool, o.ma, o.a, &nodes).await,
+        (vec![], 0),
+        "A alone reads no co-owned edge"
+    );
+    let (tri_a, tri_mass) = ids(&mut conn, &pool, o.tri, o.a, &nodes).await;
+    assert_eq!((tri_a, tri_mass), (want, 2), "A, B and C on A's map");
+    let (tri_b, _) = ids(&mut conn, &pool, o.tri, o.b, &nodes).await;
+    assert!(tri_b.contains(&o.co_bc), "B and C's edge is on B's map");
+    assert!(!tri_b.contains(&o.gone), "the retracted edge is never read");
+    // P1 named as an agent: no edge at P1 matches.
+    let wrong_kind = vec![
+        LeafNode::agent(o.p1),
+        LeafNode::claim(o.p2),
+        LeafNode::evidence(o.ev1),
+        LeafNode::evidence(o.ev2),
+    ];
+    assert_eq!(
+        ids(&mut conn, &pool, o.tri, o.a, &wrong_kind).await,
+        (vec![o.ev2e], 1),
+        "an id under another kind is no match"
+    );
+}

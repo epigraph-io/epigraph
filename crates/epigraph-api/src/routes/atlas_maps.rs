@@ -15,7 +15,7 @@
 //! A level is the document the nightly stored (migration 210,
 //! `atlas_map_levels`), read by `AtlasMapRepository::level_for_viewer` in one
 //! indexed statement on the caller's stamped connection. Nothing is computed
-//! here but the per-viewer filter below.
+//! here but the per-viewer filter and the co-owned overlay below.
 //!
 //! # What a viewer gets
 //!
@@ -26,6 +26,18 @@
 //!   their row security, agents by existence): a member never sees a node, or
 //!   an edge to one, that their session cannot read. A group level is served
 //!   as stored.
+//! * **The co-owned overlay** (backlog ff3b6046). A map draws an edge only
+//!   when its whole audience may read it, so no team map bakes in an edge
+//!   co-owned by two teams: row security lets only members of BOTH read one.
+//!   On the level route, a leaf of team T's map gains, at request time, the
+//!   co-owned edges with T as owner or co-owner that the viewer's own session
+//!   reads between two nodes the served leaf draws
+//!   (`AtlasServeRepository::co_owned_leaf_edges`), weighed as the nightly
+//!   weighs a leaf's edges and appended by `LevelDocument::with_viewer_edges`.
+//!   A member of one of the two teams gets the leaf as before. The public map,
+//!   group levels and `outgoing` are unchanged, and so is an edge whose two
+//!   ends no single map draws (a claim of each team): the overlay adds edges,
+//!   never nodes.
 //! * **Staleness.** A run is served while nothing LEFT its map's readable set
 //!   since the build (`nothing_left`), even when something arrived (`current`
 //!   false: the map is only incomplete until the next nightly). A run where a
@@ -60,9 +72,11 @@ use axum::{
 use epigraph_atlas_contract::{
     ClaimLeaf, Hierarchy, LevelDocument, MapScope, Node, CLAIM_LEAF_SCHEMA_VERSION, SCHEMA_VERSION,
 };
+use epigraph_db::repos::atlas_leaf::LeafNode;
 use epigraph_db::repos::atlas_map::{AtlasHierarchy, AtlasMap, MapLevel};
 use epigraph_db::repos::atlas_serve::ThemeRoot;
 use epigraph_db::{AtlasMapRepository, AtlasServeRepository, Viewer};
+use epigraph_engine::atlas_flow::weigh_leaf_edges;
 use serde::Serialize;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -449,11 +463,68 @@ pub async fn atlas_level(
         .read_as(&viewer)
         .await
         .map_err(|e| scoped_read_failed(e, "atlas_level"))?;
-    let served = served_level(&mut read, &viewer, map, hierarchy, id).await?;
+    let served = match served_level(&mut read, &viewer, map, hierarchy, id).await? {
+        Some((_, doc)) => Some(with_co_owned_edges(&mut read, &viewer, map, doc).await?),
+        None => None,
+    };
     crate::routes::finish_scoped_read(read, "atlas_level").await?;
     match served {
-        Some((_, doc)) => Ok(private_json(doc)),
+        Some(doc) => Ok(private_json(doc)),
         None => Err(level_not_found(id)),
+    }
+}
+
+/// A served leaf of team `T`'s map with the co-owned edges the viewer's own
+/// session reads drawn on top (see the module documentation, "The co-owned
+/// overlay"). Any other document is returned as it is. An overlay that would
+/// make the document invalid is a fault: logged, and the leaf is served
+/// without it.
+async fn with_co_owned_edges(
+    conn: &mut PgConnection,
+    viewer: &Viewer,
+    map: AtlasMap,
+    doc: LevelDocument,
+) -> Result<LevelDocument, ApiError> {
+    let (AtlasMap::Team(team), LevelDocument::Leaf(leaf)) = (map, &doc) else {
+        return Ok(doc);
+    };
+    let nodes: Vec<LeafNode> = leaf
+        .nodes
+        .iter()
+        .map(|n| match n {
+            Node::Claim(c) => LeafNode::claim(c.id),
+            Node::Agent(a) => LeafNode::agent(a.id),
+            Node::Evidence(e) => LeafNode::evidence(e.id),
+        })
+        .collect();
+    let found = AtlasServeRepository::co_owned_leaf_edges(conn, viewer, team, &nodes).await?;
+    if found.set.edges.is_empty() {
+        return Ok(doc);
+    }
+    let extra = weigh_leaf_edges(&found.set, &found.inputs);
+    let (merged, added, over_cap) = doc.with_viewer_edges(&extra);
+    if over_cap > 0 {
+        tracing::warn!(
+            target: "atlas.serve",
+            level_id = %doc.level_id(),
+            over_cap,
+            "co-owned edges left out of a full leaf"
+        );
+    }
+    if added == 0 {
+        return Ok(doc);
+    }
+    match merged.validate() {
+        Ok(()) => Ok(merged),
+        Err(v) => {
+            tracing::error!(
+                target: "atlas.serve",
+                level_id = %doc.level_id(),
+                reason = %v,
+                "co-owned overlay refused; serving the leaf without it"
+            );
+            Ok(doc)
+        }
     }
 }
 

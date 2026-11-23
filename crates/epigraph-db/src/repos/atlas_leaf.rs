@@ -33,9 +33,11 @@
 //!   `edges_tenancy`, after 072) lets a session read an edge co-owned by two
 //!   teams only when it is in BOTH, so a member of T alone cannot read it and
 //!   a co-owned edge is never baked into a single-team map, neither the
-//!   owner's nor the co-owner's. A view for a viewer in both teams is future
-//!   work. Migration 210 already treats "the edge gained a co-owner" as the
-//!   edge leaving the owner's map;
+//!   owner's nor the co-owner's. A viewer in both teams gets such an edge at
+//!   request time instead, on their own answer only
+//!   ([`crate::AtlasServeRepository::co_owned_leaf_edges`]). Migration 210
+//!   already treats "the edge gained a co-owner" as the edge leaving the
+//!   owner's map;
 //! * the public map binds T as NULL, so only public rows pass.
 //!
 //! The edge predicate is the MAP rule, not
