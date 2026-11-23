@@ -520,9 +520,14 @@ async fn get_descendant_lineage(
     include_traces: bool,
 ) -> Result<(Vec<LineageNode>, Vec<LineageEdge>, u32, bool), ApiError> {
     // Use LineageRepository for descendant traversal
-    let lineage_result =
-        LineageRepository::get_descendants_conn(&mut *conn, viewer, claim_id, Some(max_depth))
-            .await?;
+    let lineage_result = LineageRepository::get_descendants_conn(
+        &mut *conn,
+        viewer,
+        claim_id,
+        Some(max_depth),
+        None,
+    )
+    .await?;
 
     // If no claims found (empty result), return just the root claim.
     //

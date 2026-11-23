@@ -84,9 +84,8 @@ impl Observation {
 ///
 /// A parameter and not a closure: the arms take `&mut ScopedRead` / `&mut
 /// PgConnection`, which a shared `Fn(..) -> Fut` cannot thread without an HRTB
-/// fight, and the two primitives differ in arity anyway (`get_descendants_conn`
-/// has no `max_nodes`). `anchor_case` below CAN use a closure because it takes
-/// only `Uuid`s and acquires its own connection inside.
+/// fight. `anchor_case` below CAN use a closure because it takes only `Uuid`s
+/// and acquires its own connection inside.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Walk {
     Ancestors,
@@ -105,7 +104,7 @@ impl Walk {
                 LineageRepository::get_lineage_conn(conn, viewer, root, Some(10), None).await?
             }
             Walk::Descendants => {
-                LineageRepository::get_descendants_conn(conn, viewer, root, Some(10)).await?
+                LineageRepository::get_descendants_conn(conn, viewer, root, Some(10), None).await?
             }
         };
         Ok(result.claims.keys().copied().collect())
@@ -370,7 +369,7 @@ async fn the_descendant_walks_anchor_term_suppresses_a_root_the_viewer_cannot_se
         async move {
             let viewer = Viewer::resolve(&pool, agent).await.expect("resolve");
             let mut conn = pool.acquire().await.expect("acquire");
-            LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(10))
+            LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(10), None)
                 .await
                 .expect("walk")
                 .claims
