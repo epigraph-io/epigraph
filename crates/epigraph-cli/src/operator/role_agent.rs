@@ -35,9 +35,13 @@
 //!
 //! Every rule stays in the database (`ROL02`: no human or role node, no
 //! overlapping window, no back-dating; the definer's own `22004`), and the
-//! table's trigger writes the audit rows. The transaction carries this
-//! process's identity for the audit trail's `actor`, as the group verbs'
-//! (`team_group::begin_audited`).
+//! table's trigger writes the audit rows: one `platform.role_agent_attached`
+//! per row an attach writes (copies included) and one
+//! `platform.role_agent_detached` per row a detach ends, each naming the
+//! writing login (`attached_by` / `detached_by`) and the reason. The
+//! transaction also carries this process's identity in
+//! `epigraph.operator_actor`, as the group verbs' does
+//! (`team_group::begin_audited`); 166's audit trigger does not read it.
 
 use anyhow::bail;
 use chrono::{DateTime, Utc};

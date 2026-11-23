@@ -206,6 +206,15 @@ async fn events(pool: &PgPool, event_type: &str) -> i64 {
         .expect("events")
 }
 
+/// The `details` of every `security_events` row of `event_type`.
+async fn event_details(pool: &PgPool, event_type: &str) -> Vec<serde_json::Value> {
+    sqlx::query_scalar("SELECT details FROM security_events WHERE event_type = $1 ORDER BY id")
+        .bind(event_type)
+        .fetch_all(pool)
+        .await
+        .expect("event details")
+}
+
 fn has_line(r: &Run, prefix: &str, needles: &[String]) -> bool {
     r.lines_starting(prefix)
         .iter()
@@ -356,6 +365,7 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
     // ---- attach, apply ----
     let applied = attach(true);
     let rows_after_apply = role_rows(&pool).await;
+    let attached_events = event_details(&pool, "platform.role_agent_attached").await;
     let derived_after_attach = (
         derived_in(&pool, p, group).await,
         derived_in(&pool, a, group).await,
@@ -364,9 +374,11 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
     // ---- detach A, dry run ----
     let ddry = detach(false);
     let rows_after_ddry = role_rows(&pool).await;
+    let detached_after_ddry = events(&pool, "platform.role_agent_detached").await;
     // ---- detach A, apply; then again ----
     let dapplied = detach(true);
     let rows_after_detach = role_rows(&pool).await;
+    let detached_events = event_details(&pool, "platform.role_agent_detached").await;
     let derived_after_detach = (
         derived_in(&pool, p, group).await,
         derived_in(&pool, a, group).await,
@@ -426,6 +438,25 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
     );
     assert!(!applied.stdout.contains("WOULD BE"), "{}", applied.show());
     assert_eq!(rows_after_apply, (3, 3), "P's row and two copies");
+    // The audit trail (166's trigger): one attached event per row, the row
+    // made by name carrying the operator's reason and the writing login.
+    assert_eq!(
+        attached_events.len(),
+        3,
+        "one audit row per attachment: {attached_events:?}"
+    );
+    let by_name: Vec<&serde_json::Value> = attached_events
+        .iter()
+        .filter(|d| d["inherited_from"].is_null())
+        .collect();
+    assert_eq!(by_name.len(), 1, "{attached_events:?}");
+    assert_eq!(by_name[0]["agent"], ps.as_str(), "{}", by_name[0]);
+    assert_eq!(
+        by_name[0]["reason"], "role-attach cli test",
+        "{}",
+        by_name[0]
+    );
+    assert_eq!(by_name[0]["attached_by"], login.as_str(), "{}", by_name[0]);
     assert_eq!(
         derived_after_attach,
         (
@@ -467,10 +498,22 @@ async fn role_attach_follows_the_chained_lineage_and_role_detach_cuts_it_off(poo
         ddry.show()
     );
     assert_eq!(rows_after_ddry, (3, 3), "a dry-run detach changes no row");
+    assert_eq!(
+        detached_after_ddry, 0,
+        "a dry-run detach writes no audit row"
+    );
 
     // The applied detach.
     assert_eq!(dapplied.code, 0, "{}", dapplied.show());
     assert_eq!(rows_after_detach, (3, 2), "A's row only is detached");
+    assert_eq!(
+        detached_events.len(),
+        1,
+        "one audit row for the one detached row: {detached_events:?}"
+    );
+    assert_eq!(detached_events[0]["agent"], as_.as_str());
+    assert_eq!(detached_events[0]["detach_reason"], "role-detach cli test");
+    assert_eq!(detached_events[0]["detached_by"], login.as_str());
     assert_eq!(
         derived_after_detach,
         (vec!["writer".to_string()], vec![], vec![]),
