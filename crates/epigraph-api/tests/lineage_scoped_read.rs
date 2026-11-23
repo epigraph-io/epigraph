@@ -131,6 +131,7 @@ async fn split_state(pool: &PgPool) -> AppState {
 fn params(direction: Option<LineageDirection>) -> LineageParams {
     LineageParams {
         max_depth: None,
+        max_nodes: None,
         direction, // `None` defaults to Ancestors
         include_evidence: None,
         include_traces: None,
@@ -625,6 +626,7 @@ async fn walk_to_depth(
         Path(root),
         Query(LineageParams {
             max_depth: Some(max_depth),
+            max_nodes: None,
             direction: Some(direction),
             include_evidence: None,
             include_traces: None,
@@ -700,4 +702,321 @@ async fn the_lineage_truncated_flag_is_exact_at_max_depth(pool: PgPool) {
         "both: from c0 the descendants run past max_depth, so the merged response is cut \
          even though the ancestor side is empty"
     );
+}
+
+/// One lineage call with an explicit `max_nodes` (default depth).
+async fn walk_capped(
+    pool: &PgPool,
+    agent: Uuid,
+    root: Uuid,
+    direction: LineageDirection,
+    max_nodes: u32,
+) -> LineageResponse {
+    let viewer = epigraph_db::visibility::Viewer::resolve(pool, agent)
+        .await
+        .expect("resolve");
+    get_lineage(
+        ViewerExtractor(viewer),
+        State(split_state(pool).await),
+        Path(root),
+        Query(LineageParams {
+            max_depth: None,
+            max_nodes: Some(max_nodes),
+            direction: Some(direction),
+            include_evidence: None,
+            include_traces: None,
+        }),
+    )
+    .await
+    .expect("the viewer can read every claim in the fixture, so the walk must serve")
+    .0
+}
+
+/// Every edge served joins two served claims: a cap that trims `nodes` but
+/// not `edges` would hand the client edges into claims it never received.
+fn assert_edges_closed(r: &LineageResponse, what: &str) {
+    let ids: std::collections::HashSet<Uuid> = node_ids(r).into_iter().collect();
+    for e in &r.edges {
+        assert!(
+            ids.contains(&e.source_id) && ids.contains(&e.target_id),
+            "{what}: edge {} -> {} names a claim outside `nodes`",
+            e.source_id,
+            e.target_id
+        );
+    }
+}
+
+/// THE NODE CAP (backlog 04007084): a lineage WIDER than `max_nodes` comes
+/// back with at most `max_nodes` claims, the root among them, and says exactly
+/// how many readable claims it left out. A lineage exactly as wide as the cap
+/// is complete and says so; the boundary is what proves the count exact rather
+/// than "at least one".
+///
+/// Before the fix the route passed `max_nodes: None` to the ancestor walk and
+/// the descendant walk had no cap at all, so `nodes` grew with the fan-out at
+/// any depth and nothing in the response could report a cut.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_node_cap_cuts_a_wide_lineage_and_counts_exactly_what_it_left_out(pool: PgPool) {
+    const FAN: usize = 6; // parents AND children of the root, all readable
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap").await;
+    let (other, _other_group) = seed_agent_with_group(&pool, "lineage-cap-other").await;
+    let root = seed_fan(&pool, agent, group, other, FAN).await;
+
+    for direction in [LineageDirection::Ancestors, LineageDirection::Descendants] {
+        // CALIBRATION: uncapped (default cap), the whole side comes back.
+        let full = walk_in(
+            &pool,
+            split_state(&pool).await,
+            agent,
+            root,
+            Some(direction),
+        )
+        .await;
+        assert_eq!(
+            full.nodes.len(),
+            1 + FAN,
+            "{direction:?}: {:?}",
+            node_ids(&full)
+        );
+        assert!(!full.truncated && full.nodes_omitted == 0, "{direction:?}");
+
+        let cap = 4u32;
+        let cut = walk_capped(&pool, agent, root, direction, cap).await;
+        assert_eq!(cut.max_nodes, cap, "{direction:?}: the cap is echoed");
+        assert_eq!(
+            cut.nodes.len(),
+            cap as usize,
+            "{direction:?}: nothing beyond the cap may be returned; got {:?}",
+            node_ids(&cut)
+        );
+        assert!(
+            node_ids(&cut).contains(&root),
+            "{direction:?}: the root is always served"
+        );
+        assert!(
+            cut.truncated,
+            "{direction:?}: a capped response must say it was cut"
+        );
+        assert!(
+            !cut.truncated_by_depth,
+            "{direction:?}: the fan is one layer deep, so the cut is the cap's alone"
+        );
+        assert_eq!(
+            cut.nodes_omitted as usize,
+            1 + FAN - cap as usize,
+            "{direction:?}: the count of left-out claims must be exact"
+        );
+        assert_edges_closed(&cut, &format!("{direction:?}"));
+
+        // Exactly at the cap: complete.
+        let exact = walk_capped(&pool, agent, root, direction, (1 + FAN) as u32).await;
+        assert_eq!(exact.nodes.len(), 1 + FAN, "{direction:?}");
+        assert!(
+            !exact.truncated && exact.nodes_omitted == 0,
+            "{direction:?}: a lineage exactly as wide as the cap is complete"
+        );
+    }
+
+    // `both` shares one budget: 7 ancestors-side claims (root included) fit a
+    // cap of 10, leaving the descendant walk 10 - 7 + 1 = 4 (its root is the
+    // shared one), so 3 of the 6 children are served and 3 are counted.
+    let both = walk_capped(&pool, agent, root, LineageDirection::Both, 10).await;
+    assert_eq!(both.nodes.len(), 10, "both: {:?}", node_ids(&both));
+    assert!(both.truncated && !both.truncated_by_depth);
+    assert_eq!(both.nodes_omitted, 3);
+    assert_edges_closed(&both, "both");
+
+    // A cap of 0 is clamped to 1: the root, flagged as cut, never served as a
+    // complete lineage.
+    let zero = walk_capped(&pool, agent, root, LineageDirection::Ancestors, 0).await;
+    assert_eq!(node_ids(&zero), vec![root]);
+    assert_eq!(zero.max_nodes, 1);
+    assert!(zero.truncated);
+    assert_eq!(zero.nodes_omitted as usize, FAN);
+}
+
+/// `both`: a claim BOTH walks reach, cut by the descendant walk but served by
+/// the ancestor walk, is in `nodes` and must not be counted as omitted.
+///
+/// The two walks follow different edges, so such a claim needs no special
+/// graph: `x supports root` makes it an ancestor, `root supports x` a
+/// descendant. With the cap exactly the ancestor side's size, the descendant
+/// walk keeps only the root and cuts `x` and every child; summing the two
+/// walks' cuts would report one claim too many.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_both_arm_counts_a_claim_one_walk_cut_and_the_other_served_once(pool: PgPool) {
+    const PARENTS: usize = 2;
+    const CHILDREN: usize = 3;
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap-overlap").await;
+    let root = seed_group_claim(&pool, agent, group, "overlap root").await;
+    let x = seed_group_claim(&pool, agent, group, "both an ancestor and a descendant").await;
+    seed_edge(&pool, x, root).await;
+    seed_edge(&pool, root, x).await;
+    for i in 0..PARENTS {
+        let p = seed_group_claim(&pool, agent, group, &format!("overlap parent {i}")).await;
+        seed_edge(&pool, p, root).await;
+    }
+    for i in 0..CHILDREN {
+        let c = seed_group_claim(&pool, agent, group, &format!("overlap child {i}")).await;
+        seed_edge(&pool, root, c).await;
+    }
+
+    // Ancestor side: root, x and the parents.
+    let cap = (2 + PARENTS) as u32;
+    let up = walk_capped(&pool, agent, root, LineageDirection::Ancestors, cap).await;
+    assert!(
+        !up.truncated && node_ids(&up).contains(&x),
+        "CALIBRATION: the ancestor side fits the cap exactly and serves x; got {:?}",
+        node_ids(&up)
+    );
+
+    let both = walk_capped(&pool, agent, root, LineageDirection::Both, cap).await;
+    assert_eq!(
+        both.nodes.len(),
+        cap as usize,
+        "both: {:?}",
+        node_ids(&both)
+    );
+    assert!(
+        node_ids(&both).contains(&x),
+        "x is served by the ancestor walk"
+    );
+    assert!(both.truncated, "the descendant walk was cut");
+    assert_eq!(
+        both.nodes_omitted as usize, CHILDREN,
+        "only the children are missing from `nodes`; x was cut by one walk but \
+         served by the other and must not be counted"
+    );
+    assert_edges_closed(&both, "both");
+}
+
+/// The descendant cap runs before the edges are read: a back-edge from a cut
+/// claim into a kept one is not served (T104 review finding 1).
+///
+/// The fan fixtures above cannot tell the order apart for the DESCENDANT walk:
+/// a cut child's only parent is the kept root, and its edge hangs off the cut
+/// child, so no served claim names it. Here `root -> a -> c` and `root -> k`
+/// put `c` at depth 2 and `k` at depth 1, and `c -> k` makes `k` name `c` as a
+/// parent. A cap of 3 keeps root, a and k and cuts c, so the edge `c -> k`
+/// must not be served.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_descendant_cap_does_not_serve_a_back_edge_from_a_cut_claim(pool: PgPool) {
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap-back-edge").await;
+    let root = seed_group_claim(&pool, agent, group, "back-edge root").await;
+    let a = seed_group_claim(&pool, agent, group, "back-edge a").await;
+    let k = seed_group_claim(&pool, agent, group, "back-edge k").await;
+    let c = seed_group_claim(&pool, agent, group, "back-edge c").await;
+    seed_edge(&pool, root, a).await;
+    seed_edge(&pool, a, c).await;
+    seed_edge(&pool, root, k).await;
+    seed_edge(&pool, c, k).await; // the back-edge into a kept claim
+
+    // CALIBRATION: with room for all four, c is served and so is c -> k.
+    let full = walk_capped(&pool, agent, root, LineageDirection::Descendants, 4).await;
+    assert_eq!(full.nodes.len(), 4, "{:?}", node_ids(&full));
+    assert!(
+        full.edges
+            .iter()
+            .any(|e| e.source_id == c && e.target_id == k),
+        "CALIBRATION: the back-edge c -> k must be served uncapped, or the capped \
+         assertion below proves nothing"
+    );
+
+    let cut = walk_capped(&pool, agent, root, LineageDirection::Descendants, 3).await;
+    let mut ids = node_ids(&cut);
+    ids.sort();
+    let mut want = vec![root, a, k];
+    want.sort();
+    assert_eq!(ids, want, "the cap keeps the root and the depth-1 layer");
+    assert!(cut.truncated && !cut.truncated_by_depth);
+    assert_eq!(cut.nodes_omitted, 1);
+    assert_edges_closed(&cut, "descendants with a back-edge from a cut claim");
+}
+
+/// `nodes_omitted` counts only claims the viewer can READ (T104 review
+/// finding 2). The count is a new disclosure surface: a cap applied before the
+/// visibility filter, or a count taken from an unfiltered walk, would tell the
+/// viewer how many claims it cannot see hang off the root.
+///
+/// The root is the viewer's; `READABLE` claims on each side are readable to
+/// it, and `HIDDEN` more are group-private to a stranger's group, reachable
+/// over PUBLIC edges so that only the claim predicate excludes them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_node_cap_counts_only_claims_the_viewer_can_read(pool: PgPool) {
+    const READABLE: usize = 4;
+    const HIDDEN: usize = 3;
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "lineage-cap-theirs").await;
+    let world = world_group(&pool).await;
+
+    let root = seed_group_claim(&pool, agent, group, "count root").await;
+    let mut hidden = Vec::new();
+    for i in 0..READABLE {
+        let p = seed_public_claim(&pool, stranger, &format!("readable parent {i}")).await;
+        seed_edge(&pool, p, root).await;
+        let c = seed_group_claim(&pool, agent, group, &format!("readable child {i}")).await;
+        seed_edge(&pool, root, c).await;
+    }
+    for i in 0..HIDDEN {
+        let p = seed_group_claim(
+            &pool,
+            stranger,
+            stranger_group,
+            &format!("hidden parent {i}"),
+        )
+        .await;
+        seed_edge_owned_by(&pool, p, root, "public", world).await;
+        let c = seed_group_claim(
+            &pool,
+            stranger,
+            stranger_group,
+            &format!("hidden child {i}"),
+        )
+        .await;
+        seed_edge_owned_by(&pool, root, c, "public", world).await;
+        hidden.extend([p, c]);
+    }
+
+    // CALIBRATION: the hidden claims are really in the graph, one edge each.
+    let edges_at_root: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("count edges");
+    assert_eq!(edges_at_root as usize, 2 * (READABLE + HIDDEN));
+
+    for direction in [LineageDirection::Ancestors, LineageDirection::Descendants] {
+        // CALIBRATION: uncapped, exactly the readable side is served.
+        let full = walk_capped(&pool, agent, root, direction, 100).await;
+        assert_eq!(
+            full.nodes.len(),
+            1 + READABLE,
+            "{direction:?}: {:?}",
+            node_ids(&full)
+        );
+        assert!(!full.truncated && full.nodes_omitted == 0, "{direction:?}");
+
+        let cap = 3u32;
+        let cut = walk_capped(&pool, agent, root, direction, cap).await;
+        assert_eq!(cut.nodes.len(), cap as usize, "{direction:?}");
+        assert!(
+            node_ids(&cut).iter().all(|id| !hidden.contains(id)),
+            "{direction:?}: a hidden claim was served"
+        );
+        assert!(cut.truncated, "{direction:?}");
+        assert_eq!(
+            cut.nodes_omitted as usize,
+            1 + READABLE - cap as usize,
+            "{direction:?}: the count must cover readable claims only, not the {HIDDEN} \
+             the viewer cannot see"
+        );
+    }
+
+    // `both`: root + 4 parents fill a cap of 5; the descendant walk keeps only
+    // the shared root, so the 4 readable children are counted and nothing else.
+    let both = walk_capped(&pool, agent, root, LineageDirection::Both, 5).await;
+    assert_eq!(both.nodes.len(), 5, "both: {:?}", node_ids(&both));
+    assert!(both.truncated);
+    assert_eq!(both.nodes_omitted as usize, READABLE);
 }

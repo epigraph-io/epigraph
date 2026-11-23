@@ -36,6 +36,7 @@ use epigraph_db::{
     PgPool, ReasoningTraceRepository,
 };
 use helpers::{make_agent, make_claim, make_evidence, make_trace};
+use std::collections::HashSet;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -1161,6 +1162,215 @@ async fn test_lineage_max_nodes_larger_than_result_is_noop(pool: PgPool) {
     );
 }
 
+/// Test: `omitted_by_node_cap` names EXACTLY the claims the cap cut, and a
+/// lineage that fits the cap exactly is reported complete.
+///
+/// **Evidence**: backlog 04007084. A REST node cap needs an exact signal, or a
+/// capped response silently hides part of the lineage; `truncated` alone says
+/// "something is missing" but not what or how much.
+/// **Reasoning**: the walk returns every visible claim within `max_depth`
+/// before the cap trims in memory, so the omitted set is the difference and is
+/// exact. The boundary (cap == size) is what tells exact from "at least one".
+/// A claim past `max_depth` is the depth half's business and must not be
+/// counted as cut by the cap.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_lineage_max_nodes_reports_exactly_the_omitted_claims(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // chain[0] -> chain[1] -> chain[2] -> chain[3] -> chain[4] (leaf)
+    let chain = create_claim_chain(&pool, 5).await;
+    let leaf = chain[4];
+    let set = |v: &[Uuid]| v.iter().copied().collect::<HashSet<Uuid>>();
+
+    for (cap, cut) in [(3usize, &chain[..2]), (4, &chain[..1]), (1, &chain[..4])] {
+        let l = LineageRepository::get_lineage(&pool, &viewer, leaf, None, Some(cap))
+            .await
+            .expect("capped walk");
+        assert_eq!(l.claims.len(), cap, "cap {cap}");
+        assert_eq!(
+            set(&l.omitted_by_node_cap),
+            set(cut),
+            "cap {cap}: the omitted ids must be exactly the furthest ancestors cut"
+        );
+        assert_eq!(
+            l.omitted_by_node_cap.len(),
+            cut.len(),
+            "cap {cap}: no duplicates"
+        );
+        assert!(l.truncated && !l.truncated_by_depth, "cap {cap}");
+    }
+
+    // Exactly at the cap: complete, nothing omitted.
+    let exact = LineageRepository::get_lineage(&pool, &viewer, leaf, None, Some(5))
+        .await
+        .expect("walk at exactly the cap");
+    assert_eq!(exact.claims.len(), 5);
+    assert!(exact.omitted_by_node_cap.is_empty());
+    assert!(
+        !exact.truncated,
+        "a lineage exactly as large as the cap is complete and must not be flagged"
+    );
+
+    // Depth AND cap: max_depth 3 keeps chain[1..=4] in reach (chain[0] lies
+    // past it); a cap of 2 then cuts chain[1] and chain[2]. chain[0] is the
+    // depth bound's cut, not the cap's.
+    let both = LineageRepository::get_lineage(&pool, &viewer, leaf, Some(3), Some(2))
+        .await
+        .expect("depth and cap");
+    assert!(both.truncated_by_depth, "chain[0] lies past max_depth");
+    assert_eq!(set(&both.omitted_by_node_cap), set(&chain[1..3]));
+    assert!(both.truncated);
+}
+
+/// Test: the DESCENDANT walk takes a `max_nodes` cap, keeping the root and its
+/// nearest descendants, and names what it cut.
+///
+/// **Evidence**: backlog 04007084. `get_descendants_conn` had no node cap, so
+/// `GET /lineage/:id?direction=descendants` could not be bounded at all.
+/// **Reasoning**: the cap keeps the claims NEAREST the root by depth; one that
+/// kept the deepest would drop the root itself, and its `topological_order` is
+/// root-first (the opposite of `get_lineage`'s), so the root leads it. Every
+/// kept claim's `parent_ids` must resolve inside `claims`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_descendants_max_nodes_keeps_root_and_nearest_descendants(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    // chain[0] (root) -> chain[1] -> chain[2] -> chain[3] -> chain[4]
+    let chain = create_claim_chain(&pool, 5).await;
+    let root = chain[0];
+
+    let full = LineageRepository::get_descendants(&pool, &viewer, root, None, None)
+        .await
+        .expect("uncapped descendant walk");
+    assert_eq!(full.claims.len(), 5, "CALIBRATION: the chain is 5 claims");
+    assert!(!full.truncated && full.omitted_by_node_cap.is_empty());
+
+    let capped = LineageRepository::get_descendants(&pool, &viewer, root, None, Some(3))
+        .await
+        .expect("capped descendant walk");
+    assert_eq!(capped.claims.len(), 3);
+    for kept in &chain[..3] {
+        assert!(capped.claims.contains_key(kept), "nearest kept: {kept}");
+    }
+    assert_eq!(capped.topological_order[0], root, "root first, and kept");
+    assert_eq!(
+        capped
+            .omitted_by_node_cap
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>(),
+        chain[3..].iter().copied().collect::<HashSet<_>>(),
+        "the two furthest descendants are the ones cut"
+    );
+    assert!(capped.truncated && !capped.truncated_by_depth);
+    for c in capped.claims.values() {
+        for p in &c.parent_ids {
+            assert!(
+                capped.claims.contains_key(p),
+                "claim {} names parent {p} outside the kept set",
+                c.id
+            );
+        }
+    }
+
+    let exact = LineageRepository::get_descendants(&pool, &viewer, root, None, Some(5))
+        .await
+        .expect("descendant walk at exactly the cap");
+    assert!(!exact.truncated && exact.omitted_by_node_cap.is_empty());
+}
+
+/// Test: the descendant cap runs BEFORE the edges and evidence statements, so
+/// nothing a kept claim carries points at a claim the cap cut.
+///
+/// **Evidence**: T104 review finding 1. Every other capped fixture is a chain
+/// or a one-layer fan, where a kept descendant's parents are all kept, so a
+/// cap moved below the follow-up statements (with `claims` still built from
+/// the kept rows) left every test green while a kept claim named a cut parent
+/// and the cut claims' evidence was fetched and served.
+/// **Reasoning**: a back-edge from a cut claim into a kept one is the shape
+/// that tells the two orders apart. `root -> a -> c` puts `c` at depth 2;
+/// `root -> k` puts `k` at depth 1; `c -> k` is the back-edge (it leaves `k`
+/// at depth 1, its shortest). A cap of 3 keeps root, a and k and cuts c. `c`
+/// carries evidence, which must not be served either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn test_descendants_max_nodes_cut_claim_does_not_leak_through_a_back_edge(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let agent = AgentRepository::create(&pool, &make_agent(None))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for name in ["root", "a", "k", "c"] {
+        let claim = make_claim(agent.id, &format!("back-edge fixture {name}"), 0.6);
+        let claim = ClaimRepository::create(&pool, &claim, epigraph_core::TenancyDecl::Inherited)
+            .await
+            .unwrap();
+        ids.push(claim.id);
+    }
+    let [root, a, k, c] = [ids[0], ids[1], ids[2], ids[3]].map(|id| id.as_uuid());
+    create_claim_edge(&pool, root, a, "supports").await;
+    create_claim_edge(&pool, a, c, "supports").await;
+    create_claim_edge(&pool, root, k, "supports").await;
+    create_claim_edge(&pool, c, k, "supports").await; // the back-edge
+
+    let ev_k = make_evidence(agent.id, ids[2], "evidence on the kept claim k");
+    let ev_k = EvidenceRepository::create(&pool, &ev_k, epigraph_db::EvidenceEdge::supports(None))
+        .await
+        .unwrap()
+        .id
+        .as_uuid();
+    let ev_c = make_evidence(agent.id, ids[3], "evidence on the cut claim c");
+    let ev_c = EvidenceRepository::create(&pool, &ev_c, epigraph_db::EvidenceEdge::supports(None))
+        .await
+        .unwrap()
+        .id
+        .as_uuid();
+
+    // CALIBRATION: uncapped, c is a depth-2 descendant and k names it as a
+    // parent, so the back-edge is really in the walk.
+    let full = LineageRepository::get_descendants(&pool, &viewer, root, None, None)
+        .await
+        .expect("uncapped descendant walk");
+    assert_eq!(full.claims.len(), 4);
+    assert_eq!(full.claims[&c].depth, 2);
+    assert_eq!(full.claims[&k].depth, 1);
+    assert!(
+        full.claims[&k].parent_ids.contains(&c),
+        "CALIBRATION: k must name c as a parent uncapped, or the capped \
+         assertions below prove nothing; got {:?}",
+        full.claims[&k].parent_ids
+    );
+    assert!(full.evidence.contains_key(&ev_c));
+
+    let capped = LineageRepository::get_descendants(&pool, &viewer, root, None, Some(3))
+        .await
+        .expect("capped descendant walk");
+    assert_eq!(
+        capped.claims.keys().copied().collect::<HashSet<_>>(),
+        HashSet::from([root, a, k])
+    );
+    assert_eq!(capped.omitted_by_node_cap, vec![c]);
+    assert!(capped.truncated && !capped.truncated_by_depth);
+    for kept in capped.claims.values() {
+        for p in &kept.parent_ids {
+            assert!(
+                capped.claims.contains_key(p),
+                "claim {} names parent {p}, which the cap cut",
+                kept.id
+            );
+        }
+    }
+    assert_eq!(capped.claims[&k].parent_ids, vec![root]);
+    assert!(
+        capped.evidence.contains_key(&ev_k),
+        "CALIBRATION: a kept claim's evidence is served"
+    );
+    assert!(
+        !capped.evidence.contains_key(&ev_c),
+        "the cut claim's evidence must not be fetched and served"
+    );
+    for ev in capped.evidence.values() {
+        assert!(capped.claims.contains_key(&ev.claim_id));
+    }
+}
+
 /// Test: depth-based truncation sets `truncated = true` even without `max_nodes`
 ///
 /// **Evidence**: Reusing the existing max_depth=2 scenario over a 5-claim
@@ -1243,7 +1453,7 @@ async fn lineage_ending_exactly_at_max_depth_is_not_truncated(pool: PgPool) {
          not be flagged truncated"
     );
 
-    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT))
+    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT), None)
         .await
         .expect("descendant walk");
     assert_eq!(
@@ -1286,7 +1496,7 @@ async fn lineage_with_a_claim_past_max_depth_is_truncated_and_omits_it(pool: PgP
     assert!(up.claims.values().all(|c| c.depth <= CUT));
     assert_eq!(up.topological_order.len(), CUT as usize + 1);
 
-    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT))
+    let down = LineageRepository::get_descendants(&pool, &viewer, chain[0], Some(CUT), None)
         .await
         .expect("descendant walk");
     assert!(
@@ -1353,10 +1563,10 @@ async fn lineage_truncation_follows_the_viewer(pool: PgPool) {
     );
     assert!(!up_member.claims.contains_key(&above));
 
-    let down_public = LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT))
+    let down_public = LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT), None)
         .await
         .expect("descendant walk, public");
-    let down_member = LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT))
+    let down_member = LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT), None)
         .await
         .expect("descendant walk, member");
     assert!(
@@ -1411,10 +1621,10 @@ async fn lineage_truncation_follows_edge_visibility(pool: PgPool) {
         ),
         (
             "get_descendants",
-            LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT))
+            LineageRepository::get_descendants(&pool, &public, chain[0], Some(CUT), None)
                 .await
                 .expect("descendant walk, public"),
-            LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT))
+            LineageRepository::get_descendants(&pool, &member, chain[0], Some(CUT), None)
                 .await
                 .expect("descendant walk, member"),
             below,
@@ -1726,7 +1936,7 @@ async fn lineage_walks_finish_on_a_dense_dag(pool: PgPool) {
     assert_eq!(ids.last(), Some(&bottom));
 
     // ---- descendants of `top` ----
-    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None)
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None, None)
         .await
         .expect("get_descendants over the lattice must finish inside the statement timeout");
     assert_eq!(down.claims.len(), total);
@@ -1743,9 +1953,10 @@ async fn lineage_walks_finish_on_a_dense_dag(pool: PgPool) {
     }
     assert_eq!(down.claims[&bottom].depth, d + 1);
     assert!(!down.truncated);
-    let down_short = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d))
-        .await
-        .expect("descendants one layer short");
+    let down_short =
+        LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d), None)
+            .await
+            .expect("descendants one layer short");
     assert!(down_short.truncated, "bottom lies past max_depth");
     assert_eq!(down_short.claims.len(), total - 1);
     assert!(!down_short.claims.contains_key(&bottom));
@@ -1805,7 +2016,7 @@ async fn lineage_shortcut_keeps_the_shortest_depth_on_a_dense_dag(pool: PgPool) 
     );
     assert_eq!(up.topological_order.last(), Some(&bottom));
 
-    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d))
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, Some(d), None)
         .await
         .expect("descendants with a shortcut");
     assert_eq!(down.claims.len(), total);
@@ -1972,9 +2183,10 @@ async fn lineage_walks_end_on_a_cycle_at_exact_depths(pool: PgPool) {
     assert_eq!(ids[total - 4..], [root, kids[0], tail, end]);
 
     // ---- descendants of `root`: kids 1, tail 2, end 3 ----
-    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED))
-        .await
-        .expect("get_descendants on a cycle must end inside the statement timeout");
+    let down =
+        LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED), None)
+            .await
+            .expect("get_descendants on a cycle must end inside the statement timeout");
     assert_eq!(down.claims.len(), total);
     assert_eq!(down.claims[&root].depth, 0);
     assert!(kids.iter().all(|k| down.claims[k].depth == 1));
@@ -1984,9 +2196,10 @@ async fn lineage_walks_end_on_a_cycle_at_exact_depths(pool: PgPool) {
     assert!(!down.truncated);
     assert_unique(&down.topological_order, "descendant topological order");
 
-    let down_short = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(2))
-        .await
-        .expect("descendants one layer short");
+    let down_short =
+        LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(2), None)
+            .await
+            .expect("descendants one layer short");
     assert!(down_short.truncated, "end lies past max_depth");
     assert_eq!(down_short.claims.len(), total - 1);
     assert!(!down_short.claims.contains_key(&end));
@@ -2062,7 +2275,7 @@ async fn depth_and_cycle_check_finish_on_a_dense_dag(pool: PgPool) {
         .await
         .expect("get_lineage over the lattice");
     assert!(!up.cycle_detected, "a dense DAG has no cycle");
-    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None)
+    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, top, None, None)
         .await
         .expect("get_descendants over the lattice");
     assert!(!down.cycle_detected, "a dense DAG has no cycle");
@@ -2186,16 +2399,18 @@ async fn cycle_detected_is_set_on_the_hub_cycle(pool: PgPool) {
     assert_eq!(short.claims.len(), 3);
     assert!(!short.cycle_detected, "no cycle among end, tail and kid_0");
 
-    let down = LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED))
-        .await
-        .expect("get_descendants on the hub cycle");
+    let down =
+        LineageRepository::get_descendants_conn(&mut conn, &viewer, root, Some(UNBOUNDED), None)
+            .await
+            .expect("get_descendants on the hub cycle");
     assert!(
         down.cycle_detected,
         "every kid is on a 2-cycle through root"
     );
-    let below = LineageRepository::get_descendants_conn(&mut conn, &viewer, tail, Some(UNBOUNDED))
-        .await
-        .expect("get_descendants below the cycle");
+    let below =
+        LineageRepository::get_descendants_conn(&mut conn, &viewer, tail, Some(UNBOUNDED), None)
+            .await
+            .expect("get_descendants below the cycle");
     assert!(!below.cycle_detected, "tail -> end is a chain");
 }
 
