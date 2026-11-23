@@ -139,6 +139,13 @@ WALKERS = {
     # README.md and docs/intro/*.md. A link TARGET elsewhere that is deleted or
     # renamed is only caught by a full run (main, staging, `ci:full`).
     "crates/epigraph-core/tests/doc_links.rs": ("README.md", "docs/intro/*"),
+    # Every `#[ignore]` under a member's src/ or tests/. Not `crates/*/tests/*`:
+    # that would put source-scans on every test-only change. A new `#[ignore]`
+    # in a test file is caught by a full run (main, staging, `ci:full`).
+    "crates/epigraph-core/tests/ignored_tests_have_a_lane.rs": (
+        "crates/*/src/*",
+        "tests/engine-integration/*",
+    ),
     "crates/epigraph-core/tests/workspace_layout.rs": ("crates/*/Cargo.toml",),
     "crates/epigraph-crypto/tests/entity_signing_sites.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/belief_lint/mod.rs": ("crates/*/src/*", "scripts/*"),
