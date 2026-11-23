@@ -56,7 +56,13 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "crates/epigraph-cli/src/bin/ingest_git.rs",
-        "build_packet",
+        "sign_packet",
+        1,
+        PACKET_ENVELOPE,
+    ),
+    (
+        "crates/epigraph-cli/src/bin/ingest_literature.rs",
+        "packet_signature",
         1,
         PACKET_ENVELOPE,
     ),
@@ -256,7 +262,7 @@ mod tests {
     assert!(
         measure().contains_key(&(
             "crates/epigraph-cli/src/bin/ingest_git.rs".to_string(),
-            "build_packet".to_string()
+            "sign_packet".to_string()
         )),
         "the scanner no longer sees a registered site: it has gone vacuous"
     );
