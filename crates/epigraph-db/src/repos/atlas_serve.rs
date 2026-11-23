@@ -22,14 +22,45 @@
 //! its children's `claim_count` (or its claim nodes, when the root is itself a
 //! leaf), and a leaf's claim nodes. A document of another version is skipped,
 //! never misread.
+//!
+//! # The co-owned overlay
+//!
+//! [`AtlasServeRepository::co_owned_leaf_edges`] is the one read here that
+//! adds to a stored document rather than filtering it. A team map never bakes
+//! in an edge co-owned by two teams (row security lets only members of BOTH
+//! read it, and a map draws an edge only when its whole audience may), so a
+//! member of both teams gets, at request time and on top of the leaf they are
+//! served, the co-owned edges of that team's map whose two ends the leaf
+//! already draws. The read takes the viewer's own session as the audience
+//! (row security beneath, the edge splice in the statement), never a map's.
+//!
+//! What it reaches is narrow. The edge trigger (`epigraph_edges_tenancy`)
+//! co-owns an edge when its two ends are private to two different groups, and
+//! no single team map draws both of those ends, so such an edge (an argument
+//! from a claim of team A to a claim of team B) is still drawn nowhere: the
+//! overlay adds edges, never nodes. It reaches only a co-owned edge whose
+//! stored tenancy is narrower than its endpoints' meet, which can arise from
+//! the trigger's no-widening arm (a co-owned edge re-pointed onto two public
+//! claims) or from an operator narrowing that kept a co-owner. Drawing the
+//! cross-team case needs nodes of another team on a leaf, which is open work.
+//!
+//! The read is best-effort and bounded: it runs inside its own nested
+//! transaction under a local `statement_timeout`, which is always rolled
+//! back, so a slow or failing overlay leaves the caller's read usable and the
+//! caller serves the stored leaf.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::errors::DbError;
+use crate::repos::atlas_flow::{EvidenceMassRow, FlowInputs};
+use crate::repos::atlas_leaf::{
+    LeafCounts, LeafEdge, LeafEdgeOrigin, LeafNode, LeafNodeKind, LeafNodeSet,
+};
 use crate::repos::atlas_map::{AtlasHierarchy, AtlasMap};
 use crate::visibility::Viewer;
 
@@ -71,6 +102,60 @@ pub struct ThemeRoot {
 
 /// The serving reads. See the module documentation.
 pub struct AtlasServeRepository;
+
+/// The co-owned edges one viewer reads among a served leaf's nodes, with what
+/// weighing them needs: [`AtlasServeRepository::co_owned_leaf_edges`].
+///
+/// `set` holds one [`LeafEdge`] per stored row (origin
+/// [`LeafEdgeOrigin::Stored`] with that row's id), pointing the way the row
+/// points, sorted by (source, target, relationship), and the nodes they join
+/// (its counts are those of the edges and nodes; it is no built leaf, so
+/// nothing is capped); `inputs` holds each claim-to-claim row's
+/// stored strength and the mass rows behind each evidence-to-claim row that
+/// the viewer's session reads. `epigraph_engine::atlas_flow::weigh_leaf_edges`
+/// turns the pair into contract edges, collapsing rows by (source, target,
+/// lower-cased relationship) as for a stored leaf.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoOwnedLeafEdges {
+    pub set: LeafNodeSet,
+    pub inputs: FlowInputs,
+}
+
+impl CoOwnedLeafEdges {
+    fn empty() -> Self {
+        Self {
+            set: LeafNodeSet {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                capped: Vec::new(),
+                counts: LeafCounts::default(),
+            },
+            inputs: FlowInputs::default(),
+        }
+    }
+}
+
+/// One co-owned edge row as the overlay read selects it.
+type OverlayRow = (
+    Uuid,
+    String,
+    Uuid,
+    String,
+    Uuid,
+    String,
+    Option<serde_json::Value>,
+);
+
+/// One mass row as the overlay read selects it.
+type OverlayMassRow = (
+    Uuid,
+    Uuid,
+    Uuid,
+    Uuid,
+    Option<i32>,
+    Option<i32>,
+    serde_json::Value,
+);
 
 type RunRow = (Uuid, Uuid, String, DateTime<Utc>, bool, Option<String>);
 
@@ -361,5 +446,207 @@ impl AtlasServeRepository {
             q = q.bind(g);
         }
         Ok(q.fetch_all(&mut *conn).await?.into_iter().collect())
+    }
+
+    /// The co-owned edges of team `team`'s map that the viewer's own session
+    /// reads between two of `nodes` (a served leaf's nodes, each with the
+    /// kind the document gives it), with their weighing inputs. See the
+    /// module documentation ("The co-owned overlay") for the narrow subset of
+    /// co-owned edges this can reach.
+    ///
+    /// An edge row is returned when:
+    /// * it is co-owned (`visibility = 'group'`, `co_owner_group_id` set) and
+    ///   `team` is its owner or its co-owner, so it belongs on this team's
+    ///   map. An edge of two other teams is not, even for a viewer in all
+    ///   three;
+    /// * it is in force (`valid_to` unset or in the future, as on every edge
+    ///   read);
+    /// * each end matches a claim or evidence node of `nodes` by id AND kind
+    ///   (`source_type`/`target_type`), so an id is never matched against a
+    ///   row of another kind. Agent nodes are not looked up: an agent edge
+    ///   carries no flow, the trigger never co-owns one (an agent meets as
+    ///   public), and a high-volume agent's edge list is the costly part of
+    ///   such a join;
+    /// * the viewer's session reads it: the edge splice, with row security
+    ///   beneath on the caller's stamped connection, admits a co-owned row
+    ///   only to a session in both of its groups.
+    ///
+    /// The mass rows are read only when an evidence-to-claim row is
+    /// returned: live (`retracted_at` unset) rows keyed by that evidence and
+    /// claim, with the frame's size and the claim's hypothesis index, each of
+    /// the three tables filtered by the MAP's audience as
+    /// `AtlasFlowRepository::read_flow_inputs` filters them (public, or
+    /// `team`'s) and by the viewer's session. So an overlay edge is weighed
+    /// as the nightly weighs a leaf edge of that map, and one edge weighs the
+    /// same for every viewer who gets it. No claim or belief column is read.
+    ///
+    /// Bounded and best-effort: both statements run in a nested transaction
+    /// (a savepoint inside the caller's transaction, a transaction on a
+    /// session-stamped connection) under a local `statement_timeout` of
+    /// `timeout`, and that nested transaction is always rolled back (it only
+    /// reads), which also ends the timeout. An error, a timeout included,
+    /// therefore leaves `conn` usable for the caller's remaining work.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if a statement fails or times out, with `conn`
+    /// rolled back to where it was.
+    pub async fn co_owned_leaf_edges(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        team: Uuid,
+        nodes: &[LeafNode],
+        timeout: Duration,
+    ) -> Result<CoOwnedLeafEdges, DbError> {
+        let nodes: Vec<LeafNode> = nodes
+            .iter()
+            .copied()
+            .filter(|n| n.kind != LeafNodeKind::Agent)
+            .collect();
+        if nodes.len() < 2 {
+            return Ok(CoOwnedLeafEdges::empty());
+        }
+        let mut sp = sqlx::Acquire::begin(&mut *conn).await?;
+        let read = Self::read_co_owned_leaf_edges(&mut sp, viewer, team, &nodes, timeout).await;
+        // Read-only: never kept. The rollback also ends the local timeout.
+        let rolled_back = sp.rollback().await;
+        let out = read?;
+        rolled_back?;
+        Ok(out)
+    }
+
+    /// The statements of [`Self::co_owned_leaf_edges`], on its nested
+    /// transaction: the local `statement_timeout` (a `SET LOCAL`, ended by
+    /// that transaction's rollback), then the edge read and the mass read.
+    /// `nodes` holds no agent and at least two nodes.
+    async fn read_co_owned_leaf_edges(
+        conn: &mut PgConnection,
+        viewer: &Viewer,
+        team: Uuid,
+        nodes: &[LeafNode],
+        timeout: Duration,
+    ) -> Result<CoOwnedLeafEdges, DbError> {
+        let ms = timeout.as_millis().max(1);
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{ms}ms"))
+            .execute(&mut *conn)
+            .await?;
+        let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
+        let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
+        let sql = viewer.splice(
+            "SELECT e.id, e.source_type::text, e.source_id, e.target_type::text, e.target_id, \
+                    e.relationship::text, e.properties -> 'strength' \
+               FROM edges e \
+               JOIN unnest($1::uuid[], $2::text[]) AS s(id, kind) \
+                 ON s.id = e.source_id AND s.kind = e.source_type::text \
+               JOIN unnest($1::uuid[], $2::text[]) AS t(id, kind) \
+                 ON t.id = e.target_id AND t.kind = e.target_type::text \
+              WHERE e.visibility = 'group' \
+                AND e.co_owner_group_id IS NOT NULL \
+                AND (e.owner_group_id = $3 OR e.co_owner_group_id = $3) \
+                AND (e.valid_to IS NULL OR e.valid_to > now()) \
+                /* {EDGE_VISIBILITY:e} */ \
+              ORDER BY e.id",
+            4,
+        );
+        let mut q = sqlx::query_as::<_, OverlayRow>(&sql)
+            .bind(&ids)
+            .bind(&kinds)
+            .bind(team);
+        if let Some(g) = viewer.group_bind() {
+            q = q.bind(g);
+        }
+        let rows = q.fetch_all(&mut *conn).await?;
+
+        let mut out = CoOwnedLeafEdges::empty();
+        let mut joined: BTreeSet<LeafNode> = BTreeSet::new();
+        let mut pairs: BTreeSet<(Uuid, Uuid)> = BTreeSet::new();
+        for (id, st, sid, tt, tid, relationship, strength) in rows {
+            let (Some(sk), Some(tk)) = (
+                LeafNodeKind::from_stored(&st),
+                LeafNodeKind::from_stored(&tt),
+            ) else {
+                continue;
+            };
+            let source = LeafNode { kind: sk, id: sid };
+            let target = LeafNode { kind: tk, id: tid };
+            match (sk, tk) {
+                (LeafNodeKind::Claim, LeafNodeKind::Claim) => {
+                    out.inputs.link_strengths.insert(id, strength);
+                }
+                (LeafNodeKind::Evidence, LeafNodeKind::Claim) => {
+                    pairs.insert((sid, tid));
+                }
+                _ => {}
+            }
+            joined.insert(source);
+            joined.insert(target);
+            out.set.edges.push(LeafEdge {
+                source,
+                target,
+                relationship,
+                origin: LeafEdgeOrigin::Stored { edge_ids: vec![id] },
+            });
+        }
+        out.set.edges.sort_by(|a, b| {
+            (a.source, a.target, &a.relationship).cmp(&(b.source, b.target, &b.relationship))
+        });
+        out.set.nodes = joined.into_iter().collect();
+        let of = |k: LeafNodeKind| out.set.nodes.iter().filter(|n| n.kind == k).count();
+        out.set.counts = LeafCounts {
+            claims: of(LeafNodeKind::Claim),
+            agents: of(LeafNodeKind::Agent),
+            evidence: of(LeafNodeKind::Evidence),
+            nodes: out.set.nodes.len(),
+            edges: out.set.edges.len(),
+            ..LeafCounts::default()
+        };
+
+        if !pairs.is_empty() {
+            let evidence: Vec<Uuid> = pairs.iter().map(|p| p.0).collect();
+            let claims: Vec<Uuid> = pairs.iter().map(|p| p.1).collect();
+            let sql = viewer.splice(
+                "SELECT mf.id, mf.evidence_id, mf.claim_id, mf.frame_id, \
+                        array_length(f.hypotheses, 1), cf.hypothesis_index, mf.masses \
+                   FROM mass_functions mf \
+                   JOIN unnest($1::uuid[], $2::uuid[]) AS p(ev, claim) \
+                     ON p.ev = mf.evidence_id AND p.claim = mf.claim_id \
+                   JOIN frames f ON f.id = mf.frame_id \
+                    AND (f.visibility = 'public' \
+                         OR (f.visibility = 'group' AND f.owner_group_id = $3)) \
+                    /* {VISIBILITY:f} */ \
+                   LEFT JOIN claim_frames cf \
+                     ON cf.claim_id = mf.claim_id AND cf.frame_id = mf.frame_id \
+                    AND (cf.visibility = 'public' \
+                         OR (cf.visibility = 'group' AND cf.owner_group_id = $3)) \
+                    /* {VISIBILITY:cf} */ \
+                  WHERE mf.retracted_at IS NULL \
+                    AND (mf.visibility = 'public' \
+                         OR (mf.visibility = 'group' AND mf.owner_group_id = $3)) \
+                    /* {VISIBILITY:mf} */ \
+                  ORDER BY mf.id",
+                4,
+            );
+            let mut q = sqlx::query_as::<_, OverlayMassRow>(&sql)
+                .bind(&evidence)
+                .bind(&claims)
+                .bind(team);
+            if let Some(g) = viewer.group_bind() {
+                q = q.bind(g);
+            }
+            for (id, ev, claim, frame, count, index, masses) in q.fetch_all(&mut *conn).await? {
+                out.inputs.evidence_masses.push(EvidenceMassRow {
+                    id,
+                    evidence: ev,
+                    claim,
+                    frame,
+                    // As in `AtlasFlowRepository::read_flow_inputs`: 0 reads
+                    // as "no usable frame" downstream.
+                    hypothesis_count: count.unwrap_or(0),
+                    hypothesis_index: index,
+                    masses,
+                });
+            }
+        }
+        Ok(out)
     }
 }
