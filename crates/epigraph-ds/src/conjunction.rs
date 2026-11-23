@@ -331,8 +331,9 @@ pub struct ConjResult {
     pub exact: bool,
     /// Some item gives `~` mass on a query atom. The closed forms
     /// ([`not_all_closed_form`], [`single_negative_sibling`]) are exact only
-    /// when this is `false`; with `~`, only [`conj_belief`]'s own `not_all`
-    /// is exact CDST.
+    /// when this is `false`; with `~`, only the DP's own valuations
+    /// ([`conj_belief`]'s `not_all`, [`conj_belief_with_valuation`]) are
+    /// exact CDST.
     pub open_world: bool,
 }
 
@@ -344,6 +345,13 @@ const LF: u8 = 3;
 const LO: u8 = 4;
 /// Flag bit: the state also carries the `not_all` valuation ¬(∧L).
 const NOT_ALL: u64 = 1 << 63;
+/// Flag bit: the state also carries a negative valuation ¬(∧C) over the
+/// subset C of the query positions in [`Prepared::sub`]
+/// ([`conj_belief_with_valuation`]). Bits 48..62 are free: at most
+/// [`MAX_LEAVES`] positions of 3 bits each.
+const SUB: u64 = 1 << 62;
+/// Either valuation flag.
+const FLAGS: u64 = NOT_ALL | SUB;
 
 const fn code(letter: Letter) -> u8 {
     match letter {
@@ -398,6 +406,9 @@ struct Prepared {
     open: Vec<bool>,
     /// Per item: its focal elements as (mass, [(position, letter code)]).
     items: Vec<Vec<ProjectedFocal>>,
+    /// The positions C of a negative valuation over a subset of the query
+    /// (the [`SUB`] flag); empty when there is none.
+    sub: Vec<usize>,
 }
 
 impl Prepared {
@@ -451,6 +462,7 @@ fn prepare<A: Ord + Clone>(query: &[Lit<A>], items: &[Item<A>]) -> Result<Prepar
         holds,
         open,
         items: Vec::new(),
+        sub: Vec::new(),
     };
     for item in items {
         // Atoms outside the query (for example, leaves the viewer cannot
@@ -480,23 +492,44 @@ fn prepare<A: Ord + Clone>(query: &[Lit<A>], items: &[Item<A>]) -> Result<Prepar
     Ok(prepared)
 }
 
-/// Settle a state carrying `not_all`: drop the flag once a literal is
-/// contradicted, turn it into ⊥ once every literal holds, and resolve it
-/// when exactly one literal is still open (that literal must fail).
+/// Settle a state carrying a valuation flag: drop the flag once one of its
+/// literals is contradicted, turn the state into ⊥ once every one of them
+/// holds, and resolve it when exactly one of them is still open (that literal
+/// must fail). `not_all` ([`NOT_ALL`]) covers every query literal; the
+/// subset valuation ([`SUB`]) covers the literals at [`Prepared::sub`].
 ///
-/// A flagged state never holds O: the valuation starts every open position
-/// at Θ (touched), and Θ ∧ O = ⊥. So an open literal here is `*` or Θ, and
-/// forcing it to fail is always a meet, never a clash.
+/// C ⊆ L, so ¬(∧C) ⊆ ¬(∧L): a state carrying both flags is the same set as
+/// one carrying [`SUB`] alone, and `not_all` is dropped there. A state
+/// therefore carries at most one flag, and resolving it (which may force one
+/// literal) leaves no other flag to re-settle.
+///
+/// A flagged state never holds O on its flag's positions: the valuation
+/// starts each of them at Θ (touched), and Θ ∧ O = ⊥. So an open literal
+/// here is `*` or Θ, and forcing it to fail is always a meet, never a clash.
 fn settle(p: &Prepared, state: u64) -> Option<u64> {
-    if state & NOT_ALL == 0 {
+    let state = if state & SUB != 0 {
+        state & !NOT_ALL
+    } else {
+        state
+    };
+    let flag = state & FLAGS;
+    if flag == 0 {
         return Some(state);
     }
+    let all: Vec<usize>;
+    let positions: &[usize] = if flag == SUB {
+        &p.sub
+    } else {
+        all = (0..p.n()).collect();
+        &all
+    };
     let mut open_pos = None;
     let mut open_count = 0;
-    for (pos, &holds) in p.holds.iter().enumerate() {
+    for &pos in positions {
+        let holds = p.holds[pos];
         let l = get(state, pos);
         if l == Prepared::fails(holds) {
-            return Some(state & !NOT_ALL);
+            return Some(state & !flag);
         }
         if l != holds {
             open_count += 1;
@@ -505,7 +538,7 @@ fn settle(p: &Prepared, state: u64) -> Option<u64> {
     }
     match (open_count, open_pos) {
         (0, _) => None,
-        (1, Some(pos)) => Some(put(state, pos, Prepared::fails(p.holds[pos])) & !NOT_ALL),
+        (1, Some(pos)) => Some(put(state, pos, Prepared::fails(p.holds[pos])) & !flag),
         _ => Some(state),
     }
 }
@@ -517,23 +550,38 @@ struct Joint {
 }
 
 /// Run the DP. `Ok(None)` means the live-state cap was hit.
-fn run_dp(p: &Prepared, not_all: f64) -> Result<Option<Joint>, DsError> {
+///
+/// `not_all` is the mass of ¬(∧L) and `sub` the mass of ¬(∧C) over
+/// [`Prepared::sub`]; each is absent at 0.
+fn run_dp(p: &Prepared, not_all: f64, sub: f64) -> Result<Option<Joint>, DsError> {
     let mut states: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
     let mut k = 0.0;
-    if not_all > 0.0 {
-        // The valuation is one more item over the product frame of L's
-        // atoms: ¬(∧L) with mass m, the frame itself with 1 − m. Both are
-        // closed-world sets on L's atoms, so they meet O as ⊥ (exact CDST).
-        let base = (0..p.n()).fold(0u64, |s, pos| put(s, pos, p.theta(pos)));
-        if not_all < 1.0 {
-            states.insert(base, 1.0 - not_all);
+    states.insert(0, 1.0);
+    // Each valuation is one more item over the product frame of its atoms:
+    // the negation with mass m, the frame itself with 1 − m. Both are
+    // closed-world sets on those atoms (Θ there, `*` elsewhere), so they
+    // meet O as ⊥ (exact CDST). The initial state holds no O, so writing Θ
+    // is a meet that never clashes.
+    let all: Vec<usize> = (0..p.n()).collect();
+    for (m, flag, positions) in [(not_all, NOT_ALL, &all), (sub, SUB, &p.sub)] {
+        if m <= 0.0 {
+            continue;
         }
-        match settle(p, base | NOT_ALL) {
-            Some(s) => *states.entry(s).or_insert(0.0) += not_all,
-            None => k += not_all,
+        let mut next: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+        for (&s, &ms) in &states {
+            let framed = positions.iter().fold(s, |t, &pos| {
+                // No O is written before the items, so this meet never clashes.
+                put(t, pos, meet(get(t, pos), p.theta(pos)).unwrap_or(THETA))
+            });
+            if m < 1.0 {
+                *next.entry(framed).or_insert(0.0) += ms * (1.0 - m);
+            }
+            match settle(p, framed | flag) {
+                Some(t) => *next.entry(t).or_insert(0.0) += ms * m,
+                None => k += ms * m,
+            }
         }
-    } else {
-        states.insert(0, 1.0);
+        states = next;
     }
     for focals in &p.items {
         let mut next: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
@@ -597,14 +645,17 @@ fn evaluate(p: &Prepared, joint: &Joint) -> ConjResult {
     let mut pl_i = vec![0.0; n];
     let mut dis_i = vec![0.0; n];
     for &(s, m) in &joint.states {
-        let not_all = s & NOT_ALL != 0;
+        // A flagged state (`not_all`, or the subset valuation ¬(∧C) with
+        // C ⊆ L) contradicts ∧L: it counts toward Dis, never toward Pl.
+        let not_all = s & FLAGS != 0;
         let (mut all, mut any, mut refuted, mut open_world, mut free) =
             (true, false, false, false, 0i32);
         for pos in 0..n {
             let l = get(s, pos);
             let fails = Prepared::fails(p.holds[pos]);
-            // A settled not_all state has at least two open literals and none
-            // refuted, so each leaf's own marginal reads it as unflagged.
+            // A settled flagged state has at least two open literals among its
+            // flag's positions and none of them refuted, so each leaf's own
+            // marginal reads it as unflagged.
             if l == p.holds[pos] {
                 any = true;
                 bel_i[pos] += m;
@@ -710,7 +761,7 @@ pub fn conj_belief<A: Ord + Clone>(
     check_not_all(not_all)?;
     let p = prepare(query, items)?;
     if p.n() <= MAX_LEAVES {
-        if let Some(joint) = run_dp(&p, not_all)? {
+        if let Some(joint) = run_dp(&p, not_all, 0.0)? {
             return Ok(evaluate(&p, &joint));
         }
     }
@@ -726,7 +777,7 @@ fn independent_fallback<A: Ord + Clone>(
     let mut singles = Vec::with_capacity(query.len());
     for lit in query {
         let p = prepare(std::slice::from_ref(lit), items)?;
-        let joint = run_dp(&p, 0.0)?.ok_or(DsError::ConjunctionOverCap {
+        let joint = run_dp(&p, 0.0, 0.0)?.ok_or(DsError::ConjunctionOverCap {
             leaves: 1,
             states: MAX_STATES,
         })?;
@@ -788,7 +839,7 @@ pub fn joint_bel<A: Ord + Clone>(
     if p.n() > MAX_LEAVES {
         return Err(over);
     }
-    let joint = run_dp(&p, not_all)?.ok_or(over)?;
+    let joint = run_dp(&p, not_all, 0.0)?.ok_or(over)?;
     let total: f64 = joint.states.iter().map(|(_, m)| m).sum();
     let fixed: f64 = joint
         .states
@@ -797,6 +848,59 @@ pub fn joint_bel<A: Ord + Clone>(
         .map(|(_, m)| m)
         .sum();
     Ok(unit(fixed / total))
+}
+
+/// R-DEP with a negative valuation over a SUBSET of the query: mass `m` on
+/// ¬(∧C), where C is the query literals at `positions`, on top of the
+/// optional `not_all` valuation m' on ¬(∧L) of [`conj_belief`].
+///
+/// This is the exact path of [`single_negative_sibling`] (C = the sibling
+/// pair, `m` the edge's strength): the valuation is one more item in the DP,
+/// ¬(∧C) with mass m and the frame of C's atoms with mass 1 − m. Both are
+/// closed-world sets on C's atoms only, so they meet open-world states on
+/// those atoms as conflict (exact CDST, as [`conj_belief`]'s `not_all` does
+/// on all of L) and leave every other atom alone. Unlike the closed form it
+/// is exact with `~` on the query's atoms (`exact: true`), so its sign under
+/// `~` is the one [`conj_belief`] documents for `not_all`: a refutation can
+/// raise Bel and Pl once the annihilated O mass is renormalized away. At
+/// ow = 0 it equals [`single_negative_sibling`] (C a pair) and with C = L
+/// it equals [`conj_belief`] with `not_all` = m (when m' = 0). With m = 0
+/// the valuation is absent.
+///
+/// # Errors
+/// As [`conj_belief`] (`InvalidProbability` covers `m` too), plus
+/// `InvalidConjunction` for an empty, repeated or out-of-range position and
+/// `ConjunctionOverCap` above the exact cap (there is no inexact fallback
+/// here; the caller keeps its own).
+pub fn conj_belief_with_valuation<A: Ord + Clone>(
+    query: &[Lit<A>],
+    items: &[Item<A>],
+    not_all: f64,
+    positions: &[usize],
+    m: f64,
+) -> Result<ConjResult, DsError> {
+    check_not_all(not_all)?;
+    check_not_all(m)?;
+    let distinct: BTreeSet<usize> = positions.iter().copied().collect();
+    if positions.is_empty()
+        || distinct.len() != positions.len()
+        || positions.iter().any(|&i| i >= query.len())
+    {
+        return Err(DsError::InvalidConjunction {
+            reason: "positions must be distinct indices into the query".into(),
+        });
+    }
+    let mut p = prepare(query, items)?;
+    p.sub = distinct.into_iter().collect();
+    let over = DsError::ConjunctionOverCap {
+        leaves: query.len(),
+        states: MAX_STATES,
+    };
+    if p.n() > MAX_LEAVES {
+        return Err(over);
+    }
+    let joint = run_dp(&p, not_all, m)?.ok_or(over)?;
+    Ok(evaluate(&p, &joint))
 }
 
 /// Combine `base` with a negative valuation of mass `m` on ¬(∧C), where C
@@ -892,8 +996,8 @@ pub fn not_all_closed_form(base: &ConjResult, m: f64) -> Result<ConjResult, DsEr
 ///
 /// **Precondition: no `~` on the query's atoms** (ow = 0). When
 /// `base.open_world` is set the value is not exact CDST and is returned with
-/// `exact: false`. This module has no exact path for a valuation over a
-/// subset of the query; a caller that needs one under `~` must add it.
+/// `exact: false`. The exact path, with or without `~`, is
+/// [`conj_belief_with_valuation`] with the pair's two positions.
 ///
 /// # Errors
 /// `InvalidProbability` for `m` or `pair_bel` outside [0, 1];
