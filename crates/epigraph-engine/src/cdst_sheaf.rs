@@ -2121,4 +2121,37 @@ mod tests {
             }
         }
     }
+
+    /// Backlog d3cc7492, end to end: a `supersedes` edge between a believed
+    /// source and a doubted target is lineage, not evidence, so it reports no
+    /// inconsistency even when the edge stores a CDST interval. Before the
+    /// relationship gate, the supporting interval made it a Positive
+    /// restriction with a bel floor of .9·.9 = .81 the target (bel .1) falls
+    /// far short of: a false obstruction for a supersession.
+    #[test]
+    fn supersedes_with_cdst_properties_reports_no_inconsistency() {
+        let s = Uuid::new_v4();
+        let t = Uuid::new_v4();
+        let source = EpistemicInterval::new(0.90, 0.95, 0.0);
+        let target = EpistemicInterval::new(0.10, 0.20, 0.0);
+        for props in [
+            serde_json::json!({ "cdst_bel": 0.9, "cdst_pl": 0.95 }),
+            serde_json::json!({ "cdst_bel": 0.05, "cdst_pl": 0.2 }),
+        ] {
+            let obs = compute_cdst_edge_inconsistency_with_properties(
+                s,
+                t,
+                source,
+                target,
+                "supersedes",
+                &props,
+                &sci(),
+            );
+            assert!(
+                obs.interval_inconsistency.abs() < 1e-12,
+                "supersedes with {props} scored {}",
+                obs.interval_inconsistency
+            );
+        }
+    }
 }

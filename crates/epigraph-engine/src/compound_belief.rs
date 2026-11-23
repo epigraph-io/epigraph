@@ -415,6 +415,15 @@ struct Served {
 /// frozen BBA from its target, run R-DEP, and meet the pair through the
 /// closed form. `None` when it cannot be evaluated exactly (over the cap, or
 /// a total conflict the closed form cannot meet).
+///
+/// With `~` on a visible leaf the closed form is the ow = 0 reading and is
+/// served labelled inexact. The exact-CDST value exists
+/// ([`epigraph_ds::conjunction::conj_belief_with_valuation`] with the pair's
+/// positions) but is deliberately not served here: under `~` it can RAISE
+/// Bel and Pl over the no-edge value (the annihilated O mass is renormalized
+/// away), and whether a refuting valuation may do that is an open ruling
+/// (backlog 4657136b). Switching to it changes served values and waits on
+/// that ruling.
 fn one_sibling(
     leaves: &[Uuid],
     batch: &[BatchItem],

@@ -22,8 +22,8 @@
 
 use epigraph_ds::combination::dempster_combine;
 use epigraph_ds::conjunction::{
-    conj_belief, joint_bel, not_all_closed_form, profile, single_negative_sibling, ConjResult,
-    Item, Letter, Lit, MAX_LEAVES,
+    conj_belief, conj_belief_with_valuation, joint_bel, not_all_closed_form, profile,
+    single_negative_sibling, ConjResult, Item, Letter, Lit, MAX_LEAVES,
 };
 use epigraph_ds::measures::{belief, pignistic_probability, plausibility};
 use epigraph_ds::{DsError, FocalElement, FrameOfDiscernment, MassFunction};
@@ -1121,6 +1121,222 @@ fn closed_forms_with_open_world_are_not_exact() {
     assert!(dp.exact, "the DP is exact CDST under `~`");
     assert!(!sib.exact, "sibling closed form under `~` claimed exact");
     assert!(!cf.exact, "not_all closed form under `~` claimed exact");
+}
+
+// ---------------------------------------------------------------------------
+// A negative valuation over a subset of the query (backlog 57215743)
+// ---------------------------------------------------------------------------
+
+/// Run `conj_belief_with_valuation`, discarding total and near-total conflict
+/// as [`conj`] does.
+fn conj_v(
+    query: &[Lit<u32>],
+    items: &[Item<u32>],
+    not_all: f64,
+    positions: &[usize],
+    m: f64,
+) -> Option<ConjResult> {
+    match conj_belief_with_valuation(query, items, not_all, positions, m) {
+        Ok(r) if r.k > NEAR_TOTAL => None,
+        Ok(r) => Some(r),
+        Err(DsError::TotalConflict) => None,
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+/// The query positions a bit mask selects; never empty (bit 0 by default).
+fn subset_of(n: usize, mask: u32) -> Vec<usize> {
+    let v: Vec<usize> = (0..n).filter(|p| mask >> p & 1 == 1).collect();
+    if v.is_empty() {
+        vec![mask as usize % n]
+    } else {
+        v
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Exact CDST with `~`, up to n = 5: a valuation ¬(∧C) of mass m over
+    /// any non-empty subset C of the query, alone or together with the
+    /// compound's own `not_all`, equals the world-set oracle given both as
+    /// explicit focal sets (closed-world on their own atoms only). Every
+    /// measure, the conflict, and the Fréchet envelope from the in-joint leaf
+    /// marginals, all labelled exact.
+    #[test]
+    fn subset_valuation_equals_world_set_oracle_with_open_world(
+        (query, raws) in arb_case(5, 4, true),
+        mask in any::<u32>(),
+        m_milli in 1u32..=1000,
+        not_all_milli in prop_oneof![Just(0u32), 1u32..=1000],
+    ) {
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let positions = subset_of(query.len(), mask);
+        let m = f64::from(m_milli) / 1000.0;
+        let not_all = f64::from(not_all_milli) / 1000.0;
+        let mut clauses = vec![Clause { m, positions: positions.clone() }];
+        if not_all > 0.0 {
+            clauses.push(Clause { m: not_all, positions: (0..query.len()).collect() });
+        }
+        let o = oracle(&query, &raws, &clauses);
+        prop_assume!(o.k < NEAR_TOTAL);
+        let r = conj_v(&query, &items, not_all, &positions, m)
+            .expect("oracle says not total conflict");
+        prop_assert!(r.exact);
+        prop_assert!((r.bel - o.bel).abs() < 1e-9, "bel {} vs {}", r.bel, o.bel);
+        prop_assert!((r.pl - o.pl).abs() < 1e-9, "pl {} vs {}", r.pl, o.pl);
+        prop_assert!((r.nr - o.nr).abs() < 1e-9, "nr {} vs {}", r.nr, o.nr);
+        prop_assert!((r.bel_or - o.bel_or).abs() < 1e-9, "bel_or {} vs {}", r.bel_or, o.bel_or);
+        prop_assert!((r.k - o.k).abs() < 1e-9, "k {} vs {}", r.k, o.k);
+        let n = o.leaf_bel.len() as f64;
+        let lo = (o.leaf_bel.iter().sum::<f64>() - (n - 1.0)).max(0.0);
+        let hi = o.leaf_pl.iter().copied().fold(1.0, f64::min);
+        let hi_nr = o.leaf_nr.iter().copied().fold(1.0, f64::min);
+        prop_assert!((r.frechet.lo - lo).abs() < 1e-9, "lo {} vs {}", r.frechet.lo, lo);
+        prop_assert!((r.frechet.hi - hi).abs() < 1e-9, "hi {} vs {}", r.frechet.hi, hi);
+        prop_assert!((r.frechet.hi_nr - hi_nr).abs() < 1e-9, "hi_nr {} vs {}", r.frechet.hi_nr, hi_nr);
+        prop_assert!(chain_violation(&r).is_none(), "{:?}", chain_violation(&r));
+    }
+
+    /// Without `~`, up to n = 6: Bel, Pl and the product-frame BetP of the
+    /// subset valuation (with and without `not_all`) equal the
+    /// complete-assignment oracle.
+    #[test]
+    fn subset_valuation_equals_complete_assignment_oracle_without_open_world(
+        (query, raws) in arb_case(6, 4, false),
+        mask in any::<u32>(),
+        m_milli in 1u32..=1000,
+        not_all_milli in prop_oneof![Just(0u32), 1u32..=1000],
+    ) {
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let positions = subset_of(query.len(), mask);
+        let m = f64::from(m_milli) / 1000.0;
+        let not_all = f64::from(not_all_milli) / 1000.0;
+        let mut clauses = vec![Clause { m, positions: positions.clone() }];
+        if not_all > 0.0 {
+            clauses.push(Clause { m: not_all, positions: (0..query.len()).collect() });
+        }
+        let (bel, pl, betp, k) = closed_world_oracle(&query, &raws, &clauses);
+        prop_assume!(k < NEAR_TOTAL);
+        let r = conj_v(&query, &items, not_all, &positions, m)
+            .expect("oracle says not total conflict");
+        prop_assert!((r.bel - bel).abs() < 1e-9, "bel {} vs {}", r.bel, bel);
+        prop_assert!((r.pl - pl).abs() < 1e-9, "pl {} vs {}", r.pl, pl);
+        prop_assert!((r.betp - betp).abs() < 1e-9, "betp {} vs {}", r.betp, betp);
+    }
+
+    /// At ow = 0 the exact path of a sibling pair is the single-negative-sibling
+    /// closed form (which is exact there), on a rotated query so the pair is
+    /// any two leaves.
+    #[test]
+    fn pair_valuation_equals_sibling_closed_form_without_open_world(
+        (query, raws) in arb_case(5, 4, false),
+        rotate in any::<usize>(),
+        m_milli in 1u32..=999,
+    ) {
+        let n = query.len();
+        prop_assume!(n >= 2);
+        let mut query = query;
+        query.rotate_left(rotate % n);
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let m = f64::from(m_milli) / 1000.0;
+        let Some(base) = conj(&query, &items, 0.0) else { return Ok(()); };
+        let pair_bel = joint_bel(&query, &items, 0.0, &[0, 1]).unwrap();
+        let Ok(cf) = single_negative_sibling(&base, pair_bel, m) else { return Ok(()); };
+        let Some(r) = conj_v(&query, &items, 0.0, &[1, 0], m) else { return Ok(()); };
+        prop_assert!(cf.exact && r.exact);
+        prop_assert!((r.bel - cf.bel).abs() < 1e-9, "bel {} vs {}", r.bel, cf.bel);
+        prop_assert!((r.pl - cf.pl).abs() < 1e-9, "pl {} vs {}", r.pl, cf.pl);
+        prop_assert!((r.nr - cf.nr).abs() < 1e-9, "nr {} vs {}", r.nr, cf.nr);
+        prop_assert!((r.betp - cf.betp).abs() < 1e-9, "betp {} vs {}", r.betp, cf.betp);
+        prop_assert!((r.bel_or - cf.bel_or).abs() < 1e-9, "bel_or {} vs {}", r.bel_or, cf.bel_or);
+        prop_assert!((r.k - cf.k).abs() < 1e-9, "k {} vs {}", r.k, cf.k);
+    }
+
+    /// With `~`: C = every query position is `not_all` itself, and m = 0 is no
+    /// valuation, so both reduce to `conj_belief` field for field.
+    #[test]
+    fn subset_valuation_reduces_to_conj_belief(
+        (query, raws) in arb_case(5, 4, true),
+        m_milli in 1u32..=1000,
+        not_all_milli in prop_oneof![Just(0u32), 1u32..=1000],
+        mask in any::<u32>(),
+    ) {
+        let items: Vec<Item<u32>> = raws.iter().map(build).collect();
+        let n = query.len();
+        let m = f64::from(m_milli) / 1000.0;
+        let all: Vec<usize> = (0..n).collect();
+        if let Some(dp) = conj(&query, &items, m) {
+            let r = conj_v(&query, &items, 0.0, &all, m).expect("same joint");
+            prop_assert_eq!(r, dp, "C = L");
+        }
+        let not_all = f64::from(not_all_milli) / 1000.0;
+        if let Some(dp) = conj(&query, &items, not_all) {
+            let r = conj_v(&query, &items, not_all, &subset_of(n, mask), 0.0).expect("same joint");
+            prop_assert_eq!(r, dp, "m = 0");
+        }
+    }
+}
+
+/// The fixture of `closed_forms_with_open_world_are_not_exact`: a {T .6,
+/// `~` .4}, b {T 1}, a sibling edge of strength .5 between them. The closed
+/// form gives .3/.7 and must say inexact; the exact path annihilates a's `~`
+/// with the valuation's frame part, so Bel is 1 (K .7), and says exact.
+#[test]
+fn pair_valuation_with_open_world_is_exact_cdst() {
+    let items = vec![
+        Item::new(vec![(Lit::pos(0u32), 0.6, 0.4)]).unwrap(),
+        Item::new(vec![(Lit::pos(1u32), 1.0, 0.0)]).unwrap(),
+    ];
+    let q = positives(2);
+    let r = conj_belief_with_valuation(&q, &items, 0.0, &[0, 1], 0.5).unwrap();
+    assert!(r.exact, "the subset valuation is exact CDST under `~`");
+    assert!(r.open_world);
+    assert!(close(r.bel, 1.0), "bel {}", r.bel);
+    assert!(close(r.pl, 1.0), "pl {}", r.pl);
+    assert!(close(r.k, 0.7), "k {}", r.k);
+    // A third leaf outside C, with `~` of its own: the valuation is
+    // closed-world on C's atoms only, so c's `~` survives (Pl < 1).
+    let mut items = items;
+    items.push(Item::new(vec![(Lit::pos(2u32), 0.5, 0.25)]).unwrap());
+    let r = conj_belief_with_valuation(&positives(3), &items, 0.0, &[0, 1], 0.5).unwrap();
+    assert!(close(r.bel, 0.5), "bel {}", r.bel);
+    assert!(close(r.pl, 0.75), "pl {}", r.pl);
+}
+
+#[test]
+fn subset_valuation_rejects_bad_positions_and_masses_and_respects_the_cap() {
+    let items = vec![Item::new(vec![(Lit::pos(0u32), 0.5, 0.0)]).unwrap()];
+    let q = positives(2);
+    for positions in [&[][..], &[0, 0][..], &[2][..]] {
+        assert!(
+            matches!(
+                conj_belief_with_valuation(&q, &items, 0.0, positions, 0.5),
+                Err(DsError::InvalidConjunction { .. })
+            ),
+            "positions {positions:?}"
+        );
+    }
+    for m in [-0.1, 1.5, f64::NAN] {
+        assert!(matches!(
+            conj_belief_with_valuation(&q, &items, 0.0, &[0], m),
+            Err(DsError::InvalidProbability { .. })
+        ));
+    }
+    // One whole item over every leaf keeps the live states few, so only the
+    // leaf cap decides: 17 leaves are refused, 16 run exactly.
+    let n = u32::try_from(MAX_LEAVES).unwrap() + 1;
+    let whole =
+        |n: u32| vec![Item::new((0..n).map(|a| (Lit::pos(a), 0.9, 0.0)).collect()).unwrap()];
+    assert!(matches!(
+        conj_belief_with_valuation(&positives(n), &whole(n), 0.0, &[0, 1], 0.5),
+        Err(DsError::ConjunctionOverCap { .. })
+    ));
+    assert!(
+        conj_belief_with_valuation(&positives(n - 1), &whole(n - 1), 0.0, &[0, 1], 0.5)
+            .unwrap()
+            .exact
+    );
 }
 
 // ---------------------------------------------------------------------------
