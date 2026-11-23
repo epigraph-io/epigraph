@@ -299,16 +299,8 @@ impl PaperRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    ///
-    /// Generic over the executor. Since migration 246 `papers` has row
-    /// security and one document may have one row per scope, so this
-    /// unscoped, single-row lookup answers differently per connection; a
-    /// caller's read goes through [`Self::visible_by_document_key`] instead.
-    #[instrument(skip(executor))]
-    pub async fn find_by_doi<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        doi: &str,
-    ) -> Result<Option<PaperRow>, DbError> {
+    #[instrument(skip(pool))]
+    pub async fn find_by_doi(pool: &PgPool, doi: &str) -> Result<Option<PaperRow>, DbError> {
         // Use `as "title?"` to override sqlx introspection: the migration
         // declares `title` nullable; the dev DB has historical NOT NULL drift.
         let row = sqlx::query!(
@@ -319,7 +311,7 @@ impl PaperRepository {
             "#,
             doi
         )
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?;
         Ok(row.map(|r| PaperRow {
             id: r.id,
