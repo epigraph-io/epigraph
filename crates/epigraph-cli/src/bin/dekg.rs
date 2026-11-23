@@ -1440,21 +1440,20 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     let frame_id = frame_row.0;
                     println!("  Created frame {} '{}'", frame_id, frame_name);
 
-                    // Assign claims
-                    // Rows written, not attempted; a failed insert stops the
-                    // run instead of being discarded and counted.
-                    for (h_idx, claim_id, _) in &cluster_claims {
-                        let inserted = sqlx::query(
-                            "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
-                        )
-                        .bind(claim_id)
-                        .bind(frame_id)
-                        .bind(*h_idx as i32 % hypotheses.len() as i32)
-                        .execute(&pool)
-                        .await
-                        .context("insert claim_frames assignment")?;
-                        claims_assigned += inserted.rows_affected();
-                    }
+                    // Assign claims. Rows written, not attempted; a failed
+                    // insert stops the run instead of being discarded and
+                    // counted (pinned by tests/dekg_create_frames_assign.rs).
+                    let assignments: Vec<(usize, Uuid)> = cluster_claims
+                        .iter()
+                        .map(|(h_idx, claim_id, _)| (*h_idx, **claim_id))
+                        .collect();
+                    claims_assigned += epigraph_cli::dekg_frames::assign_claims_to_frame(
+                        &pool,
+                        frame_id,
+                        &assignments,
+                        hypotheses.len(),
+                    )
+                    .await?;
 
                     frames_created += 1;
                 }

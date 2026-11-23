@@ -24,6 +24,8 @@ pub mod bridge;
 pub mod cache_owner_audit;
 pub mod decompose;
 #[cfg(feature = "db")]
+pub mod dekg_frames;
+#[cfg(feature = "db")]
 pub mod edge_rewire;
 #[cfg(feature = "db")]
 pub mod embed_backfill;
