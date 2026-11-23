@@ -36,8 +36,10 @@
 //!   agent's edge onto a public claim is world-owned, like the HTTP route's,
 //!   so `owned_by_caller` is false and its writer cannot retract it,
 //! - `invokes`, `depends_on` and `executes` refuse an edge that would close a
-//!   cycle through `invokes` / `executes` (or `depends_on`) edges the caller
-//!   reads; the check and the insert are serialized per relationship set,
+//!   cycle through in-force `invokes` / `executes` (or `depends_on`) edges,
+//!   including edges the caller cannot read (walked by migration 254's
+//!   definer; the refusal names only the two endpoints, never the hidden
+//!   edges); the check and the insert are serialized per relationship set,
 //! - `properties` may not carry a reserved key
 //!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`), refused with the HTTP edges
 //!   route's text (`epigraph_db::reserved_edge_property_refusal`),
@@ -494,7 +496,9 @@ pub async fn do_link_hierarchical(
     }
 
     // Cycle refusal (backlog 41d7b27a): `source -rel-> target` closes a cycle
-    // exactly when `target` already reaches `source`.
+    // exactly when `target` already reaches `source`. The walk sees every
+    // in-force edge, readable or not (backlog 7149132e), and the message
+    // names only the two endpoints read above, whichever edges closed it.
     if let Some(walk) = cycle_walk_for(&params.relationship) {
         if EdgeRepository::reaches_in_force_conn(&mut tx, target_id, source_id, walk)
             .await

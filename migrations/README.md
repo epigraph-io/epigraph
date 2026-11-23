@@ -3776,6 +3776,27 @@ restart.
   (`the_legacy_reown_never_follows_a_server_signer_whatever_the_list`, each arm
   mutation-tested; `the_253_undo_restores_120s_body_on_190s_path`). Undo:
   `docs/runbooks/253-undo.sql`. **Deploy order:** none required; no binary calls the function.
+- **254**: public `hierarchical_cycle_walk_definer` (backlog 7149132e). Adds the SECURITY
+  DEFINER `epigraph_edges_reach(from, to, relationships)`, which answers whether `from`
+  reaches `to` along in-force edges of the named relationships, read with definer rights
+  (not row-security filtered). Only `invokes`, `executes` and `depends_on` may be walked
+  (anything else, an empty set or a NULL is 22023). `EdgeRepository::reaches_in_force_conn`,
+  the cycle guard of MCP `link_hierarchical`, now calls it instead of walking inline on the
+  caller's stamped transaction, so a cycle closed through an edge the caller cannot read is
+  refused (before, the walk skipped that edge and the cycle was written). The refusal names
+  only the two endpoints the caller already read. The advisory lock stays a separate,
+  earlier statement in the Rust caller (a STABLE function reads its calling statement's
+  snapshot). Owned by `epigraph_maintenance`, EXECUTE revoked from PUBLIC and granted to
+  `epigraph_app` and `epigraph_maintenance` (guarded, as in 193); registered in
+  `tenancy_backfill.rs` `DEFERRED_DEFINER_FUNCTIONS` (a non-member owner fails OPEN).
+  Pinned by `epigraph-db/tests/edge_reach_definer.rs` (the hidden-edge walk on an
+  `epigraph_app` stamp, the relationship refusal, the catalog shape, the two-session
+  advisory-lock race) and `epigraph-mcp/tests/link_hierarchical_hidden_cycle.rs` (the
+  refusal end to end on the application role, nothing written, no hidden id named).
+  Does not repair cycles that already exist. Undo: `docs/runbooks/254-undo.sql`.
+  **Deploy order:** migrate BEFORE rolling out a 254 binary: without the function every
+  cycle-checked `link_hierarchical` call fails 42883 and writes nothing. Undo only after
+  rolling every 254 binary back.
 - **256**: `derived_writer_scope_read_committed` (backlog a8cabb45). Re-states 166's
   `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
   so that 165's role-DERIVED writer arm admits a write only under READ COMMITTED. Under

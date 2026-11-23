@@ -2397,6 +2397,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // OPEN (quiet). Its read of `workflows` (to leave a hierarchical id to
     // that trigger) is filtered too under a non-member owner; not measured.
     ("epigraph_claim_behavioral_executions_follow", 240),
+    // 254 (backlog 7149132e), the cycle walk of MCP `link_hierarchical`'s
+    // workflow references (`EdgeRepository::reaches_in_force_conn`). Its read
+    // of the FORCEd `edges` is admitted by `epigraph_definer_bypass()` (the
+    // owner). Under a non-member owner the walk is row-security filtered to
+    // the calling session's stamp, so a cycle closed through an edge that
+    // session cannot read is admitted: fail OPEN, the defect the function
+    // closes. The owner is load-bearing.
+    ("epigraph_edges_reach", 254),
 ];
 
 /// [`DEFINER_FUNCTIONS`] plus every [`DEFERRED_DEFINER_FUNCTIONS`] entry that

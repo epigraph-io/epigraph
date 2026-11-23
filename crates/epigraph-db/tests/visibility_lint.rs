@@ -726,11 +726,12 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "reaches_in_force_conn",
         "READ of `edges` only, returning one boolean: whether one node reaches another along \
          in-force edges of the named relationships (backlog 41d7b27a, the cycle guard for \
-         MCP `link_hierarchical`'s `invokes` / `depends_on`). It returns no row. Its caller \
-         runs it on the writer's STAMPED transaction, after both endpoints were read as the \
-         viewer, so `edges_tenancy` bounds the walk to edges that session reads; an edge it \
-         cannot see does not count toward a cycle, and the answer reveals nothing beyond \
-         what the session could already traverse.",
+         MCP `link_hierarchical`'s `invokes` / `executes` / `depends_on`). It returns no row. \
+         The walk is migration 254's SECURITY DEFINER `epigraph_edges_reach` (backlog \
+         7149132e): the integrity property is graph-wide, so it must see edges the viewer \
+         cannot, and a viewer would be the wrong bound. Its caller asks it only about two \
+         endpoints it has just read as the viewer, and refuses naming only those two; the \
+         definer walks only the three workflow-reference relationships.",
     ),
     (
         "admin_act.rs",
