@@ -3776,6 +3776,29 @@ restart.
   (`the_legacy_reown_never_follows_a_server_signer_whatever_the_list`, each arm
   mutation-tested; `the_253_undo_restores_120s_body_on_190s_path`). Undo:
   `docs/runbooks/253-undo.sql`. **Deploy order:** none required; no binary calls the function.
+- **256**: `derived_writer_scope_read_committed` (backlog a8cabb45). Re-states 166's
+  `epigraph_require_writer_scope` (an md5 precondition refuses to apply over any other body)
+  so that 165's role-DERIVED writer arm admits a write only under READ COMMITTED. Under
+  REPEATABLE READ or SERIALIZABLE the derivation reads the transaction's first snapshot, so an
+  assignment or binding ended by another session after it still read as live and the writer
+  kept writing into the role's group (165's documented residual); 166 had closed that for
+  agents only (ROL01), leaving a human role holder. Now, under any level other than READ
+  COMMITTED, a write the derived arm would admit is refused OPL02 ("a write through a role
+  binding is admitted only under READ COMMITTED"), after the privileged-session exemption;
+  122's direct arm and both existing OPL02 refusals are unchanged. Same signature, STABLE,
+  owner, grants and search path. The derivation (`epigraph_role_derived_memberships`, 195's
+  body) and `epigraph_live_memberships` (235's body) are NOT touched. Residual: 122's direct
+  arm reads `group_memberships` through the same snapshot. Pinned by
+  `epigraph-db/tests/derived_writer_scope_read_committed.rs` (an assignment or binding ended
+  from a second session mid-transaction: the REPEATABLE READ and SERIALIZABLE writer is
+  refused, and lands on 166's body; READ COMMITTED, direct-arm, privileged and agent
+  controls; the undo, twice, and both refusals over a foreign body) and
+  `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
+  `docs/runbooks/256-undo.sql` (run it before `166-undo.sql`). **Deploy order:** none; no
+  binary depends on it. Before applying, measure that no login writing as a human principal
+  on the application role has a non-default `default_transaction_isolation`
+  (`pg_db_role_setting`): such writes through a role binding are refused after 256.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

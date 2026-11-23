@@ -3684,6 +3684,8 @@ async fn migration_165_role_membership_definers_are_owned_and_granted(pool: PgPo
 /// maintenance-only `epigraph_live_memberships_unbound`, and makes
 /// `epigraph_live_memberships` the twin's rows for the session principal only;
 /// the fragments follow the body, and the bind is pinned on the bound read.
+/// 256 re-states the writer scope (the derived arm admits only under READ
+/// COMMITTED); its fragment is pinned too.
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
     for (signature, fragments) in [
@@ -3696,6 +3698,8 @@ async fn migration_165_derived_arms_survive_at_head(pool: PgPool) {
                 // statement's clock.
                 "public.epigraph_role_derived_memberships(p_agent, clock_timestamp())",
                 "d.role = 'writer'",
+                // 256: the derived arm admits only under READ COMMITTED.
+                "v_derived AND current_setting('transaction_isolation') = 'read committed'",
             ][..],
         ),
         (
