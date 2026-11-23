@@ -771,3 +771,66 @@ async fn targeted_rewire_holds_a_written_cache_that_differs_from_the_predicted_f
     assert_eq!(captured.len(), 1);
 }
 
+/// The post-wire outcome check: the source turns factorless AFTER the
+/// decision read it (a statement trigger on the rewire's own row DELETE,
+/// which runs between the decision and the wire), so the wire finds no
+/// interval. The targeted rewire must keep the row and never reach the
+/// un-targeted removal arm: rolled back, the edge row, the target cache and
+/// the source cache exactly as before, counted `held_would_remove`. The
+/// control drops the trigger and the same edge rewires, so the decision
+/// itself would have proceeded.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_keeps_an_edge_whose_source_turned_factorless_after_the_decision(
+    pool: PgPool,
+) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-decision", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_source_turns_factorless() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN \
+           UPDATE claims SET belief = NULL, plausibility = NULL, pignistic_prob = NULL \
+            WHERE id = '{}'::uuid; \
+           RETURN NULL; \
+         END $f$",
+        w.source
+    ))
+    .execute(&pool)
+    .await
+    .expect("trigger function");
+    sqlx::query(
+        "CREATE TRIGGER test_source_turns_factorless AFTER DELETE ON mass_functions \
+         FOR EACH STATEMENT EXECUTE FUNCTION test_source_turns_factorless()",
+    )
+    .execute(&pool)
+    .await
+    .expect("statement trigger");
+    let before = footprint(&pool, &w).await;
+    let source_before = cache(&pool, w.source).await;
+    assert!(source_before.belief.is_some(), "fixture: the source has a cache");
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "row, target cache and updated_at unchanged"
+    );
+    assert_eq!(
+        cache(&pool, w.source).await,
+        source_before,
+        "the source's mid-run change rolled back with the edge"
+    );
+    assert!(captured.is_empty());
+    assert_held(&out, HeldBucket::WouldRemove);
+
+    sqlx::query("DROP TRIGGER test_source_turns_factorless ON mass_functions")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    let (control, _) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the trigger the decision proceeds and the edge rewires: {control:?}"
+    );
+}
