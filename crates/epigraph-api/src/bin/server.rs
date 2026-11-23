@@ -684,8 +684,16 @@ async fn main() {
             epigraph_api::passkey_boot::running_stop(allows_software),
         );
         // The API's own edge signing key (ruling R-50): unset = unsigned edges,
-        // logged once; set but unusable = refuse to start.
+        // logged once; set but unusable = refuse to start. And while it
+        // serves: a key the verifier stops admitting (revoked, rotated out,
+        // window closed) stops the process, as it would refuse the boot.
         let edge_signer = epigraph_api::edge_signer::boot(scoped.inner()).await;
+        if let Some(signer) = &edge_signer {
+            epigraph_api::edge_signer::spawn_admission_watch(
+                scoped.inner().clone(),
+                std::sync::Arc::clone(signer),
+            );
+        }
         let state = AppState::with_scoped_pool(scoped, config)
             .with_embedding_service(embedding_service)
             .with_embedding_provider(provider_kind)
