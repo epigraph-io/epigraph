@@ -490,15 +490,7 @@ impl AtlasServeRepository {
             return Ok(CoOwnedLeafEdges::empty());
         }
         let mut sp = sqlx::Acquire::begin(&mut *conn).await?;
-        let ms = timeout.as_millis().max(1);
-        let read = match sqlx::query("SELECT set_config('statement_timeout', $1, true)")
-            .bind(format!("{ms}ms"))
-            .execute(&mut *sp)
-            .await
-        {
-            Ok(_) => Self::read_co_owned_leaf_edges(&mut sp, viewer, team, &nodes).await,
-            Err(e) => Err(e.into()),
-        };
+        let read = Self::read_co_owned_leaf_edges(&mut sp, viewer, team, &nodes, timeout).await;
         // Read-only: never kept. The rollback also ends the local timeout.
         let rolled_back = sp.rollback().await;
         let out = read?;
@@ -506,14 +498,22 @@ impl AtlasServeRepository {
         Ok(out)
     }
 
-    /// The two statements of [`Self::co_owned_leaf_edges`], on its nested
-    /// transaction. `nodes` holds no agent and at least two nodes.
+    /// The statements of [`Self::co_owned_leaf_edges`], on its nested
+    /// transaction: the local `statement_timeout` (a `SET LOCAL`, ended by
+    /// that transaction's rollback), then the edge read and the mass read.
+    /// `nodes` holds no agent and at least two nodes.
     async fn read_co_owned_leaf_edges(
         conn: &mut PgConnection,
         viewer: &Viewer,
         team: Uuid,
         nodes: &[LeafNode],
+        timeout: Duration,
     ) -> Result<CoOwnedLeafEdges, DbError> {
+        let ms = timeout.as_millis().max(1);
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{ms}ms"))
+            .execute(&mut *conn)
+            .await?;
         let ids: Vec<Uuid> = nodes.iter().map(|n| n.id).collect();
         let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_str()).collect();
         let sql = viewer.splice(
