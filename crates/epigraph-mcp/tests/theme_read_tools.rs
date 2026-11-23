@@ -162,10 +162,10 @@ async fn list_themes_reports_live_membership_and_pages_deterministically() {
         Some(3),
         "member_count must be the live COUNT(*) over claims.theme_id: {body}"
     );
-    assert_eq!(
-        themes[0].get("stored_claim_count").and_then(Value::as_i64),
-        Some(1),
-        "the stale column must still be surfaced verbatim so drift is visible: {body}"
+    assert!(
+        themes[0].get("stored_claim_count").is_none(),
+        "the stored, corpus-wide claim_count must not be on the wire: it counts members the \
+         caller may not read (backlog 06f5c5b2): {body}"
     );
     assert!(
         themes[0].get("centroid_dim").is_some(),
@@ -280,6 +280,7 @@ async fn get_theme_rejects_ambiguous_and_unresolvable_selectors() {
     let pool = test_pool_or_skip!();
     let server = common::build_test_server(pool.clone());
     let viewer = fixture::public_viewer(&pool).await;
+    let agent = seed_agent(&pool).await;
     let prefix = unique_prefix("ambig");
 
     // TWO themes with the SAME label. `claim_themes` has no UNIQUE(label), and
@@ -289,6 +290,10 @@ async fn get_theme_rejects_ambiguous_and_unresolvable_selectors() {
     let dup_label = format!("{prefix}-dup");
     let a = seed_theme(&pool, &dup_label, 0).await;
     let b = seed_theme(&pool, &dup_label, 0).await;
+    // Readable members, or both themes are hidden and the label is a plain
+    // miss (backlog 06f5c5b2).
+    seed_member(&pool, agent, a, &format!("{prefix} a member")).await;
+    seed_member(&pool, agent, b, &format!("{prefix} b member")).await;
 
     let dup: GetThemeParams =
         serde_json::from_value(json!({ "theme_label": dup_label })).expect("params");

@@ -3113,10 +3113,12 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     // Atlas P3a (migration 197): untenanted layout reads. Each is ONE statement
     // over `atlas_layout_*` (no claim_id, no FK to claims, no visibility or
-    // owner_group_id) and `claim_themes` (a corpus-wide row, as
-    // `ClaimThemeRepository::list_summaries` treats it). The per-viewer decision
-    // is made before each is called, by `visible_themes` /
-    // `any_visible_member`, which splice the viewer onto `claims`.
+    // owner_group_id) and `claim_themes` (no visibility or owner_group_id
+    // column either: whether a theme is shown is decided per viewer from its
+    // readable current members, as `ClaimThemeRepository::list_summaries`
+    // decides it). That per-viewer decision is made before each is called, by
+    // `visible_themes` / `any_visible_member`, which splice the viewer onto
+    // `claims`.
     (
         "atlas_layout.rs",
         "run",
@@ -3148,7 +3150,8 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "atlas_layout.rs",
         "theme_rows",
-        "Reads `claim_themes` labels (a corpus-wide row, as `list_summaries` treats it) and the \
+        "Reads `claim_themes` labels (no tenancy columns; which themes a viewer may see is \
+         decided from readable members, as `list_summaries` decides it) and the \
          shared `atlas_layout_themes` position for theme ids the caller already established the \
          viewer can see through the spliced `visible_themes`; neither table has a visibility or \
          owner_group_id column, and no claim row is read.",
@@ -3420,7 +3423,9 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `ClusterRunRepository::claim_placement`, the caller that matters, takes a `&Viewer` and \
          splices it onto both of them plus the `claims` existence probe. SCOPE: the Explorer \
          branch widened the executor from `&PgPool` so the three `expand` handlers can pass their \
-         viewer-stamped connection and keep one connection per request. The SQL is unchanged.",
+         viewer-stamped connection and keep one connection per request. Backlog 523dcb4f later \
+         added `WHERE algo = 'louvain'`, a filter on the same single table that joins nothing \
+         new.",
     ),
     (
         "method.rs",

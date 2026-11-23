@@ -407,6 +407,18 @@ async fn include_workflows_with_a_theme_or_an_offset_is_rejected() {
     let viewer = fixture::public_viewer(&pool).await;
     let token = format!("thwf{}", Uuid::new_v4().simple());
     let theme = seed_theme(&pool, &format!("ttest-recall-{token}")).await;
+    // A readable member, or the theme is hidden and the selector is refused
+    // before the include_workflows check is reached (backlog 06f5c5b2).
+    let agent = seed_agent(&pool).await;
+    let member = seed_claim(
+        &pool,
+        agent,
+        Some(theme),
+        &token,
+        "member",
+        &cluster_pgvec(3),
+    )
+    .await;
 
     let with_theme: RecallParams = serde_json::from_value(json!({
         "query": token,
@@ -432,7 +444,7 @@ async fn include_workflows_with_a_theme_or_an_offset_is_rejected() {
         .await
         .expect_err("offset + include_workflows must be rejected");
 
-    cleanup(&pool, &[], &[theme]).await;
+    cleanup(&pool, &[member], &[theme]).await;
 }
 
 /// The selector fails CLOSED. A dropped scope filter widens recall to the whole

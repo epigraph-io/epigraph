@@ -2870,7 +2870,7 @@ impl EpiGraphMcpFull {
     // ── Themes (2 read tools, and the retired `theme_cluster` refusal) ──
 
     #[tool(
-        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of is_current claims actually assigned — authoritative), stored_claim_count (the denormalised claim_themes.claim_count column, which the assignment writers do NOT maintain; reported only so drift is visible), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME prefix predicate, so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
+        description = "READ-ONLY paged inventory of the theme layer: for each theme its id, label, description, live member_count (COUNT(*) of the is_current claims assigned to it that YOU can read), derived centroid_dim (1536 / 3072 / null), created_at and updated_at. Only themes with at least one current member you can read are listed. Optional label_prefix filter (e.g. \"auto\" for the legacy auto-NN family). Defaults: limit=50 (clamped 1..=500), offset=0. Response carries total / returned / has_more under the SAME predicate (prefix and visibility), so a limit/offset walk terminates exactly. Clusters nothing, wipes nothing, writes nothing — use this to answer \"what topics does this graph cover\"."
     )]
     async fn list_themes(
         &self,
@@ -2883,7 +2883,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "READ-ONLY detail for ONE theme: its list_themes summary plus a page of member claim IDs (ids + truth_value + created_at — deliberately NOT content, so this is not a second unredacted content surface; resolve ids via get_claim, which redacts). Select with theme_id OR theme_label, never both; a malformed theme_id, a label matching nothing, and a label matching several themes are all REJECTED rather than silently widening the query (claim_themes has no UNIQUE(label) constraint). Members are ordered created_at ASC, id ASC — a total order, so a members_limit/members_offset walk yields each member exactly once. Defaults: members_limit=50 (max 500; 0 = summary only), members_offset=0. Response carries members_total / members_returned / members_has_more."
+        description = "READ-ONLY detail for ONE theme: its list_themes summary plus a page of member claim IDs (ids + truth_value + created_at — deliberately NOT content, so this is not a second unredacted content surface; resolve ids via get_claim, which redacts). Select with theme_id OR theme_label, never both; only themes with at least one current member you can read resolve. A malformed theme_id, an unknown or unreadable theme, a label matching nothing, and a label matching several themes are all REJECTED rather than silently widening the query (claim_themes has no UNIQUE(label) constraint). Members are ordered created_at ASC, id ASC — a total order, so a members_limit/members_offset walk yields each member exactly once. Defaults: members_limit=50 (max 500; 0 = summary only), members_offset=0. Response carries members_total / members_returned / members_has_more."
     )]
     async fn get_theme(
         &self,
