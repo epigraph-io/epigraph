@@ -11,8 +11,9 @@
 //! * `legacy_slot_rows_move_onto_the_slot_and_the_slot_perspectives_go`: each
 //!   shape lands on the slot it names, a genuine perspective's BBA is left
 //!   alone, and no slot-shaped perspective remains;
-//! * the three fail-closed refusals (A1, A2, A3) and the body precondition,
-//!   each of which changes nothing;
+//! * the fail-closed refusals (A1 to A5, A3 twice: a slot-shaped row and an
+//!   edge factor whose edge is gone) and the body precondition, each of
+//!   which changes nothing;
 //! * `the_267_undo_returns_the_catalog_and_the_rows_below_267`: the undo
 //!   restores the catalog below 267 exactly, puts the rows back on their
 //!   re-created perspectives, and is idempotent.
@@ -414,6 +415,24 @@ async fn a_slot_shaped_row_267_would_leave_behind_refuses_267(pool: PgPool) {
         None,
     )
     .await;
+    assert_refused(&pool, "cannot be classified").await;
+}
+
+/// A3: an edge factor whose edge is gone, keyed on a perspective that is not a
+/// slot row. 267 cannot place it on an edge slot (no edge has the id) and
+/// would leave it on a perspective where the cache's edge arm admits nothing,
+/// so it is decided by hand. The shape is seeded directly: no edge has the
+/// perspective's id, so no cascade or retract guard runs on the BBA.
+/// Mutation: without the `edge_factor` arm of A3, 267 applies and leaves the
+/// row on its perspective.
+#[sqlx::test(migrations = false)]
+async fn an_edge_factor_row_whose_edge_is_gone_refuses_267(pool: PgPool) {
+    migrate(&pool, &up_to(below())).await;
+    let l = seed_legacy(&pool).await;
+    let f = frame(&pool).await;
+    let lens = Uuid::new_v4();
+    perspective(&pool, lens, "a lens", Some("analytical"), l.agent).await;
+    bba(&pool, l.target, f, l.agent, Some(lens), "edge_factor", None).await;
     assert_refused(&pool, "cannot be classified").await;
 }
 

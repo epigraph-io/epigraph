@@ -52,7 +52,9 @@
 --       `edge_factor`, or typed `evidence` named `evidence_grounded`. It
 --       refuses (A2) when a `community_members` row names a slot row (the
 --       DELETE in (4) would cascade it away), (A3) when a row it did not
---       classify is keyed on an edge's id or on a slot row, (A4) when an edge
+--       classify is keyed on an edge's id or on a slot row, or is an
+--       `edge_factor` row on any perspective (its edge is gone: nothing
+--       would vouch for it), (A4) when an edge
 --       names a slot row as a `perspective` endpoint (it would dangle), and
 --       (A5) when a perspective is typed `edge` / `evidence` under another
 --       name (a viewpoint: `create_perspective` never validated the type).
@@ -239,7 +241,12 @@ BEGIN
       FROM t267_slot t
      WHERE t.kind = 'evidence' AND t.method IS DISTINCT FROM 'auto_wire'
        AND t.method IS DISTINCT FROM 'discount';
-    -- (A3) a row left on its perspective that still looks like a slot row.
+    -- (A3) a row left on its perspective that still looks like a slot row,
+    -- or an `edge_factor` row left on one. The latter is an edge factor whose
+    -- edge is gone, keyed on a perspective that is not a slot row: before 267
+    -- the cache's edge arm kept it out (no edge has the perspective's id), and
+    -- left on its perspective it would name no edge to vouch for it. It is
+    -- decided by hand, never guessed at.
     IF v_bad = 0 THEN
         SELECT count(*), string_agg(DISTINCT COALESCE(mf.combination_method, '(NULL)'), ', ')
           INTO v_bad, v_labels
@@ -248,7 +255,8 @@ BEGIN
          WHERE NOT EXISTS (SELECT 1 FROM t267_slot t WHERE t.mf_id = mf.id)
            AND (p.name IN ('edge_factor', 'evidence_grounded')
                 OR p.id IN (SELECT g.id FROM t267_gone g)
-                OR EXISTS (SELECT 1 FROM public.edges e WHERE e.id = mf.perspective_id));
+                OR EXISTS (SELECT 1 FROM public.edges e WHERE e.id = mf.perspective_id)
+                OR mf.combination_method = 'edge_factor');
     END IF;
     IF v_bad > 0 THEN
         RAISE EXCEPTION '267: % mass function(s) keyed on a slot-shaped perspective cannot be '
