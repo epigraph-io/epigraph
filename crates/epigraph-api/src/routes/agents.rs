@@ -25,7 +25,11 @@
 //!   `Viewer`, so there is nothing for `read_as` to stamp a connection with.
 //!   The residual is already on record as `F-TAILRLS-P1` in
 //!   `docs/tenancy/progress.json` and is owned by that entry, not by this shard,
-//!   which neither widens nor narrows it.
+//!   which neither widens nor narrows it. (Since backlog 8946be59
+//!   `list_agents` takes a `Viewer` for its `?public_key=` lookup, which reads
+//!   on a `read_as` connection; its label and unfiltered arms keep their four
+//!   `state.db_pool` sites, because `AgentRepository::list`, `count`,
+//!   `list_by_label` and `count_by_label` take a `&PgPool`.)
 //!
 //! `viewer_route_table_lint.rs`'s `FAIL_OPEN_SCOPE_SITES`,
 //! `AUTH_OPTIONAL_PROVENANCE_SITES` and `AUTH_OPTIONAL_WRITE_SITES` rows for
@@ -136,6 +140,10 @@ pub struct AgentListParams {
     pub offset: i64,
     /// Filter agents by PROV-O label (person, organization, software_agent, instrument)
     pub label: Option<String>,
+    /// Exact Ed25519 public key (64 hex characters, either case). When set,
+    /// the response holds the one agent with that key, or none: `total` is 0
+    /// or 1. ANDed with `label` when both are given. A malformed key is a 400.
+    pub public_key: Option<String>,
 }
 
 fn default_agent_list_limit() -> i64 {
@@ -354,19 +362,73 @@ pub async fn get_agent(
     Ok(Json(response))
 }
 
-/// List agents with pagination and optional label filter
+/// List agents with pagination and optional label / public-key filters
 ///
 /// GET /agents?limit=20&offset=0&label=person
+/// GET /api/v1/agents?public_key=<64 hex>
 ///
 /// Returns a paginated list of agents ordered by creation date (newest first).
 /// When `label` is provided, only agents with that PROV-O label are returned.
+///
+/// When `public_key` is provided, the answer is the one agent holding that
+/// exact key (`total` 0 or 1), still filtered by `label` if that is given, so
+/// a caller resolves an agent by key in ONE request instead of paging the
+/// whole list. That lookup reads on the caller's viewer-stamped connection
+/// ([`AppState::read_as`]). `agents_identity` (migration 077 section 9) is
+/// `USING (true)`, so the stamp narrows nothing today and the row is the one
+/// the unfiltered list would page to: the filter exposes nothing the list
+/// does not, including `orcid` / `ror_id` (`F-TAILRLS-P1` is unchanged).
+///
+/// The handler takes a [`ViewerExtractor`], so a token that names no
+/// principal is refused 401 on every arm, as `search_agents` and
+/// `get_agent_reputation` in this file already refuse it. The label and
+/// unfiltered arms still read through `state.db_pool`: their repository
+/// functions take a `&PgPool`, and moving them is a repository-signature
+/// change this filter does not make.
+///
+/// [`AppState::read_as`]: crate::AppState::read_as
 #[cfg(feature = "db")]
 pub async fn list_agents(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     Query(params): Query<AgentListParams>,
 ) -> Result<Json<PaginatedResponse<AgentResponse>>, ApiError> {
     let limit = params.limit.clamp(1, 100);
     let offset = params.offset.max(0);
+
+    if let Some(ref hex_key) = params.public_key {
+        let key = parse_public_key(hex_key.trim())?;
+        let mut read = state.read_as(&viewer).await.map_err(|e| {
+            tracing::error!(
+                target: "tenancy.scoped_read",
+                error = %e,
+                handler = "list_agents",
+                "could not acquire a viewer-stamped connection"
+            );
+            ApiError::InternalError {
+                message: "Failed to acquire a scoped connection".to_string(),
+            }
+        })?;
+        let found = AgentRepository::get_by_public_key(&mut *read, &key)
+            .await?
+            .filter(|a| match params.label.as_ref() {
+                None => true,
+                Some(label) => a.labels.contains(label),
+            });
+        let total = i64::from(found.is_some());
+        // One match at most, so `offset` past it pages to nothing.
+        let items: Vec<AgentResponse> = found
+            .into_iter()
+            .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+            .map(Into::into)
+            .collect();
+        return Ok(Json(PaginatedResponse {
+            items,
+            total,
+            limit,
+            offset,
+        }));
+    }
 
     let (agents, total) = if let Some(ref label) = params.label {
         let agents = AgentRepository::list_by_label(&state.db_pool, label, limit, offset).await?;
