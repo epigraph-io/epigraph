@@ -386,9 +386,13 @@ async fn a_retracted_lateral_edge_does_not_link_to_the_paper(pool: PgPool) {
     }
 }
 
-/// 9da3cf2b cost measurement, not a correctness test: `#[ignore]`d, run with
-/// `cargo test -p epigraph-engine --test source_key_derivation -- --ignored
-/// --nocapture measure_intra_source_walk_cost`.
+/// 9da3cf2b cost measurement, run in every gate: its assertion (both ends of
+/// an N-claim `section_follows` chain resolve exactly the head's one paper,
+/// the tail through an N-hop closure walk, N up to 1000) is a correctness
+/// check at size, and the timings print with `cargo test -p epigraph-engine
+/// --test source_key_derivation -- --nocapture measure_intra_source_walk_cost`.
+/// It was `#[ignore]`d, which no CI lane runs (`ignored_tests_have_a_lane`);
+/// it asserts no timing, so it cannot flake on a slow lane.
 ///
 /// Builds, per size N, one paper-asserted head claim followed by a chain of N
 /// unanchored claims linked by `section_follows`, and times
@@ -408,7 +412,6 @@ async fn a_retracted_lateral_edge_does_not_link_to_the_paper(pool: PgPool) {
 /// A prod-sized figure depends on the size of the largest unanchored
 /// component, which only the operator can measure.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "measurement; run explicitly with --ignored --nocapture"]
 async fn measure_intra_source_walk_cost(pool: PgPool) {
     const CALLS: u32 = 20;
     let agent = insert_agent(&pool).await;
