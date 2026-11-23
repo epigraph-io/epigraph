@@ -233,7 +233,7 @@ pub async fn ingest_document(
             .await
             .map(|r| with_atomicity(r, atomicity));
     }
-    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    let paper_id = ensure_paper_node(server, &viewer, auth, &extraction, &doi, choice).await?;
     // A CLONE of the parent, not a fresh `new_shared`: it must carry the
     // parent's `agent_db_id` cache, `ScopedPool` and `privileged_pool` — the
     // exact state the preflight above was run against.
@@ -313,7 +313,7 @@ async fn preflight_write_authority(
     // armed (OPL01), and a linked agent whose link is not acting (OPL02) are
     // refused HERE, to the caller, instead of being told `queued` over a task
     // that writes nothing.
-    tx.owner_decl(agent_id, tool_name, &resolution).await?;
+    let decl = tx.owner_decl(agent_id, tool_name, &resolution).await?;
     // Every explicit `source.authors[].agent_id` names an agent that may
     // author (backlog 94cc12db), on the same connection the walk will use, so
     // an unknown or system id is refused to the caller BEFORE the eager
@@ -321,9 +321,13 @@ async fn preflight_write_authority(
     // exists) the name-derived authors an `agent_id` replaces are retracted
     // here too, inside this transaction, so an author this caller cannot
     // retract is refused now rather than in the task.
-    let existing_paper = find_paper_by_document_key(&server.pool, doi)
-        .await?
-        .map(|p| p.id);
+    // The row THIS ingest would write into: the document's row in the scope
+    // the ingest declares (migration 246), read on the same stamped
+    // transaction. Another scope's row of the same document is not this
+    // ingest's paper, and another group's private one is not visible here.
+    let existing_paper = PaperRepository::find_in_scope(&mut *tx, doi, decl)
+        .await
+        .map_err(internal_error)?;
     crate::tools::ingest_authors::preflight_document_authors(
         &mut tx,
         viewer,
@@ -386,7 +390,7 @@ pub async fn ingest_document_inline(
             .await
             .map(|r| with_atomicity(r, atomicity));
     }
-    let paper_id = ensure_paper_node(server, &extraction, &doi).await?;
+    let paper_id = ensure_paper_node(server, &viewer, auth, &extraction, &doi, choice).await?;
     // A clone of the parent, sharing its `agent_db_id` cache; see
     // `ingest_document` above for why a fresh `new_shared` revived revoked
     // memberships.
@@ -475,19 +479,40 @@ fn refuse_bad_author_ids(extraction: &DocumentExtraction) -> Result<(), McpError
 /// Previously both ingest entry points returned `{doi, status, title, note}`
 /// with no id at all (issue #356): a caller could not reference, verify, or
 /// link the document it had just created.
+///
+/// The row is written with the ingest's resolved tenancy (migration 246), on
+/// a transaction stamped from the ingesting agent exactly as the walk's own
+/// ([`begin_ingest_tx`], [`IngestTx::owner_decl`]), and committed on its own
+/// so the queued response can name it. A `team` or `private` ingest's row is
+/// therefore readable only by that group, like its claims.
 async fn ensure_paper_node(
     server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    auth: Option<&epigraph_auth::AuthContext>,
     extraction: &DocumentExtraction,
     doi: &str,
+    choice: epigraph_core::VisibilityChoice,
 ) -> Result<Uuid, McpError> {
-    PaperRepository::get_or_create(
-        &server.pool,
+    let author = server.write_identity(auth, viewer).await?;
+    let agent_id = author.agent_id();
+    let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
+    let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document", &resolution)
+        .await?;
+    let id = PaperRepository::get_or_create(
+        &mut *tx,
         doi,
         Some(&extraction.source.title),
         extraction.source.journal.as_deref(),
+        decl,
     )
     .await
-    .map_err(internal_error)
+    .map_err(internal_error)?;
+    tx.commit()
+        .await
+        .map_err(crate::errors::internal_error_text)?;
+    Ok(id)
 }
 
 /// Shared response body for the two queued ingest entry points.
@@ -606,32 +631,39 @@ fn queued_response(
     body
 }
 
-/// Gate check: returns `Some(paper_id)` iff a paper with `doi` exists AND has
-/// a `processed_by` edge `viewer` can read whose `properties.pipeline` equals
-/// `pipeline_version`. Mirrors the inline gate used by `do_ingest_document`.
+/// Gate check: returns `Some(paper_id)` iff a paper of `doi` that `viewer` can
+/// read has a `processed_by` edge `viewer` can read whose
+/// `properties.pipeline` equals `pipeline_version`. Mirrors the inline gate
+/// used by `do_ingest_document`.
 ///
-/// The `papers` lookup runs on the plain pool (`papers` has no row security);
-/// the EDGE read runs on a read stamped from `viewer`
-/// (`EpiGraphMcpFull::read_as`). It used to run on the plain pool too, where
-/// FORCEd row security admits public rows only, so a group-private ingest's
-/// `processed_by` stamp was invisible to the group's own members and the gate
-/// reported "not ingested".
+/// Every read runs on ONE read stamped from `viewer`
+/// (`EpiGraphMcpFull::read_as`). The `papers` rows too, since migration 246
+/// gives them row security: a stranger asking about a document another group
+/// ingested privately finds no row and gets `None`, never the paper's id (no
+/// existence oracle). A member may read several rows of one document (its
+/// group's and the public one); any of them carrying the stamp answers.
 pub async fn paper_already_ingested(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
     doi: &str,
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
-    let Some(prior) = find_paper_by_document_key(&server.pool, doi).await? else {
-        return Ok(None);
-    };
     let mut read = server.read_as(viewer, "check_already_ingested").await?;
-    let stamped =
-        PaperRepository::has_processed_by_edge(&mut *read, viewer, prior.id, pipeline_version)
+    let papers = PaperRepository::visible_by_document_key(&mut read, viewer, doi)
+        .await
+        .map_err(internal_error)?;
+    let mut hit = None;
+    for p in papers {
+        if PaperRepository::has_processed_by_edge(&mut *read, viewer, p.id, pipeline_version)
             .await
-            .map_err(internal_error)?;
+            .map_err(internal_error)?
+        {
+            hit = Some(p.id);
+            break;
+        }
+    }
     read.commit().await.map_err(internal_error)?;
-    Ok(stamped.then_some(prior.id))
+    Ok(hit)
 }
 
 /// Pre-flight idempotency check exposing the same `(doi, pipeline)` gate that
@@ -677,9 +709,10 @@ pub async fn check_already_ingested(
     // for every chunk only because each chunk now writes its own stamp (G8
     // review: the triple-keyed writer kept only the first chunk's).
     //
-    // The `processed_by` stamps are read as the CALLER (see
-    // `paper_already_ingested`): on the plain pool a group-private ingest read
-    // as "not ingested" to the group that ran it.
+    // The `papers` rows and their `processed_by` stamps are read as the CALLER
+    // (see `paper_already_ingested`): on the plain pool a group-private ingest
+    // read as "not ingested" to the group that ran it, and, before migration
+    // 246, any caller learned the paper id of a document only a team ingested.
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
             let paper_id = paper_already_ingested(server, viewer, &params.doi, &exact).await?;
@@ -687,24 +720,30 @@ pub async fn check_already_ingested(
             (exact, paper_id, matched)
         }
         None => {
-            let paper = find_paper_by_document_key(&server.pool, &params.doi).await?;
-            let matched = match &paper {
-                Some(p) => {
-                    let mut read = server.read_as(viewer, "check_already_ingested").await?;
-                    let matched = PaperRepository::processed_by_pipelines_in_family(
-                        &mut *read,
-                        viewer,
-                        p.id,
-                        PIPELINE_VERSION_BASE,
-                    )
-                    .await
-                    .map_err(internal_error)?;
-                    read.commit().await.map_err(internal_error)?;
-                    matched
+            // Every row of the document the caller may read (migration 246),
+            // on one stamped read; the first that carries a stamp of the
+            // family answers.
+            let mut read = server.read_as(viewer, "check_already_ingested").await?;
+            let papers = PaperRepository::visible_by_document_key(&mut read, viewer, &params.doi)
+                .await
+                .map_err(internal_error)?;
+            let mut found = (None, Vec::new());
+            for p in papers {
+                let matched = PaperRepository::processed_by_pipelines_in_family(
+                    &mut *read,
+                    viewer,
+                    p.id,
+                    PIPELINE_VERSION_BASE,
+                )
+                .await
+                .map_err(internal_error)?;
+                if !matched.is_empty() {
+                    found = (Some(p.id), matched);
+                    break;
                 }
-                None => Vec::new(),
-            };
-            let paper_id = paper.filter(|_| !matched.is_empty()).map(|p| p.id);
+            }
+            read.commit().await.map_err(internal_error)?;
+            let (paper_id, matched) = found;
             (PIPELINE_VERSION_BASE.to_string(), paper_id, matched)
         }
     };
@@ -1408,10 +1447,11 @@ fn is_author_attribution(edge: &epigraph_ingest::common::plan::PlannedEdge) -> b
 /// `--visibility` / `--group-id` flags. A test harness that needs a public
 /// paper passes [`epigraph_core::VisibilityChoice::Public`].
 ///
-/// `choice` scopes the CLAIMS only. The `papers` row (title, DOI, journal),
-/// the author agents and the `processed_by` stamp carry no tenancy and stay
-/// world-readable whatever `choice` is. See
-/// docs/tenancy/claim-visibility-controls.md section 3.1 and
+/// `choice` scopes the claims AND, since migration 246, the `papers` row
+/// (title, DOI, journal) and so every edge onto it (`authored`,
+/// `processed_by`, `asserts`), which take the meet with the paper's row. The
+/// author agents themselves are still public identity rows: an author's name
+/// stays readable whatever `choice` is. See
 /// docs/tenancy/papers-tenancy-followup.md.
 pub async fn do_ingest_document(
     server: &EpiGraphMcpFull,
@@ -1468,7 +1508,6 @@ pub async fn do_ingest_document_reporting(
     refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
-    let pool = &server.pool;
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -1497,22 +1536,12 @@ pub async fn do_ingest_document_reporting(
     // write nothing" contract the rest of this branch establishes.
     let claim_labels = ingest_claim_labels(extraction, &doi)?;
 
-    // ── 1. Get-or-create paper node ──
     // (Pipeline-version gate removed: deterministic node ids handle idempotency
     //  so re-ingesting an abstract then the full paper is safe — structural nodes
     //  by document-scoped id, atoms by content hash.
     //  Use ingest_document_spine → ingest_document_inline for the two-phase
     //  flow that avoids redundant LLM atomization.)
-    let paper_id = PaperRepository::get_or_create(
-        pool,
-        &doi,
-        Some(&paper_title),
-        extraction.source.journal.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
-
-    // ── 2. ONE transaction for the whole walk, stamped from the INGESTING agent ──
+    // ── 1. ONE transaction for the whole walk, stamped from the INGESTING agent ──
     //
     // Every claim below is authored by the write identity and owned by `decl`
     // (that agent's personal group, or its operator's when it is
@@ -1531,11 +1560,38 @@ pub async fn do_ingest_document_reporting(
     // the fresh-UUID trace/evidence rows are written only for a claim that was
     // new in THIS transaction, so a rolled-back attempt leaves none behind.
     //
-    // `papers` stays on the pool: it has no row-level security, and
-    // `ensure_paper_node` already created the row synchronously before this
-    // task was spawned, so the call above is an idempotent read of it.
+    // The `papers` row is written HERE, on this transaction, with the claims'
+    // declaration (migration 246): a `team` or `private` ingest's paper is
+    // that group's, like its claims. `ensure_paper_node` already created it
+    // synchronously before this task was spawned, under the same declaration,
+    // so on that path the call below is an idempotent read of it.
+    //
+    // Tenancy declaration (PR-16), hoisted above the paper and the claim loop
+    // -- see `persist_planned_claim`'s `decl` parameter for why. `TenancyDecl`
+    // is `Copy`, so passing it per iteration costs nothing.
+    //
+    // On the STAMPED transaction, and through a helper that never mints:
+    // `IngestTx::owner_decl`. The earlier comment here said "an author with no
+    // live writable group was already refused by `begin_author_stamped_tx`" —
+    // true, and the wrong discriminator: an author live in a TEAM group but
+    // revoked in its personal one passed that check, and
+    // `default_decl_for_author`'s mint path then revived the revoked admin
+    // membership inside this transaction. See `owner_decl`.
     let resolution = resolve_ingest_visibility(server, author.agent_id(), choice).await?;
     let mut tx = begin_ingest_tx(server, author, "ingest_document", resolution.grant()).await?;
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document", &resolution)
+        .await?;
+    // ── 2. Get-or-create the paper node, in the declared scope ──
+    let paper_id = PaperRepository::get_or_create(
+        &mut *tx,
+        &doi,
+        Some(&paper_title),
+        extraction.source.journal.as_deref(),
+        decl,
+    )
+    .await
+    .map_err(internal_error)?;
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -1677,20 +1733,7 @@ pub async fn do_ingest_document_reporting(
     let mut caller_labels_withheld = 0_usize;
     let mut ds_entries: Vec<BatchDsEntry> = Vec::new();
 
-    // Tenancy declaration (PR-16), hoisted above the loop -- see
-    // `persist_planned_claim`'s `decl` parameter for why. `TenancyDecl` is
-    // `Copy`, so passing it per iteration costs nothing.
-    //
-    // On the STAMPED transaction, and through a helper that never mints:
-    // `IngestTx::owner_decl`. The earlier comment here said "an author with no
-    // live writable group was already refused by `begin_author_stamped_tx`" —
-    // true, and the wrong discriminator: an author live in a TEAM group but
-    // revoked in its personal one passed that check, and
-    // `default_decl_for_author`'s mint path then revived the revoked admin
-    // membership inside this transaction. See `owner_decl`.
-    let decl = tx
-        .owner_decl(agent_id, "ingest_document", &resolution)
-        .await?;
+    // `decl` was resolved above, before the paper row (see there).
     for planned in &plan.claims {
         let confidence = planned.confidence.clamp(0.0, 1.0);
         let methodology = methodology_from_planned(planned);
@@ -2231,28 +2274,6 @@ fn ingest_claim_labels(
 // identically (backlog 90756d26). See `epigraph_db::repos::paper`.
 pub(crate) use epigraph_db::repos::paper::canonical_document_key;
 
-/// Find the `papers` row a caller-supplied document key names, trying each of
-/// [`epigraph_db::repos::paper::document_key_spellings`] in order: the
-/// [`canonical_document_key`] first, then the key as given (trimmed), then,
-/// for a bare DOI, each legacy resolver-prefix spelling of it. A row written
-/// under a resolver-URL spelling before keys were canonicalized is thus found
-/// by that spelling AND by the bare DOI, which is what the monitor's dedup
-/// probe asks with.
-pub(crate) async fn find_paper_by_document_key(
-    pool: &sqlx::PgPool,
-    raw: &str,
-) -> Result<Option<epigraph_db::PaperRow>, McpError> {
-    for spelling in epigraph_db::repos::paper::document_key_spellings(raw) {
-        if let Some(row) = PaperRepository::find_by_doi(pool, &spelling)
-            .await
-            .map_err(internal_error)?
-        {
-            return Ok(Some(row));
-        }
-    }
-    Ok(None)
-}
-
 /// Resolve the identity key a document's `papers` row is keyed on.
 ///
 /// Priority: real DOI → arXiv id parsed from `uri` → a DOI spelled as `uri` →
@@ -2499,7 +2520,6 @@ pub async fn do_ingest_document_spine(
     refuse_bad_author_ids(extraction)?;
 
     let plan = build_ingest_plan(extraction);
-    let pool = &server.pool;
     // Author = the request's principal (batch H-b, D1); signer = this server's
     // key, recorded on evidence as its `signer_id` (see `Evidence::agent_id`).
     let author = server.write_identity(auth, viewer).await?;
@@ -2545,16 +2565,6 @@ pub async fn do_ingest_document_spine(
         map
     };
 
-    // ── 1. Get-or-create paper node ──
-    let paper_id = PaperRepository::get_or_create(
-        pool,
-        &doi,
-        Some(&paper_title),
-        extraction.source.journal.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
-
     // ONE transaction for the spine walk, stamped from the ingesting agent —
     // the same conversion, for the same reasons, as `do_ingest_document`'s
     // (see the comment there): on the unstamped pool the first claim INSERT was
@@ -2565,6 +2575,22 @@ pub async fn do_ingest_document_spine(
     let resolution = resolve_ingest_visibility(server, agent_id, choice).await?;
     let mut tx =
         begin_ingest_tx(server, author, "ingest_document_spine", resolution.grant()).await?;
+    // Hoisted above the paper row, through the same never-minting helper as
+    // `do_ingest_document`'s: the paper is written in the claims' scope
+    // (migration 246).
+    let decl = tx
+        .owner_decl(agent_id, "ingest_document_spine", &resolution)
+        .await?;
+    // ── 1. Get-or-create the paper node, in the declared scope ──
+    let paper_id = PaperRepository::get_or_create(
+        &mut *tx,
+        &doi,
+        Some(&paper_title),
+        extraction.source.journal.as_deref(),
+        decl,
+    )
+    .await
+    .map_err(internal_error)?;
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -2690,10 +2716,7 @@ pub async fn do_ingest_document_spine(
     let mut caller_labels_withheld = 0_usize;
     let mut new_paragraph_paths: Vec<String> = Vec::new();
 
-    // Hoisted, as above, and through the same never-minting helper.
-    let decl = tx
-        .owner_decl(agent_id, "ingest_document_spine", &resolution)
-        .await?;
+    // `decl` was resolved above, before the paper row.
     for planned in &plan.claims {
         if planned.level == 3 {
             continue;
@@ -3034,9 +3057,15 @@ mod tests {
         .is_none());
 
         // Create the paper without a processed_by edge → still not ingested.
-        let paper_id = PaperRepository::get_or_create(&pool, doi, Some("test"), None)
-            .await
-            .expect("create paper");
+        let paper_id = PaperRepository::get_or_create(
+            &pool,
+            doi,
+            Some("test"),
+            None,
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
+        .expect("create paper");
         assert!(paper_already_ingested(
             &server_over(&pool),
             &epigraph_db::visibility::Viewer::resolve(&pool, uuid::Uuid::nil())

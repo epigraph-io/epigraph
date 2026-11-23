@@ -888,16 +888,37 @@ async fn a_group_private_non_claim_neighbour_is_dropped_rather_than_bared(pool: 
         common::insert_edge(&pool, evidence, center, "evidence", "claim", "supports").await;
     make_evidence_private(&pool, evidence, owner).await;
 
-    // Untenanted neighbours: `agents` and `papers` are not in migration 062's
-    // `tier_a` array and carry no `owner_group_id`, so there is nothing to
-    // withhold and both must still arrive — for the stranger too.
+    // Readable neighbours: `agents` carry no `owner_group_id`, and a PUBLIC
+    // paper is readable by everyone, so both must still arrive — for the
+    // stranger too.
     let agent = seed_agent_named(&pool, "Dr. Ada Lovelace").await;
     let agent_edge =
         common::insert_edge(&pool, center, agent, "claim", "agent", "attributed_to").await;
     let paper = seed_paper(&pool, "A Paper With A Title").await;
     let paper_edge = common::insert_edge(&pool, center, paper, "claim", "paper", "asserts").await;
+    // A group-private paper (migration 246: a private ingest's paper row is
+    // the group's): withheld like the private trace and evidence.
+    let secret_paper = seed_paper(&pool, "A Confidential Title").await;
+    let secret_paper_edge =
+        common::insert_edge(&pool, center, secret_paper, "claim", "paper", "asserts").await;
+    sqlx::query("UPDATE papers SET visibility = 'group', owner_group_id = $2 WHERE id = $1")
+        .bind(secret_paper)
+        .bind(personal_group_for(&pool, owner).await)
+        .execute(&pool)
+        .await
+        .expect("make the paper group-private");
 
-    force_edges_public(&pool, &[trace_edge, evidence_edge, agent_edge, paper_edge]).await;
+    force_edges_public(
+        &pool,
+        &[
+            trace_edge,
+            evidence_edge,
+            agent_edge,
+            paper_edge,
+            secret_paper_edge,
+        ],
+    )
+    .await;
 
     let app = router(&pool).await;
     let path = format!("/api/v1/claims/{center}/ego");
@@ -927,6 +948,10 @@ async fn a_group_private_non_claim_neighbour_is_dropped_rather_than_bared(pool: 
         "the private evidence's uuid appears in the response: {raw_body}"
     );
     assert!(
+        !raw_body.contains(&secret_paper.to_string()) && !raw_body.contains("Confidential"),
+        "the private paper's uuid or title appears in the response: {raw_body}"
+    );
+    assert!(
         !raw_body.contains("\"trace\""),
         "even the bare entity type of a hidden trace is a disclosure: {raw_body}"
     );
@@ -950,7 +975,7 @@ async fn a_group_private_non_claim_neighbour_is_dropped_rather_than_bared(pool: 
         "invisibility is not cap-truncation, got {body}"
     );
 
-    // CALIBRATION: the owner sees all four, hydrated. Without this arm the
+    // CALIBRATION: the owner sees all five, hydrated. Without this arm the
     // assertions above would pass against a handler that dropped every
     // non-claim neighbour, or returned nothing at all.
     let owner_token = common::mint_token_with_agent(&["claims:read"], owner);
@@ -962,18 +987,20 @@ async fn a_group_private_non_claim_neighbour_is_dropped_rather_than_bared(pool: 
         agent.to_string(),
         evidence.to_string(),
         paper.to_string(),
+        secret_paper.to_string(),
         trace.to_string(),
     ];
     want.sort();
     assert_eq!(ids, want, "body: {body}");
+    assert_eq!(node(&body, secret_paper)["label"], "A Confidential Title");
     assert_eq!(node(&body, trace)["entity_type"], "trace");
     assert_eq!(node(&body, trace)["label"], "deductive (0.75)");
     assert_eq!(node(&body, evidence)["entity_type"], "evidence");
     assert_eq!(node(&body, evidence)["label"], "Evidence: 10.1234/secret");
     assert_eq!(node(&body, agent)["label"], "Dr. Ada Lovelace");
     assert_eq!(node(&body, paper)["label"], "A Paper With A Title");
-    assert_eq!(body["edges"].as_array().expect("edges").len(), 4);
-    assert_eq!(body["total_edges"], 4);
+    assert_eq!(body["edges"].as_array().expect("edges").len(), 5);
+    assert_eq!(body["total_edges"], 5);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

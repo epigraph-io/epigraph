@@ -231,19 +231,6 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "tools/ingestion.rs",
-        "PaperRepository::get_or_create",
-        3,
-        "The `papers` upsert, three times: `ensure_paper_node` (synchronous, before the detached \
-         task is spawned), and the walk-opening call in `do_ingest_document` and \
-         `do_ingest_document_spine` (the last two reached through `let pool = &server.pool`, which \
-         this scan now follows). `papers` has NO row-level security \
-         (`relrowsecurity = false`, measured at head 101), so these are admitted unstamped by \
-         construction, and `ensure_paper_node` has already created the row before the walk's \
-         call runs. The rest of both walks runs on ONE transaction stamped from the ingesting \
-         agent (Unit E); reverting any of those statements to `pool` adds an entry here.",
-    ),
-    (
-        "tools/ingestion.rs",
         "server.pool.begin",
         1,
         "`begin_ingest_tx`'s PRIVILEGED arm: a plain transaction, taken ONLY when the server has \

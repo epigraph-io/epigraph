@@ -792,6 +792,10 @@ pub const FORCE_PROTECTED_SET: &[&str] = &[
     // migration that creates them, on the same precedent; their policies
     // inherit the workflow row's tenancy.
     "workflow_outcome_reports",
+    // Paper rows (246, backlog 34864fb5): given tenancy columns and FORCEd by
+    // that migration, on the same precedent. Apply 246 before or with a binary
+    // carrying this name.
+    "papers",
 ];
 
 /// The role the application is expected to connect as from plan §9.2 step 11d.

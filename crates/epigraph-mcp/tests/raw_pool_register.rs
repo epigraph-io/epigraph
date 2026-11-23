@@ -389,34 +389,9 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     // ── epigraph-mcp: tables without row security ────────────────────────
     (
         "epigraph-mcp/src/tools/ingestion.rs",
-        "check_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "paper_already_ingested",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "preflight_write_authority",
-        1,
-        NO_ROW_SECURITY,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
         "resolve_ingest_visibility",
         1,
         DEFINER_RESOLUTION,
-    ),
-    (
-        "epigraph-mcp/src/tools/paper_queries.rs",
-        "query_paper",
-        1,
-        "NO_ROW_SECURITY: the `papers` lookup (find_paper_by_document_key); every claim-derived \
-         read below it runs on the caller's stamped read.",
     ),
     (
         "epigraph-mcp/src/tools/matching.rs",
@@ -452,24 +427,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
     (
         "epigraph-mcp/src/tools/ingestion.rs",
         "begin_ingest_tx",
-        1,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_reporting",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_spine",
-        2,
-        REGISTERED_WRITE,
-    ),
-    (
-        "epigraph-mcp/src/tools/ingestion.rs",
-        "ensure_paper_node",
         1,
         REGISTERED_WRITE,
     ),
@@ -576,7 +533,12 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// caller's stamped connection, removing four rows: 86 -> 82. Backlog
 /// 06f5c5b2 moved the theme label lookup and `count_summaries` onto the
 /// caller's stamped read, removing four more: 82 -> 78.
-const HIGH_WATER: usize = 78;
+/// Migration 246 (backlog 34864fb5) gave `papers` row security, so the ingest
+/// tools' `papers` writes moved onto the ingesting agent's stamped transaction,
+/// removing four rows (six sites): 78 -> 72 (82 -> 76 on its own branch).
+/// Their `papers` reads (`check_already_ingested`, `paper_already_ingested`,
+/// `query_paper`) then moved onto the caller's stamped read: 72 -> 69.
+const HIGH_WATER: usize = 69;
 
 // ===========================================================================
 // The scanner.

@@ -3644,6 +3644,25 @@ restart.
   old one leaves the stale verdict). Claims that already hold a fold of narrowed evidence
   are otherwise cleared only at their next owner-rule recompute on a stamped or maintenance
   session; nothing runs at the narrowing act itself.
+- **246**: `papers_tenancy` (backlog 34864fb5, option 2 of
+  `docs/tenancy/papers-tenancy-followup.md`). A `papers` row carries the tenancy of the ingest
+  that wrote it: `visibility` and `owner_group_id` in 183's tier-A shape (no default,
+  `papers_require_tenancy`, 115's owner guard plus `epigraph_papers_visibility_guard`), every
+  existing row backfilled to `('public', world)`, ENABLEd and FORCEd row security (read public
+  or a group in the read set, insert a written group, update a readable row, no application
+  delete, 126-style elevated write refusals). 001's `UNIQUE (doi)` constraints are replaced by
+  the unique index `papers_document_key_scope_key` on `(doi, scope)` (a public row's scope is
+  the world group, a group row's its owner): one public row per document, one row per group
+  for private copies. Re-states 219's `epigraph_node_tenancy` (a `paper` arm) and
+  `epigraph_propagate_tenancy` (paper joins), behind an md5 precondition on 219's bodies.
+  Pinned by `epigraph-db/tests/papers_tenancy.rs` (backfill, shape, app-role scope and
+  refusals, edge meet and re-meet, the undo) and
+  `epigraph-mcp/tests/paper_tenancy_app_role.rs`. Undo: `docs/runbooks/246-undo.sql`
+  (refuses while a paper is private or a key has two rows). **Deploy order:** migrate and
+  roll the binary out together: a pre-246 binary's paper writes are refused by
+  `papers_require_tenancy` (document ingest and `POST /api/v1/papers` fail), and a 246 binary
+  names columns and an index a pre-246 database lacks (its boot posture check also lists
+  `papers` as FORCEd).
 
 ## `-- no-transaction` migrations
 

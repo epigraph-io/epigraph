@@ -836,7 +836,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// branch): the key rotate and revoke routes run their reads and the key definers on the caller's stamped
 /// transaction (`routes/agent_keys.rs` 6 -> 1, the list read left). No file
 /// reached zero.
-const HIGH_WATER: usize = 176;
+/// 176 -> 173 (backlog 34864fb5, migration 246; 187 -> 184 on its own
+/// branch): `create_paper` writes and reads back on the caller's stamped
+/// transaction (`routes/papers.rs` 4 -> 1). No file reached zero.
+const HIGH_WATER: usize = 173;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -1157,9 +1160,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // Backlog fe75ef36 / b7354adc then gave `GET /api/v1/papers` per-viewer
     // fields (authors, claim count, ingests), so `list_papers` took a
     // `ViewerExtractor`, and its four registry reads moved onto the same
-    // `AppState::read_as` connection. The four that remain are
-    // `create_paper`'s, two of them writes.
-    ("routes/papers.rs", 4),
+    // `AppState::read_as` connection. The four that remained were
+    // `create_paper`'s, two of them writes; migration 246 (backlog 34864fb5)
+    // gave `papers` row security, so `create_paper` now writes and reads back
+    // on the caller's stamped transaction (`begin_claim_write`). The one that
+    // remains is its `default_decl_for_author_pool(&state.db_pool, ..)`, the
+    // home-group resolution every claim-writing handler makes on the pool.
+    ("routes/papers.rs", 1),
     // 5 before conversion shard 5, which moved `list_perspectives`,
     // `get_perspective` and `agent_perspectives` onto `AppState::read_as`, and
     // 2 before `set_source_reliability` (an `UPDATE`) moved onto

@@ -9,9 +9,15 @@ use helpers::{make_agent, make_claim};
 async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     // Set up real source (paper) and target (claim) so the edge-validation
     // trigger doesn't reject the insert.
-    let paper_id = PaperRepository::get_or_create(&pool, "10.1234/idem", Some("Idempotency"), None)
-        .await
-        .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/idem",
+        Some("Idempotency"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
 
     let agent = make_agent(Some("a"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();
@@ -57,9 +63,15 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
-    let paper_id = PaperRepository::get_or_create(&pool, "10.1234/rel", Some("Relationship"), None)
-        .await
-        .expect("create paper");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.1234/rel",
+        Some("Relationship"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("create paper");
 
     let agent = make_agent(Some("b"));
     let agent_row = AgentRepository::create(&pool, &agent).await.unwrap();

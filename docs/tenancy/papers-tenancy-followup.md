@@ -1,8 +1,15 @@
 # Follow-up: tenancy for an ingested paper's own record
 
-Status: design note, not implemented. Operator ruling, 2026-11-11: document the gap in the claim
-visibility work now and close it in a follow-up PR. Until that PR lands, **do not ingest a
-confidential document**, whatever `visibility` you pass.
+Status: option 2 (section 3) chosen by the 2026-11-16 design decision (backlog 34864fb5), and
+implemented for the `papers` row by migration 246 (section 6). Still open: the author agents'
+own tenancy, widening and merging a paper on publicize/share, the narrowing guard and the `doi:`
+label on converged public claims (section 7). Until those land, an ingest's author NAMES stay
+readable by every agent whatever `visibility` you pass, and so does an author's `asserts`
+attribution edge onto an already-public claim the ingest converges onto, so do not ingest a
+document whose author list is itself confidential.
+
+The sections below are the original design note (operator ruling, 2026-11-11: document the gap
+in the claim visibility work and close it in a follow-up), kept as written.
 
 ## 1. The gap
 
@@ -100,3 +107,52 @@ On the app role (`ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
   UPDATE.
 * A mutation probe for each read path: drop the policy (or bind the row public) and the
   non-member assertions go red.
+
+## 6. What migration 246 implemented (option 2, papers)
+
+* `papers.visibility` and `papers.owner_group_id` in 183's tier-A shape (no default; 074's
+  `papers_require_tenancy`; 115's owner guard plus a visibility guard, so only a maintenance
+  session re-tenants a row), every existing row backfilled to `('public', world)`, and ENABLEd +
+  FORCEd row security (read: public or a group in the read set; insert: a group the session
+  writes; update: a readable row; no application delete; 126-style elevated write refusals).
+* One row per document per SCOPE: 001's `UNIQUE (doi)` is replaced by a unique index on
+  `(doi, CASE WHEN visibility = 'public' THEN world ELSE owner_group_id END)`. Every public
+  ingest of a document converges on its one public row, whoever owns it (corroboration and a
+  public ingest behave as before); each group's private ingest gets its own row, and neither
+  group can see or collide with the other's. `PaperRepository::get_or_create` takes the
+  ingest's `TenancyDecl` and matches the declared scope, not merely what the session can see.
+* `epigraph_node_tenancy` has a `paper` arm and `epigraph_propagate_tenancy` meets a paper
+  endpoint with its own row (219's shape), so `authored`, `processed_by` and `asserts` edges
+  onto a group paper are group edges, including `asserts` onto a converged public claim.
+* Writers: the MCP ingest walks (`do_ingest_document`, `do_ingest_document_spine`) and the
+  queued entry points' `ensure_paper_node` write the row on the ingesting agent's stamped
+  transaction with the resolved declaration; `POST /api/v1/papers` registers a public row owned
+  by the caller's home group on the caller's stamped transaction.
+* Readers: `check_already_ingested` (both arms), `query_paper` and the ingest preflight read
+  the rows on the caller's stamped connection (`PaperRepository::visible_by_document_key`), so a
+  document another group ingested privately answers exactly as an unknown one; `GET
+  /api/v1/papers` already read on the caller's stamp and is now filtered by the row security.
+* Undo: `docs/runbooks/246-undo.sql` (refuses while any paper is private or a key has two rows).
+
+## 7. What remains (backlog 34864fb5, items 2, 3, 6, 7 and part of 8)
+
+* Author agents (non-principal, name-derived identity nodes) carry no tenancy yet: an author's
+  name is world-readable, though the `authored` edge onto a group paper is not. The walk's
+  `author -asserts-> claim` attribution edge onto a claim it CONVERGES onto (an already-public
+  atom) declares no tenancy, so with both endpoints public the meet leaves it public, and
+  `get_neighborhood` / `traverse` from that claim tie the name to it. Private author agents
+  close this; until then it is part of "do not ingest a confidential author list". Their
+  deterministic name-derived key and `agents.public_key` uniqueness must become tenant-scoped
+  before they can be private; principals stay public. `find_agent` / `get_agent` and the agents
+  routes then need the viewer.
+* Widening: `epigraph_publicize_claims` / `share_claims_with_team` do not yet widen a paper or
+  merge it into the target scope's row (merge on equal document key, re-point the edges, keep
+  every ingest's provenance, a `merged_into` redirect, an audited and revertible event). Until
+  then a publicized claim's `asserts` edge from a group paper stays the group's.
+* Narrowing: a public paper cannot be privatized by an application session at all today (the
+  visibility guard); the rule for a maintenance re-tenant (privatize only while no other
+  group's claim or edge references the paper, as for evidence) is open.
+* The `doi:<doi>` label a non-public ingest adds to a converged public claim (section 4).
+* Engine reads of `papers` (`edge_factor.rs`, `matching/source_key.rs`) run under the session
+  they are given, so on an unstamped pool a group paper is invisible to them.
+

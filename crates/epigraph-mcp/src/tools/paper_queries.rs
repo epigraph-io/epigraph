@@ -157,12 +157,18 @@ pub async fn query_paper(
     };
 
     // Canonical key first (a `https://doi.org/` spelling finds the bare-DOI
-    // row), then the key as given; see `find_paper_by_document_key`.
-    // `papers` carries no row security (it is a registry keyed on the
-    // document), so the lookup takes no stamp; every claim-derived read below
-    // runs on the caller's stamped read.
-    let paper =
-        crate::tools::ingestion::find_paper_by_document_key(&server.pool, &params.doi).await?;
+    // row), then the key as given; see `PaperRepository::visible_by_document_key`. Since
+    // migration 246 `papers` carries the tenancy of the ingest that wrote it,
+    // so the lookup runs on the caller's stamped read like every claim-derived
+    // read below: a document another group ingested privately answers exactly
+    // as an unknown one (no existence oracle). Of several readable rows (the
+    // caller's group's copy and the public one) the group's own comes first.
+    let mut read = server.read_as(viewer, "query_paper").await?;
+    let paper = PaperRepository::visible_by_document_key(&mut read, viewer, &params.doi)
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .next();
 
     let Some(paper) = paper else {
         return success_json(&PaperResponse {
@@ -183,7 +189,6 @@ pub async fn query_paper(
         });
     };
 
-    let mut read = server.read_as(viewer, "query_paper").await?;
     let asserted_count = PaperRepository::count_asserted_claims(&mut *read, viewer, paper.id)
         .await
         .map_err(internal_error)?;

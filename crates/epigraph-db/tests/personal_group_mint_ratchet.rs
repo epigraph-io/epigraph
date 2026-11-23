@@ -316,6 +316,14 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         "Hypothesis route on `state.db_pool` (unstamped). Definer answer.",
     ),
     (
+        "epigraph-api/src/routes/papers.rs",
+        "default_decl_for_author_pool",
+        1,
+        "POST /api/v1/papers (migration 246): the caller's home group, which owns the public \
+         paper row it registers, on `state.db_pool` (unstamped) as the hypothesis route \
+         does. Definer answer.",
+    ),
+    (
         "epigraph-api/src/routes/policies.rs",
         "default_decl_for_author_pool",
         1,

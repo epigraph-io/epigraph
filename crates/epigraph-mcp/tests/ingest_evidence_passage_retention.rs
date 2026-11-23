@@ -56,9 +56,15 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 
 /// Record a licence on the paper row before ingest, the way an operator would.
 async fn set_licence(pool: &PgPool, doi: &str, title: &str, licence: &str) {
-    let paper_id = PaperRepository::get_or_create(pool, doi, Some(title), None)
-        .await
-        .expect("paper row");
+    let paper_id = PaperRepository::get_or_create(
+        pool,
+        doi,
+        Some(title),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("paper row");
     sqlx::query("UPDATE papers SET licence = $2 WHERE id = $1")
         .bind(paper_id)
         .bind(licence)
@@ -254,9 +260,15 @@ async fn spine_ingest_retains_passage_under_open_licence(pool: PgPool) {
 /// Migration 226's CHECK refuses a licence that names nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn blank_licence_is_refused(pool: PgPool) {
-    let paper_id = PaperRepository::get_or_create(&pool, "10.9999/b60-blank", Some("Blank"), None)
-        .await
-        .expect("paper row");
+    let paper_id = PaperRepository::get_or_create(
+        &pool,
+        "10.9999/b60-blank",
+        Some("Blank"),
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("paper row");
     for bad in ["", " CC-BY-4.0"] {
         let err = sqlx::query("UPDATE papers SET licence = $2 WHERE id = $1")
             .bind(paper_id)

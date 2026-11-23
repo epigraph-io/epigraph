@@ -939,19 +939,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: methods.
     ("methods.rs", "get_method", &["MethodRepository::get"]),
-    // untenanted: the `papers` registry rows and their count, read on the
-    // caller's stamped connection. `papers` carries no row security (it is
-    // keyed on the document, not on a tenant), so no viewer predicate applies.
-    // Every claim-derived field (authors, claim count, ingests) is read by
-    // `paper_listings` on the same connection, with the viewer.
+    // (`papers.rs::list_papers` left this list with backlog 34864fb5's review:
+    // its four `papers` statements now bind the viewer's predicate as well as
+    // running on the caller's stamped connection.)
+    // stamped write (migration 246): the caller's home group (a definer
+    // answer on the pool, as every claim-writing handler resolves it), then
+    // the public paper row written and read back on the caller's stamped
+    // transaction (`begin_claim_write`), whose row security decides.
     (
         "papers.rs",
-        "list_papers",
+        "create_paper",
         &[
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query(SELECT).fetch_all",
-            "sqlx::query_scalar(SELECT).fetch_one",
-            "sqlx::query_scalar(SELECT).fetch_one",
+            "ClaimRepository::default_decl_for_author_pool",
+            "PaperRepository::get_or_create",
+            "PaperRepository::registered_row",
         ],
     ),
     // gated (`PerspectiveRepository::get_by_id`) then write, on a transaction

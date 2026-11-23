@@ -4199,11 +4199,36 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "paper.rs",
         "licence",
-        "READ of `papers.licence` for one paper id (migration 226). `papers` carries no tenancy \
-         (127): there is no visibility or owner_group_id column and no policy, so there is \
-         nothing to filter, and the answer is one operator-set licence string, never claim \
-         content. Ingest only reads it, to decide whether a source may be treated as \
-         open-licensed; `None` means all rights reserved.",
+        "READ of `papers.licence` for one paper id (migration 226), on the ingest's own \
+         stamped transaction, for the paper that transaction just got-or-created: since \
+         migration 246 `papers` has row security, so the row is admitted only because the \
+         ingesting session may read it, and the answer is one operator-set licence string, \
+         never claim content. `None` means all rights reserved.",
+    ),
+    (
+        "paper.rs",
+        "get_or_create",
+        "WRITE (get-or-create) of one `papers` row in the scope its declared `TenancyDecl` \
+         names (migration 246), on the writer's stamped transaction. The row security \
+         decides: the INSERT is admitted only for an owner group the session writes, and \
+         the scope's conflicting row is always one the writer reads (public, or its own \
+         group's). The id it returns is the writer's own row; it reads nothing else.",
+    ),
+    (
+        "paper.rs",
+        "find_in_scope",
+        "READ of the id of the `papers` row a write declared with `decl` would reuse \
+         (migration 246), on the writer's stamped transaction: the declaration, not a \
+         viewer, is the filter (a member sees its group's row and the public one and must \
+         pick the declared scope's), and the row security of that transaction still \
+         hides every other group's row. One id, no content.",
+    ),
+    (
+        "paper.rs",
+        "registered_row",
+        "READ-BACK of the one `papers` row `get_or_create` just returned, on the same \
+         stamped transaction, for `POST /api/v1/papers`'s response; the row security of \
+         that transaction admits it because the caller wrote or reads it.",
     ),
 ];
 
