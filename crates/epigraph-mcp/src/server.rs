@@ -416,9 +416,10 @@ impl EpiGraphMcpFull {
 /// the `OPERATED_BY` upsert. Shared, that happens once per principal per
 /// process per [`DEFAULT_AUTH_LINEAGE_TTL`]: an entry expires, so an edge
 /// retracted or deleted after a success is rewritten within one TTL of the
-/// principal's next call instead of staying missing until a restart. Everything else a session server holds is either immutable
-/// configuration or an `Arc` the old constructor already shared (`signer`,
-/// `embedder`, `federation`, the `ScopedPool`).
+/// principal's next call instead of staying missing until a restart.
+/// Everything else a session server holds is either immutable configuration
+/// or an `Arc` the old constructor already shared (`signer`, `embedder`,
+/// `federation`, the `ScopedPool`).
 ///
 /// # A cost, stated
 ///
@@ -649,8 +650,16 @@ impl EpiGraphMcpFull {
     ///   its field doc): a principal linked less than `auth_lineage_ttl` ago
     ///   short-circuits before touching the DB; an older entry is a miss, so
     ///   an edge retracted or deleted since is re-asserted. The DB
-    ///   `create_if_not_exists` is the true idempotency authority (exactly one
-    ///   edge across processes); the set is only a fast in-memory guard.
+    ///   `create_if_not_exists` is the dedup authority; the memo is only a
+    ///   fast in-memory guard. That dedup is check-then-insert with no lock
+    ///   and no unique index on the triple, so it is not exactly-once: two
+    ///   calls that both miss the memo while NO in-force edge exists (a
+    ///   process's first call per principal, or the first calls after an
+    ///   entry expires following a retraction) can each insert one. The
+    ///   result is two in-force rows for the same pair: an edge listing shows
+    ///   both, and the operator-link shared-signer checks are unaffected
+    ///   because they count distinct principals. While the edge is in force
+    ///   an expired entry costs a probe, never a second row.
     /// - **Best-effort**: any failure (e.g. a stale `principal` that no longer
     ///   exists, which trips the `validate_edge_reference` existence trigger) is
     ///   logged at WARN and swallowed. The caller's tool result is NEVER affected.
