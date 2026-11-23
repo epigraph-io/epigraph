@@ -1363,3 +1363,97 @@ async fn reverse_refuses_runs_it_must_not_delete(pool: PgPool) {
     );
     assert!(reversed_audit_rows(&pool).await.is_empty());
 }
+
+/// The reverse verb end to end through the binaries an operator runs: each
+/// binary reverses only its own apply's run (the wiring of `ApplyKind` and
+/// `--run-id`), the default is a dry run that leaves the run in place, and
+/// `--apply` removes it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_binaries_reverse_their_own_runs_dry_run_first(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    let map = c.map();
+    let mut conn = pool.acquire().await.unwrap();
+    let meaning_run = run_id(
+        &epigraph_cli::atlas_meaning::build::apply_result(
+            &mut conn,
+            &viewer,
+            map,
+            &meaning_result(&c),
+            CAP,
+            true,
+        )
+        .await
+        .expect("meaning-only apply"),
+    );
+    drop(conn);
+    let links_run = run_id(
+        &apply(&pool, &viewer, &c, &links_result(&c))
+            .await
+            .expect("apply"),
+    );
+    let url = fixture::database_url_for(&pool).await;
+    let run = |bin: &str, run: Uuid, write: bool| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("DATABASE_URL", &url)
+            .env("MAINTENANCE_DATABASE_URL", &url)
+            .env("RUST_LOG", "warn")
+            .args(["reverse", "--map", &map_key(map), "--run-id"])
+            .arg(run.to_string());
+        if write {
+            cmd.arg("--apply");
+        }
+        cmd.output().expect("run the binary")
+    };
+    let exists = |run: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM atlas_map_runs WHERE id = $1)",
+            )
+            .bind(run)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (meaning_bin, links_bin) = (
+        env!("CARGO_BIN_EXE_atlas_meaning"),
+        env!("CARGO_BIN_EXE_atlas_links"),
+    );
+
+    for (bin, other_run, want) in [
+        (meaning_bin, links_run, "atlas_meaning apply"),
+        (links_bin, meaning_run, "atlas_links apply"),
+    ] {
+        let out = run(bin, other_run, true);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{bin} reversed the other binary's run"
+        );
+        assert!(stderr.contains(want), "{bin}: {stderr}");
+    }
+    for (bin, own) in [(links_bin, links_run), (meaning_bin, meaning_run)] {
+        let dry = run(bin, own, false);
+        assert!(
+            dry.status.success(),
+            "{bin} dry run: {}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&dry.stdout).expect("report");
+        assert_eq!(report["applied"], false, "{report}");
+        assert!(exists(own).await, "the dry run kept {own}");
+        let done = run(bin, own, true);
+        assert!(
+            done.status.success(),
+            "{bin} --apply: {}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&done.stdout).expect("report");
+        assert_eq!(report["applied"], true, "{report}");
+        assert!(!exists(own).await, "{bin} --apply deleted {own}");
+    }
+}
