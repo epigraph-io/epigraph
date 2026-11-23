@@ -639,6 +639,20 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache /usr/local/share/boost || true
           df -ih / ; df -h /
       - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Self-test the SQLite dependency-graph check
+        # Throwaway workspaces outside the checkout: a postgres-only sqlx
+        # passes, a non-member crate enabling sqlx's `sqlite` feature (as a
+        # normal or a dev dependency) fails, and a graph without the control
+        # crate fails as vacuous. Proves the next step can still go red.
+        run: .github/scripts/test-sqlite-never-compiled.sh
+      - name: SQLite is never compiled (resolved dependency graph)
+        # The blocking ratchet behind the RUSTSEC-2026-0459 ignore in
+        # .cargo/audit.toml. crates/epigraph-auth/tests/sqlite_never_compiled.rs
+        # scans workspace manifests and Cargo.lock, which cannot show a crate
+        # outside the workspace enabling sqlx/sqlite in its own manifest;
+        # `cargo tree` over the feature-resolved graph can. It needs the
+        # registry, hence a step here (network) rather than a test.
+        run: .github/scripts/sqlite-never-compiled.sh
       - name: Clippy
         # --all-targets is load-bearing, not cosmetic. Without it cargo lints
         # only lib+bin targets, so `tests/`, `examples/` and `benches/` are
@@ -892,9 +906,14 @@ jobs:
       - name: Install Python test dependencies
         # A venv, not the system interpreter (PEP 668), from a pinned file, and
         # no extra setup action (the trust surface stays the pinned actions).
+        # tests/requirements-ci.txt is compiled from tests/requirements-ci.in
+        # with every transitive package pinned and sha256-hashed:
+        # --require-hashes refuses any artifact whose hash is not listed (a
+        # substituted or re-uploaded wheel), and --only-binary keeps pip from
+        # building an sdist, whose build dependencies would be unhashed.
         run: |
           python3 -m venv "$RUNNER_TEMP/pyenv"
-          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet -r tests/requirements-ci.txt
+          "$RUNNER_TEMP/pyenv/bin/pip" install --quiet --require-hashes --only-binary :all: -r tests/requirements-ci.txt
           echo "$RUNNER_TEMP/pyenv/bin" >> "$GITHUB_PATH"
       - name: Create and migrate the Python test database
         run: |
@@ -961,9 +980,17 @@ jobs:
   # backlog a2fa31b1 — sqlx 0.7->0.8 + reqwest 0.11->0.12 migrations), so the
   # job is GREEN on current advisories and a genuinely NEW one still turns it
   # red. It stays advisory (continue-on-error) by design — not a gate.
+  #
+  # The job also runs pip-audit over tests/requirements-ci.txt, the Python test
+  # dependencies the `python` job installs, so a published advisory against one
+  # of those pins turns it red too. The pip-audit steps run even when cargo
+  # audit fails (`!cancelled()`), so one ecosystem's finding cannot hide the
+  # other's; the step that failed names the ecosystem.
   audit:
     name: Security audit (advisory)
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the `python` job: tests/requirements-audit.txt
+    # is compiled for the image's python3 (3.12) and installed binary-only.
+    runs-on: ubuntu-24.04
     # Same bound as `test`. `continue-on-error` makes a FAILURE advisory; it
     # does nothing about a HANG, which still occupies a runner for six hours.
     timeout-minutes: 90
@@ -980,6 +1007,20 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit
+      - name: Install pip-audit
+        # Hash-locked like the test dependencies (tests/requirements-audit.txt),
+        # into its own venv, so the auditing tool is not an unpinned download.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pip-audit"
+          "$RUNNER_TEMP/pip-audit/bin/pip" install --quiet --require-hashes --only-binary :all: -r tests/requirements-audit.txt
+      - name: Audit Python test dependencies
+        # Reads the locked file directly (--disable-pip --require-hashes: no
+        # resolution, no install) and checks every pinned package, transitive
+        # ones included, against the PyPI advisory data. --strict fails rather
+        # than skipping a package it cannot audit.
+        if: ${{ !cancelled() }}
+        run: '"$RUNNER_TEMP/pip-audit/bin/pip-audit" --strict --progress-spinner off --disable-pip --require-hashes -r tests/requirements-ci.txt'
 
   # Secret scan, a HARD gate (no continue-on-error). epigraph is a public repo,
   # so a credential committed on a PR branch is published the moment it is

@@ -191,8 +191,8 @@ predates Plan 2.5 risks duplicate or malformed claim writes.
 
 epigraph is a public repository. The `secrets` CI job (gitleaks) catches
 credentials; this check catches the other class of leak: infrastructure
-identifiers and organisation-specific names. `.githooks/pre-commit` (and
-`.githooks/pre-merge-commit`, which git runs instead when `git merge` records a
+identifiers and organisation-specific names. A `pre-commit` hook (and a
+`pre-merge-commit` hook, which git runs instead when `git merge` records a
 merge commit) runs `scripts/check_sensitive.py` over the **staged** content and
 file paths of each commit and blocks it on:
 
@@ -209,12 +209,39 @@ file paths of each commit and blocks it on:
   ignored. The template gets no exemption: a real term typed into it blocks
   the commit like anywhere else.
 
-The hook is opt-in per clone:
+The hooks are opt-in per clone. Install them from a checkout you trust (main):
 
 ```bash
-git config core.hooksPath .githooks
+bash scripts/install-sensitive-hooks.sh
 cp .check_sensitive_local.example.yaml .check_sensitive_local.yaml   # then edit
 ```
+
+The installer writes both hooks into the clone's own hooks directory
+(`.git/hooks`, shared by linked worktrees), outside the working tree, and they
+run `scripts/check_sensitive.py` from the blob at a **trusted ref**, never from
+the working tree: `refs/remotes/origin/main` by default. To use another branch,
+`git config epigraph.sensitiveHookRef <branch>` and re-run the installer, which
+expands it to a full refname; the hooks accept only full names under
+`refs/remotes/` or `refs/heads/`, because a short name such as `origin/main` can
+be shadowed by a tag or branch of that name (fetching a fork's remote brings its
+tags). The blob runs under `python3 -I` from a private temp directory, so no
+module planted in a shared temp directory or named by `PYTHON*` variables is
+imported in its place. A scanner change therefore takes effect once it is
+reviewed and merged (and fetched); a missing ref or blob, or a ref that is not
+a full branch name, blocks the commit (exit 2). Re-run the installer after
+updating it; it never overwrites a hook it did not write.
+
+**Do not use `git config core.hooksPath .githooks`** (the setup this section
+used to document), and do not enable any in-tree hooks path in a clone you use
+to review contributor branches. With it, git runs whatever `.githooks/` the
+CHECKED-OUT branch holds, and those hooks ran that branch's
+`scripts/check_sensitive.py`: checking out a contributor's pull request and then
+committing or merging there would execute its code with your privileges and
+credentials before anyone had reviewed it. The files in `.githooks/` are now
+stubs that block every commit with migration instructions, and the installer
+removes a `core.hooksPath` set in the clone's config (it stops if one is set
+globally, where it cannot). A branch can still ship its own `.githooks/`, so
+the stubs are a reminder, not a control: the fix is to unset the option.
 
 Without the local file, or with one that lists no terms or patterns, the hook
 warns and applies the generic rules only; a local file it cannot parse blocks
@@ -226,6 +253,8 @@ its hits before enabling the hook: it scans whole staged files, so any commit
 touching a file that already contains a listed term is blocked.
 
 `scripts/tests/test_check_sensitive.py` drives real `git commit`s through the
-hooks in throwaway repositories, and its last test runs the `--all-files` audit
+installed hooks in throwaway repositories (including a checked-out branch whose
+scanner and `.githooks/` try to run their own code), and its last test runs the
+`--all-files` audit
 over this checkout. It runs in the CI `python` job with the generic rules only
 (no local list exists there).

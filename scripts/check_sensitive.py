@@ -19,8 +19,13 @@ that itself matches is replaced by a redacted label carrying the blob id. The
 matched value is never printed, so the output is safe to land in CI logs or
 agent transcripts.
 
-Enable once per clone:   git config core.hooksPath .githooks
+Enable once per clone:   bash scripts/install-sensitive-hooks.sh   (from main)
 Audit the whole tree:    python3 scripts/check_sensitive.py --all-files
+
+The installed hooks run this file from the blob at a trusted ref (default
+refs/remotes/origin/main) under `python3 -I`, not from the working tree, so a checked-out branch cannot change
+the code a commit runs. Do NOT use `git config core.hooksPath .githooks`: that
+runs the checked-out branch's hook code (see scripts/README.md).
 
 Exit codes: 0 clean, 1 findings, 2 configuration error (fails closed).
 Standard library only.
