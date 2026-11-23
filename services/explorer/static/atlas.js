@@ -137,6 +137,8 @@
   const PREVIEW = MODE === 'preview';
   cfg.claimPage = localPath(root.getAttribute('data-claim-page-prefix'));
   const NESTED = window.AtlasNested || null;
+  // A prefix, not a path: <this><map key>/<hierarchy>/<claim id>.
+  cfg.claimLeaf = NESTED ? NESTED.localPrefix(root.getAttribute('data-atlas-claim-leaf-url')) : null;
 
   const q = (role) => root.querySelector('[data-role="' + role + '"]');
   const dom = {
@@ -2626,10 +2628,11 @@
   }
 
   /**
-   * A claim inside a nested theme: fly to the leaf that draws it when that
-   * leaf has been fetched on this map and hierarchy; otherwise frame the
-   * theme and say so. Never a stand-in node: the contract has no
-   * claim-to-leaf lookup yet (W10 hand-off).
+   * A claim inside a nested theme: fly to the leaf that draws it. A leaf
+   * already fetched on this map and hierarchy answers first; otherwise the
+   * claim-to-leaf route names the leaf, which is fetched with its breadcrumb
+   * chain. The route's one not-found answer means the claim is not on this
+   * map. Never a stand-in node.
    */
   async function goToNestedClaim(theme, claimId) {
     if (theme.offMap) {
@@ -2640,15 +2643,49 @@
     const prefix = NESTED.levelKey(NS.map, NS.hierarchy, '');
     const leaves = [];
     for (const [k, d] of NS.resolved) if (k.startsWith(prefix) && d.theme_id === theme.id) leaves.push(d);
-    const doc = NESTED.findClaimLeaf(leaves, claimId);
-    const leaf = doc ? await attachChain(theme, doc) : null;
+    let doc = NESTED.findClaimLeaf(leaves, claimId);
+    let home = theme;
+    if (!doc) {
+      let place;
+      try {
+        place = await NESTED.lookupClaimLeaf((url) => getJSON(url, signalFor('resolve')), cfg.claimLeaf, NS.map, NS.hierarchy, claimId);
+      } catch (e) {
+        if (isAbort(e)) return;
+        select(theme, true);
+        setNotice(e.message);
+        return;
+      }
+      if (!place) {
+        select(theme, true);
+        setNotice('That claim is not on the map you picked.');
+        return;
+      }
+      if (place.theme_id !== theme.id) home = S.themesById.get(place.theme_id) || null;
+      if (!home) {
+        select(theme, true);
+        setNotice('On the map you picked, that claim is in a theme that is not loaded yet.');
+        return;
+      }
+      markWanted(place.level_id);
+      try {
+        doc = await fetchLevel(place.level_id, 'leaf', NS.hierarchy);
+      } catch (e) {
+        unmarkWanted(place.level_id);
+        if (isAbort(e)) return;
+        select(home, true);
+        setNotice(e.message);
+        return;
+      }
+    }
+    // attachChain says why when it cannot attach the chain.
+    const leaf = await attachChain(home, doc);
     const node = leaf && leaf.childById ? leaf.childById.get(claimId) : null;
     if (node) {
       select(node, true);
       return;
     }
-    select(theme, true);
-    setNotice('That claim is in this theme, in a group that is not open yet: zoom in to find it.');
+    select(leaf || home, true);
+    if (leaf && leaf.levelId === doc.level_id) setNotice('The map changed: that claim is no longer in the group that drew it.');
   }
 
   async function followClaim(id) {

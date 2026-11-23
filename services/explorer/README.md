@@ -127,12 +127,16 @@ What the producer and the page must keep (W10, and the nightly builder):
   route test's to assert.
 - A link target or breadcrumb pointing at a level that awaits (re)naming carries a
   null `name` (those objects have no `needs_naming` flag).
-- Search and `#c-` links into a nested theme land on the claim's leaf only once
-  that leaf has been fetched. The claim-to-leaf lookup now exists (contract
-  `atlas_claim_leaf` v1, `contract/atlas_claim_leaf/v1/schema.json`, checker
+- Search and `#c-` links into a nested theme land on the claim's leaf, cold or
+  not. A leaf already fetched answers first; otherwise `atlas.js` asks the
+  claim-to-leaf lookup (contract `atlas_claim_leaf` v1,
+  `contract/atlas_claim_leaf/v1/schema.json`, checker
   `tests/common/atlas_claim_leaf.rs`): `GET <data-atlas-claim-leaf-url><map
   key>/<hierarchy>/<claim id>` answers which leaf holds a claim the viewer can
-  read. `atlas.js` does not call it yet.
+  read, and the page fetches that leaf and its breadcrumb chain. The route's one
+  not-found answer reads as "not on the map you picked". The request and body
+  checks are `lookupClaimLeaf` and `claimLeafProblem` in
+  `static/atlas_nested.js`.
 
 With a map list, the picked map sets each theme's name and count, and a theme the
 map does not draw shows "Not on this map" and opens onto nothing. Theme and region

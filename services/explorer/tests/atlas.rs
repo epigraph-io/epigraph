@@ -2664,6 +2664,50 @@ fn atlas_js_nested_claim_links_never_invent_a_node() {
     assert!(!nested.contains("cfg.themeClaims"), "no claim-list read");
 }
 
+/// A cold claim link (a `#c-` hash or a search pick, both through
+/// `goToResolved`) into a nested theme asks the claim-to-leaf route when no
+/// fetched leaf draws the claim, then fetches that leaf: the page reads
+/// `data-atlas-claim-leaf-url` as a prefix and `goToNestedClaim` hands it to
+/// `NESTED.lookupClaimLeaf` (tested with a stubbed getter in
+/// js-tests/atlas_nested.test.cjs) only after the fetched-leaf answer.
+#[test]
+fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
+    let js = include_str!("../static/atlas.js");
+    assert!(
+        js.contains(
+            "cfg.claimLeaf = NESTED ? NESTED.localPrefix(root.getAttribute('data-atlas-claim-leaf-url')) : null;"
+        ),
+        "the page reads the lookup prefix from the shell"
+    );
+    let start = js
+        .find("async function goToNestedClaim(")
+        .expect("goToNestedClaim");
+    let nested = &js[start..start + js[start..].find("\n  }\n").expect("its end")];
+    let fetched = nested
+        .find("NESTED.findClaimLeaf(")
+        .expect("the fetched leaves answer first");
+    let lookup = nested
+        .find("NESTED.lookupClaimLeaf(")
+        .expect("then the claim-to-leaf route");
+    assert!(fetched < lookup, "the free answer comes first");
+    assert!(nested[lookup..].contains("cfg.claimLeaf, NS.map, NS.hierarchy, claimId"));
+    let leaf = nested
+        .find("fetchLevel(place.level_id, 'leaf', NS.hierarchy)")
+        .expect("the named leaf is fetched as a leaf");
+    let chain = nested
+        .rfind("attachChain(home, doc)")
+        .expect("and attached with its breadcrumb chain");
+    assert!(lookup < leaf && leaf < chain);
+    // Both entry points reach it: a #c- hash and a search pick resolve, then
+    // hand a nested theme's claim to goToNestedClaim.
+    let pick = &js[js.find("function pick(").expect("pick")..];
+    assert!(pick[..pick.find("\n  }\n").unwrap()].contains("followClaim(r.claim_id)"));
+    for f in ["async function followClaim(", "async function followHash("] {
+        let body = &js[js.find(f).expect(f)..];
+        assert!(body[..body.find("\n  }\n").unwrap()].contains("await goToResolved(res)"));
+    }
+}
+
 /// The leaf legend is un-hidden only once the page has a map list, and in
 /// the leaf view the theme-level "dashed" key steps aside, so the two legends
 /// never say different things about a dashed line.
