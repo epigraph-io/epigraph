@@ -951,6 +951,116 @@ async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) 
     assert_eq!(live_deleted, 1, "CONTROL: a live row is not guarded");
 }
 
+/// T-N6, the other half: the PURGE DEFINER re-owned. If
+/// `epigraph_purge_mass_functions` is later owned by another role (an
+/// `ALTER FUNCTION ... OWNER TO`, or the definer's share of a `REASSIGN
+/// OWNED BY epigraph_maintenance`, whose helper share the test above pins),
+/// the purge fails closed with 42501 twice over, and each is pinned:
+/// * as re-owned: 194 granted EXECUTE to `epigraph_maintenance` while it
+///   was the owner, so that grant was an owner's privilege and moved to the
+///   new owner; the maintenance session can no longer call the purge;
+/// * after EXECUTE is granted back to the maintenance role (the obvious
+///   "repair"): the body now runs as the new owner, which may not write a
+///   purge grant, so the purge is still refused.
+/// Either way nothing is deleted and no `mass_functions.purge` event is
+/// written. The guard itself is SECURITY INVOKER, so re-owning it changes
+/// nothing to pin. The ownership change is undone with the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n6_the_purge_fails_closed_after_the_purge_definer_is_re_owned(pool: PgPool) {
+    proc_exists(&pool, PURGE_DEFINER).await;
+    let w = world(&pool).await;
+    let role = format!("h10_reowner_{}", Uuid::new_v4().simple());
+    let (r, retracted) = (role.clone(), w.retracted);
+    let (purge, regranted, definer_owner, events) = with_cluster_role(
+        &pool,
+        &role,
+        &format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            pool.execute(format!("ALTER FUNCTION {PURGE_DEFINER} OWNER TO {r}").as_str())
+                .await
+                .expect("re-own the purge definer");
+            let definer_owner: String = sqlx::query_scalar(
+                "SELECT r.rolname::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = $1::regprocedure",
+            )
+            .bind(PURGE_DEFINER)
+            .fetch_one(&pool)
+            .await
+            .expect("definer owner");
+            let m = maintenance(&pool).await;
+            let purge = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 definer probe')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            pool.execute(
+                format!("GRANT EXECUTE ON FUNCTION {PURGE_DEFINER} TO epigraph_maintenance")
+                    .as_str(),
+            )
+            .await
+            .expect("grant the purge back to the maintenance role");
+            let regranted = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 definer probe, re-granted')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            m.close().await;
+            let events: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM security_events WHERE event_type = 'mass_functions.purge'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("purge events");
+            (purge, regranted, definer_owner, events)
+        },
+    )
+    .await;
+
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the re-owner role is gone"
+    );
+    assert_eq!(
+        definer_owner, role,
+        "fixture: the purge definer was re-owned"
+    );
+    let (code, message) = purge.expect_err("the purge must not be admitted");
+    assert_eq!(code, "42501", "a privilege error, fail closed: {message}");
+    assert!(message.starts_with("permission denied"), "{message}");
+    let (code, message) =
+        regranted.expect_err("the purge must not be admitted with EXECUTE granted back");
+    assert_eq!(
+        code, "42501",
+        "the body, run as the new owner, is refused: {message}"
+    );
+    assert!(message.starts_with("permission denied"), "{message}");
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives"
+    );
+    assert_eq!(events, 0, "no purge event is written");
+}
+
 // ---------------------------------------------------------------------------
 // (e) (g): the purge definer and the application role
 // ---------------------------------------------------------------------------
