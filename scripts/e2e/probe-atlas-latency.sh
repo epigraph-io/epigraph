@@ -6,7 +6,9 @@
 # Runs, in --release, from the repository root:
 #   KERNEL  crates/epigraph-api/tests/atlas_latency_gate.rs at the given scale
 #           (default full: 210 themes, about 366k claims, 13,860 levels),
-#           including its red-on-regression test;
+#           including its red-on-regression test: warm, in-process cold, and
+#           a fresh-process cold arm (one `server` binary per sample,
+#           ATLAS_LATENCY_PROCESS_SAMPLES per type, default 8 here);
 #   BFF     services/explorer/tests/atlas_latency.rs (per document: the same
 #           at any map scale), including its red-on-regression test;
 #   BROWSER only with ATLAS_LATENCY_BROWSER=1: the Explorer's fixture preview
@@ -18,12 +20,18 @@
 # is printed, and the exit code is non-zero when any arm fails.
 #
 # DATABASE_URL must name a THROWAWAY Postgres the test harness may create
-# databases on (every #[sqlx::test] creates and drops its own, migrated from
-# empty). It is refused, like every DSN in this directory (dsn-guard.sh),
-# when it names no explicit port, the production port 5432, or no host.
+# databases AND roles on (every #[sqlx::test] creates and drops its own
+# database, migrated from empty; the fresh-process arm creates and drops a
+# password login that is a member of epigraph_app, so the cluster must accept
+# password logins over TCP). It is refused, like every DSN in this directory
+# (dsn-guard.sh), when it names no explicit port, the production port 5432,
+# or no host.
 #
-# The cold samples are a fresh pool, server and client per sample inside one
-# process, not a fresh process: see the plan,
+# Cold is measured twice: in-process (a fresh pool, server and client per
+# sample inside the test process) and on a fresh process (the first request
+# of a newly started server binary, as after a deploy or restart), each with
+# p50/p95 per level type against the cold budget. Neither starts from a cold
+# Postgres buffer cache: see the plan,
 # docs/superpowers/plans/2026-11-13-atlas-w12-latency-gate-plan.md.
 set -uo pipefail
 
@@ -57,6 +65,7 @@ arm() {
 (
   cd "$ROOT" &&
     ATLAS_LATENCY_SCALE="$SCALE" ATLAS_LATENCY_REPORT="$OUT/kernel.json" \
+      ATLAS_LATENCY_PROCESS_SAMPLES="${ATLAS_LATENCY_PROCESS_SAMPLES:-8}" \
       cargo test --release --locked -p epigraph-api --test atlas_latency_gate \
       -- --test-threads=1 --nocapture
 )
