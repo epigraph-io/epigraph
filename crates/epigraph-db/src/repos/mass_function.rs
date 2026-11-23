@@ -2959,6 +2959,32 @@ mod tests {
         );
     }
 
+    /// A revert record written before migration 267 names the edge in
+    /// `perspective_id` and carries no slot keys: it is restored onto the
+    /// edge's slot with no perspective. A record that already carries a slot,
+    /// and a record with neither, come back unchanged.
+    #[test]
+    fn a_pre_267_edge_record_is_restored_onto_the_edge_slot() {
+        let edge = Uuid::new_v4();
+        let legacy = serde_json::json!({
+            "id": Uuid::new_v4(), "claim_id": Uuid::new_v4(),
+            "perspective_id": edge, "masses": {"0": 0.6, "0,1": 0.4},
+        });
+        let restored = edge_bba_record_on_slot(legacy.clone());
+        assert_eq!(restored["slot_kind"], "edge", "{restored}");
+        assert_eq!(restored["slot_id"], serde_json::json!(edge), "{restored}");
+        assert!(restored["perspective_id"].is_null(), "{restored}");
+        assert_eq!(restored["masses"], legacy["masses"], "{restored}");
+
+        let current = serde_json::json!({
+            "id": Uuid::new_v4(), "perspective_id": null,
+            "slot_kind": "edge", "slot_id": edge,
+        });
+        assert_eq!(edge_bba_record_on_slot(current.clone()), current);
+        let unkeyed = serde_json::json!({"id": Uuid::new_v4(), "perspective_id": null});
+        assert_eq!(edge_bba_record_on_slot(unkeyed.clone()), unkeyed);
+    }
+
     #[test]
     fn mass_function_row_has_expected_fields() {
         let _row = MassFunctionRow {
