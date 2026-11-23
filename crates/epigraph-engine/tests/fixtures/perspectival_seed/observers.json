@@ -1,5 +1,5 @@
 {
-  "_doc": "Fixture for perspectival_loader: four observer perspectives. source_reliability is the per-evidence_type alpha get_perspective_belief discounts every BBA by at query time.",
+  "_doc": "Fixture for perspectival_loader: four observer perspectives. source_reliability is the per-evidence_type alpha get_perspective_belief discounts every BBA by at query time. clinical_observer and tradition_observer carry the maps perspectival_demo_t2.rs and epigraph-ds perspectival_seed_validation.rs pin; regulatory_observer and skeptic_observer are synthetic.",
   "perspectives": [
     {
       "key": "clinical_observer",
