@@ -1790,7 +1790,8 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // then passed and filed, as under the proper owner.
     ("epigraph_bug_report_gate", 207),
     ("epigraph_bug_report_preflight", 207),
-    // 208, the authorship countersign route (MCP `countersign_authorship`).
+    // 208, the authorship countersign definer (MCP `countersign_authorship`
+    // and REST `POST /api/v1/papers/:id/authors/countersign`).
     // Its read and UPDATE of the FORCEd `operator_links` and of `edges` are
     // admitted by `epigraph_definer_bypass()` (the owner). Under a non-member
     // owner it fails CLOSED and loud for an operator acting for its agent
@@ -3212,8 +3213,10 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "public.epigraph_operator_bound_at(uuid, timestamptz)",
             true,
         ),
-        // 208: MCP `countersign_authorship` calls it on the request DSN as
-        // the caller; without the grant every countersign is 42501.
+        // 208: MCP `countersign_authorship` and the REST route
+        // `POST /api/v1/papers/:id/authors/countersign` call it on the
+        // request DSN as the caller; without the grant every countersign,
+        // over either surface, is 42501.
         (
             "epigraph_countersign_authorship",
             "public.epigraph_countersign_authorship(uuid, uuid, text, uuid)",
