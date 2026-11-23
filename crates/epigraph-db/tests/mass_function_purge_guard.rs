@@ -372,57 +372,117 @@ async fn migrate_rest(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> 
     r
 }
 
+/// A future that catches a panic raised while polling the future it wraps
+/// and returns it as `Err` (the `catch_unwind` of `futures`, which this
+/// crate does not depend on). It polls on the caller's task, so the wrapped
+/// future need not be `Send`.
+struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// Run `body` with the cluster-level role `role` created first (by `ddl`,
+/// which names it), and ALWAYS remove that role afterwards: everything it
+/// owns in this database is reassigned to the harness login and its grants
+/// dropped, then the role is dropped. A panic inside `body` (an `expect` in a
+/// fixture, a failed assertion) is caught, the cleanup still runs, and the
+/// panic is then resumed. A test database is thrown away after the test, but
+/// a ROLE is cluster-wide: without this a mid-test panic leaks it into every
+/// later test on the cluster (T-N7).
+async fn with_cluster_role<T, F, Fut>(pool: &PgPool, role: &str, ddl: &str, body: F) -> T
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let harness: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(pool)
+        .await
+        .expect("the harness login");
+    pool.execute(ddl).await.expect("create the cluster role");
+    let caught = CatchUnwind(Box::pin(body(pool.clone()))).await;
+    // Fresh statements on the pool: a panic may have dropped a connection
+    // mid-transaction, which the pool then discards.
+    pool.execute(format!("REASSIGN OWNED BY {role} TO {harness}").as_str())
+        .await
+        .expect("reassign the role's objects");
+    pool.execute(format!("DROP OWNED BY {role}").as_str())
+        .await
+        .expect("drop the role's grants");
+    pool.execute(format!("DROP ROLE {role}").as_str())
+        .await
+        .expect("drop the role");
+    match caught {
+        Ok(t) => t,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn role_exists(pool: &PgPool, role: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_roles")
+}
+
 /// (a), shape 2: `claims`, `frames` and `mass_functions` are owned by a
 /// NOSUPERUSER role that is NOT a maintenance member when 194 is applied (the
 /// deployed table-owner shape is not fixed by the schema, so both shapes are
 /// pinned). The cascade then runs as that role, for which
 /// `epigraph_definer_bypass()` is false and the grant helper must still answer.
+/// The role is created and removed by [`with_cluster_role`], so a panic in
+/// the migration or the attack never leaks it.
 #[sqlx::test(migrations = false)]
 async fn a_b1_attack_is_refused_sr09_when_a_nosuperuser_non_maintenance_role_owns_the_tables(
     pool: PgPool,
 ) {
     migrate_below_194(&pool).await;
     let owner = format!("h10_owner_{}", Uuid::new_v4().simple());
-    let harness: String = sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    pool.execute(format!("CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS").as_str())
-        .await
-        .expect("create the owner role");
-    for t in ["claims", "frames", "mass_functions"] {
-        pool.execute(format!("ALTER TABLE public.{t} OWNER TO {owner}").as_str())
+    let o = owner.clone();
+    let (migrated, shape, attack) = with_cluster_role(
+        &pool,
+        &owner,
+        &format!("CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            for t in ["claims", "frames", "mass_functions"] {
+                pool.execute(format!("ALTER TABLE public.{t} OWNER TO {o}").as_str())
+                    .await
+                    .unwrap_or_else(|e| panic!("re-own {t}: {e}"));
+            }
+            let migrated = migrate_rest(&pool).await;
+            let shape: (bool, bool, String) = sqlx::query_as(
+                "SELECT r.rolsuper, pg_has_role(r.oid, 'epigraph_maintenance', 'MEMBER'), \
+                        r.rolname::text \
+                   FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+                  WHERE c.oid = 'public.mass_functions'::regclass",
+            )
+            .fetch_one(&pool)
             .await
-            .unwrap_or_else(|e| panic!("re-own {t}: {e}"));
-    }
-    let migrated = migrate_rest(&pool).await;
-
-    let shape: (bool, bool, String) = sqlx::query_as(
-        "SELECT r.rolsuper, pg_has_role(r.oid, 'epigraph_maintenance', 'MEMBER'), r.rolname::text \
-           FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
-          WHERE c.oid = 'public.mass_functions'::regclass",
+            .unwrap();
+            let attack = if migrated.is_ok() {
+                Some(b1_attack(&pool).await)
+            } else {
+                None
+            };
+            (migrated.map_err(|e| e.to_string()), shape, attack)
+        },
     )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let attack = if migrated.is_ok() {
-        Some(b1_attack(&pool).await)
-    } else {
-        None
-    };
+    .await;
 
-    // Put the tables back and drop the role before asserting, so a failure
-    // does not leave a cluster-level role behind.
-    pool.execute(format!("REASSIGN OWNED BY {owner} TO {harness}").as_str())
-        .await
-        .expect("reassign");
-    pool.execute(format!("DROP OWNED BY {owner}").as_str())
-        .await
-        .expect("drop owned");
-    pool.execute(format!("DROP ROLE {owner}").as_str())
-        .await
-        .expect("drop role");
-
+    assert!(!role_exists(&pool, &owner).await, "the owner role is gone");
     migrated.expect("the rest of the migrations apply over a NOSUPERUSER table owner");
     assert_eq!(
         (shape.0, shape.1, shape.2.as_str()),
@@ -435,6 +495,53 @@ async fn a_b1_attack_is_refused_sr09_when_a_nosuperuser_non_maintenance_role_own
         "shape 2 (NOSUPERUSER, non-maintenance owner)",
     );
     assert_nothing_deleted(&pool, &w).await;
+}
+
+/// T-N7: [`with_cluster_role`] removes its role when the body PANICS part
+/// way, after re-owning a table to it (as shape 2 does), and then resumes
+/// the panic. The table is owned by the harness again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n7_a_panicking_body_still_drops_its_cluster_role(pool: PgPool) {
+    let role = format!("h10_leak_probe_{}", Uuid::new_v4().simple());
+    let (p, r) = (pool.clone(), role.clone());
+    let outcome = CatchUnwind(Box::pin(async move {
+        let r2 = r.clone();
+        with_cluster_role(
+            &p,
+            &r,
+            &format!("CREATE ROLE {r} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+            |pool| async move {
+                pool.execute(format!("ALTER TABLE public.frames OWNER TO {r2}").as_str())
+                    .await
+                    .expect("re-own frames");
+                panic!("a fixture fails mid-way");
+            },
+        )
+        .await
+    }))
+    .await;
+    let err = outcome.expect_err("the body's panic is resumed after the cleanup");
+    assert_eq!(
+        err.downcast_ref::<&str>().copied(),
+        Some("a fixture fails mid-way"),
+        "the body's own panic is the one resumed"
+    );
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the role does not outlive the panicking body"
+    );
+    let owner: String = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+          WHERE c.oid = 'public.frames'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let harness: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, harness, "frames is owned by the harness again");
 }
 
 // ---------------------------------------------------------------------------
