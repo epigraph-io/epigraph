@@ -392,11 +392,13 @@ async fn run(cli: Cli, writes: bool, created: &mut Vec<PathBuf>) -> anyhow::Resu
         })
         .await?;
         println!(
-            "applied: {} row(s) deleted on {} holder(s); recomputed {}, unbacked {}; audit {}",
+            "applied: {} row(s) deleted on {} holder(s); recomputed {}, unbacked {}, \
+             unchanged {}; audit {}",
             snap.deleted.len(),
             snap.caches.len(),
             snap.cascade.recomputed.len(),
             snap.cascade.unbacked.len(),
+            snap.cascade.unchanged.len(),
             snap.audit_event_id.map_or_else(
                 || "none (nothing to sweep)".to_string(),
                 |id| id.to_string()

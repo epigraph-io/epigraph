@@ -577,6 +577,7 @@ async fn apply_in(
             "holders": holders,
             "recomputed": sweep.report.recomputed,
             "unbacked": sweep.report.unbacked,
+            "unchanged": sweep.report.unchanged,
             "by_relationship": by_relationship,
             "mass_function_ids": want,
             "edges": planned.rows.iter().map(|r| r.edge_id).collect::<BTreeSet<_>>(),

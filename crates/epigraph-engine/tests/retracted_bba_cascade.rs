@@ -212,6 +212,137 @@ async fn the_supersede_cascade_keeps_retracted_edge_bbas_and_counts_them(pool: P
     );
 }
 
+/// The K10(2) arm (supersede SPEC §11 K10(2)), mixed case: a stayed
+/// (weakening) edge from the retired claim holds one live row and one row
+/// retracted through migration 184's definer. The supersede cascade, on the
+/// NOSUPERUSER maintenance session, invalidates the live row, keeps the
+/// retracted one with `retracted_at` set, and counts it in both the report's
+/// and the belief audit row's `retracted_key_kept` (backlog 7c1bdeec (1),
+/// (2)). Before, only the re-wire walk counted, so the stayed edge's kept row
+/// was missing from both.
+///
+/// A second stayed edge holds ONLY a retracted row. The K10(2) selection names
+/// live rows only, so that edge is never visited and its row is kept but not
+/// counted: the field counts the retracted rows on the edges the cascade
+/// invalidated (the K0 delta's wider count says the same).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_stayed_edge_arm_counts_the_retracted_row_it_keeps(pool: PgPool) {
+    let maint = maintenance(&pool).await;
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let (author, g) = fixture::seed_agent_with_group(&pool, "k10-mixed-author").await;
+    let (other, _) = fixture::seed_agent_with_group(&pool, "k10-mixed-other").await;
+    let a = claim(&pool, author, g, "k10 mixed retiring").await;
+    let b = claim(&pool, author, g, "k10 mixed holder").await;
+    let c = claim(&pool, author, g, "k10 retracted-only holder").await;
+    let bf = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        epigraph_engine::edge_factor::ensure_binary_frame(&mut conn, &viewer)
+            .await
+            .expect("binary frame")
+    };
+    // Weakening relationships stay on the retired claim, so the K10(2) arm,
+    // not the re-wire walk, reaches these edges.
+    let stayed = edge(&pool, a, b, "refutes").await;
+    let retracted_only = edge(&pool, a, c, "contradicts").await;
+    let kept = bba(
+        &pool,
+        b,
+        bf,
+        Some(author),
+        Some(stayed),
+        Some("edge_factor"),
+    )
+    .await;
+    let live = bba(&pool, b, bf, Some(other), Some(stayed), Some("edge_factor")).await;
+    let lone = bba(
+        &pool,
+        c,
+        bf,
+        Some(author),
+        Some(retracted_only),
+        Some("edge_factor"),
+    )
+    .await;
+    retract_through_definer(&pool, kept).await;
+    retract_through_definer(&pool, lone).await;
+
+    let (new_id, old_id) = {
+        let mut tx = pool.begin().await.expect("begin");
+        let ids = ClaimRepository::supersede_act_conn(
+            &mut tx,
+            None,
+            ClaimId::from_uuid(a),
+            "k10 mixed replacement",
+            epigraph_core::TruthValue::clamped(0.5),
+            "k10 cascade fixture",
+            epigraph_db::SupersedeActor::new(author, epigraph_db::SupersedeTool::SupersedeClaim),
+        )
+        .await
+        .expect("the supersede act");
+        tx.commit().await.expect("commit the act");
+        ids
+    };
+    let stays: Uuid = sqlx::query_scalar("SELECT source_id FROM edges WHERE id = $1")
+        .bind(stayed)
+        .fetch_one(&pool)
+        .await
+        .expect("read the stayed edge");
+    assert_eq!(
+        stays, old_id,
+        "PREMISE: the refutes edge stays on the retired claim"
+    );
+
+    let trigger = CascadeTrigger::new(
+        CascadeCause::Supersede,
+        Some(author),
+        None,
+        old_id,
+        Some(new_id),
+    );
+    let mut conn = maint.acquire().await.expect("acquire maintenance");
+    let (status, report) =
+        apply_after_supersede(&mut conn, &viewer, &viewer, &trigger, old_id, new_id).await;
+
+    assert!(
+        report.errors.is_empty(),
+        "the cascade completes: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        row_state(&pool, live).await,
+        None,
+        "the stayed edge's live row is invalidated"
+    );
+    assert_eq!(
+        row_state(&pool, kept).await,
+        Some((b, true)),
+        "the stayed edge's retracted row is kept, still retracted"
+    );
+    assert_eq!(
+        row_state(&pool, lone).await,
+        Some((c, true)),
+        "the retracted-only edge's row is kept, still retracted"
+    );
+    assert_eq!(report.invalidated_bbas, 1, "{report:?}");
+    assert_eq!(
+        report.retracted_key_kept, 1,
+        "the retracted row kept on the invalidated stayed edge is counted: {report:?}"
+    );
+    let belief_row = status
+        .belief_audit_event_id
+        .expect("the belief audit row of the applied cascade");
+    let counted: serde_json::Value =
+        sqlx::query_scalar("SELECT details->'belief' FROM security_events WHERE id = $1")
+            .bind(belief_row)
+            .fetch_one(&pool)
+            .await
+            .expect("the belief audit row");
+    assert_eq!(
+        counted["retracted_key_kept"], 1,
+        "the audit row counts the kept retracted row: {counted}"
+    );
+}
+
 /// Site 3: an un-mark whose returning input's slot on the duplicate is now
 /// held by a RETRACTED cached combination keeps that row (it is not the
 /// derived cache the clear exists to make room past), reports the input as

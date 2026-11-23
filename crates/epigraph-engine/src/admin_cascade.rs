@@ -458,6 +458,7 @@ pub async fn report_for_caller(
         .iter()
         .chain(&report.recomputed)
         .chain(&report.unbacked)
+        .chain(&report.unchanged)
         .copied()
         .collect();
     for e in &report.errors {
@@ -496,6 +497,7 @@ pub async fn report_for_caller(
         invalidated_bbas: report.invalidated_bbas,
         recomputed: keep(&report.recomputed),
         unbacked: keep(&report.unbacked),
+        unchanged: keep(&report.unchanged),
         errors: report
             .errors
             .iter()
@@ -701,6 +703,7 @@ async fn record_belief(
         "targets": report.targets,
         "recomputed": report.recomputed,
         "unbacked": report.unbacked,
+        "unchanged": report.unchanged,
         "errors": report.errors,
     });
     let written: Result<Uuid, String> = async {
@@ -755,6 +758,7 @@ fn belief_counts(report: &CascadeReport) -> serde_json::Value {
         "targets": report.targets.len(),
         "recomputed": report.recomputed.len(),
         "unbacked": report.unbacked.len(),
+        "unchanged": report.unchanged.len(),
         "errors": report.errors.len(),
     })
 }

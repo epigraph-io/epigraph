@@ -301,6 +301,161 @@ async fn supersede_claim_deferred_replay_keeps_a_retracted_edge_bba(pool: PgPool
     assert_eq!(rows[0]["retracted_key_kept"], 1, "{rows:?}");
 }
 
+/// A K10(2) fixture (supersede SPEC §11 K10(2), backlog 7c1bdeec (2), (3)):
+/// the author's claim `old` REFUTES another writer's claim `b` (a weakening
+/// edge, so it stays on the retired claim). The stayed edge holds one live
+/// row (another agent's) and one row retracted through migration 184's
+/// definer. `b` has a cache and no other BBA, so the invalidation leaves it
+/// unbacked.
+struct StayedWorld {
+    author: Uuid,
+    old: Uuid,
+    b: Uuid,
+    live: Uuid,
+    retracted: Uuid,
+}
+
+async fn stayed_world(pool: &PgPool) -> StayedWorld {
+    let (author, ag) = fixture::seed_agent_with_group(pool, "k10-mcp-author").await;
+    let (x, xg) = fixture::seed_agent_with_group(pool, "k10-mcp-x").await;
+    let old = claim_of(pool, author, ag, "k10 mcp refuter").await;
+    let b = claim_of(pool, x, xg, "k10 mcp refuted").await;
+    let e: Uuid = sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship) \
+         VALUES ($1, 'claim', $2, 'claim', 'refutes') RETURNING id",
+    )
+    .bind(old)
+    .bind(b)
+    .fetch_one(pool)
+    .await
+    .expect("seed the refutes edge");
+    perspective(pool, e).await;
+    let f = frame(pool, "stayed").await;
+    let retracted = harness_bba(pool, b, f, author, e).await;
+    let live = harness_bba(pool, b, f, x, e).await;
+    retract_through_definer(pool, retracted).await;
+    sqlx::query(
+        "UPDATE claims SET belief = 0.3, plausibility = 0.6, pignistic_prob = 0.45 WHERE id = $1",
+    )
+    .bind(b)
+    .execute(pool)
+    .await
+    .expect("plant b's cache");
+    StayedWorld {
+        author,
+        old,
+        b,
+        live,
+        retracted,
+    }
+}
+
+/// Live BBAs keyed on an edge sourced at `retired`, held by a current claim:
+/// what K10(2) says must be empty after the cascade.
+async fn live_rows_from_retired_source(pool: &PgPool, retired: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions mf \
+           JOIN edges e ON e.id = mf.perspective_id \
+           JOIN claims h ON h.id = mf.claim_id \
+          WHERE e.source_type = 'claim' AND e.source_id = $1 \
+            AND h.is_current AND mf.retracted_at IS NULL",
+    )
+    .bind(retired)
+    .fetch_one(pool)
+    .await
+    .expect("count rows from the retired source")
+}
+
+/// What both K10(2) twins must leave: the live row invalidated, the retracted
+/// row kept and still retracted, no live row from the retired claim anywhere,
+/// `b` unbacked, and one belief audit row counting the kept retracted row.
+async fn assert_stayed_outcome(pool: &PgPool, w: &StayedWorld) {
+    assert_eq!(
+        row_state(pool, w.live).await,
+        None,
+        "the stayed edge's live row is invalidated"
+    );
+    assert_eq!(
+        row_state(pool, w.retracted).await,
+        Some((w.b, true)),
+        "the stayed edge's retracted row is kept, still retracted"
+    );
+    assert_eq!(
+        live_rows_from_retired_source(pool, w.old).await,
+        0,
+        "no live BBA keyed on an edge sourced at the retired claim remains"
+    );
+    let rows = belief_counts(pool, w.old).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["errors"], 0, "{rows:?}");
+    assert_eq!(
+        rows[0]["retracted_key_kept"], 1,
+        "the audit row counts the retracted row the stayed-edge arm kept: {rows:?}"
+    );
+    assert_eq!(rows[0]["unbacked"], 1, "b is unbacked: {rows:?}");
+    let cache: Option<f64> = sqlx::query_scalar("SELECT belief FROM claims WHERE id = $1")
+        .bind(w.b)
+        .fetch_one(pool)
+        .await
+        .expect("read b's cache");
+    assert_eq!(cache, None, "b's cache is cleared");
+}
+
+/// K10(2) mixed case through `supersede_claim` with the cascade inline on the
+/// NOSUPERUSER maintenance login.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_inline_counts_the_retracted_row_a_stayed_edge_keeps(pool: PgPool) {
+    let server = app_role_server(&pool, true).await;
+    let w = stayed_world(&pool).await;
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, w.author).await,
+        supersede_params(w.old),
+        Some(&human(w.author)),
+    )
+    .await
+    .expect("the author's supersede");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "applied", "{body}");
+    let cascade = &body["belief_cascade"];
+    assert_eq!(cascade["errors"], serde_json::json!([]), "{cascade}");
+    assert_eq!(
+        cascade["retracted_key_kept"], 1,
+        "the caller's copy counts the kept retracted row: {cascade}"
+    );
+    assert_stayed_outcome(&pool, &w).await;
+}
+
+/// Its deferred-replay twin: with no maintenance connection the cascade is
+/// deferred, and the replay reaches the same `apply_after_supersede` on the
+/// maintenance login, with the same outcome.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_claim_deferred_replay_counts_the_retracted_row_a_stayed_edge_keeps(
+    pool: PgPool,
+) {
+    let server = app_role_server(&pool, false).await;
+    let w = stayed_world(&pool).await;
+    let r = supersede_claim(
+        &server,
+        &viewer(&pool, w.author).await,
+        supersede_params(w.old),
+        Some(&human(w.author)),
+    )
+    .await
+    .expect("the author's supersede");
+    let body = first_text(&r);
+    assert_eq!(body["cascade"]["status"], "deferred", "{body}");
+    assert_eq!(
+        row_state(&pool, w.live).await,
+        Some((w.b, false)),
+        "PREMISE: nothing is invalidated before the replay"
+    );
+
+    let report = replay_now(&pool).await;
+    assert_eq!((report.applied, report.failed), (1, 0), "{report:?}");
+    assert_stayed_outcome(&pool, &w).await;
+}
+
 /// Site 2 through `mark_duplicate` with the cascade inline: another writer's
 /// edge onto the duplicate carries two edge-keyed BBAs that collide with rows
 /// the canonical holds under the same key. The duplicate's LIVE copy, whose
