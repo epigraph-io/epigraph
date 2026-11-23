@@ -125,8 +125,9 @@ const DYNAMIC_READERS: &[DynamicReader] = &[
     DynamicReader {
         file: "crates/epigraph-api/src/serving.rs",
         lookups: &["var"],
-        computed: 1,
-        why: "the `var` closure itself; its calls pass the file's `*_ENV` constants",
+        computed: 2,
+        why: "the two `from_env` `var` closures themselves (serving settings and the request \
+              pool's); their calls pass the file's `*_ENV` constants",
     },
     DynamicReader {
         file: "crates/epigraph-cli/src/operator/client_scope.rs",
