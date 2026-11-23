@@ -100,11 +100,11 @@ const MAX_REL_CHARS: usize = 40;
 /// a 200-char label of 4-byte chars is 800 bytes, 1,067 base64url chars, so
 /// the whole token is at most 1,104.
 const MAX_CURSOR_CHARS: usize = 1200;
-const PAPER_TITLE_CHARS: usize = 300;
-const PAPER_DOI_CHARS: usize = 256;
+pub(crate) const PAPER_TITLE_CHARS: usize = 300;
+pub(crate) const PAPER_DOI_CHARS: usize = 256;
 const ALGO_CHARS: usize = 64;
 
-const STALE_LINK: &str = "That page link is no longer valid. Start again from the map.";
+pub(crate) const STALE_LINK: &str = "That page link is no longer valid. Start again from the map.";
 const SHORT_KEY: &str =
     "This link was shortened and cannot be followed. Ask for a full Atlas link.";
 const OVERLAP: &str = "These two areas overlap, so there are no links between them to list.";
@@ -168,7 +168,7 @@ pub fn parse_key(raw: &str) -> Result<Uuid, KeyError> {
 }
 
 /// One line of at most [`LABEL_CHARS`] chars (ellipsis included).
-fn label_of(s: &str) -> String {
+pub(crate) fn label_of(s: &str) -> String {
     let line = one_line(s, LABEL_CHARS);
     if line.chars().count() > LABEL_CHARS {
         one_line(s, LABEL_CHARS - 1)
@@ -179,7 +179,7 @@ fn label_of(s: &str) -> String {
 
 /// Cut to `max` chars on a char boundary, without an ellipsis; `true` when
 /// something was cut.
-fn clip(s: &str, max: usize) -> (String, bool) {
+pub(crate) fn clip(s: &str, max: usize) -> (String, bool) {
     match s.char_indices().nth(max) {
         Some((idx, _)) => (s[..idx].to_string(), true),
         None => (s.to_string(), false),
@@ -190,12 +190,12 @@ fn finite(v: Option<f64>) -> Option<f64> {
     v.filter(|x| x.is_finite())
 }
 
-fn bad(what: &str) -> AppError {
+pub(crate) fn bad(what: &str) -> AppError {
     AppError::BadRequest(format!("The `{what}` parameter is not valid."))
 }
 
 /// A trimmed, non-blank query parameter.
-fn present(raw: Option<&str>) -> Option<&str> {
+pub(crate) fn present(raw: Option<&str>) -> Option<&str> {
     raw.map(str::trim).filter(|s| !s.is_empty())
 }
 
@@ -280,7 +280,7 @@ fn parse_flag(raw: Option<&str>, what: &str) -> Result<bool, AppError> {
 }
 
 /// An integer `limit`, defaulted and clamped to `1..=max`; non-numeric is 400.
-fn parse_limit(raw: Option<&str>, default: u32, max: u32) -> Result<u32, AppError> {
+pub(crate) fn parse_limit(raw: Option<&str>, default: u32, max: u32) -> Result<u32, AppError> {
     match present(raw) {
         None => Ok(default),
         Some(s) => s
@@ -290,7 +290,7 @@ fn parse_limit(raw: Option<&str>, default: u32, max: u32) -> Result<u32, AppErro
     }
 }
 
-fn parse_uuid_param(raw: Option<&str>, what: &str) -> Result<Option<Uuid>, AppError> {
+pub(crate) fn parse_uuid_param(raw: Option<&str>, what: &str) -> Result<Option<Uuid>, AppError> {
     match present(raw) {
         None => Ok(None),
         Some(s) => Uuid::parse_str(s).map(Some).map_err(|_| bad(what)),
@@ -342,7 +342,7 @@ pub fn atlas_err(e: UpstreamError) -> AppError {
 
 /// Serialise `body` as a `private, no-store` JSON response with no ETag.
 /// The caps make the size check unreachable; it is a tripwire.
-fn finish<T: Serialize>(body: &T) -> Result<Response, AppError> {
+pub(crate) fn finish<T: Serialize>(body: &T) -> Result<Response, AppError> {
     let bytes = serde_json::to_vec(body)
         .map_err(|e| AppError::Internal(format!("encoding an atlas body: {e}")))?;
     if bytes.len() > ATLAS_BODY_CAP {
@@ -377,9 +377,12 @@ fn route_deadline(state: &AppState) -> tokio::time::Instant {
 
 /// The viewer's own theme id → label map (the `/bff/themes` body). A failed
 /// directory only nulls labels; an ended session still ends the request.
-type Directory = Degraded<HashMap<Uuid, String>>;
+pub(crate) type Directory = Degraded<HashMap<Uuid, String>>;
 
-async fn theme_directory(state: &AppState, user: &SignedIn) -> Result<Directory, AppError> {
+pub(crate) async fn theme_directory(
+    state: &AppState,
+    user: &SignedIn,
+) -> Result<Directory, AppError> {
     match themes_body_cached(state, user).await {
         Ok(body) => Ok(Degraded::ok(
             body.themes
@@ -403,7 +406,7 @@ pub struct ThemeRef {
     pub label: Option<String>,
 }
 
-fn theme_ref(dir: &Directory, id: Option<Uuid>) -> Option<ThemeRef> {
+pub(crate) fn theme_ref(dir: &Directory, id: Option<Uuid>) -> Option<ThemeRef> {
     id.map(|id| ThemeRef {
         id,
         label: dir.get().and_then(|m| m.get(&id)).cloned(),

@@ -28,7 +28,7 @@ pub const MAX_REQUEST_BODY: usize = 64 * 1024;
 ///
 /// KEEP IN SYNC with the `.route(..)` / `.merge(..)` calls below and in
 /// `auth::routes`, `pages::{core,entities,graph,atlas}::routes` and
-/// `bff::{core,graph,atlas,atlas_nested}::routes`. Adding a top-level route whose first
+/// `bff::{core,graph,atlas,atlas_nested,atlas_sources}::routes`. Adding a top-level route whose first
 /// segment is new means adding it here too.
 pub const RESERVED_BASE_PATH_SEGMENTS: &[&str] = &[
     "agent",
@@ -76,6 +76,7 @@ pub fn build_app_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(pages::atlas::routes())
         .merge(bff::atlas::routes())
         .merge(bff::atlas_nested::routes())
+        .merge(bff::atlas_sources::routes())
         .merge(extra);
 
     let base = state.config.base_path.clone();
@@ -177,6 +178,7 @@ fn top_level_segments() -> Vec<String> {
         "/bff/atlas/resolve/{key}",
         "/bff/atlas/maps/{key}/{hierarchy}/{id}",
         "/bff/atlas/claim-leaf/{key}/{hierarchy}/{claim}",
+        "/bff/atlas/sources",
     ];
     let mut segments: Vec<String> = ROUTE_PATHS
         .iter()

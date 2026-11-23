@@ -4,5 +4,6 @@
 
 pub mod atlas;
 pub mod atlas_nested;
+pub mod atlas_sources;
 pub mod core;
 pub mod graph;
