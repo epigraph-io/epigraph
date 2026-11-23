@@ -64,6 +64,10 @@ pub mod conflicts;
 pub mod context;
 #[cfg(feature = "db")]
 pub mod conventions;
+/// The REST twin of MCP `countersign_authorship` (backlog 04c02296). Its
+/// types compile in both builds (the OpenAPI derive names them); its handler
+/// is db-only and registered only in the db router.
+pub mod countersign;
 pub mod cross_source;
 pub mod crud;
 pub mod edges;
@@ -543,6 +547,13 @@ pub fn create_router_with_extensions(
         .route("/api/v1/ingest/paper", post(ingest::ingest_paper))
         .route("/api/v1/ingest/paper-url", post(ingest::ingest_paper))
         .route("/api/v1/papers", post(papers::create_paper))
+        // A named author confirms or declines an ingester's naming of them
+        // (migration 208's definer, as the caller; MCP twin
+        // `countersign_authorship`).
+        .route(
+            "/api/v1/papers/:id/authors/countersign",
+            post(countersign::countersign_authorship),
+        )
         .route("/api/v1/edges", post(edges::create_edge))
         .route(
             "/api/v1/edges/hierarchical",
