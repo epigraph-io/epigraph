@@ -2765,8 +2765,23 @@ fn atlas_js_theme_panel_offers_sources_and_timeline() {
     let off_map = panel.find("if (node.offMap)").expect("off-map gate");
     assert!(off_map < offer, "a theme not on the map offers nothing");
     let buttons = body("function themeViewButtons(");
-    assert!(
-        buttons.contains("showSourcesPanel(theme)") && buttons.contains("showTimelinePanel(theme)")
+    let gate = buttons
+        .find("if (NS.on) return;")
+        .expect("no viewer-own claim reads under a map list");
+    assert!(gate < buttons.find("showSourcesPanel(theme)").unwrap());
+    assert!(gate < buttons.find("showTimelinePanel(theme)").unwrap());
+    // The two panels are the only readers of their routes.
+    assert_eq!(js.matches("VIEWS.sourcesUrl(").count(), 1);
+    assert_eq!(js.matches("VIEWS.timelineUrl(").count(), 1);
+    assert_eq!(
+        js.matches("showSourcesPanel(theme)").count(),
+        3,
+        "its definition, the button and the retry"
+    );
+    assert_eq!(
+        js.matches("showTimelinePanel(theme)").count(),
+        3,
+        "its definition, the button and the retry"
     );
     let sources = body("function showSourcesPanel(");
     assert!(sources.contains("VIEWS.sourcesUrl(cfg.sources, theme.id, after)"));

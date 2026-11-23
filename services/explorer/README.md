@@ -92,12 +92,15 @@ sign-in prompt and OpenGraph tags, because a redirect would unfurl in chat
 apps as a login page. `/atlas` does the same, and its sign-in link keeps the
 `#c-…` fragment in `return_to`.
 
-A theme's panel offers **Sources** (papers with their authors and DOI link,
+On a page without a map list (`data-atlas-maps`), a theme's panel offers **Sources** (papers with their authors and DOI link,
 agents that filed claims directly, web domains, each with the claims the viewer
 can read) and **Timeline** (the theme's current claims by filing date on one
 SVG lane, ticks by year, quarter, month, week or day, and arcs from the earlier
 to the later of two linked claims, toned support or oppose by relationship).
-Their rules are pure functions in `static/atlas_views.js`, tested with
+Both read the viewer's own claims in the theme, so with a map list they are not
+offered: the picked map, not the viewer's layout, decides what a theme shows,
+and a map-scoped read for them does not exist yet. Their rules are pure
+functions in `static/atlas_views.js`, tested with
 `node --test js-tests/atlas_views.test.cjs`. Links are drawn within each page
 of up to 100 claims, not between pages. Not built yet: the zoomable Sources and
 Timeline tabs of the design (lanes per source, `x…`/`tc-` deep links), the

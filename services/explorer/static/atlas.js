@@ -28,7 +28,8 @@
  *   simulation. Every level request names the map, the hierarchy and the
  *   level. The rules (flow styles, switch, placement, addressing) live in
  *   atlas_nested.js. Without the attribute themes behave as before.
- * - Sources and Timeline (P3b, P3c): a theme's panel offers its sources
+ * - Sources and Timeline (P3b, P3c): without a map list, a theme's panel
+ *   offers its sources
  *   (data-sources-url: papers with authors and DOI, agents, web domains)
  *   and its timeline (data-timeline-url: its claims by filing date, with
  *   arcs between linked claims), drawn in the panel as lists and an SVG
@@ -2547,8 +2548,14 @@
 
   // ---- sources and timeline (P3b, P3c) --------------------------------------
 
-  /** A theme's Sources and Timeline buttons, when the page has the routes. */
+  /**
+   * A theme's Sources and Timeline buttons, when the page has the routes and
+   * no map list: both read the viewer's own claims in the theme, and with a
+   * map list the picked map, not the viewer's layout, decides what a theme
+   * shows (as for the theme-claims reads).
+   */
   function themeViewButtons(theme) {
+    if (NS.on) return;
     if (!VIEWS || !uuid(theme.id) || (!cfg.sources && !cfg.timeline)) return;
     const s = section(null);
     s.className = 'atlas__section atlas__views';
