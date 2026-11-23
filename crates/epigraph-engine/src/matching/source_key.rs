@@ -122,6 +122,19 @@ pub fn is_same_source(a: &SourceKey, b: &SourceKey, cfg: SourceFilterConfig) -> 
 ///   anchors: the `agent -asserts->` attribution edge ingest also writes is
 ///   not a source.
 ///
+/// Walk 2 follows a lateral edge (`section_follows`, `continues_argument`,
+/// `same_source`) only while it is in force (`valid_to IS NULL OR valid_to >
+/// now()`). `same_source` in particular is a claim-to-claim edge any writer
+/// can create (and retract) through `POST /edges`; a retracted one must stop
+/// suppressing matches. `decomposes_to` and the paper `asserts` anchor are
+/// lineage and stay unfiltered, like walk 1.
+///
+/// Walk 2 has no hop cap, unlike walk 1: canonical ingest writes long
+/// `section_follows` chains, and a cap would cut a claim deep in a chain off
+/// from its paper. It still terminates and stays linear in the component's
+/// size, because the recursive `UNION` dedupes on the claim id alone (adding a
+/// depth column would defeat that dedup on an undirected walk).
+///
 /// Cost (measured on a migrated test database, `measure_intra_source_walk_cost`
 /// in `tests/source_key_derivation.rs`): a paper-asserted claim, which is
 /// every claim canonical ingest writes, stops walk 2 at hop zero, so its cost
@@ -184,13 +197,16 @@ pub async fn derive_source_key(pool: &PgPool, claim_id: Uuid) -> Result<SourceKe
                  WHERE e.source_id = c.id \
                    AND e.relationship IN \
                        ('section_follows', 'continues_argument', 'same_source') \
+                   AND (e.valid_to IS NULL OR e.valid_to > now()) \
                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
                  UNION ALL \
                  SELECT e.source_id FROM edges e \
                  WHERE e.target_id = c.id \
-                   AND e.relationship IN \
-                       ('section_follows', 'continues_argument', 'same_source', \
-                        'decomposes_to') \
+                   AND (e.relationship = 'decomposes_to' \
+                        OR (e.relationship IN \
+                                ('section_follows', 'continues_argument', \
+                                 'same_source') \
+                            AND (e.valid_to IS NULL OR e.valid_to > now()))) \
                    AND e.source_type = 'claim' AND e.target_type = 'claim' \
              ) n \
              WHERE NOT EXISTS ( \

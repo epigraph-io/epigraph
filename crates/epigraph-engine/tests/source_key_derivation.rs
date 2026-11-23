@@ -330,6 +330,41 @@ async fn a_closure_doi_does_not_lift_the_same_agent_rule(pool: PgPool) {
     );
 }
 
+/// 9da3cf2b review: a RETRACTED lateral edge (valid window closed) no longer
+/// links a claim to the paper, in either walk direction. `same_source` is
+/// writable (and retractable) through `POST /edges`, so a mistaken edge that
+/// was later withdrawn must stop suppressing matches. (Mutation: drop the
+/// in-force filter from either branch and `v_in` or `v_out` resolves P.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retracted_lateral_edge_does_not_link_to_the_paper(pool: PgPool) {
+    let p = insert_paper(&pool, "10.9/p").await;
+    let x = claim_by_fresh_agent(&pool).await;
+    insert_asserts_edge(&pool, p, x).await;
+    let v_in = claim_by_fresh_agent(&pool).await;
+    let v_out = claim_by_fresh_agent(&pool).await;
+    for (source, target) in [(x, v_in), (v_out, x)] {
+        sqlx::query(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship,
+                                valid_from, valid_to)
+             VALUES ($1, 'claim', $2, 'claim', 'same_source',
+                     now() - interval '2 hours', now() - interval '1 hour')",
+        )
+        .bind(source)
+        .bind(target)
+        .execute(&pool)
+        .await
+        .expect("insert retracted edge");
+    }
+
+    for (name, id) in [("v_in", v_in), ("v_out", v_out)] {
+        let k = derive_source_key(&pool, id).await.expect("derive");
+        assert!(
+            k.paper_dois.is_empty(),
+            "{name} is linked to P only by a retracted edge; got {k:?}"
+        );
+    }
+}
+
 /// 9da3cf2b cost measurement, not a correctness test: `#[ignore]`d, run with
 /// `cargo test -p epigraph-engine --test source_key_derivation -- --ignored
 /// --nocapture measure_intra_source_walk_cost`.
