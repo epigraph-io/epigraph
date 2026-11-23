@@ -409,6 +409,9 @@ struct Prepared {
     /// The positions C of a negative valuation over a subset of the query
     /// (the [`SUB`] flag); empty when there is none.
     sub: Vec<usize>,
+    /// Every query position, 0..n: the positions of `not_all` ([`NOT_ALL`]),
+    /// built once so the DP never allocates for it.
+    all: Vec<usize>,
 }
 
 impl Prepared {
@@ -463,6 +466,7 @@ fn prepare<A: Ord + Clone>(query: &[Lit<A>], items: &[Item<A>]) -> Result<Prepar
         open,
         items: Vec::new(),
         sub: Vec::new(),
+        all: (0..query.len()).collect(),
     };
     for item in items {
         // Atoms outside the query (for example, leaves the viewer cannot
@@ -516,13 +520,7 @@ fn settle(p: &Prepared, state: u64) -> Option<u64> {
     if flag == 0 {
         return Some(state);
     }
-    let all: Vec<usize>;
-    let positions: &[usize] = if flag == SUB {
-        &p.sub
-    } else {
-        all = (0..p.n()).collect();
-        &all
-    };
+    let positions: &[usize] = if flag == SUB { &p.sub } else { &p.all };
     let mut open_pos = None;
     let mut open_count = 0;
     for &pos in positions {
@@ -562,8 +560,7 @@ fn run_dp(p: &Prepared, not_all: f64, sub: f64) -> Result<Option<Joint>, DsError
     // closed-world sets on those atoms (Θ there, `*` elsewhere), so they
     // meet O as ⊥ (exact CDST). The initial state holds no O, so writing Θ
     // is a meet that never clashes.
-    let all: Vec<usize> = (0..p.n()).collect();
-    for (m, flag, positions) in [(not_all, NOT_ALL, &all), (sub, SUB, &p.sub)] {
+    for (m, flag, positions) in [(not_all, NOT_ALL, &p.all), (sub, SUB, &p.sub)] {
         if m <= 0.0 {
             continue;
         }
