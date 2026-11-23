@@ -45,12 +45,9 @@
 //! | claims.rs | create_claim | claim -> evidence DERIVED_FROM | yes | holds a `Viewer`; a post-commit best-effort statement; conversion deferred (no direct test harness for the signed create path yet) |
 //! | community.rs | add_member | perspective -> community MEMBER_OF | no | structural |
 //! | conventions.rs | learn_convention | agent -> claim AUTHORED | no | structural |
-//! | conventions.rs | learn_convention | evidence -> claim SUPPORTS | yes | holds no `Viewer` (an `AuthContext` only) |
 //! | conventions.rs | learn_convention | trace -> claim TRACES | no | structural |
 //! | conventions.rs | learn_convention | claim -> trace HAS_TRACE | no | structural |
-//! | crud.rs | create_evidence | claim -> evidence DERIVED_FROM | yes | holds no `Viewer` |
 //! | perspective.rs | create_perspective | perspective -> agent PERSPECTIVE_OF | no |
-//! | spans.rs | create_span | agent -> span attributed_to | no |
 //! | spans.rs | close_span | span -> claim generated | no |
 //! | spans.rs | close_span | span -> claim uses_evidence | no |
 //! | experiment_loop.rs | create_experiment | experiment -> claim tests_hypothesis | no |
@@ -159,14 +156,13 @@ const UNSTAMPED: &[(&str, usize)] = &[
     // `cross_source.rs` (1) left in U012: the promote's matcher edge moved into
     // `MatchCandidateRepo::promote_if_pending`, still unstamped (module doc,
     // "What this file does NOT see").
-    // 2 before backlog f64cf9c6: `create_reasoning_trace` writes its HAS_TRACE
-    // edge on the caller's stamped `AppState::write_as` transaction.
-    ("crud.rs", 1),
     // R-50: moved here from RAW_INSERTS (its four raw INSERTs became
     // `EdgeRepository::create_signed` on the same raw pool); not new writes.
     ("experiment_loop.rs", 4),
     ("perspective.rs", 1),
-    ("spans.rs", 3),
+    // 3 -> 2 (backlog 1dea9589): `create_span`'s attributed_to edge is written
+    // on the caller's stamped transaction. `close_span`'s two remain.
+    ("spans.rs", 2),
 ];
 
 /// The total the register may never exceed. 28 before U012 (`cross_source.rs`
@@ -181,7 +177,16 @@ const UNSTAMPED: &[(&str, usize)] = &[
 /// `crud.rs` row fell 2 -> 1.
 /// 26 -> 25 (backlog 2d60f619, merged on staging batch 4): `learn_convention`'s
 /// evidence -> claim edge moved into the evidence write (`conventions.rs` 4 -> 3).
-const HIGH_WATER: usize = 25;
+/// 25 -> 24 (backlog 73d4f7ff): `create_evidence` writes its `DERIVED_FROM`
+/// edge on the caller's stamped transaction, and `crud.rs` left the register
+/// (its earlier row: 2 before backlog f64cf9c6 stamped `create_reasoning_trace`'s
+/// `HAS_TRACE`). `learn_convention`'s and `create_evidence`'s
+/// `evidence -> claim` `supports` edges, written inside
+/// `EvidenceRepository::create`, are stamped by the same change; this scanner
+/// never counted them.
+/// 24 -> 23 (backlog 1dea9589): `create_span`'s `attributed_to` edge is
+/// written on the caller's stamped transaction (`spans.rs` 3 -> 2).
+const HIGH_WATER: usize = 23;
 
 /// Route-layer raw `INSERT INTO edges` statements, per file (see the module
 /// doc's second register). Lower a row when a statement moves to the repo

@@ -114,6 +114,50 @@ fn span_row_to_response(row: epigraph_db::repos::SpanRow) -> SpanResponse {
     }
 }
 
+/// The refusal for a span or event naming an agent the caller does not speak
+/// for. Says nothing about whether that agent exists.
+#[cfg(feature = "db")]
+pub(crate) const NOT_SPOKEN_FOR: &str =
+    "agent_id names an agent the caller does not speak for: activity may be attributed \
+     only to the caller itself, or to an agent the caller operates through a live \
+     binding; nothing was written";
+
+/// The agent a span or event is attributed to (backlog 1dea9589): the
+/// authenticated caller when the body names none, the named agent when the
+/// caller speaks for it (`AgentRepository::speaks_for`: the agent itself, or
+/// the human operating it through a live binding, the rule `POST
+/// /api/v1/edges` applies to an edge that credits an agent), and `403`
+/// otherwise. A delegated run token's principal is the agent it runs as, so
+/// it is covered by the first arm. The body's `agent_id` / `actor_id` used to
+/// be stored as given, so any `claims:write` holder could credit another
+/// agent's identity with activity it never performed.
+///
+/// `conn` is the caller's stamped connection; the binding read is a
+/// `SECURITY DEFINER` function that does not depend on the stamp.
+#[cfg(feature = "db")]
+pub(crate) async fn attributed_agent(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    named: Option<Uuid>,
+) -> Result<Uuid, ApiError> {
+    let Some(caller) = viewer.principal() else {
+        return Err(ApiError::Forbidden {
+            reason: "attributed activity needs an authenticated caller".to_string(),
+        });
+    };
+    let Some(named) = named.filter(|n| *n != caller) else {
+        return Ok(caller);
+    };
+    let speaks = epigraph_db::AgentRepository::speaks_for(&mut *conn, caller, &[named]).await?;
+    if speaks.contains_key(&named) {
+        Ok(named)
+    } else {
+        Err(ApiError::Forbidden {
+            reason: NOT_SPOKEN_FOR.to_string(),
+        })
+    }
+}
+
 /// Generate a random 16-char hex string (64-bit span ID).
 fn random_span_id() -> String {
     let bytes: [u8; 8] = rand::random();
@@ -127,23 +171,33 @@ fn random_span_id() -> String {
 /// Open a new span.
 ///
 /// `POST /api/v1/spans`
+///
+/// The span is attributed to the caller, or to an agent the caller speaks for
+/// ([`attributed_agent`], backlog 1dea9589); a body `agent_id` naming any other
+/// agent is `403` with nothing written. The span and a root span's
+/// `agent -attributed_to-> span` edge are written on ONE transaction stamped
+/// with the caller's viewer, so the edge records the caller's writer group.
 #[cfg(feature = "db")]
 pub async fn create_span(
     // `claims:write`, checked before the body is parsed (backlog f00d75ab).
     _scope: crate::middleware::bearer::RequireScopeWrite,
+    crate::middleware::bearer::ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     Json(req): Json<CreateSpanRequest>,
 ) -> Result<(StatusCode, Json<CreateSpanResponse>), ApiError> {
     let span_id = random_span_id();
 
+    let mut tx = state.write_as(&viewer, "create_span").await?;
+    let agent_id = attributed_agent(&mut tx, &viewer, req.agent_id).await?;
+
     let row = epigraph_db::repos::SpanRepository::insert(
-        &state.db_pool,
+        &mut *tx,
         &req.trace_id,
         &span_id,
         req.parent_span_id.as_deref(),
         &req.span_name,
         &req.span_kind,
-        req.agent_id,
+        Some(agent_id),
         req.user_id,
         req.session_id,
         &req.attributes,
@@ -153,25 +207,26 @@ pub async fn create_span(
         message: format!("Failed to create span: {e}"),
     })?;
 
-    // If this is a root span (no parent) and agent_id is set,
-    // create an attributed_to edge: agent → span
+    // A root span (no parent) gets an attributed_to edge: agent → span.
+    // Best-effort, as before, under a savepoint so a refused edge cannot
+    // abort the span.
     if req.parent_span_id.is_none() {
-        if let Some(agent_id) = req.agent_id {
-            let _ = epigraph_db::repos::EdgeRepository::create_signed(
-                &state.db_pool,
-                state.edge_signing_key(),
-                agent_id,
-                "agent",
-                row.id,
-                "span",
-                "attributed_to",
-                Some(serde_json::json!({"context": "agent_session_root_span"})),
-                None,
-                None,
-            )
-            .await;
-        }
+        crate::routes::belief::create_edge_under_savepoint(
+            &mut tx,
+            state.edge_signing_key(),
+            agent_id,
+            "agent",
+            row.id,
+            "span",
+            "attributed_to",
+            Some(serde_json::json!({"context": "agent_session_root_span"})),
+        )
+        .await?;
     }
+
+    tx.commit().await.map_err(|e| ApiError::DatabaseError {
+        message: format!("Failed to commit the span: {e}"),
+    })?;
 
     Ok((
         StatusCode::CREATED,

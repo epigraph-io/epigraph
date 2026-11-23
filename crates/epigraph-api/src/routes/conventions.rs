@@ -11,8 +11,8 @@
 //! (This header said "Public (GET)" and was stale. `list_skills` carries a
 //! `ViewerExtractor`, which 401s an unauthenticated caller, so the endpoint has
 //! not been public for some time. `forget_convention` and `share_skill` carry
-//! one too; `learn_convention` does not, and gates instead on an `AuthContext`
-//! plus a `claims:admin` scope check — authenticated either way. No handler's
+//! one too, and so, since backlog 73d4f7ff, does `learn_convention`, which
+//! also gates on an `AuthContext` plus a `claims:admin` scope check. No handler's
 //! posture was changed by conversion shard 7: no `ViewerExtractor` was added or
 //! removed anywhere in `src/routes/` and no routed handler signature changed.
 //! The header was describing a contract the code had already left behind.)
@@ -169,7 +169,17 @@ async fn embed_created_claim(
 /// Learn a convention — creates a claim with "convention" label and empirical evidence.
 ///
 /// `POST /api/v1/conventions`
+///
+/// The evidence row and its `evidence -> claim` `supports` edge are written on
+/// a transaction stamped with the CALLER's viewer (backlog 73d4f7ff), as
+/// `forget_convention` writes its refutation: the convention claim is public
+/// and owned by the system agent's group, so migration 114's attach rule owns
+/// the evidence by the caller's group and migration 120 owns the edge by it.
+/// On the raw pool nothing stamped the caller and the edge landed world-owned.
+/// The claim, its labels, its trace and its structural edges still autocommit
+/// on the raw pool under the system agent, so this splits no transaction.
 pub async fn learn_convention(
+    ViewerExtractor(viewer): crate::middleware::bearer::ViewerExtractor,
     State(state): State<AppState>,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Json(request): Json<LearnConventionRequest>,
@@ -259,14 +269,16 @@ pub async fn learn_convention(
         Some(request.evidence),
         claim.id,
     );
-    // With its `evidence -> claim` `supports` edge, in the evidence's own
-    // transaction (backlog 2d60f619).
+    // With its `evidence -> claim` `supports` edge (backlog 2d60f619), in ONE
+    // transaction stamped with the caller's viewer (backlog 73d4f7ff).
+    let mut tx = state.write_as(&viewer, "learn_convention").await?;
     epigraph_db::EvidenceRepository::create(
-        pool,
+        &mut *tx,
         &evidence,
         epigraph_db::EvidenceEdge::supports(state.edge_signing_key()),
     )
     .await?;
+    tx.commit().await?;
 
     // Create reasoning trace
     let trace = epigraph_core::ReasoningTrace::new(

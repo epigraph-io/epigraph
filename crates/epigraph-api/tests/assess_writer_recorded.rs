@@ -240,7 +240,13 @@ async fn the_rest_publish_path_refuses_a_forged_assessment_record(pool: PgPool) 
     let claim = seed_public_claim(&pool, author, "assess writer record: forgery").await;
     let real = assess(&pool, writer, claim, request(true, 0.9)).await;
 
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // The forger posts AS ITSELF: since backlog 1dea9589 a body `actor_id`
+    // must be the caller (or an agent it speaks for), and the actor is decided
+    // on a viewer-stamped read, so the state carries a scoped pool.
+    let state = AppState::with_scoped_pool(
+        viewer_fixture::scoped_pool(&pool).await,
+        ApiConfig::default(),
+    );
     let post = |event_type: &str| {
         let body: CreateEventRequest = serde_json::from_value(serde_json::json!({
             "event_type": event_type,
@@ -256,7 +262,20 @@ async fn the_rest_publish_path_refuses_a_forged_assessment_record(pool: PgPool) 
             },
         }))
         .expect("CreateEventRequest deserializes");
-        create_event(write_scope(), State(state.clone()), Json(body))
+        let state = state.clone();
+        let pool = pool.clone();
+        async move {
+            let viewer = Viewer::resolve(&pool, forger)
+                .await
+                .expect("resolve forger");
+            create_event(
+                write_scope_as(forger),
+                ViewerExtractor(viewer),
+                State(state),
+                Json(body),
+            )
+            .await
+        }
     };
 
     for spelling in ["claim.assessed", "  claim.assessed\t", "Claim.Assessed"] {
@@ -348,7 +367,10 @@ async fn a_failed_record_refuses_the_call_and_stores_no_assessment(pool: PgPool)
 /// extractor (backlog f00d75ab). A direct handler call stands in for the
 /// bearer middleware, so it supplies the scope the route checks.
 fn write_scope() -> epigraph_api::middleware::bearer::RequireScopeWrite {
-    let principal = uuid::Uuid::new_v4();
+    write_scope_as(uuid::Uuid::new_v4())
+}
+
+fn write_scope_as(principal: Uuid) -> epigraph_api::middleware::bearer::RequireScopeWrite {
     epigraph_api::middleware::bearer::RequireScopeWrite(
         epigraph_api::middleware::bearer::AuthContext {
             client_id: principal,

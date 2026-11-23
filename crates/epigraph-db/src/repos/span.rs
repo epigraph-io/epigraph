@@ -32,10 +32,14 @@ pub struct SpanRepository;
 
 impl SpanRepository {
     /// Open a new span. Returns the row with server-generated id and started_at.
+    ///
+    /// Takes any executor so `POST /api/v1/spans` can write the span on the
+    /// caller's stamped transaction, together with its `attributed_to` edge
+    /// (backlog 1dea9589).
     #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(pool, attributes))]
-    pub async fn insert(
-        pool: &PgPool,
+    #[instrument(skip(executor, attributes))]
+    pub async fn insert<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
         trace_id: &str,
         span_id: &str,
         parent_span_id: Option<&str>,
@@ -67,7 +71,7 @@ impl SpanRepository {
         .bind(user_id)
         .bind(session_id)
         .bind(attributes)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
     }
 

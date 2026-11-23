@@ -773,3 +773,103 @@ async fn an_unreadable_trace_is_not_named(pool: PgPool) {
     }
     assert_eq!(raw.matches(&t3.to_string()).count(), 1);
 }
+
+/// `GET /api/v1/claims/:id` as `bearer`; returns the status, parsed body and
+/// raw body.
+async fn get_claim(app: &Router, id: Uuid, bearer: &str) -> (StatusCode, Value, String) {
+    let (status, raw) = send(
+        app,
+        Method::GET,
+        &format!("/api/v1/claims/{id}"),
+        None,
+        Some(bearer),
+    )
+    .await;
+    let value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    (status, value, raw)
+}
+
+/// The router with BOTH pools on the application role (no BYPASSRLS, FORCEd
+/// tenancy policies), the shape production serves from: row security, not only
+/// the in-query predicate, decides what the stranger reads.
+async fn app_role_router(pool: &PgPool) -> Router {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: the arm is vacuous"
+    );
+    let url = fixture::database_url_for(pool).await;
+    let scoped = epigraph_db::ScopedPool::connect_downgraded_for_tests(
+        &url,
+        epigraph_db::SessionGucMode::Session,
+        "epigraph_app",
+    )
+    .await
+    .expect("app-role ScopedPool");
+    let raw = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let mut state = AppState::with_db(raw, ApiConfig::default());
+    state.scoped = Some(scoped);
+    create_router(state)
+}
+
+/// Backlog b3d3049b: `GET /api/v1/claims/:id` answers `trace_id` exactly as
+/// batch-get does. A trace private to another group is not named to a caller
+/// that may read the claim but not the trace, and that body is the body of a
+/// claim with no trace at all. On the application role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_does_not_name_an_unreadable_trace(pool: PgPool) {
+    let owner = Uuid::new_v4();
+    let p1 = common::seed_claim_with_agent(&pool, "first public claim", owner).await;
+    let p2 = common::seed_claim_with_agent(&pool, "second public claim", owner).await;
+    let p3 = common::seed_claim_with_agent(&pool, "third public claim", owner).await;
+    let t = fixture::seed_reasoning_trace(&pool, p1, "deductive").await;
+    make_trace_private(&pool, t, owner).await;
+    let t3 = fixture::seed_reasoning_trace(&pool, p3, "inductive").await;
+    sqlx::query("UPDATE claims SET created_at = '2026-01-01T00:00:00Z' WHERE id = ANY($1)")
+        .bind(vec![p1, p2, p3])
+        .execute(&pool)
+        .await
+        .expect("align the timestamps");
+
+    let stranger = Uuid::new_v4();
+    personal_group_for(&pool, stranger).await;
+    let app = app_role_router(&pool).await;
+    let st = token(stranger);
+
+    let (s1, b1, raw1) = get_claim(&app, p1, &st).await;
+    let (s2, _, raw2) = get_claim(&app, p2, &st).await;
+    assert_eq!(s1, StatusCode::OK, "{raw1}");
+    assert_eq!(s2, StatusCode::OK, "{raw2}");
+    let low = raw1.to_lowercase();
+    for f in [t.to_string(), t.simple().to_string()] {
+        assert!(
+            !low.contains(&f),
+            "the private trace id leaked on GET: {raw1}"
+        );
+    }
+    assert_eq!(b1["trace_id"], Value::Null);
+    assert_eq!(
+        raw1.replace(&p1.to_string(), "<ID>")
+            .replace("first public claim", "<C>"),
+        raw2.replace(&p2.to_string(), "<ID>")
+            .replace("second public claim", "<C>"),
+        "on GET an unreadable trace gives the same answer as no trace"
+    );
+
+    // Selective, not blanket: a readable trace is still named.
+    let (_, b3, _) = get_claim(&app, p3, &st).await;
+    assert_eq!(b3["trace_id"], t3.to_string());
+
+    // Calibration: the owner reads the private trace, so GET names it.
+    let (status, ob, raw) = get_claim(&app, p1, &token(owner)).await;
+    assert_eq!(status, StatusCode::OK, "{raw}");
+    assert_eq!(ob["trace_id"], t.to_string());
+
+    // GET and batch-get agree for the stranger.
+    let (_, bb, _) = batch(&app, &strs(&[p1]), &st).await;
+    assert_eq!(item(&bb, p1)["trace_id"], b1["trace_id"]);
+}

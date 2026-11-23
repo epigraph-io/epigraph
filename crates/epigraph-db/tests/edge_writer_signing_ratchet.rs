@@ -381,12 +381,6 @@ const REGISTER: &[Site] = &[
     ),
     site(
         "crates/epigraph-api/src/routes/crud.rs",
-        "create_evidence",
-        1,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/crud.rs",
         "promote_staged_edges",
         1,
         Signed,
@@ -437,12 +431,6 @@ const REGISTER: &[Site] = &[
         "crates/epigraph-api/src/routes/provenance.rs",
         "set_provenance",
         4,
-        Signed,
-    ),
-    site(
-        "crates/epigraph-api/src/routes/spans.rs",
-        "create_span",
-        1,
         Signed,
     ),
     site(

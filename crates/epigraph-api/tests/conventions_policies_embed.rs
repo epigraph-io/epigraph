@@ -101,6 +101,7 @@ async fn learn_convention_embeds_the_convention_claim(pool: PgPool) {
     .expect("request");
 
     let (status, Json(created)) = learn_convention(
+        ViewerExtractor(Viewer::resolve(&pool, admin).await.expect("resolve")),
         State(state),
         token(admin, ClientType::Service, "claims:admin"),
         Json(request),
