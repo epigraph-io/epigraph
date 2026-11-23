@@ -185,6 +185,11 @@ async fn a_refold_that_empties_on_the_repaired_frame_is_reported_unchanged(pool:
 /// claim refolds `binary_truth`, and migration 114 declines that write: the
 /// claim is listed under `unchanged`. The same cascade on the privileged
 /// connection writes it (the control), so the decline is the session's.
+///
+/// The claim also holds a BBA on `claim_validity`, the frame its cache
+/// records: migration 243 lets a non-owner re-point a public claim's cache
+/// off a recorded frame that holds NO cache-admissible input, so without that
+/// BBA the stranger's write is accepted (as a re-point), not declined.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_write_migration_114_declines_is_reported_unchanged(pool: PgPool) {
     let (_scoped, bypass) = fixture::bypass(&pool).await;
@@ -194,6 +199,7 @@ async fn a_write_migration_114_declines_is_reported_unchanged(pool: PgPool) {
 
     let claim = fixture::seed_public_claim(&pool, author, "cache owned elsewhere").await;
     store(&pool, claim, binary, author).await;
+    store(&pool, claim, validity, author).await;
     plant(&pool, claim, validity).await;
     let before = cache(&pool, claim).await;
 
