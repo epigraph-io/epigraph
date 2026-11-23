@@ -52,6 +52,11 @@ async fn post(f: &Fixture, body: serde_json::Value) -> (u16, serde_json::Value) 
     (status, r.json().await.unwrap_or(serde_json::Value::Null))
 }
 
+/// A value no earlier run wrote. These tests run on the ambient `DATABASE_URL`
+/// (`#[tokio::test]`, not a per-test database), so anything a unique index
+/// keys on must come from here: a group's `group_public_key` derives its
+/// `did_key` (`groups_did_key_key`), and a fixed key made every group-creating
+/// test fail on a database it had already run against (backlog f6043078).
 fn uniq(tag: &str) -> String {
     format!("batch477 {tag} {}", Uuid::new_v4())
 }
@@ -298,7 +303,7 @@ async fn a_private_item_persists_without_an_embedding_while_a_public_one_is_embe
         .bearer_auth(&token)
         .json(&serde_json::json!({
             "name": uniq("grp"),
-            "group_public_key": hex::encode(blake3::hash(b"batch477").as_bytes())
+            "group_public_key": hex::encode(blake3::hash(uniq("key").as_bytes()).as_bytes())
         }))
         .send()
         .await
@@ -490,7 +495,7 @@ async fn a_private_item_naming_a_group_the_caller_is_not_in_is_403_and_writes_no
         .bearer_auth(&owner_token)
         .json(&serde_json::json!({
             "name": uniq("grp-not-mine"),
-            "group_public_key": hex::encode(blake3::hash(b"batch477-nonmember").as_bytes())
+            "group_public_key": hex::encode(blake3::hash(uniq("key").as_bytes()).as_bytes())
         }))
         .send()
         .await

@@ -4979,3 +4979,169 @@ async fn every_family_a_profile_names_must_be_an_allowlisted_index(pool: PgPool)
     .await
     .expect("both families allowlisted");
 }
+
+/// Whether `message` is the named refusal a label write onto a claim in a
+/// group the write identity cannot write answers (backlog 3e7bfee3,
+/// `tools::claims::label_not_writer`), for `claim`: it names the claim, says
+/// nothing was written, names the audited admin path, and is not the raw
+/// row-security error.
+fn is_named_not_writer(message: &str, claim: Uuid) -> bool {
+    message.contains(&claim.to_string())
+        && message.contains("nothing was written")
+        && message.contains("claims:admin")
+        && !message.contains("row-level security")
+}
+
+/// `apply_label_dedup`'s label writes go through `update_labels`' per-claim
+/// path (backlog 8672f843): a hygiene unit whose target the server agent
+/// AUTHORED (so the ownership checks admit it) but which is owned by a group
+/// the agent's stamp cannot write is refused by the database, and the unit
+/// fails with the named not-writer refusal, not an internal error, with
+/// nothing written. The plan predicted it (`applies: false`). Calibration: the
+/// agent's own-group hygiene unit in the same apply commits.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_apply_label_write_the_claims_group_refuses_is_the_named_refusal(pool: PgPool) {
+    let bytes = profile_bytes();
+    let root = profile_root(&bytes);
+    let (server, agent, group, viewer) =
+        app_role_server(&pool, config(Some(&root), None, 5000)).await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-group").await;
+    let in_foreign_group = seed(
+        &pool,
+        agent,
+        stranger_group,
+        "public",
+        ROOF,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-05T00:00:00Z",
+    )
+    .await;
+    let in_own_group = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        GATE,
+        &[FAMILY, "tracked-item-duplicate"],
+        "2026-09-06T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[in_foreign_group]).await;
+
+    let p = plan_params_path("profile.json", &profile_hash(&bytes), DEDUP);
+    let plan = plan_ok(&server, &viewer, p.clone(), None).await;
+    let foreign_unit = format!("hygiene:{in_foreign_group}");
+    let own_unit = format!("hygiene:{in_own_group}");
+    assert_eq!(
+        unit_check(&plan, &foreign_unit)["applies"],
+        false,
+        "predicted: {plan}"
+    );
+    assert_eq!(unit_check(&plan, &own_unit)["applies"], true, "{plan}");
+
+    let out = apply_ok(&server, &viewer, apply_params(&p, &plan_hash(&plan)), None).await;
+    let failed = result_for(&out, &foreign_unit);
+    assert_eq!(failed["ok"], false, "{out}");
+    let message = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        is_named_not_writer(message, in_foreign_group),
+        "the unit's refusal is the named not-writer refusal, not an internal error: {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &[in_foreign_group]).await,
+        before,
+        "nothing written"
+    );
+
+    assert_eq!(
+        result_for(&out, &own_unit)["ok"],
+        true,
+        "calibration: {out}"
+    );
+    assert!(
+        !labels_of(&pool, in_own_group)
+            .await
+            .contains(&FAMILY.to_string()),
+        "calibration: the own-group hygiene write landed"
+    );
+}
+
+/// `revert_label_dedup`'s label writes take the same per-claim path (backlog
+/// 8672f843): reverting a recorded change on a claim the server agent authored
+/// but whose owning group its stamp cannot write fails that step with the
+/// named not-writer refusal, with nothing written, and the revert reports
+/// `partial`. The claim CARRIES the label the revert removes, so the step is a
+/// real write the database decides, not a no-op. Calibration: the same revert
+/// of the agent's own-group claim succeeds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revert_label_write_the_claims_group_refuses_is_the_named_refusal(pool: PgPool) {
+    let (server, agent, group, viewer) = app_role_server(&pool, config(None, None, 5000)).await;
+    let (_stranger, stranger_group) = fixture::seed_agent_with_group(&pool, "item-group").await;
+    let in_foreign_group = seed(
+        &pool,
+        agent,
+        stranger_group,
+        "public",
+        ROOF,
+        &[RUN_TAG],
+        "2026-09-05T00:00:00Z",
+    )
+    .await;
+    let in_own_group = seed(
+        &pool,
+        agent,
+        group,
+        "public",
+        GATE,
+        &[RUN_TAG],
+        "2026-09-06T00:00:00Z",
+    )
+    .await;
+    let before = snapshot(&pool, &[in_foreign_group]).await;
+    let recorded = |id: Uuid| {
+        json!({
+            "unit": format!("hygiene:{id}"), "claim_id": id,
+            "labels_added": [RUN_TAG], "labels_removed": [FAMILY],
+        })
+    };
+    let params: RevertLabelDedupParams = serde_json::from_value(json!({
+        "applied_units": [recorded(in_own_group), recorded(in_foreign_group)],
+        "applied_marks": [],
+    }))
+    .expect("revert params");
+
+    let out = first_text(
+        &revert_label_dedup(&server, &viewer, params, None)
+            .await
+            .expect("revert"),
+    );
+    assert_eq!(out["status"], "partial", "{out}");
+    let step = |id: Uuid| {
+        out["steps"]
+            .as_array()
+            .and_then(|s| s.iter().find(|s| s["claim_id"] == id.to_string()))
+            .unwrap_or_else(|| panic!("no step for {id}: {out}"))
+            .clone()
+    };
+    let refused = step(in_foreign_group);
+    assert_eq!(refused["ok"], false, "{out}");
+    assert!(
+        is_named_not_writer(
+            refused["error"].as_str().unwrap_or_default(),
+            in_foreign_group
+        ),
+        "the step's refusal is the named not-writer refusal, not an internal error: {out}"
+    );
+    assert_eq!(
+        snapshot(&pool, &[in_foreign_group]).await,
+        before,
+        "nothing written"
+    );
+
+    assert_eq!(step(in_own_group)["ok"], true, "calibration: {out}");
+    assert_eq!(
+        sorted(labels_of(&pool, in_own_group).await),
+        sorted(s(&[FAMILY])),
+        "calibration: the own-group revert landed"
+    );
+}

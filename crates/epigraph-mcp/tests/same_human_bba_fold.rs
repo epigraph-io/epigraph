@@ -23,6 +23,7 @@
 mod fixture;
 
 use epigraph_crypto::AgentSigner;
+use epigraph_db::{ScopedPool, SessionGucMode};
 use epigraph_mcp::tools::ds_auto::ensure_binary_frame;
 use epigraph_mcp::types::{SubmitDsEvidenceParams, UpdateWithEvidenceParams};
 use epigraph_mcp::{embed::McpEmbedder, tools, EpiGraphMcpFull};
@@ -45,6 +46,37 @@ async fn server_for_new_agent(pool: &PgPool, seed: u8) -> (EpiGraphMcpFull, Uuid
     let server =
         EpiGraphMcpFull::new(pool.clone(), signer, embedder, false).with_scoped_pool(scoped);
     (server, agent)
+}
+
+/// [`server_for_new_agent`] on the APPLICATION ROLE: both of the server's
+/// pools are downgraded to `epigraph_app`, so row security and the stamps
+/// decide every read `compare_methods` makes (on the harness superuser, which
+/// holds BYPASSRLS, they decide nothing). Fixtures are still seeded on the
+/// superuser pool.
+async fn app_role_server_for_new_agent(pool: &PgPool, seed: u8) -> EpiGraphMcpFull {
+    let bypassrls: bool =
+        sqlx::query_scalar("SELECT rolbypassrls FROM pg_roles WHERE rolname = 'epigraph_app'")
+            .fetch_one(pool)
+            .await
+            .expect("read epigraph_app");
+    assert!(
+        !bypassrls,
+        "epigraph_app holds BYPASSRLS: an app-role arm would be vacuous"
+    );
+    let signer = AgentSigner::from_bytes(&[seed; 32]).expect("signer");
+    sqlx::query("INSERT INTO agents (public_key, display_name) VALUES ($1, 'mcp-agent')")
+        .bind(signer.public_key().as_slice())
+        .execute(pool)
+        .await
+        .expect("the server's agent row");
+    let url = fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let plain = fixture::downgraded_pool(pool, "epigraph_app").await;
+    let embedder = McpEmbedder::new(plain.clone(), None).with_scoped_pool(scoped.clone());
+    EpiGraphMcpFull::new(plain, signer, embedder, false).with_scoped_pool(scoped)
 }
 
 /// Link `agent` to human operator `human` (migration 107's live link).
@@ -356,23 +388,66 @@ async fn compare_methods_does_not_aggregate_two_agents_of_one_human(pool: PgPool
 /// different owners combine to something else again.
 #[sqlx::test(migrations = "../../migrations")]
 async fn compare_methods_reduces_distinct_sibling_bbas_by_the_cautious_rule(pool: PgPool) {
+    let (server, _) = server_for_new_agent(&pool, 0x52).await;
+    assert_cautious_sibling_reduction(&server, &pool).await;
+}
+
+/// The cautious-reduction arm above on an APPLICATION-ROLE server (backlog
+/// 7a2cfa54): the rows, the frame and each source agent's live human are read
+/// under real row security and the caller's stamp, and the same-human rule
+/// still reduces two agents of one human. CALIBRATION, the read itself: one
+/// BBA alone reports its own masses, so the rows are visible to the app role
+/// (an empty or partial read cannot pass as a reduction).
+#[sqlx::test(migrations = "../../migrations")]
+async fn compare_methods_reduces_sibling_bbas_on_an_application_role_server(pool: PgPool) {
+    let server = app_role_server_for_new_agent(&pool, 0x53).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
+    )
+    .bind(format!("same-human-app-role-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("seed frame");
+    let (alone, _) = fixture::seed_agent_with_group(&pool, "same-human-app-role-alone").await;
+    let claim = fresh_claim(&pool, "same-human app-role calibration").await;
+    seed_row(
+        &pool,
+        alone,
+        claim,
+        frame,
+        &serde_json::json!({"0": 0.7, "0,1": 0.3}),
+    )
+    .await;
+    let single = compare(&server, &pool, claim, frame).await;
+    assert!(
+        (single["Dempster"].0 - 0.7).abs() < 1e-9,
+        "calibration: the app role reads the one BBA, whose belief is its own mass: {single:?}"
+    );
+
+    assert_cautious_sibling_reduction(&server, &pool).await;
+}
+
+/// Two agents of one human store DIFFERENT BBAs on a fresh claim; every
+/// `compare_methods` row must equal the engine's cautious reduction of the
+/// pair (neither sibling's BBA), and the same two masses by agents of two
+/// different owners must combine to something else.
+async fn assert_cautious_sibling_reduction(server: &EpiGraphMcpFull, pool: &PgPool) {
     use epigraph_ds::{measures, FocalElement, FrameOfDiscernment, MassFunction};
     use std::collections::BTreeSet;
 
-    let (server, _) = server_for_new_agent(&pool, 0x52).await;
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
     )
     .bind(format!("same-human-cautious-{}", Uuid::new_v4()))
-    .fetch_one(&pool)
+    .fetch_one(pool)
     .await
     .expect("seed frame");
-    let (human, _) = fixture::seed_human_operator(&pool, "same-human-cautious").await;
-    let (a1, _) = fixture::seed_agent_with_group(&pool, "same-human-cautious-one").await;
-    let (a2, _) = fixture::seed_agent_with_group(&pool, "same-human-cautious-two").await;
-    link(&pool, a1, human).await;
-    link(&pool, a2, human).await;
-    let (stranger, _) = fixture::seed_agent_with_group(&pool, "same-human-cautious-x").await;
+    let (human, _) = fixture::seed_human_operator(pool, "same-human-cautious").await;
+    let (a1, _) = fixture::seed_agent_with_group(pool, "same-human-cautious-one").await;
+    let (a2, _) = fixture::seed_agent_with_group(pool, "same-human-cautious-two").await;
+    link(pool, a1, human).await;
+    link(pool, a2, human).await;
+    let (stranger, _) = fixture::seed_agent_with_group(pool, "same-human-cautious-x").await;
     let s1 = serde_json::json!({"0": 0.5, "1": 0.2, "0,1": 0.3});
     let s2 = serde_json::json!({"0": 0.3, "1": 0.3, "0,1": 0.4});
 
@@ -405,10 +480,10 @@ async fn compare_methods_reduces_distinct_sibling_bbas_by_the_cautious_rule(pool
         );
     }
 
-    let claim = fresh_claim(&pool, "same-human cautious siblings").await;
-    seed_row(&pool, a1, claim, frame, &s1).await;
-    seed_row(&pool, a2, claim, frame, &s2).await;
-    let siblings = compare(&server, &pool, claim, frame).await;
+    let claim = fresh_claim(pool, "same-human cautious siblings").await;
+    seed_row(pool, a1, claim, frame, &s1).await;
+    seed_row(pool, a2, claim, frame, &s2).await;
+    let siblings = compare(server, pool, claim, frame).await;
     assert!(!siblings.is_empty(), "compare_methods returned no methods");
     for (method, got) in &siblings {
         assert!(
@@ -418,10 +493,10 @@ async fn compare_methods_reduces_distinct_sibling_bbas_by_the_cautious_rule(pool
         );
     }
 
-    let control = fresh_claim(&pool, "same-human cautious control").await;
-    seed_row(&pool, a1, control, frame, &s1).await;
-    seed_row(&pool, stranger, control, frame, &s2).await;
-    let independent = compare(&server, &pool, control, frame).await;
+    let control = fresh_claim(pool, "same-human cautious control").await;
+    seed_row(pool, a1, control, frame, &s1).await;
+    seed_row(pool, stranger, control, frame, &s2).await;
+    let independent = compare(server, pool, control, frame).await;
     assert!(
         !near(independent["Dempster"], expected),
         "control: agents of different owners combine by Dempster, not the cautious rule: \

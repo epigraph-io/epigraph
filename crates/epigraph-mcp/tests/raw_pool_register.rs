@@ -246,12 +246,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         ENGINE_POOL_PARAM,
     ),
-    (
-        "epigraph-engine/src/source_dependence.rs",
-        "bba_sources_for_rows_on_pool",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
     // ── epigraph-mcp: identity, auth, plumbing ───────────────────────────
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
     (
@@ -532,7 +526,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// The ownership gate's link arms (`operator_arm_allows`,
 /// `delegate_arm_allows`) then moved onto the act's own transaction (backlog
 /// 9a5bc055), removing three: 68 -> 65 (82 -> 79 on its own branch).
-const HIGH_WATER: usize = 65;
+/// Backlog 7a2cfa54 deleted `source_dependence::bba_sources_for_rows_on_pool`,
+/// whose last caller (`compare_methods`' no-ScopedPool arm) was already gone:
+/// 65 -> 64 (82 -> 81 on its own branch).
+const HIGH_WATER: usize = 64;
 
 // ===========================================================================
 // The scanner.

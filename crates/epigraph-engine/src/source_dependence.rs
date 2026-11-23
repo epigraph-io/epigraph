@@ -393,24 +393,6 @@ pub async fn bba_sources_for_rows(
     Ok(assemble_bba_sources(rows, keys, &humans))
 }
 
-/// [`bba_sources_for_rows`] read on a pool instead of one connection: for a
-/// read-only caller with no stamped connection to hand (MCP
-/// `compare_methods` on a server built without a `ScopedPool`), which reads
-/// its rows on the same pool.
-///
-/// # Errors
-/// `DbError` if a read fails.
-pub async fn bba_sources_for_rows_on_pool(
-    pool: &sqlx::PgPool,
-    viewer: &epigraph_db::visibility::Viewer,
-    rows: &[MassFunctionRow],
-) -> Result<Vec<BbaSource>, epigraph_db::DbError> {
-    let keys = source_keys_for_rows(pool, viewer, rows).await?;
-    let agents: Vec<Uuid> = rows.iter().filter_map(|r| r.source_agent_id).collect();
-    let humans = epigraph_db::AgentRepository::humans_of(pool, &agents, true).await?;
-    Ok(assemble_bba_sources(rows, keys, &humans))
-}
-
 /// Each row's [`BbaSource`] from its same-source key and the live human of
 /// its source agent (an agent bound to no live human is its own owner).
 fn assemble_bba_sources(
