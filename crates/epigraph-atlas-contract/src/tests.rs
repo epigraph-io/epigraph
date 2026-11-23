@@ -1605,6 +1605,162 @@ fn for_viewer_drops_what_would_show_a_hidden_claim() {
     assert_eq!(group.for_viewer(|_| false), Some(group.clone()));
 }
 
+fn overlay_edge(source: uuid::Uuid, target: uuid::Uuid, rel: &str, basis: FlowBasis) -> Edge {
+    let (sign, flow_weight) = match basis {
+        FlowBasis::None => (0, 0.0),
+        FlowBasis::Proxy | FlowBasis::Exact => (1, 0.4),
+    };
+    Edge {
+        source,
+        target,
+        relationship: rel.into(),
+        sign,
+        flow_weight,
+        flow_basis: basis,
+    }
+}
+
+/// The per-viewer overlay (co-owned edges a viewer in both teams reads) adds
+/// valid edges between drawn nodes after the stored ones, and nothing else:
+/// it never changes a stored edge, never adds a node, an edge to a node the
+/// leaf does not draw, a triple the leaf already draws (in either casing),
+/// an edge the contract refuses, or an edge past the leaf's edge limit.
+#[test]
+fn viewer_edges_are_added_between_drawn_nodes_and_change_nothing_stored() {
+    let stored: LevelDocument = serde_json::from_slice(&read_fixture("public_leaf")).unwrap();
+    let s = leaf_of(&stored);
+    let of = |kind: NodeKind| -> Vec<uuid::Uuid> {
+        s.nodes
+            .iter()
+            .filter(|n| n.kind() == kind)
+            .map(Node::id)
+            .collect()
+    };
+    let (claims, agents, evidence) = (
+        of(NodeKind::Claim),
+        of(NodeKind::Agent),
+        of(NodeKind::Evidence),
+    );
+    let triple = |e: &Edge| (e.source, e.target, e.relationship.to_ascii_lowercase());
+    let drawn: BTreeSet<_> = s.edges.iter().map(triple).collect();
+    // Two claims with no stored edge between them in this direction.
+    let (c1, c2) = claims
+        .iter()
+        .flat_map(|a| claims.iter().map(move |b| (*a, *b)))
+        .find(|(a, b)| a != b && !s.edges.iter().any(|e| e.source == *a && e.target == *b))
+        .unwrap();
+    let ev = evidence[0];
+    let (ag, cl) = (agents[0], claims[0]);
+    let stored_edge = s
+        .edges
+        .iter()
+        .find(|e| e.relationship == "SUPPORTS")
+        .unwrap();
+    let outsider = uuid::Uuid::from_u128(0xdead_beef);
+
+    let good_claim = overlay_edge(c1, c2, "contradicts", FlowBasis::Proxy);
+    let good_claim = Edge {
+        sign: -1,
+        ..good_claim
+    };
+    let good_evidence = overlay_edge(ev, c2, "refutes", FlowBasis::None);
+    let good_agent = overlay_edge(ag, cl, "endorses", FlowBasis::None);
+    let mut extra = vec![
+        good_claim.clone(),
+        // a stored triple, spelled in the other casing, with another weight
+        Edge {
+            relationship: stored_edge.relationship.to_ascii_lowercase(),
+            flow_weight: 1.0,
+            ..stored_edge.clone()
+        },
+        // an end the leaf does not draw
+        overlay_edge(c1, outsider, "supports", FlowBasis::Proxy),
+        overlay_edge(outsider, c2, "supports", FlowBasis::Proxy),
+        // a self-loop
+        overlay_edge(c1, c1, "supports", FlowBasis::Proxy),
+        // a name outside the contract's pattern
+        overlay_edge(c2, c1, "is part of", FlowBasis::Proxy),
+        // a basis the kinds do not allow
+        overlay_edge(c2, c1, "supports", FlowBasis::Exact),
+        overlay_edge(ag, cl, "authored", FlowBasis::Proxy),
+        // a `none` edge with a weight, a proxy of sign 0 with a weight
+        Edge {
+            flow_weight: 0.3,
+            ..overlay_edge(ev, c1, "supports", FlowBasis::None)
+        },
+        Edge {
+            sign: 0,
+            ..overlay_edge(c2, c1, "cites", FlowBasis::Proxy)
+        },
+        // out of range
+        Edge {
+            sign: 2,
+            ..overlay_edge(c2, c1, "supports", FlowBasis::Proxy)
+        },
+        Edge {
+            flow_weight: 1.5,
+            ..overlay_edge(c2, c1, "supports", FlowBasis::Proxy)
+        },
+        good_evidence.clone(),
+        // the same triple twice: the first one given wins
+        Edge {
+            relationship: "CONTRADICTS".into(),
+            ..good_claim.clone()
+        },
+        good_agent.clone(),
+    ];
+    let (served, added, over_cap) = stored.with_viewer_edges(&extra);
+    assert_eq!((added, over_cap), (3, 0));
+    served.validate().unwrap();
+    let body = serde_json::to_vec(&served).unwrap();
+    check_as("public_leaf", &body).unwrap();
+    let l = leaf_of(&served);
+    assert_eq!(l.nodes, s.nodes, "no node is added or dropped");
+    assert_eq!(l.outgoing, s.outgoing);
+    assert_eq!(
+        &l.edges[..s.edges.len()],
+        &s.edges[..],
+        "stored edges unchanged, in order"
+    );
+    assert_eq!(
+        &l.edges[s.edges.len()..],
+        &[good_claim.clone(), good_evidence, good_agent][..],
+        "appended in the order given"
+    );
+    assert!(!drawn.contains(&triple(&good_claim)));
+
+    // Nothing to add: the leaf as given.
+    assert_eq!(stored.with_viewer_edges(&[]), (stored.clone(), 0, 0));
+
+    // A full leaf takes no more, and says how many it left out.
+    let mut full = s.clone();
+    let mut k = 0;
+    'fill: for a in &claims {
+        for b in &claims {
+            if full.edges.len() == MAX_LEAF_EDGES {
+                break 'fill;
+            }
+            let e = overlay_edge(*a, *b, "supports", FlowBasis::Proxy);
+            if a != b && !full.edges.iter().any(|x| triple(x) == triple(&e)) {
+                full.edges.push(e);
+                k += 1;
+            }
+        }
+    }
+    assert!(k > 0 && full.edges.len() == MAX_LEAF_EDGES);
+    let full = LevelDocument::Leaf(full);
+    full.validate().unwrap();
+    let fresh = overlay_edge(ev, c1, "refutes", FlowBasis::None);
+    extra = vec![good_claim, fresh];
+    let (got, added, over_cap) = full.with_viewer_edges(&extra);
+    assert_eq!(got, full, "a full leaf is served as it is");
+    assert_eq!((added, over_cap), (0, 2));
+
+    // A group level is served as stored.
+    let group: LevelDocument = serde_json::from_slice(&read_fixture("team_theme_root")).unwrap();
+    assert_eq!(group.with_viewer_edges(&extra), (group.clone(), 0, 0));
+}
+
 /// The served-body check ties the body to the request: a level of another
 /// map, or another level, fails even though it is a valid document.
 #[test]
