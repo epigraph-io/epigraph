@@ -246,12 +246,6 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
         1,
         ENGINE_POOL_PARAM,
     ),
-    (
-        "epigraph-engine/src/source_dependence.rs",
-        "bba_sources_for_rows_on_pool",
-        1,
-        ENGINE_POOL_PARAM,
-    ),
     // ── epigraph-mcp: identity, auth, plumbing ───────────────────────────
     ("epigraph-mcp/src/auth.rs", "is_revoked", 1, PRE_VIEWER),
     (
@@ -601,8 +595,10 @@ const REGISTER: &[(&str, &str, usize, &str)] = &[
 /// no caller to stamp them from. The operator approved exactly that raise on
 /// 2026-11-16 and no other; every other new site is converted, not registered
 /// against a higher ceiling. #875 then converted the recall helpers onto the
-/// caller's stamped connection, removing four rows: 86 -> 82.
-const HIGH_WATER: usize = 82;
+/// caller's stamped connection, removing four rows: 86 -> 82. Backlog
+/// 7a2cfa54 deleted `source_dependence::bba_sources_for_rows_on_pool`, whose
+/// last caller (`compare_methods`' no-ScopedPool arm) was already gone: 82 -> 81.
+const HIGH_WATER: usize = 81;
 
 // ===========================================================================
 // The scanner.
