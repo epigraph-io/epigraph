@@ -706,3 +706,68 @@ async fn targeted_rewire_rolls_back_when_its_snapshot_record_cannot_be_written(p
         "rolled back: row, created_at, target cache and updated_at unchanged"
     );
 }
+
+/// Install a row trigger that nudges `target`'s stored BetP by 1e-6 on every
+/// UPDATE of its row: the cache the wire writes is then no longer the fold
+/// the decision predicted (the shape of a cache-writer guard declining, or
+/// a write landing between the decision and the wire), deterministically.
+async fn nudge_cache_writes_of(pool: &PgPool, target: Uuid) {
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_nudge_cache() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN \
+           IF NEW.id = '{target}'::uuid AND NEW.pignistic_prob IS NOT NULL THEN \
+             NEW.pignistic_prob := NEW.pignistic_prob + 1e-6; \
+           END IF; \
+           RETURN NEW; \
+         END $f$"
+    ))
+    .execute(pool)
+    .await
+    .expect("nudge function");
+    sqlx::query(
+        "CREATE TRIGGER zz_test_nudge_cache BEFORE UPDATE ON claims \
+         FOR EACH ROW EXECUTE FUNCTION test_nudge_cache()",
+    )
+    .execute(pool)
+    .await
+    .expect("nudge trigger");
+}
+
+/// The post-wire cache check: when the cache the wire WROTE differs from the
+/// fold the decision predicted over the same rows, the edge rolls back
+/// (row, target cache and `updated_at` exactly as before, no capture) and is
+/// counted `post_wire_mismatch`, not `target_stale`: a stale target is a
+/// decision-time verdict, and folding the two together hid real mismatches
+/// between the predicted fold and the cache writer. The control drops the
+/// trigger and the same edge rewires, so the hold is the check's doing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn targeted_rewire_holds_a_written_cache_that_differs_from_the_predicted_fold(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let w = world(&pool, &viewer, "post-wire", "supports", true).await;
+    let edge = the_edge(&pool, &w).await;
+    nudge_cache_writes_of(&pool, w.target).await;
+    let before = footprint(&pool, &w).await;
+
+    let (out, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+
+    assert_eq!(
+        footprint(&pool, &w).await,
+        before,
+        "rolled back: row, target cache and updated_at unchanged"
+    );
+    assert!(captured.is_empty(), "no record for a rolled-back edge");
+    assert_held(&out, HeldBucket::PostWireMismatch);
+    assert_eq!(HeldBucket::PostWireMismatch.name(), "post_wire_mismatch");
+
+    sqlx::query("DROP TRIGGER zz_test_nudge_cache ON claims")
+        .execute(&pool)
+        .await
+        .expect("drop the nudge");
+    let (control, captured) = rewire(&pool, &viewer, &edge, &w.baseline, false).await;
+    assert!(
+        matches!(control, TargetedOutcome::Rewired(_)),
+        "without the nudge the same edge rewires: {control:?}"
+    );
+    assert_eq!(captured.len(), 1);
+}
+

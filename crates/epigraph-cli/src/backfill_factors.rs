@@ -599,7 +599,9 @@ async fn rewire_one(
                     tracing::warn!(edge = %edge.edge_id, target = %edge.target_id,
                         "targeted rewire: written cache differs from the predicted fold; rolled back");
                     tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
-                    return Ok(EdgeResult::only(EdgeRewrite::Held(HeldBucket::TargetStale)));
+                    return Ok(EdgeResult::only(EdgeRewrite::Held(
+                        HeldBucket::PostWireMismatch,
+                    )));
                 }
                 // Recorded BEFORE the commit, so no committed rewrite lacks
                 // its snapshot record.
@@ -679,11 +681,18 @@ pub enum HeldBucket {
     RowMixed,
     /// The refold would vacate the target (ruling R-80).
     WouldVacate,
+    /// Apply only: the cache the wire WROTE differs from the fold the
+    /// decision predicted over the same rows (the cache writer's owner
+    /// guard declined, or a write landed between the decision and the
+    /// wire). Rolled back. Kept apart from `target_stale`, a decision-time
+    /// verdict on the stored cache, so a real mismatch between the predicted
+    /// fold and the cache writer is not hidden among stale targets.
+    PostWireMismatch,
 }
 
 impl HeldBucket {
     /// Every bucket, in report order.
-    pub const ALL: [HeldBucket; 9] = [
+    pub const ALL: [HeldBucket; 10] = [
         HeldBucket::Supersedes,
         HeldBucket::CompoundEnd,
         HeldBucket::OffKeyOrDuplicate,
@@ -693,6 +702,7 @@ impl HeldBucket {
         HeldBucket::TargetStale,
         HeldBucket::RowMixed,
         HeldBucket::WouldVacate,
+        HeldBucket::PostWireMismatch,
     ];
 
     /// The bucket's report name.
@@ -708,6 +718,7 @@ impl HeldBucket {
             HeldBucket::TargetStale => "target_stale",
             HeldBucket::RowMixed => "row_mixed",
             HeldBucket::WouldVacate => "would_vacate",
+            HeldBucket::PostWireMismatch => "post_wire_mismatch",
         }
     }
 
