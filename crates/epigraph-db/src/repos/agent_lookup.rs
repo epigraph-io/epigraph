@@ -56,7 +56,9 @@
 //! * `role_attachments`: migration 269's `epigraph_disclosed_role_attachments`:
 //!   the roles an (LLM) agent is attached to (166 `role_agents`: the agents a
 //!   role runs), live now, shown only to the agent itself, its human
-//!   (`epigraph_human_of(agent, false)`) and admins. No outsider arm: 166
+//!   (`epigraph_human_of(agent, false)`) and a privileged (maintenance)
+//!   session; an elevated request viewer on the application role is not one
+//!   (as for 198's elevating roles). No outsider arm: 166
 //!   writes no public projection of an attachment, so to everyone else an
 //!   attached agent's card reads exactly as an unattached one's.
 //! * counts: computed under the caller's viewer with the canonical splice
@@ -339,9 +341,11 @@ pub enum AgentKind {
     /// when the human holds a disclosed role (only registered humans are
     /// granted roles; the window, not the current status, decides) or when
     /// some agent is currently bound to it (its card's `operator_human`, shown
-    /// to every reader: 122 refuses a link to an operator that is not a
-    /// registered human, and 149 an allowance; the binding record, not the
-    /// current status, decides).
+    /// to every reader; the binding record, not the current status, decides).
+    /// That arm TRUSTS the binding record as `operator_human` does: 122 refuses
+    /// a NEW link to an operator that is not a registered human (and 149 an
+    /// allowance), but a link recorded before 122 may name a non-human, which
+    /// then reads as `human` here (it outranks `llm_model_on_profile`).
     Human,
     /// An agent with an LLM model on its (visible) profile, or, failing a
     /// derived author key, an agent currently bound to a human
@@ -480,8 +484,8 @@ pub struct AgentCard {
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
     /// The roles this agent is attached to (166 `role_agents`), live now:
-    /// shown to the agent itself, its human and admins; empty for everyone
-    /// else (migration 269).
+    /// shown to the agent itself, its human and a privileged (maintenance)
+    /// session; empty for everyone else (migration 269).
     pub role_attachments: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
