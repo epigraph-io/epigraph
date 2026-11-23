@@ -121,8 +121,7 @@ async fn main() {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .init();
     let cli = Cli::parse();
-    let writes = cli.apply || (cli.restore.is_some() && !cli.dry_run);
-    let intent = if writes {
+    let intent = if writes(&cli) {
         RunIntent::Writes
     } else {
         RunIntent::WritesNothing
@@ -134,6 +133,26 @@ async fn main() {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// Whether this run writes the database: an apply, or a restore that is not a
+/// dry run. The belief-mode check and the refresh's write path both decide
+/// on this, never on whether a record file was given.
+fn writes(cli: &Cli) -> bool {
+    cli.apply || (cli.restore.is_some() && !cli.dry_run)
+}
+
+/// The record file a refresh writes: present exactly when it applies (clap
+/// also refuses `--record` without `--apply`, and `--apply` without
+/// `--record`).
+fn refresh_record_path(cli: &Cli) -> anyhow::Result<Option<PathBuf>> {
+    if !writes(cli) {
+        return Ok(None);
+    }
+    cli.record
+        .clone()
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!("--apply requires --record"))
 }
 
 fn create_new(path: &Path) -> anyhow::Result<BufWriter<File>> {
@@ -200,18 +219,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .report
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--report is required"))?;
-    // The record exists only for an apply (clap also refuses `--record`
-    // without `--apply`); the write path is chosen on `--apply` below, never
-    // on the record's presence.
-    let record_path = if cli.apply {
-        Some(
-            cli.record
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--apply requires --record"))?,
-        )
-    } else {
-        None
-    };
+    // The record exists only for an apply; the write path is chosen on
+    // `writes` below, as the belief-mode check was, never on the record's
+    // presence.
+    let record_path = refresh_record_path(&cli)?;
     let mut outputs: Vec<&Path> = vec![report_path.as_path()];
     if let Some(p) = &record_path {
         outputs.push(p);
@@ -239,7 +250,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("maintenance viewer: {e}"))?;
         let viewer = session.viewer();
-        match (cli.apply, record_w.as_mut()) {
+        match (writes(&cli), record_w.as_mut()) {
             (true, Some(w)) => {
                 apply_into(
                     maint.pool(),
@@ -265,7 +276,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     }
     .await;
 
-    let dry = !cli.apply;
+    let dry = !writes(&cli);
     let mut json = report.to_json(dry, cli.include_round, records.len());
     mark_outcome(&mut json, result.as_ref().err());
     write_json(report_w, &json)?;
@@ -298,7 +309,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
     println!("report: {}", report_path.display());
-    if let Some(p) = &cli.record {
+    if let Some(p) = &record_path {
         println!("record: {}", p.display());
     }
     Ok(())
@@ -366,4 +377,50 @@ async fn run_restore(cli: &Cli, record_path: &Path) -> anyhow::Result<()> {
     }
     println!("report: {}", report_path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Cli` built directly, past clap's guards, as `run` would see it.
+    fn cli(apply: bool, record: Option<&str>, restore: Option<&str>, dry_run: bool) -> Cli {
+        Cli {
+            waves: Vec::new(),
+            apply,
+            record: record.map(PathBuf::from),
+            include_round: false,
+            restore: restore.map(PathBuf::from),
+            dry_run,
+            report: Some(PathBuf::from("report.json")),
+            batch_size: DEFAULT_BATCH,
+            allow_mode_skew: false,
+        }
+    }
+
+    #[test]
+    fn a_record_without_apply_neither_writes_nor_opens_a_record() {
+        // Were clap's `requires = "apply"` lost, `--record` alone must stay a
+        // dry run: the belief-mode check exempts it, so it must not write.
+        let c = cli(false, Some("R.jsonl"), None, false);
+        assert!(!writes(&c));
+        assert_eq!(refresh_record_path(&c).unwrap(), None);
+    }
+
+    #[test]
+    fn an_apply_writes_through_its_record_and_needs_one() {
+        let c = cli(true, Some("R.jsonl"), None, false);
+        assert!(writes(&c));
+        assert_eq!(
+            refresh_record_path(&c).unwrap(),
+            Some(PathBuf::from("R.jsonl"))
+        );
+        assert!(refresh_record_path(&cli(true, None, None, false)).is_err());
+    }
+
+    #[test]
+    fn a_restore_writes_unless_it_is_a_dry_run() {
+        assert!(writes(&cli(false, None, Some("R.jsonl"), false)));
+        assert!(!writes(&cli(false, None, Some("R.jsonl"), true)));
+    }
 }
