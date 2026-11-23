@@ -135,9 +135,12 @@
 //! every write to those tables on the instance while a batch runs. Each
 //! `BATCH` line prints how long its transaction held those locks (`locks
 //! held <ms> ms`) and the result prints the longest (`longest lock hold`):
-//! the stall a concurrent edge or fragment writer sees, per batch. A dry run
-//! takes the same locks, so its figure at the intended `--batch-size` is the
-//! estimate to plan an apply with (`docs/deploy.md`).
+//! about the stall a concurrent edge or fragment writer sees, per batch (it
+//! is timed from the transaction's begin, so a wait to acquire the locks is
+//! included). A dry run takes the same locks for the same reads and writes,
+//! but an apply also fsyncs the manifest and commits while holding them, so
+//! a dry run's figure at the intended `--batch-size` is a LOWER BOUND for
+//! the apply's (`docs/deploy.md`).
 //!
 //! Every moved claim is `('group', TARGET)`; every recorded row ends exactly
 //! where the rule above puts it and no row became public; the per-table row
@@ -2388,9 +2391,11 @@ pub async fn run(
     writeln!(out, "  manifest row records: {}", report.manifest_rows)?;
     writeln!(
         out,
-        "  longest lock hold: {} ms over {} transaction(s) at --batch-size {} (LOCKED-PER-BATCH: \
-         every edge and fragment write on the instance waits up to this long per batch; a dry \
-         run takes the same locks, so its figure is the stall to expect)",
+        "  longest lock hold: {} ms over {} transaction(s) at --batch-size {} (each from the \
+         transaction's begin, lock waits included, to its commit or rollback: every edge and \
+         fragment write on the instance may wait about this long per batch; an apply also \
+         fsyncs the manifest and commits while holding the locks, so a dry run's figure is a \
+         lower bound)",
         report.lock_hold.max_ms, report.lock_hold.transactions, opts.batch_size
     )?;
     writeln!(

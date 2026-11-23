@@ -2666,13 +2666,17 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   for the batch; keep `--batch-size` small on a busy instance. Each `BATCH`
   line prints how long its transaction held the locks (`locks held <ms>
   ms`), and the result prints the longest (`longest lock hold: <ms> ms over
-  <n> transaction(s) at --batch-size <N>`): that is the stall a concurrent
-  edge or fragment writer sees per batch. There is no fixed figure per batch
-  size; it depends on the claims' rows and the instance's load. Measure it:
-  a dry run takes the same locks for the same work, so run the dry run at
-  the `--batch-size` you intend to apply with, at a comparable time of day,
-  and lower the batch size until the longest hold is one your writers can
-  wait (their `lock_timeout` and request timeouts are the limit). The locks
+  <n> transaction(s) at --batch-size <N>`): about the stall a concurrent
+  edge or fragment writer sees per batch. Each figure runs from the
+  transaction's begin, so a wait to acquire the locks behind other writers
+  is included. There is no fixed figure per batch size; it depends on the
+  claims' rows and the instance's load. Measure it: a dry run takes the same
+  locks for the same reads and writes, so run the dry run at the
+  `--batch-size` you intend to apply with, at a comparable time of day, and
+  lower the batch size until the longest hold is one your writers can wait
+  (their `lock_timeout` and request timeouts are the limit). Treat the dry
+  run's figure as a LOWER BOUND: an apply also fsyncs the manifest and
+  commits while it holds the locks, so leave headroom. The locks
   are not narrowed to the moving claims: every edge and fragment writer
   would have to take the same row or advisory lock, which is a schema
   change.
