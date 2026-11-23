@@ -68,6 +68,41 @@
 //! RESOLVED parameters (map keys sorted, `-0.0` read as `0.0`), so a served
 //! value can be recomputed from (rows, profile hash). The profile's name is not
 //! a parameter and is not hashed.
+//!
+//! # Numbers outside the profile
+//!
+//! Some belief-adjacent numbers are deliberately NOT parameters here, and some
+//! are not here YET. Kept apart on purpose (backlog dc32b884, part 2), so a
+//! deferral is never read as a decision:
+//!
+//! **Stay outside, with the reason:**
+//! - *Request defaults for `min_truth`* (MCP `recall` 0.3, workflow finds
+//!   0.3, REST RAG 0.7, the other read routes' own defaults). They are
+//!   read-surface filters the caller can override per request and that tool
+//!   schemas and the OpenAPI document publish; they do not shape any belief
+//!   value, only which already-served values a page returns. Several are the workflow deprecation gate (a deprecated step is
+//!   written at truth 0.05, the default hides it at 0.3), an API contract, not
+//!   an epistemic parameter. Making them follow a lens would make an API
+//!   default vary with the profile, which nothing asks for.
+//! - *Conformal quantiles* (`calibration.toml` `[conformal]`,
+//!   [`crate::classifier::classify_conformal`]). No served value or write path
+//!   reads them today; they are fit offline and label a value, they do not
+//!   compute one. Revisit if a surface starts serving the conformal set.
+//!
+//! **Deferred (real belief numbers outside the hash; each needs its own
+//! change, because adding a parameter moves every profile hash and the golden
+//! pins):**
+//! - *The `RestrictionProfile::scientific` transmission factors*
+//!   (`crate::sheaf`). The edge-factor write path and the compound `not_all`
+//!   valuation read the factor values (the atom fold reads only the
+//!   relationship classification), so a profile change cannot move them and
+//!   the profile hash does not cover them. The sheaf
+//!   tools also select a second named set (`regulatory`), which a move must
+//!   reconcile with the profile's own naming.
+//! - *Section tier weights* (`calibration.toml` `[section_tier_weights]`,
+//!   read by [`crate::bba::build_bba_directed`] on the REST assess write
+//!   path). Configurable through the calibration but not hashed; they belong
+//!   in [`CalibrationTables`] beside the methodology and journal tables.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
