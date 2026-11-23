@@ -80,12 +80,16 @@ and that graph, each small enough to read, each with a name.
   single-team map, and the public map draws public edges only. A joint per-viewer view for
   people in both teams is future work. (This replaces an earlier ruling that drew it on both
   teams' maps.)
-  - *Implemented (backlog ff3b6046) as a request-time overlay, not baked into any map:* on the
-    level route, a leaf of team T's map gains the co-owned edges with T as owner or co-owner
-    that the viewer's own session reads between two nodes the served leaf draws, weighed as
-    the nightly weighs leaf edges. It adds edges, never nodes, so an edge between a claim of
-    each team (no single map draws both ends) is still not drawn; `outgoing`, group levels
-    and the public map are unchanged.
+  - *Partly implemented (backlog ff3b6046, which stays open) as a request-time overlay, not
+    baked into any map:* on the level route, a leaf of team T's map gains the co-owned edges
+    with T as owner or co-owner that the viewer's own session reads between two claim or
+    evidence nodes the served leaf draws, weighed as the nightly weighs a leaf edge of T's map.
+    That reaches only a co-owned edge whose stored tenancy is narrower than its endpoints' meet
+    (both ends drawable on one team's map; this can arise from the edge trigger's no-widening
+    arm or an operator narrowing). The usual co-owned edge, from a claim private to one team to
+    a claim private to the other, is still drawn nowhere: no single map draws both ends and the
+    overlay adds edges, never nodes. Drawing it needs the other team's endpoint on the leaf,
+    which is open work. `outgoing`, group levels and the public map are unchanged.
 - **Proxy weights.** Claim-to-claim flow weight is link strength × sign only (§2).
 
 ## 3. Goals

@@ -29,10 +29,25 @@
 //! adds to a stored document rather than filtering it. A team map never bakes
 //! in an edge co-owned by two teams (row security lets only members of BOTH
 //! read it, and a map draws an edge only when its whole audience may), so a
-//! member of both teams gets those edges at request time, on top of the leaf
-//! they are served: the per-viewer joint view the Atlas design left as later
-//! work. The read takes the viewer's own session as the audience (row
-//! security beneath, the edge splice in the statement), never a map's.
+//! member of both teams gets, at request time and on top of the leaf they are
+//! served, the co-owned edges of that team's map whose two ends the leaf
+//! already draws. The read takes the viewer's own session as the audience
+//! (row security beneath, the edge splice in the statement), never a map's.
+//!
+//! What it reaches is narrow. The edge trigger (`epigraph_edges_tenancy`)
+//! co-owns an edge when its two ends are private to two different groups, and
+//! no single team map draws both of those ends, so such an edge (an argument
+//! from a claim of team A to a claim of team B) is still drawn nowhere: the
+//! overlay adds edges, never nodes. It reaches only a co-owned edge whose
+//! stored tenancy is narrower than its endpoints' meet, which can arise from
+//! the trigger's no-widening arm (a co-owned edge re-pointed onto two public
+//! claims) or from an operator narrowing that kept a co-owner. Drawing the
+//! cross-team case needs nodes of another team on a leaf, which is open work.
+//!
+//! The read is best-effort and bounded: it runs inside its own nested
+//! transaction under a local `statement_timeout`, which is always rolled
+//! back, so a slow or failing overlay leaves the caller's read usable and the
+//! caller serves the stored leaf.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -436,7 +451,8 @@ impl AtlasServeRepository {
     /// The co-owned edges of team `team`'s map that the viewer's own session
     /// reads between two of `nodes` (a served leaf's nodes, each with the
     /// kind the document gives it), with their weighing inputs. See the
-    /// module documentation ("The co-owned overlay").
+    /// module documentation ("The co-owned overlay") for the narrow subset of
+    /// co-owned edges this can reach.
     ///
     /// An edge row is returned when:
     /// * it is co-owned (`visibility = 'group'`, `co_owner_group_id` set) and

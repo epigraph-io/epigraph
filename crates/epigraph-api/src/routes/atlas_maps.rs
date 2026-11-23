@@ -26,20 +26,23 @@
 //!   their row security, agents by existence): a member never sees a node, or
 //!   an edge to one, that their session cannot read. A group level is served
 //!   as stored.
-//! * **The co-owned overlay** (backlog ff3b6046). A map draws an edge only
-//!   when its whole audience may read it, so no team map bakes in an edge
-//!   co-owned by two teams: row security lets only members of BOTH read one.
-//!   On the level route, a leaf of team T's map gains, at request time, the
-//!   co-owned edges with T as owner or co-owner that the viewer's own session
-//!   reads between two nodes the served leaf draws
-//!   (`AtlasServeRepository::co_owned_leaf_edges`), weighed as the nightly
-//!   weighs a leaf's edges and appended by `LevelDocument::with_viewer_edges`.
-//!   A member of one of the two teams gets the leaf as before. The public map,
-//!   group levels and `outgoing` are unchanged, and so is an edge whose two
-//!   ends no single map draws (a claim of each team): the overlay adds edges,
-//!   never nodes. The overlay is best-effort: bounded by
-//!   [`CO_OWNED_OVERLAY_TIMEOUT`], and a failed or refused overlay is logged
-//!   and the leaf served without it.
+//! * **The co-owned overlay** (backlog ff3b6046, in part). A map draws an
+//!   edge only when its whole audience may read it, so no team map bakes in
+//!   an edge co-owned by two teams: row security lets only members of BOTH
+//!   read one. On the level route, a leaf of team T's map gains, at request
+//!   time, the co-owned edges with T as owner or co-owner that the viewer's
+//!   own session reads between two claim or evidence nodes the served leaf
+//!   draws (`AtlasServeRepository::co_owned_leaf_edges`), weighed as the
+//!   nightly weighs a leaf edge of T's map and appended by
+//!   `LevelDocument::with_viewer_edges`. A member of one of the two teams gets
+//!   the leaf as before. This reaches only a co-owned edge whose stored
+//!   tenancy is narrower than its endpoints' meet (both ends drawable on one
+//!   team's map). The usual co-owned edge, from a claim private to one team
+//!   to a claim private to the other, is still drawn nowhere: no single map
+//!   draws both ends, and the overlay adds edges, never nodes. The public
+//!   map, group levels and `outgoing` are unchanged. The overlay is
+//!   best-effort: bounded by [`CO_OWNED_OVERLAY_TIMEOUT`], and a failed or
+//!   refused overlay is logged and the leaf served without it.
 //! * **Staleness.** A run is served while nothing LEFT its map's readable set
 //!   since the build (`nothing_left`), even when something arrived (`current`
 //!   false: the map is only incomplete until the next nightly). A run where a

@@ -369,9 +369,11 @@ impl Node {
 /// its endpoints. The public map draws public rows only. A team map draws
 /// public rows and the rows that team owns with no co-owner. A co-owned row
 /// is readable only by members of both groups, so it is never baked into a
-/// single team's map. The kernel draws it at request time instead, for a
-/// viewer whose own session reads it, on that viewer's answer only
-/// ([`LevelDocument::with_viewer_edges`]). Two readable endpoints do not make
+/// single team's map. When both its ends are nodes of a team's leaf, the
+/// kernel draws it at request time instead, for a viewer whose own session
+/// reads it, on that viewer's answer only
+/// ([`LevelDocument::with_viewer_edges`]); a co-owned row whose ends no
+/// single map draws (a claim of each team) is drawn nowhere yet. Two readable endpoints do not make
 /// a row readable, and a served edge carries no row id or visibility, so
 /// [`LevelDocument::for_viewer`] cannot check this: the builder must, and the
 /// kernel's overlay read does.

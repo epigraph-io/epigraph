@@ -1194,8 +1194,12 @@ async fn insert_edge(
     .expect("seed edge")
 }
 
-/// Force an edge co-owned by `owner` and `co_owner` (as 072's meet stamps an
-/// edge across two groups, or a regroup leaves one).
+/// Stamp an edge co-owned by `owner` and `co_owner` on the superuser pool.
+/// The edge trigger co-owns an edge only when its ends are private to two
+/// different groups; this stamps a tuple NARROWER than the endpoints' meet,
+/// the state the overlay can reach, as an operator narrowing that kept a
+/// co-owner leaves one (or, between two public claims, as the trigger's
+/// no-widening arm keeps a co-owned edge re-pointed onto them).
 async fn force_co_owned(pool: &PgPool, id: Uuid, owner: Uuid, co_owner: Uuid) {
     let n = sqlx::query(
         "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = $3 \
@@ -1579,13 +1583,13 @@ async fn served_edges(r: &Router, o: &Overlay, map: AtlasMap, leaf: Uuid, who: U
     sorted(l.edges[o.stored.len()..].to_vec())
 }
 
-/// DONE for backlog ff3b6046: a member of BOTH teams that co-own an edge sees
-/// it on the leaf, on either team's map, weighed as the nightly weighs a
-/// leaf edge of that map; a member of only one team does not. An edge of two
-/// other teams stays off a map, even for a member of all three; a retracted
-/// co-owned edge is never drawn; the public map gets nothing; an evidence
-/// edge whose only mass row is another team's is served `none` on this
-/// team's map, whoever asks.
+/// Backlog ff3b6046 (the reachable part): a member of BOTH teams that co-own
+/// an edge whose two ends a leaf draws sees it on that leaf, on either team's
+/// map, weighed as the nightly weighs a leaf edge of that map; a member of
+/// only one team does not. An edge of two other teams stays off a map, even
+/// for a member of all three; a retracted co-owned edge is never drawn; the
+/// public map gets nothing; an evidence edge whose only mass row is another
+/// team's is served `none` on this team's map, whoever asks.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_co_owned_edge_is_drawn_for_a_member_of_both_teams_only(pool: PgPool) {
     use epigraph_engine::atlas_flow::link_strength;
@@ -1785,6 +1789,112 @@ async fn co_owned_leaf_edges_refuses_on_its_own_predicates(pool: PgPool) {
     with_agent.push(LeafNode::agent(o.ma));
     let (got, _) = ids(&mut conn, &pool, o.dual, o.a, &with_agent).await;
     assert_eq!(got, want, "an agent node is not looked up");
+}
+
+/// The co-owned state the overlay meets in practice (review of backlog
+/// ff3b6046): an edge between two claims PRIVATE to team A, stamped A's by
+/// the trigger and later left co-owned by B (an operator narrowing that kept
+/// a co-owner). A's leaf draws both claims, so a member of A alone is served
+/// the two nodes (their row security admits them, the per-viewer node filter
+/// runs before the overlay) but not the edge, which needs B too; a member of
+/// A and B gets the edge. (B's map never draws A's private claims, so the
+/// edge cannot appear there.)
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_narrowed_co_owned_edge_between_private_claims_is_drawn_for_a_dual_member_only(
+    pool: PgPool,
+) {
+    let a = team(&pool, "Narrowed A").await;
+    let b = team(&pool, "Narrowed B").await;
+    let (ma, _) = fixture::seed_agent_with_group(&pool, "narrowed-a").await;
+    let (dual, _) = fixture::seed_agent_with_group(&pool, "narrowed-ab").await;
+    add_member(&pool, a, ma, "writer").await;
+    add_member(&pool, a, dual, "writer").await;
+    add_member(&pool, b, dual, "writer").await;
+    let theme = seed_theme(&pool).await;
+    let q1 = fixture::seed_group_claim(&pool, ma, a, "narrowed private one").await;
+    let q2 = fixture::seed_group_claim(&pool, ma, a, "narrowed private two").await;
+    for q in [q1, q2] {
+        set_theme(&pool, q, theme).await;
+    }
+    let link = insert_edge(
+        &pool,
+        ("claim", q1),
+        ("claim", q2),
+        "supports",
+        serde_json::json!({"strength": 0.8}),
+    )
+    .await;
+    // Calibration: the trigger stamps the edge A's alone (both ends A's).
+    let stamp: (String, Uuid, Option<Uuid>) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, co_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(link)
+    .fetch_one(&pool)
+    .await
+    .expect("edge stamp");
+    assert_eq!(stamp, ("group".to_string(), a, None));
+    force_co_owned(&pool, link, a, b).await;
+
+    let map = AtlasMap::Team(a);
+    let (root_id, leaf_id, other) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    build_run(&pool, map, |run| {
+        let ctx = Ctx { map, theme, run };
+        vec![
+            root(
+                &ctx,
+                AtlasHierarchy::Meaning,
+                root_id,
+                "Narrowed",
+                leaf_id,
+                2,
+                other,
+            ),
+            leaf(
+                &ctx,
+                AtlasHierarchy::Meaning,
+                leaf_id,
+                root_id,
+                other,
+                vec![
+                    claim_node(q1, "narrowed private one", -0.5),
+                    claim_node(q2, "narrowed private two", 0.5),
+                ],
+                vec![],
+            ),
+        ]
+    })
+    .await;
+    let r = router(&pool).await;
+    let serve = |who: Uuid| {
+        let r = r.clone();
+        async move {
+            let got = get(&r, &level_path(map, "meaning", leaf_id), who).await;
+            assert_eq!(got.status, StatusCode::OK, "{}", got.text());
+            let doc = check_level_body(&got.body, &Expected::team(a, leaf_id))
+                .unwrap_or_else(|e| panic!("{leaf_id}: {e:?}"));
+            let LevelDocument::Leaf(l) = doc else {
+                panic!("a leaf")
+            };
+            let mut nodes: Vec<Uuid> = l.nodes.iter().map(Node::id).collect();
+            nodes.sort_unstable();
+            (nodes, l.edges)
+        }
+    };
+    let mut both_nodes = vec![q1, q2];
+    both_nodes.sort_unstable();
+    assert_eq!(
+        serve(ma).await,
+        (both_nodes.clone(), vec![]),
+        "A alone: both private claims, no co-owned edge"
+    );
+    assert_eq!(
+        serve(dual).await,
+        (
+            both_nodes,
+            vec![flow(q1, q2, "supports", 1, 0.8, FlowBasis::Proxy)]
+        ),
+        "A and B: the co-owned edge on A's map"
+    );
 }
 
 /// The overlay never fails a leaf (review of backlog ff3b6046): with `edges`
