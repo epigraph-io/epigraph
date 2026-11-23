@@ -274,6 +274,13 @@ impl SemanticLinkRepository {
 
     /// Get all semantic links of a specific type
     ///
+    /// Matches the lower-case spelling only (`relationship = $1`), so a
+    /// claim->claim row stored as `SUPPORTS` / `CONTRADICTS` is not returned.
+    /// That is deliberate for now and pinned in
+    /// `tests/relationship_param_spelling_lint.rs::KNOWN_BYTE_EXACT`: widening
+    /// the match also needs upper-case arms in `str_to_link_type`, which
+    /// rejects those spellings today.
+    ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
