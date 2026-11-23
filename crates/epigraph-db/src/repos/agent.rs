@@ -277,6 +277,37 @@ pub struct AgentPublicProfile {
 /// [`AgentRepository::create_seed_derived_conn`].
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
+/// The `agents.agent_type` a self-provisioned SIGNER declares when it is
+/// created through [`AgentRepository::create_signer_conn`] (backlog 9d4673a0).
+///
+/// [`AgentRepository::create`] never names `agent_type`, so its rows take
+/// migration 001's column default `'human'`. A process's own signing identity
+/// is never a human: migrations 161/166/195 accept a lineage parent only when
+/// `agent_type IS DISTINCT FROM 'human'`, and 166's ROL02 refuses to attach a
+/// `'human'` row to a role. The type is closed to the two values the kernel
+/// uses for a non-human principal (`'llm'` is what 161's registration
+/// inserts; `'software_agent'` is what `ensure_for_client` maps an agent or
+/// service OAuth client to), so this path can never mint a `'human'`,
+/// `'role'` or `'system'` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerAgentType {
+    /// An LLM-driven identity (its key is derived from a model and prompt).
+    Llm,
+    /// Any other software signer.
+    SoftwareAgent,
+}
+
+impl SignerAgentType {
+    /// The stored `agents.agent_type` value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::SoftwareAgent => "software_agent",
+        }
+    }
+}
+
 /// Repository for Agent operations
 pub struct AgentRepository;
 
@@ -426,7 +457,89 @@ impl AgentRepository {
         .await
     }
 
-    /// The tail both inserts share: the `agent.registered` event on the
+    /// [`Self::create`] for a process's own SIGNER, stored with an explicit
+    /// `agent_type` instead of migration 001's `'human'` default (backlog
+    /// 9d4673a0). See [`SignerAgentType`].
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signer(
+        pool: &PgPool,
+        agent: &Agent,
+        agent_type: SignerAgentType,
+    ) -> Result<Agent, DbError> {
+        let mut conn = pool.acquire().await?;
+        Self::create_signer_conn(&mut conn, agent, agent_type).await
+    }
+
+    /// [`Self::create_conn`] with `agent_type` bound (backlog 9d4673a0). Every
+    /// other column, the duplicate-key mapping and the `agent.registered`
+    /// event are exactly [`Self::create_conn`]'s; `key_kind` keeps its
+    /// `'ed25519'` default, which 077's `agents_provision` admits.
+    ///
+    /// The type is set at INSERT because it cannot be set after: migration
+    /// 118 grants the application role UPDATE on the profile columns only,
+    /// never `agent_type`. A runtime query (not `query!`), so the `.sqlx`
+    /// offline cache of [`Self::create_conn`] is untouched.
+    ///
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_signer_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: &Agent,
+        agent_type: SignerAgentType,
+    ) -> Result<Agent, DbError> {
+        type Row = (
+            Uuid,
+            Vec<u8>,
+            Option<String>,
+            DateTime<Utc>,
+            Vec<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let id: Uuid = agent.id.into();
+        let row: Row = sqlx::query_as(
+            "INSERT INTO agents (id, public_key, display_name, created_at, updated_at, labels, \
+                                 orcid, ror_id, agent_type) \
+             VALUES ($1, $2, $3, $4, $4, $5, $6, $7, $8) \
+             RETURNING id, public_key, display_name, created_at, labels, orcid, ror_id",
+        )
+        .bind(id)
+        .bind(agent.public_key.as_slice())
+        .bind(agent.display_name.as_deref())
+        .bind(agent.created_at)
+        .bind(&agent.labels)
+        .bind(agent.orcid.as_deref())
+        .bind(agent.ror_id.as_deref())
+        .bind(agent_type.as_str())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|err| {
+            if let sqlx::Error::Database(ref db_err) = err {
+                if db_err.is_unique_violation() {
+                    return DbError::DuplicateKey {
+                        entity: "Agent".to_string(),
+                    };
+                }
+            }
+            DbError::from(err)
+        })?;
+        let (id, public_key, display_name, created_at, labels, orcid, ror_id) = row;
+        Self::registered(
+            conn,
+            id,
+            public_key,
+            display_name,
+            created_at,
+            labels,
+            orcid,
+            ror_id,
+        )
+        .await
+    }
+
+    /// The tail the inserts share: the `agent.registered` event on the
     /// caller's connection, and the returned [`Agent`].
     #[allow(clippy::too_many_arguments)]
     async fn registered(

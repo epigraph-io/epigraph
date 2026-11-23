@@ -501,9 +501,21 @@ impl EpiGraphMcpFull {
             a
         } else {
             let agent = epigraph_core::Agent::new(pub_key, Some("mcp-agent".to_string()));
-            let created = epigraph_db::AgentRepository::create(&self.pool, &agent)
-                .await
-                .map_err(internal_error)?;
+            // Backlog 9d4673a0: the server's own signer is never a human, so
+            // it is not left on migration 001's `agent_type` default
+            // ('human'), which lineage-parent (161/166/195) and role-attach
+            // (166 ROL02) gates read as a person. 'llm' when the identity is
+            // derived from an LLM config, else 'software_agent'. Set at
+            // INSERT: the application role cannot UPDATE `agent_type` (118).
+            let agent_type = if self.llm_identity.is_some() {
+                epigraph_db::SignerAgentType::Llm
+            } else {
+                epigraph_db::SignerAgentType::SoftwareAgent
+            };
+            let created =
+                epigraph_db::AgentRepository::create_signer(&self.pool, &agent, agent_type)
+                    .await
+                    .map_err(internal_error)?;
             // CREATE branch ONLY: record the derived LLM identity on the fresh
             // row. Best-effort — a failure here must not break agent resolution
             // or any downstream dispatch (the agent still exists and is usable;

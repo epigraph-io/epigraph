@@ -181,7 +181,9 @@ pub use repos::{
 };
 pub use repos::{CompromisedRevoke, PasskeyEnrollmentRow, PasskeyRepository, PasskeyRow};
 pub use repos::{CountersignDecision, CountersignRepository, CountersignedRow};
-pub use repos::{DelegationLive, RunTokens, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV};
+pub use repos::{
+    DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,
+};
 pub use repos::{
     IngestAssertedClaimRow, PaperAuthorEdge, PaperAuthorListing, PaperIngestPrincipal,
     AUTHORED_EXPLICIT_KEY, AUTHORED_INGESTED_BY_KEY, AUTHORED_NAME_KEY, AUTHORED_PENDING_KEY,
