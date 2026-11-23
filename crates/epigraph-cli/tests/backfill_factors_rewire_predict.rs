@@ -713,6 +713,11 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
     );
     assert!(predicted.totals.held.is_empty(), "{:?}", predicted.totals);
     assert_eq!(
+        predicted.totals.scc_sizes,
+        vec![2],
+        "the two-claim cycle is one component"
+    );
+    assert_eq!(
         predicted.would_rewrite(),
         records.iter().map(|x| x.edge_id).collect::<Vec<_>>(),
         "the predict's rewrites, in visit order, are the apply's"
@@ -743,4 +748,164 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
         "the verify moves no target by more than 1e-9: {:?}",
         verify.totals
     );
+}
+
+/// The design report's remaining fields, each against an oracle outside the
+/// predict:
+///
+/// * `d_row_other` (P0 − M_s): ~0 for the `r173` row (it IS the wire from the
+///   source's pre-move interval) and large for the pre-#401 row; `d_row_cal`
+///   (P1 − P0) is the move itself, non-zero;
+/// * `ow_clamped`: set only on the edge whose source stores an open-world
+///   mass wider than its interval;
+/// * `not_selectable`: an edge sourced at the moved claim, holding a live
+///   row, but no longer in force, is counted, not silently skipped;
+/// * `d_edge_belief` / `d_edge_plausibility`: on a fresh target R is the
+///   stored cache, so they equal what the real apply then moves the stored
+///   belief and plausibility by;
+/// * `top_movers`: every moved target, largest |d_edge| first;
+/// * `scc_sizes`: a chain has no cycle.
+#[sqlx::test(migrations = "../../migrations")]
+async fn predict_reports_row_components_movers_and_unselectable_edges(pool: PgPool) {
+    let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
+    let ch = chain(&pool, &viewer).await;
+    let author = seed_agent(&pool, "predict-report").await;
+    let frame = binary_frame(&pool, &viewer).await;
+    // A source whose stored open-world mass (0.999) exceeds its interval's
+    // width, wired and then moved like `a`.
+    let wide = fresh_claim(&pool, &viewer, author, frame, "wide ow", EVIDENCE_A).await;
+    sqlx::query("UPDATE claims SET open_world_mass = 0.999 WHERE id = $1")
+        .bind(wide)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let y = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "wide ow target",
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let wide_edge = wired_edge(&pool, &viewer, author, wide, y, "supports").await;
+    // An edge from `a` whose row is live but which is no longer in force.
+    let x = fresh_claim(
+        &pool,
+        &viewer,
+        author,
+        frame,
+        "retired target",
+        TARGET_EVIDENCE,
+    )
+    .await;
+    let gone = wired_edge(&pool, &viewer, author, ch.a, x, "supports").await;
+    sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(gone)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut wave = ch.wave.clone();
+    wave.push(move_claim(&pool, &viewer, wide, EVIDENCE_B).await);
+    let stored_b = cache(&pool, ch.b).await;
+
+    let report = predict(&pool, &viewer, &wave).await;
+
+    let edge = |id: Uuid| {
+        report
+            .edges
+            .iter()
+            .find(|e| e.edge_id == id)
+            .unwrap_or_else(|| panic!("edge {id} reached: {:?}", report.edges))
+    };
+    let ab = edge(ch.ab);
+    assert!(
+        ab.d_row_other.expect("ab has a baseline") < 1e-12,
+        "an r173 row is the baseline wire: {ab:?}"
+    );
+    assert!(ab.d_row_cal.expect("ab has a baseline") > 1e-3, "{ab:?}");
+    assert!(!ab.ow_clamped, "{ab:?}");
+    let held = edge(ch.held_edge);
+    assert_eq!(held.outcome, "row_mixed");
+    assert!(
+        held.d_row_other.expect("held has a baseline") > 1e-3,
+        "the pre-#401 row is stale for another reason: {held:?}"
+    );
+    let wide_e = edge(wide_edge);
+    let (bel, pl): (f64, f64) =
+        sqlx::query_as("SELECT belief, plausibility FROM claims WHERE id = $1")
+            .bind(wide)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        0.999 > pl - bel + 1e-12,
+        "PREMISE: ow exceeds the width {}",
+        pl - bel
+    );
+    assert!(wide_e.ow_clamped, "{wide_e:?}");
+    assert_eq!(wide_e.outcome, "rewire", "{wide_e:?}");
+    assert!(
+        report.edges.iter().all(|e| e.edge_id != gone),
+        "an edge out of force is not selected"
+    );
+    assert_eq!(report.passes[0].not_selectable, 1, "{:?}", report.passes);
+    assert_eq!(report.totals.not_selectable, 1, "{:?}", report.totals);
+    assert!(report.totals.scc_sizes.is_empty(), "{:?}", report.totals);
+
+    let movers: Vec<Uuid> = report
+        .totals
+        .top_movers
+        .iter()
+        .map(|m| m.target_id)
+        .collect();
+    let mut moved: Vec<Uuid> = report
+        .targets
+        .iter()
+        .filter(|(_, t)| t.d_edge.is_some())
+        .map(|(id, _)| *id)
+        .collect();
+    moved.sort_unstable();
+    let mut sorted = movers.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, moved, "every moved target is listed");
+    for pair in report.totals.top_movers.windows(2) {
+        assert!(pair[0].d_edge.abs() >= pair[1].d_edge.abs(), "{pair:?}");
+    }
+    for m in &report.totals.top_movers {
+        assert_eq!(Some(m.d_edge), report.targets[&m.target_id].d_edge);
+    }
+
+    let o = opts();
+    let mut w = Vec::new();
+    let mut r = Vec::new();
+    run_targeted_rewire(
+        &pool,
+        &viewer,
+        &seed_from_waves(&wave, o.epsilon),
+        &o,
+        &mut w,
+        &mut r,
+    )
+    .await
+    .expect("apply");
+    let written_b = cache(&pool, ch.b).await;
+    let t = &report.targets[&ch.b];
+    assert!(t.fresh, "{t:?}");
+    assert_close(
+        t.d_edge_belief.expect("d_edge_belief"),
+        written_b.belief.unwrap() - stored_b.belief.unwrap(),
+        1e-9,
+        "d_edge on belief",
+    );
+    assert_close(
+        t.d_edge_plausibility.expect("d_edge_plausibility"),
+        written_b.plausibility.unwrap() - stored_b.plausibility.unwrap(),
+        1e-9,
+        "d_edge on plausibility",
+    );
+    assert!(t.d_edge_belief.unwrap().abs() > 1e-6, "{t:?}");
 }

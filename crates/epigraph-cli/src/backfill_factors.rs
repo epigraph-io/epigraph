@@ -795,6 +795,9 @@ pub enum TargetedVerdict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetedDecision {
     pub verdict: TargetedVerdict,
+    /// The source's `(belief, plausibility, open_world_mass)` `p1` was built
+    /// from (the stored or overlaid cache).
+    pub source: Option<(f64, f64, Option<f64>)>,
     pub stored: Option<StoredEdgeRow>,
     pub p0: Option<EdgeBba>,
     pub p1: Option<EdgeBba>,
@@ -807,6 +810,7 @@ impl TargetedDecision {
     fn hold(bucket: HeldBucket) -> Self {
         Self {
             verdict: TargetedVerdict::Hold(bucket),
+            source: None,
             stored: None,
             p0: None,
             p1: None,
@@ -861,6 +865,41 @@ WHERE mf.combination_method = 'edge_factor'
   AND ($2::uuid[] IS NULL OR e.id = ANY($2))
 ORDER BY e.id, mf.created_at, mf.id
 "#;
+
+/// The edges sourced at `$1` that hold a live `edge_factor` row on their
+/// target but that [`TARGETED_REWIRE_EDGE_QUERY`] does not select, because
+/// the edge is no longer in force or an endpoint is no longer current
+/// (design report field `not_selectable`): counted, so a pass's reach is
+/// not understated by what it silently skipped.
+pub const TARGETED_UNSELECTABLE_EDGE_QUERY: &str = r#"
+SELECT count(DISTINCT e.id)
+FROM mass_functions mf
+JOIN edges e ON e.id = mf.perspective_id
+JOIN claims tgt ON tgt.id = e.target_id
+JOIN claims src ON src.id = e.source_id
+WHERE mf.combination_method = 'edge_factor'
+  AND mf.retracted_at IS NULL
+  AND mf.claim_id = e.target_id
+  AND e.source_type = 'claim' AND e.target_type = 'claim'
+  AND e.source_id = ANY($1)
+  AND NOT (tgt.is_current AND src.is_current
+           AND (e.valid_to IS NULL OR e.valid_to > now()))
+"#;
+
+/// Run [`TARGETED_UNSELECTABLE_EDGE_QUERY`].
+///
+/// # Errors
+/// The query's error.
+pub async fn count_unselectable_targeted_edges(
+    conn: &mut sqlx::PgConnection,
+    sources: &[Uuid],
+) -> Result<usize, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(TARGETED_UNSELECTABLE_EDGE_QUERY)
+        .bind(sources)
+        .fetch_one(&mut *conn)
+        .await?;
+    Ok(usize::try_from(n).unwrap_or(0))
+}
 
 /// Run [`TARGETED_REWIRE_EDGE_QUERY`].
 ///
@@ -1254,6 +1293,7 @@ pub async fn decide_targeted(
         });
     let mut decision = TargetedDecision {
         verdict: TargetedVerdict::Proceed,
+        source: Some(current),
         stored: Some(stored.clone()),
         p0: p0.clone(),
         p1: Some(p1.clone()),

@@ -425,7 +425,8 @@ async fn run_targeted(
             .collect();
         println!(
             "PREDICT ({}): would_rewrite={} unchanged={} held={:?} would_remove={} \
-             would_vacate={} cycle_unconverged={} converged={} passes={}",
+             would_vacate={} cycle_unconverged={} not_selectable={} scc_sizes={:?} \
+             converged={} passes={}",
             report.seed_mode,
             report.totals.would_rewrite,
             report.totals.unchanged,
@@ -433,6 +434,8 @@ async fn run_targeted(
             report.totals.would_remove,
             report.totals.would_vacate,
             report.totals.cycle_unconverged,
+            report.totals.not_selectable,
+            report.totals.scc_sizes,
             report.converged,
             report.passes.len()
         );
@@ -453,7 +456,7 @@ async fn run_targeted(
     for p in &report.passes {
         println!(
             "pass {}: selected={} rewired={} unchanged={} held={:?} chain_boundary_held={} \
-             skipped_stale={} failed={} moved_targets={}",
+             skipped_stale={} failed={} moved_targets={} not_selectable={}",
             p.pass,
             p.selected,
             p.rewired,
@@ -462,7 +465,8 @@ async fn run_targeted(
             p.chain_boundary_held,
             p.skipped_stale,
             p.failed,
-            p.moved_targets
+            p.moved_targets,
+            p.not_selectable
         );
     }
     println!(
