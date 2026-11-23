@@ -22,6 +22,9 @@ use epigraph_db::ClaimRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "viewer_fixture.rs"]
+mod fixture;
+
 async fn seed_current_claim(pool: &PgPool) -> Uuid {
     let agent: Uuid = sqlx::query_scalar(
         "INSERT INTO agents (public_key, display_name, agent_type) \
@@ -354,4 +357,139 @@ async fn supersede_act_conn_refuses_a_current_claim_it_cannot_retire(pool: PgPoo
     .await
     .unwrap();
     assert_eq!(edges, 0, "no supersedes edge was inserted");
+}
+
+/// `supersede_act_conn` on `conn` as `actor`, in a transaction that is
+/// committed on success and rolled back on a refusal.
+async fn supersede_as(
+    conn: &mut sqlx::PgConnection,
+    actor: Uuid,
+    old: Uuid,
+) -> Result<(Uuid, Uuid), epigraph_db::DbError> {
+    let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
+    let r = ClaimRepository::supersede_act_conn(
+        &mut tx,
+        None,
+        ClaimId::from_uuid(old),
+        "a revision the caller asked for",
+        TruthValue::clamped(0.6),
+        "visibility probe",
+        epigraph_db::SupersedeActor::new(actor, epigraph_db::SupersedeTool::SupersedeClaim),
+    )
+    .await;
+    if r.is_ok() {
+        tx.commit().await.expect("commit");
+    } else {
+        tx.rollback().await.expect("rollback");
+    }
+    r
+}
+
+/// The zero-row classification read (backlog efa3c0fe) runs on the caller's
+/// stamped connection, under row security. So a claim the caller cannot read
+/// classifies exactly as a missing one, `NotFound`, and the refusal discloses
+/// nothing a read would not; only a claim the caller CAN read is told apart
+/// (here "already superseded", for a readable retired claim).
+///
+/// Verified to fail: the classification read's existence test moved to a
+/// definer that bypasses row security (`epigraph_claim_tenancy_by_ids`),
+/// currency still read under it -> the hidden claim is `WriteRefused`, not
+/// `NotFound`. The tests above, which run unstamped, cannot see that.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supersede_act_conn_answers_not_found_for_a_claim_the_caller_cannot_read(pool: PgPool) {
+    let (a, ag) = fixture::seed_agent_with_group(&pool, "supersede-reader").await;
+    let (b, bg) = fixture::seed_agent_with_group(&pool, "supersede-owner").await;
+    let hidden = fixture::seed_group_claim(&pool, b, bg, "B's group-private claim").await;
+    let readable = fixture::seed_public_claim(&pool, b, "B's retired public claim").await;
+    sqlx::query("UPDATE claims SET is_current = false WHERE id = $1")
+        .bind(readable)
+        .execute(&pool)
+        .await
+        .expect("retire B's public claim");
+    let missing = Uuid::new_v4();
+
+    let (seen, on_hidden, on_missing, on_readable) =
+        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+            sqlx::query(
+                "SELECT set_config('epigraph.principal_id', $1, false), \
+                        set_config('epigraph.group_ids', $2, false), \
+                        set_config('epigraph.writable_group_ids', $2, false)",
+            )
+            .bind(a.to_string())
+            .bind(ag.to_string())
+            .execute(&mut *conn)
+            .await
+            .expect("stamp A");
+            let seen: Vec<Uuid> =
+                sqlx::query_scalar("SELECT id FROM claims WHERE id = ANY($1) ORDER BY id")
+                    .bind(vec![hidden, readable])
+                    .fetch_all(&mut *conn)
+                    .await
+                    .expect("calibration read");
+            let on_hidden = supersede_as(&mut conn, a, hidden).await;
+            let on_missing = supersede_as(&mut conn, a, missing).await;
+            let on_readable = supersede_as(&mut conn, a, readable).await;
+            sqlx::query(
+                "SELECT set_config('epigraph.principal_id', '', false), \
+                        set_config('epigraph.group_ids', '', false), \
+                        set_config('epigraph.writable_group_ids', '', false)",
+            )
+            .execute(&mut *conn)
+            .await
+            .expect("unstamp");
+            (conn, (seen, on_hidden, on_missing, on_readable))
+        })
+        .await;
+
+    // CALIBRATION: A's session reads B's public claim and not the private one.
+    assert_eq!(
+        seen,
+        vec![readable],
+        "A's stamped session must read the public claim and not B's private one"
+    );
+
+    let hidden_err = on_hidden.expect_err("a claim the caller cannot read is not superseded");
+    assert!(
+        matches!(&hidden_err, epigraph_db::DbError::NotFound { id, .. } if *id == hidden),
+        "a claim the caller cannot read must classify as NotFound, like a missing one; \
+         got: {hidden_err:?}"
+    );
+    let missing_err = on_missing.expect_err("a missing claim is not superseded");
+    assert!(
+        matches!(&missing_err, epigraph_db::DbError::NotFound { id, .. } if *id == missing),
+        "got: {missing_err:?}"
+    );
+    // The same session's classification DOES see a claim it can read: B's
+    // retired public claim is told apart as "already superseded".
+    let readable_err = on_readable.expect_err("a retired claim is not superseded again");
+    assert!(
+        matches!(
+            &readable_err,
+            epigraph_db::DbError::Refused {
+                kind: epigraph_db::RefusalKind::State,
+                ..
+            }
+        ),
+        "a readable, retired claim is the State refusal; got: {readable_err:?}"
+    );
+
+    // Nothing was written for either of B's claims.
+    for (old, was_current) in [(hidden, true), (readable, false)] {
+        let (is_current, successors, edges): (bool, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT is_current FROM claims WHERE id = $1), \
+                    (SELECT count(*) FROM claims WHERE supersedes = $1), \
+                    (SELECT count(*) FROM edges \
+                      WHERE target_id = $1 AND relationship = 'supersedes')",
+        )
+        .bind(old)
+        .fetch_one(&pool)
+        .await
+        .expect("post-state");
+        assert_eq!(is_current, was_current, "{old} is untouched");
+        assert_eq!(
+            (successors, edges),
+            (0, 0),
+            "no successor or edge for {old}"
+        );
+    }
 }
