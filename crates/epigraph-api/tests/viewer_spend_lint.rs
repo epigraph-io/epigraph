@@ -442,6 +442,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "sqlx::query(UPDATE).execute",
         ],
     ),
+    // stamped + write (backlog 04c02296): the transaction is stamped from the
+    // caller's viewer (`AppState::write_as`), and migration 208's countersign
+    // definer reads the caller from that session principal, acts only on
+    // authorship rows naming the caller (or an agent it is the live operator
+    // of) and returns only those rows' ids; it reads nothing for display.
+    (
+        "countersign.rs",
+        "countersign_authorship",
+        &["CountersignRepository::countersign_conn"],
+    ),
     // untenanted: match_candidates rows; both claims are checked through the
     // viewer (`are_all_current`) before a promotion writes.
     (
