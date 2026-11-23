@@ -537,8 +537,11 @@ impl AgentRepository {
     /// it." That migration names THIS function explicitly among the ones which
     /// "take no `Viewer` and return the full row". The compensating projection —
     /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
-    /// exactly one function, [`Self::get_public_profile`], and the residual is
-    /// already on record as `D-PR17-agent-projection-enforced-at-one-call-site`.
+    /// [`Self::get_public_profile`], and the residual is already on record as
+    /// `D-PR17-agent-projection-enforced-at-one-call-site`. The agent-lookup
+    /// card and matcher (`agent_lookup.rs`) spell the same rule in their own
+    /// statements; `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
+    /// keeps the three one text.
     /// Stamping the session GUCs on this read changes no row either way; the
     /// value of the widening is entirely in the SIBLING statement it lets share
     /// the connection.
@@ -2270,6 +2273,15 @@ impl AgentRepository {
     /// 3. the viewer shares a live group with it.
     ///
     /// A bypass viewer sees everything, as everywhere else.
+    ///
+    /// The same rule is spelled in two more statements, the agent-lookup card
+    /// and matcher (`agent_lookup.rs::cards_inner` / `match_ranked`), because
+    /// `visibility_lint.rs` requires each viewer-taking statement to carry its
+    /// predicate text. Change all three together:
+    /// `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
+    /// fails while their text or bind order differs, and
+    /// `agent_lookup.rs::the_three_copies_of_the_profile_rule_decide_alike`
+    /// (epigraph-db tests) while their decisions do.
     ///
     /// The decision is made in SQL, in the same round trip as the row, so there
     /// is no window in which the caller holds the PII and has not yet decided

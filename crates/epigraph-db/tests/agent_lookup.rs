@@ -1990,3 +1990,102 @@ async fn a_persons_own_authorship_outranks_a_strangers_pending_naming(pool: PgPo
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The three copies of the public-profile rule decide alike (backlog 0e419970)
+// ---------------------------------------------------------------------------
+
+/// Whether `viewer` may see `subject`'s profile details, as each copy of the
+/// rule decides it, on ONE connection: `get_public_profile` (its `orcid`),
+/// the card (`cards_inner`: its `orcid`) and the matcher (`match_ranked`:
+/// the ORCID tier).
+async fn profile_decisions(
+    conn: &mut sqlx::PgConnection,
+    viewer: &Viewer,
+    subject: Uuid,
+    orcid: &str,
+) -> [bool; 3] {
+    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, viewer, subject)
+        .await
+        .expect("get_public_profile")
+        .expect("subject exists");
+    let card = AgentLookupRepository::card(&mut *conn, viewer, subject)
+        .await
+        .expect("card")
+        .expect("subject exists");
+    let matched = AgentLookupRepository::match_by_name(&mut *conn, viewer, orcid, 25)
+        .await
+        .expect("match_by_name")
+        .iter()
+        .any(|m| m.agent_id == subject && m.tier == MatchTier::Orcid);
+    [profile.orcid.is_some(), card.orcid.is_some(), matched]
+}
+
+/// The agent public-profile rule is spelled in three statements
+/// (`get_public_profile`, the card, the matcher); `visibility_lint.rs` pins
+/// their TEXT. This pins their DECISIONS: for every arm of the rule (public
+/// profile; the agent itself; a live co-member; a co-member whose subject's
+/// membership is revoked; an outsider; an admin) the three agree, and agree
+/// with the expected truth table, so a copy whose binds or arms drift is seen
+/// at run time as well.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_three_copies_of_the_profile_rule_decide_alike(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (colleague, _) = named(&pool, "colleague").await;
+    let (former, _) = named(&pool, "former colleague").await;
+    let (private_p, _) = named(&pool, "Ivo Pellar").await;
+    let (public_p, _) = named(&pool, "Ama Quist").await;
+    let private_orcid = "0000-0002-0000-0011";
+    let public_orcid = "0000-0002-0000-0012";
+    sqlx::query("UPDATE agents SET orcid = $2, profile_visibility = 'group' WHERE id = $1")
+        .bind(private_p)
+        .bind(private_orcid)
+        .execute(&pool)
+        .await
+        .expect("private profile");
+    sqlx::query("UPDATE agents SET orcid = $2 WHERE id = $1")
+        .bind(public_p)
+        .bind(public_orcid)
+        .execute(&pool)
+        .await
+        .expect("public profile");
+    team_of(&pool, &[colleague, private_p]).await;
+    // A team the former colleague still holds, whose membership of the
+    // SUBJECT is revoked: the rule's `gm.revoked_at IS NULL` arm.
+    let old_team = team_of(&pool, &[former, private_p]).await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(old_team)
+    .bind(private_p)
+    .execute(&pool)
+    .await
+    .expect("revoke the subject's membership");
+
+    let scoped = app_pool(&pool).await;
+    for (who, private_visible) in [
+        (outsider, false),
+        (former, false),
+        (colleague, true),
+        (private_p, true),
+    ] {
+        let v = viewer(&pool, who).await;
+        let mut read = scoped.read_as(&v).await.expect("read_as");
+        let got = profile_decisions(&mut read, &v, private_p, private_orcid).await;
+        assert_eq!(got, [private_visible; 3], "private profile, viewer {who}");
+        let got = profile_decisions(&mut read, &v, public_p, public_orcid).await;
+        assert_eq!(got, [true; 3], "public profile, viewer {who}");
+    }
+
+    // An admin (a bypass viewer) sees both.
+    let (bypass_pool, admin) = fixture::bypass(&pool).await;
+    let (mut conn, _lease) = bypass_pool
+        .unscoped_for_maintenance(SystemReason::SchemaContractTest)
+        .await
+        .expect("maintenance connection");
+    assert_eq!(
+        profile_decisions(&mut conn, &admin, private_p, private_orcid).await,
+        [true; 3],
+        "admin, private profile"
+    );
+}

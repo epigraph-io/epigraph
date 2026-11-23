@@ -18,7 +18,11 @@
 //!
 //! * `orcid` / `ror_id`, and matching on them: only when the caller passes
 //!   [`AgentRepository::get_public_profile`]'s rule (profile public, the
-//!   caller is the agent, or shares a live group with it; or an admin). A
+//!   caller is the agent, or shares a live group with it; or an admin),
+//!   spelled again in the matcher and the card statements (the visibility lint
+//!   needs each statement's own predicate text) and kept one text with
+//!   `get_public_profile`'s by `visibility_lint.rs`'s
+//!   `the_agent_profile_rule_is_one_text_at_every_site`. A
 //!   private ORCID never matches, so it is not an oracle. `properties`
 //!   (`full_name`, `email`, `affiliations`) is never matched and never
 //!   returned. `display_name` is matched as written, so a display name that
