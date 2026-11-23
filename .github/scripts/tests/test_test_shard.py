@@ -106,14 +106,22 @@ class AffectedSelection(unittest.TestCase):
         self.assertTrue(d["partial"].get("epigraph-db"), d["partial"])
         self.assertLessEqual(shards_of("epigraph-api") | shards_of("epigraph-cli"), shard_ids(d))
 
-    def test_docs_only_change_runs_no_shard_and_no_gated_job(self):
-        # A doc no Rust source reads (the runbooks, docs/intro and README.md
-        # are read by tests; see the next test).
+    def test_docs_only_change_runs_only_the_docs_scan_and_no_gated_job(self):
+        # Any path under docs/ selects epigraph-core's doc_links and nothing
+        # else: it walks docs/ (the index docs/README.md must link every entry
+        # there), so an added or removed docs file is a change it reads. It is
+        # a std-only source scan, in the source-scans shard; no package suite
+        # and no gated job runs. (The runbooks are also read by db tests; see
+        # the runbook test below.)
         d = pr_plan(["docs/superpowers/plans/2026-11-14-a-plan.md", "docs/deploy.md"])
         self.assertEqual(d["mode"], "affected")
-        self.assertEqual(d["ids"], [])
-        self.assertEqual(d["matrix"], {"include": []})
-        self.assertEqual(d["run"], {job: False for job in d["run"]})
+        self.assertEqual(d["ids"], [ts.SCANS])
+        self.assertEqual(d["whole"], {})
+        self.assertEqual({k: sorted(v) for k, v in d["partial"].items()}, {"epigraph-core": ["doc_links"]})
+        self.assertEqual(
+            {job: on for job, on in d["run"].items() if job != "test-shard"},
+            {job: False for job in d["run"] if job != "test-shard"},
+        )
 
     def test_python_outside_scripts_runs_no_shard(self):
         d = pr_plan(["services/kanban/board.py", "tests/dedup/test_x.py", "tests/theme/conftest.py"])
@@ -122,7 +130,9 @@ class AffectedSelection(unittest.TestCase):
     def test_a_runbook_read_by_db_tests_runs_only_those_targets(self):
         d = pr_plan(["docs/runbooks/124-undo.sql"])
         self.assertEqual(d["ids"], [ts.SCANS])
-        self.assertEqual(set(d["partial"]), {"epigraph-db"})
+        # epigraph-core for doc_links, which walks all of docs/.
+        self.assertEqual(set(d["partial"]), {"epigraph-db", "epigraph-core"})
+        self.assertEqual(sorted(d["partial"]["epigraph-core"]), ["doc_links"])
         self.assertEqual(d["whole"], {})
 
     def test_a_test_only_change_does_not_reach_dependents(self):
