@@ -27,7 +27,7 @@ The commands assume Linux or macOS with a POSIX shell. On Windows, use WSL2.
 
 | You need | Why | Check |
 |---|---|---|
-| **Rust 1.88 or newer** | The locked dependency graph needs 1.88. `rust-version = "1.75"` in `Cargo.toml` is advisory, for clippy only. CI builds on `stable`. | `rustc --version` |
+| **Rust 1.88 or newer** | `rust-version = "1.88"` in `Cargo.toml` is the build floor: the locked dependency graph needs it, and the MSRV workflow builds on it. CI otherwise builds on `stable`. | `rustc --version` |
 | **A C toolchain, `pkg-config`, and the OpenSSL development headers** | Several dependencies link OpenSSL (`openssl-sys`, through `native-tls` and `webauthn-rs`). Without them the build stops before it compiles any EpiGraph code. Typical packages: `build-essential pkg-config libssl-dev` (Debian/Ubuntu), `gcc pkgconf openssl-devel` (Fedora), `pkg-config openssl@3` (Homebrew). | `pkg-config --modversion openssl` |
 | **PostgreSQL 16 with pgvector 0.8.0 or newer** | The schema uses the `vector`, `pg_trgm` and `uuid-ossp` extensions, and the semantic search and recall queries set `hnsw.iterative_scan`, which pgvector 0.8.0 introduced. The easiest route is Docker with the image CI uses, `pgvector/pgvector:pg16`. | `docker --version`, or `psql --version` |
 | **`openssl` and `curl`** | Generating secrets and calling the API. | `openssl version`, `curl --version` |
