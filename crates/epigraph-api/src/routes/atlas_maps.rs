@@ -482,8 +482,10 @@ pub async fn atlas_level(
 
 /// How long the co-owned overlay's statements may run on one level request
 /// before the leaf is served without it (module documentation, "The
-/// co-owned overlay"). Well inside the leaf's latency budget; the overlay
-/// read is two indexed statements.
+/// co-owned overlay"). A bound below the cold-leaf latency budget, not a
+/// target: an overlay that ran near it would already break the warm-leaf
+/// budget, which the latency gate would show. The overlay read is one
+/// indexed statement, two when an evidence edge is found.
 pub const CO_OWNED_OVERLAY_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// A served leaf of team `T`'s map with the co-owned edges the viewer's own
