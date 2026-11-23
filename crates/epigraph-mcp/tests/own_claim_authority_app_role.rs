@@ -1140,3 +1140,91 @@ async fn a_claims_admin_token_without_a_live_grant_cannot_borrow_the_server_stam
     let (who, _) = deferral(&pool, &first_text(&r)).await;
     assert_eq!(who, Some(server_agent));
 }
+
+/// `consolidate_claims(mode='identity')` on the application role (backlog
+/// 635dbfae, review of its fix): an authority refusal raised by an act inside
+/// the call's one transaction is a denial (INVALID_REQUEST), and no source is
+/// left marked.
+///
+/// The human (`claims:admin`, so it may mark onto X's public canonical, which
+/// it cannot write) consolidates two of its own claims, the clean one first.
+/// The second is bound to `binary_truth` at a non-zero index and cited by an
+/// edge, so its act raises FA07 (a dedup may not hand that binding to a
+/// canonical the session cannot write); the call's gates do not predict FA07.
+/// Before the batch transaction the clean source stayed marked (each source
+/// committed on its own); with the batch transaction alone the rolled-back
+/// call still answered INTERNAL_ERROR, a server fault an agent retries.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identity_consolidation_refused_by_an_acts_authority_rule_marks_nothing(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (h, hg) = fixture::seed_agent_with_group(&pool, "t36-human").await;
+    let (x, xg) = fixture::seed_agent_with_group(&pool, "t36-writer-x").await;
+    let survivor = claim_of(&pool, x, xg, "public", "X's canonical").await;
+    let clean = claim_of(&pool, h, hg, "public", "the human's restatement").await;
+    let bound = claim_of(&pool, h, hg, "public", "the human's restatement, bound").await;
+    let cite = claim_of(&pool, h, hg, "public", "a claim citing the bound one").await;
+    edge_between(&pool, cite, bound).await;
+    let frame: Uuid = sqlx::query_scalar(
+        "INSERT INTO frames (name, hypotheses) VALUES ('binary_truth', ARRAY['TRUE','FALSE']) \
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("frame");
+    sqlx::query(
+        "INSERT INTO claim_frames (claim_id, frame_id, hypothesis_index) VALUES ($1, $2, 1)",
+    )
+    .bind(bound)
+    .bind(frame)
+    .execute(&pool)
+    .await
+    .expect("bind the second source FALSE");
+    let hv = viewer(&pool, h).await;
+
+    let err = epigraph_mcp::tools::consolidate::consolidate_claims(
+        &server,
+        &hv,
+        epigraph_mcp::types::ConsolidateClaimsParams {
+            source_claim_ids: [survivor, clean, bound]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            merged_content: String::new(),
+            mode: "identity".to_string(),
+            survivor_claim_id: Some(survivor.to_string()),
+            reason: "an index restatement".to_string(),
+            confidence: None,
+        },
+        Some(&human(h, &["claims:write", "claims:admin"])),
+    )
+    .await
+    .expect_err("the second source's act refuses the call");
+    for dup in [clean, bound] {
+        let standing: (Option<Uuid>, bool) =
+            sqlx::query_as("SELECT supersedes, is_current FROM claims WHERE id = $1")
+                .bind(dup)
+                .fetch_one(&pool)
+                .await
+                .expect("source");
+        assert_eq!(
+            standing,
+            (None, true),
+            "source {dup} is not left marked: {err:?}"
+        );
+    }
+    let identity_edges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM edges WHERE target_id = $1 AND relationship = 'same_as'",
+    )
+    .bind(survivor)
+    .fetch_one(&pool)
+    .await
+    .expect("identity edges");
+    assert_eq!(identity_edges, 0, "no identity edge stands: {err:?}");
+    assert!(err.message.contains("FA07"), "the act's refusal: {err:?}");
+    assert_eq!(
+        err.code,
+        rmcp::model::ErrorCode::INVALID_REQUEST,
+        "a denial, not a server fault: {err:?}"
+    );
+    assert!(err.message.contains("no source was marked"), "{err:?}");
+}
