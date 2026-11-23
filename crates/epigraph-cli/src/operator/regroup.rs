@@ -111,7 +111,10 @@
 //! transaction that is always rolled back and records into memory only, the
 //! claims an `IRREVERSIBLE-EDGE` names are taken out, and the probe repeats
 //! until none is named; only then does the real batch run, so the manifest
-//! never records a claim the run does not move. A verdict is per batch (an
+//! never records a claim the run does not move. Should the real batch
+//! still find an `IRREVERSIBLE-EDGE` (an edge inserted on a moving claim
+//! between the probe's rollback and the batch's locks), it is rolled back as
+//! a failed batch (exit 2), never committed. A verdict is per batch (an
 //! edge to a claim of a later batch is judged against that claim as it is
 //! now), so the flag can hold a claim conservatively; a larger
 //! `--batch-size` judges more claims together. Restoring such an edge's
@@ -2238,7 +2241,32 @@ pub async fn run(
             sample: ctx.sample.saturating_sub(sampled),
             ..ctx
         };
-        let r = run_batch(&mut tx, &ctx_i, &claims, &mut sink, &known, audit).await;
+        let mut r = run_batch(&mut tx, &ctx_i, &claims, &mut sink, &known, audit).await;
+        // The probe ran in its own transaction: an edge inserted on a moving
+        // claim between the probe's rollback and this batch's locks can make
+        // a claim irreversible that the probe passed. Under the flag such a
+        // batch is never committed; it fails like an invariant violation.
+        if opts.refuse_irreversible {
+            if let Ok(b) = &r {
+                let late: Vec<String> = b
+                    .irreversible
+                    .iter()
+                    .filter_map(|(_, v)| v.as_ref().map(|(line, _)| line.clone()))
+                    .collect();
+                if !late.is_empty() {
+                    r = Err(BatchError::Invariant(
+                        late.into_iter()
+                            .map(|l| {
+                                format!(
+                                    "--refuse-irreversible: an edge became irreversible after \
+                                     the probe (a concurrent write); re-run the dry run: {l}"
+                                )
+                            })
+                            .collect(),
+                    ));
+                }
+            }
+        }
         if opts.apply && r.is_ok() {
             tx.commit().await?;
         } else {

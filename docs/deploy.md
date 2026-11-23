@@ -2707,6 +2707,9 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   `irreversible`, naming the edges, as `HELD-UNDER-LOCK` lines): each batch
   is probed first in a rolled-back transaction that records nothing to the
   manifest, the named claims are taken out, and the rest of the batch moves.
+  Should the real batch still find an `IRREVERSIBLE-EDGE` (an edge written on
+  a moving claim between the probe and the batch's locks), it is rolled back
+  as a failed batch (exit 2, nothing further attempted); re-run the dry run.
   Under `--apply` a held claim makes the run exit 3, as any hold does; drop
   the held claims from the ids file for an exit 0. The verdict is per batch,
   so a claim whose edge's other end moves in a later batch may be held
