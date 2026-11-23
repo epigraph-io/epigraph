@@ -19,6 +19,7 @@ records each request, standing in for the token endpoint, the introspection
 endpoint and the API.
 """
 import json
+import os
 import sys
 import threading
 import urllib.parse
@@ -353,3 +354,50 @@ def test_a_scope_the_client_was_not_granted_fails_at_construction(server, monkey
         _api_client.EpiGraphClient(scopes=["claims:write", "claims:admin"])
     msg = _exit_message(e)
     assert "claims:admin" in msg and SECRET not in msg, msg
+
+
+# --- Against the real API ---------------------------------------------------
+# The stub above answers what the tests tell it to, so it cannot see the
+# server change the introspection contract (rename `scope`, join it with
+# commas, report a valid token inactive): every EPIGRAPH_TOKEN job would then
+# exit at startup with every test above still green. CI's python job runs this
+# file under tests/ci/with_test_api.sh, which serves a migrated test database
+# and exports a token carrying claims:read, claims:write and claims:admin; the
+# skip budget there fails the step if these skip.
+LIVE_API_BASE = os.environ.get("DEDUP_TEST_API_BASE")
+LIVE_TOKEN = os.environ.get("DEDUP_TEST_TOKEN")
+live = pytest.mark.skipif(
+    not (LIVE_API_BASE and LIVE_TOKEN),
+    reason="needs DEDUP_TEST_API_BASE (a live API) and DEDUP_TEST_TOKEN (tests/ci/with_test_api.sh)",
+)
+
+
+@live
+def test_the_real_introspection_endpoint_reports_the_scopes_a_token_carries():
+    _api_client.check_token_scopes(
+        LIVE_TOKEN,
+        ["claims:read", "claims:write", "claims:admin"],
+        f"{LIVE_API_BASE.rstrip('/')}/oauth/introspect",
+    )
+    with pytest.raises(SystemExit) as e:
+        _api_client.check_token_scopes(
+            LIVE_TOKEN,
+            ["claims:read", "groups:admin"],
+            f"{LIVE_API_BASE.rstrip('/')}/oauth/introspect",
+        )
+    msg = _exit_message(e)
+    assert "lacks groups:admin" in msg and "claims:read" not in msg.split("(")[0], msg
+    assert LIVE_TOKEN not in msg
+
+
+@live
+def test_the_real_introspection_endpoint_refuses_a_tampered_token():
+    head, body, sig = LIVE_TOKEN.split(".")
+    tampered = f"{head}.{body}.{sig[:-4]}{'AAAA' if sig[-4:] != 'AAAA' else 'BBBB'}"
+    with pytest.raises(SystemExit) as e:
+        _api_client.check_token_scopes(
+            tampered, ["claims:read"], f"{LIVE_API_BASE.rstrip('/')}/oauth/introspect"
+        )
+    msg = _exit_message(e)
+    assert "not active" in msg, msg
+    assert tampered not in msg
