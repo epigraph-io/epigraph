@@ -15,6 +15,10 @@
 //! matching `epigraph_engine::sheaf::restriction_kind_with_profile`.
 //!
 //! Tight contract:
+//! - `properties` may not carry a reserved key
+//!   (`epigraph_db::RESERVED_EDGE_PROPERTIES`: the dedup identity, the
+//!   supersession act's marker, the ingest's own record): refused with the HTTP
+//!   edges route's text (`epigraph_db::reserved_edge_property_refusal`),
 //! - both endpoints are existing claims (`source_type`/`target_type` are always
 //!   `"claim"`, not caller-controllable),
 //! - `relationship` must be one of [`EPISTEMIC_RELATIONSHIPS`] or
@@ -219,6 +223,17 @@ pub async fn do_link_epistemic(
         return Err(invalid_params(
             "self-loops are not allowed (source and target are the same claim)",
         ));
+    }
+
+    // The keys only an act or the document ingest writes (backlog 3676c459):
+    // refused with the HTTP edges route's text before anything is read or
+    // written, as `patch_edge` refuses them.
+    if let Some(reason) = params
+        .properties
+        .as_ref()
+        .and_then(epigraph_db::reserved_edge_property_refusal)
+    {
+        return Err(invalid_params(reason));
     }
 
     // ONE TRANSACTION, STAMPED FROM THE WRITE IDENTITY (the caller over HTTP, the server's own agent on stdio; batch H-b D1). The existence
