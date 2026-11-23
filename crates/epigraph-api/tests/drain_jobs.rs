@@ -714,10 +714,25 @@ async fn cancel_pending_clears_an_unregistered_type_and_refuses_a_registered_one
     );
 }
 
-/// A drain-test handler whose every attempt fails with `error`.
+/// A drain-test handler whose every attempt fails with `error`, declaring
+/// `backoff(attempt)` as its retry backoff, and counting its calls.
 struct FailsWith {
     job_type: &'static str,
     error: epigraph_jobs::JobError,
+    backoff: fn(u32) -> Duration,
+    calls: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl FailsWith {
+    /// A handler with no backoff: a retry is due at once (the next run).
+    fn at_once(job_type: &'static str, error: epigraph_jobs::JobError) -> Self {
+        Self {
+            job_type,
+            error,
+            backoff: |_| Duration::ZERO,
+            calls: Arc::default(),
+        }
+    }
 }
 
 #[epigraph_jobs::async_trait]
@@ -726,11 +741,16 @@ impl epigraph_jobs::JobHandler for FailsWith {
         &self,
         _job: &epigraph_jobs::Job,
     ) -> Result<epigraph_jobs::JobResult, epigraph_jobs::JobError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(self.error.clone())
     }
 
     fn job_type(&self) -> &str {
         self.job_type
+    }
+
+    fn backoff(&self, attempt: u32) -> Duration {
+        (self.backoff)(attempt)
     }
 }
 
@@ -759,7 +779,8 @@ async fn enqueue_typed(pool: &PgPool, job_type: &str, max_retries: u32) -> Uuid 
 
 /// A job whose handler fails TRANSIENTLY (`JobError::should_retry` true) is
 /// put back to `pending` with the retry counted, and not retried in the same
-/// run (the next run is the backoff); when its retries are used up it is
+/// run (the handler here declares no backoff, so the next run retries it);
+/// when its retries are used up it is
 /// `failed`. Every run in which it failed exits 1, the retryable ones included
 /// (brief: "1 a job failed").
 #[sqlx::test(migrations = "../../migrations")]
@@ -767,14 +788,16 @@ async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
     let id = enqueue_typed(&pool, "drain_test_transient", 3).await;
 
     let scoped = maintenance_scoped(&pool).await;
+    // No backoff, so each run may retry it: this test is about the retry
+    // count; `a_retry_waits_out_the_handlers_backoff` is about the wait.
     let (runner, queue) = runner_with(
         &scoped,
-        FailsWith {
-            job_type: "drain_test_transient",
-            error: epigraph_jobs::JobError::ProcessingFailed {
+        FailsWith::at_once(
+            "drain_test_transient",
+            epigraph_jobs::JobError::ProcessingFailed {
                 message: "provider answered 503".to_string(),
             },
-        },
+        ),
     );
     for attempt in 1..=2 {
         let run = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
@@ -820,6 +843,113 @@ async fn a_failing_job_is_retried_next_run_then_fails_terminally(pool: PgPool) {
     assert_eq!(after.exit_code(), 0);
 }
 
+/// Seconds from the database's `now()` to the row's not-before time
+/// (`jobs.run_after`, migration 261), and its retry count.
+async fn wait_and_retries(pool: &PgPool, id: Uuid) -> (Option<f64>, i32) {
+    sqlx::query_as(
+        "SELECT extract(epoch FROM run_after - now())::float8, retry_count \
+           FROM jobs WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("the job row")
+}
+
+/// A retryable failure waits out its handler's `JobHandler::backoff` (backlog
+/// 6cf042a9). The handler declares `attempt + 1` hours: after the first
+/// failure the row's not-before time is one hour out (`backoff(0)`), a run
+/// straight after does not call the handler, and once the hour has passed
+/// (back-dated here) the next run retries it and schedules the second retry
+/// two hours out (`backoff(1)`), the worker loop's attempt index. Before the
+/// fix the drain wrote no such time, so the second run re-ran the job at once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_retry_waits_out_the_handlers_backoff(pool: PgPool) {
+    let id = enqueue_typed(&pool, "drain_test_backoff", 5).await;
+
+    let scoped = maintenance_scoped(&pool).await;
+    let handler = FailsWith {
+        job_type: "drain_test_backoff",
+        error: epigraph_jobs::JobError::RateLimited {
+            retry_after_secs: 60,
+        },
+        backoff: |attempt| Duration::from_secs(3600 * (u64::from(attempt) + 1)),
+        calls: Arc::default(),
+    };
+    let calls = Arc::clone(&handler.calls);
+    let (runner, queue) = runner_with(&scoped, handler);
+    let hour = 3600.0_f64;
+
+    let first = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert!(
+        first.failures.len() == 1 && !first.failures[0].terminal,
+        "the first failure must be retryable: {first:?}"
+    );
+    assert!(
+        first.failures[0].retry_not_before.is_some(),
+        "a retryable failure reported no not-before time: {first:?}"
+    );
+    let (wait, retries) = wait_and_retries(&pool, id).await;
+    let wait = wait.expect("a retryable failure stored no not-before time");
+    assert!(
+        (hour - 10.0..=hour + 0.5).contains(&wait),
+        "the first retry is not backoff(0) = 1h out on the database clock: {wait}s"
+    );
+    assert_eq!(retries, 1);
+    assert_eq!(job_state(&pool, id).await.0, "pending");
+
+    let early = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a run inside the handler's backoff re-ran the job: {early:?}"
+    );
+    assert!(
+        early.failures.is_empty() && early.completed == 0 && !early.out_of_time,
+        "{early:?}"
+    );
+    assert_eq!(
+        early.exit_code(),
+        0,
+        "a job waiting out its backoff is not a failure of the run"
+    );
+    assert_eq!(
+        wait_and_retries(&pool, id).await.1,
+        1,
+        "an attempt was spent"
+    );
+    assert_eq!(job_state(&pool, id).await.0, "pending");
+
+    sqlx::query("UPDATE jobs SET run_after = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("let the backoff elapse");
+    let due = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
+        .await
+        .expect("drain");
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "a job whose backoff had passed was not retried: {due:?}"
+    );
+    assert!(
+        due.failures.len() == 1 && !due.failures[0].terminal,
+        "{due:?}"
+    );
+    let (wait, retries) = wait_and_retries(&pool, id).await;
+    let wait = wait.expect("the second failure stored no not-before time");
+    assert!(
+        (2.0 * hour - 10.0..=2.0 * hour + 0.5).contains(&wait),
+        "the second retry is not backoff(1) = 2h out: {wait}s"
+    );
+    assert_eq!(retries, 2);
+}
+
 /// A job whose handler fails PERMANENTLY (`JobError::should_retry` false: here
 /// a payload that will never parse) is `failed` after its first run, with its
 /// retry budget unspent, and never handed out again (backlog 09109b93). Before
@@ -833,12 +963,12 @@ async fn a_permanent_failure_is_terminal_on_its_first_run(pool: PgPool) {
     let scoped = maintenance_scoped(&pool).await;
     let (runner, queue) = runner_with(
         &scoped,
-        FailsWith {
-            job_type: "drain_test_permanent",
-            error: epigraph_jobs::JobError::PayloadError {
+        FailsWith::at_once(
+            "drain_test_permanent",
+            epigraph_jobs::JobError::PayloadError {
                 message: "missing field `claim_id`".to_string(),
             },
-        },
+        ),
     );
     let run = jobs_drain::drain(&runner, &queue, Duration::from_secs(600))
         .await
@@ -926,6 +1056,7 @@ fn a_failed_job_outranks_running_out_of_time_in_the_exit_code() {
         job_type: "cluster_graph".to_string(),
         error: "boom".to_string(),
         terminal,
+        retry_not_before: None,
     };
     let clean = jobs_drain::DrainReport::default();
     assert_eq!(clean.exit_code(), 0);

@@ -306,6 +306,10 @@ impl JobQueue for PostgresJobQueue {
     ///
     /// The job's state is atomically updated to `Running` in the same transaction.
     ///
+    /// A pending row whose `run_after` (migration 261) is still in the future
+    /// is skipped: it is waiting out its handler's backoff
+    /// ([`PostgresJobQueue::requeue_after`]).
+    ///
     /// # Returns
     ///
     /// - `Some(Job)` if a pending job was found and claimed
@@ -320,6 +324,7 @@ impl JobQueue for PostgresJobQueue {
                 SELECT id
                 FROM jobs
                 WHERE state = 'pending'
+                  AND (run_after IS NULL OR run_after <= now())
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -707,6 +712,10 @@ impl PostgresJobQueue {
     /// * a job that failed and was put back to `pending` in this run is
     ///   excluded, so its retry waits for the next run instead of spinning.
     ///
+    /// A pending row whose `run_after` (migration 261) is still in the future
+    /// is not claimed either: it is waiting out its handler's backoff
+    /// ([`Self::requeue_after`]). NULL is due now.
+    ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error, or when the claimed
     /// row cannot be parsed.
@@ -724,6 +733,7 @@ impl PostgresJobQueue {
                 WHERE state = 'pending'
                   AND job_type = ANY($1)
                   AND NOT (id = ANY($2))
+                  AND (run_after IS NULL OR run_after <= now())
                 ORDER BY created_at ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -750,8 +760,11 @@ impl PostgresJobQueue {
         row.map(|r| job_from_row(&r)).transpose()
     }
 
-    /// How many `pending` jobs have a type in `job_types` and an id not in
-    /// `exclude`: the work [`Self::dequeue_of_types`] would still hand out.
+    /// How many `pending` jobs have a type in `job_types`, an id not in
+    /// `exclude`, and no `run_after` in the future: the work
+    /// [`Self::dequeue_of_types`] would still hand out now. A row waiting out
+    /// its backoff is not counted, so a run whose only leftover work is
+    /// deferred retries has not run out of time.
     ///
     /// # Errors
     /// `JobError::ProcessingFailed` on a database error.
@@ -763,7 +776,8 @@ impl PostgresJobQueue {
     ) -> Result<i64, JobError> {
         sqlx::query_scalar(
             "SELECT count(*) FROM jobs \
-              WHERE state = 'pending' AND job_type = ANY($1) AND NOT (id = ANY($2))",
+              WHERE state = 'pending' AND job_type = ANY($1) AND NOT (id = ANY($2)) \
+                AND (run_after IS NULL OR run_after <= now())",
         )
         .bind(job_types)
         .bind(exclude)
@@ -771,6 +785,66 @@ impl PostgresJobQueue {
         .await
         .map_err(|e| JobError::ProcessingFailed {
             message: format!("Failed to count pending jobs: {e}"),
+        })
+    }
+
+    /// The longest delay [`Self::requeue_after`] stores: 30 days. A handler's
+    /// `backoff` is clamped to it, so an absurd custom value cannot overflow
+    /// the database's interval arithmetic (which would abort the drain run
+    /// with the job still `running`) and a job is never parked for ever.
+    pub const MAX_REQUEUE_DELAY: std::time::Duration =
+        std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+    /// Put `job` back to `pending` after a retryable failure, not to be
+    /// claimed before `delay` has passed: writes its `retry_count` and
+    /// `error_message`, clears `started_at` and `completed_at`, and sets
+    /// `run_after` (migration 261) to the database's `now() + delay`. Returns
+    /// the stored `run_after`.
+    ///
+    /// The drain (`jobs_drain::drain` in `epigraph-api`) calls this with the
+    /// handler's [`crate::JobHandler::backoff`], which the in-process worker
+    /// loop honours by sleeping. The time is computed on the DATABASE clock
+    /// because the claims compare it with the database's `now()`; a host
+    /// clock ahead of or behind it would shorten or stretch the wait.
+    /// `delay` is clamped to [`Self::MAX_REQUEUE_DELAY`].
+    ///
+    /// # Errors
+    /// `JobError::ProcessingFailed` on a database error, or when no row has
+    /// the job's id.
+    #[instrument(skip(self, job), fields(job_id = %job.id, job_type = %job.job_type))]
+    pub async fn requeue_after(
+        &self,
+        job: &Job,
+        delay: std::time::Duration,
+    ) -> Result<DateTime<Utc>, JobError> {
+        let id: Uuid = job.id.into();
+        let micros =
+            i64::try_from(delay.min(Self::MAX_REQUEUE_DELAY).as_micros()).unwrap_or(i64::MAX);
+        let run_after: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r"
+            UPDATE jobs
+               SET state = 'pending',
+                   retry_count = $2,
+                   error_message = $3,
+                   started_at = NULL,
+                   completed_at = NULL,
+                   updated_at = now(),
+                   run_after = now() + make_interval(secs => $4::double precision / 1000000)
+             WHERE id = $1
+            RETURNING run_after
+            ",
+        )
+        .bind(id)
+        .bind(job.retry_count as i32)
+        .bind(&job.error_message)
+        .bind(micros)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| JobError::ProcessingFailed {
+            message: format!("Failed to requeue job: {e}"),
+        })?;
+        run_after.ok_or_else(|| JobError::ProcessingFailed {
+            message: format!("Failed to requeue job {id}: no such row"),
         })
     }
 
