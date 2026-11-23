@@ -867,7 +867,7 @@ async fn run_batch(
     // `changed` is the subset of the batch this direction ACTUALLY MOVED, and
     // the rest of the function turns on the difference. See the `skipped` write
     // below for why "looked at" and "changed" must not be the same item state.
-    let changed = match direction {
+    let (changed, moved_workflows) = match direction {
         Direction::Apply => {
             let changed =
                 PrivatizationRepository::restrict_claims_conn(&mut tx, &ids, plan.target_group_id)
@@ -895,7 +895,8 @@ async fn run_batch(
                 plan.target_group_id,
             )
             .await?;
-            changed
+            let moved_workflows: Vec<Uuid> = workflows.iter().map(|w| w.workflow_id).collect();
+            (changed, moved_workflows)
         }
         Direction::Revert => {
             PrivatizationRepository::record_item_audit_conn(&mut tx, audit).await?;
@@ -909,13 +910,27 @@ async fn run_batch(
             // A revert's terminal per-item state ends the item's life in this
             // plan, and nothing reads it back to decide a later write, so the
             // apply direction's distinction buys nothing here.
-            ids.clone()
+            (ids.clone(), Vec::new())
         }
     };
 
     // The meet re-run comes AFTER the tenancy write, in the same transaction, so
-    // an edge is never committed disagreeing with its endpoints.
-    PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &ids).await?;
+    // an edge is never committed disagreeing with its endpoints. It covers the
+    // workflows rows this batch moved too (already re-met by
+    // `restrict_plan_workflows_conn`; the re-run is idempotent), so every
+    // DECLARED edge the batch kept off its meet (migration 260) is recorded in
+    // the plan's audit trail on this transaction.
+    let mut touched = ids.clone();
+    touched.extend(moved_workflows);
+    let meet = PrivatizationRepository::recompute_boundary_meet_conn(&mut tx, &touched).await?;
+    PrivatizationRepository::record_edge_holds_conn(
+        &mut tx,
+        plan.id,
+        dispatched_by,
+        Some(correlation_id),
+        &meet.held,
+    )
+    .await?;
 
     // AN ITEM STATE MUST MEAN "THIS PLAN CHANGED THIS ROW", NOT "THIS PLAN
     // LOOKED AT IT". `restrict_claims_conn` is a no-op on a row already sitting

@@ -4085,6 +4085,42 @@ restart.
   `epigraph-db/tests/plan_step_skeleton_definer.rs` (owner, grants, masking, the undo). Undo:
   `docs/runbooks/259-undo.sql`. **Deploy order:** migrate BEFORE the binary; a 259 binary
   calls the definer on every outcome report that names a step.
+- **260**: public `edge_declared_tenancy` (backlog 969f01f6). Adds
+  `edges.declared_owner_group_id` and `edges.declared_co_owner_group_id` (nullable, no
+  default, no foreign key) and the definer trigger `edges_tenancy_declared`
+  (`epigraph_edges_record_declaration()`, 172's search-path form, owned by
+  `epigraph_maintenance`), BEFORE INSERT OR UPDATE OF source_id, target_id, firing right after
+  `edges_tenancy`: a `group` row whose endpoints are both public (the tuple 072's no-widening
+  arm kept) records its (owner, co-owner) as the declaration; every other INSERT records none,
+  whatever the caller bound; a re-point carries the row's record unchanged (never creates
+  or discards one). Records the existing
+  declarations once (every `group` edge whose endpoints are both public now, by the trigger's
+  own oracle `epigraph_node_tenancy`: claim, evidence and workflow endpoints by a join on
+  their tables, every other endpoint by one oracle call per distinct node, so from 258 on an
+  edge onto a group-private frame, context, perspective or community records none; edges
+  with a dangling endpoint are skipped and counted in a NOTICE). `edges_owner_immutable` also watches
+  the two columns (a non-privileged change is 42501). `epigraph_edges_tenancy` and
+  `epigraph_propagate_tenancy` are NOT re-stated. The privatization re-meet
+  (`PrivatizationRepository::recompute_boundary_meet_conn`) reads the record: a declared edge
+  is never readable outside its endpoints' meet; it keeps owner and visibility, narrowed to
+  the intersection with its meet (co-owner) when that is expressible, otherwise (stacked
+  states only) it takes the meet, keeping the declared owner where the meet allows; a revert
+  restores the declaration exactly; each such edge is recorded in the plan's audit trail
+  (`kind = 'edge'`, `edge.hold` / `edge.unmet`). Pinned by
+  `epigraph-db/tests/privatization_declared_edges.rs` (record, forgery, immutability, re-point,
+  apply/revert of claim and workflow edges with app-role reads, the inexpressible and stacked
+  cases bounded by the meet, the backfill, the undo) and
+  `epigraph-api/tests/privatization_declared_edges.rs` (the apply and revert jobs). Undo:
+  `docs/runbooks/260-undo.sql`. **Deploy order:** migrate BEFORE rolling out the 260 binary
+  (its re-meet reads the new columns; on an unmigrated database it fails with 42703, moot while
+  the privatization lifecycle answers 501 under D9); undo only after rolling it back. The ADD
+  COLUMN's ACCESS EXCLUSIVE lock on `edges` is held through the backfill's scan of the `group`
+  edges: apply in a maintenance window after measuring
+  `SELECT count(*) FROM edges WHERE visibility = 'group'`. **Order with #1022 (258):** merge
+  after #1022; safe either way (260 first records a pre-existing `group` edge onto a
+  group-private registry row as declared, as its trigger would until 258 applies; still
+  bounded by the meet; measure the non-public rows of the four registries). **Applied to throwaway
+  databases only, NOT to any deployed database.**
 - **261**: public `jobs_run_after` (backlog 6cf042a9). Adds `jobs.run_after
   timestamptz` (nullable, no default, no CHECK: a catalog change, no scan), the
   earliest time a pending row may be claimed; NULL means due now. The drain

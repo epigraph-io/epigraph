@@ -2443,6 +2443,15 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // attributed to the step one slot further on with no signal. That is the
     // stake this entry reports.
     ("epigraph_plan_step_skeleton", 259),
+    // 260 (backlog 969f01f6), the `edges_tenancy_declared` trigger body that
+    // records an edge's declared tenancy. It reads each endpoint through
+    // `epigraph_node_tenancy`, which is revoked from PUBLIC: under an
+    // APP-owned (non-member) body every INSERT of a `group` edge errors 42501
+    // with nothing written (loud, fail CLOSED); a re-point only carries the
+    // row's record and reads nothing. Under the migration runner's superuser
+    // it keeps working with more authority than intended (083's case), which
+    // only this check reports.
+    ("epigraph_edges_record_declaration", 260),
     // 264 (backlog 9073f0a5), the role-successor restore. It reads the
     // FORCEd `role_agents`, `agent_succession` and `agent_prompt_snapshots`
     // through `epigraph_definer_bypass()` and writes `role_agents` through
