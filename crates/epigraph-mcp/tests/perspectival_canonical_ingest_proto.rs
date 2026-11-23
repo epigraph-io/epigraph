@@ -2,7 +2,7 @@
 //! the REAL claim-write path (`update_with_evidence` → `ds_auto` → frame function)
 //! by mapping the demo's source-PROVENANCE types onto the kernel's canonical
 //! `evidence_type` vocabulary, instead of the bespoke repo-tier write the
-//! `perspectival_interview_merge.rs` harness uses.
+//! `perspectival_interview_merge` harness (`crates/epigraph-engine/examples/`) uses.
 //!
 //! Provenance → canonical mapping (kept 4-way distinct, no collapse):
 //!   source_practitioner → testimonial
