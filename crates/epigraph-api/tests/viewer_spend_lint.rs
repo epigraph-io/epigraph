@@ -2892,3 +2892,32 @@ pub async fn if_let_decoys(
          scrutinee stops at the body's `{{`, and the `let mut` form is unchanged"
     );
 }
+
+/// `if let Err(mut tx) = <ctor>` is a connection binding like `Ok(mut tx)`: a
+/// helper that hands an unused connection back as `Err(tx)` (a fast path that
+/// did not need it) leaves the caller holding a live connection, and a call
+/// handed `&mut tx` from that arm is measured. Red when `Err` is dropped from
+/// [`if_let_binding`]'s constructors (backlog d4890b22).
+#[test]
+fn the_scanner_sees_a_connection_bound_by_if_let_err() {
+    let src = r##"
+pub async fn if_let_err(
+    ViewerExtractor(viewer): ViewerExtractor,
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> R {
+    if let Err(mut tx) = fast_path(state.write_as(&viewer, "if_let_err").await?, id) {
+        Repo::write(&mut tx, id).await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+"##;
+    let m = unviewed_in(src);
+    assert_eq!(
+        labels(&m, "if_let_err"),
+        vec!["Repo::write"],
+        "a call handed `&mut tx` where `tx` is bound by `if let Err(mut tx) = <ctor>` is a \
+         database call"
+    );
+}
