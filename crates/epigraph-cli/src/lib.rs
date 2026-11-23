@@ -29,6 +29,8 @@ pub mod decompose;
 #[cfg(feature = "db")]
 pub mod decomposes_to_factor_sweep;
 #[cfg(feature = "db")]
+pub mod dekg_frames;
+#[cfg(feature = "db")]
 pub mod edge_rewire;
 #[cfg(feature = "db")]
 pub mod embed_backfill;
