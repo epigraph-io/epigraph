@@ -282,7 +282,9 @@ pub struct PaginatedPaperResponse {
 /// filling title/journal only where the stored value is NULL (an existing
 /// value is never overwritten; backlog 62ce37ca). A team's or agent's private
 /// copy of the document (a non-public ingest's row, migration 246) is neither
-/// returned nor touched.
+/// returned nor touched. An empty DOI, or a placeholder such as `"unknown"`
+/// ([`epigraph_core::domain::evidence::is_placeholder_id`]), is refused with
+/// 400 and writes nothing.
 ///
 /// The row is owned by the caller's home group, and written on a transaction
 /// stamped from the caller (`AppState::begin_claim_write`): since migration
@@ -307,6 +309,21 @@ pub async fn create_paper(
         return Err(ApiError::ValidationError {
             field: "doi".to_string(),
             reason: "DOI cannot be empty".to_string(),
+        });
+    }
+    // A placeholder ("unknown", "n/a", ...) means "this document has no DOI";
+    // it is not an identity. Keyed on it, every caller posting one got the
+    // same row and unrelated documents collapsed onto one paper node
+    // (backlog 8ef80a04). Same test, and same first sentence, as the MCP
+    // ingestion tools' refusal.
+    if epigraph_core::domain::evidence::is_placeholder_id(&request.doi) {
+        return Err(ApiError::ValidationError {
+            field: "doi".to_string(),
+            reason: format!(
+                "{:?} is a placeholder, not a document identity. A document with no DOI \
+                 needs a stable key of its own (for example a `urn:epigraph:doc:*` key).",
+                request.doi
+            ),
         });
     }
 
@@ -420,14 +437,23 @@ pub async fn list_papers(
 
     let (rows, total): (Vec<sqlx::postgres::PgRow>, i64) = if let Some(ref doi) = params.doi {
         // DOI lookup under every spelling of the document key (the same
-        // normalizer the writer and the MCP tools use), canonical first.
+        // normalizer and lookup the writer and the MCP tools use), canonical
+        // first; a case-variant legacy key only when no exact spelling is
+        // stored (backlog f3a3ca54).
         let spellings = epigraph_db::repos::paper::document_key_spellings(doi);
-        let rows = sqlx::query(
-            "SELECT id, doi, title, journal, created_at FROM papers \
-             WHERE doi = ANY($1) \
-               AND ($4::bool OR visibility = 'public' OR owner_group_id = ANY($5::uuid[])) \
-             ORDER BY array_position($1, doi) LIMIT $2 OFFSET $3",
-        )
+        // Scoped like the full list below (the viewer's predicate on top of
+        // the row security that admits the same rows), in both arms and the
+        // exact-spelling gate of the shared lookup.
+        let matched = epigraph_db::repos::paper::document_key_rows_in_sql(
+            "id, doi, title, journal, created_at",
+            1,
+            "$4::bool OR visibility = 'public' OR owner_group_id = ANY($5::uuid[])",
+        );
+        let rows = sqlx::query(&format!(
+            "SELECT id, doi, title, journal, created_at FROM ({matched}) AS m \
+             ORDER BY array_position($1::text[], m.doi), m.doi \
+             LIMIT $2 OFFSET $3"
+        ))
         .bind(&spellings)
         .bind(limit)
         .bind(offset)
@@ -439,18 +465,20 @@ pub async fn list_papers(
             message: format!("Failed to query papers: {e}"),
         })?;
 
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM papers WHERE doi = ANY($1) \
-               AND ($2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[]))",
-        )
-        .bind(&spellings)
-        .bind(viewer.bypass_bind())
-        .bind(viewer.group_bind().unwrap_or(&[]))
-        .fetch_one(&mut *read)
-        .await
-        .map_err(|e| ApiError::DatabaseError {
-            message: format!("Failed to count papers: {e}"),
-        })?;
+        let counted = epigraph_db::repos::paper::document_key_rows_in_sql(
+            "id",
+            1,
+            "$2::bool OR visibility = 'public' OR owner_group_id = ANY($3::uuid[])",
+        );
+        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM ({counted}) AS m"))
+            .bind(&spellings)
+            .bind(viewer.bypass_bind())
+            .bind(viewer.group_bind().unwrap_or(&[]))
+            .fetch_one(&mut *read)
+            .await
+            .map_err(|e| ApiError::DatabaseError {
+                message: format!("Failed to count papers: {e}"),
+            })?;
         (rows, total)
     } else {
         // Full list
