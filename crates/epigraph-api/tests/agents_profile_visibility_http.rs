@@ -207,11 +207,12 @@ async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgP
         "03yrm5c26",
     )
     .await;
-    let key: String = sqlx::query_scalar("SELECT encode(public_key, 'hex') FROM agents WHERE id = $1")
-        .bind(private)
-        .fetch_one(&pool)
-        .await
-        .expect("the agent's key");
+    let key: String =
+        sqlx::query_scalar("SELECT encode(public_key, 'hex') FROM agents WHERE id = $1")
+            .bind(private)
+            .fetch_one(&pool)
+            .await
+            .expect("the agent's key");
     let uri = format!("/api/v1/agents?public_key={key}");
 
     let (status, body) = get(&state, outsider, &uri).await;
@@ -226,6 +227,9 @@ async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgP
     let (status, body) = get(&state, private, &uri).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let row = item(&body, private);
-    assert_eq!(row["orcid"], "0000-0002-1825-0097", "the agent itself: {row}");
+    assert_eq!(
+        row["orcid"], "0000-0002-1825-0097",
+        "the agent itself: {row}"
+    );
     assert_eq!(row["ror_id"], "03yrm5c26", "the agent itself: {row}");
 }

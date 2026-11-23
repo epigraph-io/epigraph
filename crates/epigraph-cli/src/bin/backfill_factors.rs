@@ -75,9 +75,9 @@ use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
 use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::edge_rewire::{
-    predict_targeted_rewire, require_wave_claims_written, run_targeted_rewire, running_binary_sha256,
-    seed_from_waves,
-    TargetedRunOptions, DEFAULT_EPSILON, DEFAULT_MAX_PASSES,
+    predict_targeted_rewire, require_wave_claims_written, run_targeted_rewire,
+    running_binary_sha256, seed_from_waves, TargetedRunOptions, DEFAULT_EPSILON,
+    DEFAULT_MAX_PASSES,
 };
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;

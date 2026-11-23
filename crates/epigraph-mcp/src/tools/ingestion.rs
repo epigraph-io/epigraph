@@ -771,7 +771,8 @@ pub async fn check_already_ingested_on(
     // carries a matching stamp answers.
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
-            let paper_id = paper_already_ingested_on(&mut *conn, viewer, &params.doi, &exact).await?;
+            let paper_id =
+                paper_already_ingested_on(&mut *conn, viewer, &params.doi, &exact).await?;
             let matched = paper_id.map(|_| vec![exact.clone()]).unwrap_or_default();
             (exact, paper_id, matched)
         }

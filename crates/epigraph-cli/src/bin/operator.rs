@@ -148,8 +148,7 @@ use epigraph_cli::operator::{
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
     reown_workflows, restrict, retire_link, reverse, role_agent, role_restore, system_agent,
-    team_group,
-    workflow_submitter,
+    team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;

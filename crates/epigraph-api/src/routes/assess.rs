@@ -492,13 +492,10 @@ pub async fn assess_claim(
     // sibling agent's pre-link row is retired when that sibling assesses.
     if let Some(agent) = caller.filter(|a| owner != Some(*a)) {
         let own_slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent));
-        for row in rows_before
-            .iter()
-            .filter(|r| {
-                r.source_agent_id == Some(agent)
-                    && r.slot() == Some(epigraph_db::BbaSlot::Assessment(own_slot))
-            })
-        {
+        for row in rows_before.iter().filter(|r| {
+            r.source_agent_id == Some(agent)
+                && r.slot() == Some(epigraph_db::BbaSlot::Assessment(own_slot))
+        }) {
             use sqlx::Acquire as _;
             let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
                 message: format!("Failed to open a savepoint: {e}"),
