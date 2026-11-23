@@ -16,10 +16,12 @@
 //!
 //! # Verified to fail
 //!
-//! Run against two mutations of the function (PR for backlog 02612a76):
+//! Run against three mutations of the function (PR for backlog 02612a76):
 //! counting each attempted row (`+= 1` instead of `rows_affected()`) fails
 //! `conflicting_binding_is_not_counted`; discarding a failed insert and
-//! continuing fails `missing_frame_aborts` and `bad_row_mid_cluster_stops_the_loop`.
+//! continuing fails `missing_frame_aborts` and `bad_row_mid_cluster_stops_the_loop`;
+//! finishing the loop and only then returning the first error fails
+//! `bad_row_mid_cluster_stops_the_loop` alone (on the row-after assertion).
 
 use epigraph_cli::dekg_frames::assign_claims_to_frame;
 use sqlx::PgPool;
@@ -142,8 +144,8 @@ async fn missing_frame_aborts(pool: PgPool) {
 
 /// (c) A bad row in the middle of a cluster stops the loop: the row before it
 /// stays written and the row after it is never attempted. Distinguishes
-/// "abort" from "log and continue", which (b) cannot (there the first row
-/// already fails).
+/// "abort at once" from "keep looping and return the first error at the end",
+/// which (b) cannot (there every row fails, so both shapes write nothing).
 #[sqlx::test(migrations = "../../migrations")]
 async fn bad_row_mid_cluster_stops_the_loop(pool: PgPool) {
     let agent = seed_agent(&pool).await;
