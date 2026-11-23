@@ -309,68 +309,107 @@ async fn verify_twin_reports_as_the_tool_and_hides_an_unreadable_claim(pool: PgP
 
 // ── check_already_ingested ─────────────────────────────────────────────────
 
+/// The route reads the `processed_by` stamps as the CALLER, as the tool does.
+///
+/// Today's stamp writer makes every stamp world-owned (paper to agent is a
+/// structural edge; pinned by epigraph-mcp's `dedup_probes_app_role`), so a
+/// fixture that lets the writer stamp the tenancy cannot tell a route that
+/// reads as the caller from one that reads as the public. The chapter stamp
+/// here is therefore FORCED group-private to the member's group
+/// (`seed_edge_owned_by`'s UPDATE): the member must see the document as
+/// ingested and the stranger must not, on both surfaces. A route that read as
+/// `Viewer::public_only()`, or as any viewer but the caller's, fails the
+/// member's arm.
 #[sqlx::test(migrations = "../../migrations")]
 async fn already_ingested_twin_answers_and_refuses_as_the_tool(pool: PgPool) {
     let (router, server) = surfaces(&pool).await;
-    let (agent, _) = fixture::seed_agent_with_group(&pool, "ingest-gate").await;
+    let (member, group) = fixture::seed_agent_with_group(&pool, "ingest-member").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "ingest-stranger").await;
     let doi = "10.5555/twin-gate";
+    let chapter = "hierarchical_extraction_v2:ch1";
     let paper = epigraph_db::PaperRepository::get_or_create(&pool, doi, Some("t"), None)
         .await
         .expect("paper");
     let mut conn = pool.acquire().await.expect("conn");
     epigraph_db::EdgeRepository::create_processed_by_stamp_if_absent_conn(
-        &mut conn,
-        paper,
-        agent,
-        "hierarchical_extraction_v2:ch1",
-        "test",
+        &mut conn, paper, member, chapter, "test",
     )
     .await
     .expect("stamp");
     drop(conn);
+    let forced = sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+         WHERE source_id = $1 AND relationship = 'processed_by'",
+    )
+    .bind(paper)
+    .bind(group)
+    .execute(&pool)
+    .await
+    .expect("force the stamp group-private");
+    assert_eq!(forced.rows_affected(), 1, "exactly the one chapter stamp");
 
-    let viewer = mcp_viewer(&server, agent).await;
-    let token = bearer(agent, &["claims:read"]);
-    let cases = [
-        // Default mode: the whole family, so the one chapter stamp counts.
-        (json!({ "doi": doi }), format!("doi={doi}"), true),
-        // Exact mode: a chapter that did not land.
-        (
-            json!({ "doi": doi, "pipeline_version": "hierarchical_extraction_v2:ch2" }),
-            format!("doi={doi}&pipeline_version=hierarchical_extraction_v2:ch2"),
-            false,
-        ),
-        // A document nobody ingested.
-        (
-            json!({ "doi": "10.5555/never" }),
-            "doi=10.5555/never".to_string(),
-            false,
-        ),
-    ];
-    for (args, query, expected) in cases {
-        let tool = tools::ingestion::check_already_ingested(
-            &server,
-            &viewer,
-            serde_json::from_value(args.clone()).unwrap(),
-        )
-        .await
-        .expect("check_already_ingested");
-        let (status, body) = get(
-            &router,
-            &format!("/api/v1/ingest/already-ingested?{query}"),
-            &token,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{args}: {body}");
-        assert_eq!(
-            body,
-            tool_json(&tool),
-            "{args}: the route and the tool disagree"
-        );
-        assert_eq!(body["already_ingested"], expected, "{args}: {body}");
+    for (who, agent, member_sees) in [("member", member, true), ("stranger", stranger, false)] {
+        let viewer = mcp_viewer(&server, agent).await;
+        let token = bearer(agent, &["claims:read"]);
+        let cases = [
+            // Default mode: the whole family, so the one chapter stamp counts.
+            (json!({ "doi": doi }), format!("doi={doi}"), member_sees),
+            // Exact mode, the chapter that landed.
+            (
+                json!({ "doi": doi, "pipeline_version": chapter }),
+                format!("doi={doi}&pipeline_version={chapter}"),
+                member_sees,
+            ),
+            // Exact mode: a chapter that did not land.
+            (
+                json!({ "doi": doi, "pipeline_version": "hierarchical_extraction_v2:ch2" }),
+                format!("doi={doi}&pipeline_version=hierarchical_extraction_v2:ch2"),
+                false,
+            ),
+            // A document nobody ingested.
+            (
+                json!({ "doi": "10.5555/never" }),
+                "doi=10.5555/never".to_string(),
+                false,
+            ),
+        ];
+        for (args, query, expected) in cases {
+            let tool = tools::ingestion::check_already_ingested(
+                &server,
+                &viewer,
+                serde_json::from_value(args.clone()).unwrap(),
+            )
+            .await
+            .expect("check_already_ingested");
+            let (status, body) = get(
+                &router,
+                &format!("/api/v1/ingest/already-ingested?{query}"),
+                &token,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{who} {args}: {body}");
+            assert_eq!(
+                body,
+                tool_json(&tool),
+                "{who} {args}: the route and the tool disagree"
+            );
+            assert_eq!(
+                body["already_ingested"], expected,
+                "{who} {args}: the group-private stamp counts for its group only: {body}"
+            );
+            if expected {
+                assert_eq!(body["paper_id"], paper.to_string(), "{who} {args}: {body}");
+                assert_eq!(
+                    body["matched_pipeline_versions"],
+                    json!([chapter]),
+                    "{who} {args}: {body}"
+                );
+            }
+        }
     }
 
     // A placeholder key is refused by both, with one text.
+    let viewer = mcp_viewer(&server, member).await;
     let refused = tools::ingestion::check_already_ingested(
         &server,
         &viewer,
@@ -381,7 +420,7 @@ async fn already_ingested_twin_answers_and_refuses_as_the_tool(pool: PgPool) {
     let (status, body) = get(
         &router,
         "/api/v1/ingest/already-ingested?doi=unknown",
-        &token,
+        &bearer(member, &["claims:read"]),
     )
     .await;
     assert_eq!(bad_request_message(status, &body), refused.message);
