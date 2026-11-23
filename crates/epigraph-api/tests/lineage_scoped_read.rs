@@ -933,3 +933,90 @@ async fn the_descendant_cap_does_not_serve_a_back_edge_from_a_cut_claim(pool: Pg
     assert_edges_closed(&cut, "descendants with a back-edge from a cut claim");
 }
 
+/// `nodes_omitted` counts only claims the viewer can READ (T104 review
+/// finding 2). The count is a new disclosure surface: a cap applied before the
+/// visibility filter, or a count taken from an unfiltered walk, would tell the
+/// viewer how many claims it cannot see hang off the root.
+///
+/// The root is the viewer's; `READABLE` claims on each side are readable to
+/// it, and `HIDDEN` more are group-private to a stranger's group, reachable
+/// over PUBLIC edges so that only the claim predicate excludes them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_node_cap_counts_only_claims_the_viewer_can_read(pool: PgPool) {
+    const READABLE: usize = 4;
+    const HIDDEN: usize = 3;
+    let (agent, group) = seed_agent_with_group(&pool, "lineage-cap-mine").await;
+    let (stranger, stranger_group) = seed_agent_with_group(&pool, "lineage-cap-theirs").await;
+    let world = world_group(&pool).await;
+
+    let root = seed_group_claim(&pool, agent, group, "count root").await;
+    let mut hidden = Vec::new();
+    for i in 0..READABLE {
+        let p = seed_public_claim(&pool, stranger, &format!("readable parent {i}")).await;
+        seed_edge(&pool, p, root).await;
+        let c = seed_group_claim(&pool, agent, group, &format!("readable child {i}")).await;
+        seed_edge(&pool, root, c).await;
+    }
+    for i in 0..HIDDEN {
+        let p = seed_group_claim(
+            &pool,
+            stranger,
+            stranger_group,
+            &format!("hidden parent {i}"),
+        )
+        .await;
+        seed_edge_owned_by(&pool, p, root, "public", world).await;
+        let c = seed_group_claim(
+            &pool,
+            stranger,
+            stranger_group,
+            &format!("hidden child {i}"),
+        )
+        .await;
+        seed_edge_owned_by(&pool, root, c, "public", world).await;
+        hidden.extend([p, c]);
+    }
+
+    // CALIBRATION: the hidden claims are really in the graph, one edge each.
+    let edges_at_root: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM edges WHERE source_id = $1 OR target_id = $1")
+            .bind(root)
+            .fetch_one(&pool)
+            .await
+            .expect("count edges");
+    assert_eq!(edges_at_root as usize, 2 * (READABLE + HIDDEN));
+
+    for direction in [LineageDirection::Ancestors, LineageDirection::Descendants] {
+        // CALIBRATION: uncapped, exactly the readable side is served.
+        let full = walk_capped(&pool, agent, root, direction, 100).await;
+        assert_eq!(
+            full.nodes.len(),
+            1 + READABLE,
+            "{direction:?}: {:?}",
+            node_ids(&full)
+        );
+        assert!(!full.truncated && full.nodes_omitted == 0, "{direction:?}");
+
+        let cap = 3u32;
+        let cut = walk_capped(&pool, agent, root, direction, cap).await;
+        assert_eq!(cut.nodes.len(), cap as usize, "{direction:?}");
+        assert!(
+            node_ids(&cut).iter().all(|id| !hidden.contains(id)),
+            "{direction:?}: a hidden claim was served"
+        );
+        assert!(cut.truncated, "{direction:?}");
+        assert_eq!(
+            cut.nodes_omitted as usize,
+            1 + READABLE - cap as usize,
+            "{direction:?}: the count must cover readable claims only, not the {HIDDEN} \
+             the viewer cannot see"
+        );
+    }
+
+    // `both`: root + 4 parents fill a cap of 5; the descendant walk keeps only
+    // the shared root, so the 4 readable children are counted and nothing else.
+    let both = walk_capped(&pool, agent, root, LineageDirection::Both, 5).await;
+    assert_eq!(both.nodes.len(), 5, "both: {:?}", node_ids(&both));
+    assert!(both.truncated);
+    assert_eq!(both.nodes_omitted as usize, READABLE);
+}
