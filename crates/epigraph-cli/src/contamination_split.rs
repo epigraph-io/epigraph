@@ -143,10 +143,7 @@ pub fn to_json_bytes<T: Serialize + ?Sized>(value: &T) -> anyhow::Result<Vec<u8>
 
 /// Split `pairs` into `(clean, contaminated, counts)` against `ledger` with
 /// [`partition_by_ledger`], keeping each row whole and in input order.
-pub fn split(
-    pairs: SweepPairs,
-    ledger: &Ledger,
-) -> (Vec<SweepPair>, Vec<SweepPair>, SplitCounts) {
+pub fn split(pairs: SweepPairs, ledger: &Ledger) -> (Vec<SweepPair>, Vec<SweepPair>, SplitCounts) {
     let SweepPairs {
         pairs,
         sha256: pairs_sha256,

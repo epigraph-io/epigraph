@@ -379,14 +379,30 @@ mod tests {
             derivation_root: None,
         };
         let bare = k(None, a, None);
-        assert!(is_same_source(&closure_only, &bare, SourceFilterConfig::default()));
-        assert!(is_same_source(&bare, &closure_only, SourceFilterConfig::default()));
+        assert!(is_same_source(
+            &closure_only,
+            &bare,
+            SourceFilterConfig::default()
+        ));
+        assert!(is_same_source(
+            &bare,
+            &closure_only,
+            SourceFilterConfig::default()
+        ));
         // Different agent, no shared DOI: still cross-source.
         let other = k(None, Uuid::new_v4(), None);
-        assert!(!is_same_source(&closure_only, &other, SourceFilterConfig::default()));
+        assert!(!is_same_source(
+            &closure_only,
+            &other,
+            SourceFilterConfig::default()
+        ));
         // A paper-anchored claim of the same agent keeps the paper rule.
         let anchored = k(Some("10.1/y"), a, None);
-        assert!(!is_same_source(&closure_only, &anchored, SourceFilterConfig::default()));
+        assert!(!is_same_source(
+            &closure_only,
+            &anchored,
+            SourceFilterConfig::default()
+        ));
     }
 
     #[test]

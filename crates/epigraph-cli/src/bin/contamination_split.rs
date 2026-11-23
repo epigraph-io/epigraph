@@ -77,11 +77,9 @@ async fn main() -> anyhow::Result<()> {
             let maint = epigraph_cli::MaintenancePool::connect("contamination_split")
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (pairs, bytes) = epigraph_cli::contamination_split::fetch_run_pairs_nonempty(
-                maint.pool(),
-                run_id,
-            )
-            .await?;
+            let (pairs, bytes) =
+                epigraph_cli::contamination_split::fetch_run_pairs_nonempty(maint.pool(), run_id)
+                    .await?;
             (pairs, Some(bytes))
         }
         (None, None) => anyhow::bail!("pass --pairs or --run-id"),
