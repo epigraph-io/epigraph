@@ -51,7 +51,7 @@
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator regroup-claims --claims-file claims.txt --source-group <uuid> \
 //!         --target-group <uuid> --operator <uuid> --manifest-out regroup-1.jsonl \
-//!         [--apply --confirm-count N --ruling TEXT --reason TEXT]
+//!         [--refuse-irreversible] [--apply --confirm-count N --ruling TEXT --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
@@ -1034,6 +1034,11 @@ enum Command {
         /// How many claims the dry run lists row by row.
         #[arg(long, default_value_t = 3)]
         sample: usize,
+        /// Hold (HELD `irreversible`), instead of moving, every claim an
+        /// `IRREVERSIBLE-EDGE` names: a claim `reown-reverse` could not
+        /// reverse. Each batch is probed first in a rolled-back transaction.
+        #[arg(long)]
+        refuse_irreversible: bool,
     },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
     /// execute, the rows those carry, and their plan edges) out of the source
@@ -1724,6 +1729,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         batch_size,
         lock_timeout,
         sample,
+        refuse_irreversible,
     } = &cli.command
     {
         let o = regroup::Options {
@@ -1739,6 +1745,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
             sample: *sample,
+            refuse_irreversible: *refuse_irreversible,
         };
         regroup::validate(&o)?;
         Some(o)

@@ -105,6 +105,19 @@
 //! names (`IRREVERSIBLE-EDGE` lines and a count): those claims will not be
 //! reversible by this tool.
 //!
+//! `--refuse-irreversible` holds such claims instead of moving them (HELD
+//! `irreversible`, reported as `HELD-UNDER-LOCK` lines; under `--apply` the
+//! run then exits 3, as for any other hold). Each batch is first PROBED in a
+//! transaction that is always rolled back and records into memory only, the
+//! claims an `IRREVERSIBLE-EDGE` names are taken out, and the probe repeats
+//! until none is named; only then does the real batch run, so the manifest
+//! never records a claim the run does not move. A verdict is per batch (an
+//! edge to a claim of a later batch is judged against that claim as it is
+//! now), so the flag can hold a claim conservatively; a larger
+//! `--batch-size` judges more claims together. Restoring such an edge's
+//! recorded tuple exactly is not offered: that tuple is wider than its
+//! endpoints, which is what the reversal refuses to write.
+//!
 //! An edge is accepted only when its new meet is at least as narrow as its
 //! current tuple with the source replaced by the target; otherwise it holds
 //! its claim (`edge-would-widen`).
@@ -218,6 +231,10 @@ pub struct Options {
     pub lock_timeout: String,
     /// How many claims the dry-run sample lists row by row.
     pub sample: usize,
+    /// Hold, instead of moving, every claim this run predicts `reown-reverse`
+    /// could not reverse (an `IRREVERSIBLE-EDGE` names it): see
+    /// [`run`]'s per-batch probe.
+    pub refuse_irreversible: bool,
 }
 
 /// Refuse obviously bad options before connecting.
@@ -300,6 +317,12 @@ pub enum Hold {
         table: String,
         id: String,
     },
+    /// `--refuse-irreversible`: an edge of the claim would be an
+    /// `IRREVERSIBLE-EDGE` (its recorded tuple is wider than the meet of its
+    /// endpoints after a restore, so `reown-reverse` would hold the claim).
+    Irreversible {
+        edges: Vec<String>,
+    },
 }
 
 impl Hold {
@@ -318,6 +341,7 @@ impl Hold {
             Self::Pinned { .. } => "pinned",
             Self::EdgeWouldWiden { .. } => "edge-would-widen",
             Self::ChangedSinceRecorded { .. } => "changed",
+            Self::Irreversible { .. } => "irreversible",
         }
     }
 }
@@ -374,6 +398,12 @@ impl fmt::Display for Hold {
                 f,
                 "{table} {id} changed since this run recorded it (another writer); its recorded \
                  prior would be stale"
+            ),
+            Self::Irreversible { edges } => write!(
+                f,
+                "--refuse-irreversible: edge(s) {} would be IRREVERSIBLE-EDGE (reown-reverse \
+                 would hold this claim), so it is not moved",
+                edges.join(",")
             ),
         }
     }
@@ -1848,6 +1878,53 @@ pub struct RunReport {
     pub audit_written: bool,
 }
 
+/// `--refuse-irreversible`'s probe of one batch: run it in a transaction that
+/// is always rolled back, recording into memory only and writing no audit
+/// row, and take out every claim an `IRREVERSIBLE-EDGE` verdict names (HELD
+/// `irreversible`, with the edges). Removing a claim changes the batch's
+/// moving set and so the other verdicts, so repeat until no claim is named.
+/// A probe that fails returns the batch as it stands: the real batch then
+/// meets the same failure and reports it.
+///
+/// A verdict is per batch: an edge whose other end moves in a LATER batch is
+/// judged against that end as it is now, so the probe may hold a claim the
+/// whole run would not have left irreversible. Listing such claims in one
+/// batch (`--batch-size`) judges them together.
+async fn probe_irreversible(
+    conn: &mut PgConnection,
+    ctx: &Ctx<'_>,
+    mut claims: Vec<Uuid>,
+    known: &Known,
+) -> anyhow::Result<(Vec<Uuid>, Vec<(Uuid, Hold)>)> {
+    let mut refused: Vec<(Uuid, Hold)> = Vec::new();
+    let probe_ctx = Ctx { sample: 0, ..*ctx };
+    while !claims.is_empty() {
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        let mut scratch = Sink::Memory(Default::default(), 0);
+        let r = run_batch(&mut tx, &probe_ctx, &claims, &mut scratch, known, None).await;
+        tx.rollback().await?;
+        let Ok(b) = r else { break };
+        let mut named: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+        for (edge, verdict) in &b.irreversible {
+            if let Some((_, cs)) = verdict {
+                for c in cs {
+                    named.entry(*c).or_default().push(edge.clone());
+                }
+            }
+        }
+        if named.is_empty() {
+            break;
+        }
+        claims.retain(|c| !named.contains_key(c));
+        refused.extend(
+            named
+                .into_iter()
+                .map(|(c, edges)| (c, Hold::Irreversible { edges })),
+        );
+    }
+    Ok((claims, refused))
+}
+
 /// The exit code for `report` (see the module doc).
 #[must_use]
 pub fn exit_code(report: &RunReport, opts: &Options) -> i32 {
@@ -2093,6 +2170,7 @@ pub async fn run(
             "already": already.len(),
         },
         "batch_size": opts.batch_size,
+        "refuse_irreversible": opts.refuse_irreversible,
     });
 
     let mut known = Known::default();
@@ -2103,6 +2181,25 @@ pub async fn run(
     let mut node_edges: BTreeMap<String, String> = BTreeMap::new();
     let mut irreversible: BTreeMap<String, Irreversible> = BTreeMap::new();
     for (i, batch) in batches.iter().enumerate() {
+        // `--refuse-irreversible`: probe the batch first, in a transaction
+        // that is always rolled back and records into memory only (so the
+        // manifest never names a claim this run does not move), and drop
+        // every claim an IRREVERSIBLE-EDGE names; repeat until none is named.
+        let mut claims: Vec<Uuid> = batch.to_vec();
+        if opts.refuse_irreversible {
+            let (kept, refused) = probe_irreversible(conn, &ctx, claims, &known).await?;
+            claims = kept;
+            report.held_under_lock.extend(refused);
+        }
+        if claims.is_empty() {
+            writeln!(
+                out,
+                "BATCH {}/{total}\tOK\t0 claim(s) moved (every claim held by \
+                 --refuse-irreversible)",
+                i + 1
+            )?;
+            continue;
+        }
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
         let audit =
             (opts.apply && !report.audit_written).then_some((&audit_details, opts.operator));
@@ -2110,7 +2207,7 @@ pub async fn run(
             sample: ctx.sample.saturating_sub(sampled),
             ..ctx
         };
-        let r = run_batch(&mut tx, &ctx_i, batch, &mut sink, &known, audit).await;
+        let r = run_batch(&mut tx, &ctx_i, &claims, &mut sink, &known, audit).await;
         if opts.apply && r.is_ok() {
             tx.commit().await?;
         } else {
@@ -3138,6 +3235,7 @@ mod tests {
             batch_size: 10,
             lock_timeout: "5s".into(),
             sample: 0,
+            refuse_irreversible: false,
         };
         assert!(validate(&o).is_ok());
         o.reason = " ".into();

@@ -2856,3 +2856,109 @@ async fn a_concurrent_edge_insert_on_a_moving_claim_is_waited_for_and_moved(pool
         run.show()
     );
 }
+
+/// Backlog b1e2151c (1): `--refuse-irreversible` holds, instead of moving, a
+/// claim the run predicts `reown-reverse` could not reverse, and moves the
+/// rest of its batch. `c` has an edge to a context of the TARGET (its
+/// recorded prior is wider than the node: IRREVERSIBLE-EDGE without the
+/// flag, see `an_edge_from_a_target_node_goes_to_the_target_and_its_reversal_holds`);
+/// `b` is an ordinary claim of the SAME batch. With the flag the dry run and
+/// the apply hold `c` (HELD-UNDER-LOCK `irreversible`, naming the edge) and
+/// report no irreversible edge; the apply moves `b` only, exits 3 (a listed
+/// claim was held), leaves `c` and its edge untouched, and its manifest never
+/// names `c` or the edge, so the run it recorded reverses cleanly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn refuse_irreversible_holds_the_irreversible_claim_and_moves_the_rest_of_its_batch(
+    pool: PgPool,
+) {
+    let fx = seed(&pool).await;
+    let c = fixture::seed_group_claim(&pool, fx.operator, fx.src, "C: SRC, in DST's context").await;
+    let node = seed_node(&pool, "context", fx.dst, "group").await;
+    let e = typed_edge(&pool, node, "context", c, "claim").await;
+    let dir = scratch_dir();
+    let ids = ids_file(&dir, "ids.txt", &[c, fx.b]);
+    let flag: &[&str] = &["--refuse-irreversible"];
+    let dry = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &dir.join("dry.jsonl"),
+            apply_count: None,
+            extra: flag,
+        },
+    )
+    .await;
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(
+        has_line(
+            &dry.stdout,
+            "HELD-UNDER-LOCK\t",
+            &[&c.to_string(), "irreversible", &e.to_string()]
+        ),
+        "the dry run holds C, naming its edge\n{}",
+        dry.show()
+    );
+    assert!(
+        !dry.stdout
+            .lines()
+            .any(|l| l.starts_with("IRREVERSIBLE-EDGE\t")),
+        "{}",
+        dry.show()
+    );
+    assert!(
+        dry.stdout.contains("irreversible edges: 0 "),
+        "{}",
+        dry.show()
+    );
+
+    let mf = dir.join("m.jsonl");
+    let r = regroup(
+        &pool,
+        Regroup {
+            ids: &ids,
+            src: fx.src,
+            dst: fx.dst,
+            operator: fx.operator,
+            manifest: &mf,
+            apply_count: Some(2),
+            extra: flag,
+        },
+    )
+    .await;
+    assert_eq!(r.code, 3, "a listed claim was held\n{}", r.show());
+    assert!(
+        has_line(
+            &r.stdout,
+            "HELD-UNDER-LOCK\t",
+            &[&c.to_string(), "irreversible", &e.to_string()]
+        ),
+        "{}",
+        r.show()
+    );
+    assert!(r.stdout.contains("claims moved: 1"), "{}", r.show());
+    assert_eq!(row(&pool, "claims", c).await, grp(fx.src), "C is not moved");
+    assert_eq!(
+        edge(&pool, e).await,
+        (fx.src, "group".to_string(), None),
+        "C's edge is untouched"
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.dst), "B is moved");
+    let manifest = std::fs::read_to_string(&mf).expect("manifest");
+    assert!(
+        !manifest.contains(&c.to_string()) && !manifest.contains(&e.to_string()),
+        "the manifest never records the held claim or its edge"
+    );
+    assert!(manifest.contains(&fx.b.to_string()), "B is recorded");
+
+    let rv = reverse(&pool, &[&mf], &[], true).await;
+    assert_eq!(
+        rv.code,
+        0,
+        "the recorded run reverses cleanly\n{}",
+        rv.show()
+    );
+    assert_eq!(row(&pool, "claims", fx.b).await, grp(fx.src));
+}

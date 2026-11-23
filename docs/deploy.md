@@ -2691,6 +2691,16 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   claim cannot be reversed by this tool. The dry run and the apply predict
   this for every edge and print each one (`IRREVERSIBLE-EDGE`, naming the
   claim, and an `irreversible edges` count with the number of claims).
+  `--refuse-irreversible` holds such claims instead of moving them (HELD
+  `irreversible`, naming the edges, as `HELD-UNDER-LOCK` lines): each batch
+  is probed first in a rolled-back transaction that records nothing to the
+  manifest, the named claims are taken out, and the rest of the batch moves.
+  Under `--apply` a held claim makes the run exit 3, as any hold does; drop
+  the held claims from the ids file for an exit 0. The verdict is per batch,
+  so a claim whose edge's other end moves in a later batch may be held
+  conservatively; a larger `--batch-size` judges more claims together. The
+  tool does not restore such an edge's recorded tuple exactly: that tuple is
+  wider than its endpoints, which is what the reversal refuses to write.
 - **Authority for its first use** (the 17 legacy workflow claims an earlier
   restriction put in the wrong team group): two operator rulings, both of
   2026-11-11. "Do both along with the 25 mixed lineage move" decides the
