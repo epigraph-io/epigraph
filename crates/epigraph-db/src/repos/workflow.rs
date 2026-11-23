@@ -308,6 +308,12 @@ pub struct NewHierarchicalOutcomeReport<'a> {
     pub result: &'a HierarchicalOutcomeResult,
 }
 
+/// The advisory-lock namespace of a step lineage (backlog bf2e9aa6): the first
+/// key of `pg_advisory_xact_lock(hashtext(STEP_LINEAGE_LOCK),
+/// hashtext(lineage::text))`. See
+/// [`WorkflowRepository::lock_step_lineage_for_evolve`].
+pub const STEP_LINEAGE_LOCK: &str = "epigraph.step_lineage";
+
 pub struct WorkflowRepository;
 
 /// A legacy flat workflow: a `claims` row labelled `workflow`, as
@@ -803,6 +809,146 @@ impl WorkflowRepository {
             .bind(claim_id)
             .fetch_all(&mut *conn)
             .await
+    }
+
+    /// Serialize an `evolve_step` against every concurrent `executes` edge
+    /// into the step lineage of `parent` (backlog bf2e9aa6), on the evolve's
+    /// own transaction: lock the parent's row `FOR UPDATE`, then take the
+    /// lineage's advisory lock EXCLUSIVELY ([`STEP_LINEAGE_LOCK`], keyed on
+    /// the parent's `COALESCE(step_lineage_id, id)`), held to the end of the
+    /// transaction. Returns `false`, having locked nothing, when the parent's
+    /// row is not found on this session; the act's own `FOR UPDATE` read then
+    /// answers it.
+    ///
+    /// # Why
+    ///
+    /// The `evolve_step` gates hold the caller to workflow authority over
+    /// every workflow in [`Self::workflows_executing_step_lineage`] /
+    /// [`Self::step_lineage_executors`]. Read before any lock, an `executes`
+    /// edge committed between that read and the evolve's commit was not
+    /// gated: the evolve changed what the newly attached workflow resolves to
+    /// without authority over it. Locking the parent's row alone does not
+    /// close that, because inserting an edge takes no lock on the claim it
+    /// targets. So every `executes` writer takes the same advisory key in
+    /// SHARE mode before its INSERT ([`Self::lock_step_lineage_shared`], from
+    /// `EdgeRepository`'s connection writers), and a gate that reads its set
+    /// after this lock sees every such edge that committed, or waits for the
+    /// writer that has one in flight. Writers do not block one another.
+    ///
+    /// The row lock comes first because it pins the key: a lineage id is only
+    /// ever back-filled onto a parent under that row's `FOR UPDATE`
+    /// (`ClaimRepository::evolve_step_conn`), so the key read here is the key
+    /// until this transaction ends. A writer that read a NULL lineage before a
+    /// concurrent back-fill keys on the claim id, which is the key the
+    /// back-filling evolve holds, so it waits for that evolve. The back-fill
+    /// gives the lineage a NEW id, so once that evolve commits the claim id is
+    /// a stale key that the next evolve of the lineage no longer takes; the
+    /// writer therefore re-reads the key after its lock is granted and also
+    /// takes the new one ([`Self::lock_step_lineage_shared`]) before it
+    /// inserts.
+    ///
+    /// # Errors
+    /// Returns `sqlx::Error` if a query fails.
+    pub async fn lock_step_lineage_for_evolve(
+        conn: &mut sqlx::PgConnection,
+        parent: Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let key: Option<Uuid> = sqlx::query_scalar(
+            "-- VISIBILITY-EXEMPT: WRITE path. The evolve's own lock of the parent it is about to \
+             evolve, on the caller-stamped write transaction; returns the lineage key only.\n\
+             SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1 FOR UPDATE",
+        )
+        .bind(parent)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2::uuid::text))")
+            .bind(STEP_LINEAGE_LOCK)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(true)
+    }
+
+    /// Take the advisory lock of the step lineage `claim_id` belongs to
+    /// ([`STEP_LINEAGE_LOCK`], keyed on `COALESCE(step_lineage_id, id)`) in
+    /// SHARE mode, held to the end of the transaction: what every writer of an
+    /// `executes` edge onto `claim_id` takes before its INSERT, so that edge
+    /// and an `evolve_step` of the same lineage
+    /// ([`Self::lock_step_lineage_for_evolve`]) serialize (backlog bf2e9aa6).
+    /// Called by `EdgeRepository`'s connection writers, so every workflow
+    /// write path (`ingest`, `add_step`, `link_hierarchical`) takes it.
+    ///
+    /// The key is read under the writer's own row security, which returns a
+    /// visible row's true `step_lineage_id`. A writer that cannot read
+    /// `claim_id` is REFUSED (`DbError::NotFound`, the answer a missing claim
+    /// gets, so a hidden one is not told apart), never keyed on the claim id:
+    /// such a key would differ from the lineage key an evolve of that lineage
+    /// holds, and the two would not serialize (security review of bf2e9aa6).
+    /// No workflow path writes an `executes` edge onto a claim its stamp
+    /// cannot read anyway: the ingest refuses such a reused claim by name
+    /// (`ReusedClaimOutsideCallerGroups`) and `link_hierarchical` reads its
+    /// target first, so the refusal costs no legitimate writer anything.
+    ///
+    /// The key is re-read after each lock is granted, and a changed key is
+    /// locked too, until two reads agree. A writer that read a NULL lineage
+    /// keys on the claim id and so queues behind an evolve back-filling that
+    /// claim's lineage; but the back-fill writes a NEW lineage id, so once that
+    /// evolve commits, the next evolve of the lineage keys on the new id and
+    /// would not wait for a writer holding only the claim id (review of
+    /// bf2e9aa6). The key only ever changes from NULL to a lineage id, once,
+    /// under the back-filling evolve's exclusive lock on the old key, so the
+    /// second read is final; the loop is bounded and refuses past the bound.
+    ///
+    /// # Errors
+    /// `DbError::NotFound` when this session cannot read `claim_id` (on either
+    /// read); `DbError::WriteRefused` if the key never settles; a database
+    /// error if a query fails.
+    pub async fn lock_step_lineage_shared(
+        conn: &mut sqlx::PgConnection,
+        claim_id: Uuid,
+    ) -> Result<(), DbError> {
+        // The key changes at most once (NULL to a lineage id), so the second
+        // read settles it; one spare pass guards against a reading this
+        // reasoning missed, and past it the write is refused, never let
+        // through on a key the evolve may not hold.
+        const MAX_LOCKS: usize = 3;
+        let mut locked: Option<Uuid> = None;
+        for _ in 0..MAX_LOCKS {
+            let key: Option<Uuid> = sqlx::query_scalar(
+                "-- VISIBILITY-EXEMPT: WRITE path. The lineage key of the claim an executes edge \
+                 is about to target, for the writer's advisory lock; never returned to a \
+                 caller.\n\
+                 SELECT COALESCE(c.step_lineage_id, c.id) FROM claims c WHERE c.id = $1",
+            )
+            .bind(claim_id)
+            .fetch_optional(&mut *conn)
+            .await?;
+            let Some(key) = key else {
+                return Err(DbError::NotFound {
+                    entity: "Claim".to_string(),
+                    id: claim_id,
+                });
+            };
+            if locked == Some(key) {
+                return Ok(());
+            }
+            sqlx::query(
+                "SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2::uuid::text))",
+            )
+            .bind(STEP_LINEAGE_LOCK)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+            locked = Some(key);
+        }
+        Err(DbError::WriteRefused {
+            entity: "Claim".to_string(),
+            id: claim_id,
+            action: "executes edge: step lineage key did not settle".to_string(),
+        })
     }
 
     /// Look up a workflow root by `(canonical_name, generation)`.

@@ -1922,10 +1922,10 @@ async fn a_delegated_write_names_its_delegator_and_token_in_every_caller_write_r
 /// naming `p`. Over `p`'s public workflow in team group `t` (which `d` does
 /// not write) the gate admits it but the database does not: since migration
 /// 237 the `workflows` row's UPDATE matches nothing for a non-writer of `t`
-/// (and row security refuses the deprecation of `t`'s claims too), so the
-/// tool refuses the call by name before any claim is touched, and nothing is
-/// written or recorded. Another principal's delegate is refused by the gate
-/// itself.
+/// (and row security refuses the deprecation of `t`'s claims too, which is
+/// answered by name since backlog ab353d54), so the tool refuses the call by
+/// name before any claim is touched, and nothing is written or recorded.
+/// Another principal's delegate is refused by the gate itself.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_delegate_deprecates_its_operators_workflow(pool: PgPool) {
     let w = world(&pool).await;

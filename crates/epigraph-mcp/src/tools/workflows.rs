@@ -400,21 +400,7 @@ pub async fn store_workflow(
             {
                 return success_json(&StoreWorkflowResponse {
                     workflow_id: hit.id.to_string(),
-                    hint: Some(format!(
-                        "A workflow in the tenancy this store would use (visibility '{}', \
-                         owner group {}) already has a near-identical goal ({:.3} similar): \
-                         '{}' (canonical_name '{}', generation {}, the lineage head). Nothing \
-                         was stored. To change its steps, call improve_workflow_hierarchy \
-                         with parent_canonical_name='{}'; to mint a separate lineage anyway, \
-                         call store_workflow again with force_new=true.",
-                        hit.visibility,
-                        hit.owner_group_id,
-                        hit.similarity,
-                        hit.goal,
-                        hit.canonical_name,
-                        hit.generation,
-                        hit.canonical_name
-                    )),
+                    hint: Some(hit.hint("store_workflow")),
                     canonical_name: hit.canonical_name,
                     goal: hit.goal,
                     generation: hit.generation,
@@ -520,61 +506,18 @@ pub async fn store_workflow(
     })
 }
 
-/// Cosine similarity at or above which `store_workflow` treats a new goal as a
-/// rewording of an existing hierarchical workflow's goal (backlog 5e54282f).
-/// Well above `find_workflow_hierarchical`'s 0.5 search floor: that one finds
-/// candidates, this one refuses to mint a lineage.
-pub const STORE_WORKFLOW_MATCH_THRESHOLD: f64 = 0.90;
+/// The match threshold, shared with the REST twin (backlog 51d599a9).
+pub use epigraph_ingest_executor::STORE_WORKFLOW_MATCH_THRESHOLD;
 
-/// A lineage head [`matching_workflow`] found for a reworded goal.
-struct WorkflowMatch {
-    id: uuid::Uuid,
-    canonical_name: String,
-    generation: i32,
-    goal: String,
-    similarity: f64,
-    visibility: String,
-    owner_group_id: uuid::Uuid,
-}
-
-/// The live (`truth_value >= 0.3`) hierarchical workflow LINEAGE HEAD whose
-/// goal (or the goal of an earlier generation of its lineage) is the most
-/// similar to `qvec`, when that clears [`STORE_WORKFLOW_MATCH_THRESHOLD`]
-/// under a canonical_name other than `canonical_name`, AND the head has
-/// exactly the tenancy this store would give a new lineage.
-///
-/// # The tenancy rule
-///
-/// A match redirects every later outcome report (goal text, per-step
-/// deviation reasons, `outcome_details`) onto the matched plan. Matching
-/// anything the caller merely READS would let a store meant to stay private
-/// (the undeclared default, or a declared group) land on another team's
-/// public plan, or on a plan of another group the caller is also in. So the
-/// target tenancy is decided first, exactly as the ingest would: the declared
-/// one, else `epigraph_ingest_executor::owner::resolve_caller_owner` for a new
-/// lineage (the caller's one team, else its own default), on a transaction
-/// stamped from the CALLER (the write identity, which on stdio is this
-/// server's own agent whatever viewer a driver passed). Only a head with the
-/// same `(visibility, owner_group_id)` is a match. When the target cannot be
-/// resolved (an unbound author), nothing is matched and the ingest reports
-/// its own refusal.
-///
-/// # Heads, not generations
-///
-/// The search covers every generation, and each hit is resolved to the head
-/// of its `canonical_name`, so a match never names a superseded generation.
-/// A lineage with rows the caller cannot read is skipped: its readable
-/// "head" may not be the real one.
-///
-/// # An identical goal is not a match
-///
-/// `None` whenever a row named `canonical_name` itself exists, readable or
-/// not, embedded or not, live or deprecated: an identical goal stays the
-/// ingest's own business (its idempotent `already_ingested` no-op, or its
-/// refusal of a name with rows the caller cannot read), never a match to
-/// another lineage. That check does not go through the goal embedding, which
-/// rows stored before goals were embedded (and `embed: false` ingests) do not
-/// have.
+/// [`epigraph_ingest_executor::matching_workflow_conn`] for this store's
+/// caller: the rule (tenancy, heads, an identical goal is no match) lives
+/// there, shared with REST `POST /api/v1/workflows` (backlog 51d599a9). Here
+/// the caller is the write identity (on stdio this server's own agent,
+/// whatever viewer a driver passed), read on a transaction stamped from it
+/// and rolled back. A failed match READ is logged and matches nothing, so the
+/// store goes on as it would without matching, as REST does: one input, one
+/// answer on either transport (review of 51d599a9). Resolving the caller and
+/// opening its transaction still fail the call, as the store itself would.
 async fn matching_workflow(
     server: &EpiGraphMcpFull,
     viewer: &epigraph_db::visibility::Viewer,
@@ -582,7 +525,7 @@ async fn matching_workflow(
     declared: Option<epigraph_core::TenancyDecl>,
     canonical_name: &str,
     qvec: &[f32],
-) -> Result<Option<WorkflowMatch>, McpError> {
+) -> Result<Option<epigraph_ingest_executor::WorkflowGoalMatch>, McpError> {
     let caller = server.write_identity(auth, viewer).await?;
     let resolved = crate::tools::workflow_ingest::caller_viewer(
         server,
@@ -594,110 +537,26 @@ async fn matching_workflow(
     let caller_viewer = resolved.as_ref().unwrap_or(viewer);
     let mut tx =
         crate::claim_helper::begin_caller_workflow_tx(server, caller, "store_workflow").await?;
-    let target = match declared {
-        Some(d) => d,
-        None => {
-            match epigraph_ingest_executor::owner::resolve_caller_owner(
-                &mut tx,
-                caller.agent_id(),
-                None,
-            )
-            .await
-            {
-                Ok(owner) => owner.decl,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "store_workflow: no target tenancy for matching; not matching"
-                    );
-                    tx.rollback().await.map_err(internal_error)?;
-                    return Ok(None);
-                }
-            }
-        }
-    };
-    let (Some(target_visibility), Some(target_owner)) =
-        (target.visibility_bind(), target.owner_group_bind())
-    else {
-        tx.rollback().await.map_err(internal_error)?;
-        return Ok(None);
-    };
-
-    let name_taken = WorkflowRepository::head_by_canonical(&mut *tx, canonical_name)
-        .await
-        .map_err(internal_error)?
-        .is_some()
-        || WorkflowRepository::name_has_hidden_rows_conn(&mut tx, canonical_name)
-            .await
-            .map_err(internal_error)?;
-    if name_taken {
-        tx.rollback().await.map_err(internal_error)?;
-        return Ok(None);
-    }
-    let hits = WorkflowRepository::search_hierarchical_by_embedding_scored(
-        &mut *tx,
+    let found = epigraph_ingest_executor::matching_workflow_conn(
+        &mut tx,
         caller_viewer,
-        &epigraph_db::pgvector_literal(qvec),
-        0.3,
-        10,
+        caller.agent_id(),
+        declared,
+        canonical_name,
+        qvec,
     )
-    .await
-    .map_err(internal_error)?;
-
-    let mut seen: Vec<String> = Vec::new();
-    let mut found = None;
-    for hit in hits
-        .into_iter()
-        .filter(|h| h.similarity >= STORE_WORKFLOW_MATCH_THRESHOLD)
-    {
-        if seen.contains(&hit.canonical_name) {
-            continue;
-        }
-        seen.push(hit.canonical_name.clone());
-        if WorkflowRepository::name_has_hidden_rows_conn(&mut tx, &hit.canonical_name)
-            .await
-            .map_err(internal_error)?
-        {
-            continue;
-        }
-        let Some(head_id) = WorkflowRepository::head_by_canonical(&mut *tx, &hit.canonical_name)
-            .await
-            .map_err(internal_error)?
-        else {
-            continue;
-        };
-        let Some(head) = WorkflowRepository::row_as_viewer(&mut tx, caller_viewer, head_id)
-            .await
-            .map_err(internal_error)?
-        else {
-            continue;
-        };
-        if head.truth_value < 0.3 {
-            continue;
-        }
-        let Some((visibility, owner_group_id)) =
-            WorkflowRepository::tenancy_as_viewer(&mut tx, caller_viewer, head_id)
-                .await
-                .map_err(internal_error)?
-        else {
-            continue;
-        };
-        if visibility != target_visibility || owner_group_id != target_owner {
-            continue;
-        }
-        found = Some(WorkflowMatch {
-            id: head.id,
-            canonical_name: head.canonical_name,
-            generation: head.generation,
-            goal: head.goal,
-            similarity: hit.similarity,
-            visibility,
-            owner_group_id,
-        });
-        break;
+    .await;
+    // Read-only: roll back whatever the read left, before branching on it.
+    if let Err(e) = tx.rollback().await {
+        tracing::warn!(error = %e, "store_workflow: could not end the match read");
     }
-    tx.rollback().await.map_err(internal_error)?;
-    Ok(found)
+    match found {
+        Ok(found) => Ok(found),
+        Err(e) => {
+            tracing::warn!(error = %e, "store_workflow: goal match failed; not matching");
+            Ok(None)
+        }
+    }
 }
 
 pub async fn find_workflow(
@@ -1798,7 +1657,7 @@ pub async fn deprecate_workflow(
         epigraph_core::ClaimId::from_uuid(workflow_id),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(deprecate_write_error)?;
     // Cascade onto the hierarchical `workflows` row (no-op when this
     // workflow has only a flat-claim representation). Without this,
     // `find_workflow_hierarchical` keeps returning the deprecated row.
@@ -1813,7 +1672,7 @@ pub async fn deprecate_workflow(
     let row_rows =
         epigraph_db::WorkflowRepository::set_truth_value_if_changed(&mut *tx, workflow_id, 0.05)
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
     if row_rows == 0 {
         refuse_a_live_row_left_behind(&mut tx, workflow_id, None).await?;
     }
@@ -1904,11 +1763,11 @@ pub async fn deprecate_workflow(
                     epigraph_core::ClaimId::from_uuid(child_id),
                 )
                 .await
-                .map_err(internal_error)?;
+                .map_err(deprecate_write_error)?;
                 // Mirror onto the hierarchical row, if any.
                 epigraph_db::WorkflowRepository::set_truth_value(&mut *tx, child_id, 0.05)
                     .await
-                    .map_err(internal_error)?;
+                    .map_err(deprecate_write_error)?;
                 // REPORT ONLY WHAT ACTUALLY FLIPPED. `deprecate_claim` returns
                 // `rows_affected`, and a cascade child can legitimately yield 0:
                 // `claims_tenancy`'s USING side filters the UPDATE's target, so a
@@ -1935,6 +1794,48 @@ pub async fn deprecate_workflow(
         kept_shared_claim_ids: Vec::new(),
         reason: params.reason,
     })
+}
+
+/// `deprecate_workflow`'s answer when row security refuses one of its writes
+/// (backlog ab353d54): an UNCODED `42501` from a deprecation UPDATE (the
+/// claims tenancy policy's WITH CHECK, `new row violates row-level security
+/// policy`), the transaction aborted and nothing written. Since the delegate
+/// arm was added, the workflow gate admits callers that need not write the
+/// workflow's owner group (a delegate acting for the submitter, say), and a
+/// public plan's rows pass row security's read side, so the refusal comes
+/// from the write. It is a
+/// denial the caller can act on, `INVALID_REQUEST` naming the missing group
+/// write authority, as `evolve_step` answers its own `42501`; it used to be
+/// the opaque INTERNAL_ERROR, which reads as a server fault and invites a
+/// retry. A CODED refusal (`XX00: ...`) and every other error keep
+/// [`internal_error`]'s handling.
+fn deprecate_write_error<E: std::fmt::Display + 'static>(e: E) -> McpError {
+    let any: &dyn std::any::Any = &e;
+    let source = match any.downcast_ref::<epigraph_db::DbError>() {
+        Some(epigraph_db::DbError::QueryFailed { source }) => Some(source),
+        _ => any.downcast_ref::<sqlx::Error>(),
+    };
+    if let Some(sqlx::Error::Database(d)) = source {
+        if d.code().as_deref() == Some("42501") && !crate::errors::coded(d.message()) {
+            tracing::warn!(
+                target: "tenancy.scoped_write",
+                tool = "deprecate_workflow",
+                error = %e,
+                "row security refused the deprecation write"
+            );
+            return McpError {
+                code: rmcp::model::ErrorCode::INVALID_REQUEST,
+                message: std::borrow::Cow::from(
+                    "deprecate_workflow: refused: the caller does not write the group that owns \
+                     this workflow or a claim it executes, so row security refused the \
+                     deprecation. It needs write authority over that owner group as well as \
+                     authority over the workflow. Nothing was written.",
+                ),
+                data: None,
+            };
+        }
+    }
+    internal_error(e)
 }
 
 /// `deprecate_workflow`'s answer for an id that names nothing the caller can
@@ -2140,7 +2041,7 @@ async fn deprecate_hierarchical_workflow(
         if !grant.is_admin() {
             row_changed = WorkflowRepository::set_truth_value_if_changed(&mut *tx, row, 0.05)
                 .await
-                .map_err(internal_error)?;
+                .map_err(deprecate_write_error)?;
             if row_changed == 0 {
                 refuse_a_live_row_left_behind(&mut tx, row, Some(not_found_answer)).await?;
             }
@@ -2160,7 +2061,7 @@ async fn deprecate_hierarchical_workflow(
                 epigraph_core::ClaimId::from_uuid(c.id),
             )
             .await
-            .map_err(internal_error)?;
+            .map_err(deprecate_write_error)?;
             if n > 0 {
                 row_retired.push(c.id.to_string());
             }

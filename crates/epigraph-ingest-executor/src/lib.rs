@@ -11,6 +11,7 @@ pub mod error;
 pub mod owner;
 pub mod system_agent;
 pub mod workflow;
+pub mod workflow_match;
 pub mod workflow_plan;
 pub mod workflow_steps;
 
@@ -24,5 +25,8 @@ pub use system_agent::{
 pub use workflow::{
     execute_workflow_ingest_plan, execute_workflow_ingest_plan_in_group,
     require_caller_writes_group, InsertedPlanEdge, ReusedClaim, WorkflowIngestExecutionResult,
+};
+pub use workflow_match::{
+    matching_workflow_conn, WorkflowGoalMatch, STORE_WORKFLOW_MATCH_THRESHOLD,
 };
 pub use workflow_steps::{add_step, delete_step, AddStepResult, DeleteStepResult, StepOpError};
