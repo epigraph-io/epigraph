@@ -997,6 +997,36 @@ mod tests {
             );
         }
 
+        /// Boundary: only `"refusal"` is terminal. A truncated answer
+        /// (`max_tokens`) whose text does not parse stays a `MalformedResponse`,
+        /// so a check widened to "anything but `end_turn`" is caught.
+        #[tokio::test]
+        async fn max_tokens_with_unparseable_text_is_malformed_not_refusal() {
+            let err = complete_against(messages_response(
+                "max_tokens",
+                serde_json::json!([{"type": "text", "text": "{\"a\": [1, 2"}]),
+            ))
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, LlmError::MalformedResponse { .. }),
+                "expected MalformedResponse for a truncated answer, got {err:?}"
+            );
+        }
+
+        /// Boundary: a response with no `stop_reason` at all is not a refusal;
+        /// its JSON text is returned as before.
+        #[tokio::test]
+        async fn missing_stop_reason_with_json_text_is_ok() {
+            let mut body = messages_response(
+                "end_turn",
+                serde_json::json!([{"type": "text", "text": "{\"a\": 1}"}]),
+            );
+            body.as_object_mut().unwrap().remove("stop_reason");
+            let got = complete_against(body).await.unwrap();
+            assert_eq!(got, serde_json::json!({"a": 1}));
+        }
+
         fn assert_refusal(err: &LlmError) {
             match err {
                 LlmError::Refusal { message } => assert!(
