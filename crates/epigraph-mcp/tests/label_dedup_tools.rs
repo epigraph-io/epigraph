@@ -814,7 +814,9 @@ async fn store_profile_claim(server: &EpiGraphMcpFull, pool: &PgPool, bytes: &[u
                 source_url: None,
                 reasoning: None,
                 labels: s(&["label-dedup-profile"]),
-                novelty_threshold: None,
+                // As the docs advise: never answered with a near-identical
+                // existing claim in place of these bytes.
+                novelty_threshold: Some(0.0),
                 visibility: Some("public".to_string()),
                 group_id: None,
                 dataset: None,
@@ -952,6 +954,33 @@ async fn http_reads_a_profile_stored_as_a_claim_pinned_by_its_hash(pool: PgPool)
     .await
     .expect_err("a malformed claim id");
     assert_eq!(code(&err), "INVALID_ARGUMENT", "{err:?}");
+
+    // The caller's OWN group-private claim with the same bytes loads: it is
+    // read with the caller's viewer, not a public-only one and not the
+    // server's own identity (neither can see the caller's personal group).
+    let own_private = seed(
+        &pool,
+        caller,
+        caller_group,
+        "group",
+        std::str::from_utf8(&bytes).expect("utf8"),
+        &["label-dedup-profile"],
+        "2026-10-02T00:00:00Z",
+    )
+    .await;
+    let own = plan_ok(
+        &server,
+        &viewer,
+        plan_params_claim(&own_private.to_string(), &hash, DEDUP),
+        Some(&auth),
+    )
+    .await;
+    assert_eq!(own["profile_hash"], hash, "{own}");
+    assert_eq!(
+        own["profile_source"],
+        json!({"kind": "claim", "claim_id": own_private.to_string()}),
+        "the caller's own private profile claim, read as the caller: {own}"
+    );
 
     // Missing, and another group's private claim with the very same bytes:
     // one answer, indistinguishable but for the id.
