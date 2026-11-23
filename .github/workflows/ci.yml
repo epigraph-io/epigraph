@@ -829,10 +829,13 @@ jobs:
   # so it cannot outlive the step into tests/theme's table wipes (backlog
   # 03fd7e00).
   #
-  # The database arms connect as the service container's superuser, so RLS is
-  # bypassed: they verify the scripts' logic against the migrated schema, not
-  # role or tenancy scoping (a script run as a non-superuser role seeing only
-  # part of the rows is outside what they can catch).
+  # FIXTURES connect as the service container's superuser. The SCRIPTS under
+  # test connect as a non-superuser maintenance login, the role they use in
+  # production (EPIGRAPH_PYTEST_MAINTENANCE_DSN below, tests/db_roles.py;
+  # backlog 9d02a5e0), so a missing grant or a forced policy without a bypass
+  # arm fails here, and tests/theme/test_script_session_role.py pins that the
+  # login is not privileged and that row security on claims is forced. The API
+  # server itself still connects as the superuser.
   #
   # Advisory at first (continue-on-error, the `audit` precedent): promote it to
   # a hard gate once it has been stable on main.
@@ -864,6 +867,14 @@ jobs:
       # Migration 216: see the `test` job. The Python fixtures write through the
       # same superuser, so the migrate step grants it epigraph_seed.
       EPIGRAPH_MIGRATE_GRANT_SEED_TO_SELF: "1"
+      # The SCRIPTS under test do not run as that superuser (backlog 9d02a5e0):
+      # in production they connect on MAINTENANCE_DATABASE_URL, a non-superuser,
+      # NOBYPASSRLS login in epigraph_maintenance, so a missing grant or a forced
+      # policy without a bypass arm must fail here too. The migrate step creates
+      # this login (tests/ci/provision_test_roles.py); tests/db_roles.py hands it
+      # to the scripts and, with EPIGRAPH_PYTEST_REQUIRE_DB=1, fails an arm that
+      # would fall back to the superuser. Fixtures keep the superuser.
+      EPIGRAPH_PYTEST_MAINTENANCE_DSN: postgres://epigraph_test_maintenance:epigraph_test_maintenance@localhost:5432/epigraph_py_test
       SQLX_OFFLINE: "true"
       CARGO_BUILD_JOBS: "2"
     steps:
@@ -901,6 +912,7 @@ jobs:
           export DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
           export MIGRATION_DATABASE_URL="$DATABASE_URL"
           ./target/debug/epigraph-migrate
+          TEST_ROLES_DATABASE_URL="$DATABASE_URL" python3 tests/ci/provision_test_roles.py
       - name: Python tests (scripts/tests, tests/dedup)
         run: |
           export DEDUP_TEST_DATABASE_URL="${DATABASE_URL%/*}/epigraph_py_test"
