@@ -33,6 +33,36 @@
 //! commits after both, so the act and the refold commit together or not at
 //! all.
 //!
+//! # `truth_value`
+//!
+//! Several writers persist `claims.truth_value` as a copy of the fold they
+//! just cached (`submit_claim`, `update_with_evidence`), and a later recompute
+//! of the cache leaves that copy as it was. So `truth_value` can carry the
+//! same inadmissible BBA as the old cache, and readers that order or filter
+//! on it (recall's fallback among them) would serve its influence to the new
+//! audience (backlog 0d9dfd24). Whenever the refold writes the cache, the act
+//! therefore sets `truth_value` to the refolded BetP in the same transaction
+//! (`ClaimRepository::mirror_refolded_cache_into_truth_conn`, which states
+//! the claims it leaves alone). A copy is not told apart from an authored
+//! value: an authored confidence (`memorize`) is replaced by the admissible
+//! fold, which still contains the author's own seed BBA. Workflow, step and
+//! procedural claims are written too: `report_workflow_outcome` persists the
+//! same fold copy, and an outcome track kept without a BBA (the REST outcome
+//! route) is derived from reports the new audience may not read. Only a
+//! value at the deprecation marker (0.05) is kept, current or not: it is a
+//! retirement or a step's soft delete, not a fold, and carries no input.
+//!
+//! # Scoped beliefs
+//!
+//! Migration 215 deletes a moved claim's `ds_combined_beliefs` and
+//! `ds_bayesian_divergence` rows as folded for the old audience. The act then
+//! writes the claim's `ds_combined_beliefs` rows afresh, at the keys it had
+//! before the act and for the new audience
+//! ([`crate::scoped_belief::refresh_scoped_beliefs`]: `global` and
+//! `perspective` scopes, each best-effort under its own savepoint as the REST
+//! route writes them), so a scoped read right after the act finds a value
+//! (backlog 4d8df0cf). A key with nothing admissible left gets no row.
+//!
 //! # Fail closed when the session cannot write the moved claim
 //!
 //! The refold writes `claims` on the caller's stamped session, under row
@@ -57,15 +87,32 @@
 //!   (`MassFunctionRepository::cache_owner_frame_keeping_recorded`). The
 //!   claim's next ordinary recompute hands the cache to that other frame
 //!   (the admissible-first owner rule, backlog 8d720490 (1)).
-//! * `claims.truth_value`, which some writers set from a fold, is not
-//!   recomputed.
+//! * `claims.truth_value` follows the refold only where the cache was
+//!   written. A claim the refold leaves unchanged (the first item: a
+//!   template-only claim, a non-procedural compound) keeps its `truth_value`,
+//!   which can still carry an input the new audience cannot read (a value a
+//!   propagation wrote); there is no admissible fold to replace it with here.
+//!   A claim at the deprecation marker keeps it (see "`truth_value`").
 //! * Claims moved by 206 before this ran keep the value folded then.
+//! * A `community` scoped row is not written afresh: its fold reads the
+//!   community's members and mass override on the raw pool. It stays absent
+//!   until the next computation that stores it.
+//! * `ds_bayesian_divergence` rows are not written afresh. Their posterior is
+//!   the claim's Beta track (`claims.beta_alpha` / `beta_beta`), which moves
+//!   with the claim unchanged and was accumulated from every BBA the old
+//!   audience could read. That track is itself an open leak this act does not
+//!   close: the claim's next live evidence write returns its posterior to the
+//!   writer and records a divergence row from it, both served to the new
+//!   audience. Recomputing the row here would only serve it sooner.
+
+use std::collections::HashMap;
 
 use epigraph_db::errors::RefusalKind;
-use epigraph_db::{ClaimRepository, DbError, VisibilityActOutcome};
+use epigraph_db::{ClaimRepository, DbError, ScopedBeliefRepository, VisibilityActOutcome};
 use uuid::Uuid;
 
 use crate::edge_factor;
+use crate::scoped_belief::{self, ScopeKey};
 
 /// Why [`publicize_claims`] or [`share_claims_with_team`] did not complete.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +141,7 @@ pub async fn publicize_claims(
     claim_ids: &[Uuid],
     reason: &str,
 ) -> Result<Vec<VisibilityActOutcome>, VisibilityActError> {
+    let scoped = scoped_keys(&mut *conn, viewer, claim_ids).await?;
     let outcomes = ClaimRepository::publicize_conn(&mut *conn, claim_ids, reason).await?;
     refold_moved(
         &mut *conn,
@@ -101,6 +149,7 @@ pub async fn publicize_claims(
         "publicize_claims",
         &outcomes,
         "publicized",
+        &scoped,
     )
     .await?;
     Ok(outcomes)
@@ -118,6 +167,7 @@ pub async fn share_claims_with_team(
     group_id: Uuid,
     reason: &str,
 ) -> Result<Vec<VisibilityActOutcome>, VisibilityActError> {
+    let scoped = scoped_keys(&mut *conn, viewer, claim_ids).await?;
     let outcomes =
         ClaimRepository::share_with_team_conn(&mut *conn, claim_ids, group_id, reason).await?;
     refold_moved(
@@ -126,19 +176,48 @@ pub async fn share_claims_with_team(
         "share_claims_with_team",
         &outcomes,
         "shared",
+        &scoped,
     )
     .await?;
     Ok(outcomes)
 }
 
+/// The `ds_combined_beliefs` keys of each of `claim_ids` the caller reads,
+/// before the act deletes them (migration 215), so that [`refold_moved`]
+/// writes the same keys afresh for the new audience.
+async fn scoped_keys(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    claim_ids: &[Uuid],
+) -> Result<HashMap<Uuid, Vec<ScopeKey>>, VisibilityActError> {
+    let mut keys: HashMap<Uuid, Vec<ScopeKey>> = HashMap::new();
+    for &claim_id in claim_ids {
+        if keys.contains_key(&claim_id) {
+            continue;
+        }
+        let mut rows: Vec<ScopeKey> =
+            ScopedBeliefRepository::list_for_claim(&mut *conn, viewer, claim_id)
+                .await?
+                .into_iter()
+                .map(|r| (r.frame_id, r.scope_type, r.scope_id))
+                .collect();
+        rows.sort();
+        rows.dedup();
+        keys.insert(claim_id, rows);
+    }
+    Ok(keys)
+}
+
 /// Refold the cached belief of every claim the act reported `moved_outcome`
-/// for, refusing first if the session cannot write one of them.
+/// for, refusing first if the session cannot write one of them, then write
+/// its scoped rows afresh at the keys it had before the act (`scoped`).
 async fn refold_moved(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
     act: &str,
     outcomes: &[VisibilityActOutcome],
     moved_outcome: &str,
+    scoped: &HashMap<Uuid, Vec<ScopeKey>>,
 ) -> Result<(), VisibilityActError> {
     let moved: Vec<Uuid> = outcomes
         .iter()
@@ -166,9 +245,25 @@ async fn refold_moved(
         .into());
     }
     for claim_id in moved {
-        edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
-            .await
-            .map_err(VisibilityActError::Cache)?;
+        let written =
+            edge_factor::recompute_widened_claim_cached_belief(&mut *conn, viewer, claim_id)
+                .await
+                .map_err(VisibilityActError::Cache)?;
+        // `truth_value` may be a copy of the cache as folded for the OLD
+        // audience (see the module doc, "truth_value"): replace it with the
+        // refolded value, which is admissible by construction.
+        if written {
+            ClaimRepository::mirror_refolded_cache_into_truth_conn(&mut *conn, viewer, claim_id)
+                .await?;
+        }
+        // The scoped rows the definer deleted as stale, folded for the new
+        // audience (see the module doc, "Scoped beliefs").
+        if let Some(keys) = scoped.get(&claim_id).filter(|k| !k.is_empty()) {
+            let report = scoped_belief::refresh_scoped_beliefs(&mut *conn, viewer, claim_id, keys)
+                .await
+                .map_err(VisibilityActError::Cache)?;
+            tracing::debug!(%claim_id, ?report, "{act}: scoped beliefs recomputed");
+        }
     }
     Ok(())
 }

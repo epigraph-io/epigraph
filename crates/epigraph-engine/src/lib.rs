@@ -62,6 +62,7 @@ pub mod reputation;
 pub mod rerank;
 pub mod retention;
 pub mod retraction_cascade;
+pub mod scoped_belief;
 pub mod service;
 pub mod sheaf;
 pub mod silence_alarm;

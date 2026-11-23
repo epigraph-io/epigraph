@@ -20,6 +20,10 @@
 //!   claim that never had that BBA. Its stored scoped folds
 //!   (`ds_combined_beliefs`, `ds_bayesian_divergence`) are deleted as stale,
 //!   and another claim's are kept.
+//! * backlog 4d8df0cf: the moved claim's `ds_combined_beliefs` rows are then
+//!   written afresh at the keys it had, for the new audience (`global` and
+//!   `perspective` scopes); a scope with nothing admissible gets no row, and
+//!   the divergence row stays deleted.
 //! * backlog 31285392, the cache-owner frame: a claim whose `binary_truth`
 //!   (the frame that owns its cache) holds only inputs the new audience may
 //!   not read, while its `claim_validity` keeps an admissible one, is served
@@ -32,6 +36,13 @@
 //!   the cache from `claim_validity`.
 //! * the refold fails closed: an operated agent whose session does not itself
 //!   write the target team is refused, and nothing moves.
+//! * backlog 0d9dfd24: `claims.truth_value`, which `update_with_evidence`
+//!   persisted as a copy of a fold that took in a BBA on evidence that stays
+//!   behind (pinned), is replaced by the refolded value: the new audience is
+//!   served the truth value of a control claim that never had that BBA. The
+//!   same holds for a flat workflow claim whose copy `report_workflow_outcome`
+//!   wrote, and for a vacated cache (`truth_value` 0.5). A current claim at
+//!   the deprecation marker (a step's soft delete) keeps 0.05.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -47,9 +58,13 @@ use epigraph_engine::edge_factor::{
     resolve_claim_validity_frame, EdgeFactorOutcome,
 };
 use epigraph_mcp::server::EpiGraphMcpFull;
-use epigraph_mcp::tools::claims::submit_claim;
+use epigraph_mcp::tools::claims::{submit_claim, update_with_evidence};
 use epigraph_mcp::tools::visibility::{publicize_claims, share_claims_with_team};
-use epigraph_mcp::types::{PublicizeClaimsParams, ShareClaimsWithTeamParams, SubmitClaimParams};
+use epigraph_mcp::tools::workflows::report_workflow_outcome;
+use epigraph_mcp::types::{
+    PublicizeClaimsParams, ReportWorkflowOutcomeParams, ShareClaimsWithTeamParams, StepExecution,
+    SubmitClaimParams, UpdateWithEvidenceParams,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -630,6 +645,31 @@ async fn scoped_rows(pool: &PgPool, claim: Uuid) {
     .expect("seed ds_bayesian_divergence");
 }
 
+/// The `(pignistic_prob, belief, plausibility)` of `claim`'s scoped row at
+/// `(scope_type, scope_id)`, as `agent` is served it on its stamped app-role
+/// connection; `None` when it reads no row.
+async fn served_scoped(
+    pool: &PgPool,
+    s: &AppRole,
+    agent: Uuid,
+    claim: Uuid,
+    scope_type: &str,
+    scope_id: Option<Uuid>,
+) -> Option<Cache> {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as(
+        "SELECT pignistic_prob, belief, plausibility FROM ds_combined_beliefs \
+          WHERE claim_id = $1 AND scope_type = $2 AND scope_id IS NOT DISTINCT FROM $3",
+    )
+    .bind(claim)
+    .bind(scope_type)
+    .bind(scope_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .unwrap_or_else(|e| panic!("{agent} reads the claim's scoped row: {e}"))
+}
+
 async fn scoped_count(pool: &PgPool, claim: Uuid) -> (i64, i64) {
     sqlx::query_as(
         "SELECT (SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1), \
@@ -677,7 +717,17 @@ async fn publicize_refolds_the_belief_without_the_bba_on_evidence_left_behind(po
         "a stranger is served the fold of what it may read ({served:?}), not the team's \
          fold ({stale:?}); control {expected:?}"
     );
-    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
+    // 4d8df0cf: the global row is written afresh for the new audience, and
+    // the divergence row stays deleted (its Beta track moved with the claim).
+    assert_eq!(scoped_count(&pool, c).await, (1, 0), "scoped folds afresh");
+    let row = served_scoped(&pool, &s, carol, c, "global", None)
+        .await
+        .expect("a stranger reads the moved claim's global row");
+    assert!(
+        same(&row, &expected),
+        "the global row is the fold of what the stranger may read ({row:?}), not the stale \
+         row; control {expected:?}"
+    );
     assert_eq!(
         scoped_count(&pool, control).await,
         (1, 1),
@@ -727,7 +777,17 @@ async fn share_refolds_the_belief_without_the_bba_on_evidence_left_at_home(pool:
         "the teammate is served the fold of what the team may read ({served:?}), not the \
          home fold ({stale:?}); control {expected:?}"
     );
-    assert_eq!(scoped_count(&pool, c).await, (0, 0), "stale scoped folds");
+    // 4d8df0cf: the global row is written afresh for the team; the
+    // divergence row stays deleted.
+    assert_eq!(scoped_count(&pool, c).await, (1, 0), "scoped folds afresh");
+    let row = served_scoped(&pool, &s, bob, c, "global", None)
+        .await
+        .expect("the teammate reads the moved claim's global row");
+    assert!(
+        same(&row, &expected),
+        "the global row is the fold of what the team may read ({row:?}), not the stale row; \
+         control {expected:?}"
+    );
 }
 
 /// The refold fails closed. An agent its human operates writes a private
@@ -851,6 +911,13 @@ async fn publicize_vacates_a_cache_whose_owner_frame_cites_only_evidence_left_be
         cache_frame(&pool, c).await == Some(binary) && stale.0.is_some_and(|p| p > 0.6),
         "PREMISE: binary_truth owns the team's fold of the pinned evidence ({stale:?})"
     );
+    // `truth_value` as the mirroring writers leave it: a copy of that fold.
+    copy_cache_into_truth(&pool, c).await;
+    let stale_truth = truth(&pool, c).await.0;
+    assert!(
+        (stale_truth - 0.5).abs() > 0.1,
+        "PREMISE: the copy carries the pinned evidence ({stale_truth})"
+    );
 
     publicize(&pool, &s, eve, &[c]).await.expect("publicized");
 
@@ -867,6 +934,12 @@ async fn publicize_vacates_a_cache_whose_owner_frame_cites_only_evidence_left_be
          input it may read; it was served {served:?}, the team's fold was {stale:?}"
     );
     assert_eq!(cache_frame(&pool, c).await, Some(binary), "owner unchanged");
+    let (served_tv, _) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served_tv - 0.5).abs() < 1e-9,
+        "the vacated cache's value (0.5) must replace the team's copy {stale_truth} in \
+         truth_value; a stranger was served {served_tv}"
+    );
 }
 
 /// Share: the private claim's `binary_truth` holds only an edge-factor BBA
@@ -932,5 +1005,403 @@ async fn share_vacates_a_cache_whose_owner_frame_holds_only_a_home_edge_factor_b
         vacuous(&served),
         "the teammate must be served full ignorance once binary_truth (the cache owner) holds \
          only the home edge's BBA; it was served {served:?}, the home fold was {stale:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 0d9dfd24: truth_value follows the refold
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `agent` adds strongly refuting evidence to `claim` through MCP
+/// `update_with_evidence`, which stores a BBA citing a new evidence row and
+/// persists `truth_value` as a copy of the fold. The new evidence row's id.
+async fn refute_through_mcp(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> Uuid {
+    let seed = evidence_of(pool, claim).await;
+    update_with_evidence(
+        &s.server,
+        &viewer(pool, agent).await,
+        UpdateWithEvidenceParams {
+            claim_id: claim.to_string(),
+            canonical_name: None,
+            step_index: None,
+            evidence_data: format!("a refutation of {claim}"),
+            evidence_type: "empirical".to_string(),
+            supports: false,
+            strength: 0.95,
+            source_url: None,
+            labels: vec![],
+        },
+        Some(&token(agent)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("update_with_evidence on {claim}: {e:?}"));
+    sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1 AND id <> $2")
+        .bind(claim)
+        .bind(seed)
+        .fetch_one(pool)
+        .await
+        .expect("the refutation's evidence row")
+}
+
+/// `(truth_value, pignistic_prob)` as stored.
+async fn truth(pool: &PgPool, claim: Uuid) -> (f64, Option<f64>) {
+    sqlx::query_as("SELECT truth_value, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(pool)
+        .await
+        .expect("truth")
+}
+
+/// `(truth_value, pignistic_prob)` as `agent` is served them, on its stamped
+/// app-role connection.
+async fn served_truth(pool: &PgPool, s: &AppRole, agent: Uuid, claim: Uuid) -> (f64, Option<f64>) {
+    let v = viewer(pool, agent).await;
+    let mut conn = s.scoped.acquire_as(&v).await.expect("stamped connection");
+    sqlx::query_as("SELECT truth_value, pignistic_prob FROM claims WHERE id = $1")
+        .bind(claim)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or_else(|e| panic!("{agent} reads the claim's truth value: {e}"))
+}
+
+/// The premise both tests share: `update_with_evidence` stored `truth_value`
+/// as a copy of its fold, which took in the refuting BBA, so it differs from
+/// `expected`, the control's refolded value (which never had that BBA).
+fn assert_truth_premise(stale: (f64, Option<f64>), expected: f64) {
+    let (t0, p0) = stale;
+    assert!(
+        p0.is_some_and(|p| (t0 - p).abs() < 1e-12),
+        "PREMISE: update_with_evidence persisted truth_value as a copy of its fold \
+         ({t0} vs {p0:?})"
+    );
+    assert!(
+        (t0 - expected).abs() > 0.05,
+        "PREMISE: the copy carries the refuting BBA ({t0}), so it differs from the control's \
+         value ({expected})"
+    );
+}
+
+/// Share: the private claim's `truth_value` was persisted from a fold that
+/// took in a BBA citing evidence pinned at home. After the act the teammate is
+/// served the truth value of a control claim that never had that BBA, the
+/// refolded cache, and not the home copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn share_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_at_home(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (alice, home) = fixture::seed_agent_with_group(&pool, "truth-alice").await;
+    let (bob, _) = fixture::seed_agent_with_group(&pool, "truth-bob").await;
+    add_member(&pool, t, alice, "writer").await;
+    add_member(&pool, t, bob, "reader").await;
+    let c = write(
+        &pool,
+        &s,
+        alice,
+        "a private finding, refuted at home",
+        "private",
+        None,
+    )
+    .await;
+    let control = write(&pool, &s, alice, "the same finding, team", "team", Some(t)).await;
+    let hidden = refute_through_mcp(&pool, &s, alice, c).await;
+    pin(&pool, hidden, alice).await;
+    refold(&pool, &s, alice, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    share(&pool, &s, alice, &[c], t).await.expect("shared");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", hidden).await,
+        group(home),
+        "pinned"
+    );
+    let (served, betp) = served_truth(&pool, &s, bob, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "the teammate is served truth_value {served}, which must be the team-readable value \
+         {expected} (the control's), not the home copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Publicize: the team claim's `truth_value` was persisted from a fold that
+/// took in a BBA citing evidence pinned in the team. After the act a stranger
+/// is served the truth value of a public control claim that never had that
+/// BBA, not the team's copy.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_replaces_a_truth_value_copied_from_a_fold_of_evidence_left_behind(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "truth-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "truth-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(
+        &pool,
+        &s,
+        eve,
+        "a team finding, refuted in the team",
+        "team",
+        Some(t),
+    )
+    .await;
+    let control = write(&pool, &s, eve, "the same finding, public", "public", None).await;
+    let hidden = refute_through_mcp(&pool, &s, eve, c).await;
+    pin(&pool, hidden, eve).await;
+    refold(&pool, &s, eve, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "a stranger is served truth_value {served}, which must be the public value {expected} \
+         (the control's), not the team's copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Set `truth_value` to the claim's cached BetP, as the mirroring writers
+/// (`submit_claim`, `update_with_evidence`) persist it.
+async fn copy_cache_into_truth(pool: &PgPool, claim: Uuid) {
+    sqlx::query(
+        "UPDATE claims SET truth_value = LEAST(GREATEST(pignistic_prob, 0.0), 1.0) \
+          WHERE id = $1 AND pignistic_prob IS NOT NULL",
+    )
+    .bind(claim)
+    .execute(pool)
+    .await
+    .expect("copy the cache into truth_value");
+}
+
+/// Make `claim` a legacy flat workflow claim (the `workflow` label, which
+/// `report_workflow_outcome`'s flat path and `find_workflow` key on).
+async fn label_workflow(pool: &PgPool, claim: Uuid) {
+    sqlx::query("UPDATE claims SET labels = array_append(labels, 'workflow') WHERE id = $1")
+        .bind(claim)
+        .execute(pool)
+        .await
+        .expect("label the workflow claim");
+}
+
+/// Publicize a flat workflow claim: `report_workflow_outcome` persisted its
+/// `truth_value` as a copy of a fold that took in a failed run's outcome BBA,
+/// whose evidence stays in the team (pinned). After the act a stranger is
+/// served the value of a public control workflow that never had that report,
+/// not the team's copy, which `find_workflow` would filter and rank on.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_replaces_a_workflow_truth_value_copied_from_an_outcome_left_behind(
+    pool: PgPool,
+) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "wf-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "wf-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(
+        &pool,
+        &s,
+        eve,
+        "a team workflow: run the check",
+        "team",
+        Some(t),
+    )
+    .await;
+    let control = write(&pool, &s, eve, "the same workflow, public", "public", None).await;
+    label_workflow(&pool, c).await;
+    label_workflow(&pool, control).await;
+    let seed = evidence_of(&pool, c).await;
+    report_workflow_outcome(
+        &s.server,
+        &viewer(&pool, eve).await,
+        ReportWorkflowOutcomeParams {
+            workflow_id: c.to_string(),
+            success: false,
+            execution_log: vec![StepExecution {
+                step_index: 0,
+                planned: "run the check".to_string(),
+                actual: "the check failed".to_string(),
+                deviated: false,
+                deviation_reason: None,
+            }],
+            outcome_details: "a team-internal failure".to_string(),
+            quality: Some(0.95),
+            goal_text: None,
+            idempotency_key: None,
+        },
+        Some(&token(eve)),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("report_workflow_outcome on {c}: {e:?}"));
+    let outcome: Uuid =
+        sqlx::query_scalar("SELECT id FROM evidence WHERE claim_id = $1 AND id <> $2")
+            .bind(c)
+            .bind(seed)
+            .fetch_one(&pool)
+            .await
+            .expect("the outcome's evidence row");
+    pin(&pool, outcome, eve).await;
+    refold(&pool, &s, eve, control).await;
+    let expected = cache(&pool, control)
+        .await
+        .0
+        .expect("PREMISE: the control has a cache");
+    let stale = truth(&pool, c).await;
+    assert_truth_premise(stale, expected);
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(
+        tenancy(&pool, "evidence", outcome).await,
+        group(t),
+        "pinned"
+    );
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        (served - expected).abs() < 1e-9,
+        "a stranger is served the workflow's truth_value {served}, which must be the public \
+         value {expected} (the control's), not the team's copy {}",
+        stale.0
+    );
+    assert!(
+        betp.is_some_and(|p| (p - served).abs() < 1e-12),
+        "truth_value {served} is the refolded cache {betp:?}"
+    );
+}
+
+/// Publicize a claim at the deprecation marker that is still current, as
+/// `delete_step` leaves a soft-deleted step: its cache is refolded, but its
+/// `truth_value` stays 0.05, so the act does not revive it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_keeps_a_current_claim_at_the_deprecation_marker(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "marker-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "marker-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = write(&pool, &s, eve, "a soft-deleted team step", "team", Some(t)).await;
+    let hidden = refute_through_mcp(&pool, &s, eve, c).await;
+    pin(&pool, hidden, eve).await;
+    let stale = cache(&pool, c).await;
+    // `delete_step`'s write: the marker, and the claim stays current.
+    sqlx::query("UPDATE claims SET truth_value = 0.05 WHERE id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .expect("soft delete");
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    let (served, betp) = served_truth(&pool, &s, carol, c).await;
+    assert!(
+        betp.is_some_and(|p| stale.0.is_some_and(|q| (p - q).abs() > 0.05)),
+        "PREMISE: the act refolded the cache ({:?} -> {betp:?})",
+        stale.0
+    );
+    let current: bool = sqlx::query_scalar("SELECT is_current FROM claims WHERE id = $1")
+        .bind(c)
+        .fetch_one(&pool)
+        .await
+        .expect("is_current");
+    assert!(current, "PREMISE: the soft-deleted step is still current");
+    assert!(
+        (served - 0.05).abs() < 1e-9,
+        "the deprecation marker must survive the act; a stranger was served {served}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4d8df0cf: the moved claim's scoped rows, written afresh
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A stale scoped row of `claim` on `frame` (values no fold produces here).
+async fn stale_scoped_row(pool: &PgPool, claim: Uuid, frame: Uuid, scope: &str, id: Option<Uuid>) {
+    sqlx::query(
+        "INSERT INTO ds_combined_beliefs (frame_id, claim_id, scope_type, scope_id, belief, \
+                                          plausibility, pignistic_prob) \
+         VALUES ($1, $2, $3, $4, 0.1, 0.2, 0.15)",
+    )
+    .bind(frame)
+    .bind(claim)
+    .bind(scope)
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("seed a scoped row");
+}
+
+/// Publicize: the team claim's `binary_truth` holds a BBA on evidence that
+/// goes public with it (perspective `open`) and one on evidence pinned in the
+/// team (perspective `hidden`), and the claim has a global row and a row per
+/// perspective. Right after the act a stranger reads the global row and the
+/// `open` perspective row folded from the public BBA alone, and no `hidden`
+/// row: nothing of it is admissible.
+///
+/// The oracle is arithmetic: one BBA with mass 0.7 on the claim's hypothesis
+/// and 0.3 on the whole frame, read undiscounted, is Bel 0.7, Pl 1, BetP 0.85.
+#[sqlx::test(migrations = "../../migrations")]
+async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(pool: PgPool) {
+    let s = app_role(&pool).await;
+    let (binary, _) = frames(&pool).await;
+    let t = team(&pool, "team").await;
+    let (eve, _) = fixture::seed_agent_with_group(&pool, "scoped-admin").await;
+    let (carol, _) = fixture::seed_agent_with_group(&pool, "scoped-stranger").await;
+    add_member(&pool, t, eve, "admin").await;
+    let c = fixture::seed_group_claim(&pool, eve, t, "a team finding, two perspectives").await;
+    let open = fixture::seed_evidence(&pool, c, "observation").await;
+    let hidden = fixture::seed_evidence(&pool, c, "reference").await;
+    pin(&pool, hidden, eve).await;
+    bba_on(&pool, c, binary, eve, open, 0.7).await;
+    bba_on(&pool, c, binary, eve, hidden, 0.9).await;
+    refold(&pool, &s, eve, c).await;
+    stale_scoped_row(&pool, c, binary, "global", None).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(open)).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(hidden)).await;
+
+    publicize(&pool, &s, eve, &[c]).await.expect("publicized");
+
+    assert_eq!(tenancy(&pool, "evidence", hidden).await, group(t), "pinned");
+    let open_only: Cache = (Some(0.85), Some(0.7), Some(1.0));
+    let global = served_scoped(&pool, &s, carol, c, "global", None).await;
+    assert!(
+        global.as_ref().is_some_and(|g| same(g, &open_only)),
+        "the stranger reads the global row folded from the public BBA alone {open_only:?}, \
+         not nothing and not the team's fold; read {global:?}"
+    );
+    let persp = served_scoped(&pool, &s, carol, c, "perspective", Some(open)).await;
+    assert!(
+        persp.as_ref().is_some_and(|p| same(p, &open_only)),
+        "the stranger reads the public perspective's row {open_only:?}; read {persp:?}"
+    );
+    let n_hidden: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1 AND scope_id = $2",
+    )
+    .bind(c)
+    .bind(hidden)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(
+        n_hidden, 0,
+        "the pinned perspective has nothing admissible: no row"
     );
 }
