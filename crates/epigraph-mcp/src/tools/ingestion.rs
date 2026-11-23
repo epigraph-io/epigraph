@@ -103,6 +103,19 @@ pub async fn structure_source(
     _server: &EpiGraphMcpFull,
     params: StructureSourceParams,
 ) -> Result<CallToolResult, McpError> {
+    success_json(&structure_source_extraction(params)?)
+}
+
+/// The answer `structure_source` gives, as a value: the ONE implementation the
+/// MCP tool and its HTTP twin (`POST /api/v1/ingest/structure-source`, in
+/// `epigraph-api`'s `routes::mcp_twins`) both run, so the two cannot drift.
+///
+/// # Errors
+/// `invalid_params` for an unknown `format`, or when the segmentation or the
+/// deterministic parse fails.
+pub fn structure_source_extraction(
+    params: StructureSourceParams,
+) -> Result<DocumentExtraction, McpError> {
     let doc = if let Some(seg) = params.segmentation {
         slice_segmentation(&params.text, &seg.into())
             .map_err(|e| invalid_params(format!("segmentation failed: {e}")))?
@@ -119,8 +132,7 @@ pub async fn structure_source(
         parse_structure(&params.text, fmt)
             .map_err(|e| invalid_params(format!("structuring failed: {e}")))?
     };
-    let extraction = structured_doc_to_extraction(doc, params.source);
-    success_json(&extraction)
+    Ok(structured_doc_to_extraction(doc, params.source))
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -649,21 +661,33 @@ pub async fn paper_already_ingested(
     pipeline_version: &str,
 ) -> Result<Option<Uuid>, McpError> {
     let mut read = server.read_as(viewer, "check_already_ingested").await?;
-    let papers = PaperRepository::visible_by_document_key(&mut read, viewer, doi)
+    let hit = paper_already_ingested_on(&mut read, viewer, doi, pipeline_version).await?;
+    read.commit().await.map_err(internal_error)?;
+    Ok(hit)
+}
+
+/// [`paper_already_ingested`] on `conn`, a read the caller already holds,
+/// stamped from `viewer`; the exact-stamp arm of
+/// [`check_already_ingested_on`] (and so of its HTTP twin) runs it too. The
+/// caller commits.
+async fn paper_already_ingested_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    doi: &str,
+    pipeline_version: &str,
+) -> Result<Option<Uuid>, McpError> {
+    let papers = PaperRepository::visible_by_document_key(&mut *conn, viewer, doi)
         .await
         .map_err(internal_error)?;
-    let mut hit = None;
     for p in papers {
-        if PaperRepository::has_processed_by_edge(&mut *read, viewer, p.id, pipeline_version)
+        if PaperRepository::has_processed_by_edge(&mut *conn, viewer, p.id, pipeline_version)
             .await
             .map_err(internal_error)?
         {
-            hit = Some(p.id);
-            break;
+            return Ok(Some(p.id));
         }
     }
-    read.commit().await.map_err(internal_error)?;
-    Ok(hit)
+    Ok(None)
 }
 
 /// Pre-flight idempotency check exposing the same `(doi, pipeline)` gate that
@@ -688,17 +712,46 @@ pub async fn check_already_ingested(
     viewer: &epigraph_db::visibility::Viewer,
     params: CheckAlreadyIngestedParams,
 ) -> Result<CallToolResult, McpError> {
-    // A placeholder is not an identity. Answering the gate for `doi: "unknown"`
-    // used to report on whatever shared bucket every DOI-less document had
-    // collapsed into (issue #356); fail loudly and point at the real key instead.
-    if is_placeholder_id(&params.doi) {
+    // Refused before a connection is taken, as it always was.
+    refuse_placeholder_document_key(&params.doi)?;
+    let mut read = server.read_as(viewer, "check_already_ingested").await?;
+    let answer = check_already_ingested_on(&mut read, viewer, params).await?;
+    read.commit().await.map_err(internal_error)?;
+    success_json(&answer)
+}
+
+/// A placeholder is not an identity. Answering the gate for `doi: "unknown"`
+/// used to report on whatever shared bucket every DOI-less document had
+/// collapsed into (issue #356); fail loudly and point at the real key instead.
+///
+/// # Errors
+/// `invalid_params` when `doi` is a placeholder.
+pub fn refuse_placeholder_document_key(doi: &str) -> Result<(), McpError> {
+    if is_placeholder_id(doi) {
         return Err(invalid_params(format!(
-            "{:?} is a placeholder, not a document identity. Documents with no DOI are keyed \
+            "{doi:?} is a placeholder, not a document identity. Documents with no DOI are keyed \
              on a synthesized `urn:epigraph:doc:*` key — pass the `document_key` the ingest \
-             call returned (set source.external_id to control it).",
-            params.doi
+             call returned (set source.external_id to control it)."
         )));
     }
+    Ok(())
+}
+
+/// The answer `check_already_ingested` gives, read on `conn`, the caller's
+/// viewer-stamped read: the ONE implementation the MCP tool and its HTTP twin
+/// (`GET /api/v1/ingest/already-ingested`, in `epigraph-api`'s
+/// `routes::mcp_twins`) both run, so the two cannot drift. The caller commits.
+///
+/// # Errors
+/// `invalid_params` for a placeholder key ([`refuse_placeholder_document_key`],
+/// checked again here so no caller can skip it); a redacted internal error
+/// when a read fails.
+pub async fn check_already_ingested_on(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: CheckAlreadyIngestedParams,
+) -> Result<CheckAlreadyIngestedResponse, McpError> {
+    refuse_placeholder_document_key(&params.doi)?;
     // An explicit `pipeline_version` is matched EXACTLY — that is how a caller
     // gates one chunk (`...:ch3`). An omitted one used to default to the bare
     // base stamp, which a chunked ingest never writes (it stamps `base:ch{n}`
@@ -710,27 +763,26 @@ pub async fn check_already_ingested(
     // review: the triple-keyed writer kept only the first chunk's).
     //
     // The `papers` rows and their `processed_by` stamps are read as the CALLER
-    // (see `paper_already_ingested`): on the plain pool a group-private ingest
-    // read as "not ingested" to the group that ran it, and, before migration
-    // 246, any caller learned the paper id of a document only a team ingested.
+    // on `conn` (see `paper_already_ingested`): on the plain pool a
+    // group-private ingest read as "not ingested" to the group that ran it,
+    // and, before migration 246, any caller learned the paper id of a
+    // document only a team ingested. Since 246 a caller may read several rows
+    // of one document (its group's and the public one); the first that
+    // carries a matching stamp answers.
     let (pipeline, paper_id, matched) = match params.pipeline_version {
         Some(exact) => {
-            let paper_id = paper_already_ingested(server, viewer, &params.doi, &exact).await?;
+            let paper_id = paper_already_ingested_on(&mut *conn, viewer, &params.doi, &exact).await?;
             let matched = paper_id.map(|_| vec![exact.clone()]).unwrap_or_default();
             (exact, paper_id, matched)
         }
         None => {
-            // Every row of the document the caller may read (migration 246),
-            // on one stamped read; the first that carries a stamp of the
-            // family answers.
-            let mut read = server.read_as(viewer, "check_already_ingested").await?;
-            let papers = PaperRepository::visible_by_document_key(&mut read, viewer, &params.doi)
+            let papers = PaperRepository::visible_by_document_key(&mut *conn, viewer, &params.doi)
                 .await
                 .map_err(internal_error)?;
             let mut found = (None, Vec::new());
             for p in papers {
                 let matched = PaperRepository::processed_by_pipelines_in_family(
-                    &mut *read,
+                    &mut *conn,
                     viewer,
                     p.id,
                     PIPELINE_VERSION_BASE,
@@ -742,13 +794,12 @@ pub async fn check_already_ingested(
                     break;
                 }
             }
-            read.commit().await.map_err(internal_error)?;
             let (paper_id, matched) = found;
             (PIPELINE_VERSION_BASE.to_string(), paper_id, matched)
         }
     };
 
-    success_json(&CheckAlreadyIngestedResponse {
+    Ok(CheckAlreadyIngestedResponse {
         already_ingested: paper_id.is_some(),
         paper_id: paper_id.map(|id| id.to_string()),
         doi: params.doi,
