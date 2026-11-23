@@ -672,7 +672,20 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
     let b = fresh_claim(&pool, &viewer, author, frame, "pcycle b", TARGET_EVIDENCE).await;
     let _ab = wired_edge(&pool, &viewer, author, a, b, "supports").await;
     let _ba = wired_edge(&pool, &viewer, author, b, a, "supports").await;
+    // An edge from `a` with a live row but no longer in force: `a` is a
+    // source again in later passes (the cycle brings it back), and the
+    // edge is still ONE unselectable edge.
+    let x = fresh_claim(&pool, &viewer, author, frame, "pcycle x", TARGET_EVIDENCE).await;
+    let gone = wired_edge(&pool, &viewer, author, a, x, "supports").await;
     settle(&pool, &viewer, &[a, b]).await;
+    sqlx::query(
+        "UPDATE edges SET valid_from = now() - interval '2 hours', \
+                          valid_to = now() - interval '1 hour' WHERE id = $1",
+    )
+    .bind(gone)
+    .execute(&pool)
+    .await
+    .unwrap();
     let wave = vec![move_claim(&pool, &viewer, a, EVIDENCE_B).await];
     let o = TargetedRunOptions {
         max_passes: 200,
@@ -717,6 +730,17 @@ async fn predict_converges_on_a_cycle_and_equals_the_apply(pool: PgPool) {
         vec![2],
         "the two-claim cycle is one component"
     );
+    let per_pass: usize = predicted.passes.iter().map(|p| p.not_selectable).sum();
+    assert!(
+        per_pass > 1,
+        "PREMISE: `a` is a source in more than one pass: {:?}",
+        predicted.passes
+    );
+    assert_eq!(
+        predicted.totals.not_selectable, 1,
+        "one distinct unselectable edge, not a per-pass sum"
+    );
+    assert_eq!(applied.not_selectable, 1, "{applied:?}");
     assert_eq!(
         predicted.would_rewrite(),
         records.iter().map(|x| x.edge_id).collect::<Vec<_>>(),

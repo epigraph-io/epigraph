@@ -478,10 +478,11 @@ async fn run_targeted(
         );
     }
     println!(
-        "targeted rewire: rewired={} converged={} unconverged_edges={}",
+        "targeted rewire: rewired={} converged={} unconverged_edges={} not_selectable={}",
         report.rewired(),
         report.converged,
-        report.unconverged_edges.len()
+        report.unconverged_edges.len(),
+        report.not_selectable
     );
     Ok(())
 }

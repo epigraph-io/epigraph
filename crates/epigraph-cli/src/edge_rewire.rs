@@ -48,8 +48,8 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::backfill_factors::{
-    cache_of_fold, count_unselectable_targeted_edges, decide_targeted, rewire_edge_targeted,
-    select_targeted_edges, selected_edge_row, HeldBucket, RewireCapture, RewireEdge, RewireOverlay,
+    cache_of_fold, decide_targeted, rewire_edge_targeted, select_targeted_edges, selected_edge_row,
+    unselectable_targeted_edges, HeldBucket, RewireCapture, RewireEdge, RewireOverlay,
     StoredEdgeRow, TargetedGuards, TargetedOutcome, TargetedVerdict,
 };
 use crate::belief_cache::{plan_restore, write_wave_record, CacheColumns, WaveRecord};
@@ -153,7 +153,9 @@ pub struct PassSummary {
     pub moved_targets: usize,
     /// Edges sourced at the pass's sources with a live edge-factor row that
     /// the selection skips (no longer in force, or an endpoint no longer
-    /// current).
+    /// current). A claim that is a source again in a later pass (a cycle, a
+    /// diamond) counts its edges again here; the run's distinct count is
+    /// [`TargetedRunReport::not_selectable`] / [`PredictTotals::not_selectable`].
     #[serde(default)]
     pub not_selectable: usize,
 }
@@ -173,6 +175,10 @@ pub struct TargetedRunReport {
     /// When not converged: the edges the next pass would have taken, left
     /// alone (`cycle_unconverged` / `chain_boundary_held` at the pass cap).
     pub unconverged_edges: Vec<Uuid>,
+    /// Distinct edges over all passes that [`PassSummary::not_selectable`]
+    /// counted.
+    #[serde(default)]
+    pub not_selectable: usize,
 }
 
 impl TargetedRunReport {
@@ -307,6 +313,7 @@ pub async fn run_targeted_rewire(
     let mut sources: BTreeSet<Uuid> = seed.moved.clone();
     let mut report = TargetedRunReport::default();
     let accepted: Option<Vec<Uuid>> = opts.edges.as_ref().map(|e| e.iter().copied().collect());
+    let mut unselectable: BTreeSet<Uuid> = BTreeSet::new();
 
     for pass in 1..=opts.max_passes.max(1) {
         if sources.is_empty() {
@@ -314,19 +321,20 @@ pub async fn run_targeted_rewire(
             break;
         }
         let src: Vec<Uuid> = sources.iter().copied().collect();
-        let (edges, not_selectable) = {
+        let (edges, skipped) = {
             let mut conn = pool.acquire().await?;
             (
                 select_targeted_edges(&mut conn, &src, None).await?,
-                count_unselectable_targeted_edges(&mut conn, &src).await?,
+                unselectable_targeted_edges(&mut conn, &src).await?,
             )
         };
         let mut summary = PassSummary {
             pass,
             selected: edges.len(),
-            not_selectable,
+            not_selectable: skipped.len(),
             ..PassSummary::default()
         };
+        unselectable.extend(skipped);
         let mut next: BTreeSet<Uuid> = BTreeSet::new();
         let wave = format!("{}-pass-{pass}", opts.wave_prefix);
         for edge in &edges {
@@ -401,6 +409,7 @@ pub async fn run_targeted_rewire(
         report.passes.push(summary);
         sources = next;
     }
+    report.not_selectable = unselectable.len();
     if sources.is_empty() {
         report.converged = true;
     } else {
@@ -683,7 +692,8 @@ pub struct PredictTotals {
     pub d_edge_over_0_20: usize,
     /// Crossings by name, summed over targets.
     pub crossings: BTreeMap<String, usize>,
-    /// Summed over passes: [`PassSummary::not_selectable`].
+    /// Distinct edges over all passes that [`PassSummary::not_selectable`]
+    /// counted (the design's per-edge count, not a per-pass sum).
     #[serde(default)]
     pub not_selectable: usize,
     /// The [`TOP_MOVERS`] targets with the largest |d_edge|, largest first
@@ -999,6 +1009,7 @@ pub async fn predict_targeted_rewire(
     let mut edges_out: Vec<PredictedEdge> = Vec::new();
     let mut targets: BTreeMap<Uuid, PredictedTarget> = BTreeMap::new();
     let mut converged = false;
+    let mut unselectable: BTreeSet<Uuid> = BTreeSet::new();
 
     for pass in 1..=opts.max_passes.max(1) {
         if sources.is_empty() {
@@ -1007,12 +1018,14 @@ pub async fn predict_targeted_rewire(
         }
         let src: Vec<Uuid> = sources.iter().copied().collect();
         let edges: Vec<RewireEdge> = select_targeted_edges(&mut tx, &src, None).await?;
+        let skipped = unselectable_targeted_edges(&mut tx, &src).await?;
         let mut summary = PassSummary {
             pass,
             selected: edges.len(),
-            not_selectable: count_unselectable_targeted_edges(&mut tx, &src).await?,
+            not_selectable: skipped.len(),
             ..PassSummary::default()
         };
+        unselectable.extend(skipped);
         let mut next: BTreeSet<Uuid> = BTreeSet::new();
         for edge in &edges {
             let mut out = PredictedEdge {
@@ -1186,6 +1199,7 @@ pub async fn predict_targeted_rewire(
 
     let mut totals = PredictTotals {
         cycle_unconverged: unconverged_edges.len(),
+        not_selectable: unselectable.len(),
         ..PredictTotals::default()
     };
     let reached: Vec<(Uuid, Uuid)> = edges_out
@@ -1194,7 +1208,6 @@ pub async fn predict_targeted_rewire(
         .collect();
     totals.scc_sizes = cycle_sizes(&reached);
     for p in &passes {
-        totals.not_selectable += p.not_selectable;
         totals.would_rewrite += p.rewired;
         totals.unchanged += p.unchanged;
         totals.chain_boundary_held += p.chain_boundary_held;

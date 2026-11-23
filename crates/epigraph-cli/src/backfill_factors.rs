@@ -869,10 +869,10 @@ ORDER BY e.id, mf.created_at, mf.id
 /// The edges sourced at `$1` that hold a live `edge_factor` row on their
 /// target but that [`TARGETED_REWIRE_EDGE_QUERY`] does not select, because
 /// the edge is no longer in force or an endpoint is no longer current
-/// (design report field `not_selectable`): counted, so a pass's reach is
-/// not understated by what it silently skipped.
+/// (design report field `not_selectable`): reported, so a pass's reach is
+/// not understated by what it silently skipped. One row per edge, by id.
 pub const TARGETED_UNSELECTABLE_EDGE_QUERY: &str = r#"
-SELECT count(DISTINCT e.id)
+SELECT DISTINCT e.id
 FROM mass_functions mf
 JOIN edges e ON e.id = mf.perspective_id
 JOIN claims tgt ON tgt.id = e.target_id
@@ -884,21 +884,21 @@ WHERE mf.combination_method = 'edge_factor'
   AND e.source_id = ANY($1)
   AND NOT (tgt.is_current AND src.is_current
            AND (e.valid_to IS NULL OR e.valid_to > now()))
+ORDER BY e.id
 "#;
 
-/// Run [`TARGETED_UNSELECTABLE_EDGE_QUERY`].
+/// Run [`TARGETED_UNSELECTABLE_EDGE_QUERY`]: the edge ids, ordered.
 ///
 /// # Errors
 /// The query's error.
-pub async fn count_unselectable_targeted_edges(
+pub async fn unselectable_targeted_edges(
     conn: &mut sqlx::PgConnection,
     sources: &[Uuid],
-) -> Result<usize, sqlx::Error> {
-    let n: i64 = sqlx::query_scalar(TARGETED_UNSELECTABLE_EDGE_QUERY)
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(TARGETED_UNSELECTABLE_EDGE_QUERY)
         .bind(sources)
-        .fetch_one(&mut *conn)
-        .await?;
-    Ok(usize::try_from(n).unwrap_or(0))
+        .fetch_all(&mut *conn)
+        .await
 }
 
 /// Run [`TARGETED_REWIRE_EDGE_QUERY`].
