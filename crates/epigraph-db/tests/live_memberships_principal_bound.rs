@@ -398,6 +398,8 @@ async fn the_unbound_twin_is_maintenance_only_and_every_caller_is_listed(pool: P
     assert_eq!(
         callers("%epigraph\\_live\\_memberships(%").await,
         vec![
+            // 263: the caller's own groups, read for epigraph_principal_id().
+            "epigraph_my_groups()".to_string(),
             "epigraph_publicize_claims(uuid[],text)".to_string(),
             "epigraph_share_claims_with_team(uuid[],uuid,text)".to_string(),
         ],
