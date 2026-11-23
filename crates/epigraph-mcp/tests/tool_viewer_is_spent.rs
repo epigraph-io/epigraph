@@ -1795,6 +1795,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::search_hierarchical_by_text",
         ],
     ),
+    // stamped: `WorkflowRepository::list_hierarchical_lineage_heads` (on the caller's
+    // `read_as`; `workflows` row security returns exactly the rows the stamp reads).
+    (
+        "workflow_hierarchical.rs",
+        "list_workflows",
+        &["WorkflowRepository::list_hierarchical_lineage_heads"],
+    ),
     // resolves: `Viewer::resolve`. Raw pool: `Viewer::resolve` reads memberships on
     // `server.pool`.
     ("workflow_ingest.rs", "caller_viewer", &["Viewer::resolve"]),
