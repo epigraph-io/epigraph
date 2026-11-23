@@ -56,7 +56,8 @@
 -- fleet identities of its schedules). It is FORCE RLS and admits a read only
 -- to a privileged session or a maintenance-owned definer, so the application
 -- role reads no row and the card showed no attachment. For each agent of
--- `p_agents` this returns, per role, the attachment LIVE now (not detached,
+-- `p_agents` this returns, per role, the attachment LIVE now (see WHAT "LIVE"
+-- MEANS HERE below: not detached,
 -- `valid_from <= now() < valid_to`, `valid_to` NULL: open-ended), the
 -- earliest by (`valid_from`, `id`) when several are; one row per (agent,
 -- role), and ONLY when the session may see that agent's attachments:
@@ -68,10 +69,31 @@
 --       operator is no longer the agent's human and sees nothing, including
 --       attachments added after the retire, which 166 permits); or
 --   (c) a privileged session (`epigraph_bypass()`, which reads
---       `session_user`).
+--       `session_user`). An elevated request viewer on the application role
+--       is NOT one: it gets (a)/(b) like any principal.
 --
 -- Current attachments follow the binding in force; reads of an agent's
 -- PAST (the prompt-history gate) use `epigraph_human_of(agent, false)`.
+--
+-- WHAT (a) AND (b) TRUST. Before 269, 166's read policy admitted a
+-- `role_agents` read only to `epigraph_bypass()` (session_user role
+-- membership) or a maintenance-owned definer: no session setting could get
+-- an application session past it. Arms (a) and (b) instead trust the
+-- stamped principal (`epigraph_principal_id()`, the `epigraph.principal_id`
+-- setting), which the request path stamps from the authenticated caller but
+-- which any login holding the application DSN can set itself. Such a login
+-- can therefore read any agent's live attachment list (elevating roles
+-- included) by stamping that agent, or its live human, as the principal.
+-- That is the same trust class as 198's own-assignments arm and every other
+-- principal-scoped read on the application role; it is not a new class, but
+-- it does widen what a self-stamping application login reads.
+--
+-- WHAT "LIVE" MEANS HERE. Rows not detached and inside their window now
+-- (`valid_from <= now() < valid_to`). That is NOT the set 179's attached
+-- mode admits: a succession copy (`inherited_from` set) whose root or any
+-- hop is detached still lists here although 195's cutoff makes it admit
+-- nothing, and a future-dated row is hidden here although it opens with no
+-- operator act. The card is a roster, not an authority check.
 --
 -- NO OUTSIDER ARM, deliberately. 198 shows any reader the assignments of the
 -- non-elevating roles because 123 already writes a world-readable projection

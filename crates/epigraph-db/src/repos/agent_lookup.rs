@@ -55,13 +55,18 @@
 //!   status never moves it), plus the caller's own assignments of any role.
 //! * `role_attachments`: migration 269's `epigraph_disclosed_role_attachments`:
 //!   the roles an (LLM) agent is attached to (166 `role_agents`: the agents a
-//!   role runs), live now, shown only to the agent itself, its LIVE human
-//!   (`epigraph_human_of(agent, true)`, the binding `operator_human` shows;
-//!   a retired link's former operator sees none) and a privileged
-//!   (maintenance) session; an elevated request viewer on the application role is not one
-//!   (as for 198's elevating roles). No outsider arm: 166
-//!   writes no public projection of an attachment, so to everyone else an
-//!   attached agent's card reads exactly as an unattached one's.
+//!   role runs) that are not detached and inside their window now (a
+//!   roster, not the set 179 admits: a succession copy of a detached root
+//!   still lists, a future-dated row does not), shown only to the agent
+//!   itself, its LIVE human (`epigraph_human_of(agent, true)`, the binding
+//!   `operator_human` shows; a retired link's former operator sees none) and
+//!   a privileged (maintenance) session; an elevated request viewer on the
+//!   application role is not one (as for 198's elevating roles). The two
+//!   principal arms trust the stamped principal setting, which any login
+//!   holding the application DSN can set (migration 269's header). No
+//!   outsider arm: 166 writes no public projection of an attachment, so to
+//!   everyone else an attached agent's card reads exactly as an unattached
+//!   one's.
 //! * counts: computed under the caller's viewer with the canonical splice
 //!   markers, so a claim or paper edge the caller cannot read never moves a
 //!   number. Only in-force edges carrying the ingest-written marker count
@@ -484,9 +489,12 @@ pub struct AgentCard {
     /// `bound_to_visible_human`, `name_derived_key`, `orcid_derived_key`.
     pub kind_evidence: Vec<&'static str>,
     pub roles: Vec<CardRole>,
-    /// The roles this agent is attached to (166 `role_agents`), live now:
-    /// shown to the agent itself, its live human and a privileged
-    /// (maintenance) session; empty for everyone else (migration 269).
+    /// The roles this agent is attached to (166 `role_agents`): rows not
+    /// detached and inside their window now, which is not the set 179 lets
+    /// in (a succession copy of a detached root still lists; a future-dated
+    /// row does not). Shown to the agent itself, its live human and a
+    /// privileged (maintenance) session; empty for everyone else, an
+    /// elevated application-role viewer included (migration 269).
     pub role_attachments: Vec<CardRole>,
     pub orcid: Option<String>,
     pub ror_id: Option<String>,
