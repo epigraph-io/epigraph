@@ -527,8 +527,14 @@ impl FrameRepository {
     /// ignore. It lives here only because the SQL must (the profile type is
     /// the engine's, and the engine depends on this crate, not the reverse).
     ///
+    /// This function checks NOTHING about `overrides`: a direct caller can
+    /// store an object the read path will ignore. It is hidden from the docs
+    /// for that reason, and the `write_gate_lint` register row for
+    /// `write_property` names it.
+    ///
     /// # Errors
     /// As [`Self::set_property`], without the key refusal.
+    #[doc(hidden)]
     #[instrument(skip(pool, overrides))]
     pub async fn set_validated_belief_profile(
         pool: &PgPool,
