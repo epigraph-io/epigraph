@@ -137,6 +137,8 @@ WALKERS = {
     ),
     "crates/epigraph-api/tests/delegated_run_token_viewer.rs": ("crates/epigraph-mcp/src/*",),
     # `Viewer::public_only` is built only in routes/guest.rs: every crate's src.
+    # The API's error texts, and the engine error collections it serves.
+    "crates/epigraph-api/tests/error_text_ratchet.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/guest_public_reads.rs": ("crates/*/src/*",),
     "crates/epigraph-api/tests/no_redaction_sentinel.rs": ("crates/*/src/*",),
     # README.md and docs/intro/*.md. A link TARGET elsewhere can be anywhere
@@ -166,6 +168,8 @@ WALKERS = {
     "crates/epigraph-db/tests/owner_scoped_delete.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/personal_group_mint_ratchet.rs": ("crates/*/src/*", "migrations/*"),
     "crates/epigraph-db/tests/schema_contract.rs": (),
+    # Every vector writer in every crate's src.
+    "crates/epigraph-db/tests/sealed_vector_writer_ratchet.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/system_agent_single_resolver.rs": ("crates/*/src/*",),
     "crates/epigraph-db/tests/tenancy_migration_shape.rs": (),
     "crates/epigraph-db/tests/unstamped_http_edge_writes.rs": (),
