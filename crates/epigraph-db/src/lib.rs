@@ -252,7 +252,7 @@ pub use repos::graph_view::{
     SubgraphTraceRow,
 };
 pub use repos::mass_function::{
-    cached_combination_slot_holds_input, delete_edge_bbas, CachedBelief, EdgeBbaCascade,
+    cached_combination_slot_holds_input, delete_edge_bbas, BbaSlot, CachedBelief, EdgeBbaCascade,
     MassFunctionRow, CACHED_COMBINATION_UNFOLDED,
 };
 // `repos::ownership` is intentionally absent: 40969da5 retired the legacy

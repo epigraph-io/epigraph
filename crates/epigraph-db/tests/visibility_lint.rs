@@ -3962,7 +3962,8 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "mass_function.rs",
         "store_with_perspective",
         "INSERT INTO `mass_functions` (ON CONFLICT on `(claim_id, frame_id, source_agent_id, \
-         perspective_id)` DO UPDATE). Same write-side control as the entries above. This is the \
+         perspective_id, slot_kind, slot_id)` DO UPDATE, through `store_keyed`). Same write-side \
+         control as the entries above. This is the \
          table whose EMPTINESS was the original symptom: its last successful production write was \
          2026-09-22 and it stayed 0 through every e2e run, so every `supports` / `refutes` edge \
          created since the deployed DSN moved to `epigraph_app` moved NO belief mass. The \
@@ -3971,6 +3972,29 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          further down its own pipeline — the same BBA is re-stored rather than combined twice — \
          which is why this half was convertible ahead of the pool-bound DS recompute it feeds. \
          SCOPE: executor only; the SQL is unchanged.",
+    ),
+    (
+        "mass_function.rs",
+        "store_keyed",
+        "The one INSERT INTO `mass_functions` `store_with_perspective`, `store_in_slot` and \
+         `store_for_evidence` share (migration 267): the same upsert, keyed on a perspective or \
+         on a slot. Same write-side control as `store_with_perspective` above; no FROM for a \
+         viewer splice.",
+    ),
+    (
+        "mass_function.rs",
+        "store_in_slot",
+        "`store_with_perspective` for an edge, evidence or assessment BBA keyed on its slot \
+         (migration 267, backlog 1777638e): runs no SQL of its own, it delegates to \
+         `store_keyed`. Same write-side control; generic so the edge factor and the assess slot \
+         upsert ride their callers' stamped transactions.",
+    ),
+    (
+        "mass_function.rs",
+        "store_for_evidence",
+        "`store_in_slot` on the evidence row's slot when one is named, the agent's unscoped key \
+         otherwise (the DS evidence auto-wire, C-1). Runs no SQL of its own; same write-side \
+         control.",
     ),
     (
         "scoped_belief.rs",
@@ -4149,8 +4173,8 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "mass_function.rs",
-        "delete_for_perspective",
-        "WRITE: DELETE from `mass_functions` for one perspective, the retraction half of a \
+        "delete_for_edge",
+        "WRITE: DELETE from `mass_functions` for one edge's slot, the retraction half of a \
          re-combination. Delegates to `delete_edge_bbas` (cause `retraction_cascade`), so it is \
          authorised by migration 115's cascade definer on the caller's connection, not by a \
          viewer.",
@@ -4177,19 +4201,6 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "WRITE: `UPDATE claims SET classification`, followed by a mass_functions COUNT that \
          already carries the `{VISIBILITY:mass_functions}` marker. Same WITH CHECK argument as \
          `update_claim_belief`.",
-    ),
-    (
-        "perspective.rs",
-        "ensure_edge_perspective",
-        "WRITE: idempotent INSERT INTO `perspectives` for an edge-factor BBA's perspective. \
-         Authorised by the table's WITH CHECK on the caller's stamped connection; widened so it \
-         rides the DS wiring's transaction.",
-    ),
-    (
-        "perspective.rs",
-        "ensure_evidence_perspective",
-        "WRITE: idempotent INSERT INTO `perspectives` for an evidence BBA's perspective; same \
-         argument as `ensure_edge_perspective`.",
     ),
     (
         "workflow.rs",

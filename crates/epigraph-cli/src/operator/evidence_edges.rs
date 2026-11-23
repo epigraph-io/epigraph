@@ -62,7 +62,7 @@
 //! manifest names, and only while each still runs from the recorded evidence
 //! to the recorded claim with the recorded relationship, AND nobody has built
 //! on it since: an edge that was retracted, or that keys an edge-keyed BBA
-//! (`mass_functions.perspective_id`), is kept and counted, so a reversal never
+//! (`mass_functions.slot_id`, `slot_kind = 'edge'`), is kept and counted, so a reversal never
 //! drops a retraction record nor leaves a BBA keyed on a deleted edge. Every edge line is
 //! reversed, committed batch or not: a batch whose COMMIT landed before the
 //! process died has no `committed_batch` line, and a line whose batch rolled
@@ -864,7 +864,7 @@ pub struct ReverseReport {
     pub not_matched: u64,
     /// Recorded edges still between the recorded endpoints, but built on
     /// since the backfill: retracted (`valid_to` set), or the key of an
-    /// edge-keyed BBA (`mass_functions.perspective_id`). Left alone, so a
+    /// edge-keyed BBA (`mass_functions.slot_id`, `slot_kind = 'edge'`). Left alone, so a
     /// reversal never drops a retraction record nor dangles a BBA.
     pub kept_in_use: u64,
 }
@@ -881,7 +881,8 @@ const REVERSE_MATCH: &str = "\
 /// (retracted or not).
 const REVERSE_UNUSED: &str = "\
     e.valid_to IS NULL \
-    AND NOT EXISTS (SELECT 1 FROM public.mass_functions mf WHERE mf.perspective_id = e.id)";
+    AND NOT EXISTS (SELECT 1 FROM public.mass_functions mf \
+                     WHERE mf.slot_kind = 'edge' AND mf.slot_id = e.id)";
 
 /// Delete exactly the edges a run's manifest names (see the module doc).
 ///

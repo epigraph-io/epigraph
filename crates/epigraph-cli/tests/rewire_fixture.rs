@@ -189,7 +189,7 @@ pub async fn move_claim(pool: &PgPool, viewer: &Viewer, claim: Uuid, masses: &st
     let before = cache(pool, claim).await;
     sqlx::query(
         "UPDATE mass_functions SET masses = $2::jsonb \
-          WHERE claim_id = $1 AND perspective_id IS NULL",
+          WHERE claim_id = $1 AND perspective_id IS NULL AND slot_id IS NULL",
     )
     .bind(claim)
     .bind(masses)
@@ -224,7 +224,7 @@ pub async fn edge_rows(pool: &PgPool, edge: Uuid) -> Vec<RowText> {
     sqlx::query_as(
         "SELECT id, masses::text, source_strength, evidence_type, locality_tag, created_at, \
                 retracted_at IS NOT NULL \
-           FROM mass_functions WHERE perspective_id = $1 ORDER BY created_at, id",
+           FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1 ORDER BY created_at, id",
     )
     .bind(edge)
     .fetch_all(pool)

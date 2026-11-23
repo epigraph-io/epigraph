@@ -595,6 +595,8 @@ mod tests {
             frame_id: Uuid::nil(),
             source_agent_id: None,
             perspective_id: None,
+            slot_kind: None,
+            slot_id: None,
             masses,
             conflict_k: None,
             combination_method: method.map(str::to_string),

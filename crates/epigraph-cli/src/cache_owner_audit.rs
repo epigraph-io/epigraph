@@ -38,7 +38,7 @@
 //!    not `Neutral`, decided by the engine function per stored relationship)
 //!    with NO mass function keyed on the edge id ON ANY CLAIM (any row,
 //!    retracted included: the wire's own "ever wired" test,
-//!    `MassFunctionRepository::exists_for_perspective`, which has no claim
+//!    `MassFunctionRepository::exists_for_edge`, which has no claim
 //!    restriction). Each carries two
 //!    HTTP-origin markers, neither complete alone, so `http_created` is
 //!    either one:
@@ -86,8 +86,7 @@
 //! exactly the shape whose cache the old retract path left behind), keyset
 //! paged by id. Edges: the in-force epistemic claim-to-claim edges, keyset
 //! paged by id, tested against the set of edge ids that key ANY mass
-//! function, read once (`perspective_id` has no index, so a per-edge test
-//! would scan the table per edge). `limit` bounds each pass separately; the report says whether
+//! function, read once (rather than one probe per edge). `limit` bounds each pass separately; the report says whether
 //! each pass finished (`claims_complete`, `edges_complete`), so a trial run is
 //! never read as totals.
 
@@ -556,15 +555,15 @@ fn resolve_signers(named: &[Uuid], explicit: &[Uuid]) -> Result<Vec<Uuid>, Strin
 
 /// Every claim-to-claim edge id that keys at least one mass function, on any
 /// claim, retracted rows included: the wire's "ever wired" test
-/// (`MassFunctionRepository::exists_for_perspective`, which has no claim
-/// restriction) for every edge at once. One read: `perspective_id` has no
-/// index, so testing each edge would scan the table per edge.
+/// (`MassFunctionRepository::exists_for_edge`, which has no claim
+/// restriction) for every edge at once. One read, rather than one probe per
+/// edge.
 async fn edge_keyed_perspectives(
     conn: &mut sqlx::PgConnection,
 ) -> Result<std::collections::HashSet<Uuid>, String> {
     let ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT DISTINCT mf.perspective_id FROM mass_functions mf \
-           JOIN edges e ON e.id = mf.perspective_id \
+        "SELECT DISTINCT mf.slot_id FROM mass_functions mf \
+           JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
           WHERE e.source_type = 'claim' AND e.target_type = 'claim'",
     )
     .fetch_all(&mut *conn)
@@ -591,7 +590,7 @@ async fn edge_page(
         "SELECT e.id, e.source_id, e.target_id, e.relationship::text, e.signer_id, \
                 EXISTS (SELECT 1 FROM mass_functions mf \
                          WHERE mf.claim_id IN (e.source_id, e.target_id) \
-                           AND mf.perspective_id = e.id), \
+                           AND mf.slot_kind = 'edge' AND mf.slot_id = e.id), \
                 EXISTS (SELECT 1 FROM provenance_log p \
                          WHERE p.record_type = 'edge' AND p.record_id = e.id \
                            AND p.action = 'create'), \

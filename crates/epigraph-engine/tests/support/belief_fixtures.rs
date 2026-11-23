@@ -289,6 +289,8 @@ pub fn rows(case: &Case) -> Vec<MassFunctionRow> {
             frame_id: Uuid::from_u128(0xF4A3),
             source_agent_id: spec.source.map(|(seed, _)| agent(seed)),
             perspective_id: None,
+            slot_kind: None,
+            slot_id: None,
             masses: masses(spec.shape),
             conflict_k: None,
             combination_method: Some("fixture".to_string()),

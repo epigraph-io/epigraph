@@ -134,7 +134,7 @@ pub struct RewireSummary {
 /// - Keyed on the STORED row's `source_agent_id`, not on the source claim's
 ///   author as [`EDGE_QUERY`] is: the live
 ///   `link_epistemic` path and migration 114's writer-owned rows store other
-///   agents, and the upsert key is `(claim, frame, source_agent, perspective)`,
+///   agents, and the upsert key is `(claim, frame, source_agent, edge slot)`,
 ///   so re-wiring under a different agent would add a second BBA for the edge
 ///   that double-counts in combine, and the stored row would be replaced
 ///   rather than rewritten in place (losing its owner; see
@@ -173,7 +173,7 @@ SELECT DISTINCT ON (e.id)
        COALESCE(mf.source_agent_id, e.signer_id, src.agent_id) AS agent_id,
        e.source_id, e.target_id, e.relationship, mf.frame_id
 FROM mass_functions mf
-JOIN edges e ON e.id = mf.perspective_id
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
@@ -358,7 +358,7 @@ async fn delete_edge_rows(
     let (keep_frame, keep_agent) = keep.unzip();
     sqlx::query_as(
         "DELETE FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 \
             AND combination_method = 'edge_factor' AND retracted_at IS NULL \
             AND NOT ($3::uuid IS NOT NULL AND frame_id = $3 \
                      AND source_agent_id IS NOT DISTINCT FROM $4) \
@@ -516,7 +516,7 @@ async fn rewire_one(
     // DISTINCT ON), locked, with the tenancy a rewrite must keep.
     let selected: Option<(Uuid, Uuid, String, bool)> = sqlx::query_as(
         "SELECT id, owner_group_id, visibility::text, writer_owned FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
             AND retracted_at IS NULL \
           ORDER BY created_at, id LIMIT 1 FOR UPDATE",
     )
@@ -597,7 +597,7 @@ async fn rewire_one(
             sqlx::query(
                 "UPDATE mass_functions \
                     SET owner_group_id = $5, visibility = $6, writer_owned = $7 \
-                  WHERE perspective_id = $1 AND claim_id = $2 AND frame_id = $3 \
+                  WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND frame_id = $3 \
                     AND source_agent_id = $4 \
                     AND (owner_group_id, visibility::text, writer_owned) \
                         IS DISTINCT FROM ($5, $6, $7)",
@@ -897,7 +897,7 @@ SELECT DISTINCT ON (e.id)
        COALESCE(mf.source_agent_id, e.signer_id, src.agent_id) AS agent_id,
        e.source_id, e.target_id, e.relationship, mf.frame_id
 FROM mass_functions mf
-JOIN edges e ON e.id = mf.perspective_id
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
@@ -919,7 +919,7 @@ ORDER BY e.id, mf.created_at, mf.id
 pub const TARGETED_UNSELECTABLE_EDGE_QUERY: &str = r#"
 SELECT DISTINCT e.id
 FROM mass_functions mf
-JOIN edges e ON e.id = mf.perspective_id
+JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id
 JOIN claims tgt ON tgt.id = e.target_id
 JOIN claims src ON src.id = e.source_id
 WHERE mf.combination_method = 'edge_factor'
@@ -1028,14 +1028,14 @@ pub async fn edge_shape(
                 public.epigraph_claim_is_compound(e.source_id) \
                   OR public.epigraph_claim_is_compound(e.target_id), \
                 (SELECT count(*) FROM mass_functions m \
-                  WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                  WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                     AND m.combination_method = 'edge_factor' AND m.retracted_at IS NULL), \
                 (SELECT count(*) FROM mass_functions m \
-                  WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                  WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                     AND m.combination_method = 'edge_factor' AND m.retracted_at IS NULL \
                     AND m.frame_id = $2 AND m.source_agent_id = $3), \
                 EXISTS (SELECT 1 FROM mass_functions m \
-                         WHERE m.perspective_id = e.id AND m.claim_id = e.target_id \
+                         WHERE m.slot_kind = 'edge' AND m.slot_id = e.id AND m.claim_id = e.target_id \
                            AND m.retracted_at IS NOT NULL) \
            FROM edges e WHERE e.id = $1",
     )
@@ -1098,7 +1098,7 @@ pub async fn selected_edge_row(
 ) -> Result<Option<Uuid>, String> {
     sqlx::query_scalar(
         "SELECT id FROM mass_functions \
-          WHERE perspective_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2 AND combination_method = 'edge_factor' \
             AND retracted_at IS NULL \
           ORDER BY created_at, id LIMIT 1",
     )

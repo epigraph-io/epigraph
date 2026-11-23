@@ -216,7 +216,10 @@ pub fn decide(row: &UntypedBbaProvenance, calibration: &CalibrationConfig) -> De
 
     // Masses that already carry a weight: a typed row would be weighed twice,
     // and no #573 writer types these shapes.
-    let agentless_unscoped = row.source_agent_id.is_none() && row.perspective_id.is_none();
+    // A slot (migration 267) is what `perspective_id` held for an edge,
+    // evidence or assessment BBA, so it scopes the row as that did.
+    let agentless_unscoped =
+        row.source_agent_id.is_none() && row.perspective_id.is_none() && row.slot_id.is_none();
     // The assess input: agent-less, perspective-less `discount`, its masses
     // sized by `build_bba_directed` with the type weight. An anonymous REST
     // input has the same stored shape and cannot be told apart, so both stay.

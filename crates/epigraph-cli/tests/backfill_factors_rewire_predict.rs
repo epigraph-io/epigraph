@@ -46,12 +46,14 @@ async fn chain(pool: &PgPool, viewer: &Viewer) -> Chain {
     let ab = wired_edge(pool, viewer, author, a, b, "supports").await;
     let bc = wired_edge(pool, viewer, author, b, c, "contradicts").await;
     let held_edge = wired_edge(pool, viewer, author, a, m, "supports").await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(held_edge)
-        .bind(STALE_PRE_401)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(held_edge)
+    .bind(STALE_PRE_401)
+    .execute(pool)
+    .await
+    .unwrap();
     refold(pool, viewer, m).await;
     let wave = vec![move_claim(pool, viewer, a, EVIDENCE_B).await];
     Chain {
@@ -447,10 +449,10 @@ async fn targeted_predict_apply_and_restore_run_on_a_maintenance_login(pool: PgP
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag, \
                                      retracted_at, retracted_by, retract_reason) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
                  now(), $3, 'cal4 maint fixture')",
     )
     .bind(held_target)

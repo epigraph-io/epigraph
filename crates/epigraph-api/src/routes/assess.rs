@@ -373,7 +373,8 @@ pub async fn assess_claim(
     // combine as independent evidence. U027F's per-call perspective let one
     // caller stack: ten identical calls took BetP 0.61 -> 0.997.
     //
-    // The row is keyed (claim, frame, OWNER, the owner's slot perspective), so
+    // The row is keyed (claim, frame, OWNER, the owner's assessment slot:
+    // `BbaSlot::Assessment`, migration 267), so
     // the slot is the table's own `UNIQUE NULLS NOT DISTINCT` key: every agent
     // of one human upserts the same row, atomically, with no delete authority
     // needed over a sibling's row and no race between two siblings, and no
@@ -407,7 +408,6 @@ pub async fn assess_claim(
         None => None,
     };
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&mut *tx, slot, owner).await?;
 
     // The claim's hypothesis on this frame, read before the slot transaction:
     // whether this call contests the assessment it replaces is decided once,
@@ -470,7 +470,10 @@ pub async fn assess_claim(
     // below overwrites.
     let mut replaced_assessments: Vec<ReplacedAssessment> = rows_before
         .iter()
-        .filter(|row| row.source_agent_id == owner && row.perspective_id == Some(slot))
+        .filter(|row| {
+            row.source_agent_id == owner
+                && row.slot() == Some(epigraph_db::BbaSlot::Assessment(slot))
+        })
         .map(|row| replaced(row, false))
         .collect();
     // And the calling agent's OWN earlier assessment, when the agent now
@@ -491,7 +494,10 @@ pub async fn assess_claim(
         let own_slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent));
         for row in rows_before
             .iter()
-            .filter(|r| r.source_agent_id == Some(agent) && r.perspective_id == Some(own_slot))
+            .filter(|r| {
+                r.source_agent_id == Some(agent)
+                    && r.slot() == Some(epigraph_db::BbaSlot::Assessment(own_slot))
+            })
         {
             use sqlx::Acquire as _;
             let mut sp = tx.begin().await.map_err(|e| ApiError::DatabaseError {
@@ -538,12 +544,12 @@ pub async fn assess_claim(
         }
         None => false,
     };
-    let mf_id = epigraph_db::MassFunctionRepository::store_with_perspective(
+    let mf_id = epigraph_db::MassFunctionRepository::store_in_slot(
         &mut *tx,
         claim_id,
         frame_id,
         owner,
-        Some(slot),
+        epigraph_db::BbaSlot::Assessment(slot),
         &bba_json,
         None,
         Some("discount"),
@@ -723,9 +729,8 @@ pub async fn assess_claim(
     // input BBA's key and overwrote it, and a recompute must never re-combine a
     // combined row. The per-frame result is cached by the upsert below.
     // So no cached row can ever sit over an agent-less input (backlog
-    // b5cb3efb): the input is keyed by its owner's assessment slot
-    // perspective, and nothing is stored on the (claim, frame, NULL, NULL)
-    // slot.
+    // b5cb3efb): the input is keyed by its owner's assessment slot, and
+    // nothing is stored on the (claim, frame, NULL, NULL) key.
 
     // Store the global scoped belief cache (best-effort, under a SAVEPOINT,
     // as `submit_evidence` does).

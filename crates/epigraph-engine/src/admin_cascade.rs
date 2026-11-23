@@ -1435,7 +1435,7 @@ pub async fn apply_match_retire(
 /// The `edge_retract` cascade (migration 120), on the maintenance connection:
 /// remove every BBA keyed on the withdrawn edge
 /// ([`epigraph_db::EdgeRepository::remove_withdrawn_edge_bbas_conn`], keyed on
-/// `perspective_type = 'edge'`) with its audit row, atomically, then re-derive
+/// the edge's slot, `slot_kind = 'edge'`) with its audit row, atomically, then re-derive
 /// the beliefs of the claims those BBAs lived on AND the `sources` of every
 /// OPEN `edge_retract` deferral of the edge (not only the trigger's: two acts
 /// before one replay record two deferrals, and this run's applied row closes
@@ -1533,7 +1533,7 @@ pub struct WithdrawnEdgeSweepItem {
 
 /// The one-shot legacy sweep (`replay_deferred_cascades
 /// --sweep-withdrawn-edge-bbas`), on the maintenance connection: every edge
-/// whose edge-keyed BBAs outlived it (an edge-factor perspective with BBAs whose
+/// whose edge-keyed BBAs outlived it (an edge slot with BBAs whose
 /// edge is absent or out of force, retracted before migration 120 recorded
 /// deferrals) goes through [`apply_after_edge_retract`], audited as cause
 /// `edge_retract` naming `acting_agent` (the operator running it, D1) with

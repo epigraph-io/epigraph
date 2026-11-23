@@ -115,11 +115,11 @@
 //! residue ([`INSTANCE_WIDE_REGISTRIES`]).
 //!
 //! Every writer of `perspectives` declares `TenancyDecl::instance_wide()`
-//! (`('public', world)`) on purpose: `PerspectiveRepository::create`,
-//! `ensure_evidence_perspective` and `ensure_edge_perspective`. Migration 077's
+//! (`('public', world)`) on purpose: `PerspectiveRepository::create` (and,
+//! before migration 267 moved the per-evidence / per-edge keys onto
+//! `mass_functions`' own slot, the two synthetic-row writers). Migration 077's
 //! registry WITH CHECK admits exactly that declaration, and a perspective is a
-//! lens, or a per-evidence / per-edge key on `mass_functions`, not authored
-//! content. So `run` does not re-own a perspective and `verify` does not count
+//! lens, not authored content. So `run` does not re-own a perspective and `verify` does not count
 //! a world-owned one as residue. An earlier revision walked `perspectives` as
 //! an agent-keyed arm on `owner_agent_id`; once the DS auto-wire began
 //! recording an `owner_agent_id` on the synthetic perspectives, every
@@ -2074,6 +2074,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // public-only and the two team lists answer "no team" (loud for reads,
     // silent for defaults, fail-closed). The owner is load-bearing.
     ("epigraph_live_memberships_unbound", 236),
+    // 267, whether a BBA (any writer's) is keyed on an edge's slot, asked by
+    // the edge-withdraw path for the edge's writer. Its reads of the FORCEd
+    // `mass_functions` and `edges` are row-security filtered under a
+    // non-member owner, so it fails CLOSED and SILENTLY: an edge whose only
+    // BBAs are other writers' rows on claims the caller cannot read records
+    // no `edge_retract` deferral, and those BBAs outlive the edge until the
+    // legacy sweep finds them. The owner is load-bearing.
+    ("epigraph_edge_bbas_keyed", 267),
     // 206's default-team write changes only the principal's own `agents` row
     // and writes a principal-attributed audit row, both of which 077 admits
     // for any owner, and its authority check goes through the read above, so a
@@ -4042,6 +4050,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_agent_prompt_history_meta",
         "public.epigraph_agent_prompt_history_meta(uuid, integer, uuid, timestamptz, uuid, integer)",
+        true,
+    ),
+    // 267: every edge withdrawal on the application role
+    // (`EdgeRepository::withdraw_edge_bbas_conn`) asks it first, so a
+    // missing grant is 42501 on every edge retract, delete and rewire.
+    (
+        "epigraph_edge_bbas_keyed",
+        "public.epigraph_edge_bbas_keyed(uuid)",
         true,
     ),
 ];

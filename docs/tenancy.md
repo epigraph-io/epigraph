@@ -389,9 +389,11 @@ locked are stepped over. Run one.
 4. `settle_remaining`, then `verify`.
 
 **`perspectives` is not re-owned, and `verify` does not count it.** Every
-writer of `perspectives` (`PerspectiveRepository::create`,
-`ensure_evidence_perspective`, `ensure_edge_perspective`) declares
-`TenancyDecl::instance_wide()`, `('public', world)`, on purpose. 077's registry
+writer of `perspectives` (`PerspectiveRepository::create`; before migration
+267 also `ensure_evidence_perspective` and `ensure_edge_perspective`, whose
+per-evidence and per-edge keys 267 moved onto `mass_functions.slot_kind` /
+`slot_id`) declares `TenancyDecl::instance_wide()`, `('public', world)`, on
+purpose. 077's registry
 WITH CHECK admits exactly that declaration, as it does for `frames` and
 `contexts`. The backfill used to walk `perspectives` on `owner_agent_id` like
 `recall_events`. Since the DS auto-wire records an `owner_agent_id` on its

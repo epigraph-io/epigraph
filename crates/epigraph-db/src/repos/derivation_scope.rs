@@ -6,8 +6,9 @@
 //! is itself public. Visibility of the row therefore says nothing about the
 //! evidence it was derived from:
 //!
-//! * an edge-factor row (`combination_method = 'edge_factor'`, keyed by the
-//!   edge id in `perspective_id`) carries the belief of the edge's SOURCE
+//! * an edge-factor row (`combination_method = 'edge_factor'`, keyed on the
+//!   edge's slot, `slot_kind = 'edge'` and `slot_id` = the edge, migration
+//!   267) carries the belief of the edge's SOURCE
 //!   claim, which may be group-private, through an edge that may be
 //!   group-private;
 //! * an evidence-derived row (`evidence_id`) may cite an evidence row narrowed
@@ -28,7 +29,12 @@
 //!
 //! A consequence, recorded: an edge-factor row whose edge (or source claim) no
 //! longer exists is not admissible either, since nothing visible vouches for
-//! it.
+//! it. The edge arm FAILS CLOSED on the key: an edge-factor row is admitted
+//! only when it is keyed on nothing at all (no perspective, no slot) or on an
+//! edge slot whose edge and source are visible. A row keyed on a perspective
+//! or on another slot kind (a legacy shape migration 267 could not place on an
+//! edge slot) names no edge to vouch for it, so it stays out, as it did when
+//! the edge arm read `perspective_id`.
 
 use std::collections::{HashMap, HashSet};
 
@@ -67,9 +73,10 @@ pub fn cache_admissible_predicate(mf: &str, c: &str) -> String {
                                OR ({c}.visibility <> 'public' \
                                    AND e.owner_group_id = {c}.owner_group_id)))) \
        AND ({mf}.combination_method IS DISTINCT FROM 'edge_factor' \
-            OR {mf}.perspective_id IS NULL \
-            OR EXISTS (SELECT 1 FROM edges ed \
-                        WHERE ed.id = {mf}.perspective_id \
+            OR ({mf}.perspective_id IS NULL AND {mf}.slot_id IS NULL) \
+            OR ({mf}.slot_kind = 'edge' \
+                AND EXISTS (SELECT 1 FROM edges ed \
+                        WHERE ed.id = {mf}.slot_id \
                           AND (ed.visibility = 'public' \
                                OR ({c}.visibility <> 'public' \
                                    AND ed.owner_group_id = {c}.owner_group_id \
@@ -78,7 +85,7 @@ pub fn cache_admissible_predicate(mf: &str, c: &str) -> String {
                                        WHERE s.id = ed.source_id \
                                          AND (s.visibility = 'public' \
                                               OR ({c}.visibility <> 'public' \
-                                                  AND s.owner_group_id = {c}.owner_group_id))))))"
+                                                  AND s.owner_group_id = {c}.owner_group_id)))))))"
     )
 }
 
@@ -91,12 +98,13 @@ const VIEWER_DERIVED_PREDICATE: &str = "(mf.evidence_id IS NULL \
             OR EXISTS (SELECT 1 FROM evidence e \
                         WHERE e.id = mf.evidence_id /* {VISIBILITY:e} */)) \
        AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
-            OR mf.perspective_id IS NULL \
-            OR EXISTS (SELECT 1 FROM edges ed \
-                        WHERE ed.id = mf.perspective_id /* {EDGE_VISIBILITY:ed} */ \
+            OR (mf.perspective_id IS NULL AND mf.slot_id IS NULL) \
+            OR (mf.slot_kind = 'edge' \
+                AND EXISTS (SELECT 1 FROM edges ed \
+                        WHERE ed.id = mf.slot_id /* {EDGE_VISIBILITY:ed} */ \
                           AND EXISTS (SELECT 1 FROM claims s \
                                        WHERE s.id = ed.source_id \
-                                         /* {VISIBILITY:s} */)))";
+                                         /* {VISIBILITY:s} */))))";
 
 /// Repository for derivation-scoped belief reads.
 pub struct DerivationScopeRepository;

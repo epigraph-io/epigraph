@@ -422,7 +422,7 @@ impl MatchCandidateRepo {
     /// cull order of migration `012_cull_low_similarity_corroborates`:
     /// `bp_messages` → `factors` → `edges`, all keyed by `source_edge_id`.
     ///
-    /// `mass_functions` keyed `perspective_id = <edge id>` are deleted too.
+    /// `mass_functions` keyed on the edge's slot (`slot_kind = 'edge'`) are deleted too.
     /// The promote paths
     /// (`epigraph-api/src/routes/cross_source.rs::decide_candidate`,
     /// `epigraph-mcp/src/tools/matching.rs::decide_match_candidate`) call
@@ -430,7 +430,7 @@ impl MatchCandidateRepo {
     /// `auto_wire_edge_if_epistemic`, so today that count is 0 — but
     /// `epigraph-engine/src/retraction_cascade.rs` documents why leaving one
     /// behind is unrecoverable: `auto_wire_edge_if_epistemic` short-circuits on
-    /// `exists_for_perspective`, so a stale BBA makes any future re-wire of a
+    /// `exists_for_edge`, so a stale BBA makes any future re-wire of a
     /// re-promoted pair a permanent no-op, and recompute cannot remove it
     /// because the combine path reads `mass_functions.masses` verbatim.
     /// Deleting zero rows is free; omitting the statement would make this

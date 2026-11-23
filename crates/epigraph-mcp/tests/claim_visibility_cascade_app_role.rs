@@ -64,7 +64,7 @@ use common::*;
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief,
     resolve_claim_validity_frame, EdgeFactorOutcome,
@@ -914,10 +914,7 @@ async fn refuting_bba(pool: &PgPool, claim: Uuid, agent: Uuid, evidence: Uuid) {
     let mut masses = serde_json::Map::new();
     masses.insert("1".to_string(), serde_json::json!(0.9));
     masses.insert(all, serde_json::json!(0.1));
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -1261,10 +1258,7 @@ async fn bba_on(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: 
     let mut masses = serde_json::Map::new();
     masses.insert("0".to_string(), serde_json::json!(t));
     masses.insert(all, serde_json::json!(1.0 - t));
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -1280,6 +1274,56 @@ async fn bba_on(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: 
     )
     .await
     .expect("store a BBA");
+}
+
+/// A genuine perspective (a viewpoint) owned by `owner`.
+async fn lens(pool: &PgPool, name: &str, owner: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(name)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("a perspective")
+}
+
+/// [`bba_on`]'s BBA, filed under the genuine perspective `lens` and citing
+/// `evidence` through `evidence_id` (no slot).
+async fn bba_under_lens(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Uuid,
+    lens: Uuid,
+    evidence: Uuid,
+    t: f64,
+) {
+    let n: i32 = sqlx::query_scalar("SELECT array_length(hypotheses, 1) FROM frames WHERE id = $1")
+        .bind(frame)
+        .fetch_one(pool)
+        .await
+        .expect("frame size");
+    let all = (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let mut masses = serde_json::Map::new();
+    masses.insert("0".to_string(), serde_json::json!(t));
+    masses.insert(all, serde_json::json!(1.0 - t));
+    MassFunctionRepository::store_with_perspective(
+        pool,
+        claim,
+        frame,
+        Some(agent),
+        Some(lens),
+        &serde_json::Value::Object(masses),
+        None,
+        Some("auto_wire"),
+        Some(1.0),
+        None,
+        "unknown",
+        Some(evidence),
+    )
+    .await
+    .expect("store a BBA under the perspective");
 }
 
 /// `(binary_truth, claim_validity)` frame ids.
@@ -1771,9 +1815,13 @@ async fn stale_scoped_row(pool: &PgPool, claim: Uuid, frame: Uuid, scope: &str, 
 }
 
 /// Publicize: the team claim's `binary_truth` holds a BBA on evidence that
-/// goes public with it (perspective `open`) and one on evidence pinned in the
-/// team (perspective `hidden`), and the claim has a global row and a row per
-/// perspective. Right after the act a stranger reads the global row and the
+/// goes public with it (under the genuine perspective `open`) and one on
+/// evidence pinned in the team (under perspective `hidden`), and the claim has
+/// a global row and a row per perspective. (Before migration 267 an evidence
+/// BBA was keyed on its evidence id AS a perspective, and this test used those
+/// ids as the two lenses; since 267 an evidence id is a slot, never a
+/// perspective, so the lenses are real `perspectives` rows citing the
+/// evidence through `evidence_id`.) Right after the act a stranger reads the global row and the
 /// `open` perspective row folded from the public BBA alone, and no `hidden`
 /// row: nothing of it is admissible.
 ///
@@ -1791,12 +1839,16 @@ async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(poo
     let open = fixture::seed_evidence(&pool, c, "observation").await;
     let hidden = fixture::seed_evidence(&pool, c, "reference").await;
     pin(&pool, hidden, eve).await;
-    bba_on(&pool, c, binary, eve, open, 0.7).await;
-    bba_on(&pool, c, binary, eve, hidden, 0.9).await;
+    let (open_lens, hidden_lens) = (
+        lens(&pool, "open", eve).await,
+        lens(&pool, "hidden", eve).await,
+    );
+    bba_under_lens(&pool, c, binary, eve, open_lens, open, 0.7).await;
+    bba_under_lens(&pool, c, binary, eve, hidden_lens, hidden, 0.9).await;
     refold(&pool, &s, eve, c).await;
     stale_scoped_row(&pool, c, binary, "global", None).await;
-    stale_scoped_row(&pool, c, binary, "perspective", Some(open)).await;
-    stale_scoped_row(&pool, c, binary, "perspective", Some(hidden)).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(open_lens)).await;
+    stale_scoped_row(&pool, c, binary, "perspective", Some(hidden_lens)).await;
 
     publicize(&pool, &s, eve, &[c]).await.expect("publicized");
 
@@ -1808,7 +1860,7 @@ async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(poo
         "the stranger reads the global row folded from the public BBA alone {open_only:?}, \
          not nothing and not the team's fold; read {global:?}"
     );
-    let persp = served_scoped(&pool, &s, carol, c, "perspective", Some(open)).await;
+    let persp = served_scoped(&pool, &s, carol, c, "perspective", Some(open_lens)).await;
     assert!(
         persp.as_ref().is_some_and(|p| same(p, &open_only)),
         "the stranger reads the public perspective's row {open_only:?}; read {persp:?}"
@@ -1817,7 +1869,7 @@ async fn publicize_writes_the_moved_claims_scoped_rows_afresh_for_the_public(poo
         "SELECT count(*) FROM ds_combined_beliefs WHERE claim_id = $1 AND scope_id = $2",
     )
     .bind(c)
-    .bind(hidden)
+    .bind(hidden_lens)
     .fetch_one(&pool)
     .await
     .expect("count");

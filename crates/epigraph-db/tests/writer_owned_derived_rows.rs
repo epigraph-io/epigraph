@@ -880,21 +880,42 @@ async fn store_bba(
     perspective: Option<Uuid>,
     masses: serde_json::Value,
 ) -> Result<Uuid, epigraph_db::DbError> {
-    MassFunctionRepository::store_with_perspective(
-        &mut *conn,
-        claim,
-        frame,
-        Some(agent),
-        perspective,
-        &masses,
-        None,
-        Some("test"),
-        None,
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                &mut *conn,
+                claim,
+                frame,
+                Some(agent),
+                epigraph_db::BbaSlot::Edge(edge),
+                &masses,
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame,
+                Some(agent),
+                None,
+                &masses,
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
 }
 
 fn cache(belief: f64, plausibility: f64, betp: f64, frame: Uuid) -> CachedBelief {
@@ -1209,15 +1230,6 @@ async fn a_legacy_claim_owned_bba_is_replaceable_after_the_maintenance_reown(poo
     assert_eq!(events, 2, "one audit row per call that re-owned anything");
 }
 
-async fn seed_perspective(pool: &PgPool, id: Uuid) {
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(id)
-        .bind(format!("edge {id}"))
-        .execute(pool)
-        .await
-        .expect("seed edge perspective");
-}
-
 /// W4(b), after migration 117. A writer marks its own claim a duplicate of a
 /// WORLD-owned canonical: the ACT lands on the application role. The REPAIR --
 /// the administrative cascade, on the maintenance connection -- moves the
@@ -1242,9 +1254,6 @@ async fn mark_duplicate_onto_a_world_canonical_moves_every_writers_bba(pool: PgP
     let ex = fixture::seed_edge(&pool, sx, dup).await;
     let ew = fixture::seed_edge(&pool, sw, dup).await;
     let ef = fixture::seed_edge(&pool, sw, dup_false).await;
-    for e in [ex, ew, ef] {
-        seed_perspective(&pool, e).await;
-    }
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();

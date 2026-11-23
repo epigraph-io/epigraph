@@ -22,7 +22,6 @@ use epigraph_cli::backfill_factors::{
     rewire_edges, run_rewire_phase, select_rewire_edges, RewireEdge, RewireOptions, RewireSummary,
     EDGE_QUERY,
 };
-use epigraph_db::PerspectiveRepository;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -108,13 +107,10 @@ async fn seed_evidence_bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid)
 
 /// A stored edge-factor row in the pre-#401 shape, keyed on `agent`.
 async fn seed_stale_edge_factor(pool: &PgPool, edge: Uuid, target: Uuid, frame: Uuid, agent: Uuid) {
-    PerspectiveRepository::ensure_edge_perspective(pool, edge, Some(agent))
-        .await
-        .expect("edge perspective");
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
     )
     .bind(target)
     .bind(frame)
@@ -127,7 +123,7 @@ async fn seed_stale_edge_factor(pool: &PgPool, edge: Uuid, target: Uuid, frame: 
 }
 
 async fn edge_rows(pool: &PgPool, edge: Uuid) -> Vec<(Uuid, serde_json::Value)> {
-    sqlx::query_as("SELECT source_agent_id, masses FROM mass_functions WHERE perspective_id = $1")
+    sqlx::query_as("SELECT source_agent_id, masses FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1")
         .bind(edge)
         .fetch_all(pool)
         .await
@@ -312,7 +308,7 @@ async fn rewire_selects_already_wired_edge_factor_and_keeps_one_row_per_edge(poo
     // The target's own evidence BBA is untouched.
     assert_eq!(claim_rows(&pool, w.target).await, 2);
     let evidence: serde_json::Value = sqlx::query_scalar(
-        "SELECT masses FROM mass_functions WHERE claim_id = $1 AND perspective_id IS NULL",
+        "SELECT masses FROM mass_functions WHERE claim_id = $1 AND perspective_id IS NULL AND slot_id IS NULL",
     )
     .bind(w.target)
     .fetch_one(&pool)
@@ -441,7 +437,7 @@ async fn rewire_removes_edge_factors_it_cannot_rederive_and_recomputes_targets(p
 async fn edge_row_tenancy(pool: &PgPool, edge: Uuid) -> Vec<(Uuid, String, bool)> {
     sqlx::query_as(
         "SELECT owner_group_id, visibility::text, writer_owned FROM mass_functions \
-          WHERE perspective_id = $1",
+          WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(edge)
     .fetch_all(pool)
@@ -464,7 +460,7 @@ async fn rewire_keeps_a_writer_owned_edge_factor_owned_by_its_writer(pool: PgPoo
     // what a non-owner's attach would have stamped.
     sqlx::query(
         "UPDATE mass_functions SET owner_group_id = $2, visibility = 'public', writer_owned = true \
-          WHERE perspective_id = $1",
+          WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(w.edge)
     .bind(writer_group)
@@ -516,7 +512,7 @@ async fn rewire_replacing_a_row_off_the_wire_key_keeps_its_writer_owner(pool: Pg
         viewer_fixture::seed_agent_with_group(&pool, "rewire-writer-null").await;
     sqlx::query(
         "UPDATE mass_functions SET source_agent_id = NULL, owner_group_id = $2, \
-                visibility = 'public', writer_owned = true WHERE perspective_id = $1",
+                visibility = 'public', writer_owned = true WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(w.edge)
     .bind(writer_group)
@@ -563,7 +559,7 @@ async fn rewire_merges_a_double_wired_edge_and_counts_it(pool: PgPool) {
     let w = seed_world(&pool, "double").await;
     let second = seed_agent(&pool, "rewire-second-wirer").await;
     // Strictly later than the first row, so the selection is deterministic.
-    sqlx::query("UPDATE mass_functions SET created_at = now() - interval '1 minute' WHERE perspective_id = $1")
+    sqlx::query("UPDATE mass_functions SET created_at = now() - interval '1 minute' WHERE slot_kind = 'edge' AND slot_id = $1")
         .bind(w.edge)
         .execute(&pool)
         .await
@@ -656,7 +652,7 @@ async fn rewire_written_before_selects_only_older_rows_and_rewritten_rows_drop_o
     let old = seed_world(&pool, "old").await;
     let new = seed_world(&pool, "new").await;
     sqlx::query(
-        "UPDATE mass_functions SET created_at = now() - interval '1 day' WHERE perspective_id = $1",
+        "UPDATE mass_functions SET created_at = now() - interval '1 day' WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(old.edge)
     .execute(&pool)
@@ -781,7 +777,7 @@ async fn rewire_runs_on_a_maintenance_login_without_bypassrls(pool: PgPool) {
     let (_wa, writer_group) = viewer_fixture::seed_agent_with_group(&pool, "maint-writer").await;
     sqlx::query(
         "UPDATE mass_functions SET owner_group_id = $2, visibility = 'public', writer_owned = true \
-          WHERE perspective_id = $1",
+          WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(owned.edge)
     .bind(writer_group)
@@ -792,7 +788,7 @@ async fn rewire_runs_on_a_maintenance_login_without_bypassrls(pool: PgPool) {
     let replaced = seed_world(&pool, "maint-replaced").await;
     sqlx::query(
         "UPDATE mass_functions SET source_agent_id = NULL, owner_group_id = $2, \
-                visibility = 'public', writer_owned = true WHERE perspective_id = $1",
+                visibility = 'public', writer_owned = true WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(replaced.edge)
     .bind(writer_group)
@@ -891,7 +887,7 @@ async fn rewire_rekeys_an_agentless_row_under_the_edge_signer_without_a_second_b
     .expect("sign the edge as a third agent");
     sqlx::query(
         "UPDATE mass_functions SET source_agent_id = NULL \
-          WHERE perspective_id = $1 AND combination_method = 'edge_factor'",
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND combination_method = 'edge_factor'",
     )
     .bind(w.edge)
     .execute(&pool)
@@ -917,7 +913,7 @@ async fn rewire_rekeys_an_agentless_row_under_the_edge_signer_without_a_second_b
     assert_eq!((summary.rewired, summary.failed), (1, 0), "{summary:?}");
     let rows: Vec<(Option<Uuid>,)> = sqlx::query_as(
         "SELECT source_agent_id FROM mass_functions \
-          WHERE perspective_id = $1 AND combination_method = 'edge_factor'",
+          WHERE slot_kind = 'edge' AND slot_id = $1 AND combination_method = 'edge_factor'",
     )
     .bind(w.edge)
     .fetch_all(&pool)
@@ -935,11 +931,13 @@ async fn rewire_rekeys_an_agentless_row_under_the_edge_signer_without_a_second_b
 #[sqlx::test(migrations = "../../migrations")]
 async fn rewire_refuses_to_rewrite_a_retracted_edge_factor_and_changes_nothing(pool: PgPool) {
     let w = seed_world(&pool, "r103").await;
-    let held: Uuid = sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
-        .bind(w.edge)
-        .fetch_one(&pool)
-        .await
-        .expect("the wire-key row");
+    let held: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(w.edge)
+    .fetch_one(&pool)
+    .await
+    .expect("the wire-key row");
     let other_frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) RETURNING id",
     )

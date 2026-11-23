@@ -1164,27 +1164,46 @@ async fn an_insert_that_arrives_retracted_is_refused(pool: PgPool) {
 
 /// The edge wake-up gate counts a retracted row as present (its register
 /// entry in `bba_retract_read_lint.rs`): a re-asserted edge must not silently
-/// re-derive a BBA somebody retracted. Pinned with the perspective's ONLY row
+/// re-derive a BBA somebody retracted. Pinned with the edge slot's ONLY row
 /// retracted.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_perspective_whose_only_bba_is_retracted_still_exists(pool: PgPool) {
+async fn an_edge_whose_only_bba_is_retracted_is_still_wired(pool: PgPool) {
     let w = world(&pool).await;
-    let before = exists_for(&pool, w.owner, w.perspective).await;
-    assert!(before, "CALIBRATION: the perspective holds the owner's row");
-    mark_retracted_directly(&pool, w.owner_bba, w.owner).await;
+    let edge = Uuid::new_v4();
+    let row = MassFunctionRepository::store_in_slot(
+        &pool,
+        w.claim,
+        w.frame_a,
+        Some(w.owner),
+        epigraph_db::BbaSlot::Edge(edge),
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("edge_factor"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("the owner's edge-slot row");
     assert!(
-        exists_for(&pool, w.owner, w.perspective).await,
+        exists_for(&pool, w.owner, edge).await,
+        "CALIBRATION: the edge slot holds the owner's row"
+    );
+    mark_retracted_directly(&pool, row, w.owner).await;
+    assert!(
+        exists_for(&pool, w.owner, edge).await,
         "a retracted row still counts as wired"
     );
 }
 
-async fn exists_for(pool: &PgPool, agent: Uuid, perspective: Uuid) -> bool {
+async fn exists_for(pool: &PgPool, agent: Uuid, edge: Uuid) -> bool {
     let p = pool.clone();
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
         let v = stamp(&mut conn, &p, agent).await;
-        let e = MassFunctionRepository::exists_for_perspective(&mut *conn, &v, perspective)
+        let e = MassFunctionRepository::exists_for_edge(&mut *conn, &v, edge)
             .await
-            .expect("exists_for_perspective");
+            .expect("exists_for_edge");
         (conn, e)
     })
     .await

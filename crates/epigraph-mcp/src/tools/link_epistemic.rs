@@ -352,7 +352,7 @@ pub async fn do_link_epistemic(
     // is `false` on that call but the wake-up must still fire (backlog claim
     // 8ef5cf61-7382-43a4-85cb-565d76ba3f06). `auto_wire_edge_if_epistemic`
     // itself resolves the "already wired?" check (via
-    // `MassFunctionRepository::exists_for_perspective`) and is a no-op once a
+    // `MassFunctionRepository::exists_for_edge`) and is a no-op once a
     // BBA exists for this edge_id, so it's safe to attempt on every call.
     //
     // The BBA is attributed to the SOURCE claim's agent_id ("A's author asserts
@@ -424,7 +424,7 @@ pub async fn do_link_epistemic(
             let already_wired = if was_created {
                 Some(false)
             } else {
-                MassFunctionRepository::exists_for_perspective(&mut *probe, viewer, edge_id)
+                MassFunctionRepository::exists_for_edge(&mut *probe, viewer, edge_id)
                     .await
                     .ok()
             };

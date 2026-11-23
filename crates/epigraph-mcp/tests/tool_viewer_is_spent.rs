@@ -1045,9 +1045,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "optional_read_under_savepoint",
         ],
     ),
-    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_with_perspective`,
-    // `MassFunctionRepository::update_claim_belief`,
-    // `PerspectiveRepository::ensure_evidence_perspective`; stamped:
+    // write: `FrameRepository::assign_claim`, `MassFunctionRepository::store_for_evidence`
+    // (the evidence slot, migration 267), `MassFunctionRepository::store_with_perspective`,
+    // `MassFunctionRepository::update_claim_belief`; stamped:
     // `optional_read_under_savepoint`; narrows: `derivation_scope::retain_for_cache`.
     (
         "ds_auto.rs",
@@ -1055,10 +1055,9 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "FrameRepository::assign_claim",
             "FrameRepository::assign_claim",
-            "MassFunctionRepository::store_with_perspective",
+            "MassFunctionRepository::store_for_evidence",
             "MassFunctionRepository::store_with_perspective",
             "MassFunctionRepository::update_claim_belief",
-            "PerspectiveRepository::ensure_evidence_perspective",
             "derivation_scope::retain_for_cache",
             "optional_read_under_savepoint",
             "optional_read_under_savepoint",

@@ -913,7 +913,8 @@ async fn the_seed_batch_and_edge_wires_leave_the_track_alone(pool: PgPool) {
     assert_eq!(body["belief_wired"], true, "PREMISE: {body}");
     let edge = parse_uuid_field(&body, "edge_id");
     let masses: serde_json::Value = sqlx::query_scalar(
-        "SELECT masses FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT masses FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' \
+           AND slot_id = $2",
     )
     .bind(target)
     .bind(edge)

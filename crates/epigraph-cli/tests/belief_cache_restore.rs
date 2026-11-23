@@ -693,15 +693,12 @@ async fn seed_edge_factor(
     frame: Uuid,
     at: DateTime<Utc>,
 ) {
-    epigraph_db::PerspectiveRepository::ensure_edge_perspective(pool, edge, Some(agent))
-        .await
-        .expect("edge perspective");
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_in_slot(
         pool,
         target,
         frame,
         Some(agent),
-        Some(edge),
+        epigraph_db::BbaSlot::Edge(edge),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),
@@ -712,12 +709,14 @@ async fn seed_edge_factor(
     )
     .await
     .expect("edge-factor BBA");
-    sqlx::query("UPDATE mass_functions SET created_at = $2 WHERE perspective_id = $1")
-        .bind(edge)
-        .bind(at)
-        .execute(pool)
-        .await
-        .expect("date the BBA");
+    sqlx::query(
+        "UPDATE mass_functions SET created_at = $2 WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .bind(at)
+    .execute(pool)
+    .await
+    .expect("date the BBA");
 }
 
 /// The downstream list must cover EVERY edge-factor BBA that may have frozen a

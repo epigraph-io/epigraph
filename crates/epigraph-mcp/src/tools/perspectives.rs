@@ -57,6 +57,10 @@ pub async fn create_perspective(
         .collect::<Result<Vec<_>, _>>()?;
 
     let perspective_type = params.perspective_type.as_deref().unwrap_or("analytical");
+    if let Some(why) = epigraph_db::repos::perspective::reserved_perspective_type(perspective_type)
+    {
+        return Err(invalid_params(why));
+    }
     let extraction_method = params
         .extraction_method
         .as_deref()

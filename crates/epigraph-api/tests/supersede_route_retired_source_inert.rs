@@ -64,11 +64,13 @@ async fn plant_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
 }
 
 async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge)
-        .fetch_one(pool)
-        .await
-        .expect("count edge-keyed rows")
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge-keyed rows")
 }
 
 /// Live BBAs keyed on an edge sourced at `retired`, held by a current claim:
@@ -77,7 +79,7 @@ async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
 async fn live_rows_from_retired_source(pool: &PgPool, retired: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions mf \
-           JOIN edges e ON e.id = mf.perspective_id \
+           JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
            JOIN claims h ON h.id = mf.claim_id \
           WHERE e.source_type = 'claim' AND e.source_id = $1 \
             AND h.is_current AND mf.retracted_at IS NULL",

@@ -175,20 +175,9 @@ async fn exact_mass(pool: &PgPool, ev: Uuid, claim: Uuid, filer: Uuid) {
     .await
     .expect("seed claim_frames");
     sqlx::query(
-        "INSERT INTO perspectives (id, name, owner_agent_id, perspective_type, visibility, \
-                                   owner_group_id) \
-         VALUES ($1, 'nightly', $2, 'evidence', 'public', $3)",
-    )
-    .bind(ev)
-    .bind(filer)
-    .bind(WORLD)
-    .execute(pool)
-    .await
-    .expect("seed perspective");
-    sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, \
                                      masses, evidence_id, source_strength) \
-         VALUES ($1, $2, $3, $4, $5, $4, 0.5)",
+         VALUES ($1, $2, $3, 'evidence', $4, $5, $4, 0.5)",
     )
     .bind(claim)
     .bind(frame)

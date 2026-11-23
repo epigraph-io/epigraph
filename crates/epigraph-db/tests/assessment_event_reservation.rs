@@ -615,12 +615,12 @@ async fn store_slot(
     slot: Uuid,
     masses: &serde_json::Value,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         conn,
         w.claim,
         w.frame,
         Some(w.agent),
-        Some(slot),
+        epigraph_db::BbaSlot::Assessment(slot),
         masses,
         None,
         Some("discount"),
@@ -645,9 +645,6 @@ async fn an_identical_reassessment_writes_no_masses_and_is_detected(pool: PgPool
         .await
         .expect("resolve viewer");
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(w.agent));
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, slot, Some(w.agent))
-        .await
-        .expect("the slot's perspective, as the route ensures it");
     let same: serde_json::Value = serde_json::from_str(MASSES).expect("masses");
     let other: serde_json::Value =
         serde_json::from_str(r#"{"0": 0.3, "0,1": 0.7}"#).expect("masses");

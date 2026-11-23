@@ -64,13 +64,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> 
     .fetch_one(pool)
     .await
     .expect("seed edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .expect("seed the edge's perspective");
     id
 }
 
@@ -83,21 +76,42 @@ async fn bba(
     perspective: Option<Uuid>,
     method: Option<&str>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        perspective,
-        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
-        None,
-        method,
-        Some(1.0),
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                method,
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                method,
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store a BBA")
 }
 
@@ -452,7 +466,7 @@ async fn is_current(pool: &PgPool, id: Uuid) -> bool {
 async fn live_rows_at(pool: &PgPool, claim: Uuid, edge: Uuid, agent: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2 AND source_agent_id = $3 \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 AND source_agent_id = $3 \
             AND retracted_at IS NULL",
     )
     .bind(claim)

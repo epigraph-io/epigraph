@@ -47,7 +47,7 @@ async fn wire(
     assert_eq!(out, EdgeFactorOutcome::Wired, "PREMISE: the edge wires");
     sqlx::query_scalar(
         "SELECT id FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2 AND combination_method = 'edge_factor'",
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 AND combination_method = 'edge_factor'",
     )
     .bind(to)
     .bind(edge)
@@ -149,4 +149,96 @@ async fn each_derivation_source_is_checked_on_its_own(pool: PgPool) {
         !admitted.contains(&orphan_row),
         "an orphan edge-factor BBA was admitted"
     );
+}
+
+/// An edge-factor row stored directly with a given key (the harness is a
+/// privileged writer): no key at all, a perspective, or a slot.
+async fn edge_factor_row(
+    pool: &PgPool,
+    claim: Uuid,
+    frame: Uuid,
+    agent: Uuid,
+    perspective: Option<Uuid>,
+    slot: Option<(&str, Uuid)>,
+) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, \
+                                     slot_kind, slot_id, masses, combination_method) \
+         VALUES ($1, $2, $3, $4, $5, $6, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, 'edge_factor') \
+         RETURNING id",
+    )
+    .bind(claim)
+    .bind(frame)
+    .bind(agent)
+    .bind(perspective)
+    .bind(slot.map(|s| s.0))
+    .bind(slot.map(|s| s.1))
+    .fetch_one(pool)
+    .await
+    .expect("store an edge-factor row")
+}
+
+/// The edge arm fails CLOSED on the key (backlog 1777638e, review finding 1):
+/// an edge-factor row is admitted only when it is keyed on nothing, or on an
+/// edge slot whose edge vouches for it. A row left on a perspective (a legacy
+/// shape migration 267 could not place: its edge is gone and its perspective
+/// is not a slot row) or on another slot kind names no edge, so it stays out
+/// of the cache and out of a viewer's derived set, as it did when the arm read
+/// `perspective_id`. The control is the same row with no key: it IS admitted,
+/// so the only thing that differs is the key.
+/// Mutation: the arm spelled `slot_kind IS DISTINCT FROM 'edge'` (in either
+/// predicate) admits both keyed rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_edge_factor_row_not_keyed_on_an_edge_slot_is_not_admissible(pool: PgPool) {
+    let public = fixture::public_viewer(&pool).await;
+    let (author, _) = fixture::seed_agent_with_group(&pool, "m267-adm-author").await;
+    let frame = ensure_binary_frame(&mut pool.acquire().await.expect("acquire"), &public)
+        .await
+        .expect("binary_truth");
+    let target = fixture::seed_public_claim(&pool, author, "m267 adm target").await;
+
+    let unkeyed = edge_factor_row(&pool, target, frame, author, None, None).await;
+    let lens = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO perspectives (id, name, perspective_type, owner_agent_id) \
+         VALUES ($1, 'a lens that held an edge factor', 'analytical', $2)",
+    )
+    .bind(lens)
+    .bind(author)
+    .execute(&pool)
+    .await
+    .expect("seed a perspective");
+    let on_perspective = edge_factor_row(&pool, target, frame, author, Some(lens), None).await;
+    let on_other_slot = edge_factor_row(
+        &pool,
+        target,
+        frame,
+        author,
+        None,
+        Some(("evidence", Uuid::new_v4())),
+    )
+    .await;
+    let rows = [unkeyed, on_perspective, on_other_slot];
+
+    let cached = DerivationScopeRepository::cache_admissible(&pool, &rows)
+        .await
+        .expect("cache_admissible");
+    let derived = DerivationScopeRepository::viewer_derived(&pool, &public, &rows)
+        .await
+        .expect("viewer_derived");
+    for (what, set) in [("cache_admissible", &cached), ("viewer_derived", &derived)] {
+        assert!(
+            set.contains(&unkeyed),
+            "CONTROL ({what}): an unkeyed edge-factor row on a public claim is admitted"
+        );
+        assert!(
+            !set.contains(&on_perspective),
+            "{what}: an edge-factor row keyed on a perspective (no edge vouches for it) was \
+             admitted"
+        );
+        assert!(
+            !set.contains(&on_other_slot),
+            "{what}: an edge-factor row keyed on an evidence slot was admitted"
+        );
+    }
 }

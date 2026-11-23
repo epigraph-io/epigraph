@@ -148,8 +148,8 @@ async fn aef_rows(pool: &PgPool, viewer: &Viewer, claim: Uuid) -> Vec<AxiomRow> 
 /// The `edge_factor` row edge `edge` wired on `target`.
 async fn edge_row(pool: &PgPool, edge: Uuid, target: Uuid) -> Uuid {
     sqlx::query_scalar(
-        "SELECT id FROM mass_functions WHERE perspective_id = $1 AND claim_id = $2 \
-           AND combination_method = 'edge_factor'",
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1 \
+           AND claim_id = $2 AND combination_method = 'edge_factor'",
     )
     .bind(edge)
     .bind(target)

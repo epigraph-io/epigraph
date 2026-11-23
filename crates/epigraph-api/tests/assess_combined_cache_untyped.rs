@@ -129,19 +129,22 @@ async fn assess_leaves_only_its_untyped_input_row(
     assert_eq!(rows[0].2, None, "the input BBA must stay untyped: {rows:?}");
 
     // Ruling Q-U027F-2: the row is the caller's OWNER's one assessment slot,
-    // keyed (claim, frame, owner, the owner's assessment perspective); an
-    // unlinked agent is its own owner, and the slot perspective records it.
-    let (source, slot_owner): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
-        "SELECT m.source_agent_id, p.owner_agent_id FROM mass_functions m \
-           JOIN perspectives p ON p.id = m.perspective_id WHERE m.id = $1",
+    // keyed (claim, frame, owner, the owner's assessment slot: a column since
+    // migration 267); an unlinked agent is its own owner.
+    let (source, slot): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT m.source_agent_id, m.slot_id FROM mass_functions m \
+          WHERE m.id = $1 AND m.slot_kind = 'assessment'",
     )
     .bind(mf_id)
     .fetch_one(&pool)
     .await
-    .expect("the input row and its slot perspective");
+    .expect("the input row on its assessment slot");
     assert_eq!(
-        (source, slot_owner),
-        (Some(agent), Some(agent)),
+        (source, slot),
+        (
+            Some(agent),
+            Some(epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent)))
+        ),
         "the input row must sit in the calling agent's own assessment slot"
     );
 }

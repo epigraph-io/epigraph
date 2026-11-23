@@ -17,7 +17,7 @@ use sqlx::Acquire;
 
 use uuid::Uuid;
 
-use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
+use epigraph_db::{FrameRepository, MassFunctionRepository};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 // Edge-factor auto-wire moved to `epigraph_engine::edge_factor` so the HTTP
@@ -594,9 +594,11 @@ pub async fn auto_wire_ds_for_claim(
 /// (Shafer's reliability discounting), combines via `combine_multiple()`,
 /// and updates the claim's DS columns.
 ///
-/// `evidence_id` is passed as `perspective_id` so that each evidence submission
-/// gets its own BBA row rather than upsert-overwriting the previous one on the
-/// unique constraint (claim_id, frame_id, agent_id, perspective_id=NULL).
+/// `evidence_id` keys the BBA on the evidence row's slot
+/// (`BbaSlot::Evidence`, migration 267) so that each evidence submission gets
+/// its own BBA row rather than upsert-overwriting the previous one on the
+/// agent's unscoped key (claim_id, frame_id, agent_id, no perspective, no
+/// slot).
 ///
 /// # The claim's scalar prior (backlog fc55465b)
 ///
@@ -632,7 +634,7 @@ pub async fn auto_wire_ds_update(
     weight: f64,
     supports: bool,
     evidence_type_str: Option<&str>, // NEW: evidence classification tag
-    evidence_id: Option<Uuid>,       // C-1: used as perspective_id to separate BBAs
+    evidence_id: Option<Uuid>,       // C-1: keys the BBA's evidence slot to separate BBAs
     seed_truth_prior: bool,
 ) -> Result<DsAutoResult, String> {
     auto_wire_ds_update_filed_on(
@@ -690,16 +692,6 @@ pub async fn auto_wire_ds_update_filed_on(
         FrameRepository::assign_claim(&mut *conn, claim_id, store_frame_id, Some(0))
             .await
             .map_err(|e| format!("assign_claim: {e}"))?;
-    }
-
-    // Materialize a synthetic perspective with id=evidence_id so the
-    // mass_functions.perspective_id FK is satisfied. Without this, every
-    // multi-evidence update path (report_workflow_outcome, update_with_evidence)
-    // failed with mass_functions_perspective_id_fkey since C-1 (355cf4f).
-    if let Some(persp_id) = evidence_id {
-        PerspectiveRepository::ensure_evidence_perspective(&mut *conn, persp_id, Some(agent_id))
-            .await
-            .map_err(|e| format!("ensure_evidence_perspective: {e}"))?;
     }
 
     // The canonical key: callers pass a DB-vocab tag of the evidence row they
@@ -760,6 +752,7 @@ pub async fn auto_wire_ds_update_filed_on(
                     frame_id,
                     Some(author),
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| format!("retracted_row_at_key: {e}"))?
@@ -791,17 +784,19 @@ pub async fn auto_wire_ds_update_filed_on(
         }
     }
 
-    // Store BBA — use evidence_id as perspective_id so each evidence submission
-    // gets its own row instead of upsert-overwriting on (claim, frame, agent, NULL).
+    // Store BBA — keyed on the evidence row's own slot (migration 267; C-1:
+    // one row per evidence submission instead of upsert-overwriting on
+    // (claim, frame, agent, NULL)). With no evidence row the BBA is the
+    // agent's one unscoped row, as before.
     // source_strength = evidence-type reliability weight (used for Shafer
     // discount at combination time); agent confidence is already in the
     // BBA mass shape, storing it here too would double-discount.
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         &mut *conn,
         claim_id,
         store_frame_id, // binary_truth, or the frame the caller files on (R-17)
         Some(agent_id),
-        evidence_id, // C-1: unique perspective per evidence prevents overwrite
+        evidence_id, // C-1: the evidence row's own slot prevents overwrite
         &masses_json,
         None,
         Some("auto_wire"),

@@ -4317,6 +4317,103 @@ restart.
   depends on it and none sets the setting; apply whenever. Operator note: a value set on
   the role or database (`ALTER ROLE .. SET`) would apply to every revoke; clear it with
   `ALTER ROLE epigraph_maintenance RESET epigraph.compromised_revoke_max_passes`.
+- **267**: `mass_functions_bba_slot` (backlog 1777638e, the residual of 63bb3d2e). Edge,
+  evidence and assessment BBAs are keyed on `mass_functions`' own slot (`slot_kind` in
+  `edge` / `evidence` / `assessment`, `slot_id`, both nullable, no foreign key) instead of a
+  pseudo-row of `perspectives` (`perspective_type` `edge` / `evidence`), so `perspectives`
+  holds viewpoints only. A slot row is one a slot writer wrote (typed `edge` named
+  `edge_factor`, typed `evidence` named `evidence_grounded`). It moves every slot-keyed row
+  (`perspective_id` to the slot: an edge's for an edge-typed row or an `edge_factor` row on
+  an edge's id, an evidence row's for a key that is an evidence row's id whatever the label,
+  otherwise an assessment for `discount`), FAILS CLOSED (55000, nothing changed) on a row it
+  cannot classify (A1), on a slot-shaped row it would leave behind or an `edge_factor` row
+  whose edge is gone (A3), on a
+  `community_members` row naming a slot row (A2), on an edge naming a slot row as a
+  `perspective` endpoint (A4: it would dangle; a past `dekg migrate` wrote CONTRIBUTES_TO
+  edges from every BBA's perspective) and on a perspective typed `edge` / `evidence` under
+  another name (A5: a viewpoint, `create_perspective` never validated the type); rebuilds the unique key as
+  `mass_functions_unique_per_key UNIQUE NULLS NOT DISTINCT (claim_id, frame_id,
+  source_agent_id, perspective_id, slot_kind, slot_id)` with `mass_functions_slot_shape`
+  and `idx_mass_functions_slot`; deletes the slot rows (a perspective that is not a slot
+  row is kept even when BBAs move off it: it is a viewpoint 267 has no copy of) and
+  adds `perspectives_not_bba_slot` (a `create_perspective` with either type is then refused
+  with 23514).
+  Re-states 194's `epigraph_cascade_delete_edge_bbas`, 115's `epigraph_dedup_move_bbas`
+  and 120's `epigraph_record_cascade_deferral` on the slot (an md5 precondition refuses to
+  apply over any other body) and adds `epigraph_edge_bbas_keyed(uuid)` (SECURITY DEFINER,
+  owner `epigraph_maintenance`, EXECUTE to `epigraph_app` and `epigraph_maintenance`):
+  whether any writer's BBA is keyed on an edge's slot, answered only to the edge's writer,
+  which the edge-withdraw path asks before it records an `edge_retract` deferral. It also
+  re-states 243's `epigraph_foreign_belief_cache` (md5 precondition on 243's body; added
+  when the 2026-11-23 staging integration merged 267 over 243): only its inlined owner-rule
+  predicates change, to read the slot, so a moved edge-factor row is admissible through its
+  edge slot alone and never through a NULL `perspective_id`; the undo re-states 243's body.
+  Pinned by `epigraph-db/tests/foreign_cache_repoint.rs` (the body carries the Rust predicates
+  verbatim) and by
+  `epigraph-db/tests/bba_slot_migration_267.rs` (the legacy shapes, each refusal, the
+  undo), `perspective_list_internal_types.rs`, `perspective_evidence_fk_tests.rs`, and the
+  writer tests `epigraph-mcp/tests/bba_slot_writers.rs` and
+  `epigraph-api/tests/assess_canonical_frame.rs::the_assessment_slot_is_a_column_and_writes_no_perspective`.
+  Before migrating, measure on the deployed database. Below, SLOT stands for the slot-row
+  test `((p.perspective_type = 'edge' AND p.name = 'edge_factor') OR (p.perspective_type =
+  'evidence' AND p.name = 'evidence_grounded'))`, the exact set 267 deletes; each query
+  computes what the migration computes:
+  - what 267 deletes and moves: `SELECT p.perspective_type, p.name, count(*) FROM
+    perspectives p WHERE p.perspective_type IN ('edge','evidence') GROUP BY 1, 2` and
+    `SELECT p.perspective_type, mf.combination_method, count(*) FROM mass_functions mf JOIN
+    perspectives p ON p.id = mf.perspective_id WHERE SLOT GROUP BY 1, 2` (A1 refuses an
+    `evidence`-typed row whose label is neither `auto_wire` nor `discount`);
+  - A3, expected no rows: `SELECT mf.combination_method, count(*) FROM mass_functions mf
+    JOIN perspectives p ON p.id = mf.perspective_id WHERE NOT (SLOT OR
+    (mf.combination_method = 'edge_factor' AND EXISTS (SELECT 1 FROM edges e WHERE e.id =
+    mf.perspective_id)) OR (mf.combination_method = 'auto_wire' AND EXISTS (SELECT 1 FROM
+    evidence v WHERE v.id = mf.perspective_id))) AND (p.name IN ('edge_factor',
+    'evidence_grounded') OR EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id) OR
+    mf.combination_method = 'edge_factor') GROUP BY 1`. A row here is a slot-shaped row 267
+    would leave behind, or an `edge_factor` row whose edge is gone, keyed on a perspective
+    that is not a slot row (before 267 the cache's edge arm kept it out; decide it by hand,
+    for example delete it, since no edge vouches for it);
+  - A2, expected 0: `SELECT count(*) FROM community_members cm JOIN perspectives p ON p.id =
+    cm.perspective_id WHERE SLOT`;
+  - A4, expected 0 (an operator decision otherwise: delete or re-point those edges first):
+    `SELECT count(*) FROM edges e JOIN perspectives p ON (e.source_type = 'perspective' AND
+    p.id = e.source_id) OR (e.target_type = 'perspective' AND p.id = e.target_id) WHERE
+    SLOT`;
+  - A5, expected 0 (retype them first): `SELECT count(*) FROM perspectives p WHERE
+    p.perspective_type IN ('edge','evidence') AND NOT SLOT`;
+  - viewpoints 267 KEEPS although it moves their BBAs to a slot (for information):
+    `SELECT count(DISTINCT p.id) FROM mass_functions mf JOIN perspectives p ON p.id =
+    mf.perspective_id WHERE NOT SLOT AND ((mf.combination_method = 'edge_factor' AND
+    EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) OR
+    (mf.combination_method = 'auto_wire' AND EXISTS (SELECT 1 FROM evidence v WHERE v.id =
+    mf.perspective_id)))`;
+  - `pg_total_relation_size('mass_functions')`: the key rebuild holds ACCESS EXCLUSIVE on
+    the table for one index build.
+
+  Undo: `docs/runbooks/267-undo.sql` (re-creates the slot rows from each slot's earliest
+  BBA; a kept viewpoint takes its BBAs back unchanged).
+
+  **Deploy order:** every binary that writes a BBA and the migration go TOGETHER, writers
+  stopped between them. On a database at 267, a binary built before 267 fails on EVERY BBA
+  write, not only the slot writes: `MassFunctionRepository::store_keyed` upserts with
+  `ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id)`, which no unique index
+  matches once 267 drops `mass_functions_unique_per_perspective`, so genuine-perspective and
+  unscoped writes fail with 42P10 too. Its slot writers are also refused by
+  `perspectives_not_bba_slot` (23514). In the other direction, a 267 binary on a database
+  before 267 writes slot columns that do not exist. Swap together, from one build:
+  - the API (`server`, `drain_jobs`);
+  - the MCP server (`epigraph-mcp-full`), including every agent container image that
+    bundles it. Restart every stdio MCP client too: each keeps the old binary open until it
+    is restarted;
+  - the `epigraph-cli` binaries the timers and operators run that store, move or restore
+    BBAs: among them `backfill_factors`, `recompute_claim_belief`, `recompute_betp`,
+    `replay_deferred_cascades`, `restore_edge_factors`, `sweep_retired_source_bbas`,
+    `sweep_semantic_duplicates`, `unmark_duplicate` and `operator`. The read paths changed
+    too (an edge's BBAs are found on the slot), so the safe rule is every binary of the
+    workspace.
+
+  Rolling back means the undo with the binaries rolled back first (see its header).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 - **268**: public `agent_prompt_history_meta` (backlog bedd59b7, 24a9f4fa). Adds the
   SECURITY DEFINER `epigraph_agent_prompt_history_meta(agent, after_depth, after_agent,
   after_first_seen, after_snapshot, limit)`: 161's prompt-history gate (its admin assignment

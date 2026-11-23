@@ -511,7 +511,8 @@ async fn link_epistemic_wires_belief_into_a_world_claim(pool: PgPool) {
     assert_eq!(body["belief_wired"], true, "{body}");
     let edge = parse_uuid_field(&body, "edge_id");
     let bba: Uuid = sqlx::query_scalar(
-        "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT id FROM mass_functions \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
     )
     .bind(target)
     .bind(edge)
@@ -761,7 +762,8 @@ async fn link_epistemic_reports_the_stored_cache_when_it_may_not_write_it(pool: 
     );
     let edge = parse_uuid_field(&body, "edge_id");
     let bba: Uuid = sqlx::query_scalar(
-        "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+        "SELECT id FROM mass_functions \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
     )
     .bind(target)
     .bind(edge)
@@ -1067,12 +1069,6 @@ async fn edge_between(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .execute(pool)
     .await
     .expect("edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(e)
-        .bind(format!("edge {e}"))
-        .execute(pool)
-        .await
-        .expect("edge perspective");
     e
 }
 
@@ -1085,12 +1081,12 @@ async fn harness_edge_bba(
     source_agent: Uuid,
     edge: Uuid,
 ) -> Uuid {
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_in_slot(
         pool,
         target,
         frame,
         Some(source_agent),
-        Some(edge),
+        epigraph_db::BbaSlot::Edge(edge),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("test"),
@@ -2128,14 +2124,6 @@ async fn writer_edge(pool: &PgPool, writer: Uuid, source: Uuid, target: Uuid) ->
     .fetch_one(&mut *conn)
     .await
     .expect("the writer's edge");
-    // Its edge-factor perspective (what `ensure_edge_perspective` creates when
-    // a BBA is wired onto the edge).
-    sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, 'edge')")
-        .bind(e)
-        .bind(format!("edge {e}"))
-        .execute(&mut *conn)
-        .await
-        .expect("edge perspective");
     sqlx::query(
         "SELECT set_config('epigraph.group_ids', '', false), \
                 set_config('epigraph.writable_group_ids', '', false), \
@@ -2199,12 +2187,12 @@ async fn the_admin_cascade_keeps_another_writers_edge_its_writers(pool: PgPool) 
             .execute(&mut *conn)
             .await
             .expect("stamp X");
-            let id = epigraph_db::MassFunctionRepository::store_with_perspective(
+            let id = epigraph_db::MassFunctionRepository::store_in_slot(
                 &mut *conn,
                 dup,
                 bt,
                 Some(x),
-                Some(dedup_edge),
+                epigraph_db::BbaSlot::Edge(dedup_edge),
                 &serde_json::json!({"0": 0.6, "0,1": 0.4}),
                 None,
                 Some("test"),

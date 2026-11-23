@@ -80,12 +80,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) -> Uuid {
     .execute(pool)
     .await
     .expect("seed edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(id)
-        .bind(format!("edge {id}"))
-        .execute(pool)
-        .await
-        .expect("seed edge perspective");
     id
 }
 
@@ -97,21 +91,42 @@ async fn bba(
     perspective: Option<Uuid>,
     m: serde_json::Value,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        perspective,
-        &m,
-        None,
-        Some("test"),
-        None,
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &m,
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &m,
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -132,12 +147,14 @@ async fn snapshot(pool: &PgPool, claims: &[Uuid]) -> Vec<String> {
     .expect("edges");
     out.extend(
         sqlx::query_scalar::<_, String>(
-            "SELECT format('bba %s on %s frame %s agent %s persp %s masses %s %s/%s wo=%s', \
-                           id, claim_id, frame_id, source_agent_id, perspective_id, masses, \
-                           visibility, owner_group_id, writer_owned) \
+            "SELECT format('bba %s on %s frame %s agent %s persp %s slot %s %s masses %s %s/%s \
+                            wo=%s', \
+                           id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, \
+                           slot_id, masses, visibility, owner_group_id, writer_owned) \
                FROM mass_functions WHERE claim_id = ANY($1) \
-                 OR perspective_id IN (SELECT id FROM edges \
-                                        WHERE source_id = ANY($1) OR target_id = ANY($1)) \
+                 OR (slot_kind = 'edge' \
+                     AND slot_id IN (SELECT id FROM edges \
+                                      WHERE source_id = ANY($1) OR target_id = ANY($1))) \
               ORDER BY id",
         )
         .bind(claims)
@@ -770,12 +787,12 @@ async fn a_restore_whose_evidence_is_gone_drifts_instead_of_failing(pool: PgPool
     .expect("frame")
     .id;
     let ev = fixture::seed_evidence(&pool, dup, "observation").await;
-    let cited = MassFunctionRepository::store_with_perspective(
+    let cited = MassFunctionRepository::store_in_slot(
         &pool,
         dup,
         frame,
         Some(b),
-        Some(e_dup),
+        epigraph_db::BbaSlot::Edge(e_dup),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("test"),

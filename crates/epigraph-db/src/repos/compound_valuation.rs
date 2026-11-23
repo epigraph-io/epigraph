@@ -142,7 +142,7 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
         &format!(
             r#"
             SELECT mf.id, mf.claim_id, mf.frame_id, mf.source_agent_id, mf.perspective_id,
-                   mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
+                   mf.slot_kind, mf.slot_id, mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
                    mf.evidence_type, mf.locality_tag, mf.evidence_id, mf.created_at,
                    f.name AS frame_name,
                    f.hypotheses AS frame_hypotheses,
@@ -152,13 +152,11 @@ pub async fn compound_own_rows<'e, E: sqlx::PgExecutor<'e>>(
                    NULL::text AS edge_relationship,
                    NULL::uuid AS edge_source_id,
                    false AS edge_source_is_compound,
-                   EXISTS (SELECT 1 FROM perspectives p
-                            WHERE p.id = mf.perspective_id
-                              AND p.perspective_type = 'evidence'
-                              /* {{VISIBILITY:p}} */) AS perspective_is_evidence,
                    ARRAY(SELECT DISTINCT ar.claim_id FROM mass_functions ar
                           WHERE ar.combination_method = 'attributed_v1'
-                            AND ar.perspective_id IN (mf.id, mf.perspective_id, mf.evidence_id)
+                            AND ar.perspective_id IN (
+                                    mf.id, mf.perspective_id, mf.evidence_id,
+                                    CASE WHEN mf.slot_kind = 'evidence' THEN mf.slot_id END)
                             AND COALESCE((ar.masses->>'1')::float8, 0) > 0
                             AND ar.retracted_at IS NULL
                             /* {{VISIBILITY:ar}} */) AS refuting_citers

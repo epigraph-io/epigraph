@@ -54,9 +54,6 @@ async fn narrowed_evidence(pool: &PgPool, claim: Uuid, group: Uuid, owner: Uuid)
         .execute(pool)
         .await
         .expect("narrow the evidence");
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, ev, Some(owner))
-        .await
-        .expect("evidence perspective");
     ev
 }
 
@@ -113,7 +110,7 @@ async fn update_with_evidence_never_caches_a_bba_citing_narrowed_evidence(pool: 
     // A member's earlier supporting BBA whose evidence was narrowed to its
     // group afterwards (the row stays public with its claim).
     let hidden = narrowed_evidence(&pool, with_hidden, group, member).await;
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_for_evidence(
         &pool,
         with_hidden,
         frame,

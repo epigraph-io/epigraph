@@ -120,23 +120,19 @@ async fn concurrent_same_owner_calls_report_exactly_one_replacement(
     .expect("create frame")
     .id;
 
-    // The caller is bound to no human, so it owns its own slot. The slot's
-    // perspective is created COMMITTED up front: an uncommitted one in X would
-    // block both calls before their reads, which is not the interleave wanted.
+    // The caller is bound to no human, so it owns its own slot (a column of
+    // the row since migration 267: there is no slot row to create first).
     let owner = Some(caller);
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(owner);
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, slot, owner)
-        .await
-        .expect("slot perspective");
 
     // X: an uncommitted slot row on exactly the key both calls upsert.
     let mut x = pool.begin().await.expect("begin X");
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_in_slot(
         &mut *x,
         claim,
         frame,
         owner,
-        Some(slot),
+        epigraph_db::BbaSlot::Assessment(slot),
         &serde_json::json!({"0": 0.5, "0,1": 0.5}),
         None,
         Some("discount"),

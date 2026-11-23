@@ -3,7 +3,7 @@
 //! * The ORACLE is the real cascade on the same throwaway database: the
 //!   delta runs first, then the fixes' own write paths run over the rows it
 //!   measured (the K10(2) arm through `cascade_after_supersede`, the edge-BBA
-//!   removal and repair through `delete_for_perspective` +
+//!   removal and repair through `delete_for_edge` +
 //!   `cascade_after_edge_withdrawal` for the `supersedes` rows, and the K3
 //!   mint `regenerate_superseded_edge_factors_conn` for the R-131 set), and
 //!   every value the delta predicted must be the value the cascade wrote.
@@ -25,7 +25,7 @@
 mod fixture;
 
 use epigraph_db::visibility::{SystemReason, Viewer};
-use epigraph_db::{ClaimRepository, MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{ClaimRepository, MassFunctionRepository, PgPool};
 use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
 use epigraph_engine::supersede_delta::r173::R173Options;
 use epigraph_engine::supersede_delta::{
@@ -155,15 +155,12 @@ async fn owned_claim(pool: &PgPool, owner: Uuid, group: Uuid, tag: &str) -> Uuid
 /// nothing wires one any more) and return its id.
 async fn store_on_edge(pool: &PgPool, holder: Uuid, frame: Uuid, agent: Uuid, edge: Uuid) -> Uuid {
     let mut conn = pool.acquire().await.expect("acquire");
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge, Some(agent))
-        .await
-        .expect("edge perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         &mut *conn,
         holder,
         frame,
         Some(agent),
-        Some(edge),
+        epigraph_db::BbaSlot::Edge(edge),
         &serde_json::json!({"1": 0.7, "0,1": 0.3}),
         None,
         Some("edge_factor"),
@@ -174,12 +171,14 @@ async fn store_on_edge(pool: &PgPool, holder: Uuid, frame: Uuid, agent: Uuid, ed
     )
     .await
     .expect("the pre-K12(b) supersedes BBA");
-    sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1 AND claim_id = $2")
-        .bind(edge)
-        .bind(holder)
-        .fetch_one(&mut *conn)
-        .await
-        .expect("the stored row")
+    sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2",
+    )
+    .bind(edge)
+    .bind(holder)
+    .fetch_one(&mut *conn)
+    .await
+    .expect("the stored row")
 }
 
 /// Retract `row` as `owner` through the real repository path.
@@ -249,12 +248,13 @@ async fn world_with(pool: &PgPool, private: bool) -> World {
     } else {
         None
     };
-    let kept_row: Uuid =
-        sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
-            .bind(kept_edge)
-            .fetch_one(pool)
-            .await
-            .expect("the row to retract");
+    let kept_row: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(kept_edge)
+    .fetch_one(pool)
+    .await
+    .expect("the row to retract");
     retract_as(pool, owner, kept_row).await;
     // The retirement the K10(2) arm never saw.
     retire(pool, retired).await;
@@ -529,7 +529,7 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
     // both removals, which is the `combined` value).
     {
         let mut tx = sqlx::Connection::begin(&mut *conn).await.expect("begin");
-        let n = MassFunctionRepository::delete_for_perspective(&mut *tx, w.overlap_lineage_edge)
+        let n = MassFunctionRepository::delete_for_edge(&mut *tx, w.overlap_lineage_edge)
             .await
             .expect("remove the overlap's supersedes BBA");
         assert_eq!(n, 1);
@@ -581,7 +581,7 @@ async fn the_delta_predicts_what_the_real_cascade_then_writes(pool: PgPool) {
 
     let mut n = 0;
     for e in [w.lineage_edge, w.overlap_lineage_edge] {
-        let one = MassFunctionRepository::delete_for_perspective(&mut *conn, e)
+        let one = MassFunctionRepository::delete_for_edge(&mut *conn, e)
             .await
             .expect("remove the supersedes BBA");
         assert_eq!(one, 1);
@@ -749,8 +749,12 @@ fn the_delta_calls_no_write_path() {
         "update_claim_belief",
         "clear_claim_belief",
         "delete_for_perspective",
+        // Migration 267's slot-keyed renames and additions of the write paths.
+        "delete_for_edge",
         "auto_wire",
         "store_with_perspective",
+        "store_in_slot",
+        "store_for_evidence",
         "apply_after",
         "cascade_after",
         "replay_deferred",
@@ -865,13 +869,10 @@ async fn the_delta_reads_every_row_on_the_maintenance_login(pool: PgPool) {
     );
 }
 
-/// Store a BBA on `claim` citing `evidence` (keyed on its evidence
-/// perspective), as the evidence write path does.
+/// Store a BBA on `claim` citing `evidence` (keyed on its evidence slot,
+/// migration 267), as the evidence write path does.
 async fn store_cited(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid) {
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,

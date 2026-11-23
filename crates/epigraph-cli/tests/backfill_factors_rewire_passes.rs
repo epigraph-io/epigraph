@@ -404,15 +404,17 @@ async fn targeted_rewire_restores_rows_and_caches_byte_identical(pool: PgPool) {
     assert_eq!(report.rewired(), 3, "{report:?}");
 
     // Edge 1 is rewritten organically after the rewire; edge 2 is retracted.
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(edges[1])
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edges[1])
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "UPDATE mass_functions SET retracted_at = now(), retracted_by = $2, \
-                retract_reason = 'cal4 restore fixture' WHERE perspective_id = $1",
+                retract_reason = 'cal4 restore fixture' WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(edges[2])
     .bind(author)
@@ -631,12 +633,14 @@ async fn targeted_restore_unwinds_a_cycle_run_to_the_pre_run_rows(pool: PgPool) 
     let ((_a2, _b2), (ab2, ba2), wave2) = settled_cycle(&pool, &viewer, "two").await;
     let ba2_pre = edge_rows(&pool, ba2).await;
     let (_, _, rows2) = apply(&pool, &viewer, &wave2, &until_fixed(80)).await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(ab2)
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(ab2)
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .unwrap();
     let ab2_now = edge_rows(&pool, ab2).await;
     let restored2 = restore_edge_rows(&pool, &rows2, false)
         .await

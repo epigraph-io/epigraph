@@ -238,13 +238,6 @@ async fn the_withdrawn_edge_bba_sweep_needs_an_actor_and_a_reason_and_audits_the
     let a = viewer_fixture::seed_public_claim(&pool, operator, "w12b cli sweep a").await;
     let b = viewer_fixture::seed_public_claim(&pool, operator, "w12b cli sweep b").await;
     let edge = viewer_fixture::seed_edge(&pool, a, b).await;
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'w12b', 'edge')",
-    )
-    .bind(edge)
-    .execute(&pool)
-    .await
-    .expect("edge-factor perspective");
     let frame = epigraph_db::FrameRepository::create(
         &pool,
         "binary_truth",
@@ -254,12 +247,12 @@ async fn the_withdrawn_edge_bba_sweep_needs_an_actor_and_a_reason_and_audits_the
     .await
     .expect("frame")
     .id;
-    let bba = epigraph_db::MassFunctionRepository::store_with_perspective(
+    let bba = epigraph_db::MassFunctionRepository::store_in_slot(
         &pool,
         b,
         frame,
         Some(operator),
-        Some(edge),
+        epigraph_db::BbaSlot::Edge(edge),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("test"),

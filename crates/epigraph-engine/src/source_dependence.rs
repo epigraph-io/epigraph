@@ -603,7 +603,8 @@ pub fn combine_with_owner_dependence(
 /// re-cited onto an atom (`perspective_id` = the original evidence id for a
 /// text-bearing item, the original `mass_functions.id` for a textless one).
 pub const ATTRIBUTED_METHOD: &str = "attributed_v1";
-/// `combination_method` of an edge-factor row (`perspective_id` = edge id).
+/// `combination_method` of an edge-factor row (keyed on the edge's slot,
+/// `BbaSlot::Edge`, migration 267).
 pub const EDGE_FACTOR_METHOD: &str = "edge_factor";
 /// `combination_method` of an ingest self-assertion ("paper P asserts this
 /// claim"), written by the ingest batch with no perspective and no evidence.
@@ -650,8 +651,8 @@ impl std::fmt::Display for ItemKey {
 }
 
 /// The evidence row a BBA cites, as the caller's viewer sees it: the row's
-/// `evidence_id`, or its `perspective_id` when that perspective is an
-/// evidence perspective. `doi` is `properties->>'doi'`.
+/// `evidence_id`, or the evidence row its slot names (`BbaSlot::Evidence`,
+/// migration 267). `doi` is `properties->>'doi'`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemEvidence {
     pub id: Uuid,
@@ -756,8 +757,8 @@ fn source_url_key(url: &str) -> Option<ItemKey> {
 /// agents is one source. The agent never enters a key.
 ///
 /// `evidence` is the row's cited evidence **as the caller's viewer sees it**:
-/// the row's `evidence_id`, or its `perspective_id` when that perspective is
-/// an evidence perspective. A row whose evidence is hidden from the viewer
+/// the row's `evidence_id`, or the evidence row its slot names
+/// (`BbaSlot::Evidence`, migration 267). A row whose evidence is hidden from the viewer
 /// gets `None` and keys `ev:<row.evidence_id>`: the id is already on the
 /// visible `mass_functions` row and no evidence content is read, so this
 /// discloses nothing, and rows citing that one evidence row (a `whole`
@@ -794,10 +795,15 @@ pub fn item_key(
         return ItemKey::Evidence(cited);
     }
     let method = row.combination_method.as_deref();
-    match (method, row.perspective_id, row.evidence_id) {
-        (Some(ATTRIBUTED_METHOD), Some(original), None) => ItemKey::Attribution(original),
-        (Some(EDGE_FACTOR_METHOD), Some(edge), None) => ItemKey::Edge(edge),
-        (Some(INGEST_ASSERTION_METHOD), None, None) => {
+    // An edge-factor row's edge is its slot (migration 267); any other slot
+    // keys the row as a perspective did before 267: it is not a lone
+    // ingest self-assertion.
+    match (method, row.perspective_id, row.evidence_id, row.slot()) {
+        (Some(ATTRIBUTED_METHOD), Some(original), None, None) => ItemKey::Attribution(original),
+        (Some(EDGE_FACTOR_METHOD), None, None, Some(epigraph_db::BbaSlot::Edge(edge))) => {
+            ItemKey::Edge(edge)
+        }
+        (Some(INGEST_ASSERTION_METHOD), None, None, None) => {
             asserting_paper.map_or(ItemKey::Row(row.id), ItemKey::Paper)
         }
         _ => ItemKey::Row(row.id),

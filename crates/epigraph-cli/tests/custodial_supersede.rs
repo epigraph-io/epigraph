@@ -497,11 +497,11 @@ async fn insert_claim_with_interval(pool: &PgPool, author: Uuid, bel: f64, pl: f
     id
 }
 
-/// Live BBAs on `claim` keyed on `edge` (edge-keyed: `perspective_id` is the
-/// edge id).
+/// Live BBAs on `claim` keyed on `edge` (edge-keyed: the edge's slot,
+/// migration 267).
 async fn edge_bbas(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2 \
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 \
            AND retracted_at IS NULL",
     )
     .bind(claim)
@@ -949,8 +949,8 @@ async fn a_replayed_custodial_cascade_lands_on_the_successors_current_head(pool:
         );
     }
     let frozen_bba: Uuid = sqlx::query_scalar(
-        "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2 \
-           AND retracted_at IS NULL",
+        "SELECT id FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' \
+           AND slot_id = $2 AND retracted_at IS NULL",
     )
     .bind(target)
     .bind(outgoing)

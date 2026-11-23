@@ -469,10 +469,7 @@ async fn an_operator_sets_its_agents_default_private_over_rest(pool: PgPool) {
 
 /// A BBA on (`claim`, binary frame) by `agent`, citing `evidence`.
 async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid, m: Value) {
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,

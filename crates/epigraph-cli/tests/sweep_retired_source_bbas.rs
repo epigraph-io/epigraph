@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, PgPool};
+use epigraph_db::{MassFunctionRepository, PgPool};
 use epigraph_engine::edge_factor::{auto_wire_ds_for_edge, ensure_binary_frame, EdgeFactorOutcome};
 use uuid::Uuid;
 
@@ -298,12 +298,14 @@ async fn owned_claim(pool: &PgPool, owner: Uuid, group: Uuid, tag: &str) -> Uuid
 }
 
 async fn row_on(pool: &PgPool, edge: Uuid, holder: Uuid) -> Uuid {
-    sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1 AND claim_id = $2")
-        .bind(edge)
-        .bind(holder)
-        .fetch_one(pool)
-        .await
-        .expect("the edge row")
+    sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1 AND claim_id = $2",
+    )
+    .bind(edge)
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("the edge row")
 }
 
 async fn retire(pool: &PgPool, id: Uuid) {
@@ -356,15 +358,12 @@ async fn world(pool: &PgPool) -> World {
     // retired: on the retired source's edge, but not measured.
     let stray_holder = fixture::seed_public_claim(pool, agent, "k10r stray holder").await;
     let mut conn = pool.acquire().await.expect("acquire");
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, refuting, Some(agent))
-        .await
-        .expect("edge perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         &mut *conn,
         stray_holder,
         frame,
         Some(agent),
-        Some(refuting),
+        epigraph_db::BbaSlot::Edge(refuting),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),
@@ -856,8 +855,9 @@ async fn the_undo_leaves_what_was_written_since_the_sweep_alone(pool: PgPool) {
         .unwrap()
         .to_string();
     let new_row: Uuid = sqlx::query_scalar(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses) \
-         SELECT r.claim_id, r.frame_id, r.source_agent_id, r.perspective_id, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, \
+                                     masses) \
+         SELECT r.claim_id, r.frame_id, r.source_agent_id, r.slot_kind, r.slot_id, \
                 '{\"0,1\": 1.0}'::jsonb \
            FROM jsonb_populate_record(NULL::mass_functions, $1::jsonb) r RETURNING id",
     )

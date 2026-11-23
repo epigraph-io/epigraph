@@ -743,7 +743,8 @@ async fn snapshot(pool: &PgPool) -> BTreeMap<Uuid, (Option<String>, serde_json::
 
 async fn mf_row(pool: &PgPool, id: Uuid) -> MassFunctionRow {
     sqlx::query_as(
-        "SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, \
+        "SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, \
+                masses, conflict_k, \
                 combination_method, source_strength, evidence_type, locality_tag, evidence_id, \
                 created_at FROM mass_functions WHERE id = $1",
     )

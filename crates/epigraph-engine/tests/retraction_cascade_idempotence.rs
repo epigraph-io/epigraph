@@ -245,10 +245,11 @@ async fn snapshot(pool: &PgPool, claims: &[Uuid]) -> Snapshot {
     .await
     .expect("read the caches");
     let masses = sqlx::query_as(
-        "SELECT claim_id, frame_id, source_agent_id, perspective_id, masses::text, \
-                source_strength, evidence_type::text, retracted_at IS NOT NULL \
+        "SELECT claim_id, frame_id, source_agent_id, COALESCE(slot_id, perspective_id), \
+                masses::text, source_strength, evidence_type::text, retracted_at IS NOT NULL \
            FROM mass_functions WHERE claim_id = ANY($1) \
-          ORDER BY claim_id, frame_id, source_agent_id, perspective_id, masses::text",
+          ORDER BY claim_id, frame_id, source_agent_id, COALESCE(slot_id, perspective_id), \
+                   masses::text",
     )
     .bind(claims)
     .fetch_all(pool)
@@ -404,10 +405,10 @@ async fn running_the_supersede_cascade_twice_equals_running_it_once(pool: PgPool
         let once = snapshot(&pool, &claims).await;
         assert!(
             !once.frames.is_empty()
-                && !once.perspectives.is_empty()
+                && !once.masses.is_empty()
                 && once.caches.iter().any(|c| c.7.is_some()),
-            "CALIBRATION case {n}: the first run must leave frame assignments, edge \
-             perspectives and a cache frame, or their comparison below is vacuous: {once:?}"
+            "CALIBRATION case {n}: the first run must leave frame assignments, edge-slot \
+             BBAs and a cache frame, or their comparison below is vacuous: {once:?}"
         );
 
         let second = cascade_after_supersede(&mut conn, &bypass, retiring, replacement).await;

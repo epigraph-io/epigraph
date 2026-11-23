@@ -493,6 +493,24 @@ async fn the_definer_carries_the_owner_rules_predicates_verbatim(pool: PgPool) {
 /// the 0296077b write is declined again.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_243_undo_restores_114s_body_on_190s_path(pool: PgPool) {
+    // Migration 267 re-states this definer over 243's body, so a rollback runs
+    // 267's undo (which puts 243's body back) before 243's. Stand that step in
+    // by re-applying 243's own statement, so this test still pins 243's undo
+    // alone.
+    let m243 = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../migrations/243_foreign_cache_repoint_off_inadmissible_frame.sql"
+    ))
+    .expect("read 243");
+    let start = m243
+        .find("CREATE OR REPLACE FUNCTION public.epigraph_foreign_belief_cache(")
+        .expect("243's statement");
+    let open = start + m243[start..].find("AS $$").expect("body opens") + "AS $$".len();
+    let close = open + m243[open..].find("$$").expect("body closes") + "$$".len();
+    sqlx::raw_sql(&m243[start..close])
+        .execute(&pool)
+        .await
+        .expect("put 243's body back, as 267's undo does");
     let undo = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/runbooks/243-undo.sql"

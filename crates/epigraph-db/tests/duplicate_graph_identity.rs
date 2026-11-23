@@ -110,8 +110,7 @@ async fn seed_evidence(pool: &PgPool, claim: Uuid, tag: &str) -> Uuid {
     .expect("seed evidence")
 }
 
-/// A `supports` edge plus the `perspectives` row its edge-keyed BBA names,
-/// as `ensure_edge_perspective` leaves them.
+/// A `supports` edge (its edge-keyed BBA sits on the edge's slot).
 async fn seed_supports_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
@@ -124,12 +123,6 @@ async fn seed_supports_edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .execute(pool)
     .await
     .expect("seed edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
-        .bind(id)
-        .bind(format!("edge {id}"))
-        .execute(pool)
-        .await
-        .expect("seed edge perspective");
     id
 }
 
@@ -145,21 +138,42 @@ async fn store_bba(
     method: &str,
     evidence: Option<Uuid>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        perspective,
-        &masses,
-        None,
-        Some(method),
-        None,
-        None,
-        "unknown",
-        evidence,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &masses,
+                None,
+                Some(method),
+                None,
+                None,
+                "unknown",
+                evidence,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &masses,
+                None,
+                Some(method),
+                None,
+                None,
+                "unknown",
+                evidence,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 

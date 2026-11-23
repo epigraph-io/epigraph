@@ -117,13 +117,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .fetch_one(pool)
     .await
     .expect("seed edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .expect("seed the edge's perspective");
     id
 }
 
@@ -138,12 +131,12 @@ async fn frame(pool: &PgPool, tag: &str) -> Uuid {
 }
 
 async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, perspective: Uuid) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_in_slot(
         pool,
         claim,
         frame,
         Some(agent),
-        Some(perspective),
+        epigraph_db::BbaSlot::Edge(perspective),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),
@@ -410,12 +403,12 @@ async fn app_bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspecti
     let v = viewer(pool, agent).await;
     as_role(pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &v, agent).await;
-        let id = MassFunctionRepository::store_with_perspective(
+        let id = MassFunctionRepository::store_in_slot(
             &mut *conn,
             claim,
             frame,
             Some(agent),
-            Some(perspective),
+            epigraph_db::BbaSlot::Edge(perspective),
             &serde_json::json!({"0": 0.6, "0,1": 0.4}),
             None,
             Some("test"),
@@ -502,7 +495,7 @@ async fn http_dedup_inline_rewires_a_resourced_edge_past_another_keys_retracted_
     );
     let rewired: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2 AND source_agent_id = $3 \
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 AND source_agent_id = $3 \
             AND retracted_at IS NULL",
     )
     .bind(xc)
@@ -646,13 +639,6 @@ async fn edge_withdrawal_world(pool: &PgPool) -> EdgeWithdrawalWorld {
         (conn, e)
     })
     .await;
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(e)
-    .execute(&pool)
-    .await
-    .expect("seed the edge's perspective");
     let own_live = app_bba(&pool, owner, b, f1, e).await;
     let own_retracted = app_bba(&pool, owner, b, f2, e).await;
     let foreign_live = app_bba(&pool, foreign, b, f1, e).await;

@@ -173,13 +173,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid) -> Uuid {
     .fetch_one(pool)
     .await
     .expect("seed edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'edge_factor', 'edge')",
-    )
-    .bind(id)
-    .execute(pool)
-    .await
-    .expect("seed the edge's perspective");
     id
 }
 
@@ -192,21 +185,42 @@ async fn bba(
     agent: Uuid,
     perspective: Option<Uuid>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        Some(agent),
-        perspective,
-        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
-        None,
-        None,
-        Some(1.0),
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                Some(agent),
+                epigraph_db::BbaSlot::Edge(edge),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                None,
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                Some(agent),
+                None,
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                None,
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store a BBA")
 }
 
@@ -1421,10 +1435,11 @@ async fn e_the_purge_definer_deletes_audits_and_keeps_its_grants(pool: PgPool) {
             .unwrap_or_else(|| panic!("the audit names {id}: {a}"));
         assert_eq!(row["claim_id"], w.claim.to_string(), "{row}");
         assert_eq!(row["frame_id"], w.frame.to_string(), "{row}");
+        assert_eq!(row["perspective_id"], serde_json::Value::Null, "{row}");
         assert_eq!(
-            row["perspective_id"],
+            row["slot_id"],
             perspective.map_or(serde_json::Value::Null, |p| p.to_string().into()),
-            "{row}"
+            "the audit keeps the edge slot: {row}"
         );
         assert_eq!(!row["retracted_at"].is_null(), retracted, "{row}");
         assert_eq!(

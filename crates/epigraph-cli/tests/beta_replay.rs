@@ -314,7 +314,8 @@ async fn replay_equals_the_live_track_of_the_mcp_writers(pool: PgPool) {
 async fn creation_and_seed_rows(pool: &PgPool, claim: Uuid) -> (i64, i64) {
     sqlx::query_as(
         "SELECT count(*) FILTER (WHERE combination_method = 'auto_wire' \
-                                   AND perspective_id IS NULL), \
+                                   AND perspective_id IS NULL \
+                                   AND slot_id IS NULL), \
                 count(*) FILTER (WHERE combination_method = 'truth_value_seed') \
            FROM mass_functions WHERE claim_id = $1",
     )
@@ -490,7 +491,7 @@ async fn workflow_outcome_rows_are_reported_and_excludable_apart(pool: PgPool) {
     .expect("update_with_evidence");
     let perspectives: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions WHERE claim_id = $1 \
-            AND combination_method = 'auto_wire' AND perspective_id IS NOT NULL",
+            AND combination_method = 'auto_wire' AND slot_kind = 'evidence'",
     )
     .bind(claim)
     .fetch_one(&pool)

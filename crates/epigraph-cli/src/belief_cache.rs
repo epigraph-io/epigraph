@@ -708,7 +708,7 @@ where
 /// [`DOWNSTREAM_SLACK_SECS`]:
 ///
 /// * it was created (`edges.created_at`), or
-/// * an edge-factor BBA keyed on it (`mass_functions.perspective_id = edge`,
+/// * an edge-factor BBA keyed on it (`mass_functions.slot_id = edge`, `slot_kind = 'edge'`,
 ///   `claim_id = target`) was written (`mass_functions.created_at`, which the
 ///   upsert resets on every re-store). An edge created while its source was
 ///   factorless is wired later (a dedup re-hit, `backfill_factors`), so its
@@ -740,7 +740,7 @@ pub async fn downstream_edges(
               WHERE e.source_type = 'claim' AND e.source_id = ANY($1) \
                 AND (e.created_at > $2 \
                      OR EXISTS (SELECT 1 FROM mass_functions mf \
-                                 WHERE mf.perspective_id = e.id \
+                                 WHERE mf.slot_kind = 'edge' AND mf.slot_id = e.id \
                                    AND mf.claim_id = e.target_id \
                                    AND mf.created_at > $2)) \
               ORDER BY e.created_at, e.id",
