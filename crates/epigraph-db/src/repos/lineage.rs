@@ -168,6 +168,54 @@ struct LineageEdgeRow {
 /// direction.
 pub const LINEAGE_INCOMING: &[&str] = &["supports", "elaborates", "decomposes_to"];
 
+/// Relationships [`LineageRepository::get_ancestor_ids`] walks, each behind an
+/// INCOMING edge (`ancestor -> claim`): [`LINEAGE_INCOMING`] plus
+/// [`ANCESTOR_DERIVATION_RELATIONSHIPS`].
+///
+/// Not walked (backlog 19d325d5): `refutes`, `contradicts`, cross-source
+/// `CORROBORATES` and every other relationship, which are not ancestry, and
+/// `supersedes`, which is written new -> old, so its INCOMING edge names a
+/// successor; the export reaches predecessors by its own one-hop outgoing
+/// expansion.
+///
+/// The two halves are matched differently. [`LINEAGE_INCOMING`] is compared
+/// lower-cased, exactly as [`LineageRepository::get_lineage`] compares it, so
+/// the two walks agree on what an ancestor is. The derivation family is
+/// matched EXACTLY: `DERIVED_FROM` is a different relationship from
+/// `derived_from` (`epigraph_core::edge::relationships::CASE_FOLDED_RELATIONSHIPS`
+/// says never to fold the pair), written paraphrase -> source atom, i.e.
+/// descendant -> origin, so its incoming edge names a paraphrase, not an
+/// ancestor.
+pub const ANCESTOR_ID_RELATIONSHIPS: &[&str] = &[
+    "supports",
+    "elaborates",
+    "decomposes_to",
+    "derived_from",
+    "derives_from",
+    "generated",
+    "uses_evidence",
+];
+
+/// The derivation family of [`ANCESTOR_ID_RELATIONSHIPS`]: what the PROV-O
+/// export maps to `prov:wasDerivedFrom` / `prov:wasGeneratedBy` / `prov:used`
+/// (`derived_from`, its legacy spelling `derives_from`, `generated`,
+/// `uses_evidence`), in the exact lower-case spelling that mapping matches.
+/// Matched case-sensitively; see [`ANCESTOR_ID_RELATIONSHIPS`].
+pub const ANCESTOR_DERIVATION_RELATIONSHIPS: &[&str] =
+    &["derived_from", "derives_from", "generated", "uses_evidence"];
+
+/// The ancestor ids of a claim and whether the walk stopped at its depth
+/// bound; see [`LineageRepository::get_ancestor_ids_probed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AncestorIds {
+    /// The root and its ancestors within `max_depth`, ancestors first
+    /// (descending depth).
+    pub ids: Vec<Uuid>,
+    /// `true` iff a claim the viewer can read, reached over a readable edge,
+    /// lies one layer past `max_depth`.
+    pub truncated_by_depth: bool,
+}
+
 /// Row for evidence queries
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct EvidenceQueryRow {
@@ -1100,6 +1148,7 @@ impl LineageRepository {
     ///
     /// Returns just the UUIDs of all ancestor claims, useful for
     /// quick membership checks without fetching full claim data.
+    /// [`Self::get_ancestor_ids_probed`] without the depth flag.
     ///
     /// # Arguments
     /// * `pool` - Database connection pool
@@ -1111,14 +1160,54 @@ impl LineageRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor, viewer))]
     pub async fn get_ancestor_ids<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
         claim_id: Uuid,
         max_depth: Option<i32>,
     ) -> Result<Vec<Uuid>, DbError> {
+        Ok(
+            Self::get_ancestor_ids_probed(executor, viewer, claim_id, max_depth)
+                .await?
+                .ids,
+        )
+    }
+
+    /// The root and its ancestor claim ids within `max_depth` (default 100),
+    /// ancestors first, and whether a readable ancestor lies past the bound.
+    ///
+    /// "Ancestor" means reached over an incoming edge whose relationship is in
+    /// [`ANCESTOR_ID_RELATIONSHIPS`] ([`LINEAGE_INCOMING`] compared
+    /// lower-cased, [`ANCESTOR_DERIVATION_RELATIONSHIPS`] exactly, so a
+    /// `paraphrase -DERIVED_FROM-> claim` row is not walked). A disputing claim
+    /// (`refutes`, `contradicts`) or a successor (`supersedes`, written
+    /// new -> old) is not walked, so under a caller's node cap it can never
+    /// take a slot ahead of a derivation ancestor (backlog 19d325d5).
+    ///
+    /// The walk is breadth-first with a visited set, so each claim enters once,
+    /// at its shortest depth, and the work is bounded by the claims reached,
+    /// not the paths to them. It runs ONE layer past `max_depth` (the
+    /// [`probe_depth`] of [`Self::get_lineage_conn`]); that layer passes the
+    /// same claim and edge predicates as every other, so
+    /// [`AncestorIds::truncated_by_depth`] counts only claims the viewer can
+    /// read and cannot reveal a hidden one. The probe layer's ids are dropped
+    /// before they are returned (backlog 4caad789).
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[instrument(skip(executor, viewer))]
+    pub async fn get_ancestor_ids_probed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        claim_id: Uuid,
+        max_depth: Option<i32>,
+    ) -> Result<AncestorIds, DbError> {
         let max_depth = max_depth.unwrap_or(100);
+        let folded: Vec<String> = LINEAGE_INCOMING.iter().map(|r| (*r).to_string()).collect();
+        let exact: Vec<String> = ANCESTOR_DERIVATION_RELATIONSHIPS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
 
         #[derive(sqlx::FromRow)]
         struct IdDepthRow {
@@ -1152,6 +1241,8 @@ impl LineageRepository {
                         SELECT c.id
                         FROM unnest(w.frontier) AS l(id)
                         JOIN edges e ON e.target_id = l.id AND e.target_type = 'claim'
+                                    AND (lower(e.relationship) = ANY($3::text[])
+                                         OR e.relationship = ANY($4::text[]))
                         JOIN claims c ON e.source_id = c.id AND e.source_type = 'claim'
                         WHERE true
                           /* {VISIBILITY:c} */ /* {EDGE_VISIBILITY:e} */
@@ -1167,21 +1258,34 @@ impl LineageRepository {
             CROSS JOIN LATERAL unnest(w.frontier) AS u(id)
             ORDER BY u.id
             "#,
-            3,
+            5,
         );
         let mut q = sqlx::query_as::<_, IdDepthRow>(&sql)
             .bind(claim_id)
-            .bind(max_depth);
+            .bind(probe_depth(max_depth))
+            .bind(&folded)
+            .bind(&exact);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         let rows: Vec<IdDepthRow> = q.fetch_all(executor).await?;
 
+        // Drop the probe layer first; its presence is the depth flag.
+        let fetched = rows.len();
+        let mut sorted: Vec<(Uuid, i32)> = rows
+            .iter()
+            .filter(|r| r.depth <= max_depth)
+            .map(|r| (r.id, r.depth))
+            .collect();
+        let truncated_by_depth = sorted.len() != fetched;
+
         // Sort by depth descending (ancestors first)
-        let mut sorted: Vec<(Uuid, i32)> = rows.iter().map(|r| (r.id, r.depth)).collect();
         sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-        Ok(sorted.into_iter().map(|(id, _)| id).collect())
+        Ok(AncestorIds {
+            ids: sorted.into_iter().map(|(id, _)| id).collect(),
+            truncated_by_depth,
+        })
     }
 
     /// Query descendant lineage for a claim using recursive CTE

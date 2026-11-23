@@ -588,10 +588,12 @@ pub struct ExportProvenanceProvOParams {
     pub claim_id: String,
 
     #[schemars(
-        description = "Maximum ancestor depth to walk. The walk follows every claim-to-claim \
-                       edge INTO a claim, of any relationship (not only derived_from). \
-                       Default 5, clamped to 1..=20. A depth cutoff is NOT reported in \
-                       `truncated`."
+        description = "Maximum ancestor depth to walk. The walk follows derivation edges \
+                       INTO a claim (the derived_from family plus supports, elaborates, \
+                       decomposes_to), never refutes, contradicts or a successor's \
+                       supersedes. Default 5, clamped to 1..=20. When a claim you can read \
+                       lies past it, the document reports `truncated: true` and \
+                       `depth_truncated: true`."
     )]
     #[serde(default)]
     pub max_depth: Option<i32>,

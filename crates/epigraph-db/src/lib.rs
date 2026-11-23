@@ -263,6 +263,6 @@ pub use repos::political::{
 
 // Re-export Lineage types for users of LineageRepository
 pub use repos::lineage::{
-    LcaResult, LineageClaim, LineageEvidence, LineageNode, LineageResult, LineageTrace,
-    LINEAGE_INCOMING,
+    AncestorIds, LcaResult, LineageClaim, LineageEvidence, LineageNode, LineageResult,
+    LineageTrace, ANCESTOR_DERIVATION_RELATIONSHIPS, ANCESTOR_ID_RELATIONSHIPS, LINEAGE_INCOMING,
 };

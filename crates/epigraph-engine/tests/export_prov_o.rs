@@ -194,3 +194,249 @@ async fn export_maps_predicates_and_leaves_edges_relationship_column_unchanged()
         .expect("fetch supersedes edge");
     assert_eq!(supersedes_row.0, "supersedes");
 }
+
+// ---------------------------------------------------------------------------
+// Bounds and walk set (backlog 4caad789, 19d325d5) and parallel rows (11402482)
+// ---------------------------------------------------------------------------
+
+/// A public claim-to-claim `relationship` edge `source -> target`, forced to
+/// `('public', world)` so only the CLAIM predicate can hide an endpoint.
+async fn public_edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> Uuid {
+    let world = fixture::world_group(pool).await;
+    let id = fixture::seed_edge_owned_by(pool, source, target, "public", world).await;
+    sqlx::query("UPDATE edges SET relationship = $2 WHERE id = $1")
+        .bind(id)
+        .bind(relationship)
+        .execute(pool)
+        .await
+        .expect("set relationship");
+    id
+}
+
+async fn export_as(
+    pool: &PgPool,
+    viewer: &epigraph_db::visibility::Viewer,
+    root: Uuid,
+    max_depth: i32,
+    max_nodes: Option<usize>,
+) -> serde_json::Value {
+    let mut conn = pool.acquire().await.expect("acquire");
+    export_provenance_prov_o(
+        &mut conn,
+        viewer,
+        root,
+        Some(max_depth),
+        ProvExportLimits {
+            max_nodes,
+            max_content_chars: None,
+        },
+    )
+    .await
+    .expect("export")
+}
+
+fn entity_set(doc: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    doc["entities"]
+        .as_array()
+        .expect("entities")
+        .iter()
+        .map(|e| e["@id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn claim_set(ids: &[Uuid]) -> std::collections::BTreeSet<String> {
+    ids.iter().map(|id| format!("claim:{id}")).collect()
+}
+
+/// Two parallel rows of one `derived_from` fact (the edges table has no triple
+/// uniqueness since migrations 017/018/053) are ONE `prov:Relation`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn parallel_rows_of_one_fact_are_one_relation(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-parallel").await;
+    let root = fixture::seed_public_claim(&pool, agent, "parallel root").await;
+    let anc = fixture::seed_public_claim(&pool, agent, "parallel ancestor").await;
+    public_edge(&pool, anc, root, "derived_from").await;
+    public_edge(&pool, anc, root, "derived_from").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let doc = export_as(&pool, &viewer, root, 5, None).await;
+    let derived: Vec<_> = doc["relations"]
+        .as_array()
+        .expect("relations")
+        .iter()
+        .filter(|r| r["predicate"] == "prov:wasDerivedFrom")
+        .collect();
+    assert_eq!(
+        derived.len(),
+        1,
+        "one derivation fact is one relation, whatever its row count: {doc}"
+    );
+    assert_eq!(entity_set(&doc), claim_set(&[root, anc]));
+}
+
+/// The walk follows DERIVATION edges only. Disputing neighbours (`refutes`,
+/// `contradicts`) and a successor that `supersedes` the root (written
+/// new -> old, so it is an incoming edge but not an ancestor) are not
+/// ancestors; a `supports` ancestor still is. Under a node cap, the depth-2
+/// derivation ancestor is kept instead of the depth-1 disputers.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_walk_follows_derivation_edges_only(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-walkset").await;
+    let root = fixture::seed_public_claim(&pool, agent, "walkset root").await;
+    let a = fixture::seed_public_claim(&pool, agent, "walkset parent").await;
+    let b = fixture::seed_public_claim(&pool, agent, "walkset grandparent").await;
+    let refuter = fixture::seed_public_claim(&pool, agent, "walkset refuter").await;
+    let contra = fixture::seed_public_claim(&pool, agent, "walkset contradicter").await;
+    let successor = fixture::seed_public_claim(&pool, agent, "walkset successor").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, b, a, "derived_from").await;
+    public_edge(&pool, refuter, root, "refutes").await;
+    public_edge(&pool, contra, root, "contradicts").await;
+    public_edge(&pool, successor, root, "supersedes").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let whole = export_as(&pool, &viewer, root, 5, None).await;
+    assert_eq!(
+        entity_set(&whole),
+        claim_set(&[root, a, b]),
+        "only derivation ancestors are in the export: {whole}"
+    );
+
+    let capped = export_as(&pool, &viewer, root, 5, Some(3)).await;
+    assert_eq!(
+        entity_set(&capped),
+        claim_set(&[root, a, b]),
+        "a capped export keeps the derivation ancestors, not disputing neighbours: {capped}"
+    );
+    assert_eq!(capped["truncated"], false, "nothing derivational was cut");
+
+    // A `supports` ancestor is still lineage (as in `get_lineage`).
+    let support = fixture::seed_public_claim(&pool, agent, "walkset support").await;
+    public_edge(&pool, support, root, "supports").await;
+    let with_support = export_as(&pool, &viewer, root, 5, None).await;
+    assert!(
+        entity_set(&with_support).contains(&format!("claim:{support}")),
+        "a supports ancestor is still walked: {with_support}"
+    );
+}
+
+/// Upper-case `DERIVED_FROM` is NOT the derivation `derived_from`: it is the
+/// paraphrase edge, written paraphrase -> source atom (descendant -> origin),
+/// and `epigraph_core::edge::relationships` says never to fold the pair. So
+/// the walk must not take a paraphrase for an ancestor: not as an entity, and
+/// not as the depth probe's evidence of a cut. Membership is asserted (not a
+/// capped order), so the uuid order within a depth cannot make it pass.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paraphrase_is_not_an_ancestor(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-paraphrase").await;
+    let root = fixture::seed_public_claim(&pool, agent, "paraphrase root atom").await;
+    let parent = fixture::seed_public_claim(&pool, agent, "paraphrase compound parent").await;
+    let derived = fixture::seed_public_claim(&pool, agent, "paraphrase derivation source").await;
+    let probe = fixture::seed_public_claim(&pool, agent, "a paraphrase of the root").await;
+    let parent_probe = fixture::seed_public_claim(&pool, agent, "a paraphrase of the parent").await;
+    public_edge(&pool, parent, root, "decomposes_to").await;
+    public_edge(&pool, derived, root, "derived_from").await;
+    public_edge(&pool, probe, root, "DERIVED_FROM").await;
+    public_edge(&pool, parent_probe, parent, "DERIVED_FROM").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let walked =
+        epigraph_db::LineageRepository::get_ancestor_ids_probed(&pool, &viewer, root, Some(5))
+            .await
+            .expect("ancestor walk");
+    let walked: std::collections::BTreeSet<Uuid> = walked.ids.into_iter().collect();
+    assert_eq!(
+        walked,
+        [root, parent, derived].into_iter().collect(),
+        "the decomposes_to parent and the derived_from source are ancestors; \
+         the DERIVED_FROM paraphrases ({probe}, {parent_probe}) are not"
+    );
+
+    let doc = export_as(&pool, &viewer, root, 5, None).await;
+    assert_eq!(
+        entity_set(&doc),
+        claim_set(&[root, parent, derived]),
+        "{doc}"
+    );
+
+    // At max_depth 1 the only claim one layer further is the parent's
+    // paraphrase, which is not an ancestor, so nothing was cut.
+    let shallow = export_as(&pool, &viewer, root, 1, None).await;
+    assert_eq!(
+        entity_set(&shallow),
+        claim_set(&[root, parent, derived]),
+        "{shallow}"
+    );
+    assert_eq!(
+        shallow["depth_truncated"], false,
+        "a paraphrase past the depth is not a cut ancestor: {shallow}"
+    );
+}
+
+/// `truncated` reports a depth cutoff: a readable ancestor one layer past
+/// `max_depth` sets it (and `depth_truncated`); a lineage that ends exactly at
+/// `max_depth` does not.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_depth_cutoff_is_reported(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "prov-depth").await;
+    let root = fixture::seed_public_claim(&pool, agent, "depth root").await;
+    let a = fixture::seed_public_claim(&pool, agent, "depth 1").await;
+    let b = fixture::seed_public_claim(&pool, agent, "depth 2").await;
+    let c = fixture::seed_public_claim(&pool, agent, "depth 3").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, b, a, "derived_from").await;
+    public_edge(&pool, c, b, "derived_from").await;
+
+    let viewer = fixture::public_viewer(&pool).await;
+    let cut = export_as(&pool, &viewer, root, 2, None).await;
+    assert_eq!(entity_set(&cut), claim_set(&[root, a, b]));
+    assert_eq!(
+        cut["truncated"], true,
+        "depth 3 lies past max_depth 2: {cut}"
+    );
+    assert_eq!(cut["depth_truncated"], true, "{cut}");
+    assert!(
+        !cut.to_string().contains(&c.to_string()),
+        "the probe layer is named nowhere: {cut}"
+    );
+
+    let exact = export_as(&pool, &viewer, root, 3, None).await;
+    assert_eq!(entity_set(&exact), claim_set(&[root, a, b, c]));
+    assert_eq!(exact["truncated"], false, "complete at depth 3: {exact}");
+    assert_eq!(exact["depth_truncated"], false, "{exact}");
+}
+
+/// The depth probe counts READABLE ancestors only: a group-private ancestor
+/// past `max_depth` sets the flag for a member and leaves it false for a
+/// stranger, so the flag cannot reveal a hidden claim. The edges are forced
+/// public, so only the claim predicate decides.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_hidden_ancestor_past_the_depth_sets_no_flag(pool: PgPool) {
+    let (member, group) = fixture::seed_agent_with_group(&pool, "prov-depth-member").await;
+    let (stranger, _) = fixture::seed_agent_with_group(&pool, "prov-depth-stranger").await;
+    let root = fixture::seed_public_claim(&pool, member, "hidden-depth root").await;
+    let a = fixture::seed_public_claim(&pool, member, "hidden-depth parent").await;
+    let hidden = fixture::seed_group_claim(&pool, member, group, "hidden-depth private").await;
+    public_edge(&pool, a, root, "derived_from").await;
+    public_edge(&pool, hidden, a, "derived_from").await;
+
+    let member_viewer = epigraph_db::visibility::Viewer::resolve(&pool, member)
+        .await
+        .expect("member");
+    let doc = export_as(&pool, &member_viewer, root, 1, None).await;
+    assert_eq!(
+        doc["truncated"], true,
+        "CALIBRATION: the member can read the ancestor past the cut: {doc}"
+    );
+
+    let stranger_viewer = epigraph_db::visibility::Viewer::resolve(&pool, stranger)
+        .await
+        .expect("stranger");
+    let doc = export_as(&pool, &stranger_viewer, root, 1, None).await;
+    assert_eq!(entity_set(&doc), claim_set(&[root, a]));
+    assert_eq!(
+        doc["truncated"], false,
+        "the flag must not reveal a hidden ancestor past the cut: {doc}"
+    );
+    assert_eq!(doc["depth_truncated"], false, "{doc}");
+}
