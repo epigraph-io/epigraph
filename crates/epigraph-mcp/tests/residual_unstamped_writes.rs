@@ -106,18 +106,19 @@ const RESIDUAL_UNSTAMPED_WRITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "server.rs",
-        "AgentRepository::create",
+        "AgentRepository::create_signer",
         1,
-        "`agent_id`'s first-boot creation of the server's OWN `agents` row. `agents` carries no \
-         owner group (universally readable, migration 077), so the INSERT is admitted unstamped, \
-         and no caller exists to stamp from: this resolves the identity requests are attributed to.",
+        "`agent_id`'s first-boot creation of the server's OWN `agents` row (typed `llm` or \
+         `software_agent` at INSERT, backlog 9d4673a0). `agents` carries no owner group \
+         (universally readable, migration 077), so the INSERT is admitted unstamped, and no \
+         caller exists to stamp from: this resolves the identity requests are attributed to.",
     ),
     (
         "server.rs",
         "AgentRepository::set_llm_properties",
         1,
         "`agent_id`'s CREATE branch: annotate the freshly created server agent row with its \
-         derived LLM identity. Same row and same reason as `AgentRepository::create` above.",
+         derived LLM identity. Same row and same reason as `AgentRepository::create_signer` above.",
     ),
     (
         "server.rs",
