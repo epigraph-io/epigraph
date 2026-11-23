@@ -210,9 +210,9 @@ struct Registry {
 /// Six lineages, of which only ONE has "workflow" in its name or goal, and
 /// three flat workflow claims:
 ///
-/// * `afm-calibration`: three public generations; the head's goal diverged.
-/// * `funding-pipeline`, `md-campaign` (two generations): public.
-/// * `ndi-sysml-roadmap`: one generation, private to the member's group.
+/// * `alpha-calibration`: three public generations; the head's goal diverged.
+/// * `bravo-intake`, `charlie-recompute` (two generations): public.
+/// * `delta-roadmap`: one generation, private to the member's group.
 /// * `split-tenancy`: gen 0 public, gen 1 (the head) private to the group.
 /// * `zz-workflow-audit`: the one lineage a keyword search for "workflow" finds.
 /// * `retired-plan`: gen 0 live, gen 1 the head, DEPRECATED (truth 0.05).
@@ -226,15 +226,15 @@ async fn seed_registry(pool: &PgPool) -> Registry {
         seed_generation(pool, name, g, goal, 1.0, "public", group, at)
     };
 
-    public("afm-calibration", 0, "calibrate the cantilever", 50).await;
-    public("afm-calibration", 1, "calibrate the cantilever v2", 60).await;
-    let afm_head = public("afm-calibration", 2, "retune the tip after a crash", 70).await;
-    let funding = public("funding-pipeline", 0, "screen funding calls", 10).await;
-    public("md-campaign", 0, "recompute the md campaign", 5).await;
-    let md_head = public("md-campaign", 1, "recompute the md campaign again", 40).await;
-    let sysml = seed_generation(
+    public("alpha-calibration", 0, "calibrate the probe", 50).await;
+    public("alpha-calibration", 1, "calibrate the probe v2", 60).await;
+    let alpha_head = public("alpha-calibration", 2, "retune the probe after a fault", 70).await;
+    let bravo = public("bravo-intake", 0, "screen incoming requests", 10).await;
+    public("charlie-recompute", 0, "recompute the batch", 5).await;
+    let charlie_head = public("charlie-recompute", 1, "recompute the batch again", 40).await;
+    let delta = seed_generation(
         pool,
-        "ndi-sysml-roadmap",
+        "delta-roadmap",
         0,
         "draft the roadmap model",
         1.0,
@@ -289,10 +289,10 @@ async fn seed_registry(pool: &PgPool) -> Registry {
         .expect("retire flat workflow");
 
     let member_view = BTreeMap::from([
-        ("afm-calibration".to_string(), (afm_head, 2, 3)),
-        ("funding-pipeline".to_string(), (funding, 0, 1)),
-        ("md-campaign".to_string(), (md_head, 1, 2)),
-        ("ndi-sysml-roadmap".to_string(), (sysml, 0, 1)),
+        ("alpha-calibration".to_string(), (alpha_head, 2, 3)),
+        ("bravo-intake".to_string(), (bravo, 0, 1)),
+        ("charlie-recompute".to_string(), (charlie_head, 1, 2)),
+        ("delta-roadmap".to_string(), (delta, 0, 1)),
         ("split-tenancy".to_string(), (split_head, 1, 2)),
         ("zz-workflow-audit".to_string(), (audit, 0, 1)),
     ]);
@@ -437,7 +437,7 @@ async fn a_stranger_is_listed_only_what_it_reads(pool: PgPool) {
 
     let all = entries(&walk(&server, &r.stranger, 2, None).await);
     let mut want = r.member_view.clone();
-    want.remove("ndi-sysml-roadmap");
+    want.remove("delta-roadmap");
     want.insert("split-tenancy".to_string(), (r.split_public_gen0, 0, 1));
     assert_eq!(
         lineages(&all),
@@ -463,14 +463,14 @@ async fn a_lineage_that_gains_a_generation_mid_walk_is_listed_once(pool: PgPool)
     let first_entries = first["workflows"].as_array().expect("array").clone();
     assert_eq!(first_entries.len(), 1, "{first}");
     assert_eq!(
-        first_entries[0]["canonical_name"], "afm-calibration",
+        first_entries[0]["canonical_name"], "alpha-calibration",
         "{first}"
     );
 
     // A new head, created after every row seeded so far.
     seed_generation(
         &pool,
-        "afm-calibration",
+        "alpha-calibration",
         3,
         "a generation written mid-walk",
         1.0,
@@ -506,7 +506,7 @@ async fn a_lineage_that_gains_a_generation_mid_walk_is_listed_once(pool: PgPool)
 async fn a_cursor_the_tool_did_not_issue_is_invalid_params(pool: PgPool) {
     let server = app_role_server(&pool).await;
     let r = seed_registry(&pool).await;
-    for bad in ["x:afm", "h:", "f:not-a-uuid", "afm-calibration"] {
+    for bad in ["x:alpha", "h:", "f:not-a-uuid", "alpha-calibration"] {
         let err = call(&server, &r.member, 5, Some(bad.to_string()), None)
             .await
             .expect_err(bad);
@@ -521,7 +521,7 @@ async fn a_cursor_the_tool_did_not_issue_is_invalid_params(pool: PgPool) {
         &server,
         &r.member,
         5,
-        Some("h:md-campaign".to_string()),
+        Some("h:charlie-recompute".to_string()),
         None,
     )
     .await
