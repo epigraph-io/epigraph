@@ -3989,6 +3989,20 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
          text)",
         false,
     ),
+    // 239: the key rotation definer. No EXECUTE for the application role
+    // (239 section 1c: it would re-open the INSERT 239 revokes from it).
+    (
+        "epigraph_agent_key_rotate",
+        "public.epigraph_agent_key_rotate(uuid, bytea)",
+        false,
+    ),
+    // 254: the hierarchical cycle walk, called by the application's edge
+    // writers.
+    (
+        "epigraph_edges_reach",
+        "public.epigraph_edges_reach(uuid, uuid, text[])",
+        true,
+    ),
 ];
 
 /// The EXECUTE grants to `epigraph_app` of the definers in
@@ -5731,6 +5745,17 @@ mod definer_register_tests {
         // 217: the factor triggers on edges and claims.
         "auto_create_factor_from_edge",
         "deactivate_superseded_factors",
+        // 238: the claims widening guard.
+        "epigraph_claims_block_widening",
+        // 240: the behavioral-execution tenancy inheritance and its follows.
+        "epigraph_behavioral_execution_inherit_tenancy",
+        "epigraph_workflow_behavioral_executions_follow",
+        "epigraph_claim_behavioral_executions_follow",
+        // 250: the masses-written marker and the assessment-event guard.
+        "epigraph_mass_function_masses_written",
+        "epigraph_events_assessment_guard",
+        // 260: the edge declaration recorder.
+        "epigraph_edges_record_declaration",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each
