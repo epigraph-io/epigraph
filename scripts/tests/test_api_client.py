@@ -49,7 +49,8 @@ class _Server:
     """Records (method, path, headers, body) of every request. Token-endpoint
     paths answer `token_status` / `token_body`, the introspection path answers
     `introspect_status` / `introspect_body` (inactive unless a test says
-    otherwise), and every other path answers 200."""
+    otherwise), and every other path answers 200. With `redirect_to` set,
+    every path instead answers a 307 to the same path on that base."""
 
     def __init__(self):
         self.requests = []
@@ -59,6 +60,7 @@ class _Server:
         self.introspect_path = "/oauth/introspect"
         self.introspect_status = 200
         self.introspect_body = {"active": False}
+        self.redirect_to = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -66,6 +68,12 @@ class _Server:
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n).decode() if n else ""
                 outer.requests.append((self.command, self.path, dict(self.headers), body))
+                if outer.redirect_to:
+                    self.send_response(307)
+                    self.send_header("Location", outer.redirect_to + self.path)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if self.path in outer.token_paths:
                     status, payload = outer.token_status, outer.token_body
                 elif self.path == outer.introspect_path:
@@ -275,6 +283,45 @@ def test_an_elevated_token_holds_admin_scopes_through_platform_admin(server, mon
     with pytest.raises(SystemExit) as e:
         _api_client.EpiGraphClient(scopes=["claims:write", "entity-types:write"])
     assert "entity-types:write" in _exit_message(e)
+
+
+@pytest.fixture
+def elsewhere():
+    """A second server, standing in for whatever host a redirect points at."""
+    s = _Server()
+    yield s
+    s.httpd.shutdown()
+    s.httpd.server_close()
+
+
+def test_a_redirected_introspection_never_sends_the_token_on(server, elsewhere, monkeypatch):
+    """The token travels in the introspection BODY, which `requests` re-sends
+    on a 307/308 to any host (it strips only the Authorization header on a
+    host change). A redirect must stop the check, not carry the token to the
+    redirect's target and take that host's word that it is active."""
+    monkeypatch.setenv("EPIGRAPH_TOKEN", OPERATOR_TOKEN)
+    server.redirect_to = elsewhere.base
+    elsewhere.introspect_body = {"active": True, "scope": "claims:read"}
+    with pytest.raises(SystemExit) as e:
+        _api_client.EpiGraphClient(scopes=["claims:read"])
+    msg = _exit_message(e)
+    assert "307" in msg and "/oauth/introspect" in msg, msg
+    assert OPERATOR_TOKEN not in msg
+    assert elsewhere.requests == []
+
+
+def test_a_redirected_exchange_never_sends_the_secret_on(server, elsewhere, monkeypatch):
+    """The same for the client_credentials exchange: the secret is in the
+    form body, so a redirect must stop the exchange, not re-post it."""
+    _service_credentials(monkeypatch)
+    server.redirect_to = elsewhere.base
+    elsewhere.token_body = {"access_token": "elsewhere", "scope": "claims:read"}
+    with pytest.raises(SystemExit) as e:
+        _api_client.EpiGraphClient(scopes=["claims:read"])
+    msg = _exit_message(e)
+    assert "307" in msg and "/oauth/token" in msg, msg
+    assert SECRET not in msg
+    assert elsewhere.requests == []
 
 
 def test_a_refused_exchange_exits_without_echoing_the_secret(server, monkeypatch):

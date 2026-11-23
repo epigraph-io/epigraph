@@ -1551,7 +1551,12 @@ introspected scopes of `EPIGRAPH_TOKEN`), or when introspection says the token
 is not active or cannot be reached. An elevated token carrying `platform:admin`
 counts as holding the `*:admin` scopes, as the server does. The check reads
 only the token: a scope the server's admin-scope switch or a delegation ceiling
-withholds still fails at the request that needs it. A job that
+withholds still fails at the request that needs it. Neither request follows a
+redirect, because both carry a credential in the body (the token, or the
+client secret), which an HTTP client re-sends to the redirect's target
+whatever its host: a 3xx from either endpoint exits, so point
+`EPIGRAPH_API_BASE` and `EPIGRAPH_OAUTH_TOKEN_URL` at the final URL (for
+example `https://`, not an `http://` that a proxy upgrades). A job that
 had both `EPIGRAPH_TOKEN` and `EPIGRAPH_JWT_SECRET` set used to ignore the
 token and sign its own; it now runs on the token. That covers `anchor_papers_to_themes.py`, `classify_paper_document_type.py`,
 `update_theme_workflow_steps.py` and `lib/nli_stance.py`.

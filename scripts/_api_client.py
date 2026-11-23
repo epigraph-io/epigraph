@@ -60,6 +60,21 @@ def resolve_api_base(base: Optional[str] = None) -> str:
     return (base or _env("EPIGRAPH_API_BASE") or DEFAULT_API_BASE).rstrip("/")
 
 
+def _is_2xx(resp: requests.Response) -> bool:
+    """`resp.ok` is true for any status below 400, a 3xx included; an auth
+    endpoint that answers anything but 2xx has not answered."""
+    return 200 <= resp.status_code < 300
+
+
+def _redirect_hint(resp: requests.Response, env_var: str) -> str:
+    if 300 <= resp.status_code < 400:
+        return (
+            f" (a redirect, which this helper does not follow because the request"
+            f" body carries a credential; point {env_var} at the final URL)"
+        )
+    return ""
+
+
 def fetch_service_token(
     client_id: str,
     client_secret: str,
@@ -73,7 +88,9 @@ def fetch_service_token(
     Exits when the endpoint refuses, answers without an `access_token`, or
     grants fewer scopes than requested: the server drops ungranted scopes
     silently, and a job that needs one should stop here rather than 403
-    partway through. No message includes the secret.
+    partway through. A redirect also exits: the secret is in the request
+    body, which `requests` would re-post to the redirect's target, whatever
+    its host. No message includes the secret.
     """
     try:
         resp = requests.post(
@@ -85,12 +102,14 @@ def fetch_service_token(
                 "scope": " ".join(scopes),
             },
             timeout=timeout,
+            allow_redirects=False,
         )
     except requests.RequestException as e:
         raise SystemExit(f"token endpoint {token_url} unreachable: {type(e).__name__}")
-    if not resp.ok:
+    if not _is_2xx(resp):
         raise SystemExit(
             f"token endpoint {token_url} refused client {client_id!r}: HTTP {resp.status_code}"
+            + _redirect_hint(resp, "EPIGRAPH_OAUTH_TOKEN_URL")
         )
     try:
         body = resp.json()
@@ -135,22 +154,26 @@ def check_token_scopes(
     a JSON `{"token": ...}` body) says `token` is active and carries every
     scope in `scopes`.
 
-    Fails closed: an unreachable endpoint, a non-2xx answer or a body that
-    does not say `"active": true` all exit, so a wrong, expired or revoked
-    token stops here instead of on its first refused call. No message
-    includes the token.
+    Fails closed: an unreachable endpoint, a non-2xx answer (a redirect
+    included) or a body that does not say `"active": true` all exit, so a
+    wrong, expired or revoked token stops here instead of on its first
+    refused call. Redirects are not followed: the token is in the request
+    body, which `requests` would re-send to the redirect's target, whatever
+    its host. No message includes the token.
     """
     try:
-        resp = requests.post(introspect_url, json={"token": token}, timeout=timeout)
+        resp = requests.post(
+            introspect_url, json={"token": token}, timeout=timeout, allow_redirects=False
+        )
     except requests.RequestException as e:
         raise SystemExit(
             f"introspection endpoint {introspect_url} unreachable: {type(e).__name__}; "
             "cannot check EPIGRAPH_TOKEN"
         )
-    if not resp.ok:
+    if not _is_2xx(resp):
         raise SystemExit(
             f"introspection endpoint {introspect_url} answered HTTP {resp.status_code}; "
-            "cannot check EPIGRAPH_TOKEN"
+            "cannot check EPIGRAPH_TOKEN" + _redirect_hint(resp, "EPIGRAPH_API_BASE")
         )
     try:
         body = resp.json()
