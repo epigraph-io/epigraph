@@ -477,8 +477,9 @@ async fn a_freshly_registered_agent_client_cannot_read_a_claim(pool: PgPool) {
     }
 
     // And no token can be obtained: get_by_client_id filters status='active',
-    // so there is no credential with which to read a claim.
-    let (status, _) = post_json(
+    // so there is no credential with which to read a claim. A pending client
+    // reads as unknown: RFC 6749 `invalid_client` (400, backlog 31d799b3).
+    let (status, body) = post_json(
         app(pool.clone()),
         "/oauth/token",
         json!({
@@ -488,10 +489,13 @@ async fn a_freshly_registered_agent_client_cannot_read_a_claim(pool: PgPool) {
         }),
     )
     .await;
-    assert!(
-        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN,
-        "a pending client must not obtain a token, got {status}"
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a pending client must not obtain a token: {body}"
     );
+    assert_eq!(body["error"], "invalid_client", "{body}");
+    assert!(body.get("access_token").is_none(), "{body}");
 }
 
 // =============================================================================

@@ -171,9 +171,13 @@ pub fn chain_scopes(consented: Vec<String>) -> Vec<String> {
     epigraph_auth::without_elevated_only_scope(consented)
 }
 
-/// What a path that HANDS OUT scopes (client approval, registration's
-/// request, the operator CLI's grant) may do with the admin-only ones it was
-/// asked for.
+/// What a request path that HANDS OUT scopes may do with the admin-only ones
+/// it was asked for: registration's `scope`, and the refusals of
+/// `POST /api/v1/admin/clients/:id/approve`, which then answers 501 and
+/// approves nothing (migration 188). Client approval itself is
+/// `epigraph-operator approve-client` on the maintenance DSN (through the
+/// definer `epigraph_oauth_client_approve`, for a pending client), and it and
+/// the CLI's `grant-client-scope` read migration 128's switch themselves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandOut {
     /// None of the scopes is admin-only.

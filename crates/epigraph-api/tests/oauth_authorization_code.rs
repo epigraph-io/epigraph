@@ -1670,6 +1670,16 @@ async fn authorize_relaxes_only_the_loopback_port(pool: PgPool) {
 /// request carried `redirect_uri` (Google's token endpoint mocked as in
 /// `the_consent_page_cannot_be_framed_or_cached`).
 async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String) {
+    consent_page_with_origins(pool, redirect_uri, RedirectOrigins::default()).await
+}
+
+/// [`consent_page_for`] on a server configured with `origins`
+/// (`EPIGRAPH_OAUTH_REDIRECT_ORIGINS`).
+async fn consent_page_with_origins(
+    pool: &PgPool,
+    redirect_uri: &str,
+    origins: RedirectOrigins,
+) -> (String, String) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -1705,8 +1715,11 @@ async fn consent_page_for(pool: &PgPool, redirect_uri: &str) -> (String, String)
             Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
         )
         .expect("register google");
-    let app =
-        create_router(AppState::with_db(pool.clone(), config()).with_providers(Arc::new(registry)));
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_providers(Arc::new(registry))
+            .with_oauth_redirect_origins(origins),
+    );
 
     let google_state = format!("gstate_{}", Uuid::new_v4().simple());
     AuthorizeSessionRepository::create(
@@ -1761,5 +1774,87 @@ async fn consent_names_a_local_application_for_a_loopback_redirect(pool: PgPool)
     assert!(
         body.contains("Authorize Claude"),
         "a claude.ai sign-in is still presented as Claude: {body}"
+    );
+}
+
+// ── 5664ea1c: operator-configured redirect origins ───────────────────────
+
+use epigraph_api::oauth::redirect::RedirectOrigins;
+
+const PARTNER_CALLBACK: &str = "https://explorer.example.test/oauth/callback";
+
+fn partner_origins() -> RedirectOrigins {
+    RedirectOrigins::parse(Some("https://explorer.example.test")).expect("a valid origin")
+}
+
+fn dcr_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "Explorer",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    })
+}
+
+/// An operator adds a redirect origin by configuration: dynamic registration
+/// with a callback on that origin succeeds and locks it; a callback on an
+/// unlisted origin (or a lookalike of the listed one) is still refused on the
+/// same server; and the same callback is refused by a server without the
+/// setting, so the acceptance is the configuration's.
+///
+/// Catches: the allowlist ignoring the configured origins, and a configured
+/// origin matched by prefix or suffix instead of exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_a_configured_origin_and_refuses_an_unlisted_one(pool: PgPool) {
+    let configured = create_router(
+        AppState::with_db(pool.clone(), config()).with_oauth_redirect_origins(partner_origins()),
+    );
+    let (status, body) = post_json2(
+        configured.clone(),
+        "/oauth/register",
+        dcr_body(PARTNER_CALLBACK),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "configured origin: {body}");
+    assert_eq!(body["redirect_uris"][0], PARTNER_CALLBACK, "{body}");
+
+    for unlisted in [
+        "https://other.example.test/oauth/callback",
+        "https://explorer.example.test.evil.test/oauth/callback",
+        "https://explorer.example.test@evil.test/oauth/callback",
+        "http://explorer.example.test/oauth/callback",
+        "https://explorer.example.test:8443/oauth/callback",
+    ] {
+        let (status, body) =
+            post_json2(configured.clone(), "/oauth/register", dcr_body(unlisted)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unlisted}: {body}");
+    }
+
+    let (status, body) = post_json2(
+        create_router(AppState::with_db(pool.clone(), config())),
+        "/oauth/register",
+        dcr_body(PARTNER_CALLBACK),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "without the setting the same origin is refused: {body}"
+    );
+}
+
+/// The consent page for a configured origin names that origin, which the
+/// server validated, and does not present the sign-in as Claude's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_the_configured_origin(pool: PgPool) {
+    let (body, email) = consent_page_with_origins(&pool, PARTNER_CALLBACK, partner_origins()).await;
+    assert!(
+        !body.contains("Claude"),
+        "a configured origin is not presented as Claude: {body}"
+    );
+    assert!(
+        body.contains("https://explorer.example.test") && body.contains(&email),
+        "the page names the origin that receives access: {body}"
     );
 }

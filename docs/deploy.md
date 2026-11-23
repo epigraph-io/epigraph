@@ -583,6 +583,7 @@ For the others, anything else is off.
 | `EPIGRAPH_REQUEST_UNIT_RECHECK_SECS` | `30` (1–300) | How often a running request unit re-reads its database posture. |
 | `EPIGRAPH_RUN_TOKENS` | `off` | `on` admits delegated run tokens where their delegation is live. Any other value stays off and is warned about. `POST /oauth/introspect` applies the same check: a delegated run token reads `active: false` while the switch is off, once its delegation has ended (operator link retired, delegator's allowance, client or writer membership revoked), or when it carries a scope outside the delegated ceiling, and the endpoint answers 503 when the check cannot be made. |
 | `EPIGRAPH_RUN_TOKEN_MODELS` | empty | The LLM models a run token may be minted for, matched against the agent's attested registration (migration 161), never its display properties. Empty refuses every mint. |
+| `EPIGRAPH_OAUTH_REDIRECT_ORIGINS` | empty | Extra HTTPS origins on which `/oauth/register` (dynamic client registration) accepts a `redirect_uri`, beside the built-in `https://claude.ai/`, `https://claude.com/` and loopback (`http://127.0.0.1`, `http://[::1]`) callbacks. Comma- or space-separated, each exactly `https://host[:port]`: no path, query, fragment, userinfo or `*`; anything else **refuses the boot**, naming the entry. A redirect must be on a listed origin exactly (same scheme, host and port; any path). The consent page names the origin, not the client's self-chosen name. Removing an origin later does not revoke clients already registered with it: `/oauth/authorize` matches the client's registered `redirect_uris`, so suspend or revoke those clients (`epigraph-operator suspend-client` / `revoke-client`). See `crates/epigraph-api/src/oauth/redirect.rs`. |
 | `EPIGRAPH_TOKEN_EXCHANGE_AUDIENCES` | empty | The federation extensions (by their `EPIGRAPH_MCP_EXTENSIONS` name) the RFC 8693 token-exchange grant at `/oauth/token` may mint for. Empty refuses every exchange, so a gateway with mounted extensions can call none of them. The kernel's own audience is never accepted here. See `crates/epigraph-api/src/oauth/token_exchange.rs`. |
 | `EPIGRAPH_BP_APPLY` | `off` | `on` lets `POST /api/v1/bp/propagate` write results to atom claims. BP apply is retired; compounds are never written. |
 | `EPIGRAPH_BP_MAX_CONCURRENT` | `2` | How many `POST /api/v1/bp/propagate` runs may be in flight at once. A run beyond it is refused with 503 rather than queued; `0` refuses every run. A value that is not a non-negative integer, or is above the runtime semaphore's maximum (`usize::MAX >> 3`), is warned about and the default is used. Each request must also name its scope (`claim_ids` and `max_hops`, or `frame_id`). |
@@ -603,7 +604,7 @@ For the others, anything else is off.
 | `--agent-key` / `EPIGRAPH_MCP_AGENT_KEY` | unset | The signer's Ed25519 secret key, 64 hex characters. |
 | `--agent-model` / `EPIGRAPH_AGENT_MODEL`, `--agent-system-prompt` / `EPIGRAPH_AGENT_SYSTEM_PROMPT`, `--agent-system-prompt-hash` / `EPIGRAPH_AGENT_SYSTEM_PROMPT_HASH` | must be unset | Set → exit 1 (backlog bfc2eff8). They derived the signing key as BLAKE3 of public inputs (model and prompt hash), which anyone can recompute. Use the separate-signing-key mode, whose identity the host derives with a secret, or `--agent-key`. |
 | `--agent-identity-pubkey` / `EPIGRAPH_AGENT_IDENTITY_PUBKEY` with `EPIGRAPH_AGENT_SIGNING_KEY_FILE` or `EPIGRAPH_AGENT_SIGNING_KEY` (environment only, exactly one) | unset | The separate-signing-key mode: the host registered the identity, and the process signs with a different, active `signing` key of that agent. stdio only. Excludes `--agent-key`. Prefer `EPIGRAPH_AGENT_SIGNING_KEY_FILE`: a path to a regular file (not a symlink) owned by the process's uid, mode 0600 or 0400, holding the 64 hex characters; anything else → exit 1. `EPIGRAPH_AGENT_SIGNING_KEY` puts the key itself in `/proc/<pid>/environ` for the life of the process. Both set → exit 1. |
-| `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`). The flag's `--help` text says "mock embeddings"; the code disables embedding instead. |
+| `--openai-api-key` / `OPENAI_API_KEY` | unset | Embeddings. Unset → embedding is disabled (`embeddings disabled (no API key)`): claims are stored without vectors and semantic recall over them is unavailable. No mock vectors are generated. |
 | `--listen` | stdio | `host:port` or `unix:/abs/path`. |
 | `--jwt-secret` / `EPIGRAPH_JWT_SECRET` | — | A TCP `--listen` needs this or `--jwt-jwks`. At least 32 bytes. The same secret as the API. Beside `--jwt-jwks` it is the HS256 accept window. |
 | `--jwt-jwks` / `EPIGRAPH_JWT_JWKS` | unset | The API's `/.well-known/jwks.json`, for an API that signs EdDSA: verify-only by public key. A set that is not all Ed25519 keys is a boot error. |
@@ -2066,9 +2067,9 @@ scopes, narrowed to the client's current `granted_scopes` (RFC 6749 section
    `client_assertion_type=urn:epigraph:ed25519`), and a service sends its
    `client_secret`. Each is checked exactly as the `client_credentials` grant
    checks it (one shared check). A `client_id` on the request must be the
-   chain's own. A refresh that does not authenticate is refused (`400` for a
-   missing credential, `401` for a wrong one or a foreign `client_id`) and
-   changes nothing: the presented token is neither burned nor rotated, so the
+   chain's own. A refresh that does not authenticate is refused (`400
+   invalid_client` for a missing or wrong credential, see "Token-endpoint
+   error bodies" below; `401` for a foreign `client_id`) and changes nothing: the presented token is neither burned nor rotated, so the
    client can retry with its credential. A later secret rotation or key change
    therefore cuts a live chain. No in-tree consumer refreshes an agent or
    service chain (the agents re-run `client_credentials`). An out-of-tree
@@ -2109,6 +2110,42 @@ scopes, narrowed to the client's current `granted_scopes` (RFC 6749 section
    `epigraph_refresh_token_revoke_client_app`, drop the partial index, and
    drop the column. The rotate definer is untouched by 174, so nothing is
    re-run for it.
+
+### Token-endpoint and revocation error bodies (RFC 6749 section 5.2, RFC 7009)
+
+A contract change for clients of `POST /oauth/token` and `POST /oauth/revoke`
+(backlog 31d799b3 and cd96cd49):
+
+1. **A confidential client that fails to authenticate gets `invalid_client`.**
+   On the `client_credentials` grant and on the refresh grant of an agent or
+   service chain, every client-authentication failure (an unknown or missing
+   `client_id`, a missing, malformed or wrong `client_secret` or
+   `client_assertion`, a replayed assertion) answers
+   `{"error":"invalid_client","error_description":"client authentication failed"}`.
+   The description is the same for every case; the reason is in the API log
+   (`confidential client authentication failed`, with `reason=`).
+   * The status is `400`: the client authenticated in the request body
+     (`client_secret_post`, the only method the server metadata advertises),
+     so RFC 6749 section 5.2 owes no challenge.
+   * A request that carried `Authorization: Basic ...` (not accepted) gets
+     `401` with `WWW-Authenticate: Basic realm="oauth", charset="UTF-8"`, as
+     section 5.2 requires for a client that tried the header.
+   * **Before:** `{"error":"Unauthorized",...}` (`401`) for an unknown client
+     or a wrong credential and `{"error":"BadRequest",...}` (`400`) for a
+     missing or malformed one. A caller that matched the old body text
+     (`Unknown client_id`, `Invalid client_secret`) or keyed on `401` for a
+     wrong secret must key on `error == "invalid_client"` instead. The
+     in-tree and host callers measured treat every non-2xx mint alike.
+   * Unchanged: a refresh token that is unknown, spent or presented under a
+     foreign `client_id` (`401`), a suspended client (`403`), a human client
+     on `client_credentials` (`400`), and a database failure (`500`).
+2. **A malformed revocation request gets `invalid_request`.** `POST
+   /oauth/revoke` with no `token`, or a body that does not parse, answers
+   `400 {"error":"invalid_request","error_description":...}` (RFC 7009
+   section 2.2.1) instead of `{"error":"BadRequest",...}`. The status is
+   unchanged.
+
+Rollback: the previous API binary. No migration.
 
 ## 9. Operator binding, the custodian role, identities, groups and the operator CLI
 

@@ -70,7 +70,8 @@ pub const CLAIMS_ADMIN: &str = "claims:admin";
 /// `epigraph-operator grant-client-scope <client-id> <scope>` (and withdraws it
 /// with `revoke-client-scope`): maintenance DSN only, scopes from THIS list
 /// only, `client_type = 'human'` only (service and agent clients are refused;
-/// `bootstrap_clients` and the approval route manage theirs), both
+/// `bootstrap_clients` and approval, `epigraph-operator approve-client`,
+/// manage theirs), both
 /// `allowed_scopes` and `granted_scopes` kept consistent for that scope,
 /// idempotent, with a `--dry-run`, and one `security_events` row
 /// (`oauth.client_scope_granted` / `oauth.client_scope_revoked`) naming who,

@@ -617,6 +617,22 @@ async fn service_and_agent_clients_are_refused(pool: PgPool) {
             "{}",
             r.show()
         );
+        // The refusal names a path that works (backlog dd11c01e): an agent
+        // client's scopes are set when it is approved by the operator verb on
+        // the maintenance DSN, not by the disabled `/approve` route (501 since
+        // migration 188).
+        assert!(
+            !r.stderr.contains("approval route") && !r.stderr.contains("/approve"),
+            "no disabled route named: {}",
+            r.show()
+        );
+        if kind == "agent" {
+            assert!(
+                r.stderr.contains("epigraph-operator approve-client"),
+                "the agent refusal names the approval verb: {}",
+                r.show()
+            );
+        }
         assert_eq!(scopes(&pool, client).await, before, "nothing was written");
     }
     assert_eq!(all_scope_audit_rows(&pool).await, 0);

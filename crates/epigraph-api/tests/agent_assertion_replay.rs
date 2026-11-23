@@ -7,15 +7,16 @@
 //! refresh token as often as it was replayed inside that window. Driven
 //! through the real `/oauth/token` route against a `#[sqlx::test]` database:
 //!
-//! * `client_credentials`: the same assertion twice -> 200, then 401 with no
-//!   token; a FRESH assertion by the same client right after -> 200
-//!   (calibration: the refusal is the replay, not the client's state); another
-//!   client's assertion carrying the same nonce bytes -> 200 (the record is per
-//!   client).
+//! * `client_credentials`: the same assertion twice -> 200, then 400
+//!   `invalid_client` with no token; a FRESH assertion by the same client
+//!   right after -> 200 (calibration: the refusal is the replay, not the
+//!   client's state); another client's assertion carrying the same nonce
+//!   bytes -> 200 (the record is per client).
 //! * the refresh grant, where an agent authenticates with the same assertion
-//!   check: an assertion already spent on `client_credentials` -> 401, an
-//!   assertion replayed after one successful refresh -> 401, and each refusal
-//!   leaves the presented refresh token usable with a fresh assertion.
+//!   check: an assertion already spent on `client_credentials` -> 400
+//!   `invalid_client`, an assertion replayed after one successful refresh ->
+//!   400 `invalid_client` (RFC 6749 section 5.2, backlog 31d799b3), and each
+//!   refusal leaves the presented refresh token usable with a fresh assertion.
 //!
 //! The grants this file cannot see (the definer's EXECUTE grant to the
 //! application role, the revoked table DML) are measured as `epigraph_app` in
@@ -164,10 +165,11 @@ async fn a_replayed_client_credentials_assertion_is_refused(pool: PgPool) {
     let (status, body) = post_token(&app, credentials_grant(&client_id, &captured)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the same assertion presented again inside its window must be refused: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
     assert!(body.get("refresh_token").is_none(), "{body}");
 
     // Calibration: the client itself is fine; a fresh assertion mints.
@@ -215,10 +217,11 @@ async fn a_replayed_assertion_is_refused_on_the_refresh_grant(pool: PgPool) {
     let (status, body) = post_token(&app, refresh_grant(&r0, &client_id, &minted_with)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "an assertion already spent on client_credentials is a replay on refresh: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 
     // r0 was left intact by that refusal.
     let refreshed_with = fresh_assertion(&key);
@@ -234,10 +237,11 @@ async fn a_replayed_assertion_is_refused_on_the_refresh_grant(pool: PgPool) {
     let (status, body) = post_token(&app, refresh_grant(&r1, &client_id, &refreshed_with)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "an assertion replayed on a second refresh must be refused: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 
     let (status, body) =
         post_token(&app, refresh_grant(&r1, &client_id, &fresh_assertion(&key))).await;
@@ -287,10 +291,11 @@ async fn an_assertion_spent_on_one_spelling_of_a_key_is_refused_on_another(pool:
     let (status, body) = post_token(&app, credentials_grant(&upper, &captured)).await;
     assert_eq!(
         status,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::BAD_REQUEST,
         "the same signed assertion replayed under the other spelling of the key: {body}"
     );
     assert!(body.get("access_token").is_none(), "{body}");
+    assert_eq!(body["error"], "invalid_client", "{body}");
 }
 
 /// Backlog 57943a39: an agent client whose key is held by a `seed-derived`

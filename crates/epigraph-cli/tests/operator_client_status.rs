@@ -301,12 +301,10 @@ async fn suspend_then_revoke_contains_a_service_client(pool: PgPool) {
     );
     assert_eq!(applied_state, ("suspended".to_string(), 0, 2, 1));
     // `get_by_client_id` reads only an ACTIVE client, so a suspended one is
-    // refused as unknown (401), the same answer as a client that never existed.
-    assert_eq!(cc_status, StatusCode::UNAUTHORIZED, "{cc_body}");
-    assert!(
-        cc_body.to_string().contains("Unknown client_id"),
-        "{cc_body}"
-    );
+    // refused as unknown (RFC 6749 `invalid_client`, 400), the same answer as
+    // a client that never existed.
+    assert_eq!(cc_status, StatusCode::BAD_REQUEST, "{cc_body}");
+    assert_eq!(cc_body["error"], "invalid_client", "{cc_body}");
     assert_ne!(
         rt_status,
         StatusCode::OK,

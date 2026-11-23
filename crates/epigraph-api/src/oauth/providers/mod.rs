@@ -119,7 +119,9 @@ pub fn build_registry(
     let mut registry = ProviderRegistry::empty();
     if !path.exists() {
         return Err(format!(
-            "providers.toml not found at {path:?}; copy from providers.toml at repo root or set EPIGRAPH_PROVIDERS_CONFIG"
+            "providers.toml not found at {path:?}; create it from the template \
+             providers.toml.example (shipped at the repository root), or set \
+             EPIGRAPH_PROVIDERS_CONFIG to the path of an existing providers.toml"
         ));
     }
 
@@ -226,6 +228,29 @@ pub(crate) fn jwks_unavailable(flow: &'static str, detail: &str) -> crate::error
     );
     crate::errors::ApiError::ServiceUnavailable {
         service: JWKS_UNAVAILABLE_SERVICE.into(),
+    }
+}
+
+#[cfg(test)]
+mod missing_config_tests {
+    use super::build_registry;
+
+    /// The repository ships only `providers.toml.example`, so the error for a
+    /// missing file names that template and `EPIGRAPH_PROVIDERS_CONFIG`, never
+    /// a `providers.toml` "at repo root" that does not exist (backlog
+    /// a13bef05).
+    #[test]
+    fn a_missing_providers_toml_names_the_shipped_template() {
+        let path = std::env::temp_dir().join(format!(
+            "epigraph-no-providers-{}/providers.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let err = build_registry(&path, false, "production")
+            .err()
+            .expect("a missing file is an error");
+        assert!(err.contains("providers.toml.example"), "{err}");
+        assert!(err.contains("EPIGRAPH_PROVIDERS_CONFIG"), "{err}");
+        assert!(!err.contains("repo root"), "{err}");
     }
 }
 

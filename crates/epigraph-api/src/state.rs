@@ -490,6 +490,12 @@ pub struct AppState {
     /// but external `grant_type=*` requests return 400 unsupported_grant_type.
     pub providers: Arc<ProviderRegistry>,
 
+    /// The operator's extra OAuth redirect origins
+    /// (`crate::oauth::redirect::REDIRECT_ORIGINS_ENV`), which
+    /// `/oauth/register` accepts beside the built-in hosted and loopback
+    /// classes. EMPTY in every constructor; `bin/server.rs` sets it at boot.
+    pub oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins,
+
     /// entity_types registry cache: `type_name` -> resolved [`EntityTypeEntry`].
     ///
     /// The single source of truth (in-process) for BOTH edge entity-type
@@ -1418,6 +1424,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -1477,6 +1484,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -1511,6 +1519,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -2080,6 +2089,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2116,6 +2126,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
         }
     }
 
@@ -2164,6 +2175,7 @@ impl AppState {
             jwt_config: Self::default_jwt_config(),
             policy_gate: Arc::new(epigraph_authz::GroupPolicyGate::new()),
             providers: Arc::new(ProviderRegistry::empty()),
+            oauth_redirect_origins: crate::oauth::redirect::RedirectOrigins::default(),
             entity_type_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             admin_scope_arming: Arc::new(epigraph_db::AdminScopeArmingCache::default()),
             passkeys: None,
@@ -2876,6 +2888,17 @@ impl AppState {
     #[must_use]
     pub fn with_policy_gate(mut self, gate: SharedPolicyGate) -> Self {
         self.policy_gate = gate;
+        self
+    }
+
+    /// Set the extra OAuth redirect origins; see
+    /// [`Self::oauth_redirect_origins`].
+    #[must_use]
+    pub fn with_oauth_redirect_origins(
+        mut self,
+        origins: crate::oauth::redirect::RedirectOrigins,
+    ) -> Self {
+        self.oauth_redirect_origins = origins;
         self
     }
 
