@@ -38,10 +38,17 @@ use crate::host_guard::{streamable_http_server_config, HostAllowlist};
 /// on a downstream) and no tool-level timeout.
 ///
 /// One hour outlasts those calls while keeping a bound on abandoned sessions
-/// (a client whose connection dropped without a `DELETE`). Sessions can only
-/// be created through the auth layer, so a longer bound does not let an
-/// unauthenticated caller grow the session table; the separate `init_timeout`
-/// (rmcp's default, 60 s) still bounds sessions that never initialize.
+/// (a client whose connection dropped without a `DELETE`). What stands in
+/// front of session creation depends on the listener kind. On a
+/// `--jwt-secret` listener (every TCP listener) sessions are created inside
+/// the bearer layer, so only an authenticated caller can hold one open for the
+/// hour. A unix-socket listener started with `--allow-unauthenticated-http`
+/// has no bearer layer: any process that can open the socket creates sessions
+/// with no credential (`tests/unauthenticated_listener_binary.rs` does), and
+/// the socket's filesystem permissions are the only barrier to growing the
+/// session table there. On both kinds the separate `init_timeout` (rmcp's
+/// default, 60 s) still bounds sessions that never initialize; an initialized
+/// session that goes quiet lives for this bound.
 pub const SESSION_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// The largest MCP HTTP request body the listener reads: 4 MiB, rmcp 3.x's
