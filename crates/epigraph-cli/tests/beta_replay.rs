@@ -10,13 +10,13 @@
 //!   of claims still on the prior, records them in the manifest, and writes no
 //!   `ds_bayesian_divergence` row;
 //! * a claim created through `submit_claim` replays to its live track too: its
-//!   creation BBA (`auto_wire` with no perspective) is counted, as the seed
-//!   wire counts it live since backlog d3648d3c, and the comparison is not
-//!   vacuous (leaving it out changes it);
+//!   creation BBA (`auto_wire` with no perspective) plays the seed's role and
+//!   is left out, and the comparison is not vacuous (counting it changes it);
 //! * `report_workflow_outcome` rows get their own replay label, so the
 //!   operator can see and exclude them apart from `update_with_evidence`'s;
-//! * retracted rows, cached combinations, ingest templates and frames with no
-//!   hypothesis index count nothing; a claim off the prior is never touched;
+//! * retracted rows, cached combinations, ingest templates, creation rows and
+//!   frames with no hypothesis index count nothing; a claim off the prior is
+//!   never touched;
 //! * the reversal puts the found parameters back on every claim that still
 //!   holds what was written, and leaves a claim a live write moved since.
 
@@ -326,12 +326,11 @@ async fn creation_and_seed_rows(pool: &PgPool, claim: Uuid) -> (i64, i64) {
 
 /// The commonest lineage: created by `submit_claim` (one
 /// creation BBA, `auto_wire` with no perspective, and so no seed later), then
-/// one `update_with_evidence`. Live, both move the track (the seed wire counts
-/// the creation BBA since backlog d3648d3c). Reset to the prior and replayed
-/// with the defaults, the claim gets the live track back; leaving the
-/// creation row out gives a different one.
+/// one `update_with_evidence`. Live, only the second moves the track. Reset to
+/// the prior and replayed with the defaults, the claim gets the live track
+/// back; counting the creation row gives a different one.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_submit_claim_creation_bba_is_counted_as_the_live_track_counts_it(pool: PgPool) {
+async fn a_submit_claim_creation_bba_is_left_out_as_the_live_track_leaves_it(pool: PgPool) {
     let (server, viewer, group) = server_and_group(&pool).await;
     let content = "b96 submit_claim lineage claim";
     epigraph_mcp::tools::claims::submit_claim(
@@ -374,10 +373,11 @@ async fn a_submit_claim_creation_bba_is_counted_as_the_live_track_counts_it(pool
         "fixture: submit_claim stores one creation BBA and no seed"
     );
     let (a0, b0) = beta(&pool, claim).await;
-    assert!(
-        a0.unwrap_or(1.0) > 1.0,
-        "fixture: submit_claim counts its creation BBA on the Beta track live; if it \
-         does not, this test no longer pins the creation row being counted: ({a0:?}, {b0:?})"
+    assert_eq!(
+        (a0.unwrap_or(1.0), b0.unwrap_or(1.0)),
+        (1.0, 1.0),
+        "fixture: submit_claim does not move the Beta track live; if it does, this \
+         test no longer pins the creation exclusion"
     );
 
     epigraph_mcp::tools::claims::update_with_evidence(
@@ -403,19 +403,15 @@ async fn a_submit_claim_creation_bba_is_counted_as_the_live_track_counts_it(pool
     reset_to_prior(&pool, claim).await;
     let mut conn = pool.acquire().await.expect("conn");
 
-    // Not vacuous: leaving the creation row out gives a different track.
-    let mut without_creation = opts(false);
-    without_creation
-        .excluded_methods
-        .insert(CREATION_LABEL.to_string());
-    let left_out = run(&mut conn, &without_creation, None)
-        .await
-        .expect("dry run");
-    assert_eq!(left_out.sample.len(), 1, "{left_out:?}");
-    let (ca, cb) = left_out.sample[0].replayed;
+    // Not vacuous: counting the creation row gives a different track.
+    let mut with_creation = opts(false);
+    with_creation.excluded_methods.remove(CREATION_LABEL);
+    let counted = run(&mut conn, &with_creation, None).await.expect("dry run");
+    assert_eq!(counted.sample.len(), 1, "{counted:?}");
+    let (ca, cb) = counted.sample[0].replayed;
     assert!(
         !(close(ca, live_a) && close(cb, live_b)),
-        "leaving the creation row out must change the replay, or this test proves nothing"
+        "counting the creation row must change the replay, or this test proves nothing"
     );
 
     let mut manifest = Vec::new();
@@ -424,7 +420,7 @@ async fn a_submit_claim_creation_bba_is_counted_as_the_live_track_counts_it(pool
         .expect("apply");
     assert_eq!((report.replayed, report.written), (1, 1), "{report:?}");
     assert_eq!(
-        report.counted_by_method.get(CREATION_LABEL),
+        report.excluded_by_method.get(CREATION_LABEL),
         Some(&1),
         "{report:?}"
     );
@@ -649,8 +645,7 @@ async fn corpus(pool: &PgPool) -> Corpus {
     .await;
 
     // The creation BBA `submit_claim` / ingest store (`auto_wire`, no
-    // perspective), counted as the live seed wire counts it, and an ingest
-    // template, a placeholder left out.
+    // perspective) and an ingest template: both priors, left out.
     let (creator, _) = viewer_fixture::seed_agent_with_group(pool, "b96-creator").await;
     store_bba(
         pool,
@@ -720,11 +715,11 @@ async fn corpus(pool: &PgPool) -> Corpus {
     }
 }
 
-/// The three live inputs count, by hand: alpha 1 + 0.6 + 0 + 0.9 = 2.5, beta
-/// 1 + 0.4 + 1.0 + 0.1 = 2.5 (the edge row, the other agent's row on FALSE,
-/// the creation row). The retracted row, the cached combination, the row on
-/// the unindexed frame and the ingest template count nothing.
-const COUNTED: (f64, f64) = (2.5, 2.5);
+/// The two live inputs count, by hand: alpha 1 + 0.6 + 0 = 1.6, beta
+/// 1 + 0.4 + 1.0 = 2.4. The retracted row, the cached combination, the row
+/// on the unindexed frame, the creation row and the ingest template count
+/// nothing.
+const COUNTED: (f64, f64) = (1.6, 2.4);
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_dry_run_writes_nothing_and_reports_what_an_apply_would(pool: PgPool) {
@@ -746,15 +741,14 @@ async fn a_dry_run_writes_nothing_and_reports_what_an_apply_would(pool: PgPool) 
         "the moved claim is not a candidate: {report:?}"
     );
     assert_eq!((report.replayed, report.unchanged), (1, 1), "{report:?}");
-    assert_eq!(report.bbas_counted, 4, "{report:?}");
+    assert_eq!(report.bbas_counted, 3, "{report:?}");
     assert_eq!(report.bbas_without_hypothesis_index, 1, "{report:?}");
     assert_eq!(report.excluded_by_method.get("truth_value_seed"), Some(&1));
     assert_eq!(
-        report.counted_by_method.get(CREATION_LABEL),
+        report.excluded_by_method.get(CREATION_LABEL),
         Some(&1),
         "{report:?}"
     );
-    assert_eq!(report.excluded_by_method.get(CREATION_LABEL), None);
     assert_eq!(
         report.excluded_by_method.get(INGEST_TEMPLATE_LABEL),
         Some(&1),
@@ -772,7 +766,7 @@ async fn a_dry_run_writes_nothing_and_reports_what_an_apply_would(pool: PgPool) 
         close(s.replayed.0, COUNTED.0) && close(s.replayed.1, COUNTED.1),
         "{s:?}"
     );
-    assert!(close(s.replayed_posterior, 2.5 / 5.0), "{s:?}");
+    assert!(close(s.replayed_posterior, 1.6 / 4.0), "{s:?}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

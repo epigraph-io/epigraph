@@ -72,11 +72,6 @@ pub enum EdgeFactorOutcome {
 /// retry later once the source acquires a BBA. Returns `NonEpistemic` if the
 /// relationship maps to a `RestrictionKind::Neutral` (cheap short-circuit
 /// before any DB query).
-///
-/// It does not count the BBA on the target's Beta-Bernoulli track: called
-/// directly it is a RE-wire (`backfill_factors`), which replaces the edge's
-/// BBA at its key. The creation-time gate [`auto_wire_edge_if_epistemic`]
-/// counts a first materialization (see `crate::ds_divergence`).
 pub async fn auto_wire_ds_for_edge(
     conn: &mut sqlx::PgConnection,
     viewer: &epigraph_db::visibility::Viewer,
@@ -86,45 +81,10 @@ pub async fn auto_wire_ds_for_edge(
     target_id: Uuid,
     relationship: &str,
 ) -> Result<EdgeFactorOutcome, String> {
-    wire_edge_factor(
-        conn,
-        viewer,
-        edge_id,
-        edge_signer_agent_id,
-        source_id,
-        target_id,
-        relationship,
-    )
-    .await
-    .map(|(outcome, _)| outcome)
-}
-
-/// What [`wire_edge_factor`] stored on the target, for the Beta track.
-struct WiredEdgeBba {
-    /// The frame the BBA was stored on (`binary_truth`).
-    frame_id: Uuid,
-    /// The edge's BBA as stored.
-    bba: MassFunction,
-    /// The BetP this wire wrote to the target's cache, when it refolded and
-    /// wrote it from evidence (not a vacate).
-    cached_betp: Option<f64>,
-}
-
-/// [`auto_wire_ds_for_edge`], also returning what it stored when the outcome
-/// is [`EdgeFactorOutcome::Wired`].
-async fn wire_edge_factor(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    edge_id: Uuid,
-    edge_signer_agent_id: Uuid,
-    source_id: Uuid,
-    target_id: Uuid,
-    relationship: &str,
-) -> Result<(EdgeFactorOutcome, Option<WiredEdgeBba>), String> {
     let restriction =
         restriction_kind_with_profile(relationship, &RestrictionProfile::scientific());
     if matches!(restriction, RestrictionKind::Neutral) {
-        return Ok((EdgeFactorOutcome::NonEpistemic, None));
+        return Ok(EdgeFactorOutcome::NonEpistemic);
     }
 
     let source_row: Option<(Option<f64>, Option<f64>, Option<f64>)> =
@@ -134,13 +94,13 @@ async fn wire_edge_factor(
             .await
             .map_err(|e| format!("fetch source interval: {e}"))?;
     let Some((Some(bel), Some(pl), ow_opt)) = source_row else {
-        return Ok((EdgeFactorOutcome::SourceFactorless, None));
+        return Ok(EdgeFactorOutcome::SourceFactorless);
     };
     // Write-time constants come from the served (default) profile.
     let profile = BeliefProfile::served();
     let restricted = match restrict_edge_source((bel, pl, ow_opt), relationship, profile) {
-        EdgeRestriction::NonEpistemic => return Ok((EdgeFactorOutcome::NonEpistemic, None)),
-        EdgeRestriction::Vacuous => return Ok((EdgeFactorOutcome::Vacuous, None)),
+        EdgeRestriction::NonEpistemic => return Ok(EdgeFactorOutcome::NonEpistemic),
+        EdgeRestriction::Vacuous => return Ok(EdgeFactorOutcome::Vacuous),
         EdgeRestriction::Restricted(r) => r,
     };
 
@@ -158,7 +118,6 @@ async fn wire_edge_factor(
         locality_tag,
     } = finish_edge_bba(&restricted, relationship, is_intra, intra_factor, profile)?;
     let frame = binary_frame()?;
-    let bba = parse_stored_bba(&frame, &masses_json)?;
 
     FrameRepository::assign_claim(&mut *conn, target_id, frame_id, Some(0))
         .await
@@ -204,8 +163,8 @@ async fn wire_edge_factor(
     let owner = MassFunctionRepository::cache_owner_frame_for_claim(&mut *conn, viewer, target_id)
         .await
         .map_err(|e| format!("cache_owner_frame_for_claim: {e}"))?;
-    let cached_betp = if owner == Some(frame_id) {
-        recompute_combined_belief_reporting(
+    if owner == Some(frame_id) {
+        recompute_combined_belief(
             &mut *conn,
             viewer,
             target_id,
@@ -214,7 +173,7 @@ async fn wire_edge_factor(
             crate::belief_profile::overrides_in(&frame_row.properties),
             VacateGate::ClaimWide,
         )
-        .await?
+        .await?;
     } else {
         tracing::debug!(
             edge = %edge_id,
@@ -222,16 +181,8 @@ async fn wire_edge_factor(
             owner = ?owner,
             "edge BBA stored; the target's cache is not binary_truth's to refold"
         );
-        None
-    };
-    Ok((
-        EdgeFactorOutcome::Wired,
-        Some(WiredEdgeBba {
-            frame_id,
-            bba,
-            cached_betp,
-        }),
-    ))
+    }
+    Ok(EdgeFactorOutcome::Wired)
 }
 
 /// What a fresh wire of one edge would store, computed without any IO by
@@ -518,16 +469,6 @@ pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String
 /// when sources/targets aren't claims, a BBA already exists for this edge,
 /// or the auto-wire call failed. Returns `Some(outcome)` when the trigger
 /// fired.
-///
-/// # The target's Beta-Bernoulli track (backlog d3648d3c)
-///
-/// A wire that stores the edge's BBA is the BBA's FIRST materialization: the
-/// gate above admits only an edge with no BBA yet (or one just created, whose
-/// fresh id no BBA can carry). So it counts the BBA on the target's track and
-/// records the target's DS-vs-Bayesian divergence with the BetP the wire
-/// wrote (`crate::ds_divergence::track_counted_bba`), inside this savepoint.
-/// A re-derivation that deleted the edge's BBA first goes through
-/// `rederive_edge_if_epistemic` instead, which does not count it again.
 #[allow(clippy::too_many_arguments)]
 pub async fn auto_wire_edge_if_epistemic(
     conn: &mut sqlx::PgConnection,
@@ -541,99 +482,6 @@ pub async fn auto_wire_edge_if_epistemic(
     relationship: &str,
     agent_id: Uuid,
 ) -> Option<EdgeFactorOutcome> {
-    wire_edge_if_epistemic(
-        conn,
-        viewer,
-        EdgeWireRequest {
-            was_created,
-            edge_id,
-            source_id,
-            source_type,
-            target_id,
-            target_type,
-            relationship,
-            agent_id,
-        },
-        BetaTrack::Count,
-    )
-    .await
-}
-
-/// [`auto_wire_edge_if_epistemic`] for a RE-derivation: the retraction and
-/// dedup cascades delete an edge's BBA and wire it again from the edge's
-/// current source. The target's Beta track counted the edge when it was first
-/// wired, and the re-wire replaces that BBA rather than adding one beside it,
-/// so it is not counted again (`crate::ds_divergence`, "Deliberately
-/// excluded"). Same gates, savepoint and best-effort contract otherwise.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn rederive_edge_if_epistemic(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    was_created: bool,
-    edge_id: Uuid,
-    source_id: Uuid,
-    source_type: &str,
-    target_id: Uuid,
-    target_type: &str,
-    relationship: &str,
-    agent_id: Uuid,
-) -> Option<EdgeFactorOutcome> {
-    wire_edge_if_epistemic(
-        conn,
-        viewer,
-        EdgeWireRequest {
-            was_created,
-            edge_id,
-            source_id,
-            source_type,
-            target_id,
-            target_type,
-            relationship,
-            agent_id,
-        },
-        BetaTrack::Skip,
-    )
-    .await
-}
-
-/// Whether a gated edge wire counts the BBA it stores on the target's Beta
-/// track.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BetaTrack {
-    /// A first materialization: count it, and record the divergence.
-    Count,
-    /// A re-derivation of a BBA the track already counted.
-    Skip,
-}
-
-/// The arguments of one gated edge wire.
-struct EdgeWireRequest<'a> {
-    was_created: bool,
-    edge_id: Uuid,
-    source_id: Uuid,
-    source_type: &'a str,
-    target_id: Uuid,
-    target_type: &'a str,
-    relationship: &'a str,
-    agent_id: Uuid,
-}
-
-async fn wire_edge_if_epistemic(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    request: EdgeWireRequest<'_>,
-    track: BetaTrack,
-) -> Option<EdgeFactorOutcome> {
-    let EdgeWireRequest {
-        was_created,
-        edge_id,
-        source_id,
-        source_type,
-        target_id,
-        target_type,
-        relationship,
-        agent_id,
-    } = request;
     if source_type != "claim" || target_type != "claim" {
         return None;
     }
@@ -702,7 +550,7 @@ async fn wire_edge_if_epistemic(
         }
         return None;
     }
-    let wired = match wire_edge_factor(
+    match auto_wire_ds_for_edge(
         &mut sp,
         viewer,
         edge_id,
@@ -713,29 +561,6 @@ async fn wire_edge_if_epistemic(
     )
     .await
     {
-        Ok((outcome, Some(stored))) if track == BetaTrack::Count => {
-            // Hypothesis 0: the wire assigns the target to `binary_truth` at
-            // index 0 and builds the edge's BBA on TRUE/FALSE.
-            crate::ds_divergence::track_counted_bba(
-                &mut sp,
-                viewer,
-                crate::ds_divergence::CountedBba {
-                    claim_id: target_id,
-                    frame_id: stored.frame_id,
-                    bba: &stored.bba,
-                    hypothesis_index: Some(0),
-                    pignistic_prob: stored.cached_betp,
-                },
-                "edge auto-wire",
-            )
-            .await
-            .map(|_| outcome)
-            .map_err(|e| format!("Beta track: {e}"))
-        }
-        Ok((outcome, _)) => Ok(outcome),
-        Err(e) => Err(e),
-    };
-    match wired {
         Ok(outcome) => match sp.commit().await {
             Ok(()) => Some(outcome),
             Err(e) => {
@@ -1858,57 +1683,6 @@ async fn recompute_combined_belief(
     frame_overrides: Option<&serde_json::Value>,
     gate: VacateGate,
 ) -> Result<bool, String> {
-    Ok(recompute_combined_belief_written(
-        conn,
-        viewer,
-        claim_id,
-        frame_id,
-        frame,
-        frame_overrides,
-        gate,
-    )
-    .await?
-    .is_some())
-}
-
-/// [`recompute_combined_belief`], returning the BetP it wrote to the cache
-/// when it wrote one FROM EVIDENCE: `None` when it wrote nothing, and when the
-/// write was a vacate (ruling R-80), whose full-ignorance value folds no
-/// evidence. The edge wire compares it with the Beta posterior
-/// (`crate::ds_divergence`).
-async fn recompute_combined_belief_reporting(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    frame_id: Uuid,
-    frame: &FrameOfDiscernment,
-    frame_overrides: Option<&serde_json::Value>,
-    gate: VacateGate,
-) -> Result<Option<f64>, String> {
-    Ok(recompute_combined_belief_written(
-        conn,
-        viewer,
-        claim_id,
-        frame_id,
-        frame,
-        frame_overrides,
-        gate,
-    )
-    .await?
-    .and_then(|(betp, vacated)| (!vacated).then_some(betp)))
-}
-
-/// The write half both of the above share: `Some((BetP written, vacated))`
-/// when the cache was written, `None` when it was not.
-async fn recompute_combined_belief_written(
-    conn: &mut sqlx::PgConnection,
-    viewer: &epigraph_db::visibility::Viewer,
-    claim_id: Uuid,
-    frame_id: Uuid,
-    frame: &FrameOfDiscernment,
-    frame_overrides: Option<&serde_json::Value>,
-    gate: VacateGate,
-) -> Result<Option<(f64, bool)>, String> {
     let Some((preview, vacated)) = compute_combined_belief(
         &mut *conn,
         viewer,
@@ -1920,7 +1694,7 @@ async fn recompute_combined_belief_written(
     )
     .await?
     else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let written = MassFunctionRepository::update_claim_belief(
@@ -1957,7 +1731,7 @@ async fn recompute_combined_belief_written(
             .map_err(|e| format!("update_claim_classification: {e}"))?;
     }
 
-    Ok(written.then_some((preview.pignistic_prob, vacated)))
+    Ok(written)
 }
 
 /// Recompute a claim's cached DS scalars, letting exactly ONE frame own them.
