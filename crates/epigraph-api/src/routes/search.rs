@@ -51,10 +51,49 @@
 //!   `claim_themes.centroid`, which averages private members too.
 //!   `similarity` then means similarity to that core, and an absent
 //!   `min_similarity` is -1 so a walk enumerates every embedded visible member.
-//! * **`cursor`** is opaque: pass back a previous `next_cursor` unchanged. It
-//!   is a position (`o:<offset>`), never an id, inside a 1,000-row window.
-//!   `next_cursor` is emitted only on the flat path and only when the request
-//!   carried `theme_id` or `cursor`; send `"o:0"` to page an unpinned search.
+//! * **`cursor`** is opaque: pass back a previous `next_cursor` unchanged.
+//!   Walks run inside a 1,000-row window. `next_cursor` is emitted only on the
+//!   flat path and only when the request carried `theme_id` or `cursor`; send
+//!   `"o:0"` to start paging an unpinned search.
+//!   - A pinned walk (and `theme_core`) pages by position, `o:<offset>`,
+//!     over its exact ranking.
+//!   - An unpinned walk pages by KEY (backlog 4f1c2aec):
+//!     `k:<position>.<limit>.<query>.<distance>.<claim id>.<mac>`. The next page
+//!     holds the rows ranked strictly after the last row of this one, in the
+//!     ranking's total order `(distance, id)`, so a row inserted or retired
+//!     between pages cannot shift a boundary and a walk never repeats a row.
+//!     Offset pages over the approximate HNSW scan could do both.
+//!   - The key cursor is bound to its walk. `<limit>` must equal the
+//!     request's `limit`, and `<query>` (a 64-bit prefix of the SHA-256 of
+//!     the query vector) must match the vector this request embeds.
+//!     Otherwise the request is a 400 on `cursor`: the next page of a
+//!     different scan or ranking would silently skip or repeat rows. A query
+//!     re-embedded to a different vector (an expired embedding cache on a
+//!     non-deterministic provider) is refused the same way; restart the walk
+//!     from `o:0`.
+//!   - `o:<n>` with `n > 0` on an unpinned search, and `k:` on a pinned one,
+//!     are 400s.
+//!   - The key is AUTHENTICATED: `<mac>` is a truncated HMAC-SHA256, under a
+//!     server key, of everything before it, and a key whose MAC does not
+//!     verify is a 400 on `cursor`. A caller can therefore only send back a
+//!     boundary the server served. Without it a caller could rewrite the
+//!     position to 0 (walking past the 1,000-row window without end) or set
+//!     the distance to any value, which empties the iterative pass and
+//!     forces the exact kNN retry (`epigraph_db`'s `vector_scan` module)
+//!     aimed at a distance band of the caller's choice. The server key is derived from
+//!     `EPIGRAPH_JWT_SECRET` (domain-separated, never the secret itself), or
+//!     drawn at random per process when that is unset; rotating the secret,
+//!     or restarting without one, turns every in-flight key into a 400, and
+//!     the walk restarts from `o:0`.
+//!   - The key carries the id and distance of a row the viewer was just
+//!     served, so it discloses nothing new. Read back, it only narrows the
+//!     reader's own visibility-spliced ranking: even a key from another
+//!     viewer's walk is a bound, not a lookup (the row it names need not be
+//!     visible to the reader), and no response carries a count of rows the
+//!     reader cannot see. This is why this cursor may hold an id where the
+//!     house rule for position cursors (`privatization.rs`) forbids one. That
+//!     rule exists because a caller-chosen key there is applied to rows
+//!     reported back as a count.
 //! * **Pinned diverse** (`theme_id` with `diverse=true`) skips the theme
 //!   shortlist and the coverage guard, draws exact candidates from the pinned
 //!   theme with `created_after` and `min_similarity` applied in SQL, refuses
@@ -238,9 +277,10 @@ pub struct SemanticSearchRequest {
     pub rank_by: Option<String>,
 
     /// Opaque page position: pass back a previous `next_cursor` unchanged.
-    /// The format is `o:<offset>`, a position and never an id. Blank counts
-    /// as absent. Send `"o:0"` on the first page to page an unpinned search.
-    /// Not accepted with `diverse=true`.
+    /// `o:<offset>` on a pinned walk, `k:...` (a key bound to the walk's
+    /// `limit` and query vector) on an unpinned one; see the module docs.
+    /// Blank counts as absent. Send `"o:0"` on the first page to page an
+    /// unpinned search. Not accepted with `diverse=true`.
     #[serde(default)]
     pub cursor: Option<String>,
 }
@@ -364,9 +404,10 @@ pub struct SemanticSearchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme_scope: Option<SearchThemeScope>,
 
-    /// Opaque position of the next page (`o:<offset>`), flat path only, and
-    /// only when the request carried `theme_id` or `cursor`. Absent at the end
-    /// of the ranking and at the 1,000-row window.
+    /// Opaque position of the next page (`o:<offset>` pinned, `k:...`
+    /// unpinned), flat path only, and only when the request carried
+    /// `theme_id` or `cursor`. Absent at the end of the ranking and at the
+    /// 1,000-row window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
 
@@ -445,9 +486,118 @@ const HIT_OVERHEAD_BYTES: usize = 700;
 /// punctuation, one UUID and five floats come to about 300.
 const NEIGHBOR_OVERHEAD_BYTES: usize = 400;
 
-/// The cursor prefix: a position, never an id (as `privatization.rs`'s
-/// `CURSOR_PREFIX`).
+/// The position cursor prefix (pinned walks): a position, never an id (as
+/// `privatization.rs`'s `CURSOR_PREFIX`).
 const SEARCH_CURSOR_PREFIX: &str = "o:";
+
+/// The key cursor prefix (unpinned walks, backlog 4f1c2aec). See the module
+/// docs for why this one may carry an id.
+const SEARCH_KEY_CURSOR_PREFIX: &str = "k:";
+
+/// Hex digits of the key cursor's MAC: the left 128 bits of an
+/// HMAC-SHA256.
+const KEY_CURSOR_MAC_HEX: usize = 32;
+
+/// Domain label under which the key cursor's MAC key is derived from the JWT
+/// secret, so the derived key is good for nothing else.
+const KEY_CURSOR_MAC_LABEL: &[u8] = b"epigraph-api search key cursor mac v1";
+
+/// A parsed `cursor`.
+#[derive(Debug, Clone, PartialEq)]
+enum SearchCursor {
+    /// `o:<offset>`.
+    Offset(i64),
+    /// `k:<position>.<limit>.<query>.<distance bits>.<claim id>.<mac>`,
+    /// MAC verified.
+    Key(WalkKey),
+}
+
+impl SearchCursor {
+    /// Rows of the walk already served: the window counts from here.
+    fn position(&self) -> i64 {
+        match self {
+            SearchCursor::Offset(o) => *o,
+            SearchCursor::Key(k) => k.position,
+        }
+    }
+}
+
+/// An unpinned walk's key: where the next page starts, and which walk it
+/// belongs to.
+#[derive(Debug, Clone, PartialEq)]
+struct WalkKey {
+    /// Rows of the walk already served.
+    position: i64,
+    /// The walk's page size; a page with another `limit` is refused.
+    limit: usize,
+    /// [`walk_query_hash`] of the walk's query vector.
+    query: String,
+    /// The raw distance of the last row served, carried as its bits so it
+    /// compares exactly.
+    distance: f64,
+    /// The id of the last row served (the tie-breaker of the total order).
+    claim_id: Uuid,
+}
+
+/// A 64-bit prefix of the SHA-256 of the query's pgvector literal, as 16 hex
+/// digits: enough to tell one walk's vector from another, never used for
+/// anything but that comparison.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn walk_query_hash(query_vec: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(query_vec.as_bytes())[..8])
+}
+
+/// The key cursor's MAC key: HMAC-SHA256(`EPIGRAPH_JWT_SECRET`,
+/// [`KEY_CURSOR_MAC_LABEL`]) when the secret is set, so every process that
+/// shares the secret accepts the others' keys and a restart keeps walks
+/// alive; otherwise 32 random bytes for this process's lifetime. Read once.
+fn key_cursor_mac_key() -> &'static [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| match std::env::var("EPIGRAPH_JWT_SECRET") {
+        Ok(secret) if !secret.is_empty() => {
+            use hmac::{Hmac, Mac};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+                .expect("HMAC accepts any key length");
+            mac.update(KEY_CURSOR_MAC_LABEL);
+            mac.finalize().into_bytes().into()
+        }
+        _ => rand::random(),
+    })
+}
+
+/// A fresh HMAC-SHA256 under [`key_cursor_mac_key`] over a key cursor's body
+/// (the text between `k:` and the MAC).
+fn key_cursor_mac(body: &str) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key_cursor_mac_key())
+        .expect("HMAC accepts any key length");
+    mac.update(body.as_bytes());
+    mac
+}
+
+/// `k:<body>.<mac>` for a key cursor body.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn sign_key_cursor_body(body: &str) -> String {
+    use hmac::Mac;
+    let tag = key_cursor_mac(body).finalize().into_bytes();
+    format!(
+        "{SEARCH_KEY_CURSOR_PREFIX}{body}.{}",
+        hex::encode(&tag[..KEY_CURSOR_MAC_HEX / 2])
+    )
+}
+
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+fn encode_key_cursor(k: &WalkKey) -> String {
+    sign_key_cursor_body(&format!(
+        "{}.{}.{}.{:016x}.{}",
+        k.position,
+        k.limit,
+        k.query,
+        k.distance.to_bits(),
+        k.claim_id
+    ))
+}
 
 // ============================================================================
 // Theme pin, ranking, cursor and byte budget
@@ -502,8 +652,12 @@ fn parse_rank_by(raw: Option<&str>) -> Result<RankBy, ApiError> {
 
 /// `cursor`: `None` when absent or blank, so the handler can tell a supplied
 /// cursor (a paged request) from none. Otherwise `o:` plus a non-negative
-/// integer below [`MAX_SEARCH_WINDOW`].
-fn parse_search_cursor(raw: Option<&str>) -> Result<Option<i64>, ApiError> {
+/// integer below [`MAX_SEARCH_WINDOW`], or a `k:` key whose MAC verifies
+/// (checked first, in constant time, over the raw body) and whose fields are
+/// well formed, its position below the window too. Whether the kind fits the
+/// request (pinned or not, same `limit`, same query vector) is the handler's
+/// check.
+fn parse_search_cursor(raw: Option<&str>) -> Result<Option<SearchCursor>, ApiError> {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -511,13 +665,60 @@ fn parse_search_cursor(raw: Option<&str>) -> Result<Option<i64>, ApiError> {
         field: "cursor".to_string(),
         reason: reason.to_string(),
     };
-    let digits = s
-        .strip_prefix(SEARCH_CURSOR_PREFIX)
-        .ok_or_else(|| bad("cursor must be a next_cursor value from a previous page"))?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad(
-            "cursor must be a next_cursor value from a previous page",
-        ));
+    let malformed = || bad("cursor must be a next_cursor value from a previous page");
+    let digits_only = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    if let Some(signed) = s.strip_prefix(SEARCH_KEY_CURSOR_PREFIX) {
+        // The MAC first: a key the server did not issue is refused before any
+        // of its fields is read, whatever they say.
+        let (key, tag) = signed.rsplit_once('.').ok_or_else(malformed)?;
+        let is_lower_hex = |h: &str| h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if tag.len() != KEY_CURSOR_MAC_HEX || !is_lower_hex(tag) {
+            return Err(malformed());
+        }
+        let tag = hex::decode(tag).map_err(|_| malformed())?;
+        {
+            use hmac::Mac;
+            key_cursor_mac(key)
+                .verify_truncated_left(&tag)
+                .map_err(|_| malformed())?;
+        }
+        let parts: Vec<&str> = key.split('.').collect();
+        let [pos, limit, query, dist, id] = parts.as_slice() else {
+            return Err(malformed());
+        };
+        if !digits_only(pos) || !digits_only(limit) {
+            return Err(malformed());
+        }
+        let position: i64 = pos
+            .parse()
+            .map_err(|_| bad("cursor is beyond the search window"))?;
+        if position >= MAX_SEARCH_WINDOW {
+            return Err(bad("cursor is beyond the search window"));
+        }
+        let limit: usize = limit.parse().map_err(|_| malformed())?;
+        if limit == 0 || limit > MAX_LIMIT as usize {
+            return Err(malformed());
+        }
+        let hex16 = |h: &str| h.len() == 16 && is_lower_hex(h);
+        if !hex16(query) || !hex16(dist) {
+            return Err(malformed());
+        }
+        let distance = f64::from_bits(u64::from_str_radix(dist, 16).map_err(|_| malformed())?);
+        if !distance.is_finite() {
+            return Err(malformed());
+        }
+        let claim_id = Uuid::parse_str(id).map_err(|_| malformed())?;
+        return Ok(Some(SearchCursor::Key(WalkKey {
+            position,
+            limit,
+            query: (*query).to_string(),
+            distance,
+            claim_id,
+        })));
+    }
+    let digits = s.strip_prefix(SEARCH_CURSOR_PREFIX).ok_or_else(malformed)?;
+    if !digits_only(digits) {
+        return Err(malformed());
     }
     let offset: i64 = digits
         .parse()
@@ -525,7 +726,7 @@ fn parse_search_cursor(raw: Option<&str>) -> Result<Option<i64>, ApiError> {
     if offset >= MAX_SEARCH_WINDOW {
         return Err(bad("cursor is beyond the search window"));
     }
-    Ok(Some(offset))
+    Ok(Some(SearchCursor::Offset(offset)))
 }
 
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
@@ -835,7 +1036,9 @@ async fn probe_theme_coverage_isolated(
 /// - created_after must be <= created_before if both provided
 /// - theme_id must be a UUID; rank_by must be `query` or `theme_core`;
 ///   `theme_core` needs theme_id and excludes diverse
-/// - cursor must be `o:<n>` with `n < 1000`, and excludes diverse
+/// - cursor must be `o:<n>` with `n < 1000` (pinned; unpinned only `o:0`) or
+///   a `k:` key from the same unpinned walk (same `limit`, same query
+///   vector), and excludes diverse
 /// - with theme_id and diverse, created_before / claim_type / agent_id are
 ///   refused (the diverse path does not apply them)
 ///
@@ -863,7 +1066,7 @@ pub async fn semantic_search(
     let theme_filter = parse_theme_filter(request.theme_id.as_deref())?;
     let rank_by = parse_rank_by(request.rank_by.as_deref())?;
     let cursor = parse_search_cursor(request.cursor.as_deref())?;
-    let offset = cursor.unwrap_or(0);
+    let offset = cursor.as_ref().map_or(0, SearchCursor::position);
     // `next_cursor` is emitted only to a caller that pinned a theme or sent a
     // cursor, so an unpinned, unpaged response keeps its old shape.
     #[allow(unused_variables)]
@@ -913,6 +1116,28 @@ pub async fn semantic_search(
         });
     }
 
+    // A pinned walk pages by position over an exact ranking; an unpinned one
+    // pages by key (backlog 4f1c2aec), started with `o:0`.
+    match (&cursor, theme_filter.is_some()) {
+        (Some(SearchCursor::Key(_)), true) => {
+            return Err(ApiError::ValidationError {
+                field: "cursor".to_string(),
+                reason: "a k: cursor continues an unpinned search; a theme_id search pages \
+                         with the o: cursor it returned"
+                    .to_string(),
+            });
+        }
+        (Some(SearchCursor::Offset(o)), false) if *o > 0 => {
+            return Err(ApiError::ValidationError {
+                field: "cursor".to_string(),
+                reason: "an unpinned search pages by key: start with o:0 and pass back \
+                         next_cursor unchanged"
+                    .to_string(),
+            });
+        }
+        _ => {}
+    }
+
     // A pinned diverse request applies `created_after` and `min_similarity`
     // in SQL. The other three filters the diverse path has never applied are
     // refused rather than silently ignored under a pin.
@@ -960,6 +1185,21 @@ pub async fn semantic_search(
     let page_limit = limit.min(MAX_LIMIT) as usize;
     #[allow(unused_variables)]
     let limit = page_limit.min((MAX_SEARCH_WINDOW - offset) as usize);
+    // A key cursor names a row of ONE walk's ranking. Another `limit` is
+    // another `ef_search`, so another approximate scan; refuse it rather than
+    // page a different stream from this boundary.
+    if let Some(SearchCursor::Key(k)) = &cursor {
+        if k.limit != page_limit {
+            return Err(ApiError::ValidationError {
+                field: "cursor".to_string(),
+                reason: format!(
+                    "cursor belongs to a walk with limit {}; send that limit, or start a \
+                     new walk with o:0",
+                    k.limit
+                ),
+            });
+        }
+    }
 
     // Validate min_similarity. An explicit value must lie in [0, 1]. Absent,
     // it is 0.0, except under `theme_core`, where it is -1.0 (cosine's lower
@@ -1538,6 +1778,29 @@ pub async fn semantic_search(
             None => epigraph_db::FlatRanking::ThemeCore,
         };
 
+        // An unpinned paged request walks by key (backlog 4f1c2aec). Its key
+        // must belong to this query vector: a key from another ranking would
+        // page a different stream from an unrelated boundary.
+        let keyset_walk = paged && !diverse && theme_filter.is_none();
+        let walk_hash = embedding_str.as_deref().map(walk_query_hash);
+        if let Some(SearchCursor::Key(k)) = &cursor {
+            if walk_hash.as_deref() != Some(k.query.as_str()) {
+                return Err(ApiError::ValidationError {
+                    field: "cursor".to_string(),
+                    reason: "cursor belongs to a walk over a different query vector (another \
+                             query, or this one re-embedded); restart the walk with o:0"
+                        .to_string(),
+                });
+            }
+        }
+        let flat_page = match (&cursor, keyset_walk) {
+            (Some(SearchCursor::Key(k)), true) => {
+                epigraph_db::FlatPage::Keyset(Some((k.distance, k.claim_id)))
+            }
+            (_, true) => epigraph_db::FlatPage::Keyset(None),
+            (_, false) => epigraph_db::FlatPage::Offset(offset),
+        };
+
         // Step 2b: Flat pgvector similarity search (DEFAULT path)
         //
         // PR-07: this is reached whenever `diverse` is absent — i.e. the
@@ -1557,7 +1820,7 @@ pub async fn semantic_search(
         // SQL is asked for `page_limit` rows, not the window-cut `limit`, so
         // the last page of a walk runs the same HNSW scan as the pages before
         // it; the rows past the window are dropped here.
-        let mut rows = epigraph_db::ClaimRepository::semantic_search_flat(
+        let page = epigraph_db::ClaimRepository::semantic_search_flat_page(
             &mut *read,
             &viewer,
             ranking,
@@ -1568,14 +1831,17 @@ pub async fn semantic_search(
             request.agent_id,
             page_limit as i64,
             theme_filter,
-            offset,
+            flat_page,
         )
         .await
         .map_err(|e| ApiError::InternalError {
             message: format!("Database query failed: {e}"),
         })?;
+        let more = page.more;
+        let mut rows = page.hits;
         let full_page = rows.len() == page_limit;
         rows.truncate(limit);
+        let keys: Vec<(f64, Uuid)> = rows.iter().map(|r| (r.distance, r.claim_id)).collect();
 
         // Step 3: Convert rows to response DTOs. Every pinned hit is in the
         // pinned theme by construction, so it says so.
@@ -1597,13 +1863,34 @@ pub async fn semantic_search(
             .collect();
 
         // The byte budget, then the cursor. A page the budget cut resumes at
-        // the first dropped hit; a full SQL page may have more behind it. The
-        // cursor stops at the window, and only a paged request gets one.
+        // the first dropped hit. The cursor stops at the window, and only a
+        // paged request gets one. A key walk continues while the read says a
+        // row follows (`more`; its page can be short of `limit` when a tie
+        // group was held back), from the last row kept. A position walk
+        // continues after a full SQL page, as it always has.
         let (results, cut) = apply_byte_budget(results);
         let kept = results.len() as i64;
-        let next_cursor =
-            (paged && !diverse && (cut || full_page) && offset + kept < MAX_SEARCH_WINDOW)
-                .then(|| encode_search_cursor(offset + kept));
+        let next_cursor = if !(paged && !diverse) || offset + kept >= MAX_SEARCH_WINDOW {
+            None
+        } else if keyset_walk {
+            match (
+                kept.checked_sub(1).and_then(|i| keys.get(i as usize)),
+                &walk_hash,
+            ) {
+                (Some(&(distance, claim_id)), Some(query)) if cut || more => {
+                    Some(encode_key_cursor(&WalkKey {
+                        position: offset + kept,
+                        limit: page_limit,
+                        query: query.clone(),
+                        distance,
+                        claim_id,
+                    }))
+                }
+                _ => None,
+            }
+        } else {
+            (cut || full_page).then(|| encode_search_cursor(offset + kept))
+        };
         let truncated = cut && next_cursor.is_none();
 
         let total = results.len() as u64;
@@ -1905,10 +2192,132 @@ mod tests {
         for n in [0_i64, 1, 50, 999] {
             assert_eq!(
                 parse_search_cursor(Some(&encode_search_cursor(n))).unwrap(),
-                Some(n)
+                Some(SearchCursor::Offset(n))
             );
         }
         assert_eq!(encode_search_cursor(100), "o:100");
+    }
+
+    fn a_key() -> WalkKey {
+        WalkKey {
+            position: 20,
+            limit: 10,
+            query: walk_query_hash("[0.1,0.2]"),
+            // Not representable in a short decimal: the bits must round-trip.
+            distance: 0.1 + 0.2,
+            claim_id: Uuid::new_v4(),
+        }
+    }
+
+    #[test]
+    fn key_cursor_round_trips_bit_exact() {
+        let k = a_key();
+        let text = encode_key_cursor(&k);
+        assert!(text.starts_with("k:20.10."), "{text}");
+        assert_eq!(
+            parse_search_cursor(Some(&text)).unwrap(),
+            Some(SearchCursor::Key(k.clone()))
+        );
+        let Some(SearchCursor::Key(back)) = parse_search_cursor(Some(&text)).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(back.distance.to_bits(), k.distance.to_bits());
+    }
+
+    #[test]
+    fn walk_query_hash_tells_vectors_apart() {
+        let a = walk_query_hash("[0.1,0.2]");
+        assert_eq!(a.len(), 16);
+        assert_eq!(a, walk_query_hash("[0.1,0.2]"));
+        assert_ne!(a, walk_query_hash("[0.1,0.20001]"));
+    }
+
+    /// Each body carries a VALID MAC, so what rejects it is the field check
+    /// it names, not the MAC.
+    #[test]
+    fn parse_search_cursor_rejects_malformed_keys() {
+        let k = a_key();
+        let id = k.claim_id;
+        let q = &k.query;
+        let bits = format!("{:016x}", k.distance.to_bits());
+        let nan = format!("{:016x}", f64::NAN.to_bits());
+        let good_body = format!("20.10.{q}.{bits}.{id}");
+        assert!(
+            parse_search_cursor(Some(&sign_key_cursor_body(&good_body))).is_ok(),
+            "calibration: the well-formed body signed the same way parses"
+        );
+        for body in [
+            format!("1000.10.{q}.{bits}.{id}"),
+            format!("20.0.{q}.{bits}.{id}"),
+            format!("20.101.{q}.{bits}.{id}"),
+            format!("20.10.{}.{bits}.{id}", &q[..15]),
+            format!("20.10.{}.{bits}.{id}", q.to_uppercase()),
+            format!("20.10.{q}.{nan}.{id}"),
+            format!("20.10.{q}.{bits}.not-a-uuid"),
+            format!("20.10.{q}.{bits}"),
+            format!("-1.10.{q}.{bits}.{id}"),
+            format!("{good_body}.extra"),
+            String::new(),
+        ] {
+            let bad = sign_key_cursor_body(&body);
+            assert_eq!(
+                field_of(parse_search_cursor(Some(&bad)).unwrap_err()),
+                "cursor",
+                "{bad:?} must be rejected"
+            );
+        }
+        assert_eq!(
+            field_of(parse_search_cursor(Some("k:")).unwrap_err()),
+            "cursor"
+        );
+    }
+
+    /// Backlog 4f1c2aec review: a key the server did not issue is refused,
+    /// so a caller cannot reset the position past the window or aim the
+    /// exact retry at a distance band of its choice.
+    #[test]
+    fn parse_search_cursor_rejects_keys_the_server_did_not_sign() {
+        let k = a_key();
+        let good = encode_key_cursor(&k);
+        let (body, tag) = good
+            .strip_prefix("k:")
+            .and_then(|b| b.rsplit_once('.'))
+            .expect("k:<body>.<mac>");
+        assert_eq!(tag.len(), KEY_CURSOR_MAC_HEX);
+        let other = encode_key_cursor(&WalkKey {
+            position: 30,
+            ..k.clone()
+        });
+        let other_tag = other.rsplit_once('.').unwrap().1;
+        let id = k.claim_id;
+        let q = &k.query;
+        let bits = format!("{:016x}", k.distance.to_bits());
+        let far = format!("{:016x}", 2.0f64.to_bits());
+        for bad in [
+            // No MAC at all (the pre-MAC format).
+            format!("k:{body}"),
+            // A truncated, an uppercased and an extended MAC.
+            format!("k:{body}.{}", &tag[..KEY_CURSOR_MAC_HEX - 1]),
+            format!("k:{body}.{}", tag.to_uppercase()),
+            format!("k:{body}.{tag}0"),
+            // Another real cursor's MAC on this body.
+            format!("k:{body}.{other_tag}"),
+            // A field changed, the original MAC kept.
+            format!("k:0.10.{q}.{bits}.{id}.{tag}"),
+            format!("k:20.10.{q}.{far}.{id}.{tag}"),
+            format!("k:20.10.{q}.{bits}.{}.{tag}", Uuid::new_v4()),
+            format!("k:20.11.{q}.{bits}.{id}.{tag}"),
+            format!("k:20.10.{}.{bits}.{id}.{tag}", walk_query_hash("[0.3]")),
+        ] {
+            assert_ne!(bad, good);
+            assert_eq!(
+                field_of(parse_search_cursor(Some(&bad)).unwrap_err()),
+                "cursor",
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(parse_search_cursor(Some(&good)).is_ok());
+        assert!(parse_search_cursor(Some(&other)).is_ok());
     }
 
     #[test]

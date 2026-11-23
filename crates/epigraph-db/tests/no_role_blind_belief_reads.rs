@@ -185,7 +185,7 @@ const REGISTER: &[(&str, &str, Tag)] = &[
     ("crates/epigraph-db/src/repos/claim.rs", "retire_for_workflow_deprecation", Tag::Writer("one UPDATE retires a workflow claim and records its own prior truth_value in properties for a later revival (backlog 1767f2ae); it serves no belief")),
     ("crates/epigraph-db/src/repos/claim.rs", "search_by_label_and_text", Tag::Todo { pr: "unassigned", why: "workflow text search gated on truth_value; procedural, no plan row" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_graph_neighbors", Tag::Todo { pr: "PR-R5", why: "semantic search graph expansion returns c.belief / c.plausibility; SPEC §7.2" }),
-    ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility; SPEC §7.2" }),
+    ("crates/epigraph-db/src/repos/claim.rs", "semantic_search_flat_on", Tag::Todo { pr: "PR-R5", why: "the semantic_search_flat row carries c.belief / c.plausibility (the statement moved into the connection form, backlog 28b79b1e); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "semantic_selected_claims", Tag::Todo { pr: "PR-R5", why: "the diverse /search/semantic row carries c.belief / c.plausibility, the read moved out of routes/search.rs's inline full_sql (backlog 67c905a3); SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/claim.rs", "sql_expr", Tag::Todo { pr: "PR-R3", why: "BeliefSort column for frame_claims_sorted; SPEC §7.2" }),
     ("crates/epigraph-db/src/repos/divergence.rs", "get_latest", Tag::Todo { pr: "PR-R1b", why: "divergence row BetP; SPEC §7.2 derived, see leaves" }),

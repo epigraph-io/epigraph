@@ -2,6 +2,9 @@
 //! Themes are topic clusters; each claim belongs to at most one theme.
 
 use crate::errors::DbError;
+use crate::repos::vector_scan::{
+    begin_exact_vector_scan, begin_iterative_hnsw, exact_retry_or_first_pass,
+};
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -224,41 +227,6 @@ pub struct RecomputedThemeRow {
     pub id: Uuid,
     pub label: String,
     pub claim_count: i32,
-}
-
-/// Open a transaction on `conn` (a savepoint when `conn` is already in one)
-/// that runs the next statement as a pgvector ITERATIVE HNSW scan: sets,
-/// transaction-local, `hnsw.iterative_scan = strict_order` and
-/// `hnsw.ef_search = clamp(limit, 40, 1000)`.
-///
-/// Backlog a507966d. A plain HNSW scan yields at most `ef_search` rows
-/// (pgvector default 40) BEFORE the predicates the index does not encode —
-/// the visibility splice among them — run, so rows a viewer cannot read
-/// sitting nearer the query than its own displace the viewer's rows from the
-/// result, and the size of the shortfall tells the viewer how many hidden rows
-/// sit near the query. `strict_order` keeps scanning, in exact distance order,
-/// until `LIMIT` matching rows are found (bounded by `hnsw.max_scan_tuples`,
-/// default 20,000). Same settings as `ClaimRepository::search_by_embedding_scoped`
-/// and `ClaimRepository::search_by_embedding_since_conn`.
-///
-/// The caller MUST roll the returned transaction back, never commit it: a
-/// committed savepoint would carry the `SET LOCAL` values into the caller's
-/// enclosing transaction and every later read in it. Both callers are
-/// read-only, so rolling back loses nothing. Harmless when the planner picks a
-/// non-HNSW plan (the 3072-d column has no HNSW index).
-async fn begin_iterative_hnsw(
-    conn: &mut sqlx::PgConnection,
-    limit: i64,
-) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, DbError> {
-    let mut tx = sqlx::Connection::begin(conn).await?;
-    sqlx::query(
-        "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), \
-                set_config('hnsw.ef_search', $1, true)",
-    )
-    .bind(limit.clamp(40, 1000).to_string())
-    .execute(&mut *tx)
-    .await?;
-    Ok(tx)
 }
 
 /// Validate `centroid_dim` and return the `(theme_centroid_col,
@@ -843,7 +811,8 @@ impl ClaimThemeRepository {
     /// alone to keep a retired claim out of recall.
     ///
     /// Runs with an iterative HNSW scan (backlog a507966d): see
-    /// [`begin_iterative_hnsw`]. Takes a connection rather than an executor
+    /// [`begin_iterative_hnsw`], retried exact when it comes back short (backlog
+    /// 28b79b1e, see `vector_scan`). Takes a connection rather than an executor
     /// because the scan settings need a (rolled-back) transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn claims_in_themes_at_dim_since(
@@ -883,18 +852,34 @@ impl ClaimThemeRepository {
         // single brace `Viewer::splice` looks for.
         let sql = viewer.splice(&sql, 5);
 
-        let mut vq = sqlx::query(&sql)
-            .bind(theme_ids)
-            .bind(query_vec)
-            .bind(limit)
-            .bind(since);
-        if let Some(g) = viewer.group_bind() {
-            vq = vq.bind(g);
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut vq = sqlx::query(&sql)
+                    .bind(theme_ids)
+                    .bind(query_vec)
+                    .bind(limit)
+                    .bind(since);
+                if let Some(g) = viewer.group_bind() {
+                    vq = vq.bind(g);
+                }
+                vq
+            }};
         }
         let mut tx = begin_iterative_hnsw(conn, i64::from(limit)).await?;
-        let fetched = vq.fetch_all(&mut *tx).await;
+        let fetched = build!().fetch_all(&mut *tx).await;
         tx.rollback().await?;
-        let rows = fetched?;
+        let mut rows = fetched?;
+        // A short first pass may be `hnsw.max_scan_tuples` cutting the scan
+        // off (backlog 28b79b1e): retry it exact. The 3072-d column has no
+        // HNSW index, so its first pass was already exact.
+        if claim_col == "embedding" && rows.len() < usize::try_from(limit).unwrap_or(0) {
+            let mut tx = begin_exact_vector_scan(conn).await?;
+            let retried = build!().fetch_all(&mut *tx).await;
+            tx.rollback().await?;
+            rows = exact_retry_or_first_pass(retried, rows, "claims_in_themes_at_dim_since")?;
+        }
 
         let results = rows
             .iter()
@@ -1069,22 +1054,39 @@ impl ClaimThemeRepository {
         );
         let sql = viewer.splice(&sql, 5);
 
-        let mut q = sqlx::query(&sql)
-            .bind(query_vec)
-            .bind(k)
-            .bind(since)
-            .bind(shortlist);
-        if let Some(g) = viewer.group_bind() {
-            q = q.bind(g);
+        // A macro, not a closure: a closure returning a query that borrows its
+        // captures, held across `.await`, makes the future not `Send`.
+        macro_rules! build {
+            () => {{
+                let mut q = sqlx::query(&sql)
+                    .bind(query_vec)
+                    .bind(k)
+                    .bind(since)
+                    .bind(shortlist);
+                if let Some(g) = viewer.group_bind() {
+                    q = q.bind(g);
+                }
+                q
+            }};
         }
-        let mut tx = begin_iterative_hnsw(conn, i64::from(k)).await?;
-        let fetched = q.fetch_one(&mut *tx).await;
-        tx.rollback().await?;
-        let row = fetched?;
-        Ok(NeighbourhoodThemeCoverage {
+        let coverage = |row: sqlx::postgres::PgRow| NeighbourhoodThemeCoverage {
             probed: row.get("probed"),
             reachable: row.get("reachable"),
-        })
+        };
+        let mut tx = begin_iterative_hnsw(conn, i64::from(k)).await?;
+        let fetched = build!().fetch_one(&mut *tx).await;
+        tx.rollback().await?;
+        let first = coverage(fetched?);
+        // Fewer than `k` probed may be `hnsw.max_scan_tuples` cutting the
+        // scan off (backlog 28b79b1e): retry it exact. The 3072-d column has
+        // no HNSW index, so its first pass was already exact.
+        if nn_col == "embedding" && first.probed < i64::from(k) {
+            let mut tx = begin_exact_vector_scan(conn).await?;
+            let retried = build!().fetch_one(&mut *tx).await.map(coverage);
+            tx.rollback().await?;
+            return exact_retry_or_first_pass(retried, first, "nearest_theme_coverage_since");
+        }
+        Ok(first)
     }
 
     /// Find claims with high boundary_ratio and centroid_distance from claim_clusters.
