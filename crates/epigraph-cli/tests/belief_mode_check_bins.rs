@@ -1126,6 +1126,178 @@ fn backfill_factors_refuses_a_targeted_real_run_without_its_list_and_snapshots()
     assert_eq!(left.len(), 1, "only the wave file: {left:?}");
 }
 
+/// A flag that would do nothing in the chosen mode is refused from argv
+/// (exit 2, before any connection) rather than silently ignored: a page
+/// bound on a targeted run, a pass cap without `--until-fixed`, a snapshot
+/// file on a predict, a predict report on an apply, a targeted switch on the
+/// un-targeted phase, and `--written-before` outside `rewire-edges`.
+#[test]
+fn backfill_factors_refuses_flags_that_would_do_nothing() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let list = dir.join("accepted.txt");
+    std::fs::write(&list, "").expect("empty list");
+    let f = |name: &str| path_str(&dir.join(name)).to_string();
+    let (snap, rows, pj) = (f("snap.jsonl"), f("rows.jsonl"), f("predict.json"));
+    let w = path_str(&wave).to_string();
+    let l = path_str(&list).to_string();
+    let targeted = |extra: &[&str]| -> Vec<String> {
+        let mut a: Vec<String> = ["--phase", "rewire-edges", "--sources-from-waves", &w]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        a.extend(extra.iter().map(|s| (*s).to_string()));
+        a
+    };
+    let real = |extra: &[&str]| -> Vec<String> {
+        let mut a = targeted(&[
+            "--edges-from",
+            &l,
+            "--snapshot",
+            &snap,
+            "--edge-rows",
+            &rows,
+        ]);
+        a.extend(extra.iter().map(|s| (*s).to_string()));
+        a
+    };
+    let plain =
+        |extra: &[&str]| -> Vec<String> { extra.iter().map(|s| (*s).to_string()).collect() };
+    let cases: Vec<(Vec<String>, &str)> = vec![
+        (targeted(&["--dry-run", "--limit", "5"]), "--limit"),
+        (targeted(&["--dry-run", "--offset", "5"]), "--offset"),
+        (
+            targeted(&["--dry-run", "--written-before", "2026-01-01T00:00:00Z"]),
+            "--written-before",
+        ),
+        (
+            targeted(&["--dry-run", "--max-passes", "10"]),
+            "--max-passes",
+        ),
+        (targeted(&["--dry-run", "--snapshot", &snap]), "--snapshot"),
+        (
+            targeted(&["--dry-run", "--edge-rows", &rows]),
+            "--edge-rows",
+        ),
+        (real(&["--predict-json", &pj]), "--predict-json"),
+        (real(&["--limit", "5"]), "--limit"),
+        (
+            plain(&["--phase", "rewire-edges", "--dry-run", "--max-passes", "3"]),
+            "--max-passes",
+        ),
+        (
+            plain(&["--phase", "rewire-edges", "--dry-run", "--epsilon", "1e-6"]),
+            "--epsilon",
+        ),
+        (
+            plain(&[
+                "--phase",
+                "rewire-edges",
+                "--dry-run",
+                "--rewrite-unchanged",
+            ]),
+            "--rewrite-unchanged",
+        ),
+        (
+            plain(&[
+                "--phase",
+                "edges",
+                "--dry-run",
+                "--written-before",
+                "2026-01-01T00:00:00Z",
+            ]),
+            "--written-before",
+        ),
+    ];
+    for (args, needle) in cases {
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let r = run(
+            BACKFILL_FACTORS,
+            &argv,
+            &[("DATABASE_URL", "postgres://nobody@127.0.0.1:1/none")],
+        );
+        assert_eq!(
+            r.code,
+            Some(2),
+            "{argv:?} must be refused\nstdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains(needle) && r.stderr.contains("refused rather than ignored"),
+            "{argv:?}: the refusal names {needle}; stderr: {}",
+            r.stderr
+        );
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    assert_eq!(left.len(), 2, "only the wave and list files: {left:?}");
+}
+
+/// The control for [`backfill_factors_refuses_flags_that_would_do_nothing`]:
+/// the same flags where they DO act get past the argv check and fail only
+/// at the connection (no `DATABASE_URL`), so the refusals above are the
+/// argv check's doing.
+#[test]
+fn backfill_factors_accepts_the_same_flags_where_they_act() {
+    let dir = targeted_scratch();
+    let wave = dir.join("l1.jsonl");
+    std::fs::write(&wave, "").expect("empty wave file");
+    let w = path_str(&wave).to_string();
+    let pj = path_str(&dir.join("predict.json")).to_string();
+    let cases: Vec<Vec<&str>> = vec![
+        vec![
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            &w,
+            "--dry-run",
+            "--until-fixed",
+            "--max-passes",
+            "10",
+            "--epsilon",
+            "1e-6",
+            "--predict-json",
+            &pj,
+        ],
+        vec![
+            "--phase",
+            "rewire-edges",
+            "--dry-run",
+            "--limit",
+            "5",
+            "--offset",
+            "5",
+            "--written-before",
+            "2026-01-01T00:00:00Z",
+        ],
+        vec![
+            "--phase",
+            "edges",
+            "--dry-run",
+            "--limit",
+            "5",
+            "--offset",
+            "1",
+        ],
+    ];
+    for argv in cases {
+        let r = run(BACKFILL_FACTORS, &argv, &[]);
+        assert_ne!(
+            r.code,
+            Some(2),
+            "{argv:?}\nstdout: {}\nstderr: {}",
+            r.stdout,
+            r.stderr
+        );
+        assert!(
+            r.stderr.contains("DATABASE_URL not set"),
+            "{argv:?} reached the connection; stderr: {}",
+            r.stderr
+        );
+    }
+}
+
 /// A real targeted rewire is a writing run: under mode skew it is refused
 /// (exit 3) like every other writing run of this binary, before it creates
 /// its snapshot files or writes anything.
@@ -1400,6 +1572,163 @@ async fn backfill_factors_targeted_apply_refuses_a_wave_claim_rewritten_since_th
     );
 }
 
+/// Targeted mode leaves an unchanged row alone by DEFAULT: a predict run
+/// without `--only-changed` records `only_changed: true` (the apply must
+/// reuse the predict's options, so both default the same way), and
+/// `--rewrite-unchanged` is the one way to opt out. Naming both is an argv
+/// error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_runs_only_changed_by_default(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "default-only-changed").await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let wave = path_str(&ch.wave_file);
+    let predict = |name: &str, extra: &[&str]| -> (Run, std::path::PathBuf) {
+        let out = dir.join(format!("{name}.json"));
+        let mut args = vec![
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--predict-json",
+            path_str(&out),
+        ];
+        args.extend_from_slice(extra);
+        let r = run(
+            BACKFILL_FACTORS,
+            &args,
+            &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+        );
+        (r, out)
+    };
+
+    let (r, plain) = predict("plain", &[]);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        read_predict(&plain).run.only_changed,
+        "a targeted run without the flag leaves unchanged rows alone"
+    );
+    assert!(
+        r.stdout.contains("only_changed=true"),
+        "stdout: {}",
+        r.stdout
+    );
+
+    let (r, opted_out) = predict("opted-out", &["--rewrite-unchanged"]);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        !read_predict(&opted_out).run.only_changed,
+        "--rewrite-unchanged opts out"
+    );
+
+    let (r, both) = predict("both", &["--only-changed", "--rewrite-unchanged"]);
+    assert_eq!(
+        r.code,
+        Some(2),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("--rewrite-unchanged") && r.stderr.contains("--only-changed"),
+        "the conflict names both flags; stderr: {}",
+        r.stderr
+    );
+    assert!(!both.exists(), "an argv error writes no report");
+}
+
+/// sha256 (lower-case hex) of a file, the way a deploy kit's `SHA256SUMS`
+/// records it.
+fn file_sha256(path: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(
+        std::fs::read(path).expect("read the binary"),
+    ))
+}
+
+/// The predict and the apply each carry the sha256 of the binary that ran
+/// them: the predict report's `binary_sha256` and the apply's stdout line
+/// both equal the sha256 of the `backfill_factors` file itself, so "the apply
+/// ran the binary that predicted" is a string comparison.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_predict_and_apply_carry_the_binary_sha256(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "binary-sha").await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let wave = path_str(&ch.wave_file);
+    let want = file_sha256(BACKFILL_FACTORS);
+    assert_eq!(want.len(), 64, "fixture: a sha256 hex digest");
+    let stamp = format!("backfill_factors binary sha256: {want}");
+
+    let predict_json = dir.join("predict.json");
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--predict-json",
+            path_str(&predict_json),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert_eq!(read_predict(&predict_json).binary_sha256, want);
+    assert!(r.stdout.contains(&stamp), "predict stdout: {}", r.stdout);
+
+    let list = dir.join("accepted.txt");
+    std::fs::write(&list, format!("{}\n", ch.ab)).unwrap();
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--edges-from",
+            path_str(&list),
+            "--snapshot",
+            path_str(&dir.join("e-wave.jsonl")),
+            "--edge-rows",
+            path_str(&dir.join("e-rows.jsonl")),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(r.stdout.contains(&stamp), "apply stdout: {}", r.stdout);
+}
+
 /// The operator's apply and undo, through the binaries. A real targeted run
 /// (`--edges-from`, `--snapshot`, `--edge-rows`, `--until-fixed`,
 /// `--only-changed`) rewires both listed edges of the chain and writes both
@@ -1539,4 +1868,157 @@ async fn backfill_factors_targeted_apply_and_restore_edge_factors_round_trip(poo
     again.sort_unstable();
     assert_eq!(again, want, "{second:?}");
     assert!(second.restored.is_empty(), "{second:?}");
+}
+
+/// `restore_edge_factors` leaves every committed batch's outcomes on disk,
+/// through the binary (`--batch-size 1`, so the chain's two rows are two
+/// batches):
+/// * a restore that cannot reach the database leaves the not-yet-started
+///   report (`batches_done` 0 of 2, nothing restored), not an empty file;
+/// * a restore whose second batch fails (a row trigger raises on that row's
+///   UPDATE) exits 1 and leaves batch 1's outcome: `batches_done` 1 of 2,
+///   exactly the other row restored, the failing row untouched;
+/// * the re-run without the trigger finishes, finding batch 1's row
+///   already restored.
+///
+/// The restore is LIFO (the row rewritten last goes back first), so the
+/// first record's row is the second batch.
+#[sqlx::test(migrations = "../../migrations")]
+async fn restore_edge_factors_leaves_each_committed_batch_on_disk(pool: PgPool) {
+    use epigraph_cli::edge_rewire::{read_edge_row_records, EdgeRowRestoreReport};
+    use rewire_fixture::edge_rows;
+
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "batches").await;
+    let rows_pre = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let list = dir.join("batches-accepted.txt");
+    std::fs::write(&list, format!("# accepted\n{}\n{}\n", ch.ab, ch.bc)).unwrap();
+    let rows_file = dir.join("batches-e-rows.jsonl");
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            path_str(&ch.wave_file),
+            "--edges-from",
+            path_str(&list),
+            "--snapshot",
+            path_str(&dir.join("batches-e-wave.jsonl")),
+            "--edge-rows",
+            path_str(&rows_file),
+            "--until-fixed",
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let records = read_edge_row_records(std::io::BufReader::new(
+        std::fs::File::open(&rows_file).expect("edge-rows file"),
+    ))
+    .expect("edge-rows parses");
+    assert_eq!(
+        records.iter().map(|r| r.edge_id).collect::<Vec<_>>(),
+        vec![ch.ab, ch.bc],
+        "PREMISE: both rows rewired, ab first"
+    );
+    let (ab_row, bc_row) = (rows_pre.0[0].0, rows_pre.1[0].0);
+    assert_eq!(records[0].mf_id, ab_row);
+    let rewired = (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await);
+
+    let restore = |name: &str, db: &str| -> (Run, Option<EdgeRowRestoreReport>) {
+        let out = dir.join(format!("{name}.outcomes.json"));
+        let r = run(
+            RESTORE_EDGE_FACTORS,
+            &[
+                "--edge-rows",
+                path_str(&rows_file),
+                "--outcomes-out",
+                path_str(&out),
+                "--batch-size",
+                "1",
+            ],
+            &[("DATABASE_URL", db)],
+        );
+        let text = std::fs::read_to_string(&out).expect("the outcomes file exists");
+        (r, serde_json::from_str(&text).ok())
+    };
+
+    let (r, unreached) = restore("unreached", "postgres://nobody@127.0.0.1:1/none");
+    assert_eq!(
+        r.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let unreached = unreached.expect("an unreached restore leaves a parseable report");
+    assert_eq!(
+        (unreached.batches_done, unreached.batches_total),
+        (0, 2),
+        "{unreached:?}"
+    );
+    assert!(!unreached.complete());
+    assert!(unreached.restored.is_empty(), "{unreached:?}");
+
+    sqlx::query(
+        "CREATE FUNCTION test_fail_restore() RETURNS trigger LANGUAGE plpgsql AS $f$ \
+         BEGIN RAISE EXCEPTION 'test: batch 2 fails'; END $f$",
+    )
+    .execute(&pool)
+    .await
+    .expect("failing trigger function");
+    sqlx::query(&format!(
+        "CREATE TRIGGER test_fail_restore BEFORE UPDATE ON mass_functions \
+         FOR EACH ROW WHEN (OLD.id = '{ab_row}'::uuid) EXECUTE FUNCTION test_fail_restore()"
+    ))
+    .execute(&pool)
+    .await
+    .expect("failing trigger");
+    let (r, partial) = restore("partial", &db);
+    assert_eq!(
+        r.code,
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let partial = partial.expect("a part-way restore leaves a parseable report");
+    assert_eq!(
+        (partial.batches_done, partial.batches_total),
+        (1, 2),
+        "batch 1 committed and was written before batch 2 failed: {partial:?}"
+    );
+    assert_eq!(partial.restored, vec![bc_row], "{partial:?}");
+    assert_eq!(edge_rows(&pool, ch.bc).await, rows_pre.1, "bc restored");
+    assert_eq!(edge_rows(&pool, ch.ab).await, rewired.0, "ab untouched");
+
+    sqlx::query("DROP TRIGGER test_fail_restore ON mass_functions")
+        .execute(&pool)
+        .await
+        .expect("drop the trigger");
+    let (r, rest) = restore("rest", &db);
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    let rest = rest.expect("outcomes parse");
+    assert!(rest.complete(), "{rest:?}");
+    assert_eq!(rest.restored, vec![ab_row], "{rest:?}");
+    assert_eq!(rest.already_restored, vec![bc_row], "{rest:?}");
+    assert_eq!(
+        (edge_rows(&pool, ch.ab).await, edge_rows(&pool, ch.bc).await),
+        rows_pre
+    );
 }

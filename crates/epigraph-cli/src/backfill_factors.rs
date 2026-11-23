@@ -643,7 +643,9 @@ async fn rewire_one(
                     tracing::warn!(edge = %edge.edge_id, target = %edge.target_id,
                         "targeted rewire: written cache differs from the predicted fold; rolled back");
                     tx.rollback().await.map_err(|e| format!("rollback: {e}"))?;
-                    return Ok(EdgeResult::only(EdgeRewrite::Held(HeldBucket::TargetStale)));
+                    return Ok(EdgeResult::only(EdgeRewrite::Held(
+                        HeldBucket::PostWireMismatch,
+                    )));
                 }
                 // Recorded BEFORE the commit, so no committed rewrite lacks
                 // its snapshot record.
@@ -724,11 +726,18 @@ pub enum HeldBucket {
     RowMixed,
     /// The refold would vacate the target (ruling R-80).
     WouldVacate,
+    /// Apply only: the cache the wire WROTE differs from the fold the
+    /// decision predicted over the same rows (the cache writer's owner
+    /// guard declined, or a write landed between the decision and the
+    /// wire). Rolled back. Kept apart from `target_stale`, a decision-time
+    /// verdict on the stored cache, so a real mismatch between the predicted
+    /// fold and the cache writer is not hidden among stale targets.
+    PostWireMismatch,
 }
 
 impl HeldBucket {
     /// Every bucket, in report order.
-    pub const ALL: [HeldBucket; 9] = [
+    pub const ALL: [HeldBucket; 10] = [
         HeldBucket::Supersedes,
         HeldBucket::CompoundEnd,
         HeldBucket::OffKeyOrDuplicate,
@@ -738,6 +747,7 @@ impl HeldBucket {
         HeldBucket::TargetStale,
         HeldBucket::RowMixed,
         HeldBucket::WouldVacate,
+        HeldBucket::PostWireMismatch,
     ];
 
     /// The bucket's report name.
@@ -753,6 +763,7 @@ impl HeldBucket {
             HeldBucket::TargetStale => "target_stale",
             HeldBucket::RowMixed => "row_mixed",
             HeldBucket::WouldVacate => "would_vacate",
+            HeldBucket::PostWireMismatch => "post_wire_mismatch",
         }
     }
 
@@ -829,6 +840,9 @@ pub enum TargetedVerdict {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TargetedDecision {
     pub verdict: TargetedVerdict,
+    /// The source's `(belief, plausibility, open_world_mass)` `p1` was built
+    /// from (the stored or overlaid cache).
+    pub source: Option<(f64, f64, Option<f64>)>,
     pub stored: Option<StoredEdgeRow>,
     pub p0: Option<EdgeBba>,
     pub p1: Option<EdgeBba>,
@@ -841,6 +855,7 @@ impl TargetedDecision {
     fn hold(bucket: HeldBucket) -> Self {
         Self {
             verdict: TargetedVerdict::Hold(bucket),
+            source: None,
             stored: None,
             p0: None,
             p1: None,
@@ -895,6 +910,41 @@ WHERE mf.combination_method = 'edge_factor'
   AND ($2::uuid[] IS NULL OR e.id = ANY($2))
 ORDER BY e.id, mf.created_at, mf.id
 "#;
+
+/// The edges sourced at `$1` that hold a live `edge_factor` row on their
+/// target but that [`TARGETED_REWIRE_EDGE_QUERY`] does not select, because
+/// the edge is no longer in force or an endpoint is no longer current
+/// (design report field `not_selectable`): reported, so a pass's reach is
+/// not understated by what it silently skipped. One row per edge, by id.
+pub const TARGETED_UNSELECTABLE_EDGE_QUERY: &str = r#"
+SELECT DISTINCT e.id
+FROM mass_functions mf
+JOIN edges e ON e.id = mf.perspective_id
+JOIN claims tgt ON tgt.id = e.target_id
+JOIN claims src ON src.id = e.source_id
+WHERE mf.combination_method = 'edge_factor'
+  AND mf.retracted_at IS NULL
+  AND mf.claim_id = e.target_id
+  AND e.source_type = 'claim' AND e.target_type = 'claim'
+  AND e.source_id = ANY($1)
+  AND NOT (tgt.is_current AND src.is_current
+           AND (e.valid_to IS NULL OR e.valid_to > now()))
+ORDER BY e.id
+"#;
+
+/// Run [`TARGETED_UNSELECTABLE_EDGE_QUERY`]: the edge ids, ordered.
+///
+/// # Errors
+/// The query's error.
+pub async fn unselectable_targeted_edges(
+    conn: &mut sqlx::PgConnection,
+    sources: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(TARGETED_UNSELECTABLE_EDGE_QUERY)
+        .bind(sources)
+        .fetch_all(&mut *conn)
+        .await
+}
 
 /// Run [`TARGETED_REWIRE_EDGE_QUERY`].
 ///
@@ -1288,6 +1338,7 @@ pub async fn decide_targeted(
         });
     let mut decision = TargetedDecision {
         verdict: TargetedVerdict::Proceed,
+        source: Some(current),
         stored: Some(stored.clone()),
         p0: p0.clone(),
         p1: Some(p1.clone()),

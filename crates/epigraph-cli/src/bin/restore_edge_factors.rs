@@ -14,7 +14,14 @@
 //! the caches were folded from come back before the caches do.
 //!
 //! The outcomes go to `--outcomes-out` (default `<edge-rows>.restore-<UTC
-//! stamp>.outcomes.json`), which must not exist.
+//! stamp>.outcomes.json`), which must not exist. The file is rewritten after
+//! EVERY batch (written beside it, then renamed over it), so a restore that
+//! stops part-way leaves the outcomes of the batches it committed;
+//! `batches_done` < `batches_total` says it did not finish. The file holds
+//! the not-yet-started report (`batches_done` 0) before the database is
+//! reached, so a restore that fails before its first batch commits leaves
+//! that, not an empty file. A re-run of the same `--edge-rows` finds the
+//! committed rows `already_restored`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -22,7 +29,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use epigraph_cli::edge_rewire::{read_edge_row_records, restore_edge_rows};
+use epigraph_cli::edge_rewire::{
+    edge_row_restore_start, read_edge_row_records, restore_edge_rows_batched, EdgeRowRestoreReport,
+    EDGE_ROW_RESTORE_BATCH,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +48,10 @@ struct Cli {
     dry_run: bool,
     #[arg(long)]
     outcomes_out: Option<PathBuf>,
+    /// Rows per restore transaction (at least 1).
+    #[arg(long, hide = true, default_value_t = EDGE_ROW_RESTORE_BATCH,
+          value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
+    batch_size: usize,
 }
 
 #[tokio::main]
@@ -66,21 +80,42 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         p.push(format!(".restore-{stamp}{suffix}.outcomes.json"));
         PathBuf::from(p)
     });
-    let mut out = BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&out_path)
-            .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?,
-    );
+    // Reserve the name (must not exist); each batch's report replaces it.
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&out_path)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?;
+    let write_outcomes = |report: &EdgeRowRestoreReport| -> anyhow::Result<()> {
+        let mut tmp = out_path.as_os_str().to_owned();
+        tmp.push(".partial");
+        let tmp = PathBuf::from(tmp);
+        let mut out = BufWriter::new(
+            File::create(&tmp).map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?,
+        );
+        serde_json::to_writer_pretty(&mut out, report)?;
+        out.write_all(b"\n")?;
+        out.into_inner()
+            .map_err(|e| anyhow::anyhow!("{}: {e}", tmp.display()))?
+            .sync_all()?;
+        std::fs::rename(&tmp, &out_path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", out_path.display()))?;
+        Ok(())
+    };
+    write_outcomes(&edge_row_restore_start(&records, cli.batch_size))?;
 
     let maint = epigraph_cli::MaintenancePool::connect("restore_edge_factors")
         .await
         .map_err(|e| anyhow::anyhow!("maintenance pool: {e}"))?;
-    let report = restore_edge_rows(maint.pool(), &records, cli.dry_run).await?;
-    serde_json::to_writer_pretty(&mut out, &report)?;
-    out.write_all(b"\n")?;
-    out.flush()?;
+    let mut on_batch = |r: &EdgeRowRestoreReport| write_outcomes(r);
+    let report = restore_edge_rows_batched(
+        maint.pool(),
+        &records,
+        cli.dry_run,
+        cli.batch_size,
+        &mut on_batch,
+    )
+    .await?;
     println!(
         "restore_edge_factors{}: restored={} already_restored={} superseded_since_rewire={} \
          retracted_since_rewire={} missing={} (outcomes: {})",

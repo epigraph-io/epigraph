@@ -56,8 +56,8 @@ use uuid::Uuid;
 
 use crate::backfill_factors::{
     cache_of_fold, decide_targeted, rewire_edge_targeted, select_targeted_edges, selected_edge_row,
-    HeldBucket, RewireCapture, RewireEdge, RewireOverlay, StoredEdgeRow, TargetedGuards,
-    TargetedOutcome, TargetedVerdict,
+    unselectable_targeted_edges, HeldBucket, RewireCapture, RewireEdge, RewireOverlay,
+    StoredEdgeRow, TargetedGuards, TargetedOutcome, TargetedVerdict,
 };
 use crate::belief_cache::{plan_restore, write_wave_record, CacheColumns, WaveRecord};
 
@@ -206,6 +206,10 @@ pub struct TargetedRunOptions {
     pub edges: Option<BTreeSet<Uuid>>,
     pub max_passes: usize,
     pub epsilon: f64,
+    /// Leave a row alone when a fresh wire equals it (on by default: a
+    /// rewrite of an unchanged row bumps its `created_at` and refolds its
+    /// target for nothing, and the fixed-point verify counts it as a
+    /// rewrite).
     pub only_changed: bool,
     /// Wave name prefix; pass k's records are `<prefix>-pass-<k>`.
     pub wave_prefix: String,
@@ -217,7 +221,7 @@ impl Default for TargetedRunOptions {
             edges: None,
             max_passes: DEFAULT_MAX_PASSES,
             epsilon: DEFAULT_EPSILON,
-            only_changed: false,
+            only_changed: true,
             wave_prefix: "r176e".to_string(),
         }
     }
@@ -239,6 +243,13 @@ pub struct PassSummary {
     pub held: BTreeMap<String, usize>,
     /// Targets whose cache moved: the next pass's sources.
     pub moved_targets: usize,
+    /// Edges sourced at the pass's sources with a live edge-factor row that
+    /// the selection skips (no longer in force, or an endpoint no longer
+    /// current). A claim that is a source again in a later pass (a cycle, a
+    /// diamond) counts its edges again here; the run's distinct count is
+    /// [`TargetedRunReport::not_selectable`] / [`PredictTotals::not_selectable`].
+    #[serde(default)]
+    pub not_selectable: usize,
 }
 
 impl PassSummary {
@@ -256,6 +267,10 @@ pub struct TargetedRunReport {
     /// When not converged: the edges the next pass would have taken, left
     /// alone (`cycle_unconverged` / `chain_boundary_held` at the pass cap).
     pub unconverged_edges: Vec<Uuid>,
+    /// Distinct edges over all passes that [`PassSummary::not_selectable`]
+    /// counted.
+    #[serde(default)]
+    pub not_selectable: usize,
 }
 
 impl TargetedRunReport {
@@ -328,6 +343,41 @@ pub fn read_edge_row_records<R: BufRead>(input: R) -> anyhow::Result<Vec<EdgeRow
     Ok(out)
 }
 
+/// The sha256 (lower-case hex) of the executable this process runs: the
+/// stamp a predict and the apply compared with it carry, so "the same binary
+/// as the predict" is checked by comparing two strings, and the value matches
+/// a deploy kit's `SHA256SUMS` entry for the file. On Linux it hashes
+/// `/proc/self/exe`, which still reads the running image after the file on
+/// disk was replaced; elsewhere [`std::env::current_exe`]. A failure is
+/// returned as `unavailable: <reason>`, never as an empty string.
+#[must_use]
+pub fn running_binary_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    fn hash(path: &std::path::Path) -> std::io::Result<String> {
+        let mut f = std::fs::File::open(path)?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(hex::encode(h.finalize()))
+    }
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    if proc_exe.exists() {
+        if let Ok(h) = hash(proc_exe) {
+            return h;
+        }
+    }
+    std::env::current_exe()
+        .and_then(|p| hash(&p))
+        .unwrap_or_else(|e| format!("unavailable: {e}"))
+}
+
 /// Read the database clock (the run's `at`, before its first write).
 async fn db_now(pool: &PgPool) -> anyhow::Result<DateTime<Utc>> {
     Ok(sqlx::query_scalar("SELECT now()").fetch_one(pool).await?)
@@ -364,6 +414,7 @@ pub async fn run_targeted_rewire(
     let mut sources: BTreeSet<Uuid> = seed.moved.clone();
     let mut report = TargetedRunReport::default();
     let accepted: Option<Vec<Uuid>> = opts.edges.as_ref().map(|e| e.iter().copied().collect());
+    let mut unselectable: BTreeSet<Uuid> = BTreeSet::new();
 
     for pass in 1..=opts.max_passes.max(1) {
         if sources.is_empty() {
@@ -371,15 +422,20 @@ pub async fn run_targeted_rewire(
             break;
         }
         let src: Vec<Uuid> = sources.iter().copied().collect();
-        let edges = {
+        let (edges, skipped) = {
             let mut conn = pool.acquire().await?;
-            select_targeted_edges(&mut conn, &src, None).await?
+            (
+                select_targeted_edges(&mut conn, &src, None).await?,
+                unselectable_targeted_edges(&mut conn, &src).await?,
+            )
         };
         let mut summary = PassSummary {
             pass,
             selected: edges.len(),
+            not_selectable: skipped.len(),
             ..PassSummary::default()
         };
+        unselectable.extend(skipped);
         let mut next: BTreeSet<Uuid> = BTreeSet::new();
         let wave = format!("{}-pass-{pass}", opts.wave_prefix);
         for edge in &edges {
@@ -454,6 +510,7 @@ pub async fn run_targeted_rewire(
         report.passes.push(summary);
         sources = next;
     }
+    report.not_selectable = unselectable.len();
     if sources.is_empty() {
         report.converged = true;
     } else {
@@ -480,6 +537,21 @@ pub struct EdgeRowRestoreReport {
     /// Retracted since the rewire: left alone (migration 184 audit row).
     pub retracted_since_rewire: Vec<Uuid>,
     pub missing: Vec<Uuid>,
+    /// Batches finished (committed, or rolled back on a dry run) when this
+    /// report was taken, out of `batches_total`: a report written after each
+    /// batch is complete when the two are equal.
+    #[serde(default)]
+    pub batches_done: usize,
+    #[serde(default)]
+    pub batches_total: usize,
+}
+
+impl EdgeRowRestoreReport {
+    /// Every batch finished.
+    #[must_use]
+    pub fn complete(&self) -> bool {
+        self.batches_done == self.batches_total
+    }
 }
 
 /// One row a restore puts back: chained like `belief_cache::plan_restore`
@@ -541,9 +613,50 @@ pub async fn restore_edge_rows(
     records: &[EdgeRowRecord],
     dry_run: bool,
 ) -> anyhow::Result<EdgeRowRestoreReport> {
+    restore_edge_rows_batched(pool, records, dry_run, EDGE_ROW_RESTORE_BATCH, &mut |_| {
+        Ok(())
+    })
+    .await
+}
+
+/// The report [`restore_edge_rows_batched`] starts from: nothing done, out
+/// of the batches the same `records` and `batch_size` take (rows are
+/// planned per `mf_id`, so this is not `records.len()` / `batch_size`). A
+/// caller writes it before connecting, so a restore that fails before its
+/// first batch commits still leaves a parseable, visibly unfinished report.
+#[must_use]
+pub fn edge_row_restore_start(
+    records: &[EdgeRowRecord],
+    batch_size: usize,
+) -> EdgeRowRestoreReport {
+    EdgeRowRestoreReport {
+        batches_total: plan_edge_rows(records).len().div_ceil(batch_size.max(1)),
+        ..EdgeRowRestoreReport::default()
+    }
+}
+
+/// [`restore_edge_rows`] in transactions of `batch_size` rows, handing
+/// `on_batch` the cumulative report after EACH batch commits (or rolls back,
+/// on a dry run), so a caller can write its outcomes as it goes: a restore
+/// that stops part-way (a database error, a killed process) leaves the
+/// outcomes of every batch it committed on disk, not none. An `on_batch`
+/// error stops the restore after that batch, which stays committed; a re-run
+/// finds its rows `already_restored`.
+///
+/// # Errors
+/// Any database error, or `on_batch`'s; batches already committed stay
+/// committed.
+pub async fn restore_edge_rows_batched(
+    pool: &PgPool,
+    records: &[EdgeRowRecord],
+    dry_run: bool,
+    batch_size: usize,
+    on_batch: &mut (dyn FnMut(&EdgeRowRestoreReport) -> anyhow::Result<()> + Send),
+) -> anyhow::Result<EdgeRowRestoreReport> {
     let plan = plan_edge_rows(records);
-    let mut report = EdgeRowRestoreReport::default();
-    for chunk in plan.chunks(EDGE_ROW_RESTORE_BATCH) {
+    let batch_size = batch_size.max(1);
+    let mut report = edge_row_restore_start(records, batch_size);
+    for chunk in plan.chunks(batch_size) {
         let mut tx = pool.begin().await?;
         for e in chunk {
             let restored: Option<Uuid> = sqlx::query_scalar(
@@ -600,6 +713,8 @@ pub async fn restore_edge_rows(
         } else {
             tx.commit().await?;
         }
+        report.batches_done += 1;
+        on_batch(&report)?;
     }
     Ok(report)
 }
@@ -630,6 +745,26 @@ pub struct PredictedEdge {
     pub locality_changed: bool,
     /// The new row's evidence-type spelling differs from the stored one (E-f).
     pub respelled: bool,
+    /// `P1 − P0`, the part of the rewrite the source's move explains: the
+    /// largest absolute difference over the focal masses (an absent focal
+    /// set is mass 0). `None` without a baseline wire.
+    #[serde(default)]
+    pub d_row_cal: Option<f64>,
+    /// `P0 − M_s`, the stored row's staleness for any other reason, the same
+    /// measure. 0 (within rounding) for a row of class `r173`.
+    #[serde(default)]
+    pub d_row_other: Option<f64>,
+    /// The source's stored `open_world_mass` exceeds the width of the
+    /// interval `P1` was built from (by more than 1e-12), so the wire clamps
+    /// it to that width (E-c, a stale open-world value).
+    #[serde(default)]
+    pub ow_clamped: bool,
+    /// A row the diffs above read is not a JSON object of numeric masses
+    /// (the stored `masses` does not parse, or a focal mass is not a
+    /// number): its `d_row_*` is `None` although a baseline exists, so this
+    /// flag, not a missing number, says why.
+    #[serde(default)]
+    pub mass_unreadable: bool,
 }
 
 /// One target the predict touched, binary frame.
@@ -645,6 +780,16 @@ pub struct PredictedTarget {
     pub d_stale: Option<f64>,
     /// W − R on BetP: what the rewire moves it by.
     pub d_edge: Option<f64>,
+    /// R's belief and plausibility.
+    #[serde(default)]
+    pub r_belief: Option<f64>,
+    #[serde(default)]
+    pub r_plausibility: Option<f64>,
+    /// W − R on belief and on plausibility (`d_edge` is on BetP).
+    #[serde(default)]
+    pub d_edge_belief: Option<f64>,
+    #[serde(default)]
+    pub d_edge_plausibility: Option<f64>,
     pub fresh: bool,
     /// Thresholds crossed S → W on BetP: `up_0.50`, `down_0.75`, ...
     pub crossings: Vec<String>,
@@ -667,6 +812,149 @@ pub struct PredictTotals {
     pub d_edge_over_0_20: usize,
     /// Crossings by name, summed over targets.
     pub crossings: BTreeMap<String, usize>,
+    /// Distinct edges over all passes that [`PassSummary::not_selectable`]
+    /// counted (the design's per-edge count, not a per-pass sum).
+    #[serde(default)]
+    pub not_selectable: usize,
+    /// The [`TOP_MOVERS`] targets with the largest |d_edge|, largest first
+    /// (ties by target id).
+    #[serde(default)]
+    pub top_movers: Vec<Mover>,
+    /// Sizes of the strongly connected components (cycles) of the graph of
+    /// the edges the passes selected, largest first; components of one
+    /// claim without a self-edge are left out. A cycle is what keeps a
+    /// finite-epsilon run from an exact fixed point.
+    #[serde(default)]
+    pub scc_sizes: Vec<usize>,
+    /// Edges whose [`PredictedEdge::mass_unreadable`] is set.
+    #[serde(default)]
+    pub mass_unreadable: usize,
+}
+
+/// How many movers [`PredictTotals::top_movers`] lists.
+pub const TOP_MOVERS: usize = 200;
+
+/// One target in [`PredictTotals::top_movers`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Mover {
+    pub target_id: Uuid,
+    /// W − R on BetP.
+    pub d_edge: f64,
+}
+
+/// The largest absolute difference between two edge rows' focal masses (an
+/// absent focal set is mass 0). `None` when either side is not a JSON
+/// object or a focal mass is not a finite number: an unreadable row has no
+/// difference, and never reads as a clean 0.
+#[must_use]
+pub fn max_abs_mass_diff(a: &serde_json::Value, b: &serde_json::Value) -> Option<f64> {
+    let (oa, ob) = (a.as_object()?, b.as_object()?);
+    let mass = |o: &serde_json::Map<String, serde_json::Value>, k: &str| -> Option<f64> {
+        match o.get(k) {
+            None => Some(0.0),
+            Some(m) => m.as_f64().filter(|x| x.is_finite()),
+        }
+    };
+    let keys: BTreeSet<&String> = oa.keys().chain(ob.keys()).collect();
+    keys.into_iter().try_fold(0.0_f64, |acc, k| {
+        Some(acc.max((mass(oa, k)? - mass(ob, k)?).abs()))
+    })
+}
+
+/// [`PredictTotals::top_movers`]: the `n` targets with the largest |d_edge|,
+/// largest first, ties by target id (deterministic).
+#[must_use]
+pub fn top_movers(targets: &BTreeMap<Uuid, PredictedTarget>, n: usize) -> Vec<Mover> {
+    let mut movers: Vec<Mover> = targets
+        .iter()
+        .filter_map(|(id, t)| {
+            t.d_edge.map(|d| Mover {
+                target_id: *id,
+                d_edge: d,
+            })
+        })
+        .collect();
+    movers.sort_by(|x, y| {
+        y.d_edge
+            .abs()
+            .total_cmp(&x.d_edge.abs())
+            .then(x.target_id.cmp(&y.target_id))
+    });
+    movers.truncate(n);
+    movers
+}
+
+/// Sizes of the strongly connected components (Tarjan, iterative) of the
+/// directed graph `edges`, largest first, leaving out a single node without
+/// a self-edge. Deterministic: nodes and successors are visited in id order.
+#[must_use]
+pub fn cycle_sizes(edges: &[(Uuid, Uuid)]) -> Vec<usize> {
+    let mut adj: BTreeMap<Uuid, BTreeSet<Uuid>> = BTreeMap::new();
+    for &(s, t) in edges {
+        adj.entry(s).or_default().insert(t);
+        adj.entry(t).or_default();
+    }
+    let nodes: Vec<Uuid> = adj.keys().copied().collect();
+    let index_of: HashMap<Uuid, usize> = nodes.iter().enumerate().map(|(i, n)| (*n, i)).collect();
+    let succ: Vec<Vec<usize>> = nodes
+        .iter()
+        .map(|n| adj[n].iter().map(|t| index_of[t]).collect())
+        .collect();
+    let n = nodes.len();
+    let mut index = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    let mut sizes = Vec::new();
+    for root in 0..n {
+        if index[root] != usize::MAX {
+            continue;
+        }
+        // (node, position in its successor list)
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        index[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut pos)) = work.last_mut() {
+            if let Some(&w) = succ[v].get(*pos) {
+                *pos += 1;
+                if index[w] == usize::MAX {
+                    index[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(index[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == index[v] {
+                let mut size = 0usize;
+                loop {
+                    let w = stack.pop().expect("v is on the stack");
+                    on_stack[w] = false;
+                    size += 1;
+                    if w == v {
+                        break;
+                    }
+                }
+                if size > 1 || succ[v].contains(&v) {
+                    sizes.push(size);
+                }
+            }
+        }
+    }
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    sizes
 }
 
 /// The options and inputs a predict ran with. Predict-equals-apply holds only
@@ -692,6 +980,10 @@ pub struct PredictRun {
 pub struct PredictReport {
     pub calibration_source: String,
     pub profile_hash: String,
+    /// [`running_binary_sha256`] of the binary that predicted (filled in by
+    /// the binary); the apply prints its own, which must equal it.
+    #[serde(default)]
+    pub binary_sha256: String,
     pub run: PredictRun,
     /// `db` (the database holds the wave's written values) or `seeded` (some
     /// wave claims still hold their `before`: the overlay was seeded with
@@ -837,6 +1129,7 @@ pub async fn predict_targeted_rewire(
     let mut edges_out: Vec<PredictedEdge> = Vec::new();
     let mut targets: BTreeMap<Uuid, PredictedTarget> = BTreeMap::new();
     let mut converged = false;
+    let mut unselectable: BTreeSet<Uuid> = BTreeSet::new();
 
     for pass in 1..=opts.max_passes.max(1) {
         if sources.is_empty() {
@@ -845,11 +1138,14 @@ pub async fn predict_targeted_rewire(
         }
         let src: Vec<Uuid> = sources.iter().copied().collect();
         let edges: Vec<RewireEdge> = select_targeted_edges(&mut tx, &src, None).await?;
+        let skipped = unselectable_targeted_edges(&mut tx, &src).await?;
         let mut summary = PassSummary {
             pass,
             selected: edges.len(),
+            not_selectable: skipped.len(),
             ..PassSummary::default()
         };
+        unselectable.extend(skipped);
         let mut next: BTreeSet<Uuid> = BTreeSet::new();
         for edge in &edges {
             let mut out = PredictedEdge {
@@ -867,6 +1163,10 @@ pub async fn predict_targeted_rewire(
                 p1_locality_tag: None,
                 locality_changed: false,
                 respelled: false,
+                d_row_cal: None,
+                d_row_other: None,
+                ow_clamped: false,
+                mass_unreadable: false,
             };
             if accepted
                 .as_ref()
@@ -917,6 +1217,21 @@ pub async fn predict_targeted_rewire(
             .map_err(anyhow::Error::msg)?;
             out.stored_masses = d.stored.as_ref().map(|r| r.masses.clone());
             out.p0_masses = d.p0.as_ref().map(|b| b.masses_json.clone());
+            out.ow_clamped = d
+                .source
+                .is_some_and(|(b, p, ow)| ow.is_some_and(|ow| ow > (p - b).max(0.0) + 1e-12));
+            if let Some(p0) = &d.p0 {
+                if let Some(p1) = &d.p1 {
+                    out.d_row_cal = max_abs_mass_diff(&p1.masses_json, &p0.masses_json);
+                    out.mass_unreadable |= out.d_row_cal.is_none();
+                }
+                if let Some(st) = &d.stored {
+                    out.d_row_other = serde_json::from_str::<serde_json::Value>(&st.masses)
+                        .ok()
+                        .and_then(|m_s| max_abs_mass_diff(&p0.masses_json, &m_s));
+                    out.mass_unreadable |= out.d_row_other.is_none();
+                }
+            }
             if let Some(p1) = &d.p1 {
                 out.p1_masses = Some(p1.masses_json.clone());
                 out.p1_source_strength = Some(p1.source_strength);
@@ -933,12 +1248,16 @@ pub async fn predict_targeted_rewire(
                     .or_insert_with(|| PredictedTarget {
                         s: s.clone(),
                         r_betp: d.r.as_ref().map(|r| r.pignistic_prob),
+                        r_belief: d.r.as_ref().map(|r| r.belief),
+                        r_plausibility: d.r.as_ref().map(|r| r.plausibility),
                         w: None,
                         d_stale: match (s.pignistic_prob, d.r.as_ref()) {
                             (Some(s), Some(r)) => Some(r.pignistic_prob - s),
                             _ => None,
                         },
                         d_edge: None,
+                        d_edge_belief: None,
+                        d_edge_plausibility: None,
                         // The S-vs-R comparison itself, not the verdict: a
                         // held `would_vacate` target has no fold to be fresh to.
                         fresh: d.r.as_ref().is_some_and(|r| {
@@ -1003,8 +1322,15 @@ pub async fn predict_targeted_rewire(
 
     let mut totals = PredictTotals {
         cycle_unconverged: unconverged_edges.len(),
+        not_selectable: unselectable.len(),
         ..PredictTotals::default()
     };
+    let reached: Vec<(Uuid, Uuid)> = edges_out
+        .iter()
+        .map(|e| (e.source_id, e.target_id))
+        .collect();
+    totals.scc_sizes = cycle_sizes(&reached);
+    totals.mass_unreadable = edges_out.iter().filter(|e| e.mass_unreadable).count();
     for p in &passes {
         totals.would_rewrite += p.rewired;
         totals.unchanged += p.unchanged;
@@ -1025,10 +1351,13 @@ pub async fn predict_targeted_rewire(
         .unwrap_or(0);
     for t in targets.values_mut() {
         let Some(w) = &t.w else { continue };
-        t.d_edge = match (w.pignistic_prob, t.r_betp) {
+        let minus = |w: Option<f64>, r: Option<f64>| match (w, r) {
             (Some(w), Some(r)) => Some(w - r),
             _ => None,
         };
+        t.d_edge = minus(w.pignistic_prob, t.r_betp);
+        t.d_edge_belief = minus(w.belief, t.r_belief);
+        t.d_edge_plausibility = minus(w.plausibility, t.r_plausibility);
         t.crossings = crossings(t.s.pignistic_prob, w.pignistic_prob);
         if let Some(d) = t.d_edge {
             *totals
@@ -1047,11 +1376,13 @@ pub async fn predict_targeted_rewire(
             *totals.crossings.entry(c.clone()).or_default() += 1;
         }
     }
+    totals.top_movers = top_movers(&targets, TOP_MOVERS);
 
     Ok(PredictReport {
         calibration_source: epigraph_engine::calibration::CalibrationConfig::cached_source()
             .to_string(),
         profile_hash: epigraph_engine::belief_profile::BeliefProfile::served().profile_hash(),
+        binary_sha256: String::new(),
         run: PredictRun {
             epsilon: opts.epsilon,
             max_passes: opts.max_passes,
@@ -1069,4 +1400,116 @@ pub async fn predict_targeted_rewire(
         targets,
         totals,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    /// Components of one claim without a self-edge are not cycles; a
+    /// 3-cycle, a 2-cycle and a self-edge are, whatever hangs off them.
+    #[test]
+    fn cycle_sizes_lists_each_cycle_largest_first() {
+        let edges = [
+            (id(1), id(2)),
+            (id(2), id(3)),
+            (id(3), id(1)),
+            (id(3), id(7)),
+            (id(4), id(5)),
+            (id(5), id(4)),
+            (id(6), id(6)),
+            (id(7), id(8)),
+            (id(8), id(9)),
+        ];
+        assert_eq!(cycle_sizes(&edges), vec![3, 2, 1]);
+        assert!(cycle_sizes(&[(id(1), id(2)), (id(2), id(3))]).is_empty());
+        assert!(cycle_sizes(&[]).is_empty());
+    }
+
+    /// Iterative, not recursive: a 200k-claim chain and a 200k-claim ring are
+    /// walked without exhausting the stack.
+    #[test]
+    fn cycle_sizes_walks_a_deep_graph_without_recursion() {
+        let n: u128 = 200_000;
+        let chain: Vec<(Uuid, Uuid)> = (0..n).map(|i| (id(i), id(i + 1))).collect();
+        assert!(cycle_sizes(&chain).is_empty());
+        let mut ring = chain;
+        ring.push((id(n), id(0)));
+        assert_eq!(cycle_sizes(&ring), vec![200_001]);
+    }
+
+    #[test]
+    fn max_abs_mass_diff_takes_an_absent_focal_set_as_zero() {
+        let a = serde_json::json!({"0": 0.6, "1": 0.1, "0,1": 0.3});
+        let b = serde_json::json!({"0": 0.5, "0,1": 0.5});
+        assert!((max_abs_mass_diff(&a, &b).unwrap() - 0.2).abs() < 1e-12);
+        assert!((max_abs_mass_diff(&b, &a).unwrap() - 0.2).abs() < 1e-12);
+        assert_eq!(max_abs_mass_diff(&a, &a), Some(0.0));
+    }
+
+    /// A non-numeric mass (a string, a JSON null) or a side that is not an
+    /// object has no difference: `None`, never a clean-looking 0 (an `f64`
+    /// fold with `f64::max` drops a NaN and read 0.0 here).
+    #[test]
+    fn max_abs_mass_diff_has_no_difference_for_an_unreadable_row() {
+        let good = serde_json::json!({"0": 0.5, "0,1": 0.5});
+        for bad in [
+            serde_json::json!({"0": "x", "0,1": 0.5}),
+            serde_json::json!({"0": null, "0,1": 0.5}),
+            serde_json::json!([0.5, 0.5]),
+            serde_json::json!("0.5"),
+        ] {
+            assert_eq!(max_abs_mass_diff(&bad, &good), None, "{bad}");
+            assert_eq!(max_abs_mass_diff(&good, &bad), None, "{bad}");
+        }
+    }
+
+    fn target(d_edge: Option<f64>) -> PredictedTarget {
+        PredictedTarget {
+            s: CacheColumns {
+                belief: None,
+                plausibility: None,
+                pignistic_prob: None,
+                mass_on_empty: None,
+                mass_on_missing: None,
+                belief_frame_id: None,
+                classification: None,
+            },
+            r_betp: None,
+            r_belief: None,
+            r_plausibility: None,
+            w: None,
+            d_stale: None,
+            d_edge,
+            d_edge_belief: None,
+            d_edge_plausibility: None,
+            fresh: true,
+            crossings: Vec::new(),
+        }
+    }
+
+    /// Ranked by |d_edge| (a large fall outranks a small rise), ties by id,
+    /// truncated to `n`; a target the predict did not move is not a mover.
+    #[test]
+    fn top_movers_ranks_by_magnitude_then_id() {
+        let targets: BTreeMap<Uuid, PredictedTarget> = [
+            (id(1), target(Some(0.05))),
+            (id(2), target(Some(-0.30))),
+            (id(3), target(None)),
+            (id(4), target(Some(0.05))),
+            (id(5), target(Some(0.10))),
+        ]
+        .into_iter()
+        .collect();
+        let got: Vec<(Uuid, f64)> = top_movers(&targets, 3)
+            .into_iter()
+            .map(|m| (m.target_id, m.d_edge))
+            .collect();
+        assert_eq!(got, vec![(id(2), -0.30), (id(5), 0.10), (id(1), 0.05)]);
+        assert_eq!(top_movers(&targets, 10).len(), 4);
+    }
 }
