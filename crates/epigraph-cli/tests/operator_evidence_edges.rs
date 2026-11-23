@@ -700,15 +700,12 @@ async fn reverse_keeps_an_edge_retracted_or_keyed_by_a_bba_since(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("an agent");
-    // An edge-keyed BBA's perspective row has the edge's id (`auto_wire_ds_for_edge`).
-    epigraph_db::PerspectiveRepository::ensure_edge_perspective(&pool, keyed, Some(author))
-        .await
-        .expect("the edge's perspective row");
+    // An edge-keyed BBA sits on the edge's slot (`auto_wire_ds_for_edge`).
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, \
                                      locality_tag) \
-         VALUES ($1, $2, $3, $4, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, 'edge_factor', 0.8, \
+         VALUES ($1, $2, $3, 'edge', $4, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb, 'edge_factor', 0.8, \
                  'derived_support', 'cross')",
     )
     .bind(fx.group_claim)

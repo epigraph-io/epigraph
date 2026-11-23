@@ -277,11 +277,15 @@ async fn insert_row(pool: &PgPool, claim: Uuid, row: &Row<'_>) -> Uuid {
     .execute(pool)
     .await
     .expect("assign claim to frame");
+    // An edge-factor row names its edge in `perspective_id` here; it is
+    // stored on the edge's slot, as the edge factor stores it (migration 267).
+    let edge_slot = row.method == Some("edge_factor");
     sqlx::query_scalar(
         "INSERT INTO mass_functions \
            (claim_id, frame_id, source_agent_id, masses, conflict_k, combination_method, \
-            source_strength, evidence_type, locality_tag, evidence_id, perspective_id) \
-         VALUES ($1, $2, $3, $4, 0.0, $5, $6, $7, 'unknown', $8, $9) RETURNING id",
+            source_strength, evidence_type, locality_tag, evidence_id, perspective_id, \
+            slot_kind, slot_id) \
+         VALUES ($1, $2, $3, $4, 0.0, $5, $6, $7, 'unknown', $8, $9, $10, $11) RETURNING id",
     )
     .bind(claim)
     .bind(row.frame)
@@ -291,7 +295,9 @@ async fn insert_row(pool: &PgPool, claim: Uuid, row: &Row<'_>) -> Uuid {
     .bind(row.source_strength)
     .bind(row.evidence_type)
     .bind(row.evidence_id)
-    .bind(row.perspective_id)
+    .bind(if edge_slot { None } else { row.perspective_id })
+    .bind((edge_slot && row.perspective_id.is_some()).then_some("edge"))
+    .bind(if edge_slot { row.perspective_id } else { None })
     .fetch_one(pool)
     .await
     .expect("insert BBA")
@@ -1599,15 +1605,6 @@ async fn the_drift_decomposition_separates_alpha_and_compound_source_reads(pool:
     .fetch_one(&pool)
     .await
     .expect("seed the supports edge");
-    sqlx::query(
-        "INSERT INTO perspectives (id, name, owner_agent_id, perspective_type) \
-         VALUES ($1, 'edge_factor', $2, 'edge')",
-    )
-    .bind(edge)
-    .bind(owner)
-    .execute(&pool)
-    .await
-    .expect("the edge's perspective");
     insert_row(
         &pool,
         target,

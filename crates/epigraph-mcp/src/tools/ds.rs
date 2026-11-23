@@ -308,7 +308,7 @@ pub async fn submit_ds_evidence(
     // Retry-safety is still worth recording, though it no longer carries a
     // committed-partial argument. `assign_claim` is `ON CONFLICT … DO UPDATE` and
     // `store_with_perspective` upserts on
-    // `(claim_id, frame_id, source_agent_id, perspective_id)`, so a repeat call
+    // `(claim_id, frame_id, source_agent_id, perspective_id, slot)`, so a repeat call
     // re-states the same BBA rather than combining its mass twice.
     //
     // AND IT SUCCEEDS ONLY FOR CLAIMS THIS SERVER'S GROUP OWNS. Stated here because

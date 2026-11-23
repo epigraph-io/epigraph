@@ -47,7 +47,7 @@ async fn wire(
     assert_eq!(out, EdgeFactorOutcome::Wired, "PREMISE: the edge wires");
     sqlx::query_scalar(
         "SELECT id FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2 AND combination_method = 'edge_factor'",
+          WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 AND combination_method = 'edge_factor'",
     )
     .bind(to)
     .bind(edge)

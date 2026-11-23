@@ -485,7 +485,7 @@ async fn insert_claim_with_interval(pool: &PgPool, author: Uuid, bel: f64, pl: f
 /// edge id).
 async fn edge_bbas(pool: &PgPool, claim: Uuid, edge: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2 \
+        "SELECT count(*) FROM mass_functions WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2 \
            AND retracted_at IS NULL",
     )
     .bind(claim)

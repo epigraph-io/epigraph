@@ -4,7 +4,7 @@
 //! `A`'s stored `EpistemicInterval`, applies the relationship's transmission
 //! factor (per `RestrictionKind` + `RestrictionProfile`), materializes the
 //! restricted interval as a CDST `MassFunction` on the canonical `binary_truth`
-//! frame, persists it keyed by `edge_id` (perspective_id), and re-combines
+//! frame, persists it keyed on the edge's slot (`BbaSlot::Edge`), and re-combines
 //! all of the target's stored BBAs into its (Bel, Pl, BetP) columns.
 //!
 //! Lives in `epigraph-engine` (not `epigraph-mcp`) so both the MCP edge-creation
@@ -18,9 +18,7 @@ use sqlx::Acquire;
 use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 
-use epigraph_db::{
-    EdgeRepository, FrameRepository, MassFunctionRepository, MassFunctionRow, PerspectiveRepository,
-};
+use epigraph_db::{EdgeRepository, FrameRepository, MassFunctionRepository, MassFunctionRow};
 use epigraph_ds::{combination, measures, FocalElement, FrameOfDiscernment, MassFunction};
 
 use crate::belief_profile::{BeliefProfile, FrameTier, PerspectiveTier};
@@ -122,21 +120,20 @@ pub async fn auto_wire_ds_for_edge(
     FrameRepository::assign_claim(&mut *conn, target_id, frame_id, Some(0))
         .await
         .map_err(|e| format!("assign_claim: {e}"))?;
-    PerspectiveRepository::ensure_edge_perspective(&mut *conn, edge_id, Some(edge_signer_agent_id))
-        .await
-        .map_err(|e| format!("ensure_edge_perspective: {e}"))?;
-
     // Phase 1a (issue #197): the locality classification [`finish_edge_bba`]
     // computed is persisted into a dedicated column. The current combine path
     // still reads `source_strength` (already composed with the locality
     // factor); the tag is metadata so the backfill script and Phase 2 combine
     // path can stop inferring typing from the numeric value-set.
-    MassFunctionRepository::store_with_perspective(
+    //
+    // Keyed on the edge's own slot (migration 267, backlog 1777638e), not on a
+    // pseudo-perspective row: one BBA per (target, frame, signer, edge).
+    MassFunctionRepository::store_in_slot(
         &mut *conn,
         target_id,
         frame_id,
         Some(edge_signer_agent_id),
-        Some(edge_id),
+        epigraph_db::BbaSlot::Edge(edge_id),
         &masses_json,
         None,
         Some("edge_factor"),
@@ -458,8 +455,8 @@ pub fn edge_evidence_type(relationship: &str, profile: &BeliefProfile) -> String
 /// wiring — otherwise the wake-up is a permanent no-op (backlog claim
 /// 8ef5cf61-7382-43a4-85cb-565d76ba3f06). So the real gate is "has a BBA
 /// EVER been materialized for this edge_id" (checked via
-/// `MassFunctionRepository::exists_for_perspective`, since edge-factor BBAs
-/// are persisted keyed by `perspective_id = edge_id`): skip only when one
+/// `MassFunctionRepository::exists_for_edge`, since edge-factor BBAs
+/// are persisted on the edge's slot): skip only when one
 /// already exists, regardless of `was_created`. This makes the wake-up
 /// idempotent — once wired, further re-hits on the same edge are no-ops
 /// again, matching the pre-fix behavior for the common (believed-source)
@@ -528,8 +525,7 @@ pub async fn auto_wire_edge_if_epistemic(
     };
     let proceed = proceed
         && (was_created
-            || match MassFunctionRepository::exists_for_perspective(&mut *sp, viewer, edge_id).await
-            {
+            || match MassFunctionRepository::exists_for_edge(&mut *sp, viewer, edge_id).await {
                 Ok(true) => false,
                 Ok(false) => true, // never wired — attempt the wake-up below
                 Err(e) => {

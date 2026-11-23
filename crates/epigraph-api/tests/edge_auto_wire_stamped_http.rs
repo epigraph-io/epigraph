@@ -176,12 +176,13 @@ async fn post_supports(
 
 /// (edge-keyed BBAs, the target's cached BetP, the target's cache frame).
 async fn wired(pool: &PgPool, edge: Uuid, target: Uuid) -> (i64, Option<f64>, Option<Uuid>) {
-    let bbas: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
-            .bind(edge)
-            .fetch_one(pool)
-            .await
-            .expect("count edge BBAs");
+    let bbas: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge BBAs");
     let (betp, frame): (Option<f64>, Option<Uuid>) =
         sqlx::query_as("SELECT pignistic_prob, belief_frame_id FROM claims WHERE id = $1")
             .bind(target)
@@ -581,7 +582,7 @@ async fn an_edge_into_another_groups_public_claim_stores_a_writer_owned_bba(pool
     let edge = post_supports(&state, &pool, member, own_source, world_claim).await;
     let row: (Option<Uuid>, String, Option<Uuid>) = sqlx::query_as(
         "SELECT owner_group_id, visibility::text, source_agent_id FROM mass_functions \
-         WHERE perspective_id = $1",
+         WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(edge)
     .fetch_one(&pool)
@@ -612,7 +613,7 @@ async fn an_edge_into_another_groups_public_claim_stores_a_writer_owned_bba(pool
     let own_target = seed(&pool, member, member_group, "public", "autowire own target").await;
     let edge = post_supports(&state, &pool, member, third_source, own_target).await;
     let row: (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
-        "SELECT owner_group_id, source_agent_id FROM mass_functions WHERE perspective_id = $1",
+        "SELECT owner_group_id, source_agent_id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
     )
     .bind(edge)
     .fetch_one(&pool)

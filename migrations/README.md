@@ -3403,6 +3403,48 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **267**: `mass_functions_bba_slot` (backlog 1777638e, the residual of 63bb3d2e). Edge,
+  evidence and assessment BBAs are keyed on `mass_functions`' own slot (`slot_kind` in
+  `edge` / `evidence` / `assessment`, `slot_id`, both nullable, no foreign key) instead of a
+  pseudo-row of `perspectives` (`perspective_type` `edge` / `evidence`), so `perspectives`
+  holds viewpoints only. It moves every slot-keyed row (`perspective_id` to the slot,
+  classified by the perspective's type, an `edge_factor` row on an edge's id, and the
+  `discount` / `auto_wire` label for an evidence-typed one), FAILS CLOSED (55000, nothing
+  changed) on a row it cannot classify, on a slot-shaped row it would leave behind, and on
+  a `community_members` row naming a slot row; rebuilds the unique key as
+  `mass_functions_unique_per_key UNIQUE NULLS NOT DISTINCT (claim_id, frame_id,
+  source_agent_id, perspective_id, slot_kind, slot_id)` with `mass_functions_slot_shape`
+  and `idx_mass_functions_slot`; deletes every `perspectives` row typed `edge` or
+  `evidence` (and every row it moved BBAs off) and adds `perspectives_not_bba_slot`.
+  Re-states 194's `epigraph_cascade_delete_edge_bbas`, 115's `epigraph_dedup_move_bbas`
+  and 120's `epigraph_record_cascade_deferral` on the slot (an md5 precondition refuses to
+  apply over any other body) and adds `epigraph_edge_bbas_keyed(uuid)` (SECURITY DEFINER,
+  owner `epigraph_maintenance`, EXECUTE to `epigraph_app` and `epigraph_maintenance`):
+  whether any writer's BBA is keyed on an edge's slot, answered only to the edge's writer,
+  which the edge-withdraw path asks before it records an `edge_retract` deferral. Pinned by
+  `epigraph-db/tests/bba_slot_migration_267.rs` (the legacy shapes, each refusal, the
+  undo), `perspective_list_internal_types.rs`, `perspective_evidence_fk_tests.rs`, and the
+  writer tests `epigraph-mcp/tests/bba_slot_writers.rs` and
+  `epigraph-api/tests/assess_canonical_frame.rs::the_assessment_slot_is_a_column_and_writes_no_perspective`.
+  Before migrating, measure (expected: no refusal; every count is what 267 moves or
+  deletes): `SELECT p.perspective_type, p.name, count(*) FROM perspectives p WHERE
+  p.perspective_type IN ('edge','evidence') GROUP BY 1, 2`; `SELECT p.perspective_type,
+  mf.combination_method, count(*) FROM mass_functions mf JOIN perspectives p ON p.id =
+  mf.perspective_id WHERE p.perspective_type IN ('edge','evidence') GROUP BY 1, 2` (A1
+  refuses an evidence-typed row whose label is neither `auto_wire` nor `discount`);
+  `SELECT count(*) FROM mass_functions mf JOIN perspectives p ON p.id = mf.perspective_id
+  WHERE p.perspective_type IS DISTINCT FROM 'edge' AND (p.name IN ('edge_factor',
+  'evidence_grounded') OR EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id))`
+  (A3, any label but `edge_factor` on an edge's id refuses); `SELECT count(*) FROM
+  community_members cm JOIN perspectives p ON p.id = cm.perspective_id WHERE
+  p.perspective_type IN ('edge','evidence')` (A2, expected 0); and
+  `pg_total_relation_size('mass_functions')` (the key rebuild holds ACCESS EXCLUSIVE on
+  the table for one index build). Undo: `docs/runbooks/267-undo.sql` (re-creates the slot
+  rows from each slot's earliest BBA). **Deploy order:** the binary and the migration go
+  TOGETHER, writers stopped between them: a binary before 267 writes a slot perspective
+  first and is refused by `perspectives_not_bba_slot`, and a 267 binary on a database
+  before 267 writes slot columns that do not exist. **Applied to throwaway databases only,
+  NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 

@@ -49,7 +49,7 @@ mod fixture;
 use epigraph_crypto::AgentSigner;
 use epigraph_db::repos::derivation_scope::DerivationScopeRepository;
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     ensure_binary_frame, preview_claim_belief_on_frame, recompute_claim_belief_on_frame,
     recompute_claim_cached_belief, resolve_claim_validity_frame,
@@ -187,10 +187,7 @@ async fn recompute_beliefs(
 
 /// A BBA on (`claim`, `frame`) by `agent` citing `evidence`, with `t` on TRUE.
 async fn store(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: Uuid, t: f64) {
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,

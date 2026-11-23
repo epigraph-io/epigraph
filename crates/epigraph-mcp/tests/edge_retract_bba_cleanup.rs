@@ -99,8 +99,7 @@ async fn stamp(conn: &mut PgConnection, pool: &PgPool, agent: Uuid) {
     .expect("stamp");
 }
 
-/// An edge `agent` writes on the application role, and its edge-factor
-/// perspective (what `ensure_edge_perspective` creates when a BBA is wired).
+/// An edge `agent` writes on the application role.
 async fn owned_edge(pool: &PgPool, agent: Uuid, a: Uuid, b: Uuid) -> Uuid {
     let p = pool.clone();
     let edge = fixture::as_role(pool, "epigraph_app", |mut conn| async move {
@@ -117,7 +116,6 @@ async fn owned_edge(pool: &PgPool, agent: Uuid, a: Uuid, b: Uuid) -> Uuid {
         (conn, e)
     })
     .await;
-    perspective(pool, edge, "edge").await;
     edge
 }
 
@@ -131,9 +129,15 @@ async fn perspective(pool: &PgPool, id: Uuid, kind: &str) {
         .expect("seed perspective");
 }
 
-/// `agent`'s BBA on `claim`, keyed on `perspective`, written on the
-/// application role (114 makes it the writer's row on a public claim).
-async fn bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspective: Uuid) -> Uuid {
+/// `agent`'s BBA on `claim` keyed on a GENUINE perspective, written on the
+/// application role.
+async fn perspective_bba(
+    pool: &PgPool,
+    agent: Uuid,
+    claim: Uuid,
+    frame: Uuid,
+    perspective: Uuid,
+) -> Uuid {
     let p = pool.clone();
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, agent).await;
@@ -143,6 +147,33 @@ async fn bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspective: 
             frame,
             Some(agent),
             Some(perspective),
+            &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+            None,
+            Some("test"),
+            None,
+            None,
+            "unknown",
+            None,
+        )
+        .await
+        .expect("store the BBA");
+        (conn, id)
+    })
+    .await
+}
+
+/// `agent`'s BBA on `claim`, keyed on edge `perspective`'s slot, written on
+/// the application role (114 makes it the writer's row on a public claim).
+async fn bba(pool: &PgPool, agent: Uuid, claim: Uuid, frame: Uuid, perspective: Uuid) -> Uuid {
+    let p = pool.clone();
+    fixture::as_role(pool, "epigraph_app", |mut conn| async move {
+        stamp(&mut conn, &p, agent).await;
+        let id = MassFunctionRepository::store_in_slot(
+            &mut *conn,
+            claim,
+            frame,
+            Some(agent),
+            epigraph_db::BbaSlot::Edge(perspective),
             &serde_json::json!({"0": 0.6, "0,1": 0.4}),
             None,
             Some("test"),
@@ -432,7 +463,6 @@ async fn the_one_shot_sweep_is_audited_and_spares_a_genuine_perspective(pool: Pg
 
     // A legacy edge retracted before withdrawals recorded deferrals.
     let legacy = fixture::seed_edge(&pool, a, b).await;
-    perspective(&pool, legacy, "edge").await;
     let legacy_bba = bba(&pool, writer, b, frame, legacy).await;
     sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
         .bind(legacy)
@@ -443,7 +473,7 @@ async fn the_one_shot_sweep_is_audited_and_spares_a_genuine_perspective(pool: Pg
     // perspective is not an edge factor, and its BBA must survive.
     let twin = fixture::seed_edge(&pool, b, a).await;
     perspective(&pool, twin, "analytical").await;
-    let genuine_bba = bba(&pool, writer, a, frame, twin).await;
+    let genuine_bba = perspective_bba(&pool, writer, a, frame, twin).await;
     sqlx::query("UPDATE edges SET valid_to = now() - interval '1 day' WHERE id = $1")
         .bind(twin)
         .execute(&pool)
@@ -489,7 +519,7 @@ async fn the_one_shot_sweep_is_audited_and_spares_a_genuine_perspective(pool: Pg
     assert_eq!(
         status.touched.expect("touched")["bbas_deleted"],
         0,
-        "keyed on perspective_type = 'edge'"
+        "keyed on the edge slot, never a perspective"
     );
 
     assert!(
@@ -797,12 +827,12 @@ async fn try_bba(
     let p = pool.clone();
     fixture::as_role(pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, agent).await;
-        let r = MassFunctionRepository::store_with_perspective(
+        let r = MassFunctionRepository::store_in_slot(
             &mut *conn,
             claim,
             frame,
             Some(agent),
-            Some(perspective),
+            epigraph_db::BbaSlot::Edge(perspective),
             &serde_json::json!({"0": 0.6, "0,1": 0.4}),
             None,
             Some("test"),
@@ -841,8 +871,11 @@ async fn a_caller_cannot_name_the_claims_an_edge_retract_rederives(pool: PgPool)
     .expect("seed caches");
     let before = (cache3(&pool, v_pub).await, cache3(&pool, v_priv).await);
 
-    // W1 owns a withdrawn edge factor, and the honest cascade has drained.
+    // W1 owns a withdrawn edge factor (its own BBA keyed on the edge's slot:
+    // an edge no BBA is keyed on records no deferral), and the honest cascade
+    // has drained.
     let edge = owned_edge(&pool, w1.agent, a, b).await;
+    bba(&pool, w1.agent, b, frame, edge).await;
     do_delete_edge(
         &w1.server,
         &w1.viewer,

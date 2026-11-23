@@ -881,7 +881,7 @@ mod db {
         // outside its `was_created` block), so an edge whose source has since
         // acquired belief wires now; an already-wired edge is never re-sent.
         for (id, atom) in reassertable {
-            match MassFunctionRepository::exists_for_perspective(pool, viewer, id).await {
+            match MassFunctionRepository::exists_for_edge(pool, viewer, id).await {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(e) => {
@@ -917,7 +917,7 @@ mod db {
         for &id in &resolved {
             // A failed check counts as unwired: that keeps the edge open for
             // the next run instead of marking it done on no evidence.
-            match MassFunctionRepository::exists_for_perspective(pool, viewer, id).await {
+            match MassFunctionRepository::exists_for_edge(pool, viewer, id).await {
                 Ok(true) => applied.ds_wired_edge_ids.push(id),
                 Ok(false) => {}
                 Err(e) => applied

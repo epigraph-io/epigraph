@@ -6,8 +6,9 @@
 //! is itself public. Visibility of the row therefore says nothing about the
 //! evidence it was derived from:
 //!
-//! * an edge-factor row (`combination_method = 'edge_factor'`, keyed by the
-//!   edge id in `perspective_id`) carries the belief of the edge's SOURCE
+//! * an edge-factor row (`combination_method = 'edge_factor'`, keyed on the
+//!   edge's slot, `slot_kind = 'edge'` and `slot_id` = the edge, migration
+//!   267) carries the belief of the edge's SOURCE
 //!   claim, which may be group-private, through an edge that may be
 //!   group-private;
 //! * an evidence-derived row (`evidence_id`) may cite an evidence row narrowed
@@ -67,9 +68,9 @@ pub fn cache_admissible_predicate(mf: &str, c: &str) -> String {
                                OR ({c}.visibility <> 'public' \
                                    AND e.owner_group_id = {c}.owner_group_id)))) \
        AND ({mf}.combination_method IS DISTINCT FROM 'edge_factor' \
-            OR {mf}.perspective_id IS NULL \
+            OR {mf}.slot_kind IS DISTINCT FROM 'edge' \
             OR EXISTS (SELECT 1 FROM edges ed \
-                        WHERE ed.id = {mf}.perspective_id \
+                        WHERE ed.id = {mf}.slot_id \
                           AND (ed.visibility = 'public' \
                                OR ({c}.visibility <> 'public' \
                                    AND ed.owner_group_id = {c}.owner_group_id \
@@ -91,9 +92,9 @@ const VIEWER_DERIVED_PREDICATE: &str = "(mf.evidence_id IS NULL \
             OR EXISTS (SELECT 1 FROM evidence e \
                         WHERE e.id = mf.evidence_id /* {VISIBILITY:e} */)) \
        AND (mf.combination_method IS DISTINCT FROM 'edge_factor' \
-            OR mf.perspective_id IS NULL \
+            OR mf.slot_kind IS DISTINCT FROM 'edge' \
             OR EXISTS (SELECT 1 FROM edges ed \
-                        WHERE ed.id = mf.perspective_id /* {EDGE_VISIBILITY:ed} */ \
+                        WHERE ed.id = mf.slot_id /* {EDGE_VISIBILITY:ed} */ \
                           AND EXISTS (SELECT 1 FROM claims s \
                                        WHERE s.id = ed.source_id \
                                          /* {VISIBILITY:s} */)))";

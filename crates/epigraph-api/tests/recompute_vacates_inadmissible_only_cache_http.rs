@@ -47,7 +47,7 @@ use epigraph_api::routes::belief::get_claim_belief;
 use epigraph_api::routes::edges::{create_edge, CreateEdgeRequest};
 use epigraph_api::state::{ApiConfig, AppState};
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     ensure_binary_frame, preview_claim_belief_on_frame, recompute_claim_belief_binary,
     recompute_claim_cached_belief,
@@ -208,10 +208,7 @@ async fn world(pool: &PgPool, label: &str) -> World {
 async fn stale_dependent(pool: &PgPool, w: &World, label: &str) -> (Uuid, Cache) {
     let dependent = seed_public_claim(pool, w.author, label).await;
     let ev = seed_evidence(pool, dependent, "observation").await;
-    PerspectiveRepository::ensure_evidence_perspective(pool, ev, Some(w.author))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         dependent,
         w.binary,
@@ -309,12 +306,13 @@ async fn an_edge_write_vacates_a_dependent_whose_every_bba_is_inadmissible(pool:
     .await
     .unwrap_or_else(|e| panic!("create_edge failed: {e:?}"));
     assert_eq!(status, StatusCode::CREATED);
-    let wired: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
-            .bind(created.edge.id)
-            .fetch_one(&pool)
-            .await
-            .expect("count the edge's factor");
+    let wired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(created.edge.id)
+    .fetch_one(&pool)
+    .await
+    .expect("count the edge's factor");
     assert_eq!(
         wired, 1,
         "CALIBRATION: the edge wired its factor, so the propagation to D ran"

@@ -607,7 +607,7 @@ pub struct RowRestoreReport {
     /// A row with this id already holds exactly the stored image.
     pub already_restored: Vec<Uuid>,
     /// Its id holds a different row, or its upsert key
-    /// `(claim, frame, agent, perspective)` is taken by another row (written
+    /// `(claim, frame, agent, perspective, slot)` is taken by another row (written
     /// since the sweep): left alone.
     pub superseded_since_sweep: Vec<Uuid>,
     /// Its holder claim no longer exists.
@@ -649,7 +649,9 @@ SELECT r.* FROM jsonb_populate_record(NULL::mass_functions, $1::jsonb) r
    AND NOT EXISTS (SELECT 1 FROM mass_functions m
                     WHERE m.claim_id = r.claim_id AND m.frame_id = r.frame_id
                       AND m.source_agent_id IS NOT DISTINCT FROM r.source_agent_id
-                      AND m.perspective_id IS NOT DISTINCT FROM r.perspective_id)
+                      AND m.perspective_id IS NOT DISTINCT FROM r.perspective_id
+                      AND m.slot_kind IS NOT DISTINCT FROM r.slot_kind
+                      AND m.slot_id IS NOT DISTINCT FROM r.slot_id)
    AND EXISTS (SELECT 1 FROM claims c WHERE c.id = r.claim_id)
 RETURNING id"#;
 
@@ -661,9 +663,23 @@ SELECT EXISTS (SELECT 1 FROM mass_functions m WHERE m.id = r.id AND to_jsonb(m.*
        EXISTS (SELECT 1 FROM mass_functions m
                 WHERE m.claim_id = r.claim_id AND m.frame_id = r.frame_id
                   AND m.source_agent_id IS NOT DISTINCT FROM r.source_agent_id
-                  AND m.perspective_id IS NOT DISTINCT FROM r.perspective_id),
+                  AND m.perspective_id IS NOT DISTINCT FROM r.perspective_id
+                  AND m.slot_kind IS NOT DISTINCT FROM r.slot_kind
+                  AND m.slot_id IS NOT DISTINCT FROM r.slot_id),
        EXISTS (SELECT 1 FROM claims c WHERE c.id = r.claim_id)
   FROM jsonb_populate_record(NULL::mass_functions, $1::jsonb) r"#;
+
+/// The stored image of `d`, on the edge's slot: an image taken before
+/// migration 267 names the edge in `perspective_id`
+/// ([`epigraph_db::repos::mass_function::edge_bba_record_on_slot`]). An image
+/// that is not a JSON object is returned as stored (the insert then reports
+/// it failed).
+fn row_image(d: &DeletedEdgeBba) -> String {
+    serde_json::from_str::<serde_json::Value>(&d.row).map_or_else(
+        |_| d.row.clone(),
+        |v| epigraph_db::repos::mass_function::edge_bba_record_on_slot(v).to_string(),
+    )
+}
 
 /// The row half of the undo: re-insert every deleted row (last deleted
 /// first) from its image, in ONE transaction on `conn`, each in its own
@@ -684,9 +700,10 @@ pub async fn restore_rows(
     let mut report = RowRestoreReport::default();
     let mut tx = conn.begin().await?;
     for d in deleted.iter().rev() {
+        let image = row_image(d);
         let mut sp = Acquire::begin(&mut *tx).await?;
         match sqlx::query_scalar::<_, Uuid>(RESTORE_ROW_SQL)
-            .bind(&d.row)
+            .bind(&image)
             .fetch_optional(&mut *sp)
             .await
         {
@@ -706,7 +723,7 @@ pub async fn restore_rows(
         }
         let (same, id_taken, key_taken, holder): (bool, bool, bool, bool) =
             sqlx::query_as(RESTORE_PROBE_SQL)
-                .bind(&d.row)
+                .bind(&image)
                 .fetch_one(&mut *tx)
                 .await?;
         if same {

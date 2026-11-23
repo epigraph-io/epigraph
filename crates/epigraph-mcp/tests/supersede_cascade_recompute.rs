@@ -95,7 +95,7 @@ async fn wire_supports(
     // The BBA must have landed on the TARGET keyed by the edge id.
     let bba_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions mf \
-         JOIN edges e ON e.id = mf.perspective_id \
+         JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
          WHERE mf.claim_id = $1 AND e.source_id = $2 AND e.target_id = $1",
     )
     .bind(t)
@@ -252,8 +252,8 @@ async fn cascade_does_not_touch_unrelated_bbas_or_claims(pool: PgPool) {
     );
     let read_c_bba = |pool: PgPool| async move {
         sqlx::query_as::<_, BbaRow>(
-            "SELECT mf.masses, mf.source_strength, mf.evidence_type, mf.locality_tag, mf.perspective_id \
-             FROM mass_functions mf JOIN edges e ON e.id = mf.perspective_id \
+            "SELECT mf.masses, mf.source_strength, mf.evidence_type, mf.locality_tag, mf.slot_id \
+             FROM mass_functions mf JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
              WHERE e.source_id = $1 AND e.target_id = $2",
         )
         .bind(c)
@@ -437,7 +437,7 @@ async fn cyclic_support_terminates(pool: PgPool) {
 
     // ...and no second hop: the reverse edge's BBA was not touched.
     let reverse_bba_survived: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM mass_functions WHERE perspective_id = $1)",
+        "SELECT EXISTS (SELECT 1 FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1)",
     )
     .bind(reverse_edge)
     .fetch_one(&pool)
@@ -485,7 +485,8 @@ async fn cascade_failure_does_not_fail_the_write(pool: PgPool) {
     // conflict element rather than failing.)
     sqlx::query(
         "UPDATE mass_functions SET masses = '{\"0\": \"not-a-number\"}'::jsonb \
-         WHERE perspective_id = (SELECT id FROM edges WHERE source_id = $1 AND target_id = $2)",
+         WHERE slot_kind = 'edge' \
+           AND slot_id = (SELECT id FROM edges WHERE source_id = $1 AND target_id = $2)",
     )
     .bind(c)
     .bind(b)
@@ -558,12 +559,13 @@ async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
             .fetch_one(&pool)
             .await
             .expect("read B->C edge id");
-    let hop_two_masses_before: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE perspective_id = $1")
-            .bind(hop_two_edge)
-            .fetch_optional(&pool)
-            .await
-            .expect("read B->C BBA");
+    let hop_two_masses_before: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT masses FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(hop_two_edge)
+    .fetch_optional(&pool)
+    .await
+    .expect("read B->C BBA");
     assert!(
         hop_two_masses_before.is_some(),
         "fixture: the second hop must carry a BBA, else there is nothing to \
@@ -581,12 +583,13 @@ async fn second_hop_downstream_of_the_retraction_is_not_touched(pool: PgPool) {
         .await
         .expect("supersede_claim succeeds");
 
-    let hop_two_masses_after: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT masses FROM mass_functions WHERE perspective_id = $1")
-            .bind(hop_two_edge)
-            .fetch_optional(&pool)
-            .await
-            .expect("read B->C BBA");
+    let hop_two_masses_after: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT masses FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(hop_two_edge)
+    .fetch_optional(&pool)
+    .await
+    .expect("read B->C BBA");
     assert_eq!(
         hop_two_masses_before, hop_two_masses_after,
         "the B->C edge factor is two hops from the retraction; invalidating or \

@@ -64,11 +64,13 @@ async fn plant_interval(pool: &PgPool, claim: Uuid, bel: f64, pl: f64) {
 }
 
 async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge)
-        .fetch_one(pool)
-        .await
-        .expect("count edge-keyed rows")
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge-keyed rows")
 }
 
 async fn betp(pool: &PgPool, claim: Uuid) -> Option<f64> {

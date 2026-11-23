@@ -256,11 +256,6 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
     let e_other = edge(&pool, other, dup).await;
     let e_diamond = edge(&pool, third, dup).await;
     edge(&pool, third, canonical).await;
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
-        .bind(e_diamond)
-        .execute(&pool)
-        .await
-        .expect("perspective");
     let frame: Uuid = sqlx::query_scalar(
         "INSERT INTO frames (name, hypotheses) VALUES ('binary_truth', ARRAY['TRUE','FALSE']) \
          ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
@@ -268,12 +263,12 @@ async fn the_writer_unmarks_on_the_app_role_with_binding_armed(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("frame");
-    let diamond_bba = epigraph_db::MassFunctionRepository::store_with_perspective(
+    let diamond_bba = epigraph_db::MassFunctionRepository::store_in_slot(
         &pool,
         dup,
         frame,
         Some(agent),
-        Some(e_diamond),
+        epigraph_db::BbaSlot::Edge(e_diamond),
         &serde_json::json!({"0": 0.6, "0,1": 0.4}),
         None,
         Some("edge_factor"),

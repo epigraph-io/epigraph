@@ -48,6 +48,8 @@ fn row(
         frame_id: Uuid::new_v4(),
         source_agent_id: None,
         perspective_id: None,
+        slot_kind: None,
+        slot_id: None,
         masses: serde_json::json!({"0": 0.5, "0,1": 0.5}),
         conflict_k: None,
         combination_method: Some("test".to_string()),

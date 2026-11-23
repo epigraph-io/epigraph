@@ -126,14 +126,14 @@ impl PerspectiveRepository {
         // function, not about the two synthetic constructors below it.
         //
         // (The reason first written here — "`owner_agent_id` is None on both
-        // synthetic paths, so it is not a reliable author" — is false of all
-        // three writers today: `create` takes the caller, and the DS auto-wire
-        // and the edge factor pass `Some(agent)` to
-        // `ensure_evidence_perspective` / `ensure_edge_perspective`. Corrected
-        // in review: `progress.json`'s M4 finding is that an exemption whose
-        // written reason is false is worse than an unannotated one, because the
-        // lint trains reviewers to read exactly these lines. The tenancy
-        // backfill does not re-own a perspective on that column either:
+        // synthetic paths, so it is not a reliable author" — was false of every
+        // writer: `create` takes the caller, and the synthetic edge and
+        // evidence rows, which migration 267 retired in favour of a slot on
+        // `mass_functions`, passed `Some(agent)`. Corrected in review:
+        // `progress.json`'s M4 finding is that an exemption whose written
+        // reason is false is worse than an unannotated one, because the lint
+        // trains reviewers to read exactly these lines. The tenancy backfill
+        // does not re-own a perspective on that column either:
         // `bin/tenancy_backfill.rs`, module doc.)
         //
         // A perspective is a LENS, not content: it is the frame through which
@@ -257,72 +257,6 @@ impl PerspectiveRepository {
             .map(|_| ())
     }
 
-    /// Ensure a synthetic "evidence_grounded" perspective row exists with the
-    /// given id. Used by `auto_wire_ds_update` to satisfy the
-    /// `mass_functions.perspective_id` FK while keeping each evidence submission
-    /// distinguishable on the unique index `(claim, frame, agent, perspective)`.
-    ///
-    /// Idempotent — `ON CONFLICT DO NOTHING` so concurrent inserts are safe.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor))]
-    pub async fn ensure_evidence_perspective<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        id: Uuid,
-        owner_agent_id: Option<Uuid>,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"
-            INSERT INTO perspectives (id, name, owner_agent_id, perspective_type,
-                                      visibility, owner_group_id)
-            VALUES ($1, 'evidence_grounded', $2, 'evidence', $3, $4)
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(id)
-        .bind(owner_agent_id)
-        // Tenancy declaration (PR-16), as `create` above.
-        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
-        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .execute(executor)
-        .await?;
-        Ok(())
-    }
-
-    /// Ensure a synthetic "edge_factor" perspective row exists with the given
-    /// id (= edge UUID). Used by `auto_wire_ds_for_edge` to satisfy the
-    /// `mass_functions.perspective_id` FK so each epistemic edge produces its
-    /// own BBA row keyed by `(claim, frame, agent, edge_id)`.
-    ///
-    /// Idempotent — `ON CONFLICT DO NOTHING`.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the database query fails.
-    #[instrument(skip(executor))]
-    pub async fn ensure_edge_perspective<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        id: Uuid,
-        owner_agent_id: Option<Uuid>,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            r#"
-            INSERT INTO perspectives (id, name, owner_agent_id, perspective_type,
-                                      visibility, owner_group_id)
-            VALUES ($1, 'edge_factor', $2, 'edge', $3, $4)
-            ON CONFLICT (id) DO NOTHING
-            "#,
-        )
-        .bind(id)
-        .bind(owner_agent_id)
-        // Tenancy declaration (PR-16), as `create` above.
-        .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
-        .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
-        .execute(executor)
-        .await?;
-        Ok(())
-    }
-
     /// Get a perspective by ID
     ///
     /// # Errors
@@ -352,10 +286,10 @@ impl PerspectiveRepository {
         Ok(row)
     }
 
-    /// List perspectives by agent. Excludes the internal BBA-slot rows, as
-    /// [`Self::list`] does (backlog 63bb3d2e): `ensure_edge_perspective` and
-    /// `ensure_evidence_perspective` stamp the writing agent as the owner, so
-    /// without the filter an agent's listing is its edge and evidence slots.
+    /// List perspectives by agent. Every row is a viewpoint: edge, evidence and
+    /// assessment BBAs are keyed on `mass_functions`' own slot (migration 267,
+    /// backlog 1777638e), and `perspectives_not_bba_slot` refuses a row typed
+    /// `edge` or `evidence`.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -373,7 +307,6 @@ impl PerspectiveRepository {
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
             WHERE owner_agent_id = $1
-              AND COALESCE(perspective_type, '') NOT IN ('edge', 'evidence')
               /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $2 OFFSET $3
@@ -394,16 +327,11 @@ impl PerspectiveRepository {
 
     /// List all perspectives with pagination.
     ///
-    /// **Lists viewpoints only** (backlog 63bb3d2e). The rows
-    /// [`Self::ensure_edge_perspective`] (`perspective_type = 'edge'`, one per
-    /// epistemic edge, id = the edge id) and
-    /// [`Self::ensure_evidence_perspective`] (`'evidence'`, one per evidence
-    /// row) write are internal BBA slots: they exist so a mass function can be
-    /// keyed to its edge or evidence row by the `perspective_id` foreign key,
-    /// and are not lenses anyone chose. They are filtered in SQL, before
-    /// `LIMIT`, so a page is full of real perspectives however many slots are
-    /// newer. NULL-safe: a perspective with no type is listed. A slot is
-    /// still readable by id ([`Self::get_by_id`]).
+    /// Every row is a viewpoint (backlogs 63bb3d2e, 1777638e): the internal
+    /// BBA slots that used to live here as `perspective_type` `edge` and
+    /// `evidence` rows are `mass_functions.slot_kind` / `slot_id` since
+    /// migration 267, which deleted those rows and added
+    /// `perspectives_not_bba_slot`, so no listing has anything to filter.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -419,7 +347,7 @@ impl PerspectiveRepository {
             SELECT id, name, description, owner_agent_id, perspective_type,
                    frame_ids, extraction_method, confidence_calibration, properties, created_at
             FROM perspectives
-            WHERE COALESCE(perspective_type, '') NOT IN ('edge', 'evidence')
+            WHERE true
               /* {VISIBILITY:perspectives} */
             ORDER BY created_at DESC
             LIMIT $1 OFFSET $2

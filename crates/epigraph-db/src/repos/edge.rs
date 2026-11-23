@@ -176,8 +176,8 @@ pub struct BbaCleanup {
     pub deleted: u64,
     /// The `cascade.deferred` row (cause `edge_retract`) that hands every
     /// other writer's BBAs keyed on the edge to the administrative replay;
-    /// `None` when the edge carries no edge-factor perspective (so no BBA can
-    /// be keyed on it) or the retraction is future-dated.
+    /// `None` when no BBA is keyed on the edge's slot or the retraction is
+    /// future-dated.
     pub deferral_event_id: Option<Uuid>,
 }
 
@@ -1968,9 +1968,10 @@ impl EdgeRepository {
     /// runs, in the act's own transaction (migration 120; D1 names edge-keyed
     /// BBA deletes an administrative cascade).
     ///
-    /// When the edge carries an edge-factor perspective (`perspectives.id =
-    /// edge`, `perspective_type = 'edge'`: every BBA keyed on the edge hangs off
-    /// it, by FK) and the act withdrew it (see [`EdgeWithdrawal`]):
+    /// When a BBA is keyed on the edge's slot (`mass_functions.slot_kind =
+    /// 'edge'`, `slot_id` = the edge, migration 267; any writer's, asked of
+    /// 267's `epigraph_edge_bbas_keyed`, which answers only the edge's writer)
+    /// and the act withdrew it (see [`EdgeWithdrawal`]):
     ///
     /// * (b) it FIRST records a `cause = 'edge_retract'` deferral through
     ///   120's `epigraph_record_cascade_deferral` (the session must own or
@@ -2007,15 +2008,15 @@ impl EdgeRepository {
         oauth: Option<&serde_json::Value>,
         reason: &str,
     ) -> Result<BbaCleanup, DbError> {
-        // Reads only whether an edge-factor perspective exists for the edge the
-        // caller's act touches, the edge's own `valid_to`, and whether the
-        // session owns it. An edge the session does not own is left alone: the
+        // Reads only whether a BBA is keyed on the edge the caller's act
+        // touches (through 267's definer: the rows are other writers' too, and
+        // readable only under their claims' tenancy), the edge's own
+        // `valid_to`, and whether the session owns it. An edge the session does not own is left alone: the
         // act itself is refused by row security (and rolls back), and the
         // deferral definer would refuse it anyway.
         let (keyed, withdrawn, owned): (bool, bool, bool) = sqlx::query_as(
             "-- VISIBILITY-EXEMPT: the state of an edge the caller's act touches.\n\
-             SELECT EXISTS (SELECT 1 FROM perspectives p \
-                             WHERE p.id = $1 AND p.perspective_type = 'edge'), \
+             SELECT public.epigraph_edge_bbas_keyed($1), \
                     COALESCE((SELECT CASE WHEN $2 THEN true \
                                           ELSE e.valid_to IS NOT NULL AND e.valid_to <= now() END \
                                 FROM edges e WHERE e.id = $1), false), \
@@ -2066,7 +2067,7 @@ impl EdgeRepository {
         // folds it (rulings R-79, R-103).
         let deleted = sqlx::query(
             "DELETE FROM mass_functions \
-              WHERE perspective_id = $1 \
+              WHERE slot_kind = 'edge' AND slot_id = $1 \
                 AND owner_group_id = ANY (public.epigraph_writable_groups()) \
                 AND retracted_at IS NULL",
         )
@@ -2081,9 +2082,9 @@ impl EdgeRepository {
     }
 
     /// The administrative half of an `edge_retract` cascade, on the
-    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge (keyed on
-    /// `perspective_type = 'edge'`, so a genuine perspective's BBAs are never
-    /// touched) and return the claims they lived on. A RETRACTED row
+    /// MAINTENANCE connection: remove every LIVE BBA keyed on the edge's slot
+    /// (`slot_kind = 'edge'`, migration 267, so a genuine perspective's BBAs are
+    /// never touched) and return the claims they lived on. A RETRACTED row
     /// (migration 184) is kept for audit (rulings R-79, R-103).
     ///
     /// STATE-DERIVED: it acts only while the edge row is absent or out of force
@@ -2118,10 +2119,8 @@ impl EdgeRepository {
         let claims: Vec<Uuid> = sqlx::query_scalar(
             "WITH gone AS ( \
                  DELETE FROM mass_functions mf \
-                  USING perspectives p \
-                  WHERE p.id = mf.perspective_id \
-                    AND p.id = $1 \
-                    AND p.perspective_type = 'edge' \
+                  WHERE mf.slot_kind = 'edge' \
+                    AND mf.slot_id = $1 \
                     AND mf.retracted_at IS NULL \
                  RETURNING mf.claim_id) \
              SELECT claim_id FROM gone",
@@ -2140,9 +2139,9 @@ impl EdgeRepository {
         })
     }
 
-    /// The edges whose BBAs outlived them: an edge-factor perspective
-    /// (`perspective_type = 'edge'`) with LIVE BBAs keyed on it whose edge is
-    /// absent or out of force. An edge holding only retracted rows is not
+    /// The edges whose BBAs outlived them: an edge slot (`slot_kind = 'edge'`,
+    /// migration 267) with LIVE BBAs keyed on it whose edge is absent or out
+    /// of force. An edge holding only retracted rows is not
     /// listed: the removal keeps those (migration 184), so listing it would
     /// spend the sweep's `limit` on an edge it can do nothing for. The one-shot legacy sweep
     /// (`replay_deferred_cascades --sweep-withdrawn-edge-bbas`) removes their
@@ -2158,14 +2157,13 @@ impl EdgeRepository {
     ) -> Result<Vec<Uuid>, DbError> {
         Ok(sqlx::query_scalar(
             "-- VISIBILITY-EXEMPT: administrative (maintenance connection).\n\
-             SELECT p.id FROM perspectives p \
-              WHERE p.perspective_type = 'edge' \
-                AND EXISTS (SELECT 1 FROM mass_functions mf \
-                             WHERE mf.perspective_id = p.id AND mf.retracted_at IS NULL) \
+             SELECT DISTINCT mf.slot_id FROM mass_functions mf \
+              WHERE mf.slot_kind = 'edge' \
+                AND mf.retracted_at IS NULL \
                 AND NOT EXISTS (SELECT 1 FROM edges e \
-                                 WHERE e.id = p.id \
+                                 WHERE e.id = mf.slot_id \
                                    AND (e.valid_to IS NULL OR e.valid_to > now())) \
-              ORDER BY p.id \
+              ORDER BY mf.slot_id \
               LIMIT $1",
         )
         .bind(limit)
@@ -2220,7 +2218,7 @@ impl EdgeRepository {
     /// Derived artifacts (`factors`, `bp_messages`, `mass_functions`) are NOT
     /// touched here and should still be deleted by the caller: they are
     /// materializations — `factors` are built by the `edges_auto_factor` trigger,
-    /// BBAs are keyed `perspective_id = edge_id` — so removing them is cache
+    /// BBAs are keyed on the edge's slot (`slot_kind = 'edge'`) — so removing them is cache
     /// invalidation, not data loss, and they regenerate from live edges.
     ///
     /// # Errors

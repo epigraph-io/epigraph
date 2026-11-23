@@ -1,12 +1,12 @@
-//! Backlog 63bb3d2e: `PerspectiveRepository::list` lists viewpoints, not the
-//! internal BBA-keying rows.
+//! Backlogs 63bb3d2e and 1777638e: `perspectives` holds viewpoints only.
 //!
-//! `ensure_edge_perspective` and `ensure_evidence_perspective` write one
-//! `perspectives` row per epistemic edge (`perspective_type = 'edge'`) and per
-//! evidence row (`perspective_type = 'evidence'`) so a mass function can be
-//! keyed to it by foreign key. Those rows are not viewpoints an agent chose,
-//! and before this fix they were listed by `list_perspectives` and
-//! `GET /api/v1/perspectives`, where they outnumber the real ones.
+//! Before migration 267 the edge factor and the DS evidence auto-wire wrote
+//! one `perspectives` row per epistemic edge (`perspective_type = 'edge'`) and
+//! per evidence row (`'evidence'`) so a mass function could be keyed to it by
+//! foreign key, and every listing had to filter them out (e305a895). 267 moved
+//! those keys onto `mass_functions.slot_kind` / `slot_id`, deleted the rows
+//! and added `perspectives_not_bba_slot`, so no such row can exist and the
+//! listings filter nothing.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -14,13 +14,78 @@ mod fixture;
 use epigraph_db::{PerspectiveRepository, PgPool};
 use uuid::Uuid;
 
+/// The SQLSTATE of a refused write, if it was one.
+fn sqlstate(e: &sqlx::Error) -> Option<String> {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .map(|c| c.into_owned())
+}
+
+/// No path can write a slot-shaped perspective: a direct INSERT typed `edge`
+/// or `evidence` is refused by `perspectives_not_bba_slot` (23514), and so is
+/// the repository's `create` with either type. Every other type, and none,
+/// is accepted. On the code before 267 both INSERTs succeed.
 #[sqlx::test(migrations = "../../migrations")]
-async fn list_omits_edge_and_evidence_slots_and_keeps_every_genuine_perspective(pool: PgPool) {
-    let genuine = PerspectiveRepository::create(
+async fn no_perspective_row_can_be_typed_edge_or_evidence(pool: PgPool) {
+    for kind in ["edge", "evidence"] {
+        let err = sqlx::query(
+            "INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, 'slot', $2)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .expect_err("a slot-typed perspective is refused");
+        assert_eq!(
+            sqlstate(&err).as_deref(),
+            Some("23514"),
+            "type {kind}: a CHECK violation ({err})"
+        );
+        assert!(
+            err.to_string().contains("perspectives_not_bba_slot"),
+            "type {kind}: refused by perspectives_not_bba_slot ({err})"
+        );
+
+        let created = PerspectiveRepository::create(
+            &pool,
+            "slot-typed through create",
+            None,
+            None,
+            Some(kind),
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            created
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("perspectives_not_bba_slot")),
+            "type {kind}: create is refused by the same CHECK ({created:?})"
+        );
+    }
+
+    // Control: a genuine type and no type both land.
+    for kind in [Some("analytical"), None] {
+        sqlx::query("INSERT INTO perspectives (name, perspective_type) VALUES ('genuine', $1)")
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("type {kind:?} is accepted: {e}"));
+    }
+}
+
+/// The listings return every visible perspective, a NULL-typed one included
+/// (the filter e305a895 added had to be NULL-safe; with no slot rows left
+/// there is nothing to filter).
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_and_list_by_agent_return_every_genuine_perspective(pool: PgPool) {
+    let (agent, _group) = fixture::seed_agent_with_group(&pool, "list-owner").await;
+    let typed = PerspectiveRepository::create(
         &pool,
         "list-genuine-analytical",
         None,
-        None,
+        Some(agent),
         Some("analytical"),
         &[],
         None,
@@ -28,166 +93,43 @@ async fn list_omits_edge_and_evidence_slots_and_keeps_every_genuine_perspective(
     )
     .await
     .expect("create a genuine perspective");
-
-    // A genuine perspective with NO type: the column is nullable, and a
-    // filter written as a bare `perspective_type NOT IN (...)` evaluates to
-    // NULL on this row and drops it.
     let untyped: Uuid = sqlx::query_scalar(
-        "INSERT INTO perspectives (name) VALUES ('list-genuine-untyped') RETURNING id",
+        "INSERT INTO perspectives (name, owner_agent_id) VALUES ('list-genuine-untyped', $1) \
+         RETURNING id",
     )
+    .bind(agent)
     .fetch_one(&pool)
     .await
     .expect("insert an untyped perspective");
 
-    let edge_slot = Uuid::new_v4();
-    let evidence_slot = Uuid::new_v4();
-    PerspectiveRepository::ensure_edge_perspective(&pool, edge_slot, None)
-        .await
-        .expect("edge slot");
-    PerspectiveRepository::ensure_evidence_perspective(&pool, evidence_slot, None)
-        .await
-        .expect("evidence slot");
-
     let viewer = fixture::public_viewer(&pool).await;
-
-    // CALIBRATION: every row above is visible to this viewer, so an internal
-    // row's absence below is the type filter's doing and not visibility's.
-    let visible_to_public: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM perspectives \
-          WHERE id = ANY($1) AND visibility = 'public'",
-    )
-    .bind(vec![genuine.id, untyped, edge_slot, evidence_slot])
-    .fetch_one(&pool)
-    .await
-    .expect("calibrate visibility");
-    assert_eq!(
-        visible_to_public, 4,
-        "fixture: all four rows are public, so the viewer can see each of them"
-    );
-
     let listed: Vec<Uuid> = PerspectiveRepository::list(&pool, &viewer, 100, 0)
         .await
         .expect("list")
         .into_iter()
         .map(|r| r.id)
         .collect();
-
     assert!(
-        listed.contains(&genuine.id),
-        "a typed genuine perspective is listed: {listed:?}"
+        listed.contains(&typed.id),
+        "a typed perspective is listed: {listed:?}"
     );
     assert!(
         listed.contains(&untyped),
-        "a perspective with a NULL type is listed (the filter is NULL-safe): {listed:?}"
-    );
-    assert!(
-        !listed.contains(&edge_slot),
-        "an edge BBA slot (perspective_type = 'edge') is not listed: {listed:?}"
-    );
-    assert!(
-        !listed.contains(&evidence_slot),
-        "an evidence BBA slot (perspective_type = 'evidence') is not listed: {listed:?}"
+        "an untyped perspective is listed: {listed:?}"
     );
 
-    // The slot rows are still readable by id: hiding them from the listing
-    // must not break the get path the belief tools use.
-    let by_id = PerspectiveRepository::get_by_id(&pool, &viewer, edge_slot)
-        .await
-        .expect("get_by_id");
-    assert!(by_id.is_some(), "an edge slot is still readable by id");
-}
-
-/// The page is filled with genuine perspectives: internal slots are filtered
-/// in SQL, before `LIMIT`, so a page is not short when slots are newest.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_page_is_not_shortened_by_internal_slots_newer_than_it(pool: PgPool) {
-    let mut genuine = Vec::new();
-    for i in 0..3 {
-        let row = PerspectiveRepository::create(
-            &pool,
-            &format!("page-genuine-{i}"),
-            None,
-            None,
-            Some("analytical"),
-            &[],
-            None,
-            None,
-        )
-        .await
-        .expect("create a genuine perspective");
-        genuine.push(row.id);
-    }
-    // Five newer slots: ORDER BY created_at DESC puts them first.
-    for _ in 0..5 {
-        PerspectiveRepository::ensure_edge_perspective(&pool, Uuid::new_v4(), None)
+    let mut by_agent: Vec<Uuid> =
+        PerspectiveRepository::list_by_agent(&pool, &viewer, agent, 100, 0)
             .await
-            .expect("edge slot");
-    }
-
-    let viewer = fixture::public_viewer(&pool).await;
-    let page: Vec<Uuid> = PerspectiveRepository::list(&pool, &viewer, 3, 0)
-        .await
-        .expect("list")
-        .into_iter()
-        .map(|r| r.id)
-        .collect();
-    assert_eq!(page.len(), 3, "a limit-3 page holds three rows: {page:?}");
-    for id in &genuine {
-        assert!(page.contains(id), "page holds every genuine row: {page:?}");
-    }
-}
-
-/// `GET /api/v1/agents/:id/perspectives` reads `list_by_agent`, and both
-/// slot writers stamp the writing agent as the owner, so an agent's own
-/// listing is the second surface of the same leak.
-#[sqlx::test(migrations = "../../migrations")]
-async fn list_by_agent_omits_the_agents_own_edge_and_evidence_slots(pool: PgPool) {
-    let (agent, _group) = fixture::seed_agent_with_group(&pool, "slot-owner").await;
-    let genuine = PerspectiveRepository::create(
-        &pool,
-        "agent-genuine",
-        None,
-        Some(agent),
-        Some("narrative"),
-        &[],
-        None,
-        None,
-    )
-    .await
-    .expect("create a genuine perspective");
-    let edge_slot = Uuid::new_v4();
-    let evidence_slot = Uuid::new_v4();
-    PerspectiveRepository::ensure_edge_perspective(&pool, edge_slot, Some(agent))
-        .await
-        .expect("edge slot");
-    PerspectiveRepository::ensure_evidence_perspective(&pool, evidence_slot, Some(agent))
-        .await
-        .expect("evidence slot");
-
-    // CALIBRATION: the agent owns all three rows and the viewer sees them all.
-    let owned_public: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM perspectives \
-          WHERE owner_agent_id = $1 AND visibility = 'public'",
-    )
-    .bind(agent)
-    .fetch_one(&pool)
-    .await
-    .expect("calibrate");
+            .expect("list_by_agent")
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+    by_agent.sort();
+    let mut expected = vec![typed.id, untyped];
+    expected.sort();
     assert_eq!(
-        owned_public, 3,
-        "fixture: three public rows owned by the agent"
-    );
-
-    let viewer = fixture::public_viewer(&pool).await;
-    let listed: Vec<Uuid> = PerspectiveRepository::list_by_agent(&pool, &viewer, agent, 100, 0)
-        .await
-        .expect("list_by_agent")
-        .into_iter()
-        .map(|r| r.id)
-        .collect();
-    assert_eq!(
-        listed,
-        vec![genuine.id],
-        "only the agent's genuine perspective is listed"
+        by_agent, expected,
+        "the agent's two perspectives, and only them"
     );
 }

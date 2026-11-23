@@ -389,11 +389,8 @@ async fn submit_ds_evidence_cannot_write_into_the_callers_assessment_slot(pool: 
     .await
     .expect("binary frame");
     let slot = epigraph_db::repos::mass_function::assessment_slot_perspective(Some(agent));
-    // The slot perspective exists (assess created it), so only the slot rule
-    // can refuse the call.
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(&pool, slot, Some(agent))
-        .await
-        .expect("the slot perspective");
+    // No perspective row has the slot's id (migration 267: the slot is a
+    // column), so the slot rule refuses before the foreign key could.
     let claim = seed_claim(
         &pool,
         &format!("assess slot via ds {}", Uuid::new_v4()),

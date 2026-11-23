@@ -94,7 +94,7 @@ async fn stored_bba(
     masses: &serde_json::Value,
     source_strength: f64,
 ) {
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    epigraph_db::MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -175,9 +175,6 @@ async fn public_claim_with_a_narrowed_bba(pool: &PgPool) -> (Uuid, Uuid, Uuid, U
     factor(pool, frame, target, partner).await;
 
     let public_ev = seed_evidence(pool, target, "observation").await;
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, public_ev, Some(member))
-        .await
-        .expect("evidence perspective");
     bba(pool, target, frame, member, Some(public_ev), 0.6).await;
     let public_only = served(&run(pool, stranger, frame, false, false).await, target);
 
@@ -199,9 +196,6 @@ async fn public_claim_with_a_narrowed_bba(pool: &PgPool) -> (Uuid, Uuid, Uuid, U
         .execute(pool)
         .await
         .expect("narrow the evidence to the group");
-    epigraph_db::PerspectiveRepository::ensure_evidence_perspective(pool, hidden_ev, Some(member))
-        .await
-        .expect("evidence perspective");
     bba(pool, target, frame, member, Some(hidden_ev), 0.8).await;
     (frame, target, member, stranger, public_only)
 }

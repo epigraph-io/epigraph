@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use epigraph_cli::cache_owner_audit::{run_read_only, Options, Report};
-use epigraph_db::{FrameRepository, MassFunctionRepository, PerspectiveRepository};
+use epigraph_db::{FrameRepository, MassFunctionRepository};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -65,28 +65,44 @@ async fn frame_named(pool: &PgPool, name: &str) -> Uuid {
 }
 
 /// A live input BBA by `agent` (perspective `perspective`, if any).
-async fn bba(
-    pool: &PgPool,
-    claim: Uuid,
-    frame: Uuid,
-    agent: Uuid,
-    perspective: Option<Uuid>,
-) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        Some(agent),
-        perspective,
-        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
-        None,
-        Some("discount"),
-        Some(1.0),
-        None,
-        "unknown",
-        None,
-    )
-    .await
+async fn bba(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, edge: Option<Uuid>) -> Uuid {
+    let masses = serde_json::json!({"0": 0.6, "0,1": 0.4});
+    match edge {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                Some(agent),
+                epigraph_db::BbaSlot::Edge(edge),
+                &masses,
+                None,
+                Some("discount"),
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                Some(agent),
+                None,
+                &masses,
+                None,
+                Some("discount"),
+                Some(1.0),
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store the BBA")
 }
 
@@ -163,9 +179,6 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, relationship: &str) -> 
 
 /// The BBA the edge wire stores: on the target, keyed on the edge.
 async fn edge_bba(pool: &PgPool, edge_id: Uuid, target: Uuid, frame: Uuid, agent: Uuid) -> Uuid {
-    PerspectiveRepository::ensure_edge_perspective(pool, edge_id, Some(agent))
-        .await
-        .expect("the edge's perspective");
     bba(pool, target, frame, agent, Some(edge_id)).await
 }
 

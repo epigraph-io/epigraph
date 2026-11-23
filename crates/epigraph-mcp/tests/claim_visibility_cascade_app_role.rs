@@ -41,7 +41,7 @@ use common::*;
 
 use epigraph_auth::{AuthContext, ClientType};
 use epigraph_db::visibility::Viewer;
-use epigraph_db::{MassFunctionRepository, PerspectiveRepository, ScopedPool, SessionGucMode};
+use epigraph_db::{MassFunctionRepository, ScopedPool, SessionGucMode};
 use epigraph_engine::edge_factor::{
     auto_wire_ds_for_edge, ensure_binary_frame, recompute_claim_cached_belief,
     resolve_claim_validity_frame, EdgeFactorOutcome,
@@ -572,10 +572,7 @@ async fn refuting_bba(pool: &PgPool, claim: Uuid, agent: Uuid, evidence: Uuid) {
     let mut masses = serde_json::Map::new();
     masses.insert("1".to_string(), serde_json::json!(0.9));
     masses.insert(all, serde_json::json!(0.1));
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,
@@ -780,10 +777,7 @@ async fn bba_on(pool: &PgPool, claim: Uuid, frame: Uuid, agent: Uuid, evidence: 
     let mut masses = serde_json::Map::new();
     masses.insert("0".to_string(), serde_json::json!(t));
     masses.insert(all, serde_json::json!(1.0 - t));
-    PerspectiveRepository::ensure_evidence_perspective(pool, evidence, Some(agent))
-        .await
-        .expect("evidence perspective");
-    MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_for_evidence(
         pool,
         claim,
         frame,

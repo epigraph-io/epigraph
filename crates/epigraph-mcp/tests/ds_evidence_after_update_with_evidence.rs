@@ -419,7 +419,7 @@ async fn on_a_compound_link_epistemic_stores_the_bba_but_leaves_the_cache(pool: 
     );
     let edge_bbas: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM mass_functions WHERE claim_id = $1 AND frame_id = $2 \
-           AND perspective_id = $3",
+           AND slot_kind = 'edge' AND slot_id = $3",
     )
     .bind(claim)
     .bind(binary)

@@ -90,7 +90,7 @@ async fn auto_wire_ds_update_stores_weight_as_source_strength() {
     let stored: (Option<f64>, Option<String>, Option<Uuid>) = sqlx::query_as(
         "SELECT source_strength, evidence_type, evidence_id \
            FROM mass_functions \
-          WHERE claim_id = $1 AND perspective_id = $2",
+          WHERE claim_id = $1 AND slot_kind = 'evidence' AND slot_id = $2",
     )
     .bind(claim_id)
     .bind(evidence_id)

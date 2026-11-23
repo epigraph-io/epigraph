@@ -57,21 +57,42 @@ async fn store(
     persp: Option<Uuid>,
     m: serde_json::Value,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        pool,
-        claim,
-        frame,
-        agent,
-        persp,
-        &m,
-        None,
-        None,
-        None,
-        Some("empirical"),
-        "unknown",
-        None,
-    )
-    .await
+    match persp {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                pool,
+                claim,
+                frame,
+                agent,
+                epigraph_db::BbaSlot::Edge(edge),
+                &m,
+                None,
+                None,
+                None,
+                Some("empirical"),
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                pool,
+                claim,
+                frame,
+                agent,
+                None,
+                &m,
+                None,
+                None,
+                None,
+                Some("empirical"),
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -112,11 +133,6 @@ async fn an_unmark_reverses_the_recorded_repair_and_rederives_the_duplicate(pool
     .fetch_one(&pool)
     .await
     .expect("edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
-        .bind(e)
-        .execute(&pool)
-        .await
-        .expect("perspective");
     let other_writers_bba = store(
         &pool,
         dup,
@@ -803,11 +819,6 @@ async fn an_unmark_rederives_both_claims_and_the_far_end_and_filters_the_report(
     .fetch_one(&pool)
     .await
     .expect("edge");
-    sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, 'edge')")
-        .bind(e)
-        .execute(&pool)
-        .await
-        .expect("perspective");
     let far_bba = store(
         &pool,
         far,
@@ -819,7 +830,8 @@ async fn an_unmark_rederives_both_claims_and_the_far_end_and_filters_the_report(
     .await;
     let far_edge_bba = |pool: PgPool| async move {
         sqlx::query_scalar::<_, Uuid>(
-            "SELECT id FROM mass_functions WHERE claim_id = $1 AND perspective_id = $2",
+            "SELECT id FROM mass_functions \
+              WHERE claim_id = $1 AND slot_kind = 'edge' AND slot_id = $2",
         )
         .bind(far)
         .bind(e)
@@ -971,7 +983,7 @@ async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: 
         serde_json::json!({"0": 0.9, "0,1": 0.1}),
     )
     .await;
-    let assess = epigraph_db::MassFunctionRepository::store_with_perspective(
+    let assess = MassFunctionRepository::store_with_perspective(
         &pool,
         dup,
         f,
@@ -997,7 +1009,7 @@ async fn a_returning_input_clears_the_duplicates_cached_row_from_its_slot(pool: 
     .expect("act");
     let t = trigger(CascadeCause::Dedup, author, dup, Some(canonical));
     apply_after_dedup(&mut conn, &viewer, &viewer, &t, dup, canonical).await;
-    epigraph_db::MassFunctionRepository::store_with_perspective(
+    MassFunctionRepository::store_with_perspective(
         &pool,
         dup,
         f,

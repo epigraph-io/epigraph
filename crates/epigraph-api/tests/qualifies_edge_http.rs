@@ -112,11 +112,13 @@ async fn betp(pool: &PgPool, claim: Uuid) -> f64 {
 }
 
 async fn bbas_on(pool: &PgPool, edge: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge)
-        .fetch_one(pool)
-        .await
-        .expect("count edge BBAs")
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge BBAs")
 }
 
 /// Legacy BP factors over the pair, whichever writer made them (today only

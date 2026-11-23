@@ -10,8 +10,8 @@
 //! retired refuter kept pushing its frozen mass onto its target forever.
 //!
 //! Driven through the real MCP `supersede_claim`, with edges wired through
-//! `do_link_epistemic` (the path that writes the `perspective_id = edge_id`
-//! BBAs). No test body calls a recompute.
+//! `do_link_epistemic` (the path that writes the edge-slot BBAs,
+//! `slot_kind = 'edge'`). No test body calls a recompute.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -81,11 +81,13 @@ async fn wire(
 }
 
 async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge)
-        .fetch_one(pool)
-        .await
-        .expect("count edge-keyed rows")
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge)
+    .fetch_one(pool)
+    .await
+    .expect("count edge-keyed rows")
 }
 
 /// Live BBAs keyed on an edge sourced at `retired`, held by a current claim:
@@ -93,7 +95,7 @@ async fn keyed_on(pool: &PgPool, edge: Uuid) -> i64 {
 async fn live_rows_from_retired_source(pool: &PgPool, retired: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM mass_functions mf \
-           JOIN edges e ON e.id = mf.perspective_id \
+           JOIN edges e ON mf.slot_kind = 'edge' AND e.id = mf.slot_id \
            JOIN claims h ON h.id = mf.claim_id \
           WHERE e.source_type = 'claim' AND e.source_id = $1 \
             AND h.is_current AND mf.retracted_at IS NULL",
@@ -239,12 +241,13 @@ async fn a_retracted_bba_from_the_retired_source_survives_the_invalidation(pool:
     let live_edge = wire(&pool, &server, refuter, live_target, "refutes").await;
     let kept_edge = wire(&pool, &server, refuter, kept_target, "contradicts").await;
 
-    let kept_row: Uuid =
-        sqlx::query_scalar("SELECT id FROM mass_functions WHERE perspective_id = $1")
-            .bind(kept_edge)
-            .fetch_one(&pool)
-            .await
-            .expect("the row to retract");
+    let kept_row: Uuid = sqlx::query_scalar(
+        "SELECT id FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(kept_edge)
+    .fetch_one(&pool)
+    .await
+    .expect("the row to retract");
     let (auth, admin_viewer) = common::granted_server_admin(&server, &pool).await;
     let retracted = retract_bba(
         &server,
@@ -285,37 +288,6 @@ async fn a_retracted_bba_from_the_retired_source_survives_the_invalidation(pool:
     assert!(
         ids(&body["belief_cascade"], "errors").is_empty(),
         "the cascade completes: {body}"
-    );
-}
-
-/// The keying is the edge id, not the perspective row's type: a BBA keyed on
-/// a stayed edge whose perspective row is not typed `'edge'` (a legacy row:
-/// `ensure_edge_perspective` keeps an existing row's type) is invalidated
-/// like any other, as the cascade's delete by edge id already treats it.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_legacy_typed_edge_perspective_is_invalidated_too(pool: PgPool) {
-    let server = server(&pool).await;
-    let refuter = seed_claim_with_belief(&pool, 0.9, 0.95, Some(0.92)).await;
-    let target = seed_claim(&pool, "k10 legacy-typed target", 0.5).await;
-    let refutes = wire(&pool, &server, refuter, target, "refutes").await;
-    sqlx::query("UPDATE perspectives SET perspective_type = 'analytical' WHERE id = $1")
-        .bind(refutes)
-        .execute(&pool)
-        .await
-        .expect("retype the edge's perspective as a legacy row would be");
-
-    let body = supersede(&pool, &server, refuter).await;
-    assert_eq!(body["cascade"]["status"], "applied", "{body}");
-
-    assert_eq!(
-        keyed_on(&pool, refutes).await,
-        0,
-        "the BBA keyed on the stayed edge is invalidated whatever its perspective's type"
-    );
-    assert_eq!(
-        scalars(&pool, target).await,
-        (None, None, None),
-        "its only BBA gone, the target is unbacked"
     );
 }
 

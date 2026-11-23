@@ -38,7 +38,7 @@
 //!
 //! Two gaps to the online retirement remain, both older than the
 //! re-derivation: this binary does not delete matcher-edge-keyed
-//! `mass_functions` (`perspective_id` = the edge; the online path's
+//! `mass_functions` (keyed on the edge's slot; the online path's
 //! `delete_edge_bbas`), so it passes `invalidated = 0` and a DS re-derivation
 //! would fold such a BBA back in (prod measured 0 of them on 2026-08-19); and
 //! neither the retirement nor the re-derivation writes a `security_events`
@@ -49,7 +49,7 @@
 //! revisions sent the operator to `POST /api/v1/bp/propagate` instead, on the
 //! grounds that a matcher promotion writes no `mass_functions` (measured on
 //! prod 2026-08-19: 716 `cross_source_matcher` edges, 715 derived `factors`,
-//! **0** `mass_functions` with `perspective_id` = a matcher edge), so a DS
+//! **0** `mass_functions` keyed on a matcher edge), so a DS
 //! recompute reproduces the DS scalars exactly. That is true of the DS output,
 //! not of the stored column: a past propagate with `apply_updates: true`
 //! overwrote `claims.pignistic_prob` with a value the deleted factor biased,

@@ -10,8 +10,8 @@
 //!
 //! [`crate::edge_factor::auto_wire_ds_for_edge`] freezes the supporter's
 //! epistemic interval into a **stored mass shape** at wire time
-//! (`restricted.to_mass_function(&frame)` → `store_with_perspective`, keyed
-//! `perspective_id = edge_id`). The combine path
+//! (`restricted.to_mass_function(&frame)` → `store_in_slot`, keyed on the
+//! edge's slot, `BbaSlot::Edge(edge_id)`). The combine path
 //! ([`crate::edge_factor::preview_claim_belief_on_frame`] and friends) loads
 //! `mass_functions.masses` verbatim and re-derives only the reliability
 //! discount; it never queries `claims`. So calling the ordinary
@@ -20,12 +20,12 @@
 //! success and changes nothing.
 //!
 //! The required primitive is therefore **invalidation**, not recombination:
-//! delete the `perspective_id = edge_id` BBA
-//! ([`MassFunctionRepository::delete_for_perspective`]), optionally re-derive
+//! delete the edge-slot BBA
+//! ([`MassFunctionRepository::delete_for_edge`]), optionally re-derive
 //! it from whatever now sits at the edge's source, and only then recompute the
 //! target from what survives. Deletion (not overwrite) is mandatory because
 //! [`crate::edge_factor::auto_wire_edge_if_epistemic`] short-circuits on
-//! `MassFunctionRepository::exists_for_perspective`, so a re-wire that leaves
+//! `MassFunctionRepository::exists_for_edge`, so a re-wire that leaves
 //! the stale row behind is a permanent no-op.
 //!
 //! # Empty surviving set: the "unbacked" decision
@@ -504,8 +504,7 @@ async fn invalidate_and_rewire(
                 return queued;
             }
         };
-        let deleted = match MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id).await
-        {
+        let deleted = match MassFunctionRepository::delete_for_edge(&mut *sp, *edge_id).await {
             Ok(n) => n,
             Err(e) => {
                 report.note_error(&format!("invalidate BBA for edge {edge_id}"), e);
@@ -513,7 +512,7 @@ async fn invalidate_and_rewire(
                 continue;
             }
         };
-        let kept = match MassFunctionRepository::count_retracted_for_perspective(
+        let kept = match MassFunctionRepository::count_retracted_for_edge(
             &mut *sp, viewer, *edge_id,
         )
         .await
@@ -556,7 +555,8 @@ async fn invalidate_and_rewire(
                 *target_id,
                 frame_id,
                 Some(source_agent_id),
-                Some(*edge_id),
+                None,
+                Some(epigraph_db::BbaSlot::Edge(*edge_id)),
             )
             .await
             {
@@ -650,7 +650,7 @@ async fn invalidate_and_rewire(
 /// exerts no belief (supersede SPEC §11 K10(2), delivery council N5).
 ///
 /// Per edge, like [`invalidate_and_rewire`]: one savepoint, the delete
-/// ([`MassFunctionRepository::delete_for_perspective`], whose privileged arm
+/// ([`MassFunctionRepository::delete_for_edge`], whose privileged arm
 /// keeps retracted rows once K4a lands; the selection already names live
 /// rows only), and a repair probe of every holder before the savepoint
 /// commits, so a holder this connection cannot write keeps both its BBA and a
@@ -696,7 +696,7 @@ async fn invalidate_only(
         let mut images = Vec::new();
         let removed = match &delete {
             InertDelete::EdgePerspective => {
-                MassFunctionRepository::delete_for_perspective(&mut *sp, *edge_id)
+                MassFunctionRepository::delete_for_edge(&mut *sp, *edge_id)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -753,7 +753,7 @@ async fn invalidate_only(
 /// What [`invalidate_only`] deletes on each edge.
 enum InertDelete<'a> {
     /// Every live row keyed on the edge
-    /// ([`MassFunctionRepository::delete_for_perspective`]): the supersede
+    /// ([`MassFunctionRepository::delete_for_edge`]): the supersede
     /// cascade's K10(2) arm.
     EdgePerspective,
     /// Exactly the selected rows, by id, each recorded as stored into the
@@ -771,7 +771,8 @@ enum InertDelete<'a> {
 /// anyway).
 const DELETE_EXACT_EDGE_ROWS_SQL: &str = r#"-- VISIBILITY-EXEMPT: the K10(3) retroactive sweep runs on the privileged maintenance connection only.
 DELETE FROM mass_functions mf
- WHERE mf.id = ANY($1) AND mf.perspective_id = $2 AND mf.retracted_at IS NULL
+ WHERE mf.id = ANY($1) AND mf.slot_kind = 'edge' AND mf.slot_id = $2
+   AND mf.retracted_at IS NULL
 RETURNING mf.id, mf.claim_id, to_jsonb(mf.*)::text"#;
 
 async fn delete_exact_edge_rows(

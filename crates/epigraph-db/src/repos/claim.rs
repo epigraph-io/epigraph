@@ -9226,23 +9226,22 @@ impl ClaimRepository {
     /// **derived-record layer**, returning what the caller must re-derive.
     ///
     /// # Why the edge migration alone corrupts belief
-    /// Edge-factor BBAs are stored on the edge's **target** claim keyed
-    /// `perspective_id = edge_id` (`auto_wire_ds_for_edge` →
-    /// `store_with_perspective(pool, target_id, ...)`). Before this function
+    /// Edge-factor BBAs are stored on the edge's **target** claim keyed on the
+    /// edge's slot (`slot_kind = 'edge'`, `slot_id = edge_id`, migration 267;
+    /// `auto_wire_ds_for_edge` → `store_in_slot(pool, target_id, ...)`). Before this function
     /// existed, dedup touched only `edges` and `claims`, which left two
     /// distinct classes of wreckage — both instances of the MemTX I2
     /// violation "retracting a belief leaves an orphaned derived record":
     ///
     /// * **Orphaned.** The three collision pre-deletes below remove edges
-    ///   whose BBA rows survive: `mass_functions_perspective_id_fkey`
-    ///   references `perspectives(id)`, and `perspectives` rows minted by
-    ///   `ensure_edge_perspective` have no FK back to `edges`, so nothing
+    ///   whose BBA rows survive: the edge slot has no FK to `edges` (it never
+    ///   had: the slot used to be a `perspectives` row with none), so nothing
     ///   cascades. The phantom supporter keeps being combined forever.
     /// * **Stranded.** `UPDATE edges SET target_id = canonical` re-points an
     ///   edge while its BBA stays on `dup`, so `canonical` **under-counts**
     ///   that supporter permanently — and it can never self-heal, because
-    ///   `MassFunctionRepository::exists_for_perspective` is keyed on
-    ///   `perspective_id` alone and ignores `claim_id`, so
+    ///   `MassFunctionRepository::exists_for_edge` is keyed on the edge
+    ///   alone and ignores `claim_id`, so
     ///   `auto_wire_edge_if_epistemic` short-circuits on it forever.
     ///
     /// Both repairs run inside the same transaction as the edge mutation, so
@@ -13312,7 +13311,7 @@ async fn repair_marked_duplicate(
     // be migrated.
     // `RETURNING id, target_id` (here and on the two pre-deletes below) is
     // the only addition to these statements: the edge rows are about to be
-    // gone, and their `perspective_id = id` BBAs — which live on
+    // gone, and their edge-slot BBAs (`slot_id = id`) — which live on
     // `target_id` — have to be deleted with them, so the ids must be
     // captured before the DELETE commits.
     let mut deleted_edges: Vec<(Uuid, Uuid)> = sqlx::query_as(
@@ -13436,7 +13435,7 @@ async fn repair_marked_duplicate(
         sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              SELECT to_jsonb(mf) FROM mass_functions mf
-              WHERE mf.perspective_id = ANY($1) AND mf.retracted_at IS NULL
+              WHERE mf.slot_kind = 'edge' AND mf.slot_id = ANY($1) AND mf.retracted_at IS NULL
               ORDER BY mf.id"#,
         )
         .bind(&deleted_edge_ids)
@@ -13605,10 +13604,10 @@ async fn repair_marked_duplicate(
             .await?;
         }
 
-        // Guard `mass_functions_unique_per_perspective` (claim_id, frame_id,
-        // source_agent_id, perspective_id, NULLS NOT DISTINCT -- migration
-        // 034): when `canonical` already holds a LIVE row for an incoming
-        // perspective, the duplicate's LIVE copy is dropped and the canonical
+        // Guard `mass_functions_unique_per_key` (claim_id, frame_id,
+        // source_agent_id, perspective_id, slot_kind, slot_id, NULLS NOT
+        // DISTINCT -- migrations 034, 267): when `canonical` already holds a
+        // LIVE row on an incoming edge's slot, the duplicate's LIVE copy is dropped and the canonical
         // keeps its own. Both carry the same edge, frame and source agent; only
         // the moment their masses were frozen differs, and the canonical's row
         // may be another writer's contribution, which a dedup does not destroy
@@ -13627,12 +13626,13 @@ async fn repair_marked_duplicate(
         let dropped: Vec<serde_json::Value> = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              DELETE FROM mass_functions d
-              WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+              WHERE d.claim_id = $2 AND d.slot_kind = 'edge' AND d.slot_id = ANY($3)
                 AND d.retracted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM mass_functions c
                      WHERE c.claim_id = $1
-                       AND c.perspective_id = d.perspective_id
+                       AND c.slot_kind = 'edge' AND c.slot_id = d.slot_id
+                       AND c.perspective_id IS NULL
                        AND c.frame_id = d.frame_id
                        AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
                        AND c.retracted_at IS NULL)
@@ -13648,12 +13648,13 @@ async fn repair_marked_duplicate(
         kept_on_duplicate_by_retracted_holder = sqlx::query_scalar(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              SELECT d.id FROM mass_functions d
-              WHERE d.claim_id = $2 AND d.perspective_id = ANY($3)
+              WHERE d.claim_id = $2 AND d.slot_kind = 'edge' AND d.slot_id = ANY($3)
                 AND d.retracted_at IS NULL
                 AND EXISTS (
                     SELECT 1 FROM mass_functions c
                      WHERE c.claim_id = $1
-                       AND c.perspective_id = d.perspective_id
+                       AND c.slot_kind = 'edge' AND c.slot_id = d.slot_id
+                       AND c.perspective_id IS NULL
                        AND c.frame_id = d.frame_id
                        AND c.source_agent_id IS NOT DISTINCT FROM d.source_agent_id
                        AND c.retracted_at IS NOT NULL)
@@ -13672,7 +13673,7 @@ async fn repair_marked_duplicate(
         // owner); onto a group-private canonical it becomes the claim's own
         // row, as every derived row of a private claim is. A row whose key the
         // canonical holds (only the kept rows above remain so) is not moved:
-        // the move would collide with the holder on migration 034's unique key.
+        // the move would collide with the holder on the unique key (034, 267).
         // A retracted row the canonical does not hold moves with its edge, its
         // retraction intact (184's guards admit a move).
         let moved: Vec<MovedBba> = sqlx::query_as(&format!(
@@ -13680,11 +13681,12 @@ async fn repair_marked_duplicate(
              WITH before AS (
                  SELECT b.id, b.owner_group_id, b.visibility::text AS visibility, b.writer_owned
                    FROM mass_functions b
-                  WHERE b.claim_id = $2 AND b.perspective_id = ANY($3)
+                  WHERE b.claim_id = $2 AND b.slot_kind = 'edge' AND b.slot_id = ANY($3)
                     AND NOT EXISTS (
                         SELECT 1 FROM mass_functions c
                          WHERE c.claim_id = $1
-                           AND c.perspective_id = b.perspective_id
+                           AND c.slot_kind = 'edge' AND c.slot_id = b.slot_id
+                           AND c.perspective_id IS NULL
                            AND c.frame_id = b.frame_id
                            AND c.source_agent_id IS NOT DISTINCT FROM b.source_agent_id))
              {MOVE_BBAS_ONTO_CANONICAL_SQL}"#
@@ -13701,12 +13703,12 @@ async fn repair_marked_duplicate(
     // ── Derived-record repair, part 3: POOL the duplicate's own inputs ────
     // Parts 1 and 2 move only EDGE-keyed BBAs, with their edges. The
     // duplicate's other BBAs -- its auto-wired creation row, assess rows,
-    // agent BBAs (`perspective_id` NULL or naming no edge) -- would otherwise
+    // agent BBAs (no edge slot, or a slot naming no edge) -- would otherwise
     // stay on a claim no reader folds (V-1), so the canonical would not count
     // evidence the duplicate had. They move under part 2's ownership rule
     // (migration 114). Three kinds stay on the duplicate, and are reported:
     //
-    // * a row whose (frame, source agent, perspective) key the canonical
+    // * a row whose (frame, source agent, perspective, slot) key the canonical
     //   already holds: the same source's view of the same proposition, which
     //   pooling would count twice; the canonical keeps its own and the
     //   duplicate's copy is KEPT (not dropped, unlike part 2's edge rule), so
@@ -13741,8 +13743,8 @@ async fn repair_marked_duplicate(
         r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
          SELECT mf.id FROM mass_functions mf
           WHERE mf.claim_id = $2
-            AND (mf.perspective_id IS NULL
-                 OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id))
+            AND (mf.slot_kind IS DISTINCT FROM 'edge'
+                 OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.slot_id))
             AND ($3 OR NOT {poolable_sql} OR EXISTS ({CANONICAL_HOLDS_KEY_SQL}))
           ORDER BY mf.id"#
     ))
@@ -14109,7 +14111,9 @@ async fn reverse_marked_duplicate(
                 AND m.id = ANY($3) AND m.claim_id = ANY($1)
                 AND m.frame_id = k.frame_id
                 AND m.source_agent_id IS NOT DISTINCT FROM k.source_agent_id
-                AND m.perspective_id IS NOT DISTINCT FROM k.perspective_id"#,
+                AND m.perspective_id IS NOT DISTINCT FROM k.perspective_id
+                AND m.slot_kind IS NOT DISTINCT FROM k.slot_kind
+                AND m.slot_id IS NOT DISTINCT FROM k.slot_id"#,
             crate::repos::mass_function::cached_combination_predicate("k.")
         ))
         .bind(&chain)
@@ -14135,7 +14139,9 @@ async fn reverse_marked_duplicate(
                 AND NOT EXISTS (SELECT 1 FROM mass_functions k
                                  WHERE k.claim_id = $2 AND k.frame_id = mf.frame_id
                                    AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id
-                                   AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id)
+                                   AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id
+                                   AND k.slot_kind IS NOT DISTINCT FROM mf.slot_kind
+                                   AND k.slot_id IS NOT DISTINCT FROM mf.slot_id)
              RETURNING mf.id"#,
         )
         .bind(&chain)
@@ -14155,7 +14161,16 @@ async fn reverse_marked_duplicate(
     // a key a RETRACTED row holds is skipped too and its row reported
     // drifted; the retracted row is not touched).
     if !record.deleted_bbas.is_empty() {
-        let deleted = serde_json::Value::Array(record.deleted_bbas.clone());
+        // A record written before migration 267 names the edge in
+        // `perspective_id`; it is restored onto the edge's slot.
+        let deleted = serde_json::Value::Array(
+            record
+                .deleted_bbas
+                .iter()
+                .cloned()
+                .map(crate::repos::mass_function::edge_bba_record_on_slot)
+                .collect(),
+        );
         let asked: Vec<Uuid> = record
             .deleted_bbas
             .iter()
@@ -14169,14 +14184,17 @@ async fn reverse_marked_duplicate(
             r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection.
              INSERT INTO mass_functions
              SELECT r.* FROM jsonb_populate_recordset(NULL::mass_functions, $1) r
-              WHERE EXISTS (SELECT 1 FROM edges e
-                             WHERE e.id = r.perspective_id AND e.valid_to IS NULL)
+              WHERE r.slot_kind = 'edge'
+                AND EXISTS (SELECT 1 FROM edges e
+                             WHERE e.id = r.slot_id AND e.valid_to IS NULL)
                 -- Every row the record names must still be insertable: its
-                -- claim, frame, perspective, agent and evidence still exist.
-                -- One that is not is reported drifted, never fatal.
+                -- claim, frame, perspective (none, on an edge slot), agent
+                -- and evidence still exist. One that is not is reported
+                -- drifted, never fatal.
                 AND EXISTS (SELECT 1 FROM claims c WHERE c.id = r.claim_id)
                 AND EXISTS (SELECT 1 FROM frames f WHERE f.id = r.frame_id)
-                AND EXISTS (SELECT 1 FROM perspectives p WHERE p.id = r.perspective_id)
+                AND (r.perspective_id IS NULL
+                     OR EXISTS (SELECT 1 FROM perspectives p WHERE p.id = r.perspective_id))
                 AND (r.source_agent_id IS NULL
                      OR EXISTS (SELECT 1 FROM agents a WHERE a.id = r.source_agent_id))
                 AND (r.evidence_id IS NULL
@@ -14417,8 +14435,8 @@ impl ClaimRepository {
 /// `NOT`.
 fn poolable_bba_sql() -> String {
     format!(
-        "((mf.perspective_id IS NULL \
-           OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.perspective_id)) \
+        "((mf.slot_kind IS DISTINCT FROM 'edge' \
+           OR NOT EXISTS (SELECT 1 FROM edges e WHERE e.id = mf.slot_id)) \
           AND mf.combination_method IS DISTINCT FROM 'attributed_v1' \
           AND NOT {} \
           AND (mf.visibility::text = 'public' \
@@ -14430,8 +14448,10 @@ fn poolable_bba_sql() -> String {
 }
 
 /// The canonical (`$1`) already holds a row under the duplicate row `mf`'s
-/// `mass_functions_unique_per_perspective` key (migration 034).
+/// `mass_functions_unique_per_key` key (migrations 034, 267).
 const CANONICAL_HOLDS_KEY_SQL: &str = "SELECT 1 FROM mass_functions k \
       WHERE k.claim_id = $1 AND k.frame_id = mf.frame_id \
         AND k.source_agent_id IS NOT DISTINCT FROM mf.source_agent_id \
-        AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id";
+        AND k.perspective_id IS NOT DISTINCT FROM mf.perspective_id \
+        AND k.slot_kind IS NOT DISTINCT FROM mf.slot_kind \
+        AND k.slot_id IS NOT DISTINCT FROM mf.slot_id";

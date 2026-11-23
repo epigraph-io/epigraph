@@ -250,7 +250,8 @@ async fn cascade_errors_are_reported_not_propagated(pool: PgPool) {
 
     sqlx::query(
         "UPDATE mass_functions SET masses = '{\"0\": \"not-a-number\"}'::jsonb \
-         WHERE perspective_id = (SELECT id FROM edges WHERE source_id = $1 AND target_id = $2)",
+         WHERE slot_kind = 'edge' \
+           AND slot_id = (SELECT id FROM edges WHERE source_id = $1 AND target_id = $2)",
     )
     .bind(c)
     .bind(b)
@@ -461,7 +462,7 @@ async fn a_refused_downstream_target_fails_alone_on_the_stamped_cascade(pool: Pg
 /// Edge-factor BBAs stored on `claim` whose edge is now sourced at `source`.
 async fn edge_bbas(pool: &PgPool, claim: Uuid, source: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT count(*) FROM mass_functions m JOIN edges e ON e.id = m.perspective_id \
+        "SELECT count(*) FROM mass_functions m JOIN edges e ON m.slot_kind = 'edge' AND e.id = m.slot_id \
          WHERE m.claim_id = $1 AND e.source_id = $2",
     )
     .bind(claim)

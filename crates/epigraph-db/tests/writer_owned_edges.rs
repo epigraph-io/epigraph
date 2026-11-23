@@ -1422,8 +1422,10 @@ async fn a_retracted_link_asserted_again_is_a_new_edge(pool: PgPool) {
 // ===========================================================================
 
 /// 120's `epigraph_record_cascade_deferral` records `edge_retract` only for an
-/// edge the session owns or co-owns, that carries an edge-factor perspective
-/// (`perspective_type = 'edge'`), and that is not retracted into the future.
+/// edge the session owns or co-owns, that carries an edge-factor BBA (one
+/// keyed on the edge's slot, `slot_kind = 'edge'`, any writer's: migration
+/// 267, which replaced the edge-factor perspective this used to ask for), and
+/// that is not retracted into the future.
 /// Everything else is CX03 (42501), with nothing recorded. It takes no object
 /// and no caller-named sources (CX01, 22023): it records as sources the claims
 /// of the session's own BBA rows keyed on the edge.
@@ -1450,20 +1452,58 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
             (conn, ids)
         })
         .await;
-    for (id, kind) in [
-        (retracted, "edge"),
-        (future, "edge"),
-        (genuine, "analytical"),
-        (live, "edge"),
-    ] {
-        sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, $3)")
-            .bind(id)
-            .bind(format!("w12b {kind} {id}"))
-            .bind(kind)
-            .execute(&pool)
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        frames.push(
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO frames (name, hypotheses) \
+                 VALUES ('w12b ' || gen_random_uuid(), ARRAY['TRUE','FALSE']) RETURNING id",
+            )
+            .fetch_one(&pool)
             .await
-            .expect("perspective");
+            .expect("frame"),
+        );
     }
+    // A writer's BBA keyed on `edge`, on claim `claim` and frame `frame`: on
+    // the edge's slot, or (`genuine`) on a genuine perspective that happens
+    // to carry the edge's id, which is not an edge factor.
+    let keyed_bba = |who: Uuid, claim: Uuid, frame: Uuid, edge: Uuid, on_slot: bool| {
+        let p = pool.clone();
+        async move {
+            fixture::as_role(&p.clone(), "epigraph_app", |mut conn| async move {
+                stamp(&mut conn, &p, who).await;
+                sqlx::query(
+                    "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, \
+                                                 perspective_id, slot_kind, slot_id, masses) \
+                     VALUES ($1, $2, $3, $4, $5, $6, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb)",
+                )
+                .bind(claim)
+                .bind(frame)
+                .bind(who)
+                .bind((!on_slot).then_some(edge))
+                .bind(on_slot.then_some("edge"))
+                .bind(on_slot.then_some(edge))
+                .execute(&mut *conn)
+                .await
+                .expect("a BBA keyed on the edge");
+                (conn, ())
+            })
+            .await;
+        }
+    };
+    sqlx::query("INSERT INTO perspectives (id, name, perspective_type) VALUES ($1, $2, $3)")
+        .bind(genuine)
+        .bind(format!("w12b analytical {genuine}"))
+        .bind("analytical")
+        .execute(&pool)
+        .await
+        .expect("a genuine perspective");
+    // Another writer's (Z's) edge-factor BBAs: `retracted`, `future` and
+    // `live` each carry one, so each refusal below is for the reason named.
+    for edge in [retracted, future, live] {
+        keyed_bba(z, a, frames[0], edge, true).await;
+    }
+    keyed_bba(z, a, frames[0], genuine, false).await;
     sqlx::query(
         "UPDATE edges SET valid_to = CASE WHEN id = $2 THEN now() + interval '1 day' \
                                           ELSE now() END \
@@ -1505,8 +1545,11 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
     );
     for (edge, why) in [
         (future, "a future-dated retraction"),
-        (unkeyed, "an edge with no edge-factor perspective"),
-        (genuine, "a genuine (non-edge) perspective"),
+        (unkeyed, "an edge no BBA is keyed on"),
+        (
+            genuine,
+            "an edge whose id only a genuine perspective's BBA carries",
+        ),
         (live, "an edge in force that no act withdrew"),
     ] {
         assert_eq!(
@@ -1535,38 +1578,9 @@ async fn the_edge_retract_deferral_is_the_owners_and_only_for_a_withdrawn_edge_f
         .expect("an empty source list is no source list");
     // The sources are STATE: the claims of the session's OWN BBA rows keyed
     // on the edge (W's on b, on two frames, recorded once), never another
-    // writer's (Z's on a), however the caller calls.
-    let mut frames = Vec::new();
-    for _ in 0..2 {
-        frames.push(
-            sqlx::query_scalar::<_, Uuid>(
-                "INSERT INTO frames (name, hypotheses) \
-                 VALUES ('w12b ' || gen_random_uuid(), ARRAY['TRUE','FALSE']) RETURNING id",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("frame"),
-        );
-    }
-    for (who, claim, frame) in [(w, b, frames[0]), (w, b, frames[1]), (z, a, frames[0])] {
-        let p = pool.clone();
-        fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
-            stamp(&mut conn, &p, who).await;
-            sqlx::query(
-                "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, \
-                                             perspective_id, masses) \
-                 VALUES ($1, $2, $3, $4, '{\"0\": 0.6, \"0,1\": 0.4}'::jsonb)",
-            )
-            .bind(claim)
-            .bind(frame)
-            .bind(who)
-            .bind(retracted)
-            .execute(&mut *conn)
-            .await
-            .expect("an edge-keyed BBA");
-            (conn, ())
-        })
-        .await;
+    // writer's (Z's on a, seeded above), however the caller calls.
+    for frame in [frames[0], frames[1]] {
+        keyed_bba(w, b, frame, retracted, true).await;
     }
     record(w, retracted)
         .await

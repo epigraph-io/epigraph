@@ -813,15 +813,11 @@ fn classify(r: &AtomInputRow) -> AxiomClass {
     }
 }
 
-/// The evidence row a BBA cites: its `evidence_id`, else its
-/// `perspective_id` when that is an evidence perspective (which shares its
-/// evidence row's id). Any other perspective names no evidence row.
+/// The evidence row a BBA cites: its `evidence_id`, else the evidence row
+/// its slot names (`slot_kind = 'evidence'`, migration 267). A perspective
+/// names no evidence row.
 fn cited_evidence(r: &AtomInputRow) -> Option<Uuid> {
-    r.row.evidence_id.or(if r.perspective_is_evidence {
-        r.row.perspective_id
-    } else {
-        None
-    })
+    r.row.evidence_id.or(r.row.evidence_slot_id())
 }
 
 /// A positive-transfer relationship (supports, corroborates, ...), by the

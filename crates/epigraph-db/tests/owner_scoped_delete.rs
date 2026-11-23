@@ -144,15 +144,14 @@ async fn seed_public_claim_owned_by(pool: &PgPool, agent: Uuid, group: Uuid, tag
     id
 }
 
-/// An edge id is also the perspective its BBAs are keyed by
-/// (`ensure_edge_perspective`); `mass_functions.perspective_id` is an FK.
+/// A genuine (registry) perspective row with id `id`.
 async fn seed_perspective(pool: &PgPool, id: Uuid) {
     sqlx::query("INSERT INTO perspectives (id, name) VALUES ($1, $2)")
         .bind(id)
         .bind(format!("edge {id}"))
         .execute(pool)
         .await
-        .expect("seed edge perspective");
+        .expect("seed a perspective");
 }
 
 async fn insert_evidence(conn: &mut PgConnection, claim: Uuid, tag: &str) -> Uuid {
@@ -189,21 +188,42 @@ async fn store_bba(
     source_agent: Uuid,
     perspective: Option<Uuid>,
 ) -> Uuid {
-    MassFunctionRepository::store_with_perspective(
-        &mut *conn,
-        claim,
-        frame,
-        Some(source_agent),
-        perspective,
-        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
-        None,
-        Some("test"),
-        None,
-        None,
-        "unknown",
-        None,
-    )
-    .await
+    match perspective {
+        Some(edge) => {
+            MassFunctionRepository::store_in_slot(
+                &mut *conn,
+                claim,
+                frame,
+                Some(source_agent),
+                epigraph_db::BbaSlot::Edge(edge),
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+        None => {
+            MassFunctionRepository::store_with_perspective(
+                &mut *conn,
+                claim,
+                frame,
+                Some(source_agent),
+                None,
+                &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+                None,
+                Some("test"),
+                None,
+                None,
+                "unknown",
+                None,
+            )
+            .await
+        }
+    }
     .expect("store bba")
 }
 
@@ -587,7 +607,6 @@ async fn the_dedup_repair_is_the_maintenance_connections_and_drops_the_collision
     let bt = seed_frame(&pool, "binary_truth").await;
     let dup_edge = fixture::seed_edge(&pool, dup, third).await;
     let _canon_edge = fixture::seed_edge(&pool, canonical, third).await;
-    seed_perspective(&pool, dup_edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -687,7 +706,6 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, replacement, target).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -696,12 +714,11 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
             stamp(&mut conn, &p, x).await;
             let bba = store_bba(&mut conn, target, bt, w, Some(edge)).await;
             stamp(&mut conn, &p, z).await;
-            let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_z = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             unstamp(&mut conn).await;
-            let by_unstamped =
-                MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_unstamped = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             stamp(&mut conn, &p, w).await;
-            let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let by_w = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             (conn, (bba, by_z, by_unstamped, by_w))
         })
         .await;
@@ -726,7 +743,7 @@ async fn the_retraction_cascade_refuses_every_non_owner_and_lands_on_maintenance
     );
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, n)
     })
     .await
@@ -752,7 +769,6 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     let target = fixture::seed_public_claim(&pool, author, "world target").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, dup, target).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -794,9 +810,9 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     let p = pool.clone();
     let (by_z, by_w) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, z).await;
-        let by_z = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let by_z = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         stamp(&mut conn, &p, w).await;
-        let by_w = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let by_w = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, (by_z, by_w))
     })
     .await;
@@ -807,7 +823,7 @@ async fn the_resourced_edges_bba_is_the_maintenance_connections_to_invalidate(po
     assert!(exists(&pool, "mass_functions", bba).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, n)
     })
     .await
@@ -838,7 +854,6 @@ async fn a_dedup_collision_with_another_writers_row_keeps_the_canonicals(pool: P
     let source = fixture::seed_public_claim(&pool, author, "world source").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, dup).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -939,7 +954,6 @@ async fn match_candidate_retirement_is_administrative_end_to_end(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("matcher edge");
-    seed_perspective(&pool, edge).await;
     let cand = MatchCandidateRepo::new(pool.clone())
         .upsert(
             a,
@@ -1064,9 +1078,6 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     let bt = seed_frame(&pool, "binary_truth").await;
     let e1 = fixture::seed_edge(&pool, s1, target).await;
     let e2 = fixture::seed_edge(&pool, s2, target).await;
-    for e in [e1, e2] {
-        seed_perspective(&pool, e).await;
-    }
     let p = pool.clone();
     let (b1, b2) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, x).await;
@@ -1077,7 +1088,7 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     .await;
 
     let mut su = pool.acquire().await.expect("acquire");
-    let n = MassFunctionRepository::delete_for_perspective(&mut *su, e1)
+    let n = MassFunctionRepository::delete_for_edge(&mut *su, e1)
         .await
         .expect("superuser");
     drop(su);
@@ -1085,7 +1096,7 @@ async fn privileged_sessions_delete_edge_bbas_exactly_as_before(pool: PgPool) {
     assert!(!exists(&pool, "mass_functions", b1).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
         (conn, n)
     })
     .await
@@ -1177,7 +1188,6 @@ async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
     let source = fixture::seed_public_claim(&pool, author, "a world source").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, public_claim).await;
-    seed_perspective(&pool, edge).await;
     assert_app_role_does_not_bypass(&pool).await;
 
     let p = pool.clone();
@@ -1209,7 +1219,7 @@ async fn a_reader_of_a_group_deletes_none_of_its_rows(pool: PgPool) {
             ] {
                 deleted.push(delete_by_id(&mut conn, t, id).await);
             }
-            let cascade = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+            let cascade = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
             (conn, (ev, mf, seen, deleted, cascade))
         })
         .await;
@@ -1249,8 +1259,6 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     let bt = seed_frame(&pool, "binary_truth").await;
     let e1 = fixture::seed_edge(&pool, s1, target).await;
     let e2 = fixture::seed_edge(&pool, s2, target).await;
-    seed_perspective(&pool, e1).await;
-    seed_perspective(&pool, e2).await;
     // Both rows are public world-owned (they inherit the world target), so
     // W reads them and the owner arm cannot admit them.
     let b1 = store_bba_privileged(&pool, target, bt, w, e1).await;
@@ -1261,8 +1269,8 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     let (same_author, other_author) =
         fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
             stamp(&mut conn, &p, w).await;
-            let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
-            let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+            let a = MassFunctionRepository::delete_for_edge(&mut *conn, e1).await;
+            let b = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
             (conn, (a, b))
         })
         .await;
@@ -1275,8 +1283,8 @@ async fn no_retired_duplicate_licenses_another_writers_bba_any_more(pool: PgPool
     assert!(exists(&pool, "mass_functions", b2).await);
 
     let n = fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
-        let a = MassFunctionRepository::delete_for_perspective(&mut *conn, e1).await;
-        let b = MassFunctionRepository::delete_for_perspective(&mut *conn, e2).await;
+        let a = MassFunctionRepository::delete_for_edge(&mut *conn, e1).await;
+        let b = MassFunctionRepository::delete_for_edge(&mut *conn, e2).await;
         (conn, (a, b))
     })
     .await;
@@ -1300,7 +1308,6 @@ async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
     let h_claim = fixture::seed_group_claim(&pool, h, hg, "H's private claim").await;
     let bt = seed_frame(&pool, "binary_truth").await;
     let edge = fixture::seed_edge(&pool, source, target).await;
-    seed_perspective(&pool, edge).await;
     let private_bba = store_bba_privileged(&pool, h_claim, bt, author, edge).await;
     assert_eq!(
         writer_owned(&pool, "mass_functions", private_bba).await.0,
@@ -1313,7 +1320,7 @@ async fn the_cascade_never_touches_a_row_the_session_cannot_read(pool: PgPool) {
     let (z_bba, n) = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         stamp(&mut conn, &p, z).await;
         let z_bba = store_bba(&mut conn, target, bt, author, Some(edge)).await;
-        let n = MassFunctionRepository::delete_for_perspective(&mut *conn, edge).await;
+        let n = MassFunctionRepository::delete_for_edge(&mut *conn, edge).await;
         (conn, (z_bba, n))
     })
     .await;

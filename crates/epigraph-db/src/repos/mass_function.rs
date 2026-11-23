@@ -35,8 +35,9 @@ impl EdgeBbaCascade {
     }
 }
 
-/// Delete the `mass_functions` rows keyed `perspective_id = <one of
-/// edge_ids>` that this session may delete (see the two paths below),
+/// Delete the `mass_functions` rows keyed on the edge slot of one of
+/// `edge_ids` (`slot_kind = 'edge'`, migration 267) that this session may
+/// delete (see the two paths below),
 /// returning how many went.
 ///
 /// One statement, two paths, decided by migration 114's
@@ -78,7 +79,7 @@ pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
         WITH acc AS (SELECT public.epigraph_session_is_privileged_writer() AS priv),
         own AS (
             DELETE FROM mass_functions
-             WHERE perspective_id = ANY($1) AND retracted_at IS NULL
+             WHERE slot_kind = 'edge' AND slot_id = ANY($1) AND retracted_at IS NULL
                AND (SELECT priv FROM acc)
             RETURNING 1
         )
@@ -93,6 +94,26 @@ pub async fn delete_edge_bbas<'e, E: sqlx::PgExecutor<'e>>(
     .fetch_one(executor)
     .await?;
     Ok(u64::try_from(n).unwrap_or(0))
+}
+
+/// A `to_jsonb(mass_functions)` record of an EDGE-keyed BBA (a dedup
+/// repair's revert record), on the edge's slot. A record written before
+/// migration 267 names the edge in `perspective_id` and carries no slot; it is
+/// rewritten to `slot_kind = 'edge'`, `slot_id` = that id, no perspective, so
+/// it restores onto the key the row would hold today. A record that already
+/// carries a slot is returned unchanged.
+#[must_use]
+pub fn edge_bba_record_on_slot(mut record: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = record.as_object_mut() {
+        let has_slot = obj.get("slot_id").is_some_and(|v| !v.is_null());
+        let legacy_edge = obj.get("perspective_id").filter(|v| !v.is_null()).cloned();
+        if let (false, Some(edge)) = (has_slot, legacy_edge) {
+            obj.insert("slot_kind".to_string(), serde_json::json!("edge"));
+            obj.insert("slot_id".to_string(), edge);
+            obj.insert("perspective_id".to_string(), serde_json::Value::Null);
+        }
+    }
+    record
 }
 
 /// The `combination_method` a belief writer stamps on its cached result when
@@ -190,8 +211,8 @@ fn with_cached_combination_excluded(sql: &str, qualifier: &str) -> String {
     sql.replace(NOT_CACHED_COMBINATION_MARKER, &predicate)
 }
 
-/// The perspective that keys `owner`'s ONE assessment slot on any (claim,
-/// frame): the `/claims/:id/assess` row is `(claim, frame, owner, this)`
+/// The id that keys `owner`'s ONE assessment slot on any (claim, frame): the
+/// `/claims/:id/assess` row is `(claim, frame, owner, BbaSlot::Assessment(this))`
 /// (ruling Q-U027F-2: one assessment per claim, frame and owner, the owner being
 /// the caller's human). Deterministic and domain-separated from every other
 /// perspective id (random v4s, edge ids). Because it is computable, every other
@@ -234,6 +255,7 @@ pub fn cached_combination_predicate(qualifier: &str) -> String {
     let q = qualifier;
     format!(
         "COALESCE({q}source_agent_id IS NULL AND {q}perspective_id IS NULL \
+         AND {q}slot_id IS NULL \
          AND ({q}combination_method IN ({labels}) \
               OR {q}combination_method LIKE '{CACHED_COMBINATION_CAUTIOUS_PREFIX}%'), false)"
     )
@@ -547,6 +569,7 @@ pub fn cached_combination_slot_holds_input(inputs: &[MassFunctionRow]) -> bool {
     inputs.iter().any(|row| {
         row.source_agent_id.is_none()
             && row.perspective_id.is_none()
+            && row.slot_id.is_none()
             && row.combination_method.is_some()
     })
 }
@@ -558,7 +581,14 @@ pub struct MassFunctionRow {
     pub claim_id: Uuid,
     pub frame_id: Uuid,
     pub source_agent_id: Option<Uuid>,
+    /// A genuine perspective (a viewpoint) this BBA belongs to. Never set
+    /// together with a slot (`mass_functions_slot_shape`, migration 267).
     pub perspective_id: Option<Uuid>,
+    /// `mass_functions.slot_kind`: what keys an edge, evidence or assessment
+    /// BBA (migration 267); see [`MassFunctionRow::slot`].
+    pub slot_kind: Option<String>,
+    /// `mass_functions.slot_id`: the id `slot_kind` names.
+    pub slot_id: Option<Uuid>,
     pub masses: serde_json::Value,
     pub conflict_k: Option<f64>,
     pub combination_method: Option<String>,
@@ -582,6 +612,92 @@ pub struct MassFunctionRow {
     /// `claim_id`. See issue #197 Phase 3 and migration 046.
     pub evidence_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
+}
+
+impl MassFunctionRow {
+    /// The slot this row is keyed on, if any (migration 267). A row with an
+    /// unknown `slot_kind` (none exists: `mass_functions_slot_shape`) reads as
+    /// unslotted.
+    #[must_use]
+    pub fn slot(&self) -> Option<BbaSlot> {
+        BbaSlot::from_columns(self.slot_kind.as_deref(), self.slot_id)
+    }
+
+    /// The edge this row is the edge factor of: its slot when that slot is an
+    /// edge's.
+    #[must_use]
+    pub fn edge_id(&self) -> Option<Uuid> {
+        match self.slot() {
+            Some(BbaSlot::Edge(id)) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// The evidence row this row's slot names, when it is keyed on one.
+    #[must_use]
+    pub fn evidence_slot_id(&self) -> Option<Uuid> {
+        match self.slot() {
+            Some(BbaSlot::Evidence(id)) => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// What keys a BBA besides (claim, frame, source agent) when it is not a
+/// perspective's (migration 267, backlog 1777638e). Each kind used to be a
+/// pseudo-row of `perspectives`; it is now `mass_functions.slot_kind` /
+/// `mass_functions.slot_id`, part of the unique key
+/// `mass_functions_unique_per_key`, and never set together with
+/// `perspective_id`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BbaSlot {
+    /// The edge factor of the epistemic edge with this id.
+    Edge(Uuid),
+    /// The DS evidence auto-wire's BBA for the evidence row with this id.
+    Evidence(Uuid),
+    /// An owner's one `/claims/:id/assess` row
+    /// ([`assessment_slot_perspective`] of the owner).
+    Assessment(Uuid),
+}
+
+impl BbaSlot {
+    /// The `slot_kind` literal.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Edge(_) => "edge",
+            Self::Evidence(_) => "evidence",
+            Self::Assessment(_) => "assessment",
+        }
+    }
+
+    /// The `slot_id`.
+    #[must_use]
+    pub const fn id(self) -> Uuid {
+        match self {
+            Self::Edge(id) | Self::Evidence(id) | Self::Assessment(id) => id,
+        }
+    }
+
+    /// The slot two stored columns name; `None` when either is NULL or the
+    /// kind is not one of the three.
+    #[must_use]
+    pub fn from_columns(kind: Option<&str>, id: Option<Uuid>) -> Option<Self> {
+        match (kind?, id?) {
+            ("edge", id) => Some(Self::Edge(id)),
+            ("evidence", id) => Some(Self::Evidence(id)),
+            ("assessment", id) => Some(Self::Assessment(id)),
+            _ => None,
+        }
+    }
+}
+
+/// The key a stored BBA takes besides (claim, frame, source agent): a genuine
+/// perspective (or none), or a slot.
+#[derive(Debug, Clone, Copy)]
+enum BbaKey {
+    Perspective(Option<Uuid>),
+    Slot(BbaSlot),
 }
 
 /// Repository for mass function (BBA) operations
@@ -663,9 +779,10 @@ impl MassFunctionRepository {
     /// used a raw INSERT of `claim_id, frame_id, source_agent_id, masses,
     /// conflict_k, combination_method` only, so the promoted BBA lost its type,
     /// its reliability, its locality and its evidence link, and was then
-    /// combined at the 0.5 unknown-type weight. `perspective_id` is not copied, exactly as before:
-    /// the copy lands under the (claim, frame, agent, NULL) key, so re-promoting
-    /// re-states one row instead of adding another.
+    /// combined at the 0.5 unknown-type weight. `perspective_id` and the slot
+    /// (migration 267) are not copied, exactly as before: the copy lands under
+    /// the (claim, frame, agent, NULL) key, so re-promoting re-states one row
+    /// instead of adding another.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -694,7 +811,11 @@ impl MassFunctionRepository {
 
     /// Store a mass function with an optional perspective association
     ///
-    /// Uses ON CONFLICT on (claim_id, frame_id, source_agent_id, perspective_id) to update.
+    /// Uses ON CONFLICT on `mass_functions_unique_per_key` (claim_id,
+    /// frame_id, source_agent_id, perspective_id, slot_kind, slot_id; migration
+    /// 267) to update. `perspective_id` names a GENUINE perspective (a
+    /// viewpoint); an edge, evidence or assessment BBA is keyed on its slot
+    /// instead, by [`Self::store_in_slot`].
     ///
     /// A RETRACTED row holds its key (migration 184, operator ruling R-103):
     /// a write to that key is refused by the database (RT07) and changes
@@ -718,8 +839,8 @@ impl MassFunctionRepository {
     ///
     /// The ON CONFLICT is what makes a stamped caller's RETRY safe after a
     /// failure further down its own pipeline: the row is keyed on
-    /// `(claim_id, frame_id, source_agent_id, perspective_id)` and re-storing the
-    /// same BBA updates it rather than combining mass twice.
+    /// `(claim_id, frame_id, source_agent_id, perspective_id, slot)` and
+    /// re-storing the same BBA updates it rather than combining mass twice.
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
@@ -739,12 +860,132 @@ impl MassFunctionRepository {
         locality_tag: &str, // 'intra' | 'cross' | 'unknown'; column NOT NULL default 'unknown' (issue #197)
         evidence_id: Option<Uuid>, // FK to evidence(id); Some(_) on the auto_wire_ds_update evidence write path, None otherwise (issue #197 Phase 3)
     ) -> Result<Uuid, DbError> {
+        Self::store_keyed(
+            executor,
+            claim_id,
+            frame_id,
+            source_agent_id,
+            BbaKey::Perspective(perspective_id),
+            masses_json,
+            conflict_k,
+            combination_method,
+            source_strength,
+            evidence_type,
+            locality_tag,
+            evidence_id,
+        )
+        .await
+    }
+
+    /// Store a mass function keyed on `slot` (an edge's, an evidence row's or
+    /// an owner's assessment; migration 267), with no perspective. Otherwise
+    /// [`Self::store_with_perspective`]: the same upsert, the same RT07
+    /// refusal at a retracted row's key, the same executor rules.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(executor, masses_json))]
+    pub async fn store_in_slot<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        claim_id: Uuid,
+        frame_id: Uuid,
+        source_agent_id: Option<Uuid>,
+        slot: BbaSlot,
+        masses_json: &serde_json::Value,
+        conflict_k: Option<f64>,
+        combination_method: Option<&str>,
+        source_strength: Option<f64>,
+        evidence_type: Option<&str>,
+        locality_tag: &str,
+        evidence_id: Option<Uuid>,
+    ) -> Result<Uuid, DbError> {
+        Self::store_keyed(
+            executor,
+            claim_id,
+            frame_id,
+            source_agent_id,
+            BbaKey::Slot(slot),
+            masses_json,
+            conflict_k,
+            combination_method,
+            source_strength,
+            evidence_type,
+            locality_tag,
+            evidence_id,
+        )
+        .await
+    }
+
+    /// Store an evidence-derived BBA: keyed on the evidence row's slot
+    /// ([`BbaSlot::Evidence`]) when `evidence_slot` names one, so each evidence
+    /// submission is its own row (C-1); otherwise on the agent's unscoped key
+    /// (no perspective, no slot). [`Self::store_in_slot`] /
+    /// [`Self::store_with_perspective`] otherwise.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the database query fails.
+    #[allow(clippy::too_many_arguments)]
+    #[instrument(skip(executor, masses_json))]
+    pub async fn store_for_evidence<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        claim_id: Uuid,
+        frame_id: Uuid,
+        source_agent_id: Option<Uuid>,
+        evidence_slot: Option<Uuid>,
+        masses_json: &serde_json::Value,
+        conflict_k: Option<f64>,
+        combination_method: Option<&str>,
+        source_strength: Option<f64>,
+        evidence_type: Option<&str>,
+        locality_tag: &str,
+        evidence_id: Option<Uuid>,
+    ) -> Result<Uuid, DbError> {
+        Self::store_keyed(
+            executor,
+            claim_id,
+            frame_id,
+            source_agent_id,
+            evidence_slot.map_or(BbaKey::Perspective(None), |e| {
+                BbaKey::Slot(BbaSlot::Evidence(e))
+            }),
+            masses_json,
+            conflict_k,
+            combination_method,
+            source_strength,
+            evidence_type,
+            locality_tag,
+            evidence_id,
+        )
+        .await
+    }
+
+    /// The one upsert every public writer shares.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_keyed<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        claim_id: Uuid,
+        frame_id: Uuid,
+        source_agent_id: Option<Uuid>,
+        key: BbaKey,
+        masses_json: &serde_json::Value,
+        conflict_k: Option<f64>,
+        combination_method: Option<&str>,
+        source_strength: Option<f64>,
+        evidence_type: Option<&str>,
+        locality_tag: &str,
+        evidence_id: Option<Uuid>,
+    ) -> Result<Uuid, DbError> {
+        let (perspective_id, slot_kind, slot_id) = match key {
+            BbaKey::Perspective(p) => (p, None, None),
+            BbaKey::Slot(s) => (None, Some(s.kind()), Some(s.id())),
+        };
         let row: (Uuid,) = sqlx::query_as(
             r#"
             INSERT INTO mass_functions
-                (claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id) DO UPDATE
+                (claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ON CONFLICT (claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id) DO UPDATE
             SET masses = EXCLUDED.masses,
                 conflict_k = EXCLUDED.conflict_k,
                 combination_method = EXCLUDED.combination_method,
@@ -760,6 +1001,8 @@ impl MassFunctionRepository {
         .bind(frame_id)
         .bind(source_agent_id)
         .bind(perspective_id)
+        .bind(slot_kind)
+        .bind(slot_id)
         .bind(masses_json)
         .bind(conflict_k)
         .bind(combination_method)
@@ -969,7 +1212,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_cached_combination_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2
               /* {NOT_CACHED_COMBINATION} */
@@ -1001,7 +1244,7 @@ impl MassFunctionRepository {
     ) -> Result<Option<MassFunctionRow>, DbError> {
         let sql = viewer.splice(
             r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE id = $1
               /* {VISIBILITY:mass_functions} */
@@ -1031,7 +1274,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_retracted_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1
               /* {NOT_RETRACTED} */
@@ -1077,7 +1320,7 @@ impl MassFunctionRepository {
             &with_cached_combination_excluded(
                 r#"
             SELECT mf.id, mf.claim_id, mf.frame_id, mf.source_agent_id, mf.perspective_id,
-                   mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
+                   mf.slot_kind, mf.slot_id, mf.masses, mf.conflict_k, mf.combination_method, mf.source_strength,
                    mf.evidence_type, mf.locality_tag, mf.evidence_id, mf.created_at
             FROM mass_functions mf
             JOIN frames f ON mf.frame_id = f.id
@@ -1114,7 +1357,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_retracted_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = $3
               /* {NOT_RETRACTED} */
@@ -1152,7 +1395,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_retracted_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE claim_id = $1 AND frame_id = $2 AND perspective_id = ANY($3)
               /* {NOT_RETRACTED} */
@@ -1175,11 +1418,11 @@ impl MassFunctionRepository {
         Ok(rows)
     }
 
-    /// Whether any mass function row has already been materialized for the
-    /// given `perspective_id`.
+    /// Whether any mass function row has already been materialized on the
+    /// slot of edge `edge_id`.
     ///
     /// Edge-factor BBAs (see `epigraph_engine::edge_factor::auto_wire_ds_for_edge`)
-    /// are persisted with `perspective_id = edge_id`, so this doubles as
+    /// are persisted on [`BbaSlot::Edge`] (migration 267), so this is
     /// "has this edge ever been wired" — the existence check the
     /// edge-creation wake-up gate (backlog 8ef5cf61) uses to decide whether
     /// a re-asserted edge should attempt wiring even when `was_created` is
@@ -1189,20 +1432,21 @@ impl MassFunctionRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
-    pub async fn exists_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn exists_for_edge<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
-        perspective_id: Uuid,
+        edge_id: Uuid,
     ) -> Result<bool, DbError> {
         let sql = viewer.splice(
             r#"
             SELECT EXISTS (
-                SELECT 1 FROM mass_functions WHERE perspective_id = $1 /* {VISIBILITY:mass_functions} */
+                SELECT 1 FROM mass_functions
+                 WHERE slot_kind = 'edge' AND slot_id = $1 /* {VISIBILITY:mass_functions} */
             )
             "#,
             2,
         );
-        let mut vq = sqlx::query_scalar(&sql).bind(perspective_id);
+        let mut vq = sqlx::query_scalar(&sql).bind(edge_id);
         if let Some(g) = viewer.group_bind() {
             vq = vq.bind(g);
         }
@@ -1212,7 +1456,7 @@ impl MassFunctionRepository {
     }
 
     /// The id of a RETRACTED row holding the upsert key `(claim_id, frame_id,
-    /// source_agent_id, perspective_id)` that `viewer` can read, if any.
+    /// source_agent_id, perspective_id, slot)` that `viewer` can read, if any.
     ///
     /// A retracted row holds its key (migration 184, operator ruling R-103):
     /// [`Self::store_with_perspective`] onto it is refused. An AUTOMATED
@@ -1230,6 +1474,7 @@ impl MassFunctionRepository {
         frame_id: Uuid,
         source_agent_id: Option<Uuid>,
         perspective_id: Option<Uuid>,
+        slot: Option<BbaSlot>,
     ) -> Result<Option<Uuid>, DbError> {
         let sql = viewer.splice(
             r#"
@@ -1237,23 +1482,27 @@ impl MassFunctionRepository {
              WHERE claim_id = $1 AND frame_id = $2
                AND source_agent_id IS NOT DISTINCT FROM $3
                AND perspective_id IS NOT DISTINCT FROM $4
+               AND slot_kind IS NOT DISTINCT FROM $5
+               AND slot_id IS NOT DISTINCT FROM $6
                AND retracted_at IS NOT NULL /* {VISIBILITY:mass_functions} */
             "#,
-            5,
+            7,
         );
         let mut q = sqlx::query_scalar(&sql)
             .bind(claim_id)
             .bind(frame_id)
             .bind(source_agent_id)
-            .bind(perspective_id);
+            .bind(perspective_id)
+            .bind(slot.map(BbaSlot::kind))
+            .bind(slot.map(BbaSlot::id));
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
         Ok(q.fetch_optional(executor).await?)
     }
 
-    /// How many RETRACTED rows (migration 184) `viewer` can read keyed on
-    /// `perspective_id`. The retraction cascade asks this for an edge it has
+    /// How many RETRACTED rows (migration 184) `viewer` can read keyed on the
+    /// slot of edge `edge_id`. The retraction cascade asks this for an edge it has
     /// just invalidated: [`delete_edge_bbas`] keeps those rows, and each one
     /// holds its key (operator ruling R-103), so the cascade neither deletes
     /// nor re-wires them and reports how many it kept.
@@ -1261,20 +1510,20 @@ impl MassFunctionRepository {
     /// # Errors
     /// Returns `DbError::QueryFailed` if the database query fails.
     #[instrument(skip(executor, viewer))]
-    pub async fn count_retracted_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn count_retracted_for_edge<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
         viewer: &crate::visibility::Viewer,
-        perspective_id: Uuid,
+        edge_id: Uuid,
     ) -> Result<u64, DbError> {
         let sql = viewer.splice(
             r#"
             SELECT count(*) FROM mass_functions
-             WHERE perspective_id = $1
+             WHERE slot_kind = 'edge' AND slot_id = $1
                AND retracted_at IS NOT NULL /* {VISIBILITY:mass_functions} */
             "#,
             2,
         );
-        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(perspective_id);
+        let mut q = sqlx::query_scalar::<_, i64>(&sql).bind(edge_id);
         if let Some(g) = viewer.group_bind() {
             q = q.bind(g);
         }
@@ -1323,17 +1572,17 @@ impl MassFunctionRepository {
         Ok(u64::try_from(counts.1).unwrap_or(0))
     }
 
-    /// Delete every mass function keyed to a single perspective.
+    /// Delete every mass function keyed on the slot of edge `edge_id`.
     ///
-    /// The retraction-repair primitive. Edge-factor BBAs are persisted with
-    /// `perspective_id = edge_id` and their `masses` are **frozen at wire
+    /// The retraction-repair primitive. Edge-factor BBAs are persisted on
+    /// [`BbaSlot::Edge`] (migration 267) and their `masses` are **frozen at wire
     /// time** from the source claim's interval (see
     /// `epigraph_engine::edge_factor::auto_wire_ds_for_edge`), so re-running
     /// the combine pipeline over them after the source is retracted is a
     /// bit-for-bit no-op. Repair therefore requires *invalidation*, not
     /// recombination — and it must be a delete rather than an overwrite,
     /// because `auto_wire_edge_if_epistemic` short-circuits on
-    /// [`Self::exists_for_perspective`], so a re-wire that leaves the stale
+    /// [`Self::exists_for_edge`], so a re-wire that leaves the stale
     /// row in place is a permanent no-op.
     ///
     /// [`Self::delete_for_claim`] is the wrong tool here: it would drop every
@@ -1351,16 +1600,11 @@ impl MassFunctionRepository {
     /// `Err` (CD02), never a silent `Ok(0)`, so the cascade records it instead
     /// of reading it as "this edge carried no BBA".
     #[instrument(skip(executor))]
-    pub async fn delete_for_perspective<'e, E: sqlx::PgExecutor<'e>>(
+    pub async fn delete_for_edge<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
-        perspective_id: Uuid,
+        edge_id: Uuid,
     ) -> Result<u64, DbError> {
-        Ok(delete_edge_bbas(
-            executor,
-            &[perspective_id],
-            EdgeBbaCascade::RetractionCascade,
-        )
-        .await?)
+        Ok(delete_edge_bbas(executor, &[edge_id], EdgeBbaCascade::RetractionCascade).await?)
     }
 
     /// Mark a claim's cached DS scalars as **unbacked**: NULL out
@@ -1701,7 +1945,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_retracted_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id, masses, conflict_k, combination_method, source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
             WHERE frame_id = $1
               /* {NOT_RETRACTED} */
@@ -1739,7 +1983,7 @@ impl MassFunctionRepository {
         let sql = viewer.splice(
             &with_cached_combination_excluded(
                 r#"
-            SELECT id, claim_id, frame_id, source_agent_id, perspective_id,
+            SELECT id, claim_id, frame_id, source_agent_id, perspective_id, slot_kind, slot_id,
                    masses, conflict_k, combination_method,
                    source_strength, evidence_type, locality_tag, evidence_id, created_at
             FROM mass_functions
@@ -2049,12 +2293,15 @@ pub struct UntypedBbaProvenance {
     pub source_agent_id: Option<Uuid>,
     /// `mass_functions.perspective_id`.
     pub perspective_id: Option<Uuid>,
+    /// `mass_functions.slot_id` (migration 267): set for an edge, evidence or
+    /// assessment BBA, which used to carry it as `perspective_id`.
+    pub slot_id: Option<Uuid>,
     /// `frames.name` of the BBA's frame.
     pub frame_name: Option<String>,
     /// TRUE for a cached combination row, by [`cached_combination_predicate`].
     pub cached_combination: bool,
-    /// TRUE for an UNLABELLED (`combination_method` NULL) row with no agent and
-    /// no perspective that shares its (claim, frame) with another BBA: the
+    /// TRUE for an UNLABELLED (`combination_method` NULL) row with no agent,
+    /// no perspective and no slot that shares its (claim, frame) with another BBA: the
     /// shape of the single-input cache copy writers stored before b5cb3efb,
     /// which the predicate above cannot tell from a lone legacy input.
     pub unlabelled_slot_shared: bool,
@@ -2103,10 +2350,12 @@ impl MassFunctionRepository {
                    m.combination_method,
                    m.source_agent_id,
                    m.perspective_id,
+                   m.slot_id,
                    f.name::text AS frame_name,
                    {cached} AS cached_combination,
                    (m.combination_method IS NULL
                     AND m.source_agent_id IS NULL AND m.perspective_id IS NULL
+                    AND m.slot_id IS NULL
                     AND EXISTS (SELECT 1 FROM mass_functions s
                                  WHERE s.claim_id = m.claim_id AND s.frame_id = m.frame_id
                                    AND s.id <> m.id)) AS unlabelled_slot_shared,
@@ -2718,6 +2967,8 @@ mod tests {
             frame_id: Uuid::new_v4(),
             source_agent_id: Some(Uuid::new_v4()),
             perspective_id: Some(Uuid::new_v4()),
+            slot_kind: None,
+            slot_id: None,
             masses: serde_json::json!({"0": 0.7, "0,1": 0.3}),
             conflict_k: Some(0.1),
             combination_method: Some("dempster".to_string()),
@@ -2742,6 +2993,8 @@ mod tests {
                 frame_id: Uuid::nil(),
                 source_agent_id: agent,
                 perspective_id: perspective,
+                slot_kind: None,
+                slot_id: None,
                 masses: serde_json::json!({"0": 0.6, "0,1": 0.4}),
                 conflict_k: None,
                 combination_method: label.map(str::to_string),

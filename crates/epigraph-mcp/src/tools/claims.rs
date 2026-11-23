@@ -1437,7 +1437,6 @@ const DS_UPDATE_STEPS: &[&str] = &[
     "build BBA",
     "combine_multiple",
     "discount",
-    "ensure_evidence_perspective",
     "evidence source_url read",
     "evidence_type_weights",
     "fallback get_by_name",

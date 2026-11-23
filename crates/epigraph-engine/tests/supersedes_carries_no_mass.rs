@@ -91,11 +91,13 @@ async fn edge(pool: &PgPool, source: Uuid, target: Uuid, rel: &str) -> Uuid {
 }
 
 async fn rows_keyed_on(pool: &PgPool, edge_id: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM mass_functions WHERE perspective_id = $1")
-        .bind(edge_id)
-        .fetch_one(pool)
-        .await
-        .expect("count edge-keyed rows")
+    sqlx::query_scalar(
+        "SELECT count(*) FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge_id)
+    .fetch_one(pool)
+    .await
+    .expect("count edge-keyed rows")
 }
 
 /// The DS half: `auto_wire_ds_for_edge` short-circuits on a Neutral

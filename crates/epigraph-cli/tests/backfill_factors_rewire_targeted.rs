@@ -275,9 +275,9 @@ async fn targeted_rewire_never_merges_away_a_row_that_appeared_after_selection(p
     let edge = the_edge(&pool, &w).await;
     let other_agent = seed_agent(&pool, "dup-wirer").await;
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross')",
     )
     .bind(w.target)
     .bind(w.frame)
@@ -310,7 +310,7 @@ async fn targeted_rewire_holds_a_stale_target_and_the_untargeted_phase_does_not(
     let edge = the_edge(&pool, &w).await;
     sqlx::query(
         "UPDATE mass_functions SET masses = $2::jsonb \
-          WHERE claim_id = $1 AND perspective_id IS NULL",
+          WHERE claim_id = $1 AND perspective_id IS NULL AND slot_id IS NULL",
     )
     .bind(w.target)
     .bind(EVIDENCE_C)
@@ -342,12 +342,14 @@ async fn targeted_rewire_holds_a_mixed_row(pool: PgPool) {
     let (_scoped, viewer) = viewer_fixture::bypass(&pool).await;
     let w = world(&pool, &viewer, "mixed", "supports", true).await;
     let edge = the_edge(&pool, &w).await;
-    sqlx::query("UPDATE mass_functions SET masses = $2::jsonb WHERE perspective_id = $1")
-        .bind(w.edge)
-        .bind(STALE_PRE_401)
-        .execute(&pool)
-        .await
-        .expect("an older row shape");
+    sqlx::query(
+        "UPDATE mass_functions SET masses = $2::jsonb WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(w.edge)
+    .bind(STALE_PRE_401)
+    .execute(&pool)
+    .await
+    .expect("an older row shape");
     refold(&pool, &viewer, w.target).await; // the target stays fresh
     let before = footprint(&pool, &w).await;
 
@@ -437,10 +439,10 @@ async fn targeted_rewire_holds_an_edge_with_a_retracted_row_and_never_touches_it
     .await
     .expect("second frame");
     sqlx::query(
-        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, perspective_id, masses, \
+        "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, slot_kind, slot_id, masses, \
                                      combination_method, source_strength, evidence_type, locality_tag, \
                                      retracted_at, retracted_by, retract_reason) \
-         VALUES ($1, $2, $3, $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
+         VALUES ($1, $2, $3, 'edge', $4, $5::jsonb, 'edge_factor', 0.8, 'derived_support', 'cross', \
                  now(), $3, 'cal4 fixture')",
     )
     .bind(w.target)

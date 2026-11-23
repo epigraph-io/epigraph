@@ -70,12 +70,17 @@ fn row(
     perspective: Option<Uuid>,
     evidence: Option<Uuid>,
 ) -> MassFunctionRow {
+    // An edge-factor row is stored on its edge's slot, never a perspective
+    // (migration 267): `perspective` names the edge for such a row.
+    let edge_slot = method == Some(EDGE_FACTOR_METHOD);
     MassFunctionRow {
         id: Uuid::new_v4(),
         claim_id: Uuid::new_v4(),
         frame_id: Uuid::new_v4(),
         source_agent_id: agent,
-        perspective_id: perspective,
+        perspective_id: if edge_slot { None } else { perspective },
+        slot_kind: (edge_slot && perspective.is_some()).then(|| "edge".to_string()),
+        slot_id: if edge_slot { perspective } else { None },
         masses: serde_json::json!({}),
         conflict_k: None,
         combination_method: method.map(str::to_owned),

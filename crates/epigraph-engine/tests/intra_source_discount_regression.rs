@@ -667,12 +667,13 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     // write path (`auto_wire_ds_for_edge`) still writes the composed
     // value into the cache. What Phase 2 changes is that this stored
     // value is no longer the authority at combine time.
-    let override_ss: f64 =
-        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
-            .bind(edge_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch override BBA's source_strength");
+    let override_ss: f64 = sqlx::query_scalar(
+        "SELECT source_strength FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch override BBA's source_strength");
     eprintln!(
         "[per_frame_locality_factor_override_applied] override source_strength = {override_ss}"
     );
@@ -684,12 +685,13 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     // Primer was written BEFORE the override, so its cached value is
     // still the default-factor discount (~0.21). Write-through cache
     // preserves the audit trail.
-    let primer_ss: f64 =
-        sqlx::query_scalar("SELECT source_strength FROM mass_functions WHERE perspective_id = $1")
-            .bind(primer_edge)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch primer BBA's source_strength");
+    let primer_ss: f64 = sqlx::query_scalar(
+        "SELECT source_strength FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(primer_edge)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch primer BBA's source_strength");
     assert!(
         primer_ss < 0.30,
         "primer BBA's stored cache (written pre-override) should still reflect default-factor discount (<0.30), got {primer_ss}"
@@ -700,23 +702,25 @@ async fn per_frame_locality_factor_override_applied(pool: PgPool) {
     // 'intra_self_cite' (DOI-match → self-cite case) replaces the
     // bare 'intra' tag from Phase 1a. Per-frame factor changes ONLY
     // the discount, not the classification.
-    let primer_tag: String =
-        sqlx::query_scalar("SELECT locality_tag FROM mass_functions WHERE perspective_id = $1")
-            .bind(primer_edge)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch primer locality_tag");
+    let primer_tag: String = sqlx::query_scalar(
+        "SELECT locality_tag FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(primer_edge)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch primer locality_tag");
     assert_eq!(
         primer_tag, "intra_self_cite",
         "primer BBA must carry locality_tag = 'intra_self_cite'"
     );
 
-    let override_tag: String =
-        sqlx::query_scalar("SELECT locality_tag FROM mass_functions WHERE perspective_id = $1")
-            .bind(edge_id)
-            .fetch_one(&pool)
-            .await
-            .expect("fetch override locality_tag");
+    let override_tag: String = sqlx::query_scalar(
+        "SELECT locality_tag FROM mass_functions WHERE slot_kind = 'edge' AND slot_id = $1",
+    )
+    .bind(edge_id)
+    .fetch_one(&pool)
+    .await
+    .expect("fetch override locality_tag");
     assert_eq!(
         override_tag, "intra_self_cite",
         "override BBA must carry locality_tag = 'intra_self_cite' (per-frame factor changes only the discount, not the classification)"
