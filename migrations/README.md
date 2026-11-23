@@ -3403,6 +3403,35 @@ restart.
   the RLS write on an armed database, the run-token delegation, the undo) and
   `schema_contract.rs::migration_165_derived_arms_survive_at_head`. Undo:
   `docs/runbooks/235-undo.sql`. **Deploy order:** none required; the CLI needs no new binary.
+- **238**: public `claims_block_widening_definer` (backlog b5f6883b). Re-states 074's
+  `epigraph_claims_block_widening()` (the body of the `claims_block_widening` trigger) as
+  SECURITY DEFINER, owned by `epigraph_maintenance`, on 172's form (`SET search_path =
+  pg_catalog, pg_temp`, `public.claim_encryption` and `pg_catalog.current_setting`
+  qualified). Before it, the SEALED arm's `EXISTS` on `claim_encryption` ran under the
+  caller's row security, so an application session that writes a sealed claim's owner group
+  but is not in the group its ciphertext is keyed to (a seal row written before 232, or by a
+  role 232's policies do not reach) saw no row and could make the claim public with a raw
+  `UPDATE` and the self-settable declassify GUC. A definer trigger body rather than a
+  callable `claim_is_sealed(uuid)` helper: the helper would need EXECUTE for `epigraph_app`
+  and be a seal-existence oracle; a trigger body cannot be called and needs no EXECUTE.
+  Same arms, RAISE texts, SQLSTATE (42501) and trigger; EXECUTE stays revoked from PUBLIC.
+  Guarded: refuses (55000) unless the live body is 074's (md5 of `prosrc`). Registered in
+  `tenancy_backfill.rs` `DEFERRED_DEFINER_FUNCTIONS` (fails OPEN under a non-member owner).
+  Pinned by `epigraph-db/tests/sealed_claim_widening_definer.rs` (the publicize commits a
+  public sealed claim below 238 and is refused at 238; a member of the ciphertext group, an
+  unsealed claim with and without the GUC answer as before at both; the catalog shape; the
+  md5 guard; the undo). Undo: `docs/runbooks/238-undo.sql` (tested: run twice, it returns the
+  `public` catalog to below 238; run it as the migration runner, which gets the function
+  back). It repairs no existing row: measure claims that are public with a
+  `claim_encryption` row, and seal rows whose `group_id` differs from the claim's
+  `owner_group_id`, before and after. At 238 a caller outside the ciphertext's group that
+  tries the make-public without the declassify GUC gets the SEALED text instead of the
+  declassify text: one bit about a claim it can already update. **Pre-deploy check:** the
+  live body must be 074's, or the guard refuses (55000) and 238 does not apply:
+  `SELECT md5(prosrc) FROM pg_proc WHERE oid =
+  'public.epigraph_claims_block_widening()'::regprocedure` must be
+  `7d9079127fe7ad6c7195047421e87c0e`. **Deploy order:** none; no binary depends on it.
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
