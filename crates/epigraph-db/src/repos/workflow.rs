@@ -3979,11 +3979,14 @@ mod tests {
         assert_eq!(common_plan_prefix(&whole, &shown), vec![a]);
     }
 
-    /// A hidden FORK edge `a -> c` gives `a` two successors on the whole
-    /// plan, so its order falls back to plan-index order, while the caller's
-    /// chain puts the unindexed `y` second.
+    /// A hidden edge `a -> c` that the visible chain `a -> y -> b -> c`
+    /// already implies is not a fork: `order_by_step_follows` reduces the
+    /// pairs transitively first (`reduce_implied_follows`, the generation-
+    /// sharing fix), so the whole plan's order is the caller's chain and every
+    /// slot agrees. (Written before that reduction, this test expected the
+    /// edge to fork the whole order back to plan-index order.)
     #[test]
-    fn a_hidden_fork_edge_between_visible_steps_keeps_only_agreeing_slots() {
+    fn a_hidden_edge_the_visible_chain_implies_changes_no_slot() {
         let v = ids(4);
         let (a, b, c, y) = (v[0], v[1], v[2], v[3]);
         let skeleton = [
@@ -4001,8 +4004,8 @@ mod tests {
         ];
         let shown = viewer_plan_order(&rows, &[a, b, c, y], &[(a, y), (y, b), (b, c)]);
         assert_eq!(shown, vec![a, y, b, c]);
-        assert_eq!(whole, vec![a, b, c, y]);
-        assert_eq!(common_plan_prefix(&whole, &shown), vec![a]);
+        assert_eq!(whole, vec![a, y, b, c], "the implied edge is reduced away");
+        assert_eq!(common_plan_prefix(&whole, &shown), vec![a, y, b, c]);
     }
 
     /// A hidden second `executes` edge onto `b` (ordinal 3) makes the whole
