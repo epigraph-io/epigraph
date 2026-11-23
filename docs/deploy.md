@@ -3670,6 +3670,10 @@ which revokes it.
   removed from the allowlist or a root replaced: every anchor whose own chain
   or lineage depends on it stops anchoring. Synced passkeys already anchored
   stay live; revoke them, or their anchors, to remove them.
+- **Migration 266.** `docs/runbooks/266-undo.sql` on the migration DSN
+  restores 214's body of the compromised revoke (no binary to roll back
+  first; the `epigraph.compromised_revoke_max_passes` setting is ignored
+  again). Run it BEFORE `214-undo.sql`.
 - **Migration 214.** `docs/runbooks/214-undo.sql` on the migration DSN
   restores 200's body of the compromised revoke (no binary to roll back
   first). Run it BEFORE `200-undo.sql`.

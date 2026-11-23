@@ -4186,6 +4186,27 @@ restart.
   from `epigraph_app`), `search_path = pg_catalog, pg_temp`. Pinned by
   `epigraph-db/tests/role_successor_restore.rs`. Undo: `docs/runbooks/264-undo.sql` (roll the
   CLI back first). **Deploy order:** migrate first, then the CLI.
+- **266**: public `compromised_revoke_pass_cap` (backlog 51fe91bf; slot 266 assigned
+  by the 2026-11-22 backlog triage). Re-states 214's `epigraph_revoke_passkey_compromised(uuid,
+  text)` (same signature, result columns, isolation refusal, lock-and-walk fixpoint, UPDATE
+  and audit mode) with one change: the pass cap is read once, before any lock, from the
+  setting `epigraph.compromised_revoke_max_passes`, used only when it is one or two digits
+  from 1 to 31; anything else (unset, empty, non-numeric, 0, negative, 32 or more) leaves
+  214's 32. The setting can only LOWER the cap, so it can only turn a revoke whose lineage
+  grew during its lock wait into the 40001 refusal with nothing revoked; it never revokes
+  less or loops longer. It exists so that the refusal, which 32 passes made unreachable,
+  is tested. The 40001 HINT now names the setting. A precondition checks the md5 of 214's
+  body (`645f997359d64646702e3db2f86ed7ca`) and RAISEs `55000` (changing nothing) over any
+  other. Owner and grants unchanged; it stays registered at 200 in `tenancy_backfill.rs`.
+  Pinned by `epigraph-db/tests/pending_admin_acts.rs`
+  (`the_compromised_revoke_refuses_40001_once_its_pass_cap_is_spent`,
+  `the_pass_cap_setting_never_refuses_an_ordinary_revoke`,
+  `the_266_undo_restores_214s_compromised_revoke`). Undo: `docs/runbooks/266-undo.sql`
+  (tested: run twice, it returns the `public` catalog to 265's; it refuses `55000` over any
+  body but 266's or 214's); run it BEFORE `214-undo.sql`. **Deploy order:** no binary
+  depends on it and none sets the setting; apply whenever. Operator note: a value set on
+  the role or database (`ALTER ROLE .. SET`) would apply to every revoke; clear it with
+  `ALTER ROLE epigraph_maintenance RESET epigraph.compromised_revoke_max_passes`.
 
 ## `-- no-transaction` migrations
 
