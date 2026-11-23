@@ -73,6 +73,20 @@ fn request_on(frame: Uuid, supports: bool, confidence: f64) -> AssessClaimReques
     req
 }
 
+/// The handler's state: the test pool for its reads and writes, plus a
+/// `ScopedPool` over the same database for `AppState::read_as`, which the
+/// `EPIGRAPH_COMPOUND_WRITE_GUARD` decision reads on (backlog 7435772c). A
+/// state with no scoped pool refuses that read, as it should in production.
+///
+/// The guard is pinned to `warn` (the default), so no environment of the
+/// test process can turn a compound assessment below into a refusal.
+async fn assess_state(pool: &PgPool) -> AppState {
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default())
+        .with_compound_write_guard(epigraph_engine::belief_modes::CompoundWriteGuard::Warn);
+    state.scoped = Some(viewer_fixture::scoped_pool(pool).await);
+    state
+}
+
 /// `Viewer` is not `Clone`, so each call resolves its own viewer for `caller`.
 async fn try_assess(
     pool: &PgPool,
@@ -81,7 +95,7 @@ async fn try_assess(
     req: AssessClaimRequest,
 ) -> Result<AssessClaimResponse, ApiError> {
     let viewer = Viewer::resolve(pool, caller).await.expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    let state = assess_state(pool).await;
     let Json(resp) = assess_claim(
         write_scope(),
         ViewerExtractor(viewer),
@@ -1082,7 +1096,7 @@ async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) 
     let twin = seed_public_claim(&pool, caller, "assess a standalone twin").await;
 
     let twin_before = set_sentinel_cache(&pool, twin, None).await;
-    assess(&pool, caller, twin, request(true, 0.8, None)).await;
+    let twin_resp = assess(&pool, caller, twin, request(true, 0.8, None)).await;
     assert_ne!(
         full_cache(&pool, twin).await,
         twin_before,
@@ -1106,6 +1120,24 @@ async fn assessing_a_compound_stores_the_row_but_leaves_its_cache(pool: PgPool) 
         full_cache(&pool, compound).await,
         before,
         "assess must not refold a compound's own rows into its cache"
+    );
+    // EPIGRAPH_COMPOUND_WRITE_GUARD=warn (backlog 7435772c): the response
+    // names the compound and the atom to assess instead.
+    let target = resp
+        .deprecated_compound_target
+        .expect("warn reports the compound target");
+    assert_eq!(target.claim_id, compound);
+    assert_eq!(
+        target
+            .visible_atoms
+            .iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        vec![leaf]
+    );
+    assert!(
+        twin_resp.deprecated_compound_target.is_none(),
+        "a standalone claim carries no compound target"
     );
 }
 

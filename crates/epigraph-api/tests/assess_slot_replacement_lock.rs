@@ -68,7 +68,10 @@ async fn assess(
     let viewer = Viewer::resolve(&pool, caller)
         .await
         .expect("resolve caller");
-    let state = AppState::with_db(pool.clone(), ApiConfig::default());
+    // The compound-guard read (`AppState::read_as`) needs a scoped pool; the
+    // handler's reads and its slot upsert stay on this sized test pool.
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(viewer_fixture::scoped_pool(&pool).await);
     let Json(resp) = assess_claim(
         write_scope(),
         epigraph_api::middleware::bearer::ViewerExtractor(viewer),
