@@ -13,6 +13,10 @@
 //! that name files *to be created* and absolute paths on a developer's
 //! machine, so they are not reader-facing links and are not scanned.
 //!
+//! One placement check rides along (backlog 3640504e): a dated,
+//! point-in-time audit must live under `docs/audits/` with a status line
+//! saying so, not beside the living designs in `docs/architecture/`.
+//!
 //! The scan is std-only (no regex dev-dependency): it finds every inline
 //! `](target)` link, skips external (`http:`, `https:`, `mailto:`) and pure
 //! in-page (`#anchor`) targets, strips a `#fragment` and an optional
@@ -123,6 +127,61 @@ fn every_relative_link_in_the_onboarding_path_resolves() {
         broken.is_empty(),
         "relative links in the onboarding path point at files that do not exist:\n  {}",
         broken.join("\n  ")
+    );
+}
+
+/// A dated audit is a measurement of the code at one commit; a reader must
+/// not take it for a current design. So no `audit-*` file sits among the
+/// living designs in `docs/architecture/`, and every file in `docs/audits/`
+/// opens with a status line saying it is point-in-time.
+#[test]
+fn dated_audits_live_under_docs_audits_and_say_so() {
+    let root = repo_root();
+    let architecture = root.join("docs/architecture");
+    let misplaced: Vec<String> = std::fs::read_dir(&architecture)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", architecture.display()))
+        .map(|entry| {
+            entry
+                .expect("docs/architecture entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.starts_with("audit-"))
+        .collect();
+    assert!(
+        misplaced.is_empty(),
+        "dated audits belong in docs/audits/, not beside the living designs in \
+         docs/architecture/: {misplaced:?}"
+    );
+
+    let audits = root.join("docs/audits");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&audits)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", audits.display()))
+        .map(|entry| entry.expect("docs/audits entry").path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    files.sort();
+    assert!(
+        files.len() >= 2,
+        "expected at least the two audits moved out of docs/architecture, found {files:?}"
+    );
+    let unmarked: Vec<String> = files
+        .iter()
+        .filter(|f| {
+            let text =
+                std::fs::read_to_string(f).unwrap_or_else(|e| panic!("read {}: {e}", f.display()));
+            !text
+                .lines()
+                .take(10)
+                .any(|l| l.contains("**Status:** point-in-time audit"))
+        })
+        .map(|f| f.display().to_string())
+        .collect();
+    assert!(
+        unmarked.is_empty(),
+        "every docs/audits file must open (within its first 10 lines) with a \
+         `**Status:** point-in-time audit` line naming its date: {unmarked:?}"
     );
 }
 

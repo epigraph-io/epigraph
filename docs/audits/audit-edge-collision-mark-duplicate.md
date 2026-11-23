@@ -1,5 +1,9 @@
 # Audit: Edge Collision in `mark_duplicate` — `edges_alternative_of_symmetric_uniq`
 
+**Status:** point-in-time audit, written 2026-06-18 (commit `abf56e094`) and not maintained
+since. It records the code as it stood then; line numbers, branch names and
+findings may be out of date. Read the current source before acting on it.
+
 ## Scope
 
 Covers `crates/epigraph-db/src/repos/claim.rs` `mark_duplicate` (~lines 2598–2683)
