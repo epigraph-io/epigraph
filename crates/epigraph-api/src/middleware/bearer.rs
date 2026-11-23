@@ -156,8 +156,13 @@ fn refuse_outside_ceiling(
 /// any viewer exists, whether the verified token yields a principal at all,
 /// and every function it composes is an app-executable `SECURITY DEFINER`
 /// read that does not depend on the session's stamp.
+///
+/// `POST /oauth/introspect` asks the same question through this function
+/// (backlog 8d6c886f), so an RFC 7662 consumer and the API itself cannot
+/// disagree about a delegated token: a refusal here is `active: false` there,
+/// and a 503 here is a 503 there.
 #[cfg(feature = "db")]
-async fn admit_delegated(
+pub(crate) async fn admit_delegated(
     state: &AppState,
     auth: &AuthContext,
     extensions: &mut axum::http::Extensions,
@@ -225,7 +230,7 @@ async fn admit_delegated(
 /// refuses every delegated run token (fails closed) and admits every other
 /// token unchanged.
 #[cfg(not(feature = "db"))]
-async fn admit_delegated(
+pub(crate) async fn admit_delegated(
     _state: &AppState,
     auth: &AuthContext,
     _extensions: &mut axum::http::Extensions,

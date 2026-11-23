@@ -163,6 +163,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "get_agent_reputation",
         &["AgentRepository::get_by_id"],
     ),
+    // untenanted: the agent rows (`agents` is USING (true)); their ORCID / ROR
+    // id are nulled through the viewer (`profile_details_visible`, backlog
+    // 761c2b05).
+    ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    (
+        "agents.rs",
+        "list_agents",
+        &[
+            "AgentRepository::count",
+            "AgentRepository::count_by_label",
+            "AgentRepository::list",
+            "AgentRepository::list_by_label",
+        ],
+    ),
     // gated (`ClaimRepository::get_by_id`) then write; `human_of` is an agents
     // read; the SELECT is an advisory lock. narrows: `retain_for_cache` (and
     // the `acquire` it runs on) filters the BBAs just read through the viewer

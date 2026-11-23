@@ -1021,3 +1021,98 @@ async fn a_webhook_subscription_for_a_dlg_principal_is_still_refused(pool: PgPoo
         "a delegated principal's subscription was delivered to: {attempted:?}"
     );
 }
+
+/// `POST /oauth/introspect` with `token`: `(status, active)`, `active` being
+/// `None` when the body carries no boolean `active`.
+async fn introspect(state: &AppState, token: &str) -> (StatusCode, Option<bool>, String) {
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/introspect")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "token": token }).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    let body = String::from_utf8_lossy(&bytes).to_string();
+    let active = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v["active"].as_bool());
+    (status, active, body)
+}
+
+/// Introspection answers what the API answers (backlog 8d6c886f): a delegated
+/// run token is `active: true` only while its delegation is live. It used to
+/// check the signature and the revocation denylist only, so a token whose
+/// operator link had been retired, or that the process's switch refuses,
+/// introspected as active until it expired while every API route refused it.
+///
+/// CALIBRATION: the live delegation introspects active (and is admitted by a
+/// route), and the same principal's token WITHOUT `dlg` stays active after
+/// the retire, so the `false` answers are the delegation check, not the
+/// token's signature, expiry or principal.
+#[sqlx::test(migrations = "../../migrations")]
+async fn introspection_reports_a_delegated_token_inactive_once_its_delegation_ends(pool: PgPool) {
+    let d = delegation::live_delegation(&pool, "introspect").await;
+    let st = state(&pool, RunTokens::On);
+    let access = dlg_token(&st, &d);
+    let plain = token(&st, d.delegator_client, d.principal, None);
+
+    let (status, active, body) = introspect(&st, &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active,
+        Some(true),
+        "CALIBRATION: a live delegation introspects active: {body}"
+    );
+    assert_admitted(
+        "CALIBRATION: and the API admits it",
+        read(&st, &access).await,
+    );
+
+    // The switch off: the API refuses every delegated token, so does introspection.
+    let (status, active, body) =
+        introspect(&AppState::with_db(pool.clone(), config()), &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(active, Some(false), "switch off: {body}");
+    assert!(
+        !body.contains("\"sub\""),
+        "an inactive answer says nothing else about the token: {body}"
+    );
+
+    // A scope outside the delegated ceiling: refused whatever the delegation says.
+    let wide = token_with(
+        &st,
+        d.delegator_client,
+        d.principal,
+        Some(d.delegator),
+        &["claims:read", "agents:write"],
+    );
+    assert_eq!(
+        introspect(&st, &wide).await.1,
+        Some(false),
+        "a dlg token outside the delegated ceiling"
+    );
+
+    // The operator link retired: the next introspection says so, no restart.
+    delegation::retire_link(&pool, d.principal).await;
+    assert_refused("CALIBRATION: the API refuses it", read(&st, &access).await);
+    let (status, active, body) = introspect(&st, &access).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        active,
+        Some(false),
+        "a delegated token whose operator link was retired introspected active: {body}"
+    );
+    assert_eq!(
+        introspect(&st, &plain).await.1,
+        Some(true),
+        "CALIBRATION: a token without `dlg` is not subject to the delegation check"
+    );
+}

@@ -166,7 +166,7 @@ pub struct ConfigSummary {
 /// `epigraph_core::canonical_scopes::ADMIN_ONLY_SCOPES`: it is excluded from
 /// `read_only_scopes()` and from the read-write role, and absent from both
 /// `AGENT_PROVISION_SCOPES` and `PUBLIC_CLIENT_READ_SCOPES`. So every
-/// `epigraph-ro` and `epigraph-wo` token, every agent auto-provisioned by
+/// `epigraph-ro` and `epigraph-wo` token, every agent client provisioned by
 /// `POST /api/v1/agents`, and every DCR-registered public client now gets 403
 /// here. Operators pointing a dashboard at this route need an admin token or a
 /// client minted with `["claims:admin"]`.

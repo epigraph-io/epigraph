@@ -277,6 +277,41 @@ pub struct AgentPublicProfile {
 /// [`AgentRepository::create_seed_derived_conn`].
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
+/// Step 2 of [`AgentRepository::ensure_for_client`]: refuse to adopt an
+/// `ed25519` row whose key anyone can compute (backlog 55fba366).
+///
+/// `llm` is the row's LLM-identity marker (`properties ? 'llm_model'` or
+/// `source = 'mcp-llm-agent'`). The marker is self-writable by the row, which
+/// is fine here: it can only make a row REFUSE adoption, never admit one.
+/// The author test recomputes `did_key_for_author` from the row's own name and
+/// ORCID, the rule `find_agent` reports as `name_derived_key` /
+/// `orcid_derived_key`.
+fn refuse_computable_key_adoption(
+    client_row_id: Uuid,
+    public_key: &[u8],
+    display_name: Option<&str>,
+    orcid: Option<&str>,
+    llm: bool,
+) -> Result<(), DbError> {
+    let (by_name, by_orcid) =
+        crate::repos::agent_lookup::derived_key_evidence(public_key, display_name, orcid);
+    let what = if llm {
+        "an LLM agent identity"
+    } else if by_name || by_orcid {
+        "an author node whose key is derived from its name or ORCID"
+    } else {
+        return Ok(());
+    };
+    Err(DbError::Refused {
+        kind: crate::errors::RefusalKind::Authority,
+        message: format!(
+            "oauth client {client_row_id}: the agent holding this client's key is {what}; its \
+             private key is computable from public inputs, so holding it does not prove being \
+             that agent, and it is not adopted as an OAuth principal. Nothing was linked."
+        ),
+    })
+}
+
 /// Repository for Agent operations
 pub struct AgentRepository;
 
@@ -1411,6 +1446,20 @@ impl AgentRepository {
     ///    viewer identity, an agent's own claims would be invisible to its own
     ///    token. So: if `client_id` decodes to 32 bytes and an `ed25519` agent
     ///    holds that key, link to THAT row.
+    ///
+    ///    **Unless that row's key is computable from public inputs**
+    ///    (backlog 55fba366). The client proves only that it holds the
+    ///    private half of `client_id`, and for two shapes of legacy row that
+    ///    is no proof of being the agent: an LLM identity (`llm_model` in
+    ///    `properties`, or `source = 'mcp-llm-agent'`: the old epigraph-mcp
+    ///    create path keyed it as `BLAKE3("llm-agent:{model}:{prompt hash}")`)
+    ///    and a document-ingest author node whose key is `did_key_for_author`
+    ///    of its own name or ORCID. Both predate migration 230's
+    ///    `seed-derived` kind, which is set at insert only, so they are still
+    ///    `ed25519`. Such a row is REFUSED ([`DbError::Refused`], authority),
+    ///    not skipped: a derived placeholder in its place would answer a
+    ///    client that believes it speaks as that agent with a different
+    ///    principal. Nothing is linked, so an operator can still decide.
     /// 3. Otherwise derive a 32-byte PLACEHOLDER public key from the client's
     ///    row id. `agents.public_key` is `bytea NOT NULL CHECK (octet_length =
     ///    32)` with a UNIQUE constraint, so a keyless principal cannot exist
@@ -1442,7 +1491,9 @@ impl AgentRepository {
     /// Returns `DbError::QueryFailed` if any statement fails,
     /// `DbError::InvalidData` if `client_row_id` names no `oauth_clients` row,
     /// `DbError::DuplicateKey` if the derived key is squatted by a row that
-    /// is not a `derived` OAuth principal, and `DbError::MembershipRevoked` if
+    /// is not a `derived` OAuth principal, `DbError::Refused` (authority) if
+    /// an agent client's key belongs to an LLM identity or a name- or
+    /// ORCID-derived author row (step 2), and `DbError::MembershipRevoked` if
     /// the adopted agent holds only a revoked personal-group membership (step
     /// 6 no longer restores it; the RAISE aborts the caller's transaction, so
     /// the client stays unlinked).
@@ -1488,13 +1539,29 @@ impl AgentRepository {
         let real_signer: Option<Uuid> = if client_type == "agent" {
             match hex::decode(&client_id) {
                 Ok(bytes) if bytes.len() == 32 => {
-                    let row: Option<(Uuid,)> = sqlx::query_as(
-                        "SELECT id FROM agents WHERE public_key = $1 AND key_kind = 'ed25519'",
+                    let row: Option<(Uuid, Option<String>, Option<String>, bool)> = sqlx::query_as(
+                        "SELECT id, display_name, orcid, \
+                                    COALESCE(properties ? 'llm_model' \
+                                             OR properties ->> 'source' = 'mcp-llm-agent', \
+                                             false) \
+                               FROM agents WHERE public_key = $1 AND key_kind = 'ed25519'",
                     )
                     .bind(bytes.as_slice())
                     .fetch_optional(&mut *conn)
                     .await?;
-                    row.map(|r| r.0)
+                    match row {
+                        None => None,
+                        Some((id, name, orcid, llm)) => {
+                            refuse_computable_key_adoption(
+                                client_row_id,
+                                &bytes,
+                                name.as_deref(),
+                                orcid.as_deref(),
+                                llm,
+                            )?;
+                            Some(id)
+                        }
+                    }
                 }
                 _ => None,
             }
@@ -2350,6 +2417,52 @@ impl AgentRepository {
                 ror_id: if may_see_details { ror_id } else { None },
             },
         ))
+    }
+
+    /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,
+    /// `properties`) `viewer` may see, by [`Self::get_public_profile`]'s rule:
+    /// a bypass viewer, a `public` profile, the viewer itself, or a live group
+    /// membership the viewer shares. Ids that name no agent are absent.
+    ///
+    /// For the routes that read whole `Agent` rows (`GET /api/v1/agents` and
+    /// `/api/v1/agents/:id`) and must null the detail fields themselves
+    /// (backlog 761c2b05): one round trip for a whole page. Run it on a
+    /// connection stamped from `viewer` (`AppState::read_as`): the shared-group
+    /// arm reads `group_memberships`, which row security hides on an unstamped
+    /// connection, so a raw-pool call answers "not visible" for a shared group.
+    ///
+    /// # Errors
+    /// Returns `DbError::QueryFailed` if the query fails.
+    #[instrument(skip(executor, viewer, ids))]
+    pub async fn profile_details_visible<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        viewer: &crate::visibility::Viewer,
+        ids: &[Uuid],
+    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            r#"
+            SELECT a.id
+            FROM agents a
+            WHERE a.id = ANY($1::uuid[])
+              AND (   $4::bool
+                   OR a.profile_visibility = 'public'
+                   OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
+                   OR EXISTS (SELECT 1 FROM group_memberships gm
+                               WHERE gm.agent_id = a.id
+                                 AND gm.revoked_at IS NULL
+                                 AND gm.group_id = ANY($3::uuid[])))
+            "#,
+        )
+        .bind(ids)
+        .bind(viewer.principal())
+        .bind(viewer.group_bind().unwrap_or(&[]))
+        .bind(viewer.bypass_bind())
+        .fetch_all(executor)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.

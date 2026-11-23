@@ -343,7 +343,7 @@ pub async fn get_community(
 /// **Availability cost.** `groups:admin` is in `ADMIN_ONLY_SCOPES`, so it is
 /// absent from `read_only_scopes()`, from the read-write role, from
 /// `AGENT_PROVISION_SCOPES` and from `PUBLIC_CLIENT_READ_SCOPES`. Every
-/// `epigraph-ro` and `epigraph-wo` token and every auto-provisioned agent now
+/// `epigraph-ro` and `epigraph-wo` token and every provisioned agent client now
 /// gets 403 on this route and on the DELETE below. The alternative considered
 /// was minting a `communities:write` scope, which would mean editing
 /// `canonical_scopes.rs`, its role-boundary assertions and `bootstrap_clients`;

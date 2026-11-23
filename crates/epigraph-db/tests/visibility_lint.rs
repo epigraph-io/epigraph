@@ -1654,7 +1654,9 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          tenancy-partitioned: `oauth_clients` has no `visibility` and no `owner_group_id` at all, \
          and `agents` is deliberately `USING (true)` under migration 077 because authorship has to \
          render on a public claim. The PII on `agents.properties` is narrowed by the repo-layer \
-         projection in `public_profile`, which this function does not use and does not return.",
+         projection in `public_profile`, which this function does not use and does not return. \
+         The adoption lookup reads the candidate's `display_name`, `orcid` and `llm_model` marker \
+         only to REFUSE adopting a computable-key row (backlog 55fba366); none of it is returned.",
     ),
     (
         "agent.rs",
