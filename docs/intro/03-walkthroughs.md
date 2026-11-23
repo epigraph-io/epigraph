@@ -136,9 +136,12 @@ properties include `source`, `commit_hash`, `commit_type`, `scope` and `files_ch
    process list). The token comes from the `epigraph-wo` client, as in
    [quickstart step 5](01-quickstart.md#step-5--get-an-api-token). Also add
    `--orchestrator-id <uuid>` unless the PR body or a commit carries the
-   trailer. The packets carry an all-zero placeholder signature, so the
-   server must run with `EPIGRAPH_REQUIRE_SIGNATURES` unset or false. That
-   is a known limit, as is the in-process idempotency cache below.
+   trailer. The repository-node and commit packets are signed by their
+   authors' keys, but the PR-node packet still carries an all-zero
+   placeholder signature, because its author is the orchestrator agent and
+   the ingester does not hold that agent's key. So the server must run with
+   `EPIGRAPH_REQUIRE_SIGNATURES` unset or false. That is a known limit, as
+   is the in-process idempotency cache below.
 
    This step has not been run end to end, and it may be refused. The
    token's principal is never an author of these packets: the authors are
