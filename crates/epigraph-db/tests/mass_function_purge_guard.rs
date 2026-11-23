@@ -19,6 +19,12 @@
 //! `fk_action_guard_ratchet.rs`; (o) is the mutation probe recorded with the
 //! batch.
 //!
+//! The test-lens follow-ups (backlog 129f99ad): T-N3, arms (c) and (d) as a
+//! real member login; T-N6, the guard's fail mode after the grant helper is
+//! re-owned; T-N7, every test that creates a cluster role removes it even
+//! when it panics ([`with_cluster_role`]). T-N9 is in
+//! `fk_action_guard_ratchet.rs`.
+//!
 //! Every retracted row is made by migration 184's definer on the application
 //! role (`support/retracted_bba_fixture.rs`). The privileged cases run on a
 //! NOSUPERUSER `epigraph_maintenance` session (SPEC §12), checked before use.
@@ -374,57 +380,117 @@ async fn migrate_rest(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> 
     r
 }
 
+/// A future that catches a panic raised while polling the future it wraps
+/// and returns it as `Err` (the `catch_unwind` of `futures`, which this
+/// crate does not depend on). It polls on the caller's task, so the wrapped
+/// future need not be `Send`.
+struct CatchUnwind<F>(std::pin::Pin<Box<F>>);
+
+impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
+    type Output = std::thread::Result<F::Output>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let inner = self.0.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Ok(std::task::Poll::Ready(v)) => std::task::Poll::Ready(Ok(v)),
+            Err(panic) => std::task::Poll::Ready(Err(panic)),
+        }
+    }
+}
+
+/// Run `body` with the cluster-level role `role` created first (by `ddl`,
+/// which names it), and ALWAYS remove that role afterwards: everything it
+/// owns in this database is reassigned to the harness login and its grants
+/// dropped, then the role is dropped. A panic inside `body` (an `expect` in a
+/// fixture, a failed assertion) is caught, the cleanup still runs, and the
+/// panic is then resumed. A test database is thrown away after the test, but
+/// a ROLE is cluster-wide: without this a mid-test panic leaks it into every
+/// later test on the cluster (T-N7).
+async fn with_cluster_role<T, F, Fut>(pool: &PgPool, role: &str, ddl: &str, body: F) -> T
+where
+    F: FnOnce(PgPool) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let harness: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(pool)
+        .await
+        .expect("the harness login");
+    pool.execute(ddl).await.expect("create the cluster role");
+    let caught = CatchUnwind(Box::pin(body(pool.clone()))).await;
+    // Fresh statements on the pool: a panic may have dropped a connection
+    // mid-transaction, which the pool then discards.
+    pool.execute(format!("REASSIGN OWNED BY {role} TO {harness}").as_str())
+        .await
+        .expect("reassign the role's objects");
+    pool.execute(format!("DROP OWNED BY {role}").as_str())
+        .await
+        .expect("drop the role's grants");
+    pool.execute(format!("DROP ROLE {role}").as_str())
+        .await
+        .expect("drop the role");
+    match caught {
+        Ok(t) => t,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+async fn role_exists(pool: &PgPool, role: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .expect("read pg_roles")
+}
+
 /// (a), shape 2: `claims`, `frames` and `mass_functions` are owned by a
 /// NOSUPERUSER role that is NOT a maintenance member when 194 is applied (the
 /// deployed table-owner shape is not fixed by the schema, so both shapes are
 /// pinned). The cascade then runs as that role, for which
 /// `epigraph_definer_bypass()` is false and the grant helper must still answer.
+/// The role is created and removed by [`with_cluster_role`], so a panic in
+/// the migration or the attack never leaks it.
 #[sqlx::test(migrations = false)]
 async fn a_b1_attack_is_refused_sr09_when_a_nosuperuser_non_maintenance_role_owns_the_tables(
     pool: PgPool,
 ) {
     migrate_below_194(&pool).await;
     let owner = format!("h10_owner_{}", Uuid::new_v4().simple());
-    let harness: String = sqlx::query_scalar("SELECT current_user::text")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    pool.execute(format!("CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS").as_str())
-        .await
-        .expect("create the owner role");
-    for t in ["claims", "frames", "mass_functions"] {
-        pool.execute(format!("ALTER TABLE public.{t} OWNER TO {owner}").as_str())
+    let o = owner.clone();
+    let (migrated, shape, attack) = with_cluster_role(
+        &pool,
+        &owner,
+        &format!("CREATE ROLE {owner} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            for t in ["claims", "frames", "mass_functions"] {
+                pool.execute(format!("ALTER TABLE public.{t} OWNER TO {o}").as_str())
+                    .await
+                    .unwrap_or_else(|e| panic!("re-own {t}: {e}"));
+            }
+            let migrated = migrate_rest(&pool).await;
+            let shape: (bool, bool, String) = sqlx::query_as(
+                "SELECT r.rolsuper, pg_has_role(r.oid, 'epigraph_maintenance', 'MEMBER'), \
+                        r.rolname::text \
+                   FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+                  WHERE c.oid = 'public.mass_functions'::regclass",
+            )
+            .fetch_one(&pool)
             .await
-            .unwrap_or_else(|e| panic!("re-own {t}: {e}"));
-    }
-    let migrated = migrate_rest(&pool).await;
-
-    let shape: (bool, bool, String) = sqlx::query_as(
-        "SELECT r.rolsuper, pg_has_role(r.oid, 'epigraph_maintenance', 'MEMBER'), r.rolname::text \
-           FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
-          WHERE c.oid = 'public.mass_functions'::regclass",
+            .unwrap();
+            let attack = if migrated.is_ok() {
+                Some(b1_attack(&pool).await)
+            } else {
+                None
+            };
+            (migrated.map_err(|e| e.to_string()), shape, attack)
+        },
     )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let attack = if migrated.is_ok() {
-        Some(b1_attack(&pool).await)
-    } else {
-        None
-    };
+    .await;
 
-    // Put the tables back and drop the role before asserting, so a failure
-    // does not leave a cluster-level role behind.
-    pool.execute(format!("REASSIGN OWNED BY {owner} TO {harness}").as_str())
-        .await
-        .expect("reassign");
-    pool.execute(format!("DROP OWNED BY {owner}").as_str())
-        .await
-        .expect("drop owned");
-    pool.execute(format!("DROP ROLE {owner}").as_str())
-        .await
-        .expect("drop role");
-
+    assert!(!role_exists(&pool, &owner).await, "the owner role is gone");
     migrated.expect("the rest of the migrations apply over a NOSUPERUSER table owner");
     assert_eq!(
         (shape.0, shape.1, shape.2.as_str()),
@@ -437,6 +503,53 @@ async fn a_b1_attack_is_refused_sr09_when_a_nosuperuser_non_maintenance_role_own
         "shape 2 (NOSUPERUSER, non-maintenance owner)",
     );
     assert_nothing_deleted(&pool, &w).await;
+}
+
+/// T-N7: [`with_cluster_role`] removes its role when the body PANICS part
+/// way, after re-owning a table to it (as shape 2 does), and then resumes
+/// the panic. The table is owned by the harness again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n7_a_panicking_body_still_drops_its_cluster_role(pool: PgPool) {
+    let role = format!("h10_leak_probe_{}", Uuid::new_v4().simple());
+    let (p, r) = (pool.clone(), role.clone());
+    let outcome = CatchUnwind(Box::pin(async move {
+        let r2 = r.clone();
+        with_cluster_role(
+            &p,
+            &r,
+            &format!("CREATE ROLE {r} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+            |pool| async move {
+                pool.execute(format!("ALTER TABLE public.frames OWNER TO {r2}").as_str())
+                    .await
+                    .expect("re-own frames");
+                panic!("a fixture fails mid-way");
+            },
+        )
+        .await
+    }))
+    .await;
+    let err = outcome.expect_err("the body's panic is resumed after the cleanup");
+    assert_eq!(
+        err.downcast_ref::<&str>().copied(),
+        Some("a fixture fails mid-way"),
+        "the body's own panic is the one resumed"
+    );
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the role does not outlive the panicking body"
+    );
+    let owner: String = sqlx::query_scalar(
+        "SELECT r.rolname::text FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+          WHERE c.oid = 'public.frames'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let harness: String = sqlx::query_scalar("SELECT current_user::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, harness, "frames is owned by the harness again");
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +977,309 @@ async fn f_a_grant_from_an_earlier_transaction_admits_no_delete(pool: PgPool) {
         .await;
     assert_sr09(refusal(r, "delete under a stale grant"), "(f)");
     assert!(exists(&pool, "mass_functions", w.retracted).await);
+}
+
+/// T-N3: arms (c) and (d) as a REAL login that is a MEMBER of
+/// `epigraph_maintenance` (NOSUPERUSER, INHERIT), the shape a deployed
+/// maintenance session has. [`maintenance`] reaches the role by `SET SESSION
+/// AUTHORIZATION epigraph_maintenance`, where `session_user` IS the role;
+/// here `session_user` is the member login, so every check keyed on role
+/// membership (`epigraph_bypass()`'s `pg_has_role(session_user, ...)`, the
+/// inherited grants on the grant table and on `mass_functions`) is
+/// exercised as production runs it. (c): with no grant the delete is SR09
+/// and the row survives; (d): the documented residual holds for a member
+/// login too (a grant row it writes for its own transaction admits the
+/// delete).
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n3_arms_c_and_d_hold_for_a_real_maintenance_member_login(pool: PgPool) {
+    grant_table_exists(&pool).await;
+    let w = world(&pool).await;
+    let login = format!("h10_member_{}", Uuid::new_v4().simple());
+    let url = fixture::database_url_for(&pool).await;
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    let dsn = format!("{scheme}://{login}:probe-only@{host}");
+    let (retracted, live) = (w.retracted, w.live);
+    let (who, c_refusal, d_deleted) = with_cluster_role(
+        &pool,
+        &login,
+        &format!(
+            "CREATE ROLE {login} LOGIN PASSWORD 'probe-only' NOSUPERUSER NOBYPASSRLS INHERIT \
+             IN ROLE epigraph_maintenance"
+        ),
+        |_pool| async move {
+            let mut conn = PgConnection::connect(&dsn)
+                .await
+                .expect("the member logs in");
+            let who: (String, bool, bool) = sqlx::query_as(
+                "SELECT session_user::text, \
+                        (SELECT rolsuper FROM pg_roles WHERE rolname = session_user), \
+                        public.epigraph_bypass()",
+            )
+            .fetch_one(&mut conn)
+            .await
+            .expect("who is this session");
+            // (c) no grant: SR09, as a single row and as a bulk delete.
+            let c = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&mut conn)
+                .await
+                .map(|d| d.rows_affected());
+            let c = refusal(c, "a member login's delete without a grant");
+            let bulk = sqlx::query("DELETE FROM mass_functions WHERE id = ANY($1)")
+                .bind(vec![retracted, live])
+                .execute(&mut conn)
+                .await
+                .map(|d| d.rows_affected());
+            assert_sr09(
+                refusal(bulk, "a member login's bulk delete over a retracted row"),
+                "(c) bulk, member login",
+            );
+            // (d) the residual: a grant row for this transaction admits it.
+            let mut tx = conn.begin().await.expect("begin");
+            sqlx::query(
+                "INSERT INTO public.mass_function_purge_grants (mf_id, reason) \
+                 VALUES ($1, 'residual, member login')",
+            )
+            .bind(retracted)
+            .execute(&mut *tx)
+            .await
+            .expect("a member login inherits INSERT on the grant table");
+            let n = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&mut *tx)
+                .await
+                .expect("a grant for this transaction admits the delete")
+                .rows_affected();
+            tx.rollback().await.expect("rollback");
+            conn.close().await.expect("close");
+            (who, c, n)
+        },
+    )
+    .await;
+
+    assert!(!role_exists(&pool, &login).await, "the login is gone");
+    assert_eq!(
+        who,
+        (login.clone(), false, true),
+        "fixture: a NOSUPERUSER member login, privileged through membership only"
+    );
+    assert_sr09(c_refusal, "(c), member login");
+    assert_eq!(
+        d_deleted, 1,
+        "(d), member login: the grant admits the delete"
+    );
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives (the residual delete was rolled back)"
+    );
+}
+
+/// T-N6: the guard FAILS CLOSED after a later ownership change. Migration 194
+/// makes the grant helper `epigraph_mf_purge_granted` a definer owned by
+/// `epigraph_maintenance`. If it is later re-owned by another role (a
+/// careless `ALTER FUNCTION ... OWNER TO`, a `REASSIGN OWNED`), the old
+/// owner's privileges on it move to the new owner, so the maintenance
+/// session's guard can no longer call it (and the new owner could not read
+/// the grant table anyway). Pinned here: a maintenance delete of the
+/// retracted row is then refused with a 42501 PERMISSION error (not SR09,
+/// and never an admission), and so is the audited purge, and the row
+/// survives both; a LIVE row still deletes (the guard fires only on
+/// retracted rows). A guard that swallowed that error would fail open; this
+/// test is what catches it. The ownership change is undone with the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n6_the_guard_fails_closed_after_the_helper_is_re_owned(pool: PgPool) {
+    proc_exists(&pool, GRANT_HELPER).await;
+    let w = world(&pool).await;
+    let role = format!("h10_reowner_{}", Uuid::new_v4().simple());
+    let (r, retracted, live) = (role.clone(), w.retracted, w.live);
+    let (direct, purge, live_deleted, helper_owner) = with_cluster_role(
+        &pool,
+        &role,
+        &format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            pool.execute(format!("ALTER FUNCTION {GRANT_HELPER} OWNER TO {r}").as_str())
+                .await
+                .expect("re-own the grant helper");
+            let helper_owner: String = sqlx::query_scalar(
+                "SELECT r.rolname::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = $1::regprocedure",
+            )
+            .bind(GRANT_HELPER)
+            .fetch_one(&pool)
+            .await
+            .expect("helper owner");
+            let m = maintenance(&pool).await;
+            let direct = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(retracted)
+                .execute(&m)
+                .await
+                .map(|d| d.rows_affected())
+                .map_err(|e| {
+                    let db = e.as_database_error().map(|d| {
+                        (
+                            d.code().map(|c| c.to_string()).unwrap_or_default(),
+                            d.message().to_string(),
+                        )
+                    });
+                    db.unwrap_or_default()
+                });
+            let purge = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 probe')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            let live_deleted = sqlx::query("DELETE FROM mass_functions WHERE id = $1")
+                .bind(live)
+                .execute(&m)
+                .await
+                .expect("a live row still deletes")
+                .rows_affected();
+            m.close().await;
+            (direct, purge, live_deleted, helper_owner)
+        },
+    )
+    .await;
+
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the re-owner role is gone"
+    );
+    assert_eq!(helper_owner, role, "fixture: the helper was re-owned");
+    let (code, message) = direct.expect_err("the direct delete must not be admitted");
+    assert_eq!(code, "42501", "a privilege error, fail closed: {message}");
+    assert!(
+        message.starts_with("permission denied"),
+        "the helper's privilege failure, not SR09: {message}"
+    );
+    let (code, message) = purge.expect_err("the purge must not be admitted either");
+    assert_eq!(code, "42501", "the purge fails closed too: {message}");
+    assert!(message.starts_with("permission denied"), "{message}");
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives both"
+    );
+    assert_eq!(live_deleted, 1, "CONTROL: a live row is not guarded");
+}
+
+/// T-N6, the other half: the PURGE DEFINER re-owned. If
+/// `epigraph_purge_mass_functions` is later owned by another role (an
+/// `ALTER FUNCTION ... OWNER TO`, or the definer's share of a `REASSIGN
+/// OWNED BY epigraph_maintenance`, whose helper share the test above pins),
+/// the purge fails closed with 42501 twice over, and each is pinned:
+/// * as re-owned: 194 granted EXECUTE to `epigraph_maintenance` while it
+///   was the owner, so that grant was an owner's privilege and moved to the
+///   new owner; the maintenance session can no longer call the purge;
+/// * after EXECUTE is granted back to the maintenance role (the obvious
+///   "repair"): the body now runs as the new owner, which may not write a
+///   purge grant, so the purge is still refused.
+/// Either way nothing is deleted and no `mass_functions.purge` event is
+/// written. The guard itself is SECURITY INVOKER, so re-owning it changes
+/// nothing to pin. The ownership change is undone with the role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn t_n6_the_purge_fails_closed_after_the_purge_definer_is_re_owned(pool: PgPool) {
+    proc_exists(&pool, PURGE_DEFINER).await;
+    let w = world(&pool).await;
+    let role = format!("h10_reowner_{}", Uuid::new_v4().simple());
+    let (r, retracted) = (role.clone(), w.retracted);
+    let (purge, regranted, definer_owner, events) = with_cluster_role(
+        &pool,
+        &role,
+        &format!("CREATE ROLE {role} NOLOGIN NOSUPERUSER NOBYPASSRLS"),
+        |pool| async move {
+            pool.execute(format!("ALTER FUNCTION {PURGE_DEFINER} OWNER TO {r}").as_str())
+                .await
+                .expect("re-own the purge definer");
+            let definer_owner: String = sqlx::query_scalar(
+                "SELECT r.rolname::text FROM pg_proc p JOIN pg_roles r ON r.oid = p.proowner \
+                  WHERE p.oid = $1::regprocedure",
+            )
+            .bind(PURGE_DEFINER)
+            .fetch_one(&pool)
+            .await
+            .expect("definer owner");
+            let m = maintenance(&pool).await;
+            let purge = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 definer probe')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            pool.execute(
+                format!("GRANT EXECUTE ON FUNCTION {PURGE_DEFINER} TO epigraph_maintenance")
+                    .as_str(),
+            )
+            .await
+            .expect("grant the purge back to the maintenance role");
+            let regranted = sqlx::query_scalar::<_, i32>(
+                "SELECT public.epigraph_purge_mass_functions($1, 'T-N6 definer probe, re-granted')",
+            )
+            .bind(vec![retracted])
+            .fetch_one(&m)
+            .await
+            .map_err(|e| {
+                let db = e.as_database_error().map(|d| {
+                    (
+                        d.code().map(|c| c.to_string()).unwrap_or_default(),
+                        d.message().to_string(),
+                    )
+                });
+                db.unwrap_or_default()
+            });
+            m.close().await;
+            let events: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM security_events WHERE event_type = 'mass_functions.purge'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("purge events");
+            (purge, regranted, definer_owner, events)
+        },
+    )
+    .await;
+
+    assert!(
+        !role_exists(&pool, &role).await,
+        "the re-owner role is gone"
+    );
+    assert_eq!(
+        definer_owner, role,
+        "fixture: the purge definer was re-owned"
+    );
+    let (code, message) = purge.expect_err("the purge must not be admitted");
+    assert_eq!(code, "42501", "a privilege error, fail closed: {message}");
+    assert!(message.starts_with("permission denied"), "{message}");
+    let (code, message) =
+        regranted.expect_err("the purge must not be admitted with EXECUTE granted back");
+    assert_eq!(
+        code, "42501",
+        "the body, run as the new owner, is refused: {message}"
+    );
+    assert!(message.starts_with("permission denied"), "{message}");
+    assert!(
+        exists(&pool, "mass_functions", w.retracted).await,
+        "the retracted row survives"
+    );
+    assert_eq!(events, 0, "no purge event is written");
 }
 
 // ---------------------------------------------------------------------------

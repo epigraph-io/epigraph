@@ -51,7 +51,7 @@
 //!     epigraph-operator reown-reverse --manifest restrict-1.jsonl [--apply]
 //!     epigraph-operator regroup-claims --claims-file claims.txt --source-group <uuid> \
 //!         --target-group <uuid> --operator <uuid> --manifest-out regroup-1.jsonl \
-//!         [--apply --confirm-count N --ruling TEXT --reason TEXT]
+//!         [--refuse-irreversible] [--apply --confirm-count N --ruling TEXT --reason TEXT]
 //!     epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
 //!     epigraph-operator reown-workflows --canonical-names-file lineages.txt \
 //!         --target-group <team-uuid> --operator <uuid> [--from-group <uuid>] \
@@ -121,6 +121,11 @@
 //!     epigraph-operator end-group-role-binding --binding <uuid> --reason TEXT [--apply]
 //!     epigraph-operator group-roster --group <uuid> [--at <RFC3339>]
 //!         (MEMBER: derived by a role binding; DIRECT: a row of the group's own roster)
+//!     epigraph-operator role-attach --role role:K --agent <uuid> [--valid-from <RFC3339>] \
+//!         [--valid-to <RFC3339>] --reason TEXT [--apply]
+//!         (COPY: a succession copy the attach writes; MEMBERSHIP GAINED|LOST|KEPT)
+//!     epigraph-operator role-detach --role role:K --agent <uuid> --reason TEXT [--apply]
+//!         (DETACHED: a row the detach ends; MEMBERSHIP GAINED|LOST|KEPT)
 //!     epigraph-operator group-member add --group <uuid> --agent <uuid> --role reader|writer|admin \
 //!         --reason TEXT [--apply]
 //!         (a verb-made team group; or, --role writer only, the personal group of the operator
@@ -142,7 +147,8 @@ use epigraph_cli::operator::{
     self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
-    reown_workflows, restrict, retire_link, reverse, role_restore, system_agent, team_group,
+    reown_workflows, restrict, retire_link, reverse, role_agent, role_restore, system_agent,
+    team_group,
     workflow_submitter,
 };
 use std::path::PathBuf;
@@ -469,6 +475,62 @@ enum Command {
         #[arg(long)]
         reason: String,
         /// Commit. Without it, the end and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Attach an agent identity to a platform role (migration 166's
+    /// `role_agents`, through `epigraph_attach_agent_to_role`). The attach
+    /// restricts the agent (it writes nothing while its human does not hold
+    /// the role) and, where the role is bound in `attached_agents` mode
+    /// (migration 179), admits it to the group. It also attaches every
+    /// registered successor of the identity (the lineage follow, chained
+    /// since migration 195): each is printed as a `COPY` line. Register the
+    /// identity through the host's attestor FIRST: an identity attached
+    /// before its first registration makes that registration abort (AID09);
+    /// the verb prints `UNREGISTERED` for an identity the host never
+    /// registered. Prints the role-derived memberships of every identity the
+    /// act can change, before vs after (as of the window's opening when
+    /// `--valid-from` is later than now, `EVALUATED-AT`). Without `--apply`,
+    /// the attachment, its copies and their audit rows roll back.
+    RoleAttach {
+        /// The catalog role key (`role:<lowercase-key>`).
+        #[arg(long)]
+        role: String,
+        /// The agent identity to attach (never a human or a role node: ROL02).
+        #[arg(long)]
+        agent: Uuid,
+        /// When the attachment opens (default: now; never back-dated).
+        #[arg(long)]
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        /// When it closes (default: open-ended).
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Recorded on the attachment and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, everything rolls back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Detach an agent identity from a platform role now: every un-detached
+    /// attachment it holds for the role, in any window (through
+    /// `epigraph_detach_agent_from_role`). Final per row and sticky per
+    /// identity (migration 195): no succession copy admits it again, only an
+    /// attachment by name. It also cuts off the copies chained through it and
+    /// the successors below it that hold no live attachment made by name;
+    /// their role-derived memberships are printed before vs after. Without
+    /// `--apply`, the detach and its audit rows roll back.
+    RoleDetach {
+        /// The catalog role key (`role:<lowercase-key>`).
+        #[arg(long)]
+        role: String,
+        /// The agent identity to detach.
+        #[arg(long)]
+        agent: Uuid,
+        /// Recorded on each detached row and in its audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, everything rolls back.
         #[arg(long)]
         apply: bool,
     },
@@ -1008,6 +1070,11 @@ enum Command {
         /// How many claims the dry run lists row by row.
         #[arg(long, default_value_t = 3)]
         sample: usize,
+        /// Hold (HELD `irreversible`), instead of moving, every claim an
+        /// `IRREVERSIBLE-EDGE` names: a claim `reown-reverse` could not
+        /// reverse. Each batch is probed first in a rolled-back transaction.
+        #[arg(long)]
+        refuse_irreversible: bool,
     },
     /// Move listed workflow LINEAGES (every generation, the plan claims they
     /// execute, the rows those carry, and their plan edges) out of the source
@@ -1493,6 +1560,11 @@ async fn main_inner() -> anyhow::Result<i32> {
     if let Command::ApproveClient { scopes, reason, .. } = &cli.command {
         approve_client::validate(scopes, reason)?;
     }
+    // delete-frames: a reason outside the purge definer's 1..2000-character
+    // bound, before any connection is made (not at the apply's purge).
+    if let Command::DeleteFrames { reason, .. } = &cli.command {
+        delete_frames::validate_reason(reason)?;
+    }
     // A grant names its window explicitly; refused before any connection.
     let window = if let Command::GrantRole {
         role,
@@ -1693,6 +1765,7 @@ async fn main_inner() -> anyhow::Result<i32> {
         batch_size,
         lock_timeout,
         sample,
+        refuse_irreversible,
     } = &cli.command
     {
         let o = regroup::Options {
@@ -1708,6 +1781,7 @@ async fn main_inner() -> anyhow::Result<i32> {
             batch_size: *batch_size,
             lock_timeout: lock_timeout.clone(),
             sample: *sample,
+            refuse_irreversible: *refuse_irreversible,
         };
         regroup::validate(&o)?;
         Some(o)
@@ -1771,6 +1845,18 @@ async fn main_inner() -> anyhow::Result<i32> {
         }
         Command::EndGroupRoleBinding { reason, .. } => {
             team_group::validate_text("--reason", reason)?;
+        }
+        Command::RoleAttach {
+            role,
+            valid_from,
+            valid_to,
+            reason,
+            ..
+        } => {
+            role_agent::validate(role, reason, *valid_from, *valid_to)?;
+        }
+        Command::RoleDetach { role, reason, .. } => {
+            role_agent::validate(role, reason, None, None)?;
         }
         _ => {}
     }
@@ -2252,6 +2338,35 @@ async fn main_inner() -> anyhow::Result<i32> {
                 }
             } else {
                 println!("ALREADY-ENDED\tbinding={binding}\t(or no such binding; nothing changed)");
+            }
+            Ok(0)
+        }
+        Command::RoleAttach {
+            role,
+            agent,
+            valid_from,
+            valid_to,
+            reason,
+            apply,
+        } => {
+            let o = role_agent::attach(
+                &mut conn, &role, agent, valid_from, valid_to, &reason, apply,
+            )
+            .await?;
+            for l in role_agent::describe_attach(&role, agent, &o) {
+                println!("{l}");
+            }
+            Ok(0)
+        }
+        Command::RoleDetach {
+            role,
+            agent,
+            reason,
+            apply,
+        } => {
+            let o = role_agent::detach(&mut conn, &role, agent, &reason, apply).await?;
+            for l in role_agent::describe_detach(&role, agent, &o) {
+                println!("{l}");
             }
             Ok(0)
         }

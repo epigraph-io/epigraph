@@ -2594,7 +2594,8 @@ a handover: grant the role back to its human, or detach the agent and attach
 an identity linked to the new holder. `epigraph-mcp-full` asks the same question
 at boot, on every transport, and refuses to start on `may_run = false`.
 Attachments are written by a maintenance session
-(`epigraph_attach_agent_to_role` / `epigraph_detach_agent_from_role`, or a
+(`epigraph-operator role-attach` / `role-detach`, dry run by default, over
+`epigraph_attach_agent_to_role` / `epigraph_detach_agent_from_role`; or a
 direct statement that meets the same guards) and by the identity
 registration. Order: REGISTER, THEN ATTACH. Since migration 248 the attach
 verb refuses (`ROL03`, nothing written) an identity the host has not
@@ -2648,9 +2649,22 @@ epigraph-operator define-group-role --key role:<key> --description <text> --grou
 epigraph-operator bind-group-role --role <key> --group <id> --member-role reader|writer [--agent-mode ...] --reason <text> [--apply]
 epigraph-operator end-group-role-binding --binding <id> --reason <text> [--apply]
 epigraph-operator group-roster --group <id> [--at <RFC3339>]
+epigraph-operator role-attach --role <key> --agent <id> [--valid-from <RFC3339>] [--valid-to <RFC3339>] --reason <text> [--apply]
+epigraph-operator role-detach --role <key> --agent <id> --reason <text> [--apply]
 ```
 
 Without `--apply`, each verb's writes and audit row roll back.
+`role-attach` and `role-detach` attach an agent identity to a role
+(migration 166) or detach it, for the `attached_agents` mode (179). They
+print the rows the act writes or ends (`COPY` for each succession copy an
+attach follows onto, `DETACHED` for each row a detach ends) and the
+role-derived memberships of every identity the act can change, before vs
+after (`MEMBERSHIP GAINED|LOST|KEPT`). When the window the act concerns
+opens later than now (an attach `--valid-from` in the future, or a detach
+of a row that has not opened yet), both sides are read as of that opening
+and an `EVALUATED-AT` line says so. `role-attach` prints `UNREGISTERED` for
+an identity the host never registered: register a host identity first (see
+"Order: REGISTER, THEN ATTACH" above).
 `group-roster` prints a `MEMBER` line per binding-derived member and a
 `DIRECT` line per live row of the group's own roster (what `group-member add`
 writes, and the admin a team group is created with); the last line counts both
@@ -2845,7 +2859,23 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   (`LOCKED-PER-BATCH`), so an edge or fragment inserted on a moving claim
   while the batch runs either lands before the batch reads its rows or is
   stamped after the move. Every write to those tables on the instance waits
-  for the batch; keep `--batch-size` small on a busy instance.
+  for the batch; keep `--batch-size` small on a busy instance. Each `BATCH`
+  line prints how long its transaction held the locks (`locks held <ms>
+  ms`), and the result prints the longest (`longest lock hold: <ms> ms over
+  <n> transaction(s) at --batch-size <N>`): about the stall a concurrent
+  edge or fragment writer sees per batch. Each figure runs from the
+  transaction's begin, so a wait to acquire the locks behind other writers
+  is included. There is no fixed figure per batch size; it depends on the
+  claims' rows and the instance's load. Measure it: a dry run takes the same
+  locks for the same reads and writes, so run the dry run at the
+  `--batch-size` you intend to apply with, at a comparable time of day, and
+  lower the batch size until the longest hold is one your writers can wait
+  (their `lock_timeout` and request timeouts are the limit). Treat the dry
+  run's figure as a LOWER BOUND: an apply also fsyncs the manifest and
+  commits while it holds the locks, so leave headroom. The locks
+  are not narrowed to the moving claims: every edge and fragment writer
+  would have to take the same row or advisory lock, which is a schema
+  change.
 - **Left as they are**: an outsider's challenge (it is the challenger's; it
   is readable with its claim) and a fragment shared with a claim that stays.
 - **Invariants per batch**: the row census, every row's end state, and
@@ -2873,6 +2903,19 @@ epigraph-operator reown-reverse --manifest regroup-1.jsonl [--apply]
   claim cannot be reversed by this tool. The dry run and the apply predict
   this for every edge and print each one (`IRREVERSIBLE-EDGE`, naming the
   claim, and an `irreversible edges` count with the number of claims).
+  `--refuse-irreversible` holds such claims instead of moving them (HELD
+  `irreversible`, naming the edges, as `HELD-UNDER-LOCK` lines): each batch
+  is probed first in a rolled-back transaction that records nothing to the
+  manifest, the named claims are taken out, and the rest of the batch moves.
+  Should the real batch still find an `IRREVERSIBLE-EDGE` (an edge written on
+  a moving claim between the probe and the batch's locks), it is rolled back
+  as a failed batch (exit 2, nothing further attempted); re-run the dry run.
+  Under `--apply` a held claim makes the run exit 3, as any hold does; drop
+  the held claims from the ids file for an exit 0. The verdict is per batch,
+  so a claim whose edge's other end moves in a later batch may be held
+  conservatively; a larger `--batch-size` judges more claims together. The
+  tool does not restore such an edge's recorded tuple exactly: that tuple is
+  wider than its endpoints, which is what the reversal refuses to write.
 - **Authority for its first use** (the 17 legacy workflow claims an earlier
   restriction put in the wrong team group): two operator rulings, both of
   2026-11-11. "Do both along with the 25 mixed lineage move" decides the
@@ -3076,7 +3119,12 @@ was refused, and then nothing is written under `--apply`. It runs on a
 NOSUPERUSER maintenance login from migration 158 on. A `delete-frames`
 built for migration 194 purges retracted BBAs through the audited purge
 definer (`epigraph_purge_mass_functions`), so install it AFTER 194 is
-applied.
+applied. It refuses, before connecting, a `--reason` that is blank after
+trimming spaces or longer than 2000 characters (counted in characters, as
+the purge definer counts them): the definer's own bound, checked up front so
+the refusal comes before the dry run rather than at the apply. A blank reason
+was accepted before when nothing retracted was purged; it is now refused
+whatever the frames hold.
 
 ### The operator CLI at a glance
 
@@ -3088,7 +3136,7 @@ the flags.
 |---|---|
 | Humans and links | `register-human-operator`, `revoke-human-operator`, `link`, `retire-link`, `link-retired`, `link-legacy-authors`, `arm-operator-binding`, `register-system-agent`, `allow-author-binding-client`, `revoke-author-binding-client` |
 | Ownership | `reown-linked`, `reown-claims`, `hide-evidence`, `restrict-claims`, `reown-reverse`, `set-workflow-submitter` (and its `--reverse`) |
-| Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede` |
+| Roles and custodians | `grant-role`, `end-role-assignment`, `list-role-assignments`, `custodial-supersede`, `role-attach`, `role-detach` |
 | Groups | `create-group`, `group-member add\|remove\|set-role`, `define-group-role`, `bind-group-role`, `end-group-role-binding`, `group-roster` |
 | Passkeys and elevation | `passkey-enroll`, `list-passkeys`, `revoke-passkey`, `end-elevation`, `list-elevations`, `verify-confirmations` |
 | OAuth clients and scopes | `approve-client`, `grant-client-scope`, `revoke-client-scope`, `suspend-client`, `revoke-client`, `sweep-dcr-clients`, `list-dcr-clients`, `arm-admin-scopes`, `disarm-admin-scopes` |

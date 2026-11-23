@@ -1033,3 +1033,117 @@ async fn delete_frames_purges_a_retracted_companion_bba_then_deletes_the_frame(p
         audit[0]
     );
 }
+
+/// Backlog 129f99ad (1): `--reason` is held to the purge definer's bound
+/// (migration 194: 1..2000 characters after `btrim`) BEFORE any database
+/// work. An over-long or blank reason is refused with no plan printed, even
+/// on a dry run and even against a DSN nothing listens on (so the refusal
+/// comes before the connection); before this check the dry run printed its
+/// plan and exited 0, and an over-long reason failed only at the apply's
+/// purge, rolled back.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_refuses_a_reason_outside_the_purge_bound_before_any_database_work(
+    pool: PgPool,
+) {
+    let t = seed_frame(&pool, &format!("test-frame-reason-{}", Uuid::new_v4())).await;
+    let ids = ids_file(&[t]);
+    let too_long = "r".repeat(2001);
+    for (reason, what) in [
+        (too_long.as_str(), "2001 characters"),
+        ("   ", "spaces only"),
+    ] {
+        let r = run_op(
+            &pool,
+            &["delete-frames", "--ids-file", &ids, "--reason", reason],
+        )
+        .await;
+        assert_ne!(r.code, 0, "a {what} reason is refused\n{}", r.show());
+        assert!(
+            !r.stdout.contains("DELETE-PLAN"),
+            "a {what} reason is refused before the plan is read\n{}",
+            r.show()
+        );
+        assert!(
+            r.stderr.contains("--reason"),
+            "the refusal names --reason ({what})\n{}",
+            r.show()
+        );
+        // The same refusal with nothing to connect to: it is decided before
+        // any connection.
+        let offline = run_with_dsn(
+            &["delete-frames", "--ids-file", &ids, "--reason", reason],
+            "postgres://nobody:none@127.0.0.1:1/none",
+        );
+        assert_ne!(offline.code, 0, "{}", offline.show());
+        assert!(
+            offline.stderr.contains("--reason"),
+            "a {what} reason is refused before connecting, not by a connection error\n{}",
+            offline.show()
+        );
+    }
+    assert!(frame_exists(&pool, t).await, "nothing was deleted");
+
+    // The control: the same dry run with a valid reason plans the frame.
+    let ok = run_op(
+        &pool,
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--reason",
+            "reason bound test",
+        ],
+    )
+    .await;
+    assert_eq!(ok.code, 0, "{}", ok.show());
+    assert!(
+        ok.stdout.contains("DELETE-PLAN: 1 frame(s)"),
+        "{}",
+        ok.show()
+    );
+}
+
+/// Backlog 129f99ad (1), the other edge: the bound is CHARACTERS, as the
+/// definer's `length()` counts them, not bytes. A reason of exactly 2000
+/// two-byte characters (4000 bytes) passes the CLI check and the purge
+/// definer accepts it: the apply purges the retracted companion row with that
+/// reason and deletes the frame.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_frames_accepts_a_2000_character_multibyte_reason_the_purge_accepts(pool: PgPool) {
+    let (owner, group) = fixture::seed_agent_with_group(&pool, "reason-bound").await;
+    let (second, _) = fixture::seed_agent_with_group(&pool, "reason-bound-2").await;
+    let t = seed_frame(&pool, &format!("test-frame-reason-mb-{}", Uuid::new_v4())).await;
+    let tc = fixture::seed_group_claim(&pool, owner, group, "a reason-bound companion").await;
+    let r_bba = seed_bba(&pool, tc, t, second).await;
+    retracted::retract_through_definer(&pool, r_bba).await;
+    let ids = ids_file(&[t]);
+    let companions = ids_file(&[tc]);
+    let reason = "\u{e9}".repeat(2000);
+    assert_eq!(reason.len(), 4000, "fixture: 4000 bytes, 2000 characters");
+    let r = run_op(
+        &pool,
+        &[
+            "delete-frames",
+            "--ids-file",
+            &ids,
+            "--companion-claims-file",
+            &companions,
+            "--apply",
+            "--confirm-delete",
+            "1",
+            "--reason",
+            &reason,
+        ],
+    )
+    .await;
+    assert_eq!(r.code, 0, "{}", r.show());
+    assert!(!frame_exists(&pool, t).await, "the frame is gone");
+    let purged: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'mass_functions.purge'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("purge audit rows");
+    assert_eq!(purged.len(), 1, "one purge: {purged:?}");
+    assert_eq!(purged[0]["reason"], reason.as_str());
+}

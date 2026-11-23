@@ -203,6 +203,7 @@ pub mod reown_workflows;
 pub mod restrict;
 pub mod retire_link;
 pub mod reverse;
+pub mod role_agent;
 pub mod role_restore;
 pub mod system_agent;
 pub mod tables;

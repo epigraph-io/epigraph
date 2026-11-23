@@ -1520,7 +1520,8 @@ member while:
 A detach DOES revoke the lineage's grant: a succession copy counts only while
 every row it was copied through, the operator's own attachment included, is
 un-detached and inside its window. So detaching the identity you attached
-(`epigraph_detach_agent_from_role`) takes the group from every successor
+(`epigraph-operator role-detach`, over `epigraph_detach_agent_from_role`)
+takes the group from every successor
 copied from it at once, and detaching a middle identity takes it from the
 copies below that one. That holds however the copies were made: when you
 attach an identity, its registered successors are attached with it, and
@@ -1665,6 +1666,16 @@ group folder keeps the grant a copy would lose (detach it if it is reused).
 The manual pair (detach the running identity's old copy, then
 attach it by name) still works and has the same effect, without those checks.
 The copies its later identities inherit from that attachment count again.
+With the operator verbs, dry run each step of the manual pair first and
+check its `MEMBERSHIP` lines, then repeat it with `--apply`:
+
+```bash
+epigraph-operator role-detach --role <role> --agent <running identity> --reason "<why>"
+epigraph-operator role-attach --role <role> --agent <running identity> --reason "<why>"
+```
+
+The attach's dry run runs against the database as it is, so it previews the
+attach only after the detach has been applied.
 
 The lineage walk reads only recorded successions. A copy written by hand
 for an identity with no recorded parent is judged by its copy chain alone
@@ -1711,14 +1722,18 @@ identity the host may run for the group (any model, any kind of run; every
 identity with a prompt snapshot in the group's folder is one) and the
 identity at the root of every un-detached copy they hold (a copy counts
 only when its root's agent runs in the copy holder's folder, so these are
-in the same set; read each chain to check). Call
-`epigraph_detach_agent_from_role` on each of them that holds an
-UN-DETACHED attachment made by name, in ANY window: one dated to open
-later is not live yet, but it opens with no act of yours. The verb
-detaches every un-detached row the identity holds for the role. Make the
-list on a maintenance session: `role_agents` is FORCE RLS, so an app or
-read-only session reads no row of it, and an empty answer anywhere else
-means nothing. Then
+in the same set; read each chain to check). Run
+`epigraph-operator role-detach --role <role> --agent <id> --reason "<why>"`
+on each of them that holds an UN-DETACHED attachment made by name, in ANY
+window: one dated to open later is not live yet, but it opens with no act of
+yours. The verb (over `epigraph_detach_agent_from_role`) detaches every
+un-detached row the identity holds for the role. Without `--apply` it is a
+dry run: it prints each row it would end (`WOULD BE DETACHED`) and the
+role-derived memberships of the identity, its registered successors and its
+copies' holders before vs after (`MEMBERSHIP ... LOST`), and rolls back;
+re-run it with `--apply`. Make the list on a maintenance session:
+`role_agents` is FORCE RLS, so an app or read-only session reads no row of
+it, and an empty answer anywhere else means nothing. Then
 no copy any of them holds has a live root, and nothing registered from
 them later inherits one: the job stays out until you attach one of its
 identities by name again. A binding in `registered_agents` mode is out of
@@ -1788,14 +1803,24 @@ new, non-elevating role that the same human holds, here
    group folder the job runs in, and link it to that human. Do this BEFORE
    step 5: an identity that already has an attachment when the host first
    registers it is refused (`AID09`), so since migration 248 step 5 refuses
-   (`ROL03`) an identity the host has not registered yet.
+   (`ROL03`) an identity the host has not registered yet. `role-attach` also
+   prints `UNREGISTERED` for an identity the host has never registered that
+   248 still lets through (one that already authored a claim); do not apply
+   it then.
 
-5. Attach the identity to the role (166; no CLI verb yet):
+5. Attach the identity to the role (166). A dry run first:
 
-   ```sql
-   SELECT public.epigraph_attach_agent_to_role(
-       'role:platform-operations', '<identity agent id>', NULL, NULL, '<why>');
+   ```bash
+   epigraph-operator role-attach --role role:platform-operations \
+       --agent <identity agent id> --reason "<why>"
    ```
+
+   It runs `epigraph_attach_agent_to_role` and rolls back, printing the
+   attachment, a `COPY` line for every registered successor the attach
+   follows onto (the whole chain), and the role-derived memberships it
+   changes (`MEMBERSHIP GAINED ... group=<group id> role=writer` for the
+   identity). Check them, then repeat with `--apply`. `--valid-from` /
+   `--valid-to` (RFC 3339) set a window; the default is from now, open-ended.
 
 6. Check: `epigraph-operator group-roster --group <group id>` lists the holder
    and the identity at `writer`, and no other agent of that human.
