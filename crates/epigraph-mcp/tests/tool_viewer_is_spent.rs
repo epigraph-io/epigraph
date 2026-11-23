@@ -791,9 +791,10 @@ fn call_spends_viewer(region: &str) -> bool {
 ///   caller's own rows (its bug reports, its elevation, its memberships), or a
 ///   boolean about an edge the fn just read or wrote. Stamping is not a spend
 ///   (row security only), so each is listed.
-/// * **untenanted** — the table has no tenancy columns: `agents`, `papers`,
-///   `entities` and `entity_types`, `claim_themes`, `match_candidates`,
-///   `behavioral_executions`.
+/// * **untenanted** — the table has no tenancy columns: `agents`,
+///   `entities` and `entity_types`, `claim_themes`, `match_candidates`.
+///   (`papers` carries tenancy since migration 246 and `behavioral_executions`
+///   since migration 240: a read of either is stamped or viewed.)
 /// * **narrows** — `derivation_scope::retain_for_cache` filters rows the fn
 ///   already read through the viewer; it can drop a row, never add one.
 /// * **audit** — records the caller's own act (an event, a recall audit row,
@@ -972,6 +973,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "require_owner_or_admin",
         ],
     ),
+    // untenanted: `AgentRepository::key_kind_of_public_key`, the `agents.key_kind` of the
+    // signer's public key of a claim the fn already read through the viewer, on the caller's
+    // stamped read; it returns a key kind (is the bare key a signature verifier), never a row.
+    (
+        "claims.rs",
+        "verify_claim",
+        &["AgentRepository::key_kind_of_public_key"],
+    ),
     // write: `ClaimRepository::update_labels_conn`, `ClaimRepository::update_trace_id_conn`,
     // `EvidenceRepository::create_with_source_url`,
     // `ReasoningTraceRepository::create_with_reasoning_type`,
@@ -1119,11 +1128,11 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // audit: `EventRepository::insert`. Raw pool: `EventRepository::insert` runs on
     // `server.pool` (registered in `raw_pool_register.rs`).
     ("events.rs", "publish_event", &["EventRepository::insert"]),
-    // write: `ClaimRepository::evolve_step_conn`; opener:
-    // `claim_helper::begin_author_stamped_tx`; authority: `require_lineage_authority`; audit:
-    // `record_lineage_writes`; maintenance: `supersede::admin_session_or_deferral`; no SQL:
-    // `workflow_ingest::embed_created_workflow_claims`. With no ScopedPool the write
-    // transaction is `server.pool.begin()` (registered in `raw_pool_register.rs`).
+    // write: `ClaimRepository::evolve_step_conn`; opener: `claim_helper::begin_author_stamped_tx`;
+    // audit: `record_lineage_writes`; maintenance: `supersede::admin_session_or_deferral`; no SQL:
+    // `workflow_ingest::embed_created_workflow_claims`. With no ScopedPool the write transaction
+    // is `server.pool.begin()` (registered in `raw_pool_register.rs`). `require_lineage_authority`
+    // now takes the viewer (its own entry).
     (
         "evolve_step.rs",
         "evolve_step",
@@ -1133,10 +1142,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
             "record_lineage_writes",
             "record_lineage_writes",
-            "require_lineage_authority",
-            "require_lineage_authority",
             "supersede::admin_session_or_deferral",
             "workflow_ingest::embed_created_workflow_claims",
+        ],
+    ),
+    // stamped: `WorkflowRepository::workflows_executing_step_lineage`, on the write transaction
+    // under the `workflows` table's forced row security; authority:
+    // `WorkflowRepository::step_lineage_executors`, the definer that returns every executing
+    // workflow to the server only, which answers a hidden one as an unknown parent, never by id
+    // (backlog c831df4a).
+    (
+        "evolve_step.rs",
+        "require_lineage_authority",
+        &[
+            "WorkflowRepository::step_lineage_executors",
+            "WorkflowRepository::workflows_executing_step_lineage",
         ],
     ),
     // authority: `check_explicit_author_ids`.
@@ -1168,14 +1188,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "retract_replaced_name_nodes",
         &["AgentRepository::get_by_public_key"],
     ),
-    // untenanted: `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads
-    // `papers` on `server.pool`; the paper id is returned only if the viewer-filtered pipeline
-    // read matches.
-    (
-        "ingestion.rs",
-        "check_already_ingested",
-        &["find_paper_by_document_key"],
-    ),
     // write: `ClaimIngestRepository::record_signed_conn`,
     // `ClaimRepository::set_properties_conn`, `ClaimRepository::update_labels_conn`,
     // `ClaimRepository::update_trace_id_conn`,
@@ -1185,9 +1197,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `ReasoningTraceRepository::create`,
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
-    // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
-    // `spawn_ingest_embeds`. Raw pool: `PaperRepository::get_or_create` writes `papers` on
-    // `server.pool` (registered in `raw_pool_register.rs`).
+    // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
+    // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
+    // migration 246 `PaperRepository::get_or_create` writes `papers` in the ingest's declared
+    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
     (
         "ingestion.rs",
         "do_ingest_document_reporting",
@@ -1224,9 +1237,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `ReasoningTraceRepository::create`,
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
-    // `resolve_ingest_visibility`; untenanted: `PaperRepository::licence`; no SQL:
-    // `spawn_ingest_embeds`. Raw pool: `PaperRepository::get_or_create` writes `papers` on
-    // `server.pool` (registered in `raw_pool_register.rs`).
+    // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
+    // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
+    // migration 246 `PaperRepository::get_or_create` writes `papers` in the ingest's declared
+    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
     (
         "ingestion.rs",
         "do_ingest_document_spine",
@@ -1253,30 +1267,27 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "spawn_ingest_embeds",
         ],
     ),
-    // write: `ensure_paper_node`.
-    ("ingestion.rs", "ingest_document", &["ensure_paper_node"]),
-    // write: `ensure_paper_node`.
+    // write: `PaperRepository::get_or_create` (migration 246: the ingest's declared scope, on its
+    // stamped transaction); opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`.
     (
         "ingestion.rs",
-        "ingest_document_inline",
-        &["ensure_paper_node"],
+        "ensure_paper_node",
+        &[
+            "PaperRepository::get_or_create",
+            "begin_ingest_tx",
+            "resolve_ingest_visibility",
+        ],
     ),
-    // untenanted: `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads
-    // `papers` on `server.pool`.
-    (
-        "ingestion.rs",
-        "paper_already_ingested",
-        &["find_paper_by_document_key"],
-    ),
-    // opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`; untenanted:
-    // `find_paper_by_document_key`. Raw pool: `find_paper_by_document_key` reads `papers` on
-    // `server.pool`.
+    // opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`; stamped:
+    // `PaperRepository::find_in_scope`, the `papers` row of the ingest's own declared scope on its
+    // stamped transaction (forced row security since migration 246); it returns an id the write
+    // would reuse, never another scope's row.
     (
         "ingestion.rs",
         "preflight_write_authority",
         &[
+            "PaperRepository::find_in_scope",
             "begin_ingest_tx",
-            "find_paper_by_document_key",
             "resolve_ingest_visibility",
         ],
     ),
@@ -1366,17 +1377,20 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         ],
     ),
     // write: `EdgeRepository::create_if_not_exists_signed_conn`; opener:
-    // `claim_helper::begin_author_stamped_tx`; authority: `EdgeRepository::owned_by_session`,
-    // `WorkflowRepository::submitter_of`, `workflow_authority::require_workflow_authority`;
-    // stamped: `EdgeRepository::reaches_in_force_conn`,
-    // `WorkflowRepository::canonical_names_of`, `WorkflowRepository::head_by_canonical`,
+    // `claim_helper::begin_author_stamped_tx`; authority: `AgentRepository::speaks_for` (the
+    // `asserts` verb's source-agent rule, an allow or refuse over untenanted `agents` and operator
+    // links), `EdgeRepository::owned_by_session`, `WorkflowRepository::submitter_of`; stamped:
+    // `EdgeRepository::reaches_in_force_conn` (migration 254's cycle-walk definer, which answers a
+    // boolean), `WorkflowRepository::canonical_names_of`, `WorkflowRepository::head_by_canonical`,
     // `WorkflowRepository::workflows_executing_step_lineage`; untenanted:
     // `EntityTypeRepository::get_by_name_conn`; audit:
     // `workflow_authority::record_workflow_write`.
+    // `workflow_authority::require_workflow_authority` now takes the viewer (its own entry).
     (
         "link_hierarchical.rs",
         "do_link_hierarchical",
         &[
+            "AgentRepository::speaks_for",
             "EdgeRepository::create_if_not_exists_signed_conn",
             "EdgeRepository::owned_by_session",
             "EdgeRepository::reaches_in_force_conn",
@@ -1389,8 +1403,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::workflows_executing_step_lineage",
             "claim_helper::begin_author_stamped_tx",
             "workflow_authority::record_workflow_write",
-            "workflow_authority::require_workflow_authority",
         ],
+    ),
+    // untenanted: `AgentRepository::get_by_id` for an `agent` endpoint (`agents` has no tenancy;
+    // existence only); the claim and workflow arms read through the viewer.
+    (
+        "link_hierarchical.rs",
+        "endpoint_exists",
+        &["AgentRepository::get_by_id"],
     ),
     // write: `MatchCandidateRepo::promote_if_pending_conn`,
     // `MatchCandidateRepo::reject_if_pending`; opener: `claim_helper::begin_author_stamped_tx`;
@@ -1451,14 +1471,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "recall_post_embed",
         &["recall::write_recall_audit"],
     ),
-    // untenanted: `ingestion::find_paper_by_document_key`. Raw pool:
-    // `find_paper_by_document_key` reads `papers` on `server.pool`; every claim-derived read
-    // runs on the stamped read.
-    (
-        "paper_queries.rs",
-        "query_paper",
-        &["ingestion::find_paper_by_document_key"],
-    ),
     // write: `EdgeRepository::create_signed`, `PerspectiveRepository::create`. Raw pool: both
     // writes run on `server.pool` (registered in `raw_pool_register.rs`).
     (
@@ -1514,11 +1526,37 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "recall_with_context_core",
         &["spawn_recall_audit", "spawn_recall_audit"],
     ),
+    // ── crate-root helpers a tool hands its viewer to (`src/*.rs`) ──
+    //
+    // The author's own viewer, resolved from the author id for a write stamped
+    // from it; the two writes are on the author-stamped transaction, after the
+    // claim was read or created through the viewer.
+    // resolves: `Viewer::resolve`.
+    (
+        "src/claim_helper.rs",
+        "author_write_authority",
+        &["Viewer::resolve"],
+    ),
+    // write: `emit_verb_edge_best_effort`.
+    (
+        "src/claim_helper.rs",
+        "create_claim_idempotent",
+        &["emit_verb_edge_best_effort"],
+    ),
+    // write: `ClaimRepository::update_truth_value_conn`.
+    (
+        "src/claim_helper.rs",
+        "wire_ds_for_new_claim_in_tx",
+        &["ClaimRepository::update_truth_value_conn"],
+    ),
+    // resolves: `Viewer::resolve`.
+    ("src/claim_helper.rs", "write_viewer", &["Viewer::resolve"]),
     // write: `epigraph_ingest_executor::add_step`,
     // `epigraph_ingest_executor::record_caller_authorship`; opener:
-    // `claim_helper::begin_caller_workflow_tx`; authority: `require_authority_over`; audit:
+    // `claim_helper::begin_caller_workflow_tx`; audit:
     // `workflow_authority::record_workflow_write`; no SQL:
-    // `workflow_ingest::embed_created_workflow_claims`.
+    // `workflow_ingest::embed_created_workflow_claims`. `require_authority_over` now takes the
+    // viewer (its own entry).
     (
         "step_ops.rs",
         "add_step",
@@ -1526,23 +1564,30 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_caller_workflow_tx",
             "epigraph_ingest_executor::add_step",
             "epigraph_ingest_executor::record_caller_authorship",
-            "require_authority_over",
             "workflow_authority::record_workflow_write",
             "workflow_ingest::embed_created_workflow_claims",
         ],
     ),
     // write: `epigraph_ingest_executor::delete_step`; opener:
-    // `claim_helper::begin_caller_workflow_tx`; authority: `require_authority_over`; audit:
-    // `workflow_authority::record_workflow_write`.
+    // `claim_helper::begin_caller_workflow_tx`; audit:
+    // `workflow_authority::record_workflow_write`. `require_authority_over` now takes the viewer
+    // (its own entry).
     (
         "step_ops.rs",
         "delete_step",
         &[
             "claim_helper::begin_caller_workflow_tx",
             "epigraph_ingest_executor::delete_step",
-            "require_authority_over",
             "workflow_authority::record_workflow_write",
         ],
+    ),
+    // stamped: `WorkflowRepository::head_by_canonical`, the lineage head on the caller's workflow
+    // transaction under the `workflows` table's forced row security; the authority decision then
+    // takes the viewer.
+    (
+        "step_ops.rs",
+        "require_authority_over",
+        &["WorkflowRepository::head_by_canonical"],
     ),
     // opener: `claim_helper::begin_author_stamped_tx`; authority:
     // `admin_borrowed_server_identity`, `claims::require_owner_or_admin`.
@@ -1565,6 +1610,23 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         &[
             "ClaimRepository::mark_duplicate_act_attributed_conn",
             "admin_session_or_deferral",
+        ],
+    ),
+    // write: `ClaimRepository::lock_dedup_sources_conn` (row locks),
+    // `ClaimRepository::mark_duplicate_act_attributed_conn`, each on the one transaction
+    // `begin_claim_act` (viewer) opened; authority: `claims::require_owner_or_admin`, every link
+    // grant the gates made decided again on that transaction under the link lock (backlog
+    // 9a5bc055); maintenance: `maintenance::admin_cascade_session`,
+    // `admin_cascade::record_deferral`, after the acts' gates.
+    (
+        "supersede.rs",
+        "mark_duplicates_onto",
+        &[
+            "ClaimRepository::lock_dedup_sources_conn",
+            "ClaimRepository::mark_duplicate_act_attributed_conn",
+            "admin_cascade::record_deferral",
+            "claims::require_owner_or_admin",
+            "maintenance::admin_cascade_session",
         ],
     ),
     // write: `ClaimRepository::supersede_act_conn`; maintenance:
@@ -1597,20 +1659,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::session_may_unmark_conn",
         ],
     ),
-    // untenanted: `ClaimThemeRepository::count_summaries`. Raw pool: `count_summaries` reads
-    // `claim_themes` on `server.pool`.
-    (
-        "themes.rs",
-        "list_themes",
-        &["ClaimThemeRepository::count_summaries"],
-    ),
-    // untenanted: `ClaimThemeRepository::find_by_label`. Raw pool: `find_by_label` reads
-    // `claim_themes` on its `pool` parameter.
-    (
-        "themes.rs",
-        "resolve_theme_selector",
-        &["ClaimThemeRepository::find_by_label"],
-    ),
     // opener: `claim_helper::begin_author_stamped_tx`.
     (
         "visibility.rs",
@@ -1640,6 +1688,26 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "workflow_authority.rs",
         "caller_view_of",
         &["Viewer::resolve"],
+    ),
+    // authority: the workflow authority rule's arms (`admin_arm`, `claims::operator_arm_allows`,
+    // `delegate_arm`, `owner_group_arm`, `unrecorded_row_owner_group_arm`,
+    // `viewer::live_delegation`), each an allow or refuse on `conn`; stamped:
+    // `WorkflowRepository::submitter_of` and `caller_view_of`, the `workflows` row on the caller's
+    // connection under its forced row security.
+    (
+        "workflow_authority.rs",
+        "require_workflow_authority",
+        &[
+            "WorkflowRepository::submitter_of",
+            "admin_arm",
+            "admin_arm",
+            "caller_view_of",
+            "claims::operator_arm_allows",
+            "delegate_arm",
+            "owner_group_arm",
+            "unrecorded_row_owner_group_arm",
+            "viewer::live_delegation",
+        ],
     ),
     // authority: `claims::operator_arm_allows`, `delegate_arm`, `owner_group_arm`,
     // `unrecorded_row_owner_group_arm`; resolves: `Viewer::resolve`. Raw pool:
@@ -1691,11 +1759,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ),
     // write: `WorkflowRepository::record_submitter`,
     // `epigraph_ingest_executor::record_caller_authorship`; opener:
-    // `claim_helper::begin_caller_workflow_tx`; authority:
-    // `workflow_authority::require_workflow_authority`; stamped:
-    // `WorkflowRepository::ingest_anchors`; audit:
-    // `workflow_authority::audit_admin_workflow_write`,
+    // `claim_helper::begin_caller_workflow_tx`; stamped: `WorkflowRepository::ingest_anchors`;
+    // audit: `workflow_authority::audit_admin_workflow_write`,
     // `workflow_authority::record_caller_workflow_write`.
+    // `workflow_authority::require_workflow_authority` now takes the viewer (its own entry).
     (
         "workflow_ingest.rs",
         "execute_workflow_ingest_with_inserted",
@@ -1707,8 +1774,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "epigraph_ingest_executor::record_caller_authorship",
             "workflow_authority::audit_admin_workflow_write",
             "workflow_authority::record_caller_workflow_write",
-            "workflow_authority::require_workflow_authority",
-            "workflow_authority::require_workflow_authority",
         ],
     ),
     // no SQL: `embed_created_workflow_claims`, `store_workflow_goal_embedding`.
@@ -1738,10 +1803,38 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::max_generation_by_canonical",
         ],
     ),
-    // write: `ClaimRepository::deprecate_claim_if_current`,
-    // `WorkflowRepository::set_truth_value`, `WorkflowRepository::set_truth_value_if_changed`,
-    // `deprecate_hierarchical_workflow`; opener: `claim_helper::begin_author_stamped_tx`;
-    // stamped: `WorkflowRepository::exists`.
+    // write: `ClaimRepository::retire_for_workflow_deprecation`,
+    // `WorkflowRepository::admin_deprecate_row` (migration 237's audited admin definer),
+    // `WorkflowRepository::lock_lineages_for_deprecation`,
+    // `WorkflowRepository::set_truth_value_if_changed`; opener:
+    // `claim_helper::begin_caller_workflow_tx`; stamped: `WorkflowRepository::canonical_names_of`,
+    // `executed_structural_claims`, `lineage_descendants`, on the caller's transaction under the
+    // `workflows` forced row security; authority: `WorkflowRepository::name_has_hidden_rows_conn`
+    // (a boolean that refuses a name with hidden rows) and `refuse_a_live_row_left_behind`
+    // (refuses unless the row now reads deprecated); audit:
+    // `workflow_authority::record_workflow_write`.
+    (
+        "workflows.rs",
+        "deprecate_hierarchical_workflow",
+        &[
+            "ClaimRepository::retire_for_workflow_deprecation",
+            "WorkflowRepository::admin_deprecate_row",
+            "WorkflowRepository::canonical_names_of",
+            "WorkflowRepository::executed_structural_claims",
+            "WorkflowRepository::lineage_descendants",
+            "WorkflowRepository::lock_lineages_for_deprecation",
+            "WorkflowRepository::name_has_hidden_rows_conn",
+            "WorkflowRepository::set_truth_value_if_changed",
+            "claim_helper::begin_caller_workflow_tx",
+            "refuse_a_live_row_left_behind",
+            "workflow_authority::record_workflow_write",
+        ],
+    ),
+    // write: `ClaimRepository::deprecate_claim_if_current`, `WorkflowRepository::set_truth_value`,
+    // `WorkflowRepository::set_truth_value_if_changed`; opener:
+    // `claim_helper::begin_author_stamped_tx`; stamped: `WorkflowRepository::exists`; authority:
+    // `refuse_a_live_row_left_behind` (refuses unless the row now reads deprecated).
+    // `deprecate_hierarchical_workflow` now takes the viewer (its own entry).
     (
         "workflows.rs",
         "deprecate_workflow",
@@ -1752,7 +1845,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "WorkflowRepository::set_truth_value",
             "WorkflowRepository::set_truth_value_if_changed",
             "claim_helper::begin_author_stamped_tx",
-            "deprecate_hierarchical_workflow",
+            "refuse_a_live_row_left_behind",
         ],
     ),
     // untenanted: `BehavioralExecutionRepository::rolling_success_rate`.
@@ -1800,13 +1893,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "refresh_workflow_promotion",
         &["ClaimRepository::merge_properties"],
     ),
-    // write: `BehavioralExecutionRepository::create`,
+    // write: `BehavioralExecutionRepository::create` (since migration 240 on the author's stamped
+    // transaction, the second opener: the run carries its workflow's tenancy),
     // `ClaimRepository::update_truth_value_conn`, `EvidenceRepository::create`; opener:
     // `claim_helper::begin_author_stamped_tx`; authority:
     // `foreign_attach::is_foreign_public_claim`; stamped or raw-pool fallback:
-    // `WorkflowRepository::exists`. Raw pool: `WorkflowRepository::exists` here is the
-    // no-ScopedPool fallback on `server.pool`, and `BehavioralExecutionRepository::create`
-    // writes on `server.pool` (both registered in `raw_pool_register.rs`).
+    // `WorkflowRepository::exists`. Raw pool: `WorkflowRepository::exists` here is the no-
+    // ScopedPool fallback on `server.pool` (registered in `raw_pool_register.rs`).
     (
         "workflows.rs",
         "report_workflow_outcome",
@@ -1815,6 +1908,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::update_truth_value_conn",
             "EvidenceRepository::create",
             "WorkflowRepository::exists",
+            "claim_helper::begin_author_stamped_tx",
             "claim_helper::begin_author_stamped_tx",
             "foreign_attach::is_foreign_public_claim",
         ],
@@ -1829,31 +1923,6 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "workflow_ingest::store_workflow_goal_embedding",
         ],
     ),
-    // ── crate-root helpers a tool hands its viewer to (`src/*.rs`) ──
-    //
-    // The author's own viewer, resolved from the author id for a write stamped
-    // from it; the two writes are on the author-stamped transaction, after the
-    // claim was read or created through the viewer.
-    // resolves: `Viewer::resolve`.
-    (
-        "src/claim_helper.rs",
-        "author_write_authority",
-        &["Viewer::resolve"],
-    ),
-    // write: `emit_verb_edge_best_effort`.
-    (
-        "src/claim_helper.rs",
-        "create_claim_idempotent",
-        &["emit_verb_edge_best_effort"],
-    ),
-    // write: `ClaimRepository::update_truth_value_conn`.
-    (
-        "src/claim_helper.rs",
-        "wire_ds_for_new_claim_in_tx",
-        &["ClaimRepository::update_truth_value_conn"],
-    ),
-    // resolves: `Viewer::resolve`.
-    ("src/claim_helper.rs", "write_viewer", &["Viewer::resolve"]),
 ];
 
 /// The crate-root helpers a tool hands its viewer to (`claim_helper.rs`,
