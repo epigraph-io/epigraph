@@ -48,7 +48,15 @@
 //! run, `--max-passes` without `--until-fixed` (one pass), `--snapshot` and
 //! `--edge-rows` on a predict, `--predict-json` on an apply, the targeted
 //! switches on the un-targeted phases, `--written-before` outside
-//! `rewire-edges`. On a cycle, a finite `--epsilon` leaves each row
+//! `rewire-edges`.
+//!
+//! There is no built-in batching (accepted lists of a few hundred edges,
+//! canary edges first, a gate between batches): the gate is an operator
+//! check, not something this binary can decide. To split an accepted list
+//! across runs, give each run its own `--edges-from` slice and pass
+//! `--sources-from-waves` the L1 wave files PLUS every earlier run's
+//! `--snapshot` file: a claim an earlier run refolded holds neither of its
+//! L1 values, and its E records chain onto the L1 ones. On a cycle, a finite `--epsilon` leaves each row
 //! within about epsilon of a fresh wire, so there the verify is bounded (no
 //! hold, every |d_edge| below the run's tolerance) rather than empty. Undo an
 //! apply with `restore_edge_factors --edge-rows` and then
