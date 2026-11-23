@@ -1395,6 +1395,83 @@ async fn backfill_factors_targeted_runs_only_changed_by_default(pool: PgPool) {
     assert!(!both.exists(), "an argv error writes no report");
 }
 
+/// sha256 (lower-case hex) of a file, the way a deploy kit's `SHA256SUMS`
+/// records it.
+fn file_sha256(path: &str) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(
+        std::fs::read(path).expect("read the binary"),
+    ))
+}
+
+/// The predict and the apply each carry the sha256 of the binary that ran
+/// them: the predict report's `binary_sha256` and the apply's stdout line
+/// both equal the sha256 of the `backfill_factors` file itself, so "the apply
+/// ran the binary that predicted" is a string comparison.
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_factors_targeted_predict_and_apply_carry_the_binary_sha256(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let dir = targeted_scratch();
+    let ch = targeted_chain(&pool, &viewer, &dir, "binary-sha").await;
+    let db = fixture::database_url_for(&pool).await;
+    let api = fixture_health(health_with(legacy_modes()));
+    let wave = path_str(&ch.wave_file);
+    let want = file_sha256(BACKFILL_FACTORS);
+    assert_eq!(want.len(), 64, "fixture: a sha256 hex digest");
+    let stamp = format!("backfill_factors binary sha256: {want}");
+
+    let predict_json = dir.join("predict.json");
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--dry-run",
+            "--predict-json",
+            path_str(&predict_json),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert_eq!(read_predict(&predict_json).binary_sha256, want);
+    assert!(r.stdout.contains(&stamp), "predict stdout: {}", r.stdout);
+
+    let list = dir.join("accepted.txt");
+    std::fs::write(&list, format!("{}\n", ch.ab)).unwrap();
+    let r = run(
+        BACKFILL_FACTORS,
+        &[
+            "--phase",
+            "rewire-edges",
+            "--sources-from-waves",
+            wave,
+            "--edges-from",
+            path_str(&list),
+            "--snapshot",
+            path_str(&dir.join("e-wave.jsonl")),
+            "--edge-rows",
+            path_str(&dir.join("e-rows.jsonl")),
+        ],
+        &[("DATABASE_URL", &db), ("EPIGRAPH_API_URL", &api)],
+    );
+    assert_eq!(
+        r.code,
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        r.stdout,
+        r.stderr
+    );
+    assert!(r.stdout.contains(&stamp), "apply stdout: {}", r.stdout);
+}
+
 /// The operator's apply and undo, through the binaries. A real targeted run
 /// (`--edges-from`, `--snapshot`, `--edge-rows`, `--until-fixed`,
 /// `--only-changed`) rewires both listed edges of the chain and writes both

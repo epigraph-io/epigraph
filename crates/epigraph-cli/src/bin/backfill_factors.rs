@@ -63,8 +63,8 @@ use clap::{Parser, ValueEnum};
 use epigraph_cli::backfill_factors::{run_rewire_phase, RewireOptions, EDGE_QUERY};
 use epigraph_cli::belief_mode_check::{enforce_build_fold_or_exit, enforce_or_exit, RunIntent};
 use epigraph_cli::edge_rewire::{
-    predict_targeted_rewire, run_targeted_rewire, seed_from_waves, TargetedRunOptions,
-    DEFAULT_EPSILON, DEFAULT_MAX_PASSES,
+    predict_targeted_rewire, run_targeted_rewire, running_binary_sha256, seed_from_waves,
+    TargetedRunOptions, DEFAULT_EPSILON, DEFAULT_MAX_PASSES,
 };
 use epigraph_mcp::tools::ds_auto::{self, EdgeFactorOutcome};
 use sqlx::PgPool;
@@ -388,6 +388,10 @@ async fn run_targeted(
                 .map_err(|e| format!("{}: {e}", p.display()))?,
         );
     }
+    // Stamped on both a predict and an apply, so the apply can be checked to
+    // be the binary that predicted (design: the same binary sha as the predict).
+    let binary_sha256 = running_binary_sha256();
+    println!("backfill_factors binary sha256: {binary_sha256}");
     let epsilon = cli.epsilon.unwrap_or(DEFAULT_EPSILON);
     let seed = seed_from_waves(&records, epsilon);
     let opts = TargetedRunOptions {
@@ -413,6 +417,7 @@ async fn run_targeted(
     );
     if cli.dry_run {
         let mut report = predict_targeted_rewire(pool, viewer, &seed, &opts).await?;
+        report.binary_sha256 = binary_sha256;
         report.run.wave_files = cli
             .sources_from_waves
             .iter()

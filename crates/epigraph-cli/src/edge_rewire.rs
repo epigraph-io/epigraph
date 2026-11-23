@@ -240,6 +240,41 @@ pub fn read_edge_row_records<R: BufRead>(input: R) -> anyhow::Result<Vec<EdgeRow
     Ok(out)
 }
 
+/// The sha256 (lower-case hex) of the executable this process runs: the
+/// stamp a predict and the apply compared with it carry, so "the same binary
+/// as the predict" is checked by comparing two strings, and the value matches
+/// a deploy kit's `SHA256SUMS` entry for the file. On Linux it hashes
+/// `/proc/self/exe`, which still reads the running image after the file on
+/// disk was replaced; elsewhere [`std::env::current_exe`]. A failure is
+/// returned as `unavailable: <reason>`, never as an empty string.
+#[must_use]
+pub fn running_binary_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    fn hash(path: &std::path::Path) -> std::io::Result<String> {
+        let mut f = std::fs::File::open(path)?;
+        let mut h = Sha256::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Ok(hex::encode(h.finalize()))
+    }
+    let proc_exe = std::path::Path::new("/proc/self/exe");
+    if proc_exe.exists() {
+        if let Ok(h) = hash(proc_exe) {
+            return h;
+        }
+    }
+    std::env::current_exe()
+        .and_then(|p| hash(&p))
+        .unwrap_or_else(|e| format!("unavailable: {e}"))
+}
+
 /// Read the database clock (the run's `at`, before its first write).
 async fn db_now(pool: &PgPool) -> anyhow::Result<DateTime<Utc>> {
     Ok(sqlx::query_scalar("SELECT now()").fetch_one(pool).await?)
@@ -595,6 +630,10 @@ pub struct PredictRun {
 pub struct PredictReport {
     pub calibration_source: String,
     pub profile_hash: String,
+    /// [`running_binary_sha256`] of the binary that predicted (filled in by
+    /// the binary); the apply prints its own, which must equal it.
+    #[serde(default)]
+    pub binary_sha256: String,
     pub run: PredictRun,
     /// `db` (the database holds the wave's written values) or `seeded` (some
     /// wave claims still hold their `before`: the overlay was seeded with
@@ -959,6 +998,7 @@ pub async fn predict_targeted_rewire(
         calibration_source: epigraph_engine::calibration::CalibrationConfig::cached_source()
             .to_string(),
         profile_hash: epigraph_engine::belief_profile::BeliefProfile::served().profile_hash(),
+        binary_sha256: String::new(),
         run: PredictRun {
             epsilon: opts.epsilon,
             max_passes: opts.max_passes,
