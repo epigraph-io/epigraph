@@ -201,12 +201,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // id are nulled through the viewer (`profile_details_visible`, backlog
     // 761c2b05).
     ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    // untenanted, as `get_agent`: `get_by_public_key` (backlog 8946be59) reads
+    // the one agent row holding the key on the caller's stamped read, and
+    // that row's ORCID / ROR id are nulled through the viewer like the list's.
     (
         "agents.rs",
         "list_agents",
         &[
             "AgentRepository::count",
             "AgentRepository::count_by_label",
+            "AgentRepository::get_by_public_key",
             "AgentRepository::list",
             "AgentRepository::list_by_label",
         ],
