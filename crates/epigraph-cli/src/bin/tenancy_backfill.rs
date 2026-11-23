@@ -2443,6 +2443,13 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // attributed to the step one slot further on with no signal. That is the
     // stake this entry reports.
     ("epigraph_plan_step_skeleton", 259),
+    // 264 (backlog 9073f0a5), the role-successor restore. It reads the
+    // FORCEd `role_agents`, `agent_succession` and `agent_prompt_snapshots`
+    // through `epigraph_definer_bypass()` and writes `role_agents` through
+    // 166's policies. Under a non-member owner it fails CLOSED and LOUD:
+    // the folder read sees no snapshot, so every successor is refused ROL04,
+    // and the attach and detach writes are refused by the policies.
+    ("epigraph_restore_role_successor", 264),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -3531,6 +3538,14 @@ async fn verify_operator_function_grants(pool: &PgPool) -> anyhow::Result<usize>
             "epigraph_plan_step_skeleton",
             "public.epigraph_plan_step_skeleton(uuid, uuid[])",
             true,
+        ),
+        // 264: restoring a role's successor attaches identities by name, a
+        // maintenance act like 166's attach; the request DSN never calls it.
+        (
+            "epigraph_restore_role_successor",
+            "public.epigraph_restore_role_successor(text, uuid, uuid, timestamp with time zone, \
+             text)",
+            false,
         ),
     ];
 

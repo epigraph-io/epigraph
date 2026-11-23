@@ -79,6 +79,8 @@
 //!     epigraph-operator link --operator <uuid> (--agent <uuid> | --agent-model M \
 //!         --agent-system-prompt-hash H) [--apply]
 //!     epigraph-operator retire-link --agent <uuid> --reason TEXT [--revoke-membership] [--apply]
+//!     epigraph-operator restore-role-successor --role role:K --root <uuid> --successor <uuid> \
+//!         [--valid-to <RFC3339>] --reason TEXT [--apply]
 //!     epigraph-operator arm-operator-binding [--recent-days 14] [--allow-unbound-writers] [--apply]
 //!     epigraph-operator link-legacy-authors --operator <uuid> [--exclude-agents-file F] \
 //!         [--quiet-days 30 | --no-quiet-window] [--apply]
@@ -140,7 +142,8 @@ use epigraph_cli::operator::{
     self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
     evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
-    reown_workflows, restrict, retire_link, reverse, system_agent, team_group, workflow_submitter,
+    reown_workflows, restrict, retire_link, reverse, role_restore, system_agent, team_group,
+    workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -604,6 +607,37 @@ enum Command {
         #[arg(long)]
         revoke_membership: bool,
         /// Commit. Without it, the call and its audit row roll back.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Give a role's running successor the group back after its root
+    /// identity was detached (migration 264): attach the root by name (or
+    /// keep its live row made by name), detach the successor's stale
+    /// succession copy and attach the successor by name, in one audited act.
+    /// Refused (ROL04, nothing written) unless a copy written fresh from the
+    /// root's row would admit the successor.
+    RestoreRoleSuccessor {
+        /// The role key the identities are attached to.
+        #[arg(long)]
+        role: String,
+        /// The identity the operator attached by name (and detached), whose
+        /// row the successor's stale copy chains through. It must have held
+        /// a row made by name for the role (refused ROL04 otherwise): a
+        /// middle identity that only ever held copies is not a root.
+        #[arg(long)]
+        root: Uuid,
+        /// The identity the job runs now.
+        #[arg(long)]
+        successor: Uuid,
+        /// When the root's NEW row ends (RFC 3339; default never). Only when
+        /// the root is not attached by name now; the successor's row ends
+        /// with the root's.
+        #[arg(long)]
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
+        /// Recorded on the new rows, the detach and the audit row.
+        #[arg(long)]
+        reason: String,
+        /// Commit. Without it, every row and audit row roll back.
         #[arg(long)]
         apply: bool,
     },
@@ -2461,6 +2495,23 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: the retire and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        Command::RestoreRoleSuccessor {
+            role,
+            root,
+            successor,
+            valid_to,
+            reason,
+            apply,
+        } => {
+            let steps =
+                role_restore::run(&mut conn, &role, root, successor, valid_to, &reason, apply)
+                    .await?;
+            println!("{}", role_restore::describe(&steps, apply));
+            if !apply {
+                println!("DRY RUN: every attach, detach and audit row was rolled back.");
+            }
+            Ok(0)
         }
         Command::ApproveClient {
             client,

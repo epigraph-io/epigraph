@@ -4126,6 +4126,30 @@ restart.
   --manifest-out <file>` (dry run; EXPLAIN its selection and pass `--statement-timeout-ms`
   on a large corpus), review, `--manifest-out <new file> --apply --expect <file>` (refused
   unless the live selection is exactly the reviewed one), and `--remaining` must print 0.
+- **264**: public `role_successor_restore` (backlog 9073f0a5). Adds the maintenance-only
+  SECURITY DEFINER `epigraph_restore_role_successor(role, root, successor, valid_to, reason)`:
+  after a role's root identity was detached, re-attaching it by name did not give the group back
+  to its running successor, whose old succession copy (chained to the root's DETACHED row) still
+  covered the window (166's follow copies into gaps only), so recovery was the manual
+  detach-the-stale-copy-then-attach-by-name pair. The verb does that pair in ONE audited act,
+  under 107's and 166's advisory locks: it attaches the root by name (or keeps its live row made
+  by name; a root that never held a row made by name for the role is refused, so a middle
+  identity cannot be named to undo its own detach), then, only where a copy written fresh from
+  the root's row would admit the successor
+  (179's folder rule against the root; 195's sticky detach on the successor; every row of its
+  covering copies' chains below the root's row live; 195's walk up `agent_succession` reaching no
+  other detached identity), detaches the successor's covering rows and attaches it by name until
+  the root row's end (a finite end ends the successor with the root). The walk runs before the
+  "nothing to do" answer, so `successor_unchanged` means admitted. Refusals are `ROL04`, nothing
+  written. Writes one `platform.role_successor_restored` audit row (with its `outcome`, also when
+  only the root was attached) beside 166's per-row events, and reports
+  registered descendants still out. No body is re-stated: the derivation, the registration and
+  the follow are unchanged (so it does not depend on any re-statement of
+  `epigraph_role_derived_memberships`). `epigraph-operator restore-role-successor` drives it
+  (dry run by rollback). Owned by `epigraph_maintenance`, EXECUTE for that role only (revoked
+  from `epigraph_app`), `search_path = pg_catalog, pg_temp`. Pinned by
+  `epigraph-db/tests/role_successor_restore.rs`. Undo: `docs/runbooks/264-undo.sql` (roll the
+  CLI back first). **Deploy order:** migrate first, then the CLI.
 
 ## `-- no-transaction` migrations
 
