@@ -59,11 +59,12 @@ jobs:
         # Tests stub the API with wiremock; no database or network is needed.
         run: cargo test --locked
       - name: JS unit tests
-        # The Atlas's pure rendering rules (static/atlas_nested.js) under
+        # The Atlas's pure rendering rules (static/atlas_nested.js and
+        # static/atlas_views.js) under
         # node:test, with no dependencies and no package.json. The runner
         # image's preinstalled Node is enough; files are listed, not globbed,
         # because node --test globs need Node 21+.
-        run: node --test js-tests/atlas_nested.test.cjs
+        run: node --test js-tests/atlas_nested.test.cjs js-tests/atlas_views.test.cjs
       - name: Release build
         # The Dockerfile and the systemd install both ship the release binary;
         # build it the same way here so a release-only break is caught.

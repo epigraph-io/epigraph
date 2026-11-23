@@ -478,3 +478,29 @@
     max-height: 50dvh;
   }
 }
+
+/* Sources and Timeline panels (P3b, P3c). Colours of the SVG lane come from
+   the same --atlas-* tokens as the canvas, set as SVG attributes by atlas.js. */
+.atlas__views {
+  display: flex;
+  gap: 0.5rem;
+}
+.atlas__back {
+  margin-bottom: 0.5rem;
+}
+.atlas__timeline {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.atlas__timeline-tick {
+  font-size: 10px;
+}
+.atlas__timeline-dot {
+  cursor: pointer;
+}
+.atlas__timeline-dot:focus-visible {
+  outline: 2px solid var(--atlas-accent, #2d5f8a);
+  outline-offset: 2px;
+}

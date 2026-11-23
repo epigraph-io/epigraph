@@ -1,9 +1,11 @@
 /* EpiGraph Explorer — the Atlas nested levels: pure rendering rules.
  *
- * No DOM, no canvas, no fetch: every function here maps contract data
- * (services/explorer/contract/atlas_level/v1/schema.json) to numbers and
+ * No DOM, no canvas, no fetch of its own: every function here maps contract
+ * data (services/explorer/contract/atlas_level/v1/schema.json) to numbers and
  * styles, so js-tests/atlas_nested.test.cjs can test it under node:test.
- * atlas.js loads it first and reads it as the global AtlasNested.
+ * The one network step, the claim-to-leaf lookup, takes the page's getter
+ * as an argument. atlas.js loads it first and reads it as the global
+ * AtlasNested.
  *
  * - Belief as flow: an edge's look comes from its flow_basis, sign and
  *   flow_weight, never from its relationship name (stored in either
@@ -305,10 +307,9 @@
 
   /**
    * The leaf, among already-fetched level documents, that draws claim
-   * `claimId` as a claim node, or null. The contract has no claim-to-leaf
-   * lookup, so a search hit or a #c- link inside a nested theme lands on its
-   * leaf only when that leaf has been fetched; otherwise the caller says so
-   * instead of inventing a place for it.
+   * `claimId` as a claim node, or null. This is the first, free answer: when
+   * it is null the caller asks the claim-to-leaf route (lookupClaimLeaf)
+   * instead of inventing a place for the claim.
    */
   function findClaimLeaf(docs, claimId) {
     if (!uuid(claimId)) return null;
@@ -317,6 +318,78 @@
       if ((d.nodes || []).some((n) => n && n.kind === 'claim' && n.id === claimId)) return d;
     }
     return null;
+  }
+
+  // ---- the claim-to-leaf lookup (contract atlas_claim_leaf v1) -------------
+
+  /** The atlas_claim_leaf version this page reads. */
+  const CLAIM_LEAF_SCHEMA_VERSION = 1;
+
+  /**
+   * The lookup URL for claim `claimId` on `map` in `hierarchy`: the page's
+   * data-atlas-claim-leaf-url prefix, then the map key (one path segment),
+   * the hierarchy and the claim id. Null when any part is unusable.
+   */
+  function claimLeafUrl(prefix, map, hierarchy, claimId) {
+    if (!localPrefix(prefix) || !map || typeof map.key !== 'string' || !map.key) return null;
+    if (HIERARCHIES.indexOf(hierarchy) < 0 || !uuid(claimId)) return null;
+    return prefix + encodeURIComponent(map.key) + '/' + hierarchy + '/' + claimId;
+  }
+
+  /**
+   * Why a claim-to-leaf body is not the answer asked for, or null when it is.
+   * `want` = {claimId, map, hierarchy}. It must name the same claim, map and
+   * hierarchy, and a theme and level by id.
+   */
+  function claimLeafProblem(body, want) {
+    if (!body || typeof body !== 'object') return 'The claim’s place could not be read.';
+    if (body.schema_version !== CLAIM_LEAF_SCHEMA_VERSION) return 'The claim’s place is in a newer format than this page reads.';
+    if (!want || body.claim_id !== want.claimId) return 'The answer was for another claim.';
+    if (!mapMatches(body, want.map)) return 'The answer was for another map.';
+    if (body.hierarchy !== want.hierarchy) return 'The answer was for the other grouping.';
+    if (!uuid(body.theme_id) || !uuid(body.level_id)) return 'The claim’s place could not be read.';
+    return null;
+  }
+
+  /**
+   * Ask which leaf of `map` in `hierarchy` draws claim `claimId`, through
+   * `get(url)` (the page's JSON getter, which throws an error carrying
+   * `status` on a non-2xx answer). Resolves to the checked body, or to null
+   * when the route answers not-found (the claim is not on this map, or not
+   * one the viewer can read: the route does not say which) or when there is
+   * nothing to ask. Any other failure, and a body for another claim, map or
+   * hierarchy, rejects.
+   */
+  async function lookupClaimLeaf(get, prefix, map, hierarchy, claimId) {
+    const url = claimLeafUrl(prefix, map, hierarchy, claimId);
+    if (!url) return null;
+    let body;
+    try {
+      body = await get(url);
+    } catch (e) {
+      if (e && e.status === 404) return null;
+      throw e;
+    }
+    const problem = claimLeafProblem(body, { claimId, map, hierarchy });
+    if (problem) throw Object.assign(new Error(problem), { status: 0, kind: 'bad_claim_leaf' });
+    return body;
+  }
+
+  /**
+   * Which theme a cold claim link lands under, once the claim-to-leaf route
+   * has answered with `place` (null for its not-found answer). `theme` is the
+   * theme resolve named; `themeById(id)` is the page's loaded-theme lookup.
+   * Returns {home} to fetch place.level_id and attach it under `home`, or
+   * {notice} to stop at `theme` with that notice. The picked map, not
+   * resolve, decides the theme: a place in another loaded theme re-homes
+   * there, so its chain is never attached under the wrong theme.
+   */
+  function coldClaimHome(theme, place, themeById) {
+    if (!place) return { notice: 'That claim is not on the map you picked.' };
+    if (theme && place.theme_id === theme.id) return { home: theme };
+    const home = typeof themeById === 'function' ? themeById(place.theme_id) : null;
+    if (!home) return { notice: 'On the map you picked, that claim is in a theme that is not loaded yet.' };
+    return { home };
   }
 
   /** The ids to fetch to attach a level under its theme: its ancestors, then itself. */
@@ -470,6 +543,11 @@
     chainIds,
     countLabel,
     findClaimLeaf,
+    CLAIM_LEAF_SCHEMA_VERSION,
+    claimLeafUrl,
+    claimLeafProblem,
+    lookupClaimLeaf,
+    coldClaimHome,
     MAPS_SCHEMA_VERSION,
     localPrefix,
     parseMaps,

@@ -15,6 +15,7 @@
 <script src="{{ ctx.static_url("vendor/d3-quadtree.min.js") }}" defer></script>
 <script src="{{ ctx.static_url("vendor/d3-force.min.js") }}" defer></script>
 <script src="{{ ctx.static_url("atlas_nested.js") }}" defer></script>
+<script src="{{ ctx.static_url("atlas_views.js") }}" defer></script>
 <script src="{{ ctx.static_url("atlas.js") }}" defer></script>
 {% endblock %}
 
@@ -31,6 +32,8 @@
      data-login-url="{{ shell.login_url }}"
      data-atlas-url="{{ shell.atlas_url }}"
      data-atlas-claim-leaf-url="{{ shell.claim_leaf_url }}"
+     data-sources-url="{{ shell.sources_url }}"
+     data-timeline-url="{{ shell.timeline_url }}"
      {%- if let Some(maps) = shell.maps_json %}
      data-atlas-maps="{{ maps }}"
      {%- endif %}>
