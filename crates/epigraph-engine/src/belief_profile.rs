@@ -50,6 +50,12 @@
 //! ([`set_frame_overrides`]), which refuses it; the repo layer's generic
 //! frame-property setter refuses the key altogether. A perspective's object
 //! has no write path in code (only the fixed reliability maps do).
+//! [`set_frame_overrides`] has no production caller either (no API route,
+//! MCP tool or CLI writes a frame's object today), so an object written with
+//! raw SQL is still unchecked until it is read; a database-side check needs a
+//! migration, and a production writer must first settle how a profile change
+//! reaches the cached beliefs (see the cache-event note on
+//! [`set_frame_overrides`]).
 //!
 //! # Where it applies
 //!
