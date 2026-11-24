@@ -2128,12 +2128,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // control here.
     ("epigraph_refuse_sealed_claim_vector", 212),
     ("epigraph_refuse_sealed_evidence_vector", 212),
-    // 207, the bug-report intake. The write fails LOUD under a non-member
-    // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
-    // `evidence` are refused by their WITH CHECK (the owner no longer passes
-    // `epigraph_definer_bypass()`), so no report is filed. The reporter's list
-    // fails SILENTLY: its reads of the FORCEd `security_events` and `claims`
-    // admit no row, so every reporter sees an empty list.
+    // 207, the bug-report intake (both bodies re-stated by 272). The write
+    // fails LOUD under a non-member owner: its inserts into the FORCEd
+    // `claims`, `reasoning_traces` and `evidence` are refused by their WITH
+    // CHECK (the owner no longer passes `epigraph_definer_bypass()`), and
+    // under an owner without INSERT on 272's `bug_report_intake_marks` its
+    // marker INSERT is refused (42501), so no report is filed. Since 272 the
+    // reporter's list reads that marker table (no grant but the maintenance
+    // role's), so under an owner without SELECT on it, `epigraph_app` for
+    // one, it fails LOUD too (42501), where 207's read of the FORCEd
+    // `security_events` admitted no row.
     ("epigraph_submit_bug_report", 207),
     ("epigraph_my_bug_reports", 207),
     // 207's caller gate (shared by the write and the preflight). Under a

@@ -206,8 +206,9 @@ async fn every_columns_tier_registry_row_has_both_not_null_columns(pool: PgPool)
 /// `counterfactual_scenarios`, `experiments`, `learning_events`,
 /// `match_candidates`. All nine are seeded into `tenancy_exempt` by migration
 /// 069. Migration 240 covers `behavioral_executions` (backlog 88cf603b), so
-/// eight remain. The plan's own three-row seed (claim_themes / agents / jobs) is found
-/// by NEITHER generator and would have left this test red on its first run with
+/// eight remain, and migration 272 registers one more
+/// (`bug_report_intake_marks`). The plan's own three-row seed (claim_themes /
+/// agents / jobs) is found by NEITHER generator and would have left this test red on its first run with
 /// nine violations; 069 seeds twelve rows for that reason.
 #[sqlx::test(migrations = "../../migrations")]
 async fn generator_a_and_b_are_covered_or_exempt(pool: PgPool) {
@@ -558,8 +559,9 @@ async fn the_harvester_neighbours_carry_the_fragment_row_security(pool: PgPool) 
 /// registry to the generated protected set and seeded twelve rows. The two FK
 /// neighbours of the manual tier-A addition `harvester_fragments`, which no
 /// generator finds, are covered by migration 173 (ruling R-66) and carry no
-/// row, and migration 240 covers `behavioral_executions` (backlog 88cf603b) and
-/// drops its row. `the_generated_exemptions_are_exactly_the_measured` sees only
+/// row, migration 240 covers `behavioral_executions` (backlog 88cf603b) and
+/// drops its row, and migration 272 adds `bug_report_intake_marks` (backlog
+/// e690866c). `the_generated_exemptions_are_exactly_the_measured` sees only
 /// generator-found tables and
 /// `every_fk_neighbour_of_harvester_fragments_is_covered_or_exempt` only that
 /// neighbourhood, so without this pin a row for any OTHER table would pass
@@ -570,6 +572,9 @@ async fn the_registry_is_exactly_the_measured_rows(pool: PgPool) {
         "agents",
         "alt_set_decisions",
         "alternative_set",
+        // Migration 272 (backlog e690866c): the bug-report intake marker, a
+        // definer-only ledger with a `claim_id` and no tenancy columns.
+        "bug_report_intake_marks",
         "claim_encryption",
         "claim_themes",
         "claim_version_encryption",
@@ -590,14 +595,17 @@ async fn the_registry_is_exactly_the_measured_rows(pool: PgPool) {
 }
 
 /// The relations the generators find but 062 did not widen are exactly the
-/// nine 069 seeds, less `behavioral_executions`, which migration 240 covers. Pinned so that "add a table, add an exemption" cannot become
-/// the reflex: a NEW unlisted exemption is a diff to this constant, which a
+/// nine 069 seeds, less `behavioral_executions`, which migration 240 covers,
+/// plus `bug_report_intake_marks`, which migration 272 registers. Pinned so
+/// that "add a table, add an exemption" cannot become the reflex: a NEW unlisted exemption is a diff to this constant, which a
 /// reviewer reads.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_generated_exemptions_are_exactly_the_measured(pool: PgPool) {
     const GENERATED_EXEMPT: &[&str] = &[
         "alt_set_decisions",
         "alternative_set",
+        // Migration 272 (backlog e690866c), registered there with its residual.
+        "bug_report_intake_marks",
         "claim_encryption",
         "claim_version_encryption",
         "counterfactual_scenarios",
@@ -952,10 +960,11 @@ async fn migration_068_and_069_apply_twice(pool: PgPool) {
         "the 069 seed must not double on replay"
     );
     assert_eq!(
-        exempt, 11,
-        "069 seeds twelve rows, 173 covers the two tables it once registered and 240 \
-         covers behavioral_executions; a new tenancy_exempt row anywhere is a visible diff \
-         to this number and to the_registry_is_exactly_the_measured_rows"
+        exempt, 12,
+        "069 seeds twelve rows, 173 covers the two tables it once registered, 240 \
+         covers behavioral_executions and 272 registers bug_report_intake_marks; a new \
+         tenancy_exempt row anywhere is a visible diff to this number and to \
+         the_registry_is_exactly_the_measured_rows"
     );
 }
 
