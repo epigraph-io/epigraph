@@ -1731,6 +1731,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "claim_helper::begin_author_stamped_tx",
         ],
     ),
+    // write: `AgentRepository::set_profile_visibility_conn` (273's definer, the
+    // stamped principal's own row); opener: `claim_helper::begin_author_stamped_tx`.
+    (
+        "visibility.rs",
+        "set_profile_visibility",
+        &[
+            "AgentRepository::set_profile_visibility_conn",
+            "claim_helper::begin_author_stamped_tx",
+        ],
+    ),
     // opener: `claim_helper::begin_author_stamped_tx`.
     (
         "visibility.rs",

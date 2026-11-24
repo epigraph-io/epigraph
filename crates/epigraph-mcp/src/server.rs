@@ -1879,6 +1879,20 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
+        description = "Set whether YOUR name is shown to everyone (you must be a person signing in as yourself; an agent acting for one, or a service, is refused). visibility \"public\": your name is shown to everyone. \"group\": only to people who share a team or community with you, and to anyone who can read a claim you or one of your agents filed. If you, or any agent ever bound to you, filed a PUBLIC claim, your name is shown to everyone whatever this says: named_to_everyone in the answer tells you. Your id is always shown, and every claim stays traceable to you. Audited (agent.profile_visibility_set). Returns {agent_id, previous, profile_visibility, named_to_everyone}."
+    )]
+    async fn set_profile_visibility(
+        &self,
+        Parameters(params): Parameters<SetProfileVisibilityParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<CallToolResult, McpError> {
+        let auth = extensions.get::<epigraph_auth::AuthContext>();
+        let viewer = &crate::tools::viewer::request_viewer(self, auth).await?;
+        self.reject_if_read_only()?;
+        crate::tools::visibility::set_profile_visibility(self, viewer, params, auth).await
+    }
+
+    #[tool(
         description = "Create a private TEAM group (keyless: membership is the boundary, nothing is encrypted) that you administer. Only a Person signed in as themselves (a registered human operator's own token) may; an agent acting for one is refused. You become its one admin; add people with invite_to_group, and each joins only when they accept. A name you already use for one of your active team groups is refused. Audited (group.team_created). Returns {group_id, did_key, display_name, role: admin}."
     )]
     async fn create_team_group(

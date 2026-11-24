@@ -3770,6 +3770,14 @@ pub struct SetDefaultGroupParams {
     pub agent_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetProfileVisibilityParams {
+    #[schemars(
+        description = "\"public\": your name is shown to everyone. \"group\": your name is shown only to people who share a team or community with you, and to anyone who can read a claim you or one of your agents filed. If you, or any agent ever bound to you, filed a PUBLIC claim, your name is shown to everyone whatever this setting says. Your id is always shown."
+    )]
+    pub visibility: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VisibilityActResponse {
     /// Per-claim outcome: `publicized` / `already_public`, or `shared`.

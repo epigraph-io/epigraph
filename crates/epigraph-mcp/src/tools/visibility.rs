@@ -19,8 +19,8 @@ use crate::claim_helper::visibility_caller_error;
 use crate::errors::{internal_error, invalid_params, McpError};
 use crate::server::EpiGraphMcpFull;
 use crate::types::{
-    PublicizeClaimsParams, SetDefaultGroupParams, ShareClaimsWithTeamParams, VisibilityActItem,
-    VisibilityActResponse,
+    PublicizeClaimsParams, SetDefaultGroupParams, SetProfileVisibilityParams,
+    ShareClaimsWithTeamParams, VisibilityActItem, VisibilityActResponse,
 };
 
 fn success_json(value: &impl serde::Serialize) -> Result<CallToolResult, McpError> {
@@ -173,5 +173,44 @@ pub async fn set_default_group(
             .into_iter()
             .map(|(g, via)| serde_json::json!({"group_id": g.to_string(), "via": via}))
             .collect::<Vec<_>>(),
+    }))
+}
+
+/// `set_profile_visibility`: the caller (a person, over HTTP its own token's
+/// principal) sets whether its own name is shown to everyone (migration 273).
+/// Always the stamped principal's own row; an operated agent, a service or a
+/// stdio server's own agent is refused (PVS05).
+///
+/// # Errors
+/// `INVALID_PARAMS` for a value other than `public` / `group`;
+/// `INVALID_REQUEST` for a caller that is not a person (PVS05) or carries no
+/// principal (PVS01).
+pub async fn set_profile_visibility(
+    server: &EpiGraphMcpFull,
+    viewer: &epigraph_db::visibility::Viewer,
+    params: SetProfileVisibilityParams,
+    auth: Option<&epigraph_auth::AuthContext>,
+) -> Result<CallToolResult, McpError> {
+    let visibility =
+        epigraph_db::ProfileVisibility::parse(params.visibility.trim()).ok_or_else(|| {
+            invalid_params(format!(
+                "visibility {:?} is neither \"public\" nor \"group\"",
+                params.visibility
+            ))
+        })?;
+    let caller = server.write_identity(auth, viewer).await?;
+    let agent = caller.agent_id();
+    let mut tx =
+        crate::claim_helper::begin_author_stamped_tx(server, caller, "set_profile_visibility")
+            .await?;
+    let set = epigraph_db::AgentRepository::set_profile_visibility_conn(&mut tx, visibility)
+        .await
+        .map_err(visibility_caller_error)?;
+    tx.commit().await.map_err(internal_error)?;
+    success_json(&serde_json::json!({
+        "agent_id": agent.to_string(),
+        "previous": set.previous,
+        "profile_visibility": set.profile_visibility,
+        "named_to_everyone": set.named_to_everyone,
     }))
 }
