@@ -1160,9 +1160,10 @@ fn processing_failed<E: std::fmt::Display>(e: E) -> JobError {
 // condition reads what [`dispatch_conn`] writes. Each runs on the CALLER's
 // maintenance transaction and commits nothing: the route adds its
 // `platform.custodial_act` row and commits; the operator verb adds its own and
-// commits only under `--apply`. Authorization is the caller's (§6.6 in the
-// route; a live custodian assignment, checked by the act recorder, in the
-// verb). Under operator decision D9 no request-serving process holds a
+// commits only under `--apply`. Authorization is the caller's: §6.6 in the
+// route; in the verb, a live custodian assignment (checked by the act
+// recorder) for an abort, and for a revert also the route's target-group
+// conditions, read through the same `privatization_authority` probe. Under operator decision D9 no request-serving process holds a
 // maintenance pool, so on a stock deployment the operator verb is the only
 // surface that reaches these.
 

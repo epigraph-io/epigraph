@@ -150,10 +150,12 @@
 //! [`privatization`]):
 //!
 //! * `privatization abort --plan <id>` / `privatization revert --plan <id>` —
-//!   the routes' abort and revert on the maintenance DSN, through the same
-//!   code, attributed to a custodian (`--actor`, `--assignment`): the
-//!   recovery for a plan stranded in `applying` or `reverting`, which keeps
-//!   `drain_jobs` at exit 5 until it is aborted.
+//!   the routes' abort and revert writes on the maintenance DSN, attributed to
+//!   a custodian (`--actor`, `--assignment`): the recovery for a plan stranded
+//!   in `applying` or `reverting`, which keeps `drain_jobs` at exit 5 until it
+//!   is aborted. Abort needs the live custodian assignment; revert also needs
+//!   the route's target-group conditions (admin of the group, maturity,
+//!   plurality).
 //! * `privatization purge-sealed-centroids` — list (or, as the table owner
 //!   with `--apply`, delete) the cluster centroids of clusters whose members
 //!   are all sealed, left by a seal before the seal cleared them.

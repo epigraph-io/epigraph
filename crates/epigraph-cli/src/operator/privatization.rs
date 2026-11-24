@@ -14,21 +14,43 @@
 //! the stock server attaches none, so these verbs are that recovery on the
 //! maintenance DSN.
 //!
-//! They make the routes' writes, through the same code
+//! They make the routes' WRITES through the routes' own write code
 //! (`epigraph_jobs::privatization::abort_plan_conn` and `dispatch_conn`): the
 //! conditional state flip, the `privatization_audit` row and, for a revert,
 //! the `security_events` row the revert job's sixth re-validation condition
 //! reads and the job itself. The drain runs the job, which re-validates the
-//! plan as it does for a route dispatch.
+//! plan as it does for a route dispatch. The routes' AUTHORITY check is
+//! HTTP middleware this crate cannot call; the gate each verb applies instead
+//! is below, and the two verbs deliberately differ.
 //!
 //! # Authority and audit
 //!
-//! The DSN is the authority to write; the act is attributed to `--actor`, a
-//! registered human, and recorded as a `platform.custodial_act`
-//! (`privatization.plan_transition`) against `--assignment`, the actor's LIVE
-//! `role:platform-custodian` assignment, in the same transaction. The act
-//! recorder refuses (`CUS04`) any other assignment, which rolls the whole act
-//! back. The custodial act carries `--reason`.
+//! Every act is attributed to `--actor`, a registered human, and recorded as a
+//! `platform.custodial_act` (`privatization.plan_transition`) against
+//! `--assignment`, the actor's LIVE `role:platform-custodian` assignment, in
+//! the same transaction. The act recorder refuses (`CUS04`) any other
+//! assignment, which rolls the whole act back. The custodial act carries
+//! `--reason`.
+//!
+//! * `revert` applies the route's gate (`instance_authz::
+//!   require_instance_admin_for_group`), conditions 2 to 4, read through the
+//!   same one-statement probe (`InstanceAdminRepository::
+//!   privatization_authority`): the actor is a live custodian (2), the target
+//!   group is at least [`TARGET_GROUP_MIN_AGE_HOURS`] old (3a) and has at
+//!   least [`TARGET_GROUP_MIN_OTHER_ADMINS`] live admins besides the actor
+//!   (3b), and the actor is a live `admin` of the target group (4). A revert
+//!   moves claims back to their pre-plan tenancy, so holding the maintenance
+//!   DSN and a custodian assignment is not enough to revert a group one does
+//!   not administer. Checked in the dry run too, so the dry run tells the
+//!   truth.
+//! * `abort` needs condition 2 only (the `CUS04` act recorder). An abort
+//!   changes no tenancy: it stops a run and leaves the applied prefix
+//!   applied, and it is on its own what clears `drain_jobs` exit 5. Gating it
+//!   on the target group's roster would leave a plan whose group lost its
+//!   co-admins stranded for good, the availability defect migration 081's
+//!   plan guard declines to create for the same reason. Such a plan can be
+//!   aborted by any custodian but reverted, here as through the route, only by
+//!   one who passes the gate above.
 //!
 //! # Dry run by default
 //!
@@ -48,6 +70,16 @@ use uuid::Uuid;
 
 /// The custodial act both transitions are recorded as.
 const ACT: &str = "privatization.plan_transition";
+
+/// Condition 3a of the revert gate: the target group's minimum age. The same
+/// decision as `epigraph_api::middleware::instance_authz::
+/// TARGET_GROUP_MIN_AGE_HOURS` and migration 081's literal; the
+/// `operator_privatization` test pins the two constants together.
+pub const TARGET_GROUP_MIN_AGE_HOURS: i64 = 24;
+
+/// Condition 3b of the revert gate: live admins of the target group besides
+/// the actor. Pinned as [`TARGET_GROUP_MIN_AGE_HOURS`] is.
+pub const TARGET_GROUP_MIN_OTHER_ADMINS: i64 = 2;
 
 /// Who acts, on whose authority, and why.
 #[derive(Debug, Clone)]
@@ -155,6 +187,52 @@ async fn record_act(
     Ok(())
 }
 
+/// The route's gate for a revert, conditions 2 to 4 of
+/// `instance_authz::require_instance_admin_for_group`, in its order, read in
+/// one statement: `None` when `actor` passes, else why not.
+async fn revert_authority_refusal(
+    conn: &mut PgConnection,
+    actor: &Actor,
+    target_group: Uuid,
+) -> anyhow::Result<Option<String>> {
+    let authority = epigraph_db::InstanceAdminRepository::privatization_authority(
+        conn,
+        actor.agent,
+        target_group,
+    )
+    .await
+    .context("reading the actor's authority over the plan's target group")?;
+    // 2. A live role:platform-custodian assignment.
+    if !authority.is_instance_admin || authority.custodian_assignment_id.is_none() {
+        return Ok(Some("--actor is not a platform custodian".to_string()));
+    }
+    // 3a. Maturity.
+    let Some(created_at) = authority.target_group_created_at else {
+        return Ok(Some(format!(
+            "the plan's target group {target_group} does not exist"
+        )));
+    };
+    if created_at > chrono::Utc::now() - chrono::Duration::hours(TARGET_GROUP_MIN_AGE_HOURS) {
+        return Ok(Some(format!(
+            "the target group must pre-exist the plan by {TARGET_GROUP_MIN_AGE_HOURS}h"
+        )));
+    }
+    // 3b. Plurality.
+    if authority.other_live_admins < TARGET_GROUP_MIN_OTHER_ADMINS {
+        return Ok(Some(format!(
+            "the target group needs >= {TARGET_GROUP_MIN_OTHER_ADMINS} live admins besides \
+             --actor"
+        )));
+    }
+    // 4. Admin of the TARGET group.
+    if !authority.is_target_group_admin {
+        return Ok(Some(
+            "--actor must hold the admin role in the plan's target group to revert it".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
 async fn finish(tx: sqlx::Transaction<'_, sqlx::Postgres>, apply: bool) -> anyhow::Result<()> {
     if apply {
         tx.commit().await.context("commit")?;
@@ -207,9 +285,10 @@ pub async fn abort(
 }
 
 /// Dispatch a revert of an applied or aborted plan, which un-applies exactly
-/// its items in state `applied` when the drain runs the job. Refused while any
-/// item of a `seal` plan is still sealed, and under `apply` unless
-/// `plan_digest` is the plan's own.
+/// its items in state `applied` when the drain runs the job. Refused unless
+/// `actor` passes the route's gate (module docs), while any item of a `seal`
+/// plan is still sealed, and under `apply` unless `plan_digest` is the plan's
+/// own.
 ///
 /// # Errors
 /// A statement failed or the act recorder refused; nothing is written.
@@ -224,6 +303,9 @@ pub async fn revert(
     let Some(plan) = PrivatizationRepository::load_plan_conn(&mut tx, plan_id).await? else {
         return Ok(Outcome::Refused("no such plan".to_string()));
     };
+    if let Some(why) = revert_authority_refusal(&mut tx, actor, plan.target_group_id).await? {
+        return Ok(Outcome::Refused(why));
+    }
     let from_state = plan.state.clone();
     if !matches!(
         from_state.as_str(),

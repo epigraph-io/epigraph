@@ -450,3 +450,191 @@ async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(
         "only the sealed-only cluster's row goes"
     );
 }
+
+/// The revert verb's thresholds are the route's (`instance_authz`), which
+/// are pinned to migration 081's literals there. A drift would let the
+/// operator verb revert where the route refuses, or the reverse.
+#[test]
+fn the_revert_gates_thresholds_are_the_routes() {
+    use epigraph_api::middleware::instance_authz as route;
+    use epigraph_cli::operator::privatization as verb;
+    assert_eq!(
+        verb::TARGET_GROUP_MIN_AGE_HOURS,
+        route::TARGET_GROUP_MIN_AGE_HOURS
+    );
+    assert_eq!(
+        verb::TARGET_GROUP_MIN_OTHER_ADMINS,
+        route::TARGET_GROUP_MIN_OTHER_ADMINS
+    );
+}
+
+/// An applied plan of `world.target_group` in `mode`, its seed claim, and its
+/// digest as the verb echoes it.
+async fn applied_plan(pool: &PgPool, world: &fx::World, mode: &str) -> (Uuid, Uuid, String) {
+    let claim = viewer_fixture::seed_public_claim(pool, world.actor, "revert subject").await;
+    let (plan, digest) = fx::create_plan_with_mode(pool, world, &[claim], mode).await;
+    let correlation = fx::dispatch(pool, world, plan, "applying").await;
+    fx::run_apply(
+        &fx::scoped(pool).await,
+        &fx::apply_job(plan, world.actor, &correlation),
+        50,
+    )
+    .await
+    .expect("the apply run");
+    assert_eq!(
+        fx::plan_state(pool, plan).await,
+        "applied",
+        "CALIBRATION: the plan is revertible by state"
+    );
+    (plan, claim, format!("b3:{}", hex::encode(digest)))
+}
+
+fn revert_args<'a>(
+    plan: &'a str,
+    actor: &'a str,
+    assignment: &'a str,
+    extra: &[&'a str],
+) -> Vec<&'a str> {
+    let mut args = vec![
+        "privatization",
+        "revert",
+        "--plan",
+        plan,
+        "--actor",
+        actor,
+        "--assignment",
+        assignment,
+        "--reason",
+        "revert test",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// Review finding M1: the revert verb applies the route's authority gate,
+/// not only the live custodian assignment. A custodian holding the
+/// maintenance DSN but no membership in the plan's target group is refused,
+/// dry run and `--apply` alike, and nothing is written: no flip, no job, no
+/// custodial act. The plan's own group admin, a custodian too, is admitted
+/// (the calibration that the refusal is about the group, not the plan).
+///
+/// Verified to fail: with condition 4 removed from
+/// `revert_authority_refusal`, the outsider's dry run exits 0 (admitted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_custodian_outside_the_target_group_cannot_revert_its_plan(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    let (plan, _claim, echoed) = applied_plan(&pool, &world, "restrict").await;
+
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "d4-outsider").await;
+    let outsider_assignment = viewer_fixture::make_custodian(&pool, outsider).await;
+    let member_of_target: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM group_memberships \
+                         WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL)",
+    )
+    .bind(world.target_group)
+    .bind(outsider)
+    .fetch_one(&pool)
+    .await
+    .expect("read the outsider's membership");
+    assert!(
+        !member_of_target,
+        "CALIBRATION: the outsider is not in the group"
+    );
+
+    let dsn = maintenance_login(&pool).await;
+    let p = plan.to_string();
+
+    // CALIBRATION: the group's own admin passes the gate (dry run).
+    let (actor, actor_asg) = (
+        world.actor.to_string(),
+        custodian_assignment(&pool, world.actor).await.to_string(),
+    );
+    let admitted = operator(&revert_args(&p, &actor, &actor_asg, &[]), &dsn);
+    assert_eq!(admitted.code, 0, "{}", admitted.show());
+    assert!(
+        admitted.stdout.contains("WOULD BE REVERT-DISPATCHED"),
+        "{}",
+        admitted.show()
+    );
+
+    let (o, o_asg) = (outsider.to_string(), outsider_assignment.to_string());
+    let dry = operator(&revert_args(&p, &o, &o_asg, &[]), &dsn);
+    assert_eq!(dry.code, 1, "{}", dry.show());
+    assert!(
+        dry.stdout.contains("admin role in the plan's target group"),
+        "the dry run tells the truth: {}",
+        dry.show()
+    );
+    let applied = operator(
+        &revert_args(&p, &o, &o_asg, &["--apply", "--plan-digest", &echoed]),
+        &dsn,
+    );
+    assert_eq!(applied.code, 1, "{}", applied.show());
+    assert!(
+        applied.stdout.starts_with("REFUSED")
+            && applied
+                .stdout
+                .contains("admin role in the plan's target group"),
+        "refused on condition 4, not on the digest or the state: {}",
+        applied.show()
+    );
+    assert_eq!(fx::plan_state(&pool, plan).await, "applied");
+    assert_eq!(
+        jobs_naming(&pool, plan).await,
+        0,
+        "a refused revert wrote a job"
+    );
+    assert!(
+        custodial_acts(&pool, plan).await.is_empty(),
+        "a refused revert recorded a custodial act"
+    );
+}
+
+/// Review finding m3: the verb path refuses to revert a `seal` plan while
+/// one of its items is still sealed, as `revert_plan` does, and writes
+/// nothing. Setup as `privatization_revert.rs::
+/// revert_is_refused_while_a_seal_plan_item_is_still_sealed`.
+///
+/// Verified to fail: with the `sealed_item_count_conn` check removed from
+/// the verb, the dry run exits 0 (admitted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_revert_verb_refuses_a_seal_plan_with_a_sealed_item(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    sqlx::query(
+        "UPDATE groups SET kind = 'team', public_key = decode(repeat('ab', 32), 'hex') \
+          WHERE id = $1",
+    )
+    .bind(world.target_group)
+    .execute(&pool)
+    .await
+    .expect("promote the target group to a keyed one");
+    sqlx::query(
+        "INSERT INTO group_key_epochs (group_id, epoch, status) VALUES ($1, 0, 'active') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(world.target_group)
+    .execute(&pool)
+    .await
+    .expect("seed the active key epoch");
+    let (plan, claim, echoed) = applied_plan(&pool, &world, "seal").await;
+    fx::encrypt_claim(&pool, claim, world.target_group).await;
+
+    let dsn = maintenance_login(&pool).await;
+    let (p, actor, asg) = (
+        plan.to_string(),
+        world.actor.to_string(),
+        custodian_assignment(&pool, world.actor).await.to_string(),
+    );
+    for extra in [&[][..], &["--apply", "--plan-digest", &echoed][..]] {
+        let run = operator(&revert_args(&p, &actor, &asg, extra), &dsn);
+        assert_eq!(run.code, 1, "{}", run.show());
+        assert!(
+            run.stdout.contains("still sealed"),
+            "refused on the sealed item: {}",
+            run.show()
+        );
+    }
+    assert_eq!(fx::plan_state(&pool, plan).await, "applied");
+    assert_eq!(jobs_naming(&pool, plan).await, 0);
+    assert!(custodial_acts(&pool, plan).await.is_empty());
+}
