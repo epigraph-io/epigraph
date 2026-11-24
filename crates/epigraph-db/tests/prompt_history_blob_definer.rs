@@ -545,29 +545,38 @@ const FILE_276: &str = "SELECT content FROM public.epigraph_agent_prompt_history
 
 /// As the agent's operator and as an unarmed custodian, 276 answers every key
 /// exactly as 161 does: the same stored bytes for a file a readable member
-/// names (its own, a readable descendant's), nothing for the file only the
-/// other operator's parent names (an unreadable member, for the operator),
-/// and nothing for a key no snapshot names.
+/// names (its own, a readable descendant's), nothing for a file only an
+/// unreadable member names (for the operator: the other operator's parent
+/// ABOVE the agent and the third operator's child BELOW it, so a readable
+/// filter weakened for either direction of the walk is caught), and nothing
+/// for a key no snapshot names.
 #[sqlx::test(migrations = "../../migrations")]
 async fn every_key_is_answered_as_161_answers_it(pool: PgPool) {
     let operator = human_operator(&pool).await;
     let other = human_operator(&pool).await;
+    let third = human_operator(&pool).await;
     let custodian = human_operator(&pool).await;
     fixture::make_custodian(&pool, custodian).await;
     // Link after the agent's registration: a child registered under a linked
-    // parent inherits the parent's link.
+    // parent inherits the parent's link. The re-linked child is registered
+    // BEFORE the agent is linked, so it inherits no link and takes the third
+    // operator's.
     let parent = register(&pool, "g-ans-p", None).await;
     let agent = register(&pool, "g-ans-a", Some(parent)).await;
+    let relinked_child = register(&pool, "g-ans-d", Some(agent)).await;
+    link(&pool, relinked_child, third).await;
     link(&pool, agent, operator).await;
     link(&pool, parent, other).await;
     let _child = register(&pool, "g-ans-c", Some(agent)).await;
 
     let parents_only = key_of(&learned_of("g-ans-p"));
+    let relinked_childs_only = key_of(&learned_of("g-ans-d"));
     let keys = [
         key_of(SHARED),
         key_of(&learned_of("g-ans-a")),
         key_of(&learned_of("g-ans-c")),
         parents_only,
+        relinked_childs_only,
         random32(),
     ];
     for (who, label) in [(operator, "operator"), (custodian, "custodian")] {
@@ -594,6 +603,18 @@ async fn every_key_is_answered_as_161_answers_it(pool: PgPool) {
             .await
             .is_some(),
         "CALIBRATION: the unarmed custodian reads it"
+    );
+    assert!(
+        content_as(&pool, FILE_161, operator, agent, relinked_childs_only)
+            .await
+            .is_none(),
+        "CALIBRATION: the operator cannot read the third operator's child's file"
+    );
+    assert!(
+        content_as(&pool, FILE_161, custodian, agent, relinked_childs_only)
+            .await
+            .is_some(),
+        "CALIBRATION: the unarmed custodian reads the re-linked child's file"
     );
 }
 
