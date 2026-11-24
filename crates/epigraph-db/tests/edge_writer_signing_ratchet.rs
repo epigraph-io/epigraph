@@ -670,7 +670,7 @@ const REGISTER: &[Site] = &[
     // edges go through `create_ingest_written_edge_if_absent_conn`.
     site(
         "crates/epigraph-mcp/src/tools/ingestion.rs",
-        "do_ingest_document_reporting",
+        "ingest_document_walk_reporting",
         4,
         Signed,
     ),

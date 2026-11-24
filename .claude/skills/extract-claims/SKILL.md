@@ -141,9 +141,9 @@ all-or-nothing walk in the request and return its own result:
 
 The result's `doi` is the document_key. If the walk fails (verbatim-guard
 mismatch, malformed axis, a rejected row, an owner-group refusal) the call
-returns an **error** naming the cause and the document_key; no claims or edges
-were written (the papers row may exist with 0 claims), so fix the cause and
-retry: a retry is safe and converges on existing nodes.
+returns an **error** naming the cause and the document_key; no papers row,
+claims or edges were written, so fix the cause and retry: a retry is safe and
+converges on existing nodes.
 
 **Without `wait`** (the default) the call returns immediately after spawning a
 detached task:
@@ -153,10 +153,13 @@ detached task:
 ```
 
 The write may still be in flight, and if it fails the error reaches only the
-server log. Confirm a detached ingest only by `query_paper(document_key)`'s
-`claim_count` rising: the paper row exists as soon as the call returns, and
-`check_already_ingested` can already be true from an earlier spine or ingest
-of the same document, so neither proves the write landed. Do not fire a second
+server log. The background task writes the papers row too, in the same
+all-or-nothing transaction: a NEW document is not found by `query_paper` until
+the task commits, and one that never appears means the task failed (resubmit
+with `wait: true` to see why). Confirm a detached ingest only by
+`query_paper(document_key)`'s `claim_count` rising: `check_already_ingested`
+can already be true from an earlier spine or ingest of the same document, so it
+does not prove the write landed. Do not fire a second
 ingest call based on a timeout — the background task may still be running.
 One write at a time per paper is the correct pattern.
 
