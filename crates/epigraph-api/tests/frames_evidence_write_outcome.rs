@@ -771,7 +771,10 @@ async fn an_assessed_claims_frame_link_names_hypothesis_0_so_evidence_moves_beta
         .expect("assess request");
     let status = resp.status().as_u16();
     let text = resp.text().await.expect("assess body");
-    assert!(status == 200 || status == 201, "assess must succeed: {status} {text}");
+    assert!(
+        status == 200 || status == 201,
+        "assess must succeed: {status} {text}"
+    );
 
     let index: Option<i32> = sqlx::query_scalar(
         "SELECT hypothesis_index FROM claim_frames WHERE claim_id = $1 AND frame_id = $2",

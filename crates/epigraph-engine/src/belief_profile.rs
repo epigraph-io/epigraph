@@ -1160,7 +1160,11 @@ mod tests {
             !cal.section_tier_weights.is_empty(),
             "the calibration carries section tier weights"
         );
-        let named: Vec<&str> = cal.section_tier_weights.keys().map(String::as_str).collect();
+        let named: Vec<&str> = cal
+            .section_tier_weights
+            .keys()
+            .map(String::as_str)
+            .collect();
         for section in named
             .into_iter()
             .chain(["Introduction", "RESULTS", "appendix", ""])

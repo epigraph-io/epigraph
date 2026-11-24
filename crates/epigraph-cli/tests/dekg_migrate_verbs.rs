@@ -138,9 +138,16 @@ async fn create_frames_then_validate_end_to_end(pool: PgPool) {
         "--min-claims",
         "3",
     ]);
-    assert_eq!(created.code, 0, "create-frames must finish\n{}", created.show());
+    assert_eq!(
+        created.code,
+        0,
+        "create-frames must finish\n{}",
+        created.show()
+    );
     assert!(
-        created.stdout.contains("Created 2 frames, assigned 6 claims"),
+        created
+            .stdout
+            .contains("Created 2 frames, assigned 6 claims"),
         "create-frames reports what it wrote\n{}",
         created.show()
     );
@@ -184,7 +191,10 @@ async fn create_frames_then_validate_end_to_end(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("count bindings");
-    assert_eq!(bound, 6, "every seeded claim is bound to its cluster's frame");
+    assert_eq!(
+        bound, 6,
+        "every seeded claim is bound to its cluster's frame"
+    );
 
     let validated = dekg(&["migrate", "validate", "--db-url", &url]);
     assert_eq!(
@@ -243,7 +253,12 @@ async fn create_frames_cuts_names_on_a_character_boundary(pool: PgPool) {
         "--min-claims",
         "3",
     ]);
-    assert_eq!(created.code, 0, "create-frames must finish\n{}", created.show());
+    assert_eq!(
+        created.code,
+        0,
+        "create-frames must finish\n{}",
+        created.show()
+    );
 
     let frames: Vec<(String, Vec<String>)> = sqlx::query_as(
         "SELECT name, hypotheses FROM frames WHERE name LIKE 'Auto-frame-%' ORDER BY name",
@@ -254,9 +269,17 @@ async fn create_frames_cuts_names_on_a_character_boundary(pool: PgPool) {
     assert_eq!(frames.len(), 2, "{frames:?}");
     for (name, hypotheses) in &frames {
         let body = name.split_once(": ").map_or("", |(_, b)| b);
-        assert_eq!(body.len(), 59, "name cut back to the boundary at 59: {name:?}");
+        assert_eq!(
+            body.len(),
+            59,
+            "name cut back to the boundary at 59: {name:?}"
+        );
         for h in hypotheses {
-            assert_eq!(h.len(), 79, "hypothesis cut back to the boundary at 79: {h:?}");
+            assert_eq!(
+                h.len(),
+                79,
+                "hypothesis cut back to the boundary at 79: {h:?}"
+            );
         }
     }
 }
