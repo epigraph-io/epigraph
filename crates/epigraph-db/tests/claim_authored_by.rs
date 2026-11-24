@@ -55,11 +55,25 @@ async fn named(pool: &PgPool, agent: Uuid, name: &str) {
         .expect("name the agent");
 }
 
-/// A registered human operator with its personal group, named `name`.
+/// A registered human operator with its personal group, named `name`, opted
+/// in to a public profile as the self-service setter records it (`'public'`
+/// plus a consent stamp), so its name is shown to every reader. Before
+/// migration 283 (operator ruling C11) the fixture's column default
+/// `'public'` was read as that opt-in; it never was consent, and now names no
+/// one. The tests of the disclosure rule on this block set `'group'` through
+/// [`group_profile`].
 async fn human(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let (agent, group) = fixture::seed_agent_with_group(pool, name).await;
     fixture::make_human_operator(pool, agent).await;
     named(pool, agent, name).await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("opt in");
     (agent, group)
 }
 
@@ -1709,11 +1723,14 @@ async fn the_document_and_author_edges_are_filtered_in_the_query_itself(pool: Pg
 // ---------------------------------------------------------------------------
 
 async fn group_profile(pool: &PgPool, agent: Uuid) {
-    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
-        .bind(agent)
-        .execute(pool)
-        .await
-        .expect("group profile");
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', profile_public_consented_at = NULL \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("group profile");
 }
 
 /// Row D1: a human that INGESTED a claim it did not file (its ingest is no

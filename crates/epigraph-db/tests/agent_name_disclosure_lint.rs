@@ -226,14 +226,23 @@ const PENDING: &[(&str, &str)] = &[];
 // on HEAD it is read only for `= 'role'` checks (`cards_inner`,
 // `author_nodes`, `exact_name_candidates`), and a role node is public by
 // design; a future surface that serves it is review's to catch.
+// `profile_public_consented_at` (283, operator ruling C11) is set only on a
+// person who opted in, so a non-null value is human evidence too.
 const IDENTITY_COLUMNS: &[&str] = &[
     "display_name",
     "orcid",
     "ror_id",
     "properties",
     "profile_visibility",
+    "profile_public_consented_at",
 ];
-const BARE_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id", "profile_visibility"];
+const BARE_COLUMNS: &[&str] = &[
+    "display_name",
+    "orcid",
+    "ror_id",
+    "profile_visibility",
+    "profile_public_consented_at",
+];
 const NOT_ALIASES: &[&str] = &[
     "where",
     "on",

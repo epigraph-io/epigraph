@@ -905,6 +905,13 @@ async fn agents_tenancy_columns_are_intact(pool: PgPool) {
         ("default_private", "boolean", "NO"),
         ("key_kind", "character varying", "NO"),
         ("profile_visibility", "character varying", "NO"),
+        // 283 (operator ruling C11): when a human consented to a public
+        // profile; NULL until then, and the opt-in arm requires it.
+        (
+            "profile_public_consented_at",
+            "timestamp with time zone",
+            "YES",
+        ),
     ];
 
     for (name, data_type, nullable) in expected {

@@ -85,15 +85,23 @@ async fn superuser_server(pool: &PgPool) -> EpiGraphMcpFull {
         .with_scoped_pool(scoped)
 }
 
-/// A registered human operator with `display_name = name`.
+/// A registered human operator with `display_name = name`, opted in to a
+/// public profile as the self-service setter records it (`'public'` plus a
+/// consent stamp): these tests resolve an author by name as a stranger, which
+/// the disclosure rule admits only for a NAMED person. Before migration 283
+/// (operator ruling C11) the shared fixture's column default `'public'` was
+/// read as that opt-in; it never was consent, and now names no one.
 async fn human_named(pool: &PgPool, name: &str) -> Uuid {
     let (h, _) = fixture::seed_human_operator(pool, "author-resolution").await;
-    sqlx::query("UPDATE agents SET display_name = $2 WHERE id = $1")
-        .bind(h)
-        .bind(name)
-        .execute(pool)
-        .await
-        .expect("name the human");
+    sqlx::query(
+        "UPDATE agents SET display_name = $2, profile_visibility = 'public', \
+                profile_public_consented_at = now() WHERE id = $1",
+    )
+    .bind(h)
+    .bind(name)
+    .execute(pool)
+    .await
+    .expect("name the human");
     h
 }
 
@@ -2568,11 +2576,14 @@ async fn a_name_only_reingest_cannot_find_an_unnamed_person_by_spelling(pool: Pg
     let attacher = app_role_server(&pool).await;
     let name = "Philippa Unlisted";
     let person = human_named(&pool, name).await;
-    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
-        .bind(person)
-        .execute(&pool)
-        .await
-        .expect("group profile");
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', profile_public_consented_at = NULL \
+          WHERE id = $1",
+    )
+    .bind(person)
+    .execute(&pool)
+    .await
+    .expect("group profile");
     let reingest = |doi: &'static str| {
         let pool = pool.clone();
         async move {
@@ -2613,11 +2624,16 @@ async fn a_name_only_reingest_cannot_find_an_unnamed_person_by_spelling(pool: Pg
         "the spelling found the unnamed person: {also}"
     );
 
-    sqlx::query("UPDATE agents SET profile_visibility = 'public' WHERE id = $1")
-        .bind(person)
-        .execute(&pool)
-        .await
-        .expect("opt in");
+    // The opt-in as the self-service setter writes it: 'public' with a
+    // consent stamp (migration 283, operator ruling C11).
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = now() \
+          WHERE id = $1",
+    )
+    .bind(person)
+    .execute(&pool)
+    .await
+    .expect("opt in");
     let also = reingest(doi).await;
     assert!(
         also.as_array()

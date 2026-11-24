@@ -4606,6 +4606,18 @@ restart.
   widen, strip, re-time or delete a projection edge, and no application writer can write the
   marker. The grant / end / bind / unbind re-projection runs as maintenance and passes. Pinned
   by `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/282-undo.sql`.
+- **283**: `profile_public_consent` (operator ruling C11). Precondition PCN01 (55000): the
+  disclosure core is still 279's and the profile setter still 273's (md5). NEW column
+  `agents.profile_public_consented_at timestamptz` (no backfill: no one has consented) and
+  CHECK `agents_profile_public_consent_check` (a stamp only on a `'public'` profile). No
+  column privilege for the application role. `epigraph_agent_disclosure_for` re-stated: for a
+  HUMAN principal the profile term is `'public' AND consented`, in the opt-in arm and in the
+  details rule; non-humans and every other arm unchanged. `epigraph_set_profile_visibility`
+  re-stated to stamp `now()` on `'public'` and clear it on `'group'`. Pinned by
+  `epigraph-db/tests/human_identity_visibility.rs`
+  (`a_public_profile_without_recorded_consent_names_no_one`,
+  `the_consent_stamp_is_the_setters_alone`, the PCN01 refusal). Undo:
+  `docs/runbooks/283-undo.sql`.
 
 ## `-- no-transaction` migrations
 

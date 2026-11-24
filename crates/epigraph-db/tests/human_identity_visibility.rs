@@ -106,13 +106,36 @@ async fn named(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     (a, g)
 }
 
+/// Set `agent`'s profile as the self-service setter would leave it: `'public'`
+/// WITH a consent stamp (283's `profile_public_consented_at`, which the
+/// opt-in arm requires), `'group'` with none. A test that needs a `'public'`
+/// value nobody consented to (062's column default, a direct write) uses
+/// [`set_profile_unconsented`].
 async fn set_profile(pool: &PgPool, agent: Uuid, profile: &str) {
-    sqlx::query("UPDATE agents SET profile_visibility = $2 WHERE id = $1")
-        .bind(agent)
-        .bind(profile)
-        .execute(pool)
-        .await
-        .expect("profile");
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = $2, \
+                profile_public_consented_at = CASE WHEN $2 = 'public' THEN now() END \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .bind(profile)
+    .execute(pool)
+    .await
+    .expect("profile");
+}
+
+/// `'public'` written directly, with no consent stamp: what 062's column
+/// default left on every row, and what any writer other than the setter
+/// produces.
+async fn set_profile_unconsented(pool: &PgPool, agent: Uuid) {
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'public', profile_public_consented_at = NULL \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .execute(pool)
+    .await
+    .expect("unconsented profile");
 }
 
 /// A registered human operator whose profile is `'group'`, as provisioning
@@ -491,6 +514,90 @@ async fn a_public_profile_names_the_human_to_everyone(pool: PgPool) {
     assert!(
         named_to_guest(&pool, &scoped, h).await,
         "and to the guest viewer"
+    );
+}
+
+/// Operator ruling C11 (migration 283): the opt-in arm requires
+/// `profile_visibility = 'public'` AND a consent stamp only the self-service
+/// setter writes. A `'public'` nobody consented to (062's default, a direct
+/// write) names the human to no one, and does not widen the `details` of a
+/// human some other arm names. CALIBRATION: the same human, opted in through
+/// the setter, is named with details to an outsider.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_profile_without_recorded_consent_names_no_one(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Ines Elsewhere").await;
+    let (h, _) = human(&pool, "Jules Unconsenting").await;
+    set_profile_unconsented(&pool, h).await;
+    assert_eq!(
+        disclosure(&scoped, &viewer(&pool, outsider).await, h).await,
+        (false, false),
+        "an unconsented 'public' is not an opt-in"
+    );
+    assert!(!named_to_guest(&pool, &scoped, h).await, "nor to the guest");
+
+    // A human named by a public claim keeps its details hidden when its
+    // 'public' carries no consent (the details rule's profile term reads
+    // consent for a human too).
+    let (k, _) = human(&pool, "Kaspar Accountable").await;
+    let (bot, _) = named(&pool, "kaspar-bot").await;
+    link(&pool, bot, k).await;
+    fixture::seed_public_claim(&pool, bot, "kaspar's bot said this publicly").await;
+    set_profile_unconsented(&pool, k).await;
+    assert_eq!(
+        disclosure(&scoped, &viewer(&pool, outsider).await, k).await,
+        (true, false),
+        "named by the public claim, no details without consent"
+    );
+
+    // CALIBRATION: the setter records consent, and then the arm holds.
+    let set = set_as(&pool, &scoped, h, epigraph_db::ProfileVisibility::Public)
+        .await
+        .expect("opt in");
+    assert!(set.named_to_everyone);
+    assert_eq!(
+        disclosure(&scoped, &viewer(&pool, outsider).await, h).await,
+        (true, true),
+        "CALIBRATION: an opt-in through the setter names H with details"
+    );
+}
+
+/// C11: the consent stamp is written by the setter alone. The application
+/// role holds no UPDATE on the column (not even on its own row), and a stamp
+/// on a profile that is not `'public'` violates the table's CHECK, so an
+/// opt-out can never leave a stale consent behind for a later `'public'`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_consent_stamp_is_the_setters_alone(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = human(&pool, "Lorna Stamped").await;
+    let v = viewer(&pool, h).await;
+    let mut tx = scoped.begin_as(&v).await.expect("begin_as");
+    let r = sqlx::query("UPDATE agents SET profile_public_consented_at = now() WHERE id = $1")
+        .bind(h)
+        .execute(&mut *tx)
+        .await;
+    drop(tx);
+    let code = match r {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert_eq!(code.as_deref(), Some("42501"), "no column grant to the app");
+
+    let r = sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', \
+                profile_public_consented_at = now() WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await;
+    let code = match r {
+        Err(sqlx::Error::Database(e)) => e.code().map(|c| c.into_owned()),
+        other => panic!("expected the CHECK, got {other:?}"),
+    };
+    assert_eq!(
+        code.as_deref(),
+        Some("23514"),
+        "a consent stamp on a 'group' profile"
     );
 }
 
@@ -1050,6 +1157,14 @@ async fn profile_of(pool: &PgPool, agent: Uuid) -> String {
         .expect("profile")
 }
 
+async fn consent_of(pool: &PgPool, agent: Uuid) -> Option<chrono::DateTime<chrono::Utc>> {
+    sqlx::query_scalar("SELECT profile_public_consented_at FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("consent stamp")
+}
+
 fn refusal_kind(r: Result<epigraph_db::ProfileVisibilitySet, epigraph_db::DbError>) -> String {
     match r {
         Err(epigraph_db::DbError::Refused { kind, message }) => format!("{kind:?} {message}"),
@@ -1072,6 +1187,10 @@ async fn a_human_sets_its_own_profile_and_is_told_the_effective_state(pool: PgPo
     assert_eq!(set.previous, "group");
     assert_eq!(set.profile_visibility, "public");
     assert!(
+        consent_of(&pool, h).await.is_some(),
+        "C11: the opt-in records when H consented"
+    );
+    assert!(
         set.named_to_everyone,
         "a public profile is named to everyone"
     );
@@ -1092,6 +1211,11 @@ async fn a_human_sets_its_own_profile_and_is_told_the_effective_state(pool: PgPo
     assert!(
         !named_to(&pool, &scoped, outsider, h).await,
         "opted out: unnamed"
+    );
+    assert_eq!(
+        consent_of(&pool, h).await,
+        None,
+        "C11: the opt-out clears the consent stamp"
     );
 
     let audits: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
@@ -1314,7 +1438,12 @@ async fn seed_reset_population(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
     .expect("provider client");
     let (already, _) = named(pool, "Gita Already").await;
     fixture::make_human_operator(pool, already).await;
-    set_profile(pool, already, "group").await;
+    // Below 274 (and 283): the column alone, no consent stamp yet.
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(already)
+        .execute(pool)
+        .await
+        .expect("already group");
     let (svc, _) = named(pool, "Plain Software").await;
     (op, prov, already, svc)
 }
@@ -1417,6 +1546,36 @@ async fn migration_279_refuses_over_another_core_body(pool: PgPool) {
         .await
         .expect_err("279 must refuse over another body");
     assert!(err.contains("DAO01"), "precondition refusal: {err}");
+}
+
+/// 283 re-states 279's core and 273's setter; over any other body of either
+/// it refuses (PCN01) with nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_283_refuses_over_another_core_or_setter_body(pool: PgPool) {
+    migrate(&pool, &below(283)).await.expect("migrate to 282");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_set_profile_visibility(p_visibility text) \
+         RETURNS TABLE (previous text, profile_visibility text, named_to_everyone boolean) \
+         LANGUAGE plpgsql VOLATILE SECURITY DEFINER \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT NULL::text, NULL::text, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another setter body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("283 must refuse over another setter body");
+    assert!(err.contains("PCN01"), "precondition refusal: {err}");
+    let column: Option<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns \
+          WHERE table_schema = 'public' AND table_name = 'agents' \
+            AND column_name = 'profile_public_consented_at'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("column lookup");
+    assert_eq!(column, None, "nothing was changed");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

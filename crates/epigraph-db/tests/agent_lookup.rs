@@ -72,13 +72,20 @@ async fn named_human(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     (a, g)
 }
 
+/// Set `agent`'s profile as the self-service setter leaves it: `'public'`
+/// with a consent stamp (migration 283, operator ruling C11: the opt-in arm
+/// requires one), `'group'` with none.
 async fn set_profile(pool: &PgPool, agent: Uuid, profile: &str) {
-    sqlx::query("UPDATE agents SET profile_visibility = $2 WHERE id = $1")
-        .bind(agent)
-        .bind(profile)
-        .execute(pool)
-        .await
-        .expect("profile");
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = $2, \
+                profile_public_consented_at = CASE WHEN $2 = 'public' THEN now() END \
+          WHERE id = $1",
+    )
+    .bind(agent)
+    .bind(profile)
+    .execute(pool)
+    .await
+    .expect("profile");
 }
 
 async fn link(pool: &PgPool, agent: Uuid, operator: Uuid) {

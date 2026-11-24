@@ -435,6 +435,9 @@ async fn agents_identity_columns_are_not_app_updatable(pool: PgPool) {
         // only through the audited self-service definer
         // `epigraph_set_profile_visibility`, never by a column grant.
         "profile_visibility",
+        // When that human consented to a public profile (283, operator
+        // ruling C11): stamped and cleared by the same definer only.
+        "profile_public_consented_at",
     ] {
         let r = sqlx::query(&format!("UPDATE agents SET {col} = {col} WHERE id = $1"))
             .bind(agent)
