@@ -4683,6 +4683,21 @@ restart.
   `an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`, the PAK01 refusal)
   and `claim_authored_by.rs::a_human_ingesters_public_record_names_it_to_every_reader`. Undo:
   `docs/runbooks/295-undo.sql` (288's body).
+- **296**: `idx_security_events_countersigned (agent_id, created_at) WHERE event_type =
+  'authorship.countersigned'` (operator ruling C2), a single-statement `-- no-transaction`
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 297's probe of 208's countersign audit rows, one
+  descent per bound agent. Registered in `tenancy_migration_shape.rs::INDEX_MIGRATIONS`.
+- **297**: `disclosure_countersigned_authorship` (operator ruling C2; spec R3). Precondition
+  CSN01 (55000): the core is still 295's (md5). Re-states `epigraph_agent_disclosure_for` with
+  one arm after 295's: a 208 `authorship.countersigned` audit row whose caller is an agent of
+  B(H), at or after its binding start (288), on a paper that is `'public'` or owned by one of the
+  viewer's groups (246's `papers_read`). The audit row, not the edge's
+  `epigraph:countersigned_by:` label, because only the row carries the act's time; 208's
+  RESTRICTIVE policy reserves it to definer frames with `created_at = now()`. A pending naming,
+  or a declined one, names no one. Pinned by `human_identity_visibility.rs`
+  (`a_countersigned_authorship_of_a_readable_paper_names_the_human`,
+  `a_countersign_from_before_the_binding_never_names_the_human`, the CSN01 refusal). Undo:
+  `docs/runbooks/297-undo.sql` (295's body).
 
 ## `-- no-transaction` migrations
 

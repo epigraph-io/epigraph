@@ -78,6 +78,12 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "294_idx_edges_public_ingest_records_by_ingester.sql",
         "idx_edges_public_ingest_records_by_ingester",
     ),
+    // The per-bound-agent probe of 297's countersigned-authorship arm
+    // (operator ruling C2).
+    (
+        "296_idx_security_events_countersigned.sql",
+        "idx_security_events_countersigned",
+    ),
 ];
 
 /// `-- no-transaction` index files whose index no longer exists at head: 275 and
@@ -372,11 +378,19 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
               LIMIT 1",
             "idx_edges_public_ingest_records_by_ingester",
         ),
+        // 297's countersigned-authorship probe (C2).
+        (
+            "SELECT 1 FROM security_events s \
+              WHERE s.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+                AND s.event_type = 'authorship.countersigned' \
+                AND s.created_at >= '2026-01-01'::timestamptz LIMIT 1",
+            "idx_security_events_countersigned",
+        ),
     ] {
         let plan = explain(&mut conn, probe).await;
         assert!(
             plan.contains(index) && plan.contains("created_at >="),
-            "295's probe must reach {index} with the binding start as an index bound. \
+            "the core's probe must reach {index} with the binding start as an index bound. \
              Plan:\n{plan}"
         );
     }

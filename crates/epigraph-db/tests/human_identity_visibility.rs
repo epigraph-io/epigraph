@@ -1029,6 +1029,186 @@ async fn an_assertion_of_any_kind_from_before_the_binding_never_names_the_human(
     }
 }
 
+// ─── C2: a countersigned authorship (operator ruling) ───────────────────
+
+/// A paper of `visibility` owned by `owner` (explicit tenancy).
+async fn paper_owned(pool: &PgPool, visibility: &str, owner: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'A Fixture Paper', $2, $3) RETURNING id",
+    )
+    .bind(format!("10.9999/countersign.{}", Uuid::new_v4()))
+    .bind(visibility)
+    .bind(owner)
+    .fetch_one(pool)
+    .await
+    .expect("paper")
+}
+
+/// `by`'s document ingest names `author` an author of `paper`, PENDING the
+/// author's countersign (an ingester naming someone it does not speak for:
+/// the ingest-written `authored` row with `pending_countersign`).
+async fn pending_authorship(pool: &PgPool, by: Uuid, author: Uuid, paper: Uuid) {
+    let mut conn = pool.acquire().await.expect("conn");
+    let (_, created) = epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        by,
+        author,
+        "agent",
+        paper,
+        "paper",
+        "authored",
+        Some(serde_json::json!({
+            "pending_countersign": true,
+            "ingested_by": by.to_string(),
+            "position": 0,
+        })),
+    )
+    .await
+    .expect("pending authorship");
+    assert!(created, "CALIBRATION: the pending authorship was written");
+}
+
+/// `caller` confirms `agent`'s (default: its own) pending authorship of
+/// `paper` through 208's definer on its own stamped transaction.
+async fn confirm_authorship(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    caller: Uuid,
+    paper: Uuid,
+    agent: Option<Uuid>,
+) {
+    let v = viewer(pool, caller).await;
+    let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+    let rows = epigraph_db::CountersignRepository::countersign_conn(
+        &mut tx,
+        paper,
+        agent,
+        epigraph_db::CountersignDecision::Confirm,
+        None,
+    )
+    .await
+    .expect("countersign");
+    assert_eq!(
+        rows.len(),
+        1,
+        "CALIBRATION: one pending authorship confirmed"
+    );
+    tx.commit().await.expect("commit");
+}
+
+/// Operator ruling C2: a countersigned authorship (the person's own act) of a
+/// paper the viewer can read names the person, as a claim does. Confirmed by
+/// the person for itself, by a linked agent for itself, or by the person as
+/// its agent's live operator. An ingest's naming that nobody countersigned
+/// names no one; a group paper's countersign names the person to that group's
+/// readers only.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_countersigned_authorship_of_a_readable_paper_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let world = fixture::world_group(&pool).await;
+    let (outsider, _) = named(&pool, "Dario Distant").await;
+    let (ingester, _) = named(&pool, "ingest-bot").await;
+
+    // The person itself, named pending by a stranger's ingest.
+    let (h1, _) = human(&pool, "Edda Author").await;
+    let p1 = paper_owned(&pool, "public", world).await;
+    pending_authorship(&pool, ingester, h1, p1).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h1).await,
+        "an ingest-named authorship nobody countersigned must not name the person"
+    );
+    assert!(
+        !named_to_guest(&pool, &scoped, h1).await,
+        "nor to the guest viewer"
+    );
+    confirm_authorship(&pool, &scoped, h1, p1, None).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h1).await,
+        "the person's countersign of a public paper names it"
+    );
+    assert!(
+        named_to_guest(&pool, &scoped, h1).await,
+        "to the guest viewer too"
+    );
+
+    // A linked agent confirms its own authorship.
+    let (h2, _) = human(&pool, "Finn Fleet").await;
+    let (bot2, _) = named(&pool, "finn-bot").await;
+    link(&pool, bot2, h2).await;
+    let p2 = paper_owned(&pool, "public", world).await;
+    pending_authorship(&pool, ingester, bot2, p2).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h2).await,
+        "CALIBRATION: pending, the agent's naming names no human"
+    );
+    confirm_authorship(&pool, &scoped, bot2, p2, None).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h2).await,
+        "a linked agent's countersign names its human"
+    );
+
+    // The person confirms as its agent's live operator.
+    let (h3, _) = human(&pool, "Gerd Operator").await;
+    let (bot3, _) = named(&pool, "gerd-bot").await;
+    link(&pool, bot3, h3).await;
+    let p3 = paper_owned(&pool, "public", world).await;
+    pending_authorship(&pool, ingester, bot3, p3).await;
+    confirm_authorship(&pool, &scoped, h3, p3, Some(bot3)).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h3).await,
+        "the person's countersign as live operator names it"
+    );
+
+    // A group paper: only its readers.
+    let (h4, _) = human(&pool, "Hedi Grouped").await;
+    let (reader, _) = named(&pool, "Ines Reader").await;
+    let team = keyed_team(&pool, &[reader]).await;
+    let p4 = paper_owned(&pool, "group", team).await;
+    pending_authorship(&pool, ingester, h4, p4).await;
+    confirm_authorship(&pool, &scoped, h4, p4, None).await;
+    assert!(
+        named_to(&pool, &scoped, reader, h4).await,
+        "a countersign of a group paper names the person to its readers"
+    );
+    assert!(
+        !named_to(&pool, &scoped, outsider, h4).await,
+        "and to no one who cannot read the paper"
+    );
+}
+
+/// C2 is windowed as C5 is: a linked agent's countersign made BEFORE its
+/// binding to H began never names H. The person's own countersign of the
+/// agent's next naming, after the link, does (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_countersign_from_before_the_binding_never_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let world = fixture::world_group(&pool).await;
+    let (outsider, _) = named(&pool, "Jo Onlooker").await;
+    let (ingester, _) = named(&pool, "ingest-bot-2").await;
+    let (h, _) = human(&pool, "Kira Late").await;
+    let (bot, _) = named(&pool, "kira-bot").await;
+    let p1 = paper_owned(&pool, "public", world).await;
+    pending_authorship(&pool, ingester, bot, p1).await;
+    // The countersign's audit row is stamped `now()` (208's RESTRICTIVE policy),
+    // so it precedes the link written after it.
+    confirm_authorship(&pool, &scoped, bot, p1, None).await;
+    link(&pool, bot, h).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "a countersign from before the link must not name the human"
+    );
+    let p2 = paper_owned(&pool, "public", world).await;
+    pending_authorship(&pool, ingester, bot, p2).await;
+    confirm_authorship(&pool, &scoped, h, p2, Some(bot)).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h).await,
+        "CALIBRATION: the person's countersign after the link names it"
+    );
+}
+
 // ─── T8: a stranger cannot unhide H ──────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1974,6 +2154,39 @@ async fn migration_295_refuses_over_another_core_body(pool: PgPool) {
     .await
     .expect("core source");
     assert!(!src.contains("ingested_claim"), "nothing was changed");
+}
+
+/// 297 (C2) re-states 295's core; over any other body it refuses (CSN01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_297_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(297)).await.expect("migrate to 296");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("297 must refuse over another body");
+    assert!(err.contains("CSN01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(
+        !src.contains("authorship.countersigned"),
+        "nothing was changed"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]
