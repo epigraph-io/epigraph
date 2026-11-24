@@ -302,16 +302,29 @@ impl GroupMembershipRepository {
     /// [`Self::revoke_member_unless_last_admin`] on a transaction the CALLER
     /// owns: every statement above, in the same order, and no `BEGIN` /
     /// `COMMIT` of its own. The roster lock is held until the caller commits,
-    /// so the guard's argument is unchanged as long as `conn` is a transaction
-    /// (the caller must not pass a bare autocommit connection: each statement
-    /// would then release the roster lock as it finished).
+    /// so the guard's argument is unchanged as long as `conn` is a transaction.
+    ///
+    /// # An autocommit connection is refused, before anything else runs
+    ///
+    /// On a bare autocommit connection each statement is its own transaction,
+    /// so the roster lock would be released as soon as the lock statement
+    /// finished and two concurrent removals could again each see the other
+    /// admin. The type cannot say "a transaction" (`ScopedTx` derefs to a
+    /// plain `PgConnection`, and a caller may have opened its transaction
+    /// with a raw `BEGIN` sqlx does not track), so the FIRST statement is a
+    /// probe: `SAVEPOINT` outside a transaction block is SQLSTATE 25P01, and
+    /// that is answered as [`DbError::InvalidData`] with nothing locked or
+    /// written (backlog 556c5416). Before the probe the call was still
+    /// refused, but only by accident: the re-key mark's own `SAVEPOINT`, after
+    /// the roster lock had already been taken and dropped, raised a bare 25P01.
     ///
     /// `DELETE /api/v1/groups/:id/members/:agent_id` calls this on the
     /// caller's `ScopedPool::begin_as` transaction (backlog 323773fe), the
     /// same one its admin check ran on.
     ///
     /// # Errors
-    /// Returns `DbError::QueryFailed` if any statement fails.
+    /// Returns `DbError::InvalidData` on an autocommit connection (nothing
+    /// locked or written), `DbError::QueryFailed` if any statement fails.
     #[instrument(skip(conn))]
     pub async fn revoke_member_unless_last_admin_conn(
         conn: &mut sqlx::PgConnection,
@@ -319,6 +332,28 @@ impl GroupMembershipRepository {
         agent_id: Uuid,
     ) -> Result<RevokeOutcome, DbError> {
         let tx = conn;
+
+        // A TRANSACTION, OR NOTHING (see the doc comment). The probe is a
+        // savepoint of its own, released at once, so it leaves the caller's
+        // transaction exactly as it found it.
+        match sqlx::query("SAVEPOINT revoke_member_requires_tx")
+            .execute(&mut *tx)
+            .await
+        {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("25P01") => {
+                return Err(DbError::InvalidData {
+                    reason: "revoke_member_unless_last_admin_conn: the connection is not inside \
+                             a transaction block, so the roster lock would not be held; open a \
+                             transaction and call it on that. Nothing was locked or revoked."
+                        .to_string(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
+        sqlx::query("RELEASE SAVEPOINT revoke_member_requires_tx")
+            .execute(&mut *tx)
+            .await?;
 
         // THE ROWS THE GUARD READS AND WRITES, LOCKED BEFORE IT READS THEM.
         // The `UPDATE` below locks only the row it writes; this locks the whole
