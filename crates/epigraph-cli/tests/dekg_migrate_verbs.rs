@@ -283,3 +283,94 @@ async fn create_frames_cuts_names_on_a_character_boundary(pool: PgPool) {
         }
     }
 }
+
+/// A group-visible claim's text never reaches an instance-wide frame, and the
+/// claim is never bound to one.
+///
+/// `create-frames` reads through the maintenance pool, which row security does
+/// not filter, and writes every frame `visibility = 'public'` under the world
+/// group with a name and hypotheses quoted from its members. A whole cluster
+/// of group claims (axis 20) and one group claim inside a public cluster
+/// (axis 0) are seeded next to two public clusters; only the public claims may
+/// be clustered, named, quoted or bound.
+///
+/// Verified to fail: with the `visibility = 'public'` filter removed, the
+/// group cluster becomes a third `Auto-frame-*` frame whose name and
+/// hypotheses carry the group claims' text, and the group claims are bound.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_frames_never_quotes_or_binds_a_group_claim(pool: PgPool) {
+    const MARK: &str = "GROUP-ONLY-TEXT";
+    let agent = seed_agent(&pool).await;
+    for (axis, label) in [(0usize, "alpha"), (10usize, "beta")] {
+        for j in 0..3u8 {
+            let content = format!("dekg scope public {label} member {j}");
+            let emb = embedding(axis, f32::from(j) * 0.01);
+            seed_claim(&pool, agent, &content, &emb).await;
+        }
+    }
+    let (member, group) = fixture::seed_agent_with_group(&pool, "dekg-scope").await;
+    let mut private = Vec::new();
+    for (axis, j) in [(20usize, 0u8), (20, 1), (20, 2), (0, 3)] {
+        let content = format!("{MARK} dekg scope group claim {axis}-{j}");
+        let id = fixture::seed_group_claim(&pool, member, group, &content).await;
+        fixture::set_claim_embedding(&pool, id, &embedding(axis, f32::from(j) * 0.01)).await;
+        private.push(id);
+    }
+    let url = fixture::database_url_for(&pool).await;
+
+    let created = dekg(&[
+        "migrate",
+        "create-frames",
+        "--db-url",
+        &url,
+        "--k-min",
+        "3",
+        "--k-max",
+        "3",
+        "--min-claims",
+        "2",
+    ]);
+    assert_eq!(
+        created.code,
+        0,
+        "create-frames must finish\n{}",
+        created.show()
+    );
+    assert!(
+        !created.stdout.contains(MARK),
+        "a group claim's text is never printed\n{}",
+        created.show()
+    );
+
+    let frames: Vec<(String, Vec<String>, String)> = sqlx::query_as(
+        "SELECT name, hypotheses, visibility FROM frames WHERE name LIKE 'Auto-frame-%'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read auto frames");
+    // Six public points in two tight groups under k = 3: at least one cluster
+    // keeps two or more members, so the run did write frames (the check below
+    // is not passing over an empty table).
+    assert!(
+        !frames.is_empty(),
+        "public clusters still become frames\n{}",
+        created.show()
+    );
+    for (name, hypotheses, visibility) in &frames {
+        assert_eq!(visibility, "public", "auto frames are instance-wide");
+        assert!(
+            !name.contains(MARK) && hypotheses.iter().all(|h| !h.contains(MARK)),
+            "an instance-wide frame quotes a group claim: {name:?} {hypotheses:?}"
+        );
+    }
+
+    let bound: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM claim_frames cf JOIN frames f ON f.id = cf.frame_id \
+         WHERE f.name LIKE 'Auto-frame-%' AND cf.claim_id = ANY($1)",
+    )
+    .bind(&private)
+    .fetch_one(&pool)
+    .await
+    .expect("count group-claim bindings");
+    assert_eq!(bound, 0, "no group claim is bound to an auto frame");
+}

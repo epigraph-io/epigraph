@@ -311,7 +311,7 @@ enum MigrateCmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Auto-create frames by clustering claim embeddings (k-means via linfa)
+    /// Auto-create public frames by clustering PUBLIC claim embeddings (k-means via linfa)
     CreateFrames {
         /// Database URL (overrides DATABASE_URL env var)
         #[arg(long, env = "DATABASE_URL", hide_env_values = true)]
@@ -1291,10 +1291,21 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
             //    `real[]` directly; going through `::text` handed Postgres
             //    pgvector's `[..]` rendering, which array input refuses as a
             //    malformed literal on every row (backlog 06385b31).
+            //
+            //    PUBLIC CLAIMS ONLY. This pool is the maintenance pool, which
+            //    row security does not filter, and every frame below is
+            //    written instance-wide (`visibility = 'public'`, the world
+            //    group) with a name and hypotheses QUOTED from its members'
+            //    content. A group-visible claim read here would have its text
+            //    copied into a row every authenticated reader can list, and
+            //    its frame binding would name a hypothesis space built from
+            //    other groups' text. Group claims are left out of the
+            //    clustering entirely.
             let rows: Vec<(Uuid, String, Vec<f32>)> = sqlx::query_as(
                 r#"SELECT id, content, embedding::real[]
                    FROM claims
                    WHERE embedding IS NOT NULL
+                     AND visibility = 'public'
                    ORDER BY id"#,
             )
             .fetch_all(&pool)
