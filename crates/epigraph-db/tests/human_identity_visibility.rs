@@ -1346,6 +1346,48 @@ async fn migration_274_refuses_over_another_provision_body(pool: PgPool) {
     assert!(err.contains("PVR01"), "precondition refusal: {err}");
 }
 
+/// Migration 279 re-orders 277's core (review finding correctness#3): it
+/// refuses over a core whose body is not 277's (DAO01), and at head the
+/// readable-claim arm precedes the role-derived probe.
+#[sqlx::test(migrations = false)]
+async fn migration_279_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(279)).await.expect("migrate to 278");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("279 must refuse over another body");
+    assert!(err.contains("DAO01"), "precondition refusal: {err}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_role_derived_probe_is_the_cores_last_arm(pool: PgPool) {
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    let readable = src.find("readable claim:").expect("readable arm");
+    let derived = src
+        .find("epigraph_role_derived_memberships")
+        .expect("role-derived arm");
+    assert!(
+        readable < derived,
+        "the 0.6 s role-derived probe must run after the readable-claim arm"
+    );
+}
+
 /// Finding 14 (spec F4): the column default stays `'public'`, so a new path
 /// that inserts agents could create a human that reads as consented. The
 /// exact set of functions whose body inserts into `public.agents` is pinned:
@@ -2099,5 +2141,175 @@ async fn a_role_derived_teammate_sees_the_human_in_both_directions(pool: PgPool)
     assert!(
         named_to(&pool, &scoped, v2, h2).await,
         "V holds the role bound to H's team: a teammate"
+    );
+}
+
+/// Migration 279's cheap role probe (review finding correctness#3 option
+/// (b)) answers exactly as 249's `epigraph_role_derived_memberships` does,
+/// for targets no other arm names: a live binding, a binding whose
+/// revocation is FUTURE-dated (still live now), a binding revoked in the
+/// past, a target linked as another human's agent (the fallback to 249,
+/// which admits it through an `include_agents` binding of its operator's
+/// role), and a target holding a 149 allowance (the same fallback). Each
+/// reference answer is computed from 249's function itself, and the cases
+/// that only the fallback can name are calibrated true, so the equivalence
+/// cannot pass by both sides answering false.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_cheap_role_probe_answers_as_249_does(pool: PgPool) {
+    async fn bind_with(
+        pool: &PgPool,
+        group: Uuid,
+        role: &str,
+        agents: bool,
+        revoked: Option<&str>,
+    ) {
+        let mut c = pool.acquire().await.expect("acquire");
+        if revoked.is_some() {
+            sqlx::query("SET session_replication_role = replica")
+                .execute(&mut *c)
+                .await
+                .expect("replica");
+        }
+        sqlx::query(&format!(
+            "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, \
+                                              reason, revoked_at, revoked_by, revoked_reason) \
+             VALUES ($1, $2, 'reader', $3, 'equivalence fixture', {}, {}, {})",
+            revoked.map_or("NULL".to_string(), |r| format!("now() + interval '{r}'")),
+            if revoked.is_some() {
+                "'fixture'"
+            } else {
+                "NULL"
+            },
+            if revoked.is_some() {
+                "'fixture end'"
+            } else {
+                "NULL"
+            },
+        ))
+        .bind(group)
+        .bind(role)
+        .bind(agents)
+        .execute(&mut *c)
+        .await
+        .expect("binding");
+        sqlx::query("SET session_replication_role = origin")
+            .execute(&mut *c)
+            .await
+            .expect("origin");
+    }
+    async fn reference(pool: &PgPool, target: Uuid, groups: &[Uuid]) -> bool {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM public.epigraph_role_derived_memberships($1, now()) d \
+                              JOIN groups g ON g.id = d.group_id \
+                             WHERE d.group_id = ANY ($2) \
+                               AND g.kind IN ('team', 'community') AND g.status = 'active')",
+        )
+        .bind(target)
+        .bind(groups)
+        .fetch_one(pool)
+        .await
+        .expect("249 reference")
+    }
+    async fn core(pool: &PgPool, target: Uuid, groups: &[Uuid]) -> bool {
+        sqlx::query_scalar(
+            "SELECT named FROM public.epigraph_agent_disclosure_for($1, NULL, $2, false)",
+        )
+        .bind(target)
+        .bind(groups)
+        .fetch_one(pool)
+        .await
+        .expect("core")
+    }
+    let (v, _) = named(&pool, "Equivalence Reader").await;
+    for r in ["a", "b", "c", "d", "e"] {
+        seed_role(&pool, &format!("role:hiv-eq-{r}")).await;
+    }
+    let mut cases: Vec<(&str, Uuid, Uuid, Option<bool>)> = Vec::new();
+
+    // A: H holds a role live-bound to G.
+    let (ha, _) = human(&pool, "Equivalence Live").await;
+    let ga = keyed_team(&pool, &[v]).await;
+    bind_with(&pool, ga, "role:hiv-eq-a", false, None).await;
+    grant_role(&pool, "role:hiv-eq-a", ha).await;
+    cases.push(("live binding", ha, ga, Some(true)));
+
+    // B: the binding's revocation is future-dated: live now.
+    let (hb, _) = human(&pool, "Equivalence Future").await;
+    let gb = keyed_team(&pool, &[v]).await;
+    grant_role(&pool, "role:hiv-eq-b", hb).await;
+    bind_with(&pool, gb, "role:hiv-eq-b", false, Some("1 hour")).await;
+    cases.push(("future-dated revocation", hb, gb, Some(true)));
+
+    // C: the binding was revoked in the past.
+    let (hc, _) = human(&pool, "Equivalence Past").await;
+    let gc = keyed_team(&pool, &[v]).await;
+    grant_role(&pool, "role:hiv-eq-c", hc).await;
+    bind_with(&pool, gc, "role:hiv-eq-c", false, Some("-1 hour")).await;
+    cases.push(("past revocation", hc, gc, Some(false)));
+
+    // D: a human principal linked as the agent of O, who holds a role bound
+    // with include_agents: only 249's via-agent candidate admits it.
+    let (od, _) = human(&pool, "Equivalence Operator D").await;
+    let (td, _) = client_only_human(&pool, "Equivalence Linked").await;
+    set_profile(&pool, td, "group").await;
+    link(&pool, td, od).await;
+    let gd = keyed_team(&pool, &[v]).await;
+    bind_with(&pool, gd, "role:hiv-eq-d", true, None).await;
+    grant_role(&pool, "role:hiv-eq-d", od).await;
+    cases.push(("linked as an agent", td, gd, None));
+
+    // E: a person whose human client was REVOKED (still a human principal:
+    // the evidence is structural, 272) and who holds a live service client
+    // allowlisted to O2 (149 admits no second non-revoked client), whose role
+    // is bound with include_agents.
+    let (oe, _) = human(&pool, "Equivalence Operator E").await;
+    let (te, _) = allowance_bound(&pool, oe, "Equivalence Allowed").await;
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'Equivalence Allowed', 'human', ARRAY['claims:write'], 'revoked', $2)",
+    )
+    .bind(format!("fixture-provider:{te}"))
+    .bind(te)
+    .execute(&pool)
+    .await
+    .expect("human client");
+    set_profile(&pool, te, "group").await;
+    let ge = keyed_team(&pool, &[v]).await;
+    bind_with(&pool, ge, "role:hiv-eq-e", true, None).await;
+    grant_role(&pool, "role:hiv-eq-e", oe).await;
+    cases.push(("allowance holder", te, ge, None));
+
+    let mut fallback_named = Vec::new();
+    for (label, target, group, want) in cases {
+        let is_human: bool = sqlx::query_scalar("SELECT public.epigraph_is_human_principal($1)")
+            .bind(target)
+            .fetch_one(&pool)
+            .await
+            .expect("evidence");
+        assert!(
+            is_human,
+            "CALIBRATION ({label}): the target is a human principal"
+        );
+        let r = reference(&pool, target, &[group]).await;
+        if let Some(w) = want {
+            assert_eq!(r, w, "CALIBRATION ({label}): 249's answer");
+        } else if r {
+            fallback_named.push(label);
+        }
+        assert_eq!(
+            core(&pool, target, &[group]).await,
+            r,
+            "{label}: the core's role arm disagrees with 249"
+        );
+        assert!(
+            !core(&pool, target, &[]).await,
+            "CALIBRATION ({label}): no other arm names the target"
+        );
+    }
+    assert_eq!(
+        fallback_named,
+        vec!["linked as an agent", "allowance holder"],
+        "CALIBRATION: both fallback targets are named by 249's via-agent candidate"
     );
 }

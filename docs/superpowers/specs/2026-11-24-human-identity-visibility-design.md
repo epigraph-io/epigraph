@@ -748,6 +748,12 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   the re-own trigger as a second projection maintainer. Undo:
   `docs/runbooks/278-undo.sql` (130's body back; the backfill is not reversed).
 
+- **M8 `279_disclosure_role_derived_arm_last.sql`** (after review, correctness#3,
+  transactional): md5 precondition `DAO01` on 277's core body; the core re-stated with the
+  readable-claim arm before the role-derived arm, and the role-derived arm's cheap probe
+  (§11.1, after review). Same signature, owner, ACL, COST and path. Undo:
+  `docs/runbooks/279-undo.sql` (277's body).
+
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
 §11 run measures insert cost.
@@ -900,7 +906,27 @@ and 600-662 ms without (triggers off, so the difference is the indexes): +15-60 
   one without changing the data model: **[OPEN] C12** below.
 
 `human_identity_visibility_perf.rs` asserts only what it can state exactly (no `claims`
-sequential scan; calls per match well under the table); it prints the rest.
+sequential scan; calls per match well under the table); it prints the rest. It is an
+`#[ignore]`d measurement harness, not a regression gate (review tests#7): the performance
+claims here rest on the recorded runs.
+
+**After review (correctness#3, migration 279): a viewer group carries a role binding.**
+The production shape (a role bound to a team) was not measured before review. Same shape,
+plus one `group_role_bindings` row on the viewer's first group:
+
+| Case | 277 (before 279) | 279 |
+|---|---|---|
+| H holds no bound role (a miss) | 617 ms p50, 657 ms max | 28.0 ms p50, 30.5 ms max |
+| H holds the role bound to a viewer group (role-derived names) | 645 ms p50, 742 ms max | 27.9 ms p50, 33.3 ms max |
+| worst case, no binding (unchanged) | 27.1 ms p50 | 27.2 ms p50 |
+
+277 called 249's `epigraph_role_derived_memberships` (about 0.56 s on its own here) for
+every evaluation once any viewer group carried a binding. 279 runs that arm last and,
+for a target linked as nobody's agent and holding no allowance (where 249's candidate set
+is the target alone), replaces the call with one binding probe per viewer group, pinned
+equal to 249 by `human_identity_visibility.rs::the_cheap_role_probe_answers_as_249_does`.
+A human principal that is also some human's agent, or holds an allowance, still pays the
+249 call; the remaining worst case is C12's readable-claim arm.
 
 ## 12. Test plan
 

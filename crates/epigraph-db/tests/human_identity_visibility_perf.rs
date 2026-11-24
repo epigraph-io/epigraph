@@ -428,6 +428,79 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     let ((p50n, maxn), named) = time_core(&pool, other, v, &groups, 25).await;
     assert!(named, "CALIBRATION: a non-human is named");
     println!("core, non-human: p50 {p50n:.3} ms, max {maxn:.3} ms");
+    // ── review correctness#3: a viewer group carries a role binding ───────
+    // The production shape (a role bound to a team): 279 runs the
+    // role-derived probe last, but a human no earlier arm names still pays
+    // 249's call. Measured twice: H holding no bound role (a miss), and H
+    // holding the role bound to the viewer's first group (named by it).
+    let role_node = Uuid::new_v4();
+    sqlx::query(&format!(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, {}, 'role:perf-bound', 'role', 'custom', ARRAY['role'])",
+        key_sql("'perf-role'")
+    ))
+    .bind(role_node)
+    .execute(&pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ('role:perf-bound', false, false, $1, 'perf role')",
+    )
+    .bind(role_node)
+    .execute(&pool)
+    .await
+    .expect("platform role");
+    sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'perf fixture')")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("register H");
+    let binding: Uuid = sqlx::query_scalar(
+        "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, reason) \
+         VALUES ($1, 'role:perf-bound', 'reader', false, 'perf binding') RETURNING id",
+    )
+    .bind(groups[0])
+    .fetch_one(&pool)
+    .await
+    .expect("binding");
+    let ((p50b, maxb), named) = time_core(&pool, h, v, &groups, 25).await;
+    assert!(!named, "CALIBRATION: H holds no bound role");
+    println!(
+        "core, human, a viewer group is role-bound, H holds no role (miss): \
+         p50 {p50b:.2} ms, max {maxb:.2} ms"
+    );
+    let assignment: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role('role:perf-bound', $1, \
+                now() - interval '5 seconds', NULL, NULL, 'perf grant')",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("grant");
+    let ((p50r, maxr), named) = time_core(&pool, h, v, &groups, 25).await;
+    assert!(named, "CALIBRATION: the role-derived arm names H");
+    println!(
+        "core, human, H holds the role bound to a viewer group (role-derived names): \
+         p50 {p50r:.2} ms, max {maxr:.2} ms"
+    );
+    sqlx::query(
+        "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'perf done' WHERE id = $1",
+    )
+    .bind(assignment)
+    .execute(&pool)
+    .await
+    .expect("end assignment");
+    sqlx::query(
+        "UPDATE group_role_bindings SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'perf done' WHERE id = $1",
+    )
+    .bind(binding)
+    .execute(&pool)
+    .await
+    .expect("unbind");
+
     let last = *bound.last().expect("bound");
     sqlx::query(&format!(
         "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
