@@ -1362,7 +1362,11 @@ the text above.
   a free marker; `PROFILE_RULE_SITES` became `no_repo_statement_spells_the_agent_profile_rule`.
 - **`agent_name_disclosure_lint.rs`** (section 14) scans every `crates/*/src` function's
   string-literal SQL for an identity column read off `agents` and pins GATED / ALLOWED;
-  its PENDING register is empty. Limits: it is textual, so a statement whose table is a
+  its PENDING register is empty. After review (leaks#4) it also scans a write that hands
+  its row back (`UPDATE` / `INSERT INTO agents ... RETURNING` an identity column; four
+  writers registered in ALLOWED) and treats `profile_visibility` as an identity column
+  (after 274 its value is near-human evidence); `agent_type` stays out (read only for
+  `= 'role'` checks today). Limits: it is textual, so a statement whose table is a
   format argument (`graph_view.rs::graph_query_node_ids`, H6) is guarded by its HTTP test,
   not by the lint; it does not scan `events` payload builders (L14 stays pinned by T7 only).
 - **A bound agent reads its operator's teams (234)**, so once H has a team, H's own bot is

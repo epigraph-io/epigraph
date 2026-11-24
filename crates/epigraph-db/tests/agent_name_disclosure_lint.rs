@@ -177,6 +177,36 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "whole-`Agent` page fetcher for `GET /api/v1/agents`, which applies `redact_agent` per row \
          on a stamped connection before serializing",
     ),
+    // The four below are WRITES that hand their row back (`RETURNING`), seen
+    // since review finding leaks#4a extended the scan.
+    (
+        "epigraph-db/src/repos/agent.rs",
+        "update",
+        "the profile edit's `UPDATE agents ... RETURNING` row: its one caller, \
+         `routes/agents.rs::update_agent`, redacts the response through \
+         `AgentDisclosureRepository::disclosure` on the caller's stamped read before \
+         serializing (review correctness#7), whichever row the edit moved",
+    ),
+    (
+        "epigraph-db/src/repos/agent.rs",
+        "create_conn",
+        "an agent INSERT that echoes the row it just created: the caller's own input \
+         (`create_agent` on a new key, the ingest's name-derived author nodes), never \
+         another agent's stored identity",
+    ),
+    (
+        "epigraph-db/src/repos/agent.rs",
+        "create_signer_conn",
+        "an agent INSERT that echoes the row it just created from the caller's own input \
+         (a signer identity); never another agent's stored identity",
+    ),
+    (
+        "epigraph-db/src/repos/agent.rs",
+        "create_seed_derived_conn",
+        "a plain INSERT of a seed-derived node (ingest authors, operator bind, provenance \
+         seeds): it returns only the row it CREATED from the caller's own input; a key that \
+         exists is a DuplicateKey error, never another agent's stored identity",
+    ),
     (
         "epigraph-db/src/repos/agent.rs",
         "list_by_label",
@@ -190,8 +220,20 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 /// unregistered.
 const PENDING: &[(&str, &str)] = &[];
 
-const IDENTITY_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id", "properties"];
-const BARE_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id"];
+// `profile_visibility` joined after review (leaks#4b): after migration 274 a
+// human principal reads 'group' and non-humans keep the 'public' default, so
+// the value itself is near-human evidence. `agent_type` is NOT a lint column:
+// on HEAD it is read only for `= 'role'` checks (`cards_inner`,
+// `author_nodes`, `exact_name_candidates`), and a role node is public by
+// design; a future surface that serves it is review's to catch.
+const IDENTITY_COLUMNS: &[&str] = &[
+    "display_name",
+    "orcid",
+    "ror_id",
+    "properties",
+    "profile_visibility",
+];
+const BARE_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id", "profile_visibility"];
 const NOT_ALIASES: &[&str] = &[
     "where",
     "on",
@@ -440,9 +482,29 @@ fn has_word(s: &str, w: &str) -> bool {
 /// with no `FROM` of its own (`a` is the agents alias by convention), so a
 /// column list assembled in a helper is seen where it is written.
 fn reads_identity(sql: &str) -> bool {
-    if ["a.display_name", "a.orcid", "a.ror_id"]
+    // A write that hands the row back (review finding leaks#4a): `UPDATE
+    // agents ... RETURNING display_name` is a read of whatever row it moved.
+    if let Some(ret) = sql.find(" returning ") {
+        let writes_agents = [
+            "update agents",
+            "update public.agents",
+            "insert into agents",
+            "insert into public.agents",
+        ]
         .iter()
-        .any(|c| has_word(sql, c))
+        .any(|w| sql[..ret].contains(w));
+        if writes_agents && BARE_COLUMNS.iter().any(|c| has_word(&sql[ret..], c)) {
+            return true;
+        }
+    }
+    if [
+        "a.display_name",
+        "a.orcid",
+        "a.ror_id",
+        "a.profile_visibility",
+    ]
+    .iter()
+    .any(|c| has_word(sql, c))
         && !sql.contains("from agents")
         && !sql.contains("join agents")
         && !sql.contains("public.agents")
@@ -575,6 +637,21 @@ fn the_scanner_sees_aliased_unaliased_and_gated_shapes() {
     )));
     assert!(!reads_identity(&sql_of(
         r#"{ sqlx::query("INSERT INTO agents (public_key, display_name) VALUES ($1, $2)") }"#
+    )));
+    // A write that returns the identity columns is a read (leaks#4a); one
+    // that returns only the id is not.
+    assert!(reads_identity(&sql_of(
+        r#"{ sqlx::query("UPDATE agents SET labels = $2 WHERE id = $1 RETURNING id, display_name, orcid") }"#
+    )));
+    assert!(!reads_identity(&sql_of(
+        r#"{ sqlx::query("UPDATE agents SET labels = $2 WHERE id = $1 RETURNING id") }"#
+    )));
+    assert!(reads_identity(&sql_of(
+        r#"{ sqlx::query("INSERT INTO public.agents (public_key) VALUES ($1) RETURNING id, display_name") }"#
+    )));
+    // `profile_visibility` is an identity column (leaks#4b).
+    assert!(reads_identity(&sql_of(
+        r#"{ sqlx::query("SELECT a.profile_visibility FROM agents a WHERE a.id = $1") }"#
     )));
     // A name read commented out of the statement is not a read.
     assert!(!reads_identity(&sql_of(
