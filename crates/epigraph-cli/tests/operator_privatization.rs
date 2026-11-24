@@ -1,0 +1,357 @@
+//! `epigraph-operator privatization abort|revert` (backlog bb682f72): the
+//! recovery for a privatization plan stranded in `applying`, on the
+//! operator's maintenance login, ending in a `drain_jobs` run that exits 0.
+//!
+//! Before this verb, under operator decision D9 the stock server serves no
+//! privatization lifecycle route (501), so nothing could move a stranded plan
+//! and every drain run exited 5 (`EXIT_PLAN_STRANDED`) forever.
+//!
+//! The verbs run as the spawned binary on a fresh NOSUPERUSER login in
+//! `epigraph_maintenance`, as an operator runs them, so their grants are the
+//! real ones. The drain runs as `drain_jobs` builds it, on a pool downgraded
+//! to `epigraph_maintenance`. The superuser fixture pool only seeds and reads.
+
+#[path = "../../epigraph-api/tests/privatization_fixture.rs"]
+mod fx;
+
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use epigraph_api::embedding_restore::EmbeddingProviderKind;
+use epigraph_api::jobs_drain;
+use epigraph_db::{ScopedPool, SessionGucMode};
+use epigraph_jobs::{JobQueue, PostgresJobQueue};
+use fx::viewer_fixture;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const BIN: &str = env!("CARGO_BIN_EXE_epigraph-operator");
+const DSN_ENV: &str = "EPIGRAPH_OPERATOR_MAINTENANCE_DSN";
+
+struct Run {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn show(&self) -> String {
+        format!(
+            "exit={}\n--- stdout\n{}\n--- stderr\n{}",
+            self.code, self.stdout, self.stderr
+        )
+    }
+}
+
+fn operator(args: &[&str], dsn: &str) -> Run {
+    let out = Command::new(BIN)
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .env_remove("DATABASE_URL")
+        .env_remove("MAINTENANCE_DATABASE_URL")
+        .env(DSN_ENV, dsn)
+        .output()
+        .expect("spawn epigraph-operator");
+    Run {
+        code: out.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// A fresh NOSUPERUSER login in `epigraph_maintenance`: its DSN.
+async fn maintenance_login(pool: &PgPool) -> String {
+    let url = viewer_fixture::database_url_for(pool).await;
+    let role = format!("priv_maint_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'probe-only' NOSUPERUSER IN ROLE epigraph_maintenance"
+    ))
+    .execute(pool)
+    .await
+    .expect("create the maintenance login");
+    let (scheme, rest) = url.split_once("://").expect("scheme");
+    let (_, host) = rest.split_once('@').expect("credentials");
+    format!("{scheme}://{role}:probe-only@{host}")
+}
+
+/// The drain, built as `drain_jobs` builds it, on a pool downgraded to
+/// `epigraph_maintenance`.
+async fn drain_runner(pool: &PgPool) -> (epigraph_jobs::JobRunner, PostgresJobQueue) {
+    let url = viewer_fixture::database_url_for(pool).await;
+    let scoped = Arc::new(
+        ScopedPool::connect_downgraded_for_tests(
+            &url,
+            SessionGucMode::Session,
+            "epigraph_maintenance",
+        )
+        .await
+        .expect("a ScopedPool downgraded to epigraph_maintenance"),
+    );
+    let queue = PostgresJobQueue::new(scoped.inner().clone());
+    let runner = jobs_drain::build_job_runner(
+        Arc::clone(&scoped),
+        Arc::new(queue.clone()),
+        Arc::new(epigraph_embeddings::MockProvider::new(
+            epigraph_embeddings::EmbeddingConfig::openai(1536),
+        )),
+        EmbeddingProviderKind::Mock,
+    );
+    (runner, queue)
+}
+
+async fn drain(
+    runner: &epigraph_jobs::JobRunner,
+    queue: &PostgresJobQueue,
+) -> jobs_drain::DrainReport {
+    jobs_drain::drain(runner, queue, Duration::from_secs(600))
+        .await
+        .expect("a drain run")
+}
+
+/// The actor's live `role:platform-custodian` assignment.
+async fn custodian_assignment(pool: &PgPool, actor: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT public.epigraph_role_assignment_for($1, 'role:platform-custodian', now())",
+    )
+    .bind(actor)
+    .fetch_one(pool)
+    .await
+    .expect("the actor's custodian assignment")
+}
+
+/// `platform.custodial_act` rows naming `plan`.
+async fn custodial_acts(pool: &PgPool, plan: Uuid) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details -> 'details' FROM security_events \
+          WHERE event_type = 'platform.custodial_act' AND details ->> 'target' = $1::text \
+          ORDER BY created_at",
+    )
+    .bind(plan)
+    .fetch_all(pool)
+    .await
+    .expect("read custodial acts")
+}
+
+async fn jobs_naming(pool: &PgPool, plan: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM jobs \
+          WHERE payload -> 'PrivatizationRevert' ->> 'plan_id' = $1::text",
+    )
+    .bind(plan)
+    .fetch_one(pool)
+    .await
+    .expect("count revert jobs")
+}
+
+/// The whole recovery, on a plan whose apply run crashed after its last
+/// batch committed and before its terminal write (a separate transaction in
+/// the handler): every item applied, the plan still `applying`, its job
+/// failed by the reaper. The drain exits 5 naming it. Then:
+///
+/// 1. `abort` without `--apply` writes nothing (the drain still exits 5);
+/// 2. `abort` with an assignment the actor does not hold is refused (CUS04);
+/// 3. `abort --apply` sets `failed` with its `plan.abort` audit row and a
+///    custodial act, and the next drain run exits 0;
+/// 4. a second `abort --apply` writes nothing and exits 0;
+/// 5. `revert --apply` without the plan's digest, or with a wrong one, is
+///    refused; its dry run writes no job;
+/// 6. `revert --apply --plan-digest <digest>` dispatches; the drain runs the
+///    revert job, the plan ends `reverted`, the claim is public again, and the
+///    run exits 0.
+///
+/// Verified to fail: with `--apply` committing nothing (`finish` rolling
+/// back), the plan is still `applying` after step 3; with the dispatch's
+/// `security_events` row written under another event type, the drain's
+/// revert job is refused as unattributed (a drain failure, and the plan never
+/// reaches `reverted`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stranded_plan_is_aborted_and_reverted_by_the_operator_and_the_drain_exits_0(
+    pool: PgPool,
+) {
+    let world = fx::World::seed(&pool).await;
+    let claim = viewer_fixture::seed_public_claim(&pool, world.actor, "stranded plan seed").await;
+    let (plan, digest) = fx::create_plan(&pool, &world, &[claim]).await;
+    let before = fx::tenancy(&pool, claim).await;
+    assert_eq!(before.0, "public", "CALIBRATION: the seed is public");
+    let correlation = fx::dispatch(&pool, &world, plan, "applying").await;
+    let job = fx::apply_job(plan, world.actor, &correlation);
+    let job_id: Uuid = job.id.into();
+    PostgresJobQueue::new(pool.clone())
+        .enqueue(job.clone())
+        .await
+        .expect("seed the apply job");
+
+    // The run: every batch commits, then the process dies before the
+    // terminal write, and the reaper fails the job.
+    fx::run_apply(&fx::scoped(&pool).await, &job, 50)
+        .await
+        .expect("the apply run");
+    sqlx::query("UPDATE privatization_plans SET state = 'applying' WHERE id = $1")
+        .bind(plan)
+        .execute(&pool)
+        .await
+        .expect("the terminal write never happened");
+    sqlx::query("UPDATE jobs SET state = 'failed', error_message = $2 WHERE id = $1")
+        .bind(job_id)
+        .bind(epigraph_jobs::REAPED_REDELIVERIES_SPENT_MESSAGE)
+        .execute(&pool)
+        .await
+        .expect("the reaper failed the job");
+    assert_eq!(
+        fx::tenancy(&pool, claim).await,
+        ("group".to_string(), world.target_group),
+        "CALIBRATION: the applied prefix is the whole plan"
+    );
+
+    let (runner, queue) = drain_runner(&pool).await;
+    let stranded = drain(&runner, &queue).await;
+    assert_eq!(
+        stranded.exit_code(),
+        jobs_drain::EXIT_PLAN_STRANDED,
+        "CALIBRATION: the drain names the stranded plan: {stranded:?}"
+    );
+    assert_eq!(stranded.stranded_privatization_plans[0].plan_id, plan);
+
+    let dsn = maintenance_login(&pool).await;
+    let assignment = custodian_assignment(&pool, world.actor).await;
+    let (p, actor, asg) = (
+        plan.to_string(),
+        world.actor.to_string(),
+        assignment.to_string(),
+    );
+    let act = |verb: &'static str, extra: &[&str]| -> Run {
+        let mut args = vec![
+            "privatization",
+            verb,
+            "--plan",
+            &p,
+            "--actor",
+            &actor,
+            "--assignment",
+            &asg,
+            "--reason",
+            "recover a stranded plan",
+        ];
+        args.extend_from_slice(extra);
+        operator(&args, &dsn)
+    };
+
+    // 1. The dry run is the default, and it writes nothing.
+    let dry = act("abort", &[]);
+    assert_eq!(dry.code, 0, "{}", dry.show());
+    assert!(dry.stdout.contains("WOULD BE ABORTED"), "{}", dry.show());
+    assert_eq!(fx::plan_state(&pool, plan).await, "applying");
+    assert!(
+        !fx::audit_actions(&pool, plan)
+            .await
+            .contains(&"plan.abort".to_string()),
+        "a dry-run abort wrote its audit row"
+    );
+    assert!(custodial_acts(&pool, plan).await.is_empty());
+    assert_eq!(
+        drain(&runner, &queue).await.exit_code(),
+        jobs_drain::EXIT_PLAN_STRANDED,
+        "a dry run recovered nothing"
+    );
+
+    // 2. An assignment the actor does not hold refuses the whole act.
+    let stranger = Uuid::new_v4().to_string();
+    let refused = operator(
+        &[
+            "privatization",
+            "abort",
+            "--plan",
+            &p,
+            "--actor",
+            &actor,
+            "--assignment",
+            &stranger,
+            "--reason",
+            "no authority",
+            "--apply",
+        ],
+        &dsn,
+    );
+    assert_ne!(refused.code, 0, "{}", refused.show());
+    assert!(refused.stderr.contains("CUS04"), "{}", refused.show());
+    assert_eq!(fx::plan_state(&pool, plan).await, "applying");
+
+    // 3. The abort.
+    let aborted = act("abort", &["--apply"]);
+    assert_eq!(aborted.code, 0, "{}", aborted.show());
+    assert!(aborted.stdout.starts_with("ABORTED"), "{}", aborted.show());
+    assert_eq!(fx::plan_state(&pool, plan).await, "failed");
+    assert!(fx::audit_actions(&pool, plan)
+        .await
+        .contains(&"plan.abort".to_string()));
+    let acts = custodial_acts(&pool, plan).await;
+    assert_eq!(acts.len(), 1, "{acts:?}");
+    assert_eq!(acts[0]["transition"], "abort");
+    assert_eq!(acts[0]["reason"], "recover a stranded plan");
+    let after_abort = drain(&runner, &queue).await;
+    assert!(
+        after_abort.stranded_privatization_plans.is_empty(),
+        "{after_abort:?}"
+    );
+    assert_eq!(after_abort.exit_code(), 0, "{after_abort:?}");
+    assert_eq!(
+        fx::tenancy(&pool, claim).await,
+        ("group".to_string(), world.target_group),
+        "an abort stops; the applied prefix stays applied"
+    );
+
+    // 4. Idempotent.
+    let again = act("abort", &["--apply"]);
+    assert_eq!(again.code, 0, "{}", again.show());
+    assert!(
+        again.stdout.starts_with("ALREADY-FAILED"),
+        "{}",
+        again.show()
+    );
+    assert_eq!(custodial_acts(&pool, plan).await.len(), 1);
+
+    // 5. The revert needs the digest echoed back; its dry run writes no job.
+    let no_digest = act("revert", &["--apply"]);
+    assert_eq!(no_digest.code, 1, "{}", no_digest.show());
+    let wrong = format!("b3:{}", "00".repeat(32));
+    let wrong_digest = act("revert", &["--apply", "--plan-digest", &wrong]);
+    assert_eq!(wrong_digest.code, 1, "{}", wrong_digest.show());
+    let rehearsal = act("revert", &[]);
+    assert_eq!(rehearsal.code, 0, "{}", rehearsal.show());
+    let echoed = format!("b3:{}", hex::encode(digest));
+    assert!(
+        rehearsal.stdout.contains(&echoed),
+        "the dry run prints the digest to echo: {}",
+        rehearsal.show()
+    );
+    assert_eq!(fx::plan_state(&pool, plan).await, "failed");
+    assert_eq!(
+        jobs_naming(&pool, plan).await,
+        0,
+        "a dry-run revert wrote a job"
+    );
+
+    // 6. The revert, run by the drain.
+    let reverted = act("revert", &["--apply", "--plan-digest", &echoed]);
+    assert_eq!(reverted.code, 0, "{}", reverted.show());
+    assert!(
+        reverted.stdout.starts_with("REVERT-DISPATCHED"),
+        "{}",
+        reverted.show()
+    );
+    assert_eq!(fx::plan_state(&pool, plan).await, "reverting");
+    let ran = drain(&runner, &queue).await;
+    assert!(ran.failures.is_empty(), "{ran:?}");
+    assert_eq!(ran.exit_code(), 0, "{ran:?}");
+    assert_eq!(
+        fx::plan_state(&pool, plan).await,
+        "reverted",
+        "the drain's revert job re-validated the operator's dispatch and finished it"
+    );
+    assert_eq!(
+        fx::tenancy(&pool, claim).await,
+        before,
+        "the revert un-applied the applied item"
+    );
+}

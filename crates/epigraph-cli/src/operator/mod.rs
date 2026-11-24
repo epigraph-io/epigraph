@@ -146,6 +146,15 @@
 //!   attach it by name, only where a copy written fresh from the root's row
 //!   would admit it (refused `ROL04` otherwise, nothing written).
 //!
+//! And privatization plan recovery (backlog bb682f72; see
+//! [`privatization`]):
+//!
+//! * `privatization abort --plan <id>` / `privatization revert --plan <id>` —
+//!   the routes' abort and revert on the maintenance DSN, through the same
+//!   code, attributed to a custodian (`--actor`, `--assignment`): the
+//!   recovery for a plan stranded in `applying` or `reverting`, which keeps
+//!   `drain_jobs` at exit 5 until it is aborted.
+//!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an
 //! agent.
@@ -196,6 +205,7 @@ pub mod legacy;
 pub mod link;
 pub mod manifest;
 pub mod passkey;
+pub mod privatization;
 pub mod regroup;
 pub mod reown;
 pub mod reown_linked;

@@ -141,14 +141,18 @@
 //!     epigraph-operator revoke-client --client <uuid> --reason TEXT [--apply]
 //!     epigraph-operator set-default-group --operator <uuid> --agent <uuid> [--agent <uuid> ...] \
 //!         (--group <uuid> | --private | --clear) [--apply]
+//!     epigraph-operator privatization abort --plan <uuid> --actor <uuid> --assignment <uuid> \
+//!         --reason TEXT [--apply]
+//!     epigraph-operator privatization revert --plan <uuid> --actor <uuid> --assignment <uuid> \
+//!         --reason TEXT [--apply --plan-digest b3:<hex>]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
     self, admin_scopes, approve_client, arm, backfill_markers, bind, binding_client, client_scope,
     client_status, confirmations, custodian, dcr_sweep, default_group, delete_frames, elevation,
-    evidence_edges, group_role, hide, human, legacy, link, passkey, regroup, reown, reown_linked,
-    reown_workflows, restrict, retire_link, reverse, role_agent, role_restore, system_agent,
-    team_group, workflow_submitter,
+    evidence_edges, group_role, hide, human, legacy, link, passkey, privatization, regroup, reown,
+    reown_linked, reown_workflows, restrict, retire_link, reverse, role_agent, role_restore,
+    system_agent, team_group, workflow_submitter,
 };
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -655,6 +659,13 @@ enum Command {
         /// Commit. Without it, every call and audit row roll back.
         #[arg(long)]
         apply: bool,
+    },
+    /// Recover a privatization plan (backlog bb682f72): `abort` a running or
+    /// stranded one (`drain_jobs` exit 5), then `revert` it. Each is a dry run
+    /// without `--apply`.
+    Privatization {
+        #[command(subcommand)]
+        action: PrivatizationAction,
     },
     RetireLink {
         /// The linked agent's id.
@@ -1514,6 +1525,48 @@ struct ClientStatusArgs {
     #[arg(long)]
     reason: String,
     /// Commit. Without it, the change and its audit row roll back.
+    #[arg(long)]
+    apply: bool,
+}
+
+/// The `privatization` verbs.
+#[derive(Subcommand)]
+enum PrivatizationAction {
+    /// Set a plan in `applying` or `reverting` to `failed`, with its
+    /// `plan.abort` audit row: the applied prefix stays applied. A plan
+    /// already `failed` is reported and nothing is written.
+    Abort {
+        #[command(flatten)]
+        plan: PlanAct,
+    },
+    /// Dispatch a revert of an applied or aborted plan: the drain's revert job
+    /// un-applies exactly its applied items. Refused while a seal plan has a
+    /// sealed item. `--apply` needs `--plan-digest`, which the dry run prints.
+    Revert {
+        #[command(flatten)]
+        plan: PlanAct,
+        /// The plan's digest (`b3:<hex>`), echoed back.
+        #[arg(long)]
+        plan_digest: Option<String>,
+    },
+}
+
+/// The arguments `privatization abort` and `revert` share.
+#[derive(clap::Args)]
+struct PlanAct {
+    /// The plan.
+    #[arg(long)]
+    plan: Uuid,
+    /// The registered human the act is attributed to.
+    #[arg(long)]
+    actor: Uuid,
+    /// The actor's live role:platform-custodian assignment (CUS04 otherwise).
+    #[arg(long)]
+    assignment: Uuid,
+    /// Recorded on the custodial act.
+    #[arg(long)]
+    reason: String,
+    /// Commit. Without it, every write rolls back.
     #[arg(long)]
     apply: bool,
 }
@@ -2595,6 +2648,58 @@ async fn main_inner() -> anyhow::Result<i32> {
                 println!("DRY RUN: every change and its audit row were rolled back.");
             }
             Ok(outcome.exit_code())
+        }
+        Command::Privatization { action } => {
+            match action {
+                PrivatizationAction::Abort { plan } | PrivatizationAction::Revert { plan, .. }
+                    if plan.reason.trim().is_empty() =>
+                {
+                    anyhow::bail!("--reason must not be blank (plan {})", plan.plan)
+                }
+                PrivatizationAction::Abort { plan } => {
+                    let actor = privatization::Actor {
+                        agent: plan.actor,
+                        assignment: plan.assignment,
+                        reason: plan.reason,
+                    };
+                    let outcome =
+                        privatization::abort(&mut conn, plan.plan, &actor, plan.apply).await?;
+                    println!(
+                        "{}",
+                        privatization::describe(plan.plan, &outcome, plan.apply)
+                    );
+                    if !plan.apply && matches!(outcome, privatization::Outcome::Aborted { .. }) {
+                        println!("DRY RUN: the abort, its audit row and the custodial act were rolled back.");
+                    }
+                    Ok(outcome.exit_code())
+                }
+                PrivatizationAction::Revert { plan, plan_digest } => {
+                    let actor = privatization::Actor {
+                        agent: plan.actor,
+                        assignment: plan.assignment,
+                        reason: plan.reason,
+                    };
+                    let outcome = privatization::revert(
+                        &mut conn,
+                        plan.plan,
+                        &actor,
+                        plan_digest.as_deref(),
+                        plan.apply,
+                    )
+                    .await?;
+                    println!(
+                        "{}",
+                        privatization::describe(plan.plan, &outcome, plan.apply)
+                    );
+                    if !plan.apply && outcome.exit_code() == 0 {
+                        println!(
+                            "DRY RUN: the dispatch event, the state flip, the audit row, the job \
+                             and the custodial act were rolled back."
+                        );
+                    }
+                    Ok(outcome.exit_code())
+                }
+            }
         }
         Command::RetireLink {
             agent,
