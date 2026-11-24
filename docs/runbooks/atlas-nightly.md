@@ -92,7 +92,12 @@ Every result is checked on the box as an operator's result is:
 - `theme-cap` runs through `theme_cap_split.py offbox`: its export, the
   command, then its apply with every structural check (parts exactly the live
   members, under the cap, the result naming exactly the exported themes, one
-  transaction). It is NOT checked against a reviewed plan (there is none
+  transaction). A theme whose members changed while the command ran (a claim
+  arrived, left, or gained or lost an embedding) is skipped untouched and
+  listed in `themes.split.report.skipped_changed`; the others are still
+  split, and the skipped one stays over the cap for the next night. Parts
+  that cover the members but break another check (a claim twice, a part over
+  the cap) refuse the whole result. It is NOT checked against a reviewed plan (there is none
   without UMAP on the box): the manifest records `review: "offbox-command"`.
   The manifest stays in the call's directory under `--offbox-dir`
   (`themes.split.report.manifest`); undo a nightly split with

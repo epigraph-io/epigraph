@@ -35,7 +35,10 @@ Commands:
             database URL), the export is deleted once it returns, and the
             result is applied as `apply` does with every structural check
             (`--cap` is both the export's and apply's cap; the result must
-            name exactly the exported themes). It is not checked against a
+            name exactly the exported themes). A theme whose members changed
+            while the command ran is skipped and reported
+            (`skipped_changed`), not rolled back with the others; it stays
+            over the cap for the next run. It is not checked against a
             reviewed plan (there is none: no UMAP on the box); the manifest
             records `review: "offbox-command"`, and `reverse` undoes it.
             `scripts/atlas_offbox_compute.py` is a reference COMMAND that
@@ -443,8 +446,17 @@ def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=Fal
 
 
 def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_digest=None,
-                 review=None):
+                 review=None, skip_changed=False):
     """Write a result document in one transaction; returns the manifest.
+
+    With `skip_changed` (the nightly's `offbox`), a theme whose live embedded
+    members are no longer exactly the claims of its parts (one arrived, left,
+    or lost or gained an embedding since the export) is SKIPPED, untouched,
+    and listed in the manifest's `skipped_changed`, instead of rolling back
+    every other theme; it stays over the cap and the next run splits it. A
+    result whose parts DO cover the members but fail another check (a claim
+    twice, a part over the cap) is still refused whole: that is a broken
+    compute, not churn.
 
     The result's own cap is enforced, and a result whose cap exceeds `max_cap`
     (apply's `--cap`) is refused: the file may come back from off the box,
@@ -468,6 +480,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                 "review": review,
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "themes": []}
+    skipped = []
+    if skip_changed:
+        manifest["skipped_changed"] = skipped
     touched = []
     try:
         with conn.cursor() as cur:
@@ -482,6 +497,9 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
                 cur.execute("SELECT id::text FROM claims WHERE theme_id = %s "
                             "AND embedding IS NOT NULL", (parent,))
                 members = [r[0] for r in cur.fetchall()]
+                if skip_changed and set(members) != {c for part in parts for c in part}:
+                    skipped.append(parent)
+                    continue
                 try:
                     core.validate_parts(members, parts, cap)
                 except ValueError as e:
@@ -531,7 +549,10 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
             # EVERY theme the result names, not only the ones written: a
             # safety net behind the placement above, so no theme the result
             # names can stay over the cap behind a successful apply.
-            checked = sorted({t for t, _ in touched} | {str(e["theme_id"]) for e in result["themes"]})
+            # A theme skipped as changed is untouched and stays over the cap
+            # (the next run splits it): it is not this apply's to check.
+            checked = sorted({t for t, _ in touched}
+                             | ({str(e["theme_id"]) for e in result["themes"]} - set(skipped)))
             cur.execute(f"SELECT theme_id::text, count(*) FROM claims "
                         f"WHERE theme_id = ANY(%s::uuid[]) AND {CURRENT} "
                         "GROUP BY theme_id HAVING count(*) > %s ORDER BY 1",
@@ -628,7 +649,10 @@ def offbox_split(conn, command, work_dir, manifest_path, cap=core.DEFAULT_CAP,
     if named != exported:
         raise ValueError(f"the off-box result names themes {named}, not the exported "
                          f"{exported}; nothing was written")
-    manifest = apply_result(conn, result, manifest_path, max_cap=cap, review=REVIEW_OFFBOX)
+    # Skip (and report) a theme whose members changed during the call rather
+    # than roll back every other theme's split with it.
+    manifest = apply_result(conn, result, manifest_path, max_cap=cap, review=REVIEW_OFFBOX,
+                            skip_changed=True)
     return manifest, exported
 
 
@@ -857,6 +881,7 @@ def main(argv=None):
                                               args.cap, args.seed, args.theme_id, args.timeout)
             print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
                               "exported": exported,
+                              "skipped_changed": manifest.get("skipped_changed", []),
                               "manifest": mpath if manifest["themes"] else None,
                               "split_run": manifest["split_run"],
                               "parts_digest": manifest["parts_digest"],

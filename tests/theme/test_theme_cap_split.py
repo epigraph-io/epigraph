@@ -851,3 +851,67 @@ def test_offbox_command_past_the_timeout_is_killed_with_its_group(tmp_path):
     assert time.monotonic() - started < 5
     time.sleep(3)
     assert not marker.exists(), "a process of the command's group outlived the timeout"
+
+
+def _edit_result_body(tmp_path, edit, theme):
+    """A fake command body: the reference compute, then `edit` (Python source
+    run with `d`, the result document, and `t`, `theme`) rewrites the result
+    before the script reads it."""
+    ref = REPO / "scripts" / "atlas_offbox_compute.py"
+    prog = tmp_path / "edit.py"
+    prog.write_text("import json, sys\np = sys.argv[1]\nd = json.load(open(p))\n"
+                    "t = sys.argv[2]\n" + edit + "\njson.dump(d, open(p, 'w'))\n")
+    return (f'{sys.executable} {ref} "$@" || exit 1\n'
+            f'exec {sys.executable} {prog} "$3" {theme}')
+
+
+def test_offbox_skips_a_theme_whose_members_changed_and_splits_the_rest(
+        db, seed_agent, tmp_path):
+    """Review finding 2: a member of one theme changing while the command
+    ran (here its result leaves one claim out, as when that claim arrived
+    after the export) skips THAT theme, untouched and reported, and still
+    applies the other theme's split, which reverses exactly."""
+    changed, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    other, _, _ = _theme(db, seed_agent, (28, 22, 20), label="Other Theme", seed0=40)
+    before = _snapshot(db)
+    sizes_before = _sizes(db)
+    edit = ("e = [x for x in d['themes'] if x['theme_id'] == t][0]\n"
+            "e['parts'][-1] = e['parts'][-1][:-1]")
+    cmd, _ = _offbox_command(tmp_path, _edit_result_body(tmp_path, edit, changed))
+    work = _work_dir(tmp_path)
+
+    out, _ = _run(_offbox_argv(cmd, work))
+
+    report = json.loads(out)
+    assert report["status"] == "applied", report
+    assert report["exported"] == sorted([changed, other]), report
+    assert report["skipped_changed"] == [changed], report
+    assert [t["parent_id"] for t in report["themes"]] == [other], report
+    sizes = _sizes(db)
+    assert sizes[changed] == sizes_before[changed], "the changed theme was touched"
+    assert sizes[other] <= CAP and len(sizes) > len(sizes_before), sizes
+    manifest = json.loads((work / "manifest.json").read_text())
+    assert manifest["skipped_changed"] == [changed]
+
+    _run(["reverse", "--database-url", script_dsn(), "--manifest", str(work / "manifest.json")])
+    assert _snapshot(db) == before, "the offbox apply did not reverse exactly"
+
+
+def test_offbox_still_refuses_a_result_that_covers_the_members_but_breaks_the_cap(
+        db, seed_agent, tmp_path):
+    """The skip is for churn only: parts that cover the live members exactly
+    but break another check (here one part over the cap) are a broken
+    compute, refused whole, nothing written."""
+    big, _, _ = _theme(db, seed_agent, (30, 25, 20))
+    other, _, _ = _theme(db, seed_agent, (28, 22, 20), label="Other Theme", seed0=40)
+    before = _snapshot(db)
+    edit = ("e = [x for x in d['themes'] if x['theme_id'] == t][0]\n"
+            "e['parts'] = [[c for part in e['parts'] for c in part]]")
+    cmd, _ = _offbox_command(tmp_path, _edit_result_body(tmp_path, edit, big))
+    work = _work_dir(tmp_path)
+
+    with pytest.raises(ValueError, match="over the cap"):
+        _run(_offbox_argv(cmd, work))
+
+    assert _snapshot(db) == before
+    assert not (work / "manifest.json").exists()
