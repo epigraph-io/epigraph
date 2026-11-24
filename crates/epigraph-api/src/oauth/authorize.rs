@@ -293,10 +293,12 @@ fn render_consent_page(
         .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
         .collect();
     let (title, lead) = match classify(redirect_uri, extra_origins) {
-        Some(RedirectClass::Hosted) => (
-            "Authorize Claude".to_string(),
+        // A built-in hosted client, named by the callback the server matched.
+        Some(RedirectClass::Hosted(client)) => (
+            format!("Authorize {}", client.display_name()),
             format!(
-                "Claude wants to access EpiGraph as <strong>{}</strong> with:",
+                "{} wants to access EpiGraph as <strong>{}</strong> with:",
+                html_escape(client.display_name()),
                 html_escape(email)
             ),
         ),

@@ -77,7 +77,8 @@ pub async fn register_endpoint(
     // DB access, so an abusive registration is rejected DB-free (and so the negative
     // test needs no database). This closes the open-redirect / open-registration gap
     // flagged in recon: a redirect_uri that is neither a hosted MCP client's callback
-    // (claude.ai/claude.com), nor on an origin the operator configured
+    // (claude.ai/claude.com, or ChatGPT's exact chatgpt.com callbacks), nor on an
+    // origin the operator configured
     // (EPIGRAPH_OAUTH_REDIRECT_ORIGINS), nor an RFC 8252 loopback listener (native
     // clients such as OpenAI Codex) is refused regardless of client_type. See
     // `oauth::redirect`.
@@ -87,9 +88,11 @@ pub async fn register_endpoint(
                 // The configured origins are not listed in this anonymous
                 // answer: the allowlist is the operator's, not the caller's.
                 return Err(ApiError::BadRequest {
-                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, an \
-                              https origin this server is configured to accept, or a loopback \
-                              http://127.0.0.1 or http://[::1] callback"
+                    message: "redirect_uri must be https://claude.ai/, https://claude.com/, \
+                              ChatGPT's https://chatgpt.com/connector_platform_oauth_redirect or \
+                              https://chatgpt.com/connector/oauth/<id>, an https origin this \
+                              server is configured to accept, or a loopback http://127.0.0.1 or \
+                              http://[::1] callback"
                         .to_string(),
                 });
             }

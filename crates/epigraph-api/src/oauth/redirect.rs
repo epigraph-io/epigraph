@@ -2,8 +2,19 @@
 //! authorization request's `redirect_uri` is matched against a registered one.
 //!
 //! Three classes are acceptable:
-//! - **Hosted**: the fixed HTTPS callbacks of hosted MCP clients (claude.ai,
-//!   claude.com). Matched exactly.
+//! - **Hosted**: the fixed HTTPS callbacks of hosted MCP clients, each named
+//!   ([`HostedClient`]) so the consent page says who is asking:
+//!   - Claude: any callback under `https://claude.ai/` or `https://claude.com/`.
+//!   - ChatGPT: exactly `https://chatgpt.com/connector_platform_oauth_redirect`
+//!     (what ChatGPT registers when the server supports RFC 9207 issuer
+//!     identification, which this one does), or
+//!     `https://chatgpt.com/connector/oauth/<id>` where `<id>` is ONE non-empty
+//!     path segment of `[A-Za-z0-9_-]` (its form for a server without RFC
+//!     9207). Matched on the raw string, so no port (not even `:443`), no
+//!     userinfo, query, fragment, percent-encoding, upper-case host, trailing
+//!     slash or further segment.
+//!
+//!   Registration and `/authorize` then match the registered URI exactly.
 //! - **Configured**: a redirect on an HTTPS origin the operator listed in
 //!   [`REDIRECT_ORIGINS_ENV`] (e.g. a first-party web client on its own
 //!   origin). The origin (scheme, host, port) must equal a listed one exactly;
@@ -22,8 +33,35 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use url::{Host, Origin, Url};
 
-/// Callback prefixes of hosted MCP clients.
-const HOSTED_PREFIXES: &[&str] = &["https://claude.ai/", "https://claude.com/"];
+/// Callback prefixes of Claude (claude.ai and claude.com).
+const CLAUDE_PREFIXES: &[&str] = &["https://claude.ai/", "https://claude.com/"];
+
+/// ChatGPT's callback when the authorization server supports RFC 9207 issuer
+/// identification. Matched exactly.
+const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+
+/// ChatGPT's per-connector callback, followed by exactly one id segment.
+const CHATGPT_CALLBACK_PREFIX: &str = "https://chatgpt.com/connector/oauth/";
+
+/// A hosted MCP client whose callbacks are built in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostedClient {
+    /// Claude (claude.ai, claude.com).
+    Claude,
+    /// OpenAI's ChatGPT (chatgpt.com connectors).
+    ChatGpt,
+}
+
+impl HostedClient {
+    /// The client's name as the consent page shows it.
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::ChatGpt => "ChatGPT",
+        }
+    }
+}
 
 /// The environment variable listing extra redirect origins, read once at boot
 /// (`bin/server.rs`): comma- or whitespace-separated HTTPS origins, e.g.
@@ -33,8 +71,8 @@ pub const REDIRECT_ORIGINS_ENV: &str = "EPIGRAPH_OAUTH_REDIRECT_ORIGINS";
 /// The kind of an acceptable redirect URI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectClass {
-    /// A hosted MCP client's fixed HTTPS callback (claude.ai, claude.com).
-    Hosted,
+    /// A hosted MCP client's fixed HTTPS callback.
+    Hosted(HostedClient),
     /// A redirect on an origin listed in [`REDIRECT_ORIGINS_ENV`].
     Configured,
     /// A native client's loopback listener (RFC 8252 §7.3), e.g. OpenAI Codex.
@@ -131,13 +169,36 @@ fn parse_origin(entry: &str) -> Result<Origin, &'static str> {
 /// The class of `uri`, or `None` when EpiGraph does not accept it as a
 /// redirect. `extra` is the operator's [`RedirectOrigins`].
 pub fn classify(uri: &str, extra: &RedirectOrigins) -> Option<RedirectClass> {
-    if HOSTED_PREFIXES.iter().any(|p| uri.starts_with(p)) {
-        return Some(RedirectClass::Hosted);
+    // Hosted first: with `https://chatgpt.com` also configured, a ChatGPT
+    // callback is still named ChatGPT on the consent page.
+    if let Some(client) = hosted(uri) {
+        return Some(RedirectClass::Hosted(client));
     }
     if extra.admits(uri) {
         return Some(RedirectClass::Configured);
     }
     loopback(uri).map(|_| RedirectClass::Loopback)
+}
+
+/// The hosted client whose built-in callback `uri` is, compared as a raw
+/// string (never a parsed URL, which would normalise the host's case, drop a
+/// default port and decode the path).
+fn hosted(uri: &str) -> Option<HostedClient> {
+    if CLAUDE_PREFIXES.iter().any(|p| uri.starts_with(p)) {
+        return Some(HostedClient::Claude);
+    }
+    let chatgpt = uri == CHATGPT_REDIRECT
+        || uri
+            .strip_prefix(CHATGPT_CALLBACK_PREFIX)
+            .is_some_and(is_callback_id);
+    chatgpt.then_some(HostedClient::ChatGpt)
+}
+
+/// One non-empty path segment of `[A-Za-z0-9_-]`.
+fn is_callback_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Whether `requested` (an authorization request's `redirect_uri`) matches the
@@ -210,7 +271,7 @@ mod tests {
         }
         assert_eq!(
             classify("https://claude.ai/api/mcp/auth_callback", &extra),
-            Some(RedirectClass::Hosted)
+            Some(RedirectClass::Hosted(HostedClient::Claude))
         );
         assert_eq!(
             classify("http://127.0.0.1:5000/cb", &extra),
@@ -293,7 +354,7 @@ mod tests {
         }
         assert_eq!(
             classify("https://claude.ai/api/mcp/auth_callback", &none()),
-            Some(RedirectClass::Hosted)
+            Some(RedirectClass::Hosted(HostedClient::Claude))
         );
     }
 
@@ -309,6 +370,76 @@ mod tests {
             "http://127.0.0.1/callback#frag",
             "https://claude.ai.evil.example/api/mcp/auth_callback",
             "not a url",
+        ] {
+            assert_eq!(classify(uri, &none()), None, "{uri}");
+        }
+    }
+
+    const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/cb_Test-01";
+
+    /// Both ChatGPT callback forms are hosted and named ChatGPT, with and
+    /// without `https://chatgpt.com` also configured; claude.ai stays Claude.
+    #[test]
+    fn chatgpt_callbacks_are_hosted() {
+        let chatgpt_origin = RedirectOrigins::parse(Some("https://chatgpt.com")).expect("valid");
+        for extra in [none(), chatgpt_origin.clone()] {
+            for uri in [
+                CHATGPT_REDIRECT,
+                CHATGPT_CALLBACK,
+                "https://chatgpt.com/connector/oauth/-",
+            ] {
+                assert_eq!(
+                    classify(uri, &extra),
+                    Some(RedirectClass::Hosted(HostedClient::ChatGpt)),
+                    "{uri}"
+                );
+            }
+            assert_eq!(
+                classify("https://claude.ai/api/mcp/auth_callback", &extra),
+                Some(RedirectClass::Hosted(HostedClient::Claude))
+            );
+        }
+        // Any other chatgpt.com path is the operator's configured origin, and
+        // nothing at all without it.
+        assert_eq!(
+            classify("https://chatgpt.com/connector/oauth/a/b", &chatgpt_origin),
+            Some(RedirectClass::Configured)
+        );
+        assert_eq!(
+            classify("https://chatgpt.com/connector/oauth/a/b", &none()),
+            None
+        );
+        assert!(matches_registered(CHATGPT_REDIRECT, CHATGPT_REDIRECT));
+        assert!(!matches_registered(
+            CHATGPT_CALLBACK,
+            "https://chatgpt.com/connector/oauth/cb_Test-02"
+        ));
+    }
+
+    /// Only the two exact shapes: no look-alike host, port, scheme, userinfo,
+    /// case, query, fragment, encoding, trailing slash or extra segment.
+    #[test]
+    fn chatgpt_lookalikes_are_not_hosted() {
+        for uri in [
+            "https://chatgpt.com.evil.example/connector_platform_oauth_redirect",
+            "https://chatgpt.com:8443/connector_platform_oauth_redirect",
+            "https://chatgpt.com:443/connector_platform_oauth_redirect",
+            "http://chatgpt.com/connector_platform_oauth_redirect",
+            "https://CHATGPT.com/connector_platform_oauth_redirect",
+            "https://user@chatgpt.com/connector_platform_oauth_redirect",
+            "https://chatgpt.com@evil.example/connector_platform_oauth_redirect",
+            "https://chatgpt.com/connector_platform_oauth_redirect#frag",
+            "https://chatgpt.com/connector_platform_oauth_redirect?x=1",
+            "https://chatgpt.com/connector_platform_oauth_redirect/",
+            "https://chatgpt.com/connector_platform_oauth_redirect_evil",
+            "https://chatgpt.com/connector/oauth/",
+            "https://chatgpt.com/connector/oauth/a/b",
+            "https://chatgpt.com/connector/oauth/a?x=1",
+            "https://chatgpt.com/connector/oauth/a#frag",
+            "https://chatgpt.com/connector/oauth/a%2Fb",
+            "https://chatgpt.com/connector/oauth/..",
+            "https://chatgpt.com:8443/connector/oauth/a",
+            "https://chatgpt.com/",
         ] {
             assert_eq!(classify(uri, &none()), None, "{uri}");
         }

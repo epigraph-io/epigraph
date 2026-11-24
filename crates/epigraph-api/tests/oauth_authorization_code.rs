@@ -1858,3 +1858,104 @@ async fn consent_names_the_configured_origin(pool: PgPool) {
         "the page names the origin that receives access: {body}"
     );
 }
+
+// ── 76691fdd: ChatGPT as a hosted MCP client + RFC 9207 issuer identification ─
+
+/// ChatGPT's dynamic-registration callback when the authorization server
+/// advertises RFC 9207 issuer identification.
+const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+/// ChatGPT's per-connector callback form (one opaque id segment).
+const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/cb_Test-01";
+
+fn chatgpt_dcr_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "ChatGPT",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    })
+}
+
+/// Both ChatGPT callback forms register as a public client, and the
+/// registration locks the exact URI.
+///
+/// Catches: the hosted allowlist not knowing ChatGPT (the registration is
+/// refused with 400).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_chatgpt_callbacks(pool: PgPool) {
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    for uri in [CHATGPT_REDIRECT, CHATGPT_CALLBACK] {
+        let (status, body) =
+            post_json2(app.clone(), "/oauth/register", chatgpt_dcr_body(uri)).await;
+        assert_eq!(status, StatusCode::CREATED, "{uri} must register: {body}");
+        assert_eq!(body["redirect_uris"][0], uri, "{body}");
+        assert!(
+            body["client_secret"].is_null(),
+            "a public client gets no secret: {body}"
+        );
+    }
+}
+
+/// Only the two exact ChatGPT callback shapes are hosted. Each look-alike is
+/// refused by the allowlist before any database access (dummy-DB app).
+///
+/// Catches: a ChatGPT entry matched by host or prefix (`chatgpt.com/` or
+/// `chatgpt.com/connector/oauth/` followed by anything) instead of exactly.
+#[tokio::test]
+async fn dcr_rejects_chatgpt_lookalikes() {
+    for uri in [
+        "https://chatgpt.com.evil.example/connector_platform_oauth_redirect",
+        "https://chatgpt.com:8443/connector_platform_oauth_redirect",
+        "https://chatgpt.com:443/connector_platform_oauth_redirect",
+        "http://chatgpt.com/connector_platform_oauth_redirect",
+        "https://CHATGPT.com/connector_platform_oauth_redirect",
+        "https://user@chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com@evil.example/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector_platform_oauth_redirect#frag",
+        "https://chatgpt.com/connector_platform_oauth_redirect?x=1",
+        "https://chatgpt.com/connector_platform_oauth_redirect/",
+        "https://chatgpt.com/connector_platform_oauth_redirect_evil",
+        "https://chatgpt.com/connector/oauth/",
+        "https://chatgpt.com/connector/oauth/a/b",
+        "https://chatgpt.com/connector/oauth/a/",
+        "https://chatgpt.com/connector/oauth/a?x=1",
+        "https://chatgpt.com/connector/oauth/a#frag",
+        "https://chatgpt.com/connector/oauth/a%2Fb",
+        "https://chatgpt.com/connector/oauth/..",
+        "https://chatgpt.com/connector/oauth/a.b",
+        "https://chatgpt.com:8443/connector/oauth/a",
+        "https://user@chatgpt.com/connector/oauth/a",
+        "https://chatgpt.com/other/callback",
+        "https://chatgpt.com/",
+    ] {
+        let (status, _body) = post_json2(app(), "/oauth/register", chatgpt_dcr_body(uri)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} is not a ChatGPT callback and must be refused, got {status}"
+        );
+    }
+}
+
+/// The consent page for either ChatGPT callback names ChatGPT, which the server
+/// matched, and never Claude; claude.ai keeps its wording.
+///
+/// Catches: a ChatGPT sign-in presented as Claude's (both hosted under one
+/// label), or as an anonymous application.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_chatgpt_for_a_chatgpt_redirect(pool: PgPool) {
+    for uri in [CHATGPT_REDIRECT, CHATGPT_CALLBACK] {
+        let (body, email) = consent_page_for(&pool, uri).await;
+        assert!(
+            body.contains("Authorize ChatGPT") && body.contains(&email),
+            "{uri}: the page names ChatGPT and the signed-in user: {body}"
+        );
+        assert!(
+            !body.contains("Claude"),
+            "{uri}: not presented as Claude: {body}"
+        );
+    }
+    let (body, _email) = consent_page_for(&pool, REDIRECT_URI).await;
+    assert!(body.contains("Authorize Claude"), "{body}");
+}
