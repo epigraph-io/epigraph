@@ -26,7 +26,11 @@
 //!   is the caller's role in the owning group and not the claim's shape;
 //! * the same refusal and calibration on a TEAM group (migration 164's keyless
 //!   `did:epigraph:group:` shape), whose memberships are live only for a human
-//!   operator (or an agent under one), so the team machinery is exercised.
+//!   operator (or an agent under one), so the team machinery is exercised;
+//! * a foreign PUBLIC claim attached by a caller with no writable personal
+//!   group (migration 114 has no group to own the attachment): its own rule,
+//!   not the "not public" text, with a calibration that the same caller WITH
+//!   its personal group attaches.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -316,4 +320,96 @@ async fn a_team_writer_attaches_evidence(pool: PgPool) {
     let (_, _, evidence, bbas) = state_of(&pool, claim).await;
     assert_eq!(evidence, 1, "calibration: the evidence landed");
     assert!(bbas >= 1, "calibration: its BBA landed");
+}
+
+/// A PUBLIC claim owned by `group`, authored by `agent`, otherwise as
+/// [`group_claim`]. Inserted public (migration 074 refuses widening a
+/// group claim by UPDATE).
+async fn public_claim(pool: &PgPool, agent: Uuid, group: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let hash: Vec<u8> = id.as_bytes().iter().copied().cycle().take(32).collect();
+    sqlx::query(
+        "INSERT INTO claims (id, content, content_hash, truth_value, agent_id, is_current, \
+                             visibility, owner_group_id, labels) \
+         VALUES ($1, $2, $3, 0.5, $4, true, 'public', $5, ARRAY['backlog'])",
+    )
+    .bind(id)
+    .bind(format!("1c93eec8 public claim {id}"))
+    .bind(&hash)
+    .bind(agent)
+    .bind(group)
+    .execute(pool)
+    .await
+    .expect("seed public claim");
+    id
+}
+
+/// The `data.rule` of the foreign-public refusal.
+const NO_HOME_RULE: &str = "evidence_attach_requires_writable_home_group";
+
+/// A foreign PUBLIC claim, attached by a caller whose stamp writes some OTHER
+/// group but not its own personal group: migration 114 owns an attachment by
+/// the caller's personal group, finds none writable, and the row falls back
+/// to the claim's group, which row security refuses. The refusal must not
+/// tell the caller the claim is "not public" or to join the claim's group
+/// (the `evidence_not_writer` text): it names the missing home group under
+/// its own rule. Review finding on backlog 1c93eec8.
+#[sqlx::test(migrations = "../../migrations")]
+async fn foreign_public_attach_without_a_writable_home_group_is_named_as_such(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (owner, claim_group) = shared_group(&pool, "uwe-nw-pub-owner").await;
+    let claim = public_claim(&pool, owner, claim_group).await;
+    let (_, other_group) = shared_group(&pool, "uwe-nw-pub-other").await;
+    let (caller, token, _) = seed_caller(&pool, &["claims:write"]).await;
+    let personal = personal_group_of(&pool, caller).await;
+    sqlx::query("DELETE FROM group_memberships WHERE group_id = $1 AND agent_id = $2")
+        .bind(personal)
+        .bind(caller)
+        .execute(&pool)
+        .await
+        .expect("drop the caller's personal membership");
+    add_member(&pool, other_group, caller, "writer").await;
+    let caller_viewer = viewer(&pool, caller).await;
+    let before = state_of(&pool, claim).await;
+
+    let e = update_with_evidence(&server, &caller_viewer, params(claim, &[]), Some(&token))
+        .await
+        .expect_err("no writable home group owns the attachment");
+    assert_eq!(e.code, ErrorCode::INVALID_REQUEST, "{e:?}");
+    let data = e.data.clone().expect("the refusal carries data");
+    assert_eq!(data["error"], "not_writer", "{data}");
+    assert_eq!(data["rule"], NO_HOME_RULE, "{data}");
+    assert_eq!(data["retryable"], false, "{data}");
+    assert!(
+        !e.message.contains("is not public") && e.message.contains("public claim"),
+        "the claim is public and the message says so: {e:?}"
+    );
+    assert!(e.message.contains("nothing was written"), "{e:?}");
+    for g in [claim_group, other_group, personal] {
+        assert!(
+            !e.message.contains(&g.to_string()) && !data.to_string().contains(&g.to_string()),
+            "no group id is disclosed: {e:?}"
+        );
+    }
+    assert_eq!(state_of(&pool, claim).await, before, "nothing written");
+}
+
+/// Calibration for the arm above: the same caller shape WITH its personal
+/// group writable attaches to the same foreign public claim (migration 114),
+/// so the refusal above is the missing home group, not the claim's shape.
+#[sqlx::test(migrations = "../../migrations")]
+async fn foreign_public_attach_with_a_writable_home_group_lands(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (owner, claim_group) = shared_group(&pool, "uwe-nw-pub-cal-owner").await;
+    let claim = public_claim(&pool, owner, claim_group).await;
+    let (_, other_group) = shared_group(&pool, "uwe-nw-pub-cal-other").await;
+    let (caller, token, _) = seed_caller(&pool, &["claims:write"]).await;
+    add_member(&pool, other_group, caller, "writer").await;
+    let caller_viewer = viewer(&pool, caller).await;
+
+    update_with_evidence(&server, &caller_viewer, params(claim, &[]), Some(&token))
+        .await
+        .expect("CALIBRATION: a non-owner with a writable personal group attaches");
+    let (_, _, evidence, _) = state_of(&pool, claim).await;
+    assert_eq!(evidence, 1, "calibration: the evidence landed");
 }
