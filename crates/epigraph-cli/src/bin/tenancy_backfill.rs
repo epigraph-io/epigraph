@@ -4053,8 +4053,8 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "public.epigraph_disclosed_role_attachments(uuid[])",
         true,
     ),
-    // 273: `GET /api/v1/groups/:id` and the profile detail check call it on
-    // the request DSN; without the grant both are 42501.
+    // 273: group info, the agent routes and `find_agent` / `get_agent` call it
+    // on the request DSN; without the grant each is 42501.
     (
         "epigraph_group_live_roster",
         "public.epigraph_group_live_roster(uuid)",

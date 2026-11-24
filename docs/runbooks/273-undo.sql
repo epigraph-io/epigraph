@@ -4,9 +4,10 @@
 --
 -- READ FIRST: roll the API and MCP binaries back to a build WITHOUT 273
 -- before running this. A binary built with 273 calls the function from
--- `GET /api/v1/groups/:id` (the member list and count) and from the profile
--- detail check (`get_public_profile`, the agent-lookup card and matcher), and
--- answers those reads with 42883 once it is gone.
+-- `GET /api/v1/groups/:id` (the member list and count), `GET /api/v1/agents`,
+-- `GET /api/v1/agents/:id` and `GET /api/v1/agents/search`, and MCP
+-- `find_agent` and `get_agent`, and answers each of them 42883 once it is
+-- gone.
 --
 -- WHAT IT DOES: drops the function. 273 changes nothing else (no table, no
 -- other body, no grant on anything else).

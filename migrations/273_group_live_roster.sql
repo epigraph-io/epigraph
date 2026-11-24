@@ -104,9 +104,15 @@
 -- 6. DEPLOY ORDER: MIGRATE FIRST
 --
 -- Additive: nothing calls the function before the binaries that use it. A
--- binary built with this file calls it from `GET /api/v1/groups/:id` and the
--- profile detail check, and gets 42883 without it, so migrate before
--- deploying (or let `EPIGRAPH_MIGRATE_ON_BOOT` apply it).
+-- binary built with this file calls it from every read of the group roster
+-- or of the profile detail rule, and gets 42883 without it:
+--   * epigraph-api: `GET /api/v1/groups/:id` (member list and count),
+--     `GET /api/v1/agents` and `GET /api/v1/agents/:id` (the ORCID / ROR
+--     redaction, `profile_details_visible`), `GET /api/v1/agents/search`;
+--   * epigraph-mcp: `find_agent` and `get_agent` (the agent-lookup card and
+--     matcher).
+-- So migrate BEFORE deploying the API and MCP binaries (or let
+-- `EPIGRAPH_MIGRATE_ON_BOOT` apply it on the first one restarted).
 --
 -- ===================================================================
 -- UNDO: `docs/runbooks/273-undo.sql` (drops the function). Roll the binaries

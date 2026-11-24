@@ -4509,9 +4509,10 @@ restart.
   owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded; `tenancy_backfill`
   registers it). Pinned by `epigraph-db/tests/group_live_roster.rs` (every gate arm on the
   application role through `Viewer::resolve` + `read_as`; the subset; the parity; the catalog).
-  Undo: `docs/runbooks/273-undo.sql`. **Deploy order:** migrate BEFORE the binary: a binary
-  built with 273 calls it from `GET /api/v1/groups/:id` and the profile detail check and answers
-  42883 without it.
+  Undo: `docs/runbooks/273-undo.sql`. **Deploy order:** migrate BEFORE the API and MCP
+  binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
+  /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
+  `get_agent`, and answers 42883 there without it.
 
 ## `-- no-transaction` migrations
 
