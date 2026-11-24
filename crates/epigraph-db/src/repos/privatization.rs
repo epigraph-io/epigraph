@@ -3997,7 +3997,7 @@ impl PrivatizationRepository {
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
         if !themes.is_empty() {
-            let emptied: Vec<(Uuid, bool)> = sqlx::query_as(
+            let recomputed: Vec<(Uuid, bool, bool)> = sqlx::query_as(
                 r"
                 UPDATE public.claim_themes t
                    SET centroid = (SELECT avg(c.embedding)::vector(1536)
@@ -4013,8 +4013,11 @@ impl PrivatizationRepository {
                                         FROM public.claims c
                                        WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
                        updated_at = now()
-                 WHERE t.id = ANY($1)
-                RETURNING t.id, t.centroid IS NULL
+                  FROM (SELECT p.id, p.centroid_3072 IS NOT NULL AS had_3072
+                          FROM public.claim_themes p
+                         WHERE p.id = ANY($1)) prior
+                 WHERE t.id = prior.id
+                RETURNING t.id, t.centroid IS NULL, prior.had_3072 AND t.centroid_3072 IS NULL
                 ",
             )
             .bind(&themes)
@@ -4023,16 +4026,30 @@ impl PrivatizationRepository {
             .map_err(|source| DbError::QueryFailed { source })?;
             // Reported, not retired: a theme left with no embedded member is
             // unassignable until it is re-seeded or retired, and which of the
-            // two is a maintenance decision (backlog 288801f8).
-            let emptied: Vec<Uuid> = emptied
-                .into_iter()
-                .filter_map(|(id, null): (Uuid, bool)| null.then_some(id))
+            // two is a maintenance decision (backlog 288801f8). A theme that
+            // keeps a 1536-d centroid but loses its 3072-d one is reported
+            // too: it drops out of the count the search route uses to pick
+            // the 3072 index.
+            let emptied: Vec<Uuid> = recomputed
+                .iter()
+                .filter_map(|&(id, null, _)| null.then_some(id))
+                .collect();
+            let lost_3072: Vec<Uuid> = recomputed
+                .iter()
+                .filter_map(|&(id, null, lost)| (lost && !null).then_some(id))
                 .collect();
             if !emptied.is_empty() {
                 tracing::warn!(
                     themes = ?emptied,
                     "this seal's transaction leaves these themes with no embedded member \
                      (if it commits): no centroid, so unassignable until re-seeded or retired"
+                );
+            }
+            if !lost_3072.is_empty() {
+                tracing::warn!(
+                    themes = ?lost_3072,
+                    "this seal's transaction leaves these themes with no member holding a \
+                     3072-d embedding (if it commits): their centroid_3072 is now NULL"
                 );
             }
         }
