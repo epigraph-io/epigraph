@@ -155,13 +155,14 @@ newer run was published while the night ran; nothing was written) or
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
   levels whose naming input changed), `naming.report.calls`;
 - `offbox` (only with the hook, when the map had an `unbuilt` theme):
-  `status` `computed` (with `still_unbuilt`), `failed` (with `error`) or
-  `dry_run` (`would_compute`).
+  `status` `computed` (with `still_unbuilt`), `failed` (with `error`, and
+  `malformed` when the trees came back but were refused) or `dry_run`
+  (`would_compute`).
 
 At the top level, `themes.split` (only with `--theme-cap-split`, when a theme
-is over the cap): `status` `applied` (the script's `report`, and
-`still_over_cap` after it), `failed` (with `error`) or `dry_run`
-(`would_split`).
+is over the cap): `status` `applied` or `nothing to split` (the script's own
+status; its `report`, with `skipped_changed`, and `still_over_cap` after it),
+`failed` (with `error`) or `dry_run` (`would_split`).
 
 A theme whose update FAILS does not fail the night. A leaf over the edge
 limit no longer fails one (above: several claims are split, one claim is

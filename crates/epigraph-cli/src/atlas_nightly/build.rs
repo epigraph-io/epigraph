@@ -970,7 +970,11 @@ pub async fn run_night(
                         opts.theme_cap,
                     )
                     .await?;
-                    themes["split"] = json!({"status": "applied", "report": r,
+                    // The script's own status: "applied", or "nothing to
+                    // split" when no exported theme needed (or could take) a
+                    // split.
+                    let status = r["status"].as_str().unwrap_or("applied").to_string();
+                    themes["split"] = json!({"status": status, "report": r,
                                              "still_over_cap": listed(&left)});
                 }
                 Err(e) => {

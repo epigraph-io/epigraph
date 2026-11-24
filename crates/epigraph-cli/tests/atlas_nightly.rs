@@ -2392,3 +2392,34 @@ async fn an_offbox_tree_with_wrong_ids_fails_the_night(pool: PgPool) {
         std::fs::remove_dir_all(d).ok();
     }
 }
+
+/// Review finding 6: the summary carries the script's own status, so a run
+/// that split nothing is not reported as `applied`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_split_that_split_nothing_is_not_reported_applied(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let dir = private_dir();
+    let work = private_dir();
+    let python = dir.join("python.sh");
+    script(
+        &python,
+        "echo '{\"status\": \"nothing to split\", \"manifest\": null}'",
+    );
+    let mut hook = offbox(std::path::PathBuf::from("/bin/true"), work.clone());
+    hook.theme_cap_split = Some(ThemeCapSplit {
+        python,
+        script: std::path::PathBuf::from("theme_cap_split.py"),
+    });
+    let o = NightOptions {
+        theme_cap: 80,
+        offbox: Some(hook),
+        ..opts()
+    };
+    let s = night(&pool, &viewer, &namer(), &o).await;
+    assert_eq!(s["themes"]["split"]["status"], "nothing to split", "{s:#}");
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
