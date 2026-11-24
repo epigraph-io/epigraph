@@ -152,7 +152,8 @@ impl PaperRepository {
     /// key, whatever `group_copy_id` says. A new GROUP row takes
     /// `group_copy_id` when given (the random id [`Self::planned`] chose and a
     /// detached ingest already announced), else a fresh random one: never an
-    /// id derivable from the key (see [`public_paper_id`]).
+    /// id derivable from the key (see [`public_paper_id`]), so a
+    /// `group_copy_id` equal to it is ignored.
     ///
     /// The key is matched through [`document_key_spellings`] and
     /// [`document_key_first_in_sql`] within the declared scope, canonical
@@ -199,10 +200,16 @@ impl PaperRepository {
         let (visibility, owner) = declared(decl)?;
         let canonical = canonical_document_key(doi);
         let spellings = document_key_spellings(doi);
+        let derived = public_paper_id(doi);
         let new_id = if visibility == "public" {
-            public_paper_id(doi)
+            derived
         } else {
-            group_copy_id.unwrap_or_else(Uuid::new_v4)
+            // Never the derived id, even if a caller passes it: a group copy
+            // under an id computable from the key is the shape the id policy
+            // forbids, and it would squat the public row's id as well.
+            group_copy_id
+                .filter(|id| *id != derived)
+                .unwrap_or_else(Uuid::new_v4)
         };
         // Runtime-checked, not `query!`: CI's migration runner is built
         // `SQLX_OFFLINE`, so a new compile-time query cannot be cached

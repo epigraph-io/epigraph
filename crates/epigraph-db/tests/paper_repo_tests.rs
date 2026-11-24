@@ -1008,3 +1008,44 @@ async fn planned_predicts_what_get_or_create_stored_stores(pool: PgPool) {
     assert_eq!(created.id, public_paper_id(absent));
     assert_eq!(created.id, public_paper_id("10.1234/planned-absent"));
 }
+
+/// A group copy never takes the id derived from the document key, even when
+/// a caller passes it as `group_copy_id`: that id is the public row's, and a
+/// group copy under it would be computable from the key (the probe the id
+/// policy closes) and would squat the public row's id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_copy_ignores_a_group_copy_id_equal_to_the_derived_id(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let (_, g) = fixture::seed_agent_with_group(&pool, "group-copy-derived").await;
+    let doi = "10.5555/repo-group-derived";
+    let stored = PaperRepository::get_or_create_stored(
+        &mut pool.acquire().await.expect("acquire"),
+        &format!("https://doi.org/{doi}"),
+        Some("Private"),
+        None,
+        epigraph_core::TenancyDecl::group(g),
+        Some(public_paper_id(doi)),
+    )
+    .await
+    .expect("group get_or_create_stored");
+    assert_ne!(
+        stored.id,
+        public_paper_id(doi),
+        "a group copy must not be stored under the derived public id"
+    );
+    let public = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        doi,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create after the group copy");
+    assert_eq!(
+        public,
+        public_paper_id(doi),
+        "the public row keeps the derived id"
+    );
+}
