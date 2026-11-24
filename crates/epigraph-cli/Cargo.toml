@@ -427,6 +427,14 @@ name = "atlas_layout"
 path = "src/bin/atlas_layout.rs"
 required-features = ["db"]
 
+# Backlog 30633061: rebuild the graph neighbourhoods of themes a theme-cap
+# split (or its reverse) changed, in the newest clustering run, under the
+# clustering job's lock. Maintenance-only, dry run unless --apply.
+[[bin]]
+name = "rebuild_theme_neighborhoods"
+path = "src/bin/rebuild_theme_neighborhoods.rs"
+required-features = ["db"]
+
 # Spawns the `db`-gated binary above.
 [[test]]
 name = "atlas_layout_bin"

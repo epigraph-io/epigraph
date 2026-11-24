@@ -58,6 +58,7 @@ pub mod rerank;
 pub mod retarget;
 #[cfg(feature = "db")]
 pub mod shadow_report;
+pub mod theme_neighborhoods;
 #[cfg(feature = "db")]
 pub mod truth_mirror;
 
