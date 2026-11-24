@@ -10,9 +10,10 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 /// This authorization server's issuer identifier: `public_base_url` without a
-/// trailing slash. The ONE source for both the metadata document's `issuer` and
-/// the RFC 9207 `iss` on every authorization response, which a client compares
-/// byte for byte (RFC 9207 section 2.4).
+/// trailing slash. The ONE source for the metadata document's `issuer`, the
+/// protected resource's `authorization_servers` entry (RFC 9728 section 3
+/// requires the two to match) and the RFC 9207 `iss` on every authorization
+/// response, which a client compares byte for byte (RFC 9207 section 2.4).
 #[must_use]
 pub fn issuer(state: &AppState) -> &str {
     state.config.public_base_url.trim_end_matches('/')
@@ -76,7 +77,7 @@ pub async fn jwks_document(State(state): State<AppState>) -> Json<JwkSet> {
 
 /// RFC 9728 — GET /.well-known/oauth-protected-resource
 pub async fn protected_resource_metadata(State(state): State<AppState>) -> Json<Value> {
-    let base = state.config.public_base_url.trim_end_matches('/');
+    let base = issuer(&state);
     Json(json!({
         "resource": format!("{base}/mcp"),
         "authorization_servers": [base],

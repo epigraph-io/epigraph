@@ -2222,6 +2222,12 @@ async fn authorization_responses_identify_the_issuer(pool: PgPool) {
         );
         assert_eq!(params.get("state").map(String::as_str), Some("iss-state"));
     }
+
+    // RFC 9728 section 3: the protected resource names this same issuer as its
+    // authorization server, which is where a client discovers the issuer it
+    // then holds `iss` to.
+    let (_, prm) = get_json(app, "/.well-known/oauth-protected-resource").await;
+    assert_eq!(prm["authorization_servers"][0], meta["issuer"], "{prm}");
 }
 
 /// RFC 7591 section 2 makes `client_name` OPTIONAL. A dynamic registration
