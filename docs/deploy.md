@@ -1230,8 +1230,9 @@ creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
 **A read-only login for the theme scripts needs two grants.** Every theme
 label path (`label_themes_llm.py`, including `--dry-run`, `cluster_claims.py`,
 `evidential_clustering.py`, `refine_clusters.py`,
-`seed_themes_from_textbooks.py`) filters its label samples through
-`scripts/theme_lib.py::not_intake_owned`, which reads the bug-report intake's
+`seed_themes_from_textbooks.py`, `anchor_papers_to_themes.py`) filters its
+label samples through `scripts/theme_lib.py::not_intake_owned` (directly or
+through `public_label_source`), which reads the bug-report intake's
 two tables: `bug_report_intake_settings` (migration 207) and
 `bug_report_intake_marks` (migration 272). The maintenance role already holds
 SELECT on both. A login outside it (a read-only role you created for dry runs,
