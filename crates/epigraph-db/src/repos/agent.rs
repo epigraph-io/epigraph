@@ -353,6 +353,83 @@ pub struct AgentPublicProfile {
 /// with `key_kind: "seed-derived"`).
 pub const KEY_KIND_SEED_DERIVED: &str = "seed-derived";
 
+/// `agents.display_name` is `varchar(255)`.
+const DISPLAY_NAME_MAX_CHARS: usize = 255;
+
+/// Unicode general category `Cf` (format characters: bidi controls and
+/// isolates, zero-width spaces and joiners, the BOM, tag characters, ...),
+/// as of Unicode 15.1. A name carrying one can render as another name.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x00AD
+            | 0x0600..=0x0605
+            | 0x061C
+            | 0x06DD
+            | 0x070F
+            | 0x0890..=0x0891
+            | 0x08E2
+            | 0x180E
+            | 0x200B..=0x200F
+            | 0x202A..=0x202E
+            | 0x2060..=0x2064
+            | 0x2066..=0x206F
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0x110BD
+            | 0x110CD
+            | 0x13430..=0x1343F
+            | 0x1BCA0..=0x1BCA3
+            | 0x1D173..=0x1D17A
+            | 0xE0001
+            | 0xE0020..=0xE007F
+    )
+}
+
+/// The person's name an identity provider asserted for an OAuth client, or
+/// `None` when the client is not provider-provisioned or carries no usable
+/// name (human-identity visibility spec, section 9.2).
+///
+/// `Some` only when ALL hold:
+/// * `client_type == "human"`;
+/// * `client_id` contains `':'`. Only
+///   `oauth/providers/provision.rs::provision_external_user_client` mints that
+///   shape (`<provider>:<subject>`); a DCR or legacy human registration
+///   (`epigraph_<hex>`) chose its own `client_name`, so it is never trusted as
+///   a person's name (`identity_provisioning.rs::
+///   only_provider_provisioning_mints_a_colon_client_id` pins the creators);
+/// * the name, trimmed and with whitespace runs collapsed to one space, is
+///   non-empty, at most 255 characters, has no control (`Cc`) or format
+///   (`Cf`) character, contains no `'@'`, and is not
+///   `legal_contact_email` in any letter case. `provision.rs` stores
+///   `identity.name.unwrap_or(email)` as `client_name`, so a provider that
+///   sent no name leaves the EMAIL there, and an email must never become a
+///   display name.
+#[must_use]
+pub fn provider_asserted_person_name(
+    client_type: &str,
+    client_id: &str,
+    client_name: &str,
+    legal_contact_email: Option<&str>,
+) -> Option<String> {
+    if client_type != "human" || !client_id.contains(':') {
+        return None;
+    }
+    // Whitespace runs (tabs and newlines included) collapse to one space; any
+    // control or format character left after that refuses the name.
+    let name = client_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    if name.chars().any(|c| c.is_control() || is_format_char(c)) {
+        return None;
+    }
+    if name.is_empty() || name.chars().count() > DISPLAY_NAME_MAX_CHARS || name.contains('@') {
+        return None;
+    }
+    if legal_contact_email.is_some_and(|e| e.trim().eq_ignore_ascii_case(&name)) {
+        return None;
+    }
+    Some(name)
+}
+
 /// Step 2 of [`AgentRepository::ensure_for_client`]: refuse to adopt an
 /// `ed25519` row whose key anyone can compute (backlog 55fba366).
 ///
@@ -1678,7 +1755,12 @@ impl AgentRepository {
     ///    path: one indexed read). `client_type` is read from the LOCKED ROW
     ///    rather than taken as a parameter, so a caller cannot pass one
     ///    inconsistent with what is stored (`providers::provision` hardcoded
-    ///    `"human"`).
+    ///    `"human"`). For a human client, `client_name` and
+    ///    `legal_contact_email` are then read from the same locked row: a
+    ///    provider-provisioned person is named as the provider asserted
+    ///    ([`provider_asserted_person_name`], never an email), and every other
+    ///    principal is named `oauth:<client row id>`. A client that is already
+    ///    linked keeps its agent and name (no backfill).
     /// 2. **`client_type = 'agent'` first.** For an agent client the `client_id`
     ///    IS the hex Ed25519 public key by construction
     ///    (`oauth/register.rs` requires it; `oauth/token.rs` decodes it to
@@ -1776,7 +1858,25 @@ impl AgentRepository {
             "human" => "human",
             _ => "software_agent", // "agent" and "service"
         };
-        let display_name = format!("oauth:{client_row_id}");
+        // A provider-provisioned person is named as the provider asserted
+        // (operator ruling, human-identity visibility spec section 9); every
+        // other principal keeps the placeholder. The name is read from the
+        // row locked above: this transaction holds its FOR UPDATE, so no
+        // writer can change it between the two statements, and the
+        // application role keeps SELECT on `oauth_clients` (118).
+        let provider_name = if client_type == "human" {
+            let (client_name, email): (String, Option<String>) = sqlx::query_as(
+                "SELECT client_name::text, legal_contact_email::text \
+                   FROM public.oauth_clients WHERE id = $1",
+            )
+            .bind(client_row_id)
+            .fetch_one(&mut *conn)
+            .await?;
+            provider_asserted_person_name(&client_type, &client_id, &client_name, email.as_deref())
+        } else {
+            None
+        };
+        let display_name = provider_name.unwrap_or_else(|| format!("oauth:{client_row_id}"));
 
         // 2. An agent client's client_id IS its Ed25519 public key. Adopt the
         //    real signer row when one exists rather than minting a second,
@@ -2907,7 +3007,98 @@ impl AgentRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::RunTokens;
+    use super::{provider_asserted_person_name, RunTokens};
+
+    const EMAIL: Option<&str> = Some("ada.example@example.test");
+
+    fn provider(name: &str) -> Option<String> {
+        provider_asserted_person_name("human", "google:1234", name, EMAIL)
+    }
+
+    /// A provider-provisioned human client (`<provider>:<subject>`) with a
+    /// real name gives that name, whitespace trimmed and collapsed.
+    #[test]
+    fn a_provider_name_is_used_trimmed_and_collapsed() {
+        assert_eq!(provider("Ada Example").as_deref(), Some("Ada Example"));
+        assert_eq!(
+            provider("  Ada \t\n  Example  ").as_deref(),
+            Some("Ada Example")
+        );
+    }
+
+    /// The email fallback `provision.rs` stores when the provider sent no
+    /// name, in any letter case, or anything carrying an `@`, is never a
+    /// display name; neither is an empty or blank name.
+    #[test]
+    fn an_email_or_empty_name_is_never_used() {
+        for bad in [
+            "ada.example@example.test",
+            "ADA.Example@Example.TEST",
+            "someone@else.test",
+            "Ada @ Example",
+            "",
+            "   ",
+        ] {
+            assert_eq!(provider(bad), None, "{bad:?}");
+        }
+        // With no recorded contact email the '@' rule alone still holds.
+        assert_eq!(
+            provider_asserted_person_name("human", "google:1", "a@b.test", None),
+            None
+        );
+    }
+
+    /// Control (Cc) and format (Cf) characters make a name spoofable (bidi
+    /// overrides, zero-width characters, the BOM): such a name is not used.
+    #[test]
+    fn control_and_format_characters_refuse_the_name() {
+        for bad in [
+            "Ada\u{0007}Example",
+            "Ada\u{202E}elpmaxE",
+            "Ada\u{200B}Example",
+            "\u{FEFF}Ada Example",
+            "Ada\u{2066}Example",
+            "Ada\u{00AD}Example",
+            "Ada\u{E0041}Example",
+        ] {
+            assert_eq!(provider(bad), None, "{bad:?}");
+        }
+        // A non-ASCII letter is not a format character.
+        assert_eq!(provider("Zoë Ångström").as_deref(), Some("Zoë Ångström"));
+    }
+
+    /// `agents.display_name` is varchar(255): 255 characters fit, 256 do not
+    /// (counted in characters, as PostgreSQL counts varchar).
+    #[test]
+    fn the_name_fits_the_column_or_is_not_used() {
+        let fits = "é".repeat(255);
+        assert_eq!(provider(&fits).as_deref(), Some(fits.as_str()));
+        assert_eq!(provider(&"é".repeat(256)), None);
+    }
+
+    /// Only a provider-provisioned HUMAN client qualifies: a DCR or legacy
+    /// human registration (`epigraph_<hex>`, a client-chosen name), and any
+    /// service or agent client, keep the placeholder.
+    #[test]
+    fn only_a_provider_human_client_qualifies() {
+        assert_eq!(
+            provider_asserted_person_name(
+                "human",
+                "epigraph_0123456789abcdef0123456789abcdef",
+                "Ada Example",
+                EMAIL
+            ),
+            None,
+            "a DCR / legacy human registration chooses its own name"
+        );
+        for t in ["service", "agent"] {
+            assert_eq!(
+                provider_asserted_person_name(t, "google:1234", "Ada Example", EMAIL),
+                None,
+                "{t}"
+            );
+        }
+    }
 
     /// OFF unless the value is exactly `on`: unset, empty, `true`, `1`, `yes`
     /// and a typo all leave delegated run tokens refused. Mutation caught:
