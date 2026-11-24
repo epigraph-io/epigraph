@@ -175,8 +175,9 @@ async fn a_session_outside_the_group_reads_no_roster(pool: PgPool) {
         assert!(roster.is_empty(), "{who}: no roster, got {roster:?}");
     }
 
-    // A principal stamp alone (the lapsed member stamping itself, the
-    // group's own creator) does not open the gate: only the group set does.
+    // A principal stamp alone does not open the gate, even the group's own
+    // creator's (077's creator and principal arms show it rows): only the
+    // stamped group set does.
     let group = t.group;
     let owner = t.owner;
     let n: i64 = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
@@ -198,7 +199,10 @@ async fn a_session_outside_the_group_reads_no_roster(pool: PgPool) {
         (conn, n)
     })
     .await;
-    assert_eq!(n, 0, "a principal-only stamp (even the creator's) reads no roster");
+    assert_eq!(
+        n, 0,
+        "a principal-only stamp (even the creator's) reads no roster"
+    );
 
     let n: i64 = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
         let n: i64 =
@@ -276,13 +280,12 @@ async fn the_roster_decides_each_row_like_the_unbound_twin(pool: PgPool) {
         .await
         .expect("rows");
         assert!(!rows.is_empty(), "PREMISE: group {group} has rows");
-        let roster: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT agent_id FROM public.epigraph_group_live_roster($1)",
-        )
-        .bind(group)
-        .fetch_all(&pool)
-        .await
-        .expect("roster");
+        let roster: Vec<Uuid> =
+            sqlx::query_scalar("SELECT agent_id FROM public.epigraph_group_live_roster($1)")
+                .bind(group)
+                .fetch_all(&pool)
+                .await
+                .expect("roster");
         for agent in rows {
             let twin: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM public.epigraph_live_memberships_unbound($1) \

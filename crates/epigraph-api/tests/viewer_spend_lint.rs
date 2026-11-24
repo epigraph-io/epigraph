@@ -342,14 +342,16 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "ClaimRepository::writable_teams",
         ],
     ),
-    // untenanted: the caller's own membership, and the seal record of a claim
-    // already read through the viewer.
+    // untenanted: the caller's own LIVE membership (backlog f712db53: the
+    // live-membership definer, asked on the connection stamped from this
+    // viewer, whose principal is the agent asked about), and the seal record
+    // of a claim already read through the viewer.
     (
         "claims.rs",
         "get_claim",
         &[
             "ClaimEncryptionRepository::get_by_claim_id_conn",
-            "GroupMembershipRepository::is_member",
+            "GroupMembershipRepository::is_member_conn",
         ],
     ),
     (
@@ -357,7 +359,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "list_claims",
         &[
             "ClaimEncryptionRepository::get_by_claim_id_conn",
-            "GroupMembershipRepository::is_member",
+            "GroupMembershipRepository::is_member_conn",
         ],
     ),
     // gated (`write_target_of`, for every caller since backlog 4073bbb6: the
@@ -1410,8 +1412,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewed, so each helper's own body is measured and reviewed here.
     //
     // claims.rs::create_claim_core (POST /claims, /claims/batch). untenanted:
-    // the CALLER's own membership of the group it asks to encrypt into (the
-    // authenticated id, never the body), then that group's current key epoch,
+    // the CALLER's own LIVE membership of the group it asks to encrypt into
+    // (the authenticated id, never the body; asked on a `read_as` connection
+    // stamped from this viewer, backlog f712db53), then that group's current key epoch,
     // read only after the membership check passed; the author's agent row.
     // write: everything else runs on the claim-write transaction stamped with
     // this viewer, except the AUTHORED / HAS_TRACE / DERIVED_FROM edges and
@@ -1445,7 +1448,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed_conn",
             "GroupKeyEpochRepository::get_current_epoch",
-            "GroupMembershipRepository::is_member",
+            "GroupMembershipRepository::is_member_conn",
             "Viewer::resolve",
             "db_pool.acquire",
             "provenance::record_provenance",

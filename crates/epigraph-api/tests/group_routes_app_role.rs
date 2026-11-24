@@ -698,7 +698,14 @@ async fn the_removal_route_refuses_a_non_admin_and_a_stranger_on_the_application
 /// SUPERUSER pool (a privileged session, which those verbs' triggers admit)
 /// exactly as `epigraph_create_team_group` shapes it, with `creator` as its
 /// admin and `member` as a reader.
+///
+/// `creator` is made a registered human first, as the verb requires of an
+/// admin: a row in a verb-made group counts only while its human is a live
+/// human operator (164's conjunct in `epigraph_live_memberships`), and since
+/// backlog 93ed2ec3 the REST admin check reads that live answer, so a creator
+/// that is not one is refused as a lapsed admin before the database is asked.
 async fn seeded_verb_made_group(pool: &PgPool, creator: Uuid, member: Uuid) -> Uuid {
+    viewer_fixture::make_human_operator(pool, creator).await;
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
@@ -860,5 +867,202 @@ async fn a_non_member_removal_marks_nothing_on_the_application_role(pool: PgPool
         group_mark_and_epoch(&pool, group).await,
         (false, Some("active".to_string())),
         "NotAMember: no re-key mark, epoch still active"
+    );
+}
+
+// =====================================================================
+// LIVE membership (backlogs 93ed2ec3, f712db53, 6e22596c).
+//
+// A row in a verb-made team group (migration 164) LAPSES, unrevoked, when its
+// human stops being a live human operator; a member DERIVED from a role
+// binding (migration 165) holds no row at all. The resolved viewer follows
+// both; these arms pin that the REST group routes do too.
+// =====================================================================
+
+/// The words `require_group_admin_conn` and `get_group` answer a caller that
+/// holds no live membership. Asserted, not just the 403, because on a
+/// verb-made team group the DATABASE also refuses a roster write with 403
+/// (migration 164), and a bare status would pass for that refusal too.
+const NOT_A_MEMBER: &str = "Not a member of this group";
+
+/// A lapsed ADMIN of a verb-made team group (its human's registration revoked,
+/// its admin row left unrevoked) is refused by every REST group admin route by
+/// the admin check itself, reads no group info, and changes nothing; the
+/// group's live admin still reads it, and the lapsed row is not counted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_lapsed_admin_is_refused_by_every_group_admin_route(pool: PgPool) {
+    let (owner, _) = viewer_fixture::seed_human_operator(&pool, "93ed2ec3-owner").await;
+    let (lapsed, _) = viewer_fixture::seed_human_operator(&pool, "93ed2ec3-lapsed").await;
+    let (member, _) = viewer_fixture::seed_human_operator(&pool, "93ed2ec3-member").await;
+    let (newcomer, _) = viewer_fixture::seed_human_operator(&pool, "93ed2ec3-new").await;
+    let group = viewer_fixture::verb_team_group(&pool, "Synthetic Lapse Team", owner).await;
+    viewer_fixture::verb_team_group_add(&pool, group, lapsed, "admin").await;
+    viewer_fixture::verb_team_group_add(&pool, group, member, "writer").await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        lapsed,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POSITIVE CONTROL: while live, the admin reads the group: {body}"
+    );
+
+    viewer_fixture::revoke_human_operator(&pool, lapsed).await;
+    assert!(
+        viewer_fixture::has_unrevoked_row(&pool, group, lapsed).await,
+        "PREMISE: the lapsed admin's row is still unrevoked"
+    );
+    let roster_before = live_roster(&pool, group).await;
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        lapsed,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "get_group: {body}");
+    assert!(body.to_string().contains(NOT_A_MEMBER), "get_group: {body}");
+    assert!(body.get("member_count").is_none(), "no group info: {body}");
+
+    let admin_routes: [(Method, String, Option<Value>); 3] = [
+        (
+            Method::POST,
+            format!("/api/v1/groups/{group}/members"),
+            Some(member_body(newcomer, "reader", "93ed2ec3-add")),
+        ),
+        (
+            Method::DELETE,
+            format!("/api/v1/groups/{group}/members/{member}"),
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/groups/{group}/rotate"),
+            Some(json!({ "shares": [
+                { "agent_id": owner, "wrapped_key_share": wrapped_share("93ed2ec3-r1") },
+                { "agent_id": lapsed, "wrapped_key_share": wrapped_share("93ed2ec3-r2") },
+                { "agent_id": member, "wrapped_key_share": wrapped_share("93ed2ec3-r3") },
+            ] })),
+        ),
+    ];
+    for (method, uri, body_in) in admin_routes {
+        let (status, body) = send(
+            app_role_router(&pool).await,
+            method.clone(),
+            &uri,
+            lapsed,
+            body_in,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {body}");
+        assert!(
+            body.to_string().contains(NOT_A_MEMBER),
+            "{method} {uri}: refused by the admin check, not later: {body}"
+        );
+    }
+    assert_eq!(
+        live_roster(&pool, group).await,
+        roster_before,
+        "nothing was added or revoked"
+    );
+    assert!(
+        !group_mark_and_epoch(&pool, group).await.0,
+        "no re-key obligation was marked"
+    );
+
+    let (status, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        owner,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POSITIVE CONTROL: the owner: {body}"
+    );
+    assert_eq!(
+        body["member_count"],
+        json!(2),
+        "the owner and the writer; the lapsed row is not a member: {body}"
+    );
+}
+
+/// A registered human that is a member of a team group ONLY through a live
+/// assignment of a role bound to it (migration 165, no row) reads the group's
+/// info and a group-private claim over HTTP, including through the
+/// group-scoped `GET /api/v1/claims/:id?group_id=` gate; when the assignment
+/// ends, every one of those reads is refused at the next request (design #17's
+/// HTTP read-lapse, with a minted token on the application role).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_holder_reads_the_group_until_its_assignment_ends(pool: PgPool) {
+    let (owner, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-owner").await;
+    let (holder, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-holder").await;
+    let group = viewer_fixture::verb_team_group(&pool, "Synthetic Role Team", owner).await;
+    let role = "role:synthetic-rest-reader";
+    viewer_fixture::bind_new_role_to_group(&pool, role, group, "reader", false).await;
+    let assignment = viewer_fixture::grant_role_now(&pool, role, holder).await;
+    let claim =
+        viewer_fixture::seed_group_claim(&pool, owner, group, "f712db53 group-private claim").await;
+    assert!(
+        !viewer_fixture::has_unrevoked_row(&pool, group, holder).await,
+        "PREMISE: the holder holds no row"
+    );
+
+    let reads = [
+        format!("/api/v1/groups/{group}"),
+        format!("/api/v1/claims/{claim}"),
+        format!("/api/v1/claims/{claim}?group_id={group}"),
+    ];
+    for uri in &reads {
+        let (status, body) =
+            send(app_role_router(&pool).await, Method::GET, uri, holder, None).await;
+        assert_eq!(status, StatusCode::OK, "live: GET {uri}: {body}");
+    }
+    let (_, body) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/groups/{group}"),
+        holder,
+        None,
+    )
+    .await;
+    assert_eq!(
+        body["member_count"],
+        json!(1),
+        "member_count counts the explicit roster (the owner); a derived member holds no row: {body}"
+    );
+
+    viewer_fixture::end_role_assignment(&pool, assignment).await;
+    for uri in &reads {
+        let (status, body) =
+            send(app_role_router(&pool).await, Method::GET, uri, holder, None).await;
+        assert!(
+            status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+            "lapsed: GET {uri} must be refused, got {status}: {body}"
+        );
+    }
+    let (status, _) = send(
+        app_role_router(&pool).await,
+        Method::GET,
+        &format!("/api/v1/claims/{claim}"),
+        owner,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POSITIVE CONTROL: the owner still reads"
     );
 }
