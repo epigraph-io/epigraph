@@ -331,7 +331,7 @@ async fn a_processed_by_stamp_is_world_owned_and_read_as_the_caller(pool: PgPool
     let (stranger, _) = fixture::seed_agent_with_group(&pool, "ingest-stranger").await;
     let doi = "10.5555/raw-pool-probe";
     let paper = epigraph_db::PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("t"),
         None,

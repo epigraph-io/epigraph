@@ -46,12 +46,87 @@ fn declared(decl: epigraph_core::TenancyDecl) -> Result<(&'static str, Uuid), Db
     }
 }
 
+/// A `papers` row as [`PaperRepository::get_or_create_stored`] left it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPaper {
+    pub id: Uuid,
+    /// The title the row holds AFTER the call. A hit fills only a NULL title,
+    /// so this can differ from the title the caller passed (backlog 288801f8),
+    /// and it is the one a response should report.
+    pub title: Option<String>,
+}
+
+/// [`PaperRepository::planned`]: what a get-or-create in one scope would
+/// return, read without writing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedPaper {
+    /// The existing row's id, else the id a new row of that scope is to be
+    /// inserted with: [`public_paper_id`] for a public row, a fresh RANDOM id
+    /// for a group's row. Pass it to [`PaperRepository::get_or_create_stored`]
+    /// so the walk inserts the row under the id its caller was told.
+    pub id: Uuid,
+    /// The stored title, else (no row, or a NULL title) the caller's, which
+    /// is what the fill-only upsert leaves.
+    pub title: Option<String>,
+    /// Whether that scope already has a row under some spelling of the key.
+    pub exists: bool,
+}
+
+/// UUIDv5 namespace for [`public_paper_id`].
+pub const PAPER_NAMESPACE: Uuid = Uuid::from_bytes([
+    0x5a, 0x9e, 0x7d, 0x10, 0x3c, 0x2b, 0x4f, 0x61, 0x8e, 0x0d, 0x6a, 0x47, 0xb3, 0x19, 0xc2, 0xf8,
+]);
+
+/// The id a NEW PUBLIC `papers` row of `doi` is inserted with: a UUIDv5 of
+/// its [`canonical_document_key`], so every spelling of the key gives the same
+/// id, a re-ingest after a failed walk gets the id the first attempt
+/// announced, and two concurrent public ingests of a new document agree on it.
+///
+/// Public rows only. Since migration 246 a document has one row per SCOPE, and
+/// a group's private copy gets a random id instead
+/// ([`PaperRepository::planned`]): a private copy cannot share the public
+/// row's id (one primary key), and an id computable from the document key
+/// would let anyone name a group's private copy and probe whether it exists.
+/// A public row written before this keeps its random id; an existing row's id
+/// always wins over this one.
+#[must_use]
+pub fn public_paper_id(doi: &str) -> Uuid {
+    Uuid::new_v5(&PAPER_NAMESPACE, canonical_document_key(doi).as_bytes())
+}
+
+/// The scope predicate every in-scope `papers` lookup splices into
+/// [`document_key_first_in_sql`]: the declared scope's row, never another's.
+/// `vis` and `owner` are the bind numbers of the declaration's visibility and
+/// owner group (trusted literals, never caller input).
+fn in_scope_predicate(vis: usize, owner: usize) -> String {
+    format!("visibility = ${vis}::text AND (${vis}::text = 'public' OR owner_group_id = ${owner}::uuid)")
+}
+
 pub struct PaperRepository;
 
 impl PaperRepository {
+    /// [`Self::get_or_create_stored`] without the stored title, inserting a
+    /// new group row under a random id.
+    ///
+    /// # Errors
+    /// Every error of [`Self::get_or_create_stored`].
+    pub async fn get_or_create(
+        conn: &mut sqlx::PgConnection,
+        doi: &str,
+        title: Option<&str>,
+        journal: Option<&str>,
+        decl: epigraph_core::TenancyDecl,
+    ) -> Result<Uuid, DbError> {
+        Ok(
+            Self::get_or_create_stored(conn, doi, title, journal, decl, None)
+                .await?
+                .id,
+        )
+    }
+
     /// Insert a paper in the scope `decl` names, or return the existing row of
     /// that scope if the document key already exists there under any of its
-    /// spellings.
+    /// spellings, with the title the row holds after the call.
     ///
     /// # One row per document per scope (migration 246)
     ///
@@ -71,6 +146,19 @@ impl PaperRepository {
     /// the writer can read (public, or its own group's), so the upsert never
     /// lands on a hidden row.
     ///
+    /// # The id of a new row
+    ///
+    /// A new PUBLIC row takes [`public_paper_id`], derived from the document
+    /// key, whatever `group_copy_id` says, unless that id is already held by
+    /// a row this scope's lookup cannot find (another document's row, or a
+    /// row moved out of the public scope): the insert then falls back to a
+    /// random id rather than failing for good, and a detached ingest's
+    /// announced id differs from the stored one. A new GROUP row takes
+    /// `group_copy_id` when given (the random id [`Self::planned`] chose and a
+    /// detached ingest already announced), else a fresh random one: never an
+    /// id derivable from the key (see [`public_paper_id`]), so a
+    /// `group_copy_id` equal to it is ignored.
+    ///
     /// The key is matched through [`document_key_spellings`] and
     /// [`document_key_first_in_sql`] within the declared scope, canonical
     /// first, so a row an older writer stored under a resolver URL
@@ -81,31 +169,55 @@ impl PaperRepository {
     ///
     /// **A hit fills only NULL fields** (backlog 62ce37ca): the row found keeps
     /// its `title` and `journal`; a provided value is written only where the
-    /// stored one is NULL. Both arms hold this: the `updated` CTE (an existing
-    /// row) and `ON CONFLICT` (a concurrent writer inserted the same new key in
-    /// the same scope first, which makes this call wait and then return that
-    /// writer's row, not a unique violation).
+    /// stored one is NULL.
+    ///
+    /// # A concurrent creator
+    ///
+    /// The insert is `ON CONFLICT DO NOTHING` with no conflict target, so a
+    /// concurrent writer of the same new row in the same scope makes this
+    /// statement wait for it and then insert nothing, whichever unique index
+    /// the two collide on first: the document-key-per-scope index, or the
+    /// primary key (two public creators insert the same derived id, and an
+    /// `ON CONFLICT` naming only the key index would raise 23505 on the
+    /// primary key in that race). The statement then runs once more, on a
+    /// fresh snapshot that sees the winner's row, and takes the hit arm
+    /// (fill-only), so the loser returns the winner's row. That second run is
+    /// why this takes one connection rather than any executor: a pool caller
+    /// passes `&mut *pool.acquire().await?`.
     ///
     /// # Errors
     /// `DbError::InvalidData` for an undeclared (`Inherited`) `decl`: a paper
     /// has no parent to inherit from. `DbError::QueryFailed` if the statement
     /// fails, including a row-security refusal (42501) for an owner group the
-    /// session does not write.
-    #[instrument(skip(executor))]
-    pub async fn get_or_create<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
+    /// session does not write. `DbError::InvalidData` if the insert collided
+    /// on every id it tried with a row its re-runs still cannot find.
+    #[instrument(skip(conn))]
+    pub async fn get_or_create_stored(
+        conn: &mut sqlx::PgConnection,
         doi: &str,
         title: Option<&str>,
         journal: Option<&str>,
         decl: epigraph_core::TenancyDecl,
-    ) -> Result<Uuid, DbError> {
+        group_copy_id: Option<Uuid>,
+    ) -> Result<StoredPaper, DbError> {
         let (visibility, owner) = declared(decl)?;
         let canonical = canonical_document_key(doi);
         let spellings = document_key_spellings(doi);
+        let derived = public_paper_id(doi);
+        let new_id = if visibility == "public" {
+            derived
+        } else {
+            // Never the derived id, even if a caller passes it: a group copy
+            // under an id computable from the key is the shape the id policy
+            // forbids, and it would squat the public row's id as well.
+            group_copy_id
+                .filter(|id| *id != derived)
+                .unwrap_or_else(Uuid::new_v4)
+        };
         // Runtime-checked, not `query!`: CI's migration runner is built
         // `SQLX_OFFLINE`, so a new compile-time query cannot be cached
         // before the schema it is checked against exists.
-        let id: Uuid = sqlx::query_scalar(&format!(
+        let sql = format!(
             r#"
             WITH found AS (
                 {first}
@@ -116,39 +228,112 @@ impl PaperRepository {
                     journal = COALESCE(p.journal, $4::text)
                 FROM found
                 WHERE p.id = found.id
-                RETURNING p.id
+                RETURNING p.id, p.title
             ),
             inserted AS (
-                INSERT INTO papers (doi, title, journal, visibility, owner_group_id)
-                SELECT $2::text, $3::text, $4::text, $5::text, $6::uuid
+                INSERT INTO papers (id, doi, title, journal, visibility, owner_group_id)
+                SELECT $7::uuid, $2::text, $3::text, $4::text, $5::text, $6::uuid
                 WHERE NOT EXISTS (SELECT 1 FROM found)
-                ON CONFLICT (doi, (CASE WHEN visibility = 'public'
-                                        THEN '00000000-0000-0000-0000-000000000000'::uuid
-                                        ELSE owner_group_id END))
-                DO UPDATE SET
-                    title = COALESCE(papers.title, EXCLUDED.title),
-                    journal = COALESCE(papers.journal, EXCLUDED.journal)
-                RETURNING id
+                ON CONFLICT DO NOTHING
+                RETURNING id, title
             )
-            SELECT id FROM updated
+            SELECT id, title FROM updated
             UNION ALL
-            SELECT id FROM inserted
+            SELECT id, title FROM inserted
             "#,
-            first = document_key_first_in_sql(
-                "id",
-                1,
-                "visibility = $5::text AND ($5::text = 'public' OR owner_group_id = $6::uuid)",
+            first = document_key_first_in_sql("id", 1, &in_scope_predicate(5, 6)),
+        );
+        // Each id is tried twice: the second run is the race loser's (see
+        // above). A public insert whose derived id is held by a row its scope
+        // lookup cannot see (another document's row, or a row moved out of
+        // the public scope) falls back to a random id, so that row cannot
+        // block the document's public row for good; that is the one case in
+        // which a new public row does not take the derived id.
+        let fallback = (visibility == "public").then(Uuid::new_v4);
+        for id in [Some(new_id), fallback].into_iter().flatten() {
+            for _ in 0..2 {
+                let row: Option<(Uuid, Option<String>)> = sqlx::query_as(&sql)
+                    .bind(&spellings)
+                    .bind(&canonical)
+                    .bind(title)
+                    .bind(journal)
+                    .bind(visibility)
+                    .bind(owner)
+                    .bind(id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                if let Some((id, title)) = row {
+                    return Ok(StoredPaper { id, title });
+                }
+            }
+            if fallback.is_some_and(|f| f != id) {
+                tracing::warn!(
+                    "papers: a new public row's derived id is held by a row outside its \
+                     scope lookup; inserting it under a random id"
+                );
+            }
+        }
+        // Generic on purpose: which row holds the id is not the caller's to learn.
+        Err(DbError::InvalidData {
+            reason: format!(
+                "papers: could not insert or find the row of document key {canonical:?} \
+                 in the declared scope"
             ),
+        })
+    }
+
+    /// What [`Self::get_or_create_stored`] in the scope `decl` names WOULD
+    /// return, read without writing: the existing row's id and its title
+    /// filled the way the upsert fills it; or, when that scope has no row of
+    /// the key, the id a new row is to take ([`public_paper_id`] for a public
+    /// row, a fresh random id for a group's) and the caller's title.
+    ///
+    /// For the detached ingest handlers, which answer the caller before the
+    /// walk that writes the row has run (backlog b995f117): they pass
+    /// [`PlannedPaper::id`] to the walk's [`Self::get_or_create_stored`], so a
+    /// new group copy is inserted under the random id announced. Read on the
+    /// writer's stamped connection, with the same in-scope lookup as the
+    /// upsert's. The prediction holds unless another writer creates the row
+    /// of that scope in between (a concurrent ingest of the same document in
+    /// the same scope; for a group copy, its random id then differs, and the
+    /// walk converges on the other writer's row).
+    ///
+    /// # Errors
+    /// `DbError::InvalidData` for an undeclared `decl`; `DbError::QueryFailed`
+    /// if the query fails.
+    pub async fn planned<'e, E: sqlx::PgExecutor<'e>>(
+        executor: E,
+        doi: &str,
+        title: Option<&str>,
+        decl: epigraph_core::TenancyDecl,
+    ) -> Result<PlannedPaper, DbError> {
+        let (visibility, owner) = declared(decl)?;
+        let found: Option<(Uuid, Option<String>)> = sqlx::query_as(&document_key_first_in_sql(
+            "id, title",
+            1,
+            &in_scope_predicate(2, 3),
         ))
-        .bind(&spellings)
-        .bind(&canonical)
-        .bind(title)
-        .bind(journal)
+        .bind(document_key_spellings(doi))
         .bind(visibility)
         .bind(owner)
-        .fetch_one(executor)
+        .fetch_optional(executor)
         .await?;
-        Ok(id)
+        Ok(match found {
+            Some((id, stored)) => PlannedPaper {
+                id,
+                title: stored.or_else(|| title.map(str::to_string)),
+                exists: true,
+            },
+            None => PlannedPaper {
+                id: if visibility == "public" {
+                    public_paper_id(doi)
+                } else {
+                    Uuid::new_v4()
+                },
+                title: title.map(str::to_string),
+                exists: false,
+            },
+        })
     }
 
     /// The id of the row of `doi` in the scope `decl` names (see
@@ -169,7 +354,7 @@ impl PaperRepository {
         Ok(sqlx::query_scalar(&document_key_first_in_sql(
             "id",
             1,
-            "visibility = $2::text AND ($2::text = 'public' OR owner_group_id = $3::uuid)",
+            &in_scope_predicate(2, 3),
         ))
         .bind(document_key_spellings(doi))
         .bind(visibility)

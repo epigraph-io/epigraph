@@ -56,7 +56,7 @@ async fn query_paper_surfaces_labeled_claims_missing_asserts_edge(pool: PgPool) 
     // row, but the `paper -asserts-> claim` edge — written later in the same
     // loop iteration — was never created.
     PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("Random-Set Large Language Models"),
         None,

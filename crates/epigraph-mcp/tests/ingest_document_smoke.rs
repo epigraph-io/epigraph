@@ -11,7 +11,9 @@ use epigraph_ingest::document::schema::DocumentExtraction;
 use epigraph_mcp::embed::McpEmbedder;
 use epigraph_mcp::server::EpiGraphMcpFull;
 use epigraph_mcp::tools;
-use epigraph_mcp::tools::ingestion::{do_ingest_document, ingest_document, ingest_document_inline};
+use epigraph_mcp::tools::ingestion::{
+    do_ingest_document, do_ingest_document_spine, ingest_document, ingest_document_inline,
+};
 use epigraph_mcp::types::{
     IngestDocumentInlineParams, IngestDocumentParams, RecomputeBeliefsParams,
 };
@@ -953,6 +955,39 @@ async fn assert_failed_walk_reported(
         0,
         "a failed walk must not stamp the paper as processed"
     );
+    assert_eq!(
+        papers_keyed(pool, SMOKE_DOI).await,
+        0,
+        "backlog b995f117: the papers row is written on the walk's transaction, so a failed \
+         walk leaves no papers row with 0 claims behind"
+    );
+}
+
+/// `papers` rows keyed on `doi`.
+async fn papers_keyed(pool: &PgPool, doi: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM papers WHERE doi = $1")
+        .bind(doi)
+        .fetch_one(pool)
+        .await
+        .expect("count papers")
+}
+
+async fn drop_trace_refusal(pool: &PgPool) {
+    sqlx::query("DROP TRIGGER refuse_trace_for_test ON reasoning_traces")
+        .execute(pool)
+        .await
+        .expect("drop the refusing trigger");
+}
+
+/// Waits for every detached walk (and the embeds it queues) to finish.
+async fn drain(server: &EpiGraphMcpFull) {
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "the detached ingest did not finish"
+    );
 }
 
 #[tracing_test::traced_test]
@@ -1016,8 +1051,8 @@ async fn file_path_wait_mode_returns_the_walk_error_and_writes_no_claims(pool: P
 }
 
 /// In wait mode a GUARD refusal (here the D9 verbatim guard) is returned to the
-/// caller and leaves no `papers` row: the wait arm skips the handler's eager
-/// `ensure_paper_node`, and the walk's own get-or-create runs after its guards.
+/// caller and leaves no `papers` row: the walk's own get-or-create runs after
+/// its guards, on the walk's transaction.
 #[sqlx::test(migrations = "../../migrations")]
 async fn inline_wait_mode_guard_refusal_leaves_no_paper_row(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
@@ -1706,4 +1741,215 @@ async fn existing_placeholder_agent_is_not_reused(pool: PgPool) {
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     let content = result.content.first().expect("at least one content block");
     content.as_text().expect("text content").text.clone()
+}
+
+// ── Backlog b995f117: the papers row is part of the walk's transaction ──
+
+fn inline_params(wait: Option<bool>) -> IngestDocumentInlineParams {
+    IngestDocumentInlineParams {
+        extraction: serde_json::from_str(FIXTURE).expect("fixture parses"),
+        wait,
+        visibility: Some("public".to_string()),
+        group_id: None,
+    }
+}
+
+/// The DETACHED arm: the handler answers `queued` with a `paper_id`, and a walk
+/// that then fails leaves no `papers` row. Before the fix `ensure_paper_node`
+/// committed the row synchronously before the walk was spawned, so the failed
+/// walk left a `papers` row with 0 claims (what `query_paper` and
+/// `check_already_ingested` then reported as a document). The control half
+/// re-runs the same ingest without the fault and finds the row under the id
+/// the first answer announced, so "no row" above is not "the walk never ran".
+#[sqlx::test(migrations = "../../migrations")]
+async fn detached_ingest_whose_walk_fails_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+
+    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+        .await
+        .expect("the detached handler answers queued");
+    let announced = paper_id_of(&queued);
+    assert_eq!(
+        announced,
+        epigraph_db::repos::paper::public_paper_id(SMOKE_DOI),
+        "a new public paper is announced under its document-derived id"
+    );
+    drain(&server).await;
+
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        0,
+        "fixture: the walk must have failed"
+    );
+    assert_eq!(
+        papers_keyed(&pool, SMOKE_DOI).await,
+        0,
+        "a detached walk that fails must leave no papers row behind"
+    );
+
+    // Control: the fault removed, the same ingest lands, under the announced id.
+    drop_trace_refusal(&pool).await;
+    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+        .await
+        .expect("the detached handler answers queued");
+    assert_eq!(
+        paper_id_of(&queued),
+        announced,
+        "a new document's announced id is stable across attempts"
+    );
+    drain(&server).await;
+    let stored: uuid::Uuid = sqlx::query_scalar("SELECT id FROM papers WHERE doi = $1")
+        .bind(SMOKE_DOI)
+        .fetch_one(&pool)
+        .await
+        .expect("the successful walk wrote the papers row");
+    assert_eq!(
+        stored, announced,
+        "the walk's insert uses the id the handler announced"
+    );
+    assert!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await > 0,
+        "the control walk landed its claims"
+    );
+}
+
+/// The spine core is synchronous and writes its `papers` row on the walk's
+/// transaction (regression guard: it once wrote it on the pool first, so a
+/// spine walk that failed left the row).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_walk_that_fails_leaves_no_paper_row(pool: PgPool) {
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    refuse_every_trace_insert(&pool).await;
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+
+    let outcome = do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await;
+    assert!(outcome.is_err(), "fixture: the spine walk must fail");
+    assert_eq!(
+        claims_labelled(&pool, &format!("doi:{SMOKE_DOI}")).await,
+        0,
+        "the spine walk is one transaction"
+    );
+    assert_eq!(
+        papers_keyed(&pool, SMOKE_DOI).await,
+        0,
+        "a spine walk that fails must leave no papers row behind"
+    );
+}
+
+// ── Backlog 288801f8 (part 2): responses report the STORED title ──
+
+/// The papers upsert is fill-only (62ce37ca), so a re-ingest under a different
+/// title keeps the stored one. Both the detached `queued` answer and the
+/// wait-mode walk result used to echo the caller's title, misreporting what the
+/// row holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_responses_report_the_stored_title_not_the_callers(pool: PgPool) {
+    const STORED: &str = "The Title Already Stored";
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, $2)")
+        .bind(SMOKE_DOI)
+        .bind(STORED)
+        .execute(&pool)
+        .await
+        .expect("seed the stored paper");
+
+    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+        .await
+        .expect("queued");
+    let queued: serde_json::Value =
+        serde_json::from_str(&result_text(&queued)).expect("queued JSON");
+    drain(&server).await;
+    assert_eq!(queued["title"], STORED, "queued answer: {queued}");
+
+    let waited = ingest_document_inline(&server, &viewer, inline_params(Some(true)), None)
+        .await
+        .expect("the wait-mode walk succeeds");
+    let waited: serde_json::Value = serde_json::from_str(&result_text(&waited)).expect("walk JSON");
+    assert_eq!(waited["paper_title"], STORED, "walk result: {waited}");
+
+    let title: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE doi = $1")
+        .bind(SMOKE_DOI)
+        .fetch_one(&pool)
+        .await
+        .expect("read the row");
+    assert_eq!(
+        title.as_deref(),
+        Some(STORED),
+        "fill-only: the row keeps its title"
+    );
+}
+
+/// Same for the spine core's response, and the detached answer predicts a NULL
+/// stored title the way the upsert fills it (with the caller's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_response_reports_the_stored_title_and_a_null_title_is_filled(pool: PgPool) {
+    const STORED: &str = "Spine Stored Title";
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, $2), ($3, NULL)")
+        .bind(SMOKE_DOI)
+        .bind(STORED)
+        .bind("10.1234/null-title")
+        .execute(&pool)
+        .await
+        .expect("seed the stored papers");
+
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let spine = do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("the spine walk succeeds");
+    let spine: serde_json::Value = serde_json::from_str(&result_text(&spine)).expect("JSON");
+    assert_eq!(spine["paper_title"], STORED, "spine result: {spine}");
+
+    let mut null_titled: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture");
+    null_titled["source"]["doi"] = serde_json::json!("10.1234/null-title");
+    // Its own title, so its document-scoped nodes do not converge on the first's.
+    null_titled["source"]["title"] = serde_json::json!("Null Title Filled Paper");
+    let queued = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction: serde_json::from_value(null_titled).expect("fixture parses"),
+            wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await
+    .expect("queued");
+    let queued: serde_json::Value =
+        serde_json::from_str(&result_text(&queued)).expect("queued JSON");
+    drain(&server).await;
+    let filled: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE doi = $1")
+        .bind("10.1234/null-title")
+        .fetch_one(&pool)
+        .await
+        .expect("read the row");
+    assert_eq!(
+        filled.as_deref(),
+        Some("Null Title Filled Paper"),
+        "fill-only fills a NULL title"
+    );
+    assert_eq!(
+        queued["title"], "Null Title Filled Paper",
+        "the queued answer predicts the filled title: {queued}"
+    );
 }

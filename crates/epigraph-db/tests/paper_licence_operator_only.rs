@@ -247,19 +247,30 @@ async fn the_app_role_still_registers_and_fills_papers(pool: PgPool) {
     let decl = epigraph_core::TenancyDecl::public(group);
 
     // get_or_create: a new paper (the INSERT arm) ...
-    let new_id =
-        PaperRepository::get_or_create(&app, "10.9999/t67-new", Some("New"), Some("J"), decl)
-            .await
-            .expect("get_or_create inserts on the application role");
+    let new_id = PaperRepository::get_or_create(
+        &mut app.acquire().await.expect("acquire"),
+        "10.9999/t67-new",
+        Some("New"),
+        Some("J"),
+        decl,
+    )
+    .await
+    .expect("get_or_create inserts on the application role");
     // ... and an existing row whose NULL title it fills (the UPDATE arm).
     let bare: Uuid = sqlx::query_scalar("INSERT INTO papers (doi) VALUES ($1) RETURNING id")
         .bind("10.9999/t67-bare")
         .fetch_one(&pool)
         .await
         .expect("seed bare paper");
-    let hit = PaperRepository::get_or_create(&app, "10.9999/t67-bare", Some("Filled"), None, decl)
-        .await
-        .expect("get_or_create fills on the application role");
+    let hit = PaperRepository::get_or_create(
+        &mut app.acquire().await.expect("acquire"),
+        "10.9999/t67-bare",
+        Some("Filled"),
+        None,
+        decl,
+    )
+    .await
+    .expect("get_or_create fills on the application role");
     assert_eq!(hit, bare);
     let title: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE id = $1")
         .bind(bare)
@@ -359,7 +370,7 @@ async fn the_app_role_cannot_repoint_a_licensed_paper_onto_another_doi(pool: PgP
 
     // What ingest reads for the paywalled DOI: its own row, no licence.
     let found = PaperRepository::get_or_create(
-        &app,
+        &mut app.acquire().await.expect("acquire"),
         paywalled_doi,
         None,
         None,

@@ -12,7 +12,7 @@ use helpers::{make_agent, make_claim};
 async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
     let doi = "10.1234/test-paper-1";
     let id1 = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("Title 1"),
         Some("Journal X"),
@@ -23,7 +23,7 @@ async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
 
     // Second call with the same DOI should return the same id (UNIQUE on doi).
     let id2 = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("Title 1 updated"),
         None,
@@ -52,7 +52,7 @@ async fn get_or_create_inserts_then_returns_existing(pool: PgPool) {
 async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     let doi = "10.5555/repo-fill-only";
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("Original title"),
         None,
@@ -62,7 +62,7 @@ async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
     .expect("first writer");
 
     let again = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("Rewritten by a second ingester"),
         Some("Second journal"),
@@ -89,7 +89,7 @@ async fn get_or_create_on_a_hit_fills_only_null_fields(pool: PgPool) {
 
     // And once filled, the journal is not rewritten either.
     PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         None,
         Some("Third journal"),
@@ -117,7 +117,7 @@ async fn find_by_doi_returns_none_for_unknown(pool: PgPool) {
 async fn has_processed_by_edge_reflects_pipeline_property(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let paper_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.1234/has-pbe",
         Some("Has-PBE Paper"),
         None,
@@ -222,7 +222,8 @@ async fn count_claims_by_doi_label_ignores_asserts_edges(pool: PgPool) {
 // =============================================================================
 //
 // `get_or_create` is the writer every MCP ingest path uses
-// (`ensure_paper_node`, `do_ingest_document`, `do_ingest_document_spine`). Its
+// (`do_ingest_document`, `do_ingest_document_spine`, on the walk's own
+// transaction since backlog b995f117). Its
 // old `INSERT ... ON CONFLICT (doi)` only matched the exact spelling, so a DOI
 // whose only row was keyed on a resolver URL (written before keys were
 // canonicalized) got a bare-keyed twin beside it on the next ingest.
@@ -253,7 +254,7 @@ async fn get_or_create_reuses_a_legacy_url_keyed_row_instead_of_twinning(pool: P
     let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
 
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         bare,
         Some("re-ingested"),
         None,
@@ -288,7 +289,7 @@ async fn get_or_create_prefers_the_canonical_row_over_a_legacy_twin(pool: PgPool
     let canonical = seed_raw_paper(&pool, bare, "canonical").await;
 
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         &format!("https://doi.org/{bare}"),
         None,
         None,
@@ -308,7 +309,7 @@ async fn get_or_create_stores_a_new_paper_under_the_canonical_key(pool: PgPool) 
     let bare = "10.5555/repo-canonical-insert";
     for spelling in [format!("doi:{bare}"), format!("https://dx.doi.org/{bare}")] {
         PaperRepository::get_or_create(
-            &pool,
+            &mut pool.acquire().await.expect("acquire"),
             &spelling,
             None,
             None,
@@ -339,7 +340,7 @@ async fn concurrent_writers_under_two_spellings_of_a_new_doi_converge(pool: PgPo
     let p = pool.clone();
     let writer = tokio::spawn(async move {
         PaperRepository::get_or_create(
-            &p,
+            &mut p.acquire().await.expect("acquire"),
             &format!("https://doi.org/{bare}"),
             None,
             None,
@@ -397,7 +398,7 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
     let p = pool.clone();
     let writer = tokio::spawn(async move {
         PaperRepository::get_or_create(
-            &p,
+            &mut p.acquire().await.expect("acquire"),
             bare,
             Some("loser"),
             Some("loser journal"),
@@ -456,7 +457,7 @@ async fn the_race_loser_does_not_overwrite_the_winners_title(pool: PgPool) {
 async fn parallel_edges_list_each_claim_once_and_each_author_once_per_principal(pool: PgPool) {
     let viewer = fixture::public_viewer(&pool).await;
     let paper_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.1234/parallel-edges",
         Some("Parallel"),
         None,
@@ -569,7 +570,7 @@ async fn get_or_create_reuses_a_case_variant_prefix_row_instead_of_twinning(pool
         let legacy_id = seed_raw_paper(&pool, &legacy_key, "legacy").await;
 
         let id = PaperRepository::get_or_create(
-            &pool,
+            &mut pool.acquire().await.expect("acquire"),
             &bare,
             Some("re-ingested"),
             None,
@@ -611,7 +612,7 @@ async fn a_case_variant_prefix_match_keeps_the_suffix_exact_and_prefers_the_exac
         "the DOI suffix is compared exactly: {found:?}"
     );
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.5555/repo-suffix",
         None,
         None,
@@ -636,7 +637,7 @@ async fn a_case_variant_prefix_match_keeps_the_suffix_exact_and_prefers_the_exac
     let _variant = seed_raw_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "variant").await;
     let canonical = seed_raw_paper(&pool, bare, "canonical").await;
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         bare,
         None,
         None,
@@ -712,7 +713,7 @@ async fn an_exact_key_hit_never_scans_papers(pool: PgPool) {
     // read the MCP paper tools use (bare and URL spelling of the key), and
     // the row set the REST list and count read.
     let id = PaperRepository::get_or_create(
-        &one,
+        &mut one.acquire().await.expect("acquire"),
         bare,
         None,
         None,
@@ -803,7 +804,7 @@ async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool)
     let group_variant =
         seed_scoped_paper(&pool, &format!("HTTPS://DOI.ORG/{bare}"), "group", g).await;
     let public_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         bare,
         None,
         None,
@@ -816,7 +817,7 @@ async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool)
         "a public ingest must not reuse a group's case-variant row"
     );
     let group_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         bare,
         None,
         None,
@@ -842,7 +843,7 @@ async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool)
     let public_variant = seed_scoped_paper(&pool, &format!("Doi:{bare2}"), "public", world).await;
     let _group_exact = seed_scoped_paper(&pool, bare2, "group", g).await;
     let id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         bare2,
         None,
         None,
@@ -853,5 +854,248 @@ async fn the_case_variant_fallback_stays_inside_the_declared_scope(pool: PgPool)
     assert_eq!(
         id, public_variant,
         "another scope's exact row must not switch off this scope's case-variant match"
+    );
+}
+
+// =============================================================================
+// The id of a new row, and the race on it (backlog b995f117)
+// =============================================================================
+
+/// A creator whose insert collides with a concurrent writer's row on the
+/// PRIMARY KEY, not on the document-key-per-scope index, converges on that
+/// row instead of failing. A new public row's id is derived from the document
+/// key, so two concurrent public creators insert the same id, and Postgres may
+/// check the primary key before the key index: an `ON CONFLICT` naming only
+/// the key index then raised 23505 on `papers_pkey`. Here the held row has
+/// the derived id under a resolver-URL spelling of the key, so only the
+/// primary key collides (deterministically), and the writer's second run must
+/// find the held row under that spelling.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_creator_colliding_on_the_primary_key_converges_instead_of_failing(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let bare = "10.5555/repo-pk-race";
+    let spelled = format!("https://doi.org/{bare}");
+    let mut held = pool.begin().await.expect("begin held tx");
+    let held_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'held') RETURNING id",
+    )
+    .bind(public_paper_id(bare))
+    .bind(&spelled)
+    .fetch_one(&mut *held)
+    .await
+    .expect("held insert");
+
+    let p = pool.clone();
+    let writer = tokio::spawn(async move {
+        PaperRepository::get_or_create(
+            &mut p.acquire().await.expect("acquire"),
+            bare,
+            Some("writer"),
+            Some("writer journal"),
+            epigraph_core::TenancyDecl::instance_wide(),
+        )
+        .await
+    });
+
+    for _ in 0..200 {
+        if writer.is_finished() {
+            break;
+        }
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND query LIKE '%INSERT INTO papers%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        !writer.is_finished(),
+        "fixture: the writer must be waiting on the held row's primary-key entry"
+    );
+    held.commit().await.expect("commit held row");
+
+    let id = writer
+        .await
+        .expect("join")
+        .expect("a primary-key collision must converge, not fail with 23505");
+    assert_eq!(id, held_id);
+    assert_eq!(
+        rows_ending_in(&pool, "repo-pk-race").await,
+        vec![(held_id, spelled.clone())],
+        "one paper"
+    );
+    let (title, journal): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT title, journal FROM papers WHERE id = $1")
+            .bind(held_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read the row");
+    assert_eq!(title.as_deref(), Some("held"), "the winner's title stands");
+    assert_eq!(
+        journal.as_deref(),
+        Some("writer journal"),
+        "the loser fills only what the winner left NULL"
+    );
+}
+
+/// `planned` predicts exactly what `get_or_create_stored` then stores, in the
+/// three cases a detached ingest meets: no row yet (the derived public id and
+/// the caller's title), a row with a title (its id and its title, not the
+/// caller's), and a row with a NULL title (its id, filled with the caller's).
+/// A drift here is a detached handler announcing an id or a title the walk
+/// does not write.
+#[sqlx::test(migrations = "../../migrations")]
+async fn planned_predicts_what_get_or_create_stored_stores(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let public = epigraph_core::TenancyDecl::instance_wide();
+    let titled = "10.1234/planned-titled";
+    let untitled = "10.1234/planned-untitled";
+    let absent = "https://doi.org/10.1234/planned-absent";
+    seed_raw_paper(&pool, titled, "Kept").await;
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, NULL)")
+        .bind(untitled)
+        .execute(&pool)
+        .await
+        .expect("seed an untitled row");
+
+    for (doi, exists) in [(titled, true), (untitled, true), (absent, false)] {
+        let planned = PaperRepository::planned(&pool, doi, Some("Caller"), public)
+            .await
+            .expect("planned");
+        assert_eq!(planned.exists, exists, "{doi}");
+        let stored = PaperRepository::get_or_create_stored(
+            &mut pool.acquire().await.expect("acquire"),
+            doi,
+            Some("Caller"),
+            None,
+            public,
+            Some(uuid::Uuid::new_v4()),
+        )
+        .await
+        .expect("get_or_create_stored");
+        assert_eq!(
+            planned.id, stored.id,
+            "{doi}: the announced id is the stored id"
+        );
+        assert_eq!(
+            planned.title, stored.title,
+            "{doi}: the announced title is stored"
+        );
+    }
+    let kept = PaperRepository::planned(&pool, titled, Some("Caller"), public)
+        .await
+        .expect("planned");
+    assert_eq!(
+        kept.title.as_deref(),
+        Some("Kept"),
+        "fill-only keeps a title"
+    );
+    // The new public row is stored under the canonical key, with the id derived
+    // from it whichever spelling the caller used, and not the group-copy id the
+    // call above passed.
+    let created = PaperRepository::find_by_doi(&pool, "10.1234/planned-absent")
+        .await
+        .expect("find_by_doi")
+        .expect("the new row is stored under the canonical key");
+    assert_eq!(created.id, public_paper_id(absent));
+    assert_eq!(created.id, public_paper_id("10.1234/planned-absent"));
+}
+
+/// A row that holds a document's derived public id but that the public scope
+/// lookup cannot find (here another document's GROUP row, which a writer
+/// able to insert `id` could plant) must not block that document's public row
+/// for good: the insert falls back to a random id, and a re-ingest converges
+/// on the row it created. Before the fallback every public ingest of the
+/// document failed with `InvalidData`, and the error named the hidden row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_derived_id_does_not_block_the_public_row(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let (_, g) = fixture::seed_agent_with_group(&pool, "derived-id-squat").await;
+    let bare = "10.5555/repo-squatted-id";
+    sqlx::query(
+        "INSERT INTO papers (id, doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'junk', 'squat', 'group', $2)",
+    )
+    .bind(public_paper_id(bare))
+    .bind(g)
+    .execute(&pool)
+    .await
+    .expect("plant a group row under the derived id");
+
+    let public = epigraph_core::TenancyDecl::instance_wide();
+    let first = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        bare,
+        Some("Real"),
+        None,
+        public,
+    )
+    .await
+    .expect("a squatted derived id must not fail the public ingest");
+    assert_ne!(first, public_paper_id(bare), "the squat keeps its row");
+    let again = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        &format!("https://doi.org/{bare}"),
+        None,
+        None,
+        public,
+    )
+    .await
+    .expect("re-ingest");
+    assert_eq!(again, first, "a re-ingest converges on the fallback row");
+    assert_eq!(
+        rows_ending_in(&pool, "repo-squatted-id").await,
+        vec![(first, bare.to_string())],
+        "one public row, under the canonical key"
+    );
+}
+
+/// A group copy never takes the id derived from the document key, even when
+/// a caller passes it as `group_copy_id`: that id is the public row's, and a
+/// group copy under it would be computable from the key (the probe the id
+/// policy closes) and would squat the public row's id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_group_copy_ignores_a_group_copy_id_equal_to_the_derived_id(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let (_, g) = fixture::seed_agent_with_group(&pool, "group-copy-derived").await;
+    let doi = "10.5555/repo-group-derived";
+    let stored = PaperRepository::get_or_create_stored(
+        &mut pool.acquire().await.expect("acquire"),
+        &format!("https://doi.org/{doi}"),
+        Some("Private"),
+        None,
+        epigraph_core::TenancyDecl::group(g),
+        Some(public_paper_id(doi)),
+    )
+    .await
+    .expect("group get_or_create_stored");
+    assert_ne!(
+        stored.id,
+        public_paper_id(doi),
+        "a group copy must not be stored under the derived public id"
+    );
+    let public = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        doi,
+        None,
+        None,
+        epigraph_core::TenancyDecl::instance_wide(),
+    )
+    .await
+    .expect("public get_or_create after the group copy");
+    assert_eq!(
+        public,
+        public_paper_id(doi),
+        "the public row keeps the derived id"
     );
 }

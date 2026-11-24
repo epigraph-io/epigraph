@@ -351,7 +351,7 @@ pub async fn create_paper(
     // spelling waits on the insert and gets the winner's row.
     let mut tx = state.begin_claim_write(&viewer, "create_paper").await?;
     let id = epigraph_db::PaperRepository::get_or_create(
-        &mut *tx,
+        &mut tx,
         &request.doi,
         request.title.as_deref(),
         request.journal.as_deref(),

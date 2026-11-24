@@ -3794,10 +3794,11 @@ impl PrivatizationRepository {
     ///    over. `content_tsv` needs no statement — it is `GENERATED ALWAYS` and
     ///    follows `content`. Step 2b then takes the claim out of its theme
     ///    (`claims.theme_id`) and recomputes each theme it left
-    ///    (`claim_themes.centroid`, `claim_count`) from the remaining
-    ///    embedded members (backlog f43ef0a6): a centroid is an aggregate of
-    ///    member vectors, so nulling the claim's vector without recomputing
-    ///    it leaves the sealed vector folded into the theme.
+    ///    (`claim_themes.centroid`, `claim_count`, and a set `centroid_3072`)
+    ///    from the remaining embedded members (backlogs f43ef0a6, 288801f8): a
+    ///    centroid is an aggregate of member vectors, so nulling the claim's
+    ///    vector without recomputing it leaves the sealed vector folded into
+    ///    the theme.
     /// 3. `claim_version_encryption` + 4. `claim_versions` — the complete
     ///    plaintext version history, which is the survivor §6.5.4 names first.
     /// 5. `evidence_encryption` + 6. `evidence` — including
@@ -3949,8 +3950,29 @@ impl PrivatizationRepository {
         //     NULL centroid and a zero count rather than keeping the sealed
         //     vector (it is unassignable until re-seeded, which the
         //     alternative would not be, and the alternative is the leak).
-        //     `centroid_3072` is not touched: no code path averages members
-        //     into it; it is only ever seeded from outside the corpus.
+        //     `centroid_3072` is the same channel one column over (backlog
+        //     288801f8): `scripts/seed_themes_from_textbooks.py` seeds it as
+        //     the mean of the L1 claim's and its `decomposes_to` descendants'
+        //     `embedding_3072` and then sets those claims' `theme_id` to the
+        //     theme, and `scripts/theme_cap_split.py` re-averages members into
+        //     it, so a one-member theme's `centroid_3072` IS the member's
+        //     vector, read by recall at `centroid_dim=3072`. It is recomputed
+        //     here from the remaining members' `embedding_3072` (NULL when none
+        //     remain), and only where it was set: a NULL one stays NULL,
+        //     because the search route picks the 3072 index by how many themes
+        //     have one.
+        //     Residual, not closed here: only the sealed claims' CURRENT
+        //     themes are recomputed. The seed script's later `theme_id`
+        //     assignment overwrites an earlier one, and atoms converge across
+        //     documents, so an atom under several seeded sections stays folded
+        //     into an earlier theme's seeded `centroid` / `centroid_3072`
+        //     without being its member; the seal cannot find that theme (no
+        //     record says which vectors a seeded centroid averaged). The
+        //     vector is diluted by the other members there, but it is the same
+        //     class of leak and needs a one-off recompute of seeded centroids
+        //     from their current members.
+        //     Nothing retires or re-seeds a theme this leaves with no embedded
+        //     member; that is a maintenance decision, not the seal's.
         //     An unseal does not restore `theme_id`; the unthemed-assignment
         //     sweep re-themes the claim once it is re-embedded.
         let themes: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
@@ -3975,23 +3997,61 @@ impl PrivatizationRepository {
         .await
         .map_err(|source| DbError::QueryFailed { source })?;
         if !themes.is_empty() {
-            sqlx::query(
+            let recomputed: Vec<(Uuid, bool, bool)> = sqlx::query_as(
                 r"
                 UPDATE public.claim_themes t
                    SET centroid = (SELECT avg(c.embedding)::vector(1536)
                                      FROM public.claims c
                                     WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
+                       centroid_3072 = CASE
+                           WHEN t.centroid_3072 IS NULL THEN NULL
+                           ELSE (SELECT avg(c.embedding_3072)::vector(3072)
+                                   FROM public.claims c
+                                  WHERE c.theme_id = t.id AND c.embedding_3072 IS NOT NULL)
+                       END,
                        claim_count = (SELECT count(*)::int4
                                         FROM public.claims c
                                        WHERE c.theme_id = t.id AND c.embedding IS NOT NULL),
                        updated_at = now()
-                 WHERE t.id = ANY($1)
+                  FROM (SELECT p.id, p.centroid_3072 IS NOT NULL AS had_3072
+                          FROM public.claim_themes p
+                         WHERE p.id = ANY($1)) prior
+                 WHERE t.id = prior.id
+                RETURNING t.id, t.centroid IS NULL, prior.had_3072 AND t.centroid_3072 IS NULL
                 ",
             )
             .bind(&themes)
-            .execute(&mut *conn)
+            .fetch_all(&mut *conn)
             .await
             .map_err(|source| DbError::QueryFailed { source })?;
+            // Reported, not retired: a theme left with no embedded member is
+            // unassignable until it is re-seeded or retired, and which of the
+            // two is a maintenance decision (backlog 288801f8). A theme that
+            // keeps a 1536-d centroid but loses its 3072-d one is reported
+            // too: it drops out of the count the search route uses to pick
+            // the 3072 index.
+            let emptied: Vec<Uuid> = recomputed
+                .iter()
+                .filter_map(|&(id, null, _)| null.then_some(id))
+                .collect();
+            let lost_3072: Vec<Uuid> = recomputed
+                .iter()
+                .filter_map(|&(id, null, lost)| (lost && !null).then_some(id))
+                .collect();
+            if !emptied.is_empty() {
+                tracing::warn!(
+                    themes = ?emptied,
+                    "this seal's transaction leaves these themes with no embedded member \
+                     (if it commits): no centroid, so unassignable until re-seeded or retired"
+                );
+            }
+            if !lost_3072.is_empty() {
+                tracing::warn!(
+                    themes = ?lost_3072,
+                    "this seal's transaction leaves these themes with no member holding a \
+                     3072-d embedding (if it commits): their centroid_3072 is now NULL"
+                );
+            }
         }
 
         // 3/4. Version history.

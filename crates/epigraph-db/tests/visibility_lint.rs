@@ -832,6 +832,23 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          read back to the caller; the viewer is spent on the stamp.",
     ),
     (
+        "paper.rs",
+        "get_or_create",
+        "WRITE of one `papers` row through `get_or_create_stored`, returning only its id: the \
+         same declared-scope upsert on the writer's stamped connection, no SQL of its own.",
+    ),
+    (
+        "paper.rs",
+        "get_or_create_stored",
+        "WRITE (get-or-create) of one `papers` row in the scope its declared `TenancyDecl` \
+         names (migration 246), on the writer's stamped connection; a connection rather than \
+         an executor because a lost creation race runs the statement a second time. The row \
+         security decides: the INSERT is admitted only for an owner group the session \
+         writes, and the scope's conflicting row is always one the writer reads (public, or \
+         its own group's). The id and title it returns are the writer's own row's; it reads \
+         nothing else.",
+    ),
+    (
         "passkey.rs",
         "create_enrollment",
         "WRITE through migration 124's maintenance-only definer \
@@ -4427,12 +4444,13 @@ const EXECUTOR_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "paper.rs",
-        "get_or_create",
-        "WRITE (get-or-create) of one `papers` row in the scope its declared `TenancyDecl` \
-         names (migration 246), on the writer's stamped transaction. The row security \
-         decides: the INSERT is admitted only for an owner group the session writes, and \
-         the scope's conflicting row is always one the writer reads (public, or its own \
-         group's). The id it returns is the writer's own row; it reads nothing else.",
+        "planned",
+        "READ of the id and title of the `papers` row a write declared with `decl` would \
+         reuse, the same in-scope lookup as `find_in_scope`, on the writer's stamped \
+         transaction: the declaration, not a viewer, is the filter, and the row security \
+         of that transaction still hides every other group's row. With no such row it \
+         reads nothing more and returns the id a new row is to take (derived for a public \
+         row, random for a group's copy).",
     ),
     (
         "paper.rs",

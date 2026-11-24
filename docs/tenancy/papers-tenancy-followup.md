@@ -124,10 +124,17 @@ On the app role (`ScopedPool::connect_downgraded_for_tests(.., "epigraph_app")`)
 * `epigraph_node_tenancy` has a `paper` arm and `epigraph_propagate_tenancy` meets a paper
   endpoint with its own row (219's shape), so `authored`, `processed_by` and `asserts` edges
   onto a group paper are group edges, including `asserts` onto a converged public claim.
-* Writers: the MCP ingest walks (`do_ingest_document`, `do_ingest_document_spine`) and the
-  queued entry points' `ensure_paper_node` write the row on the ingesting agent's stamped
-  transaction with the resolved declaration; `POST /api/v1/papers` registers a public row owned
-  by the caller's home group on the caller's stamped transaction.
+* Writers: the MCP ingest walks (`do_ingest_document`, `do_ingest_document_spine`, and the
+  detached walk of the queued entry points) write the row on the ingesting agent's stamped
+  transaction with the resolved declaration, inside the walk, so a failed walk leaves no row
+  (backlog b995f117; the queued entry points only read it, `PaperRepository::planned`);
+  `POST /api/v1/papers` registers a public row owned by the caller's home group on the caller's
+  stamped transaction.
+* Ids: a new PUBLIC row's id is derived from the document key (`public_paper_id`, a UUIDv5 of
+  the canonical key), so a queued ingest can announce it before its walk commits; a group's
+  PRIVATE copy gets a random id, never one computable from the key (a private copy cannot share
+  the public row's primary key, and a derivable id would let anyone name a group's copy and probe
+  whether it exists). A row written before this keeps its random id.
 * Readers: `check_already_ingested` (both arms), `query_paper` and the ingest preflight read
   the rows on the caller's stamped connection (`PaperRepository::visible_by_document_key`), so a
   document another group ingested privately answers exactly as an unknown one; `GET
