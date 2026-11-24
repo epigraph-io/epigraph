@@ -347,9 +347,12 @@ cargo build --release --locked
 
 ### 1. Register the Explorer as an OAuth client (SQL)
 
-The Explorer cannot register itself. `POST /oauth/register` only accepts
-`redirect_uri`s under `https://claude.ai/` or `https://claude.com/`, and no
-admin route edits redirect URIs. An operator inserts the client row directly
+The Explorer cannot register itself unless the operator lists its origin in
+`EPIGRAPH_OAUTH_REDIRECT_ORIGINS`: `POST /oauth/register` otherwise accepts only
+the built-in hosted callbacks (`https://claude.ai/`, `https://claude.com/` and
+ChatGPT's two exact `https://chatgpt.com/` callbacks) and loopback ones
+(`crates/epigraph-api/src/oauth/redirect.rs`), and no admin route edits
+redirect URIs. An operator inserts the client row directly
 into the API's database:
 
 ```sql
@@ -443,7 +446,8 @@ registration at `/oauth/authorize` — and **never** from
 themselves (`render_consent_page` in `crates/epigraph-api/src/oauth/authorize.rs`,
 landed as `security(oauth): label the consent page from the redirect class,
 never the client's self-declared name`). A hosted `claude.ai` /
-`claude.com` redirect reads "Authorize Claude"; a loopback redirect reads
+`claude.com` redirect reads "Authorize Claude", a hosted ChatGPT callback
+"Authorize ChatGPT"; a loopback redirect reads
 "Authorize an application on this computer" and shows that redirect's origin;
 anything else reads "Authorize an application". The only
 registrant-controlled string on the page is the user's own email. So
