@@ -498,7 +498,7 @@ Operator: "Make the OCCUPIES role edges team-only too." Moved here from §15.R1 
 
 | # | Site | Today | Change |
 |---|---|---|---|
-| K1 | `migrations/130_pending_admin_acts.sql::epigraph_role_assignments_audit` (the only `OCCUPIES` writer on HEAD; 123's body re-stated by 130), its revoke/expiry arm, `group_role_bindings` changes, and every existing row | `holder -OCCUPIES-> role node` written `('public', world)` with `properties.role`: an outsider reads "this id holds role X" on `list_edges`, `get_neighborhood` / `traverse`, graph query and `graph_full`, while the card shows `roles: []`. | Migration 278 (§10 M7): owner = the role's single live binding's group when it is an active team/community, else the holder's personal group **[ORCHESTRATOR'S CALL, §16.A2]**; the personal group is minted by 105's function when absent **[FIX AGENT'S CALL, §16.A3]**; a bind/unbind re-owns the role's edges; every existing row is backfilled. Read surfaces are unchanged (edge row security already filters a `group` edge). The ego view and PROV export cannot reach an agent-to-agent edge (claim-centred / claim-rooted). |
+| K1 | `migrations/130_pending_admin_acts.sql::epigraph_role_assignments_audit` (the only `OCCUPIES` writer on HEAD; 123's body re-stated by 130), its revoke/expiry arm, `group_role_bindings` changes, and every existing row | `holder -OCCUPIES-> role node` written `('public', world)` with `properties.role`: an outsider reads "this id holds role X" on `list_edges`, `get_neighborhood` / `traverse`, graph query and `graph_full`, while the card shows `roles: []`. | Migration 278 (§10 M7): owner = the role's single live binding's group when it is an active team/community, else the holder's personal group **[ORCHESTRATOR'S CALL, §16.A2]**; the personal group is minted by 105's function when absent **[FIX AGENT'S CALL, §16.A3]**; a bind/unbind re-owns the role's edges; every existing row is backfilled. Read surfaces are unchanged (edge row security already filters a `group` edge). The ego view and PROV export cannot reach an agent-to-agent edge (claim-centred / claim-rooted). After the security review of 278: migration 281 (§10 M10) re-owns only a GENUINE projection (the audit trigger's marker joined to its `role_assignments` row), so a forged edge of the same shape is never re-owned and never fails a binding change; migration 282 (§10 M11) makes every row carrying the marker writable only by a maintenance session or a maintenance-owned definer frame (OCC05), so a writer of the owning team cannot widen, strip, re-time or delete one, and no application writer can write the marker. |
 
 ### J. Re-verified: no change
 
@@ -758,6 +758,30 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   transactional): HEV01 also refuses re-pointing or unlinking a LINKED human client's
   `agent_id` (the trigger watches `UPDATE OF client_type, agent_id`); the first link of an
   unlinked client stays allowed. Undo: `docs/runbooks/280-undo.sql`.
+
+- **M10 `281_role_edges_genuine_projections_only.sql`** (security review of 278, finding 1,
+  transactional): md5 precondition `OCC03` on 278's binding-trigger body. NEW
+  `epigraph_reown_role_projection_edges(text)` (NULL: every role; 172's path,
+  maintenance-owned, not application-callable) re-owns by 278's rule only a GENUINE
+  projection: relationship and `source_type = 'agent'` as the audit trigger writes them, the
+  marker `properties @> {"source": "role_assignments", "projection": true}`, and a
+  `role_assignments` row with `id = properties.assignment_id`,
+  `holder_person_id = source_id` and `role = properties.role`. The binding trigger is
+  re-stated to call it. A reconcile pass over every role writes one `security_events` summary
+  `edges.role_projection_edges_reconciled` {migration, before, rows, after} counting genuine
+  projections only, under post-condition `OCC04`; it turns `row_security` on for its
+  transaction (the definer frame is the non-BYPASSRLS maintenance role). Registers:
+  `tenancy_backfill.rs` DEFERRED and OPERATOR_FUNCTION_GRANTS (`false`); `custodian_role.rs`'s
+  catalog ratchet names the new function instead of the trigger (whose body no longer spells
+  the relationship). Undo: `docs/runbooks/281-undo.sql` (278's trigger body).
+
+- **M11 `282_role_projection_edges_maintenance_only.sql`** (security review of 278, finding
+  2, transactional): NEW `epigraph_role_projection_edges_guard()`, SECURITY INVOKER on 271's
+  `pg_catalog, pg_temp` path, maintenance-owned, and three BEFORE triggers on `edges` keyed by
+  WHEN on the marker (INSERT: NEW; UPDATE: OLD or NEW; DELETE: OLD). A write is admitted only
+  when `epigraph_bypass()` or `epigraph_definer_bypass()`, otherwise `OCC05` (42501). An
+  INVOKER on purpose: a definer's frame is its owner and would admit everyone. Registered in
+  `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo: `docs/runbooks/282-undo.sql`.
 
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
@@ -1132,7 +1156,9 @@ one says why.
 | `app_role_table_lockdown` | See §10. |
 | `edge_writer_signing_ratchet` | Unaffected: no edge writer changes. E2 changes the edge READ projection (part B), which this ratchet does not cover; E3's tests do. |
 | `tenancy_migration_shape` | M4 and M5 join `INDEX_MIGRATIONS`. |
-| `function_search_path_pg_temp_ratchet` | The new trigger function pins its path. |
+| `function_search_path_pg_temp_ratchet` | The new trigger function pins its path; so do 281's definer and 282's INVOKER guard (`pg_catalog, pg_temp`). |
+| `custodian_role.rs` OCCUPIES catalog ratchet | The projection's maintainers are the audit trigger and 281's `epigraph_reown_role_projection_edges`; 282's guard keys on the marker and does not spell the relationship. |
+| `tenancy_backfill.rs` definer registers | 278's two functions and 281's re-own in DEFERRED; the owner rule and the re-own `false` in OPERATOR_FUNCTION_GRANTS; 282's guard in INVOKER_EXEMPT. |
 
 **New static lint, `epigraph-db/tests/agent_name_disclosure_lint.rs`** (part B). It refuses any
 SQL literal that selects or matches `display_name`, `orcid`, `ror_id` or `properties` from an
@@ -1160,12 +1186,36 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   reading through it anyway; a group's kind does not change after creation, 108).
   Residual: a grant concurrent with an unbind of the same role can leave the new edge owned by
   the ex-team (under READ COMMITTED the unbind's re-own UPDATE cannot see the uncommitted
-  INSERT); both are maintenance acts. 278's backfill, re-own and OCC02 match on
-  `relationship = 'OCCUPIES'` alone: measured, no other writer can create one (REST
-  `create_edge`'s `VALID_RELATIONSHIPS` and the MCP link tools' sets exclude it; the
-  projection trigger is the only database writer). 278 adds a DATABASE-side caller of 105's
+  INSERT); both are maintenance acts. 278 adds a DATABASE-side caller of 105's
   personal-group mint, which `personal_group_mint_ratchet.rs` (a Rust-caller inventory) does
   not list.
+  **Hardening after the security review of 278 (migrations 281, 282).** 278's re-own,
+  backfill and OCC02 matched `relationship = 'OCCUPIES'` (plus `properties.role`) alone, on
+  the argument that no other writer creates that relationship today (REST `create_edge`'s
+  `VALID_RELATIONSHIPS` and the MCP link tools' sets exclude it). That is no longer relied on:
+  - 281: a bind, an unbind and the reconcile pass re-own only a GENUINE projection (the
+    marker AND its `role_assignments` row by assignment id, holder and role). A forged row is
+    never re-owned, never gets a personal group minted for its source, and can no longer fail
+    a binding change (under 278 a forged row whose source had only a revoked personal row made
+    the unbind raise RVK01). Tested:
+    `role_edges_team_only.rs::a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change`,
+    `::migration_281_reconciles_genuine_projections_only`.
+  - 282: a row carrying the marker is written (INSERT, UPDATE, DELETE) only by a maintenance
+    session or a maintenance-owned definer frame; OCC05 otherwise. A writer of the owning
+    team cannot widen one to `public` (260's guard froze only the owner columns), strip or
+    rewrite its marker, role or window, or delete it; no application writer can put the
+    marker on a row of its own. Tested: `::a_team_writer_cannot_widen_reown_or_delete_a_projection_edge`,
+    `::a_team_writer_cannot_write_the_projection_marker`, and
+    `::the_maintenance_verbs_still_re_project_through_the_guard` (grant, bind, unbind, end and
+    a `valid_to` narrowing on a real maintenance `session_user`).
+  - Residual: 278 is not edited (an applied migration never is), so ITS one-time backfill and
+    OCC02 still match the relationship alone. A forged row present when 278 runs would be
+    re-owned into its source's personal group (minting one), could fail the boot migration
+    (RVK01 / RVK02 for its source), and a forged PUBLIC row with a non-agent source would trip
+    OCC02. The §17 pre-check closes that window; 281 and 282 close it from then on.
+  - Not changed: an UNMARKED edge of the same relationship written by an ordinary edge
+    writer stays that writer's graph content (123 section 5): it is not a projection, is never
+    re-owned, and is never read for authority.
 - **R2. Group-admin authority can unhide H with no consent step** (findings 1, L15). The four
   paths are listed in §4: a keyed team created on demand plus a direct add (admin-tier:
   `groups:admin` is in `ADMIN_ONLY_SCOPES`), a community add by any live member holding
@@ -1278,6 +1328,15 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   its `did:epigraph:personal:` key): never the world group, and 105's RVK01 (only revoked
   personal rows) and RVK02 (a squatted key) still refuse with nothing written. Tested both
   ways (`role_edges_team_only.rs::a_missing_personal_group_is_minted_and_a_revoked_one_refuses`).
+- **A4. (Fix agent's calls, after the security review of 278.)** (a) The two findings ship as
+  NEW migrations 281 and 282, not as an edit of 278, although 278 is not yet on the
+  production database: 278 may already be applied on development and test databases, and the
+  repository rule forbids editing an applied migration. The cost is the §15.R1 residual for
+  278's own backfill, covered by the §17 pre-check. (b) 282 guards INSERT and the NEW arm of
+  UPDATE as well as the UPDATE / DELETE the review asked for, so the marker itself is
+  maintenance-only and 281's predicate cannot be satisfied by an application-written row.
+  (c) The guard is a trigger, not RESTRICTIVE policies: a refused policy USING is a silent
+  0-row write, which would hide a widening attempt instead of raising OCC05.
 
 Not a call by anyone below the operator, recorded here so it is not mistaken for one: the
 `operator_human` trade-off (§5) is operator-approved behaviour, kept as approved and not
@@ -1469,6 +1528,15 @@ Not covered by part B (open):
   personal key is squatted. Pre-check on the maintenance DSN before deploy: every live or
   ended `role_assignments.holder_person_id` has a live row in the group whose `did_key` is
   `did:epigraph:personal:<holder>`, or no such group at all.
+- M7 (278) is not narrowed by M10/M11 (it is not edited), and its one-time backfill and OCC02
+  match `relationship = 'OCCUPIES'` alone. Pre-check on the maintenance DSN before the deploy
+  that applies 278: every `OCCUPIES` edge is a genuine projection, i.e. this returns 0:
+  `SELECT count(*) FROM edges e WHERE e.relationship = 'OCCUPIES' AND NOT (e.source_type =
+  'agent' AND e.properties @> '{"source": "role_assignments", "projection": true}' AND EXISTS
+  (SELECT 1 FROM role_assignments ra WHERE ra.id::text = e.properties->>'assignment_id' AND
+  ra.holder_person_id = e.source_id AND ra.role = e.properties->>'role'))`. A non-zero count
+  means a forged row would be re-owned (and could fail the boot) by 278: remove or relabel it
+  first. 281's reconcile pass and post-condition, and 282's guard, apply from then on.
 - After deploy, rebuild the Atlas leaf levels: run the Atlas nightly builder once, outside its
   schedule. Previously stored documents carry names built under a bypass viewer.
 - MCP stdio clients pin their binary. Restart them so that the find_agent and get_agent text,
@@ -1547,3 +1615,5 @@ raised 25 findings. Dispositions; none was rejected outright.
 | tests#6 equivalent mutant | Kept as defence in depth, commented | §9.2 |
 | tests#7 perf harness | Recorded: a measurement harness, not a gate | §11.1 |
 | tests#9 pinned-test audit | No defect; the MCP fixture asymmetry is commented | - |
+| Security review of 278, finding 1: re-own / backfill / OCC02 act on forgeable rows | Fixed: migration 281, genuine-projection predicate (marker plus `role_assignments` join) on bind, unbind and the reconcile pass; 278's own backfill covered by a deploy pre-check | §7 K1, §10 M10, §15.R1, §17 |
+| Security review of 278, finding 2: owner-writable projection | Fixed: migration 282, INVOKER guard on INSERT / UPDATE / DELETE of a marked row, maintenance and definer frames only (OCC05) | §7 K1, §10 M11, §15.R1, §16.A4 |
