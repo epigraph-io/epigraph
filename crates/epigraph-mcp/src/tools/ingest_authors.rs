@@ -250,7 +250,7 @@ fn effective_attribution(
 /// (the explicit-author rule, module doc). Returns it by author index.
 ///
 /// Runs on the connection the caller holds: the handlers' synchronous
-/// preflight (so the queued path refuses before its eager `papers` row) and
+/// preflight (so the queued path refuses before it answers `queued`) and
 /// the walk's own transaction, so both decide the same way.
 pub(crate) async fn check_explicit_author_ids(
     conn: &mut sqlx::PgConnection,
