@@ -248,11 +248,14 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // row, so the viewer is spent on the stamp. untenanted: the agent row
     // (`get_by_id`) and the pre-existing profile-column write (`update`, on the
     // pool, self or `claims:admin` as before; spec section 15.R8);
-    // `record_provenance` is the request's own audit row.
+    // `record_provenance` is the request's own audit row. After review
+    // (correctness#7) the response is redacted by the stamped disclosure on
+    // `read_as(viewer)`, as `get_agent`'s.
     (
         "agents.rs",
         "update_agent",
         &[
+            "AgentDisclosureRepository::disclosure",
             "AgentRepository::get_by_id",
             "AgentRepository::set_profile_visibility_conn",
             "AgentRepository::update",

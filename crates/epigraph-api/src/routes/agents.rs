@@ -1092,6 +1092,24 @@ pub async fn update_agent(
         })?),
     };
 
+    // The opt-in is its own act, never mixed with a profile edit: the edit
+    // and the opt-in run on different connections (the edit on the request
+    // pool, the opt-in through 273's definer on a stamped transaction), so a
+    // mixed body could commit the edit and then have the opt-in refused
+    // (review finding correctness#7). Refused before anything is written.
+    let profile_only = profile.is_some();
+    if profile_only
+        && (request.display_name.is_some()
+            || request.labels.is_some()
+            || request.orcid.is_some()
+            || request.ror_id.is_some())
+    {
+        return Err(ApiError::ValidationError {
+            field: "profile_visibility".to_string(),
+            reason: "set profile_visibility in a request of its own, with no other field".into(),
+        });
+    }
+
     let agent_id = AgentId::from_uuid(id);
 
     // Fetch existing agent (404 if not found)
@@ -1101,12 +1119,6 @@ pub async fn update_agent(
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
-
-    let profile_only = profile.is_some()
-        && request.display_name.is_none()
-        && request.labels.is_none()
-        && request.orcid.is_none()
-        && request.ror_id.is_none();
 
     // Apply partial updates
     if let Some(display_name) = request.display_name {
@@ -1157,7 +1169,13 @@ pub async fn update_agent(
         }
     }
 
-    Ok(Json(updated.into()))
+    // The response is redacted by the rule on the caller's stamped read, as
+    // `get_agent` is (review findings correctness#7, leaks#4a, tests#2): a
+    // `claims:admin` caller editing ANOTHER agent must not be handed a name
+    // the rule withholds from it, whatever the edit's own connection admits.
+    let mut read = scoped_read(&state, &viewer, "update_agent").await?;
+    let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
+    Ok(Json(redact_profile(updated, &d)))
 }
 
 /// Update an existing agent (placeholder - no database)

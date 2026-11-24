@@ -350,3 +350,109 @@ async fn put_profile_visibility_is_self_service_for_a_person_only(pool: PgPool) 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(profile_of(&pool, h).await, "public", "nothing changed");
 }
+
+/// Review finding correctness#7: a body that mixes `profile_visibility` with a
+/// profile edit is refused 400 before anything is written (the edit and the
+/// opt-in run on different connections, so a mixed body could commit one and
+/// fail the other).
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_profile_visibility_mixed_with_an_edit_is_refused_whole(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-mixed").await;
+    sqlx::query(
+        "UPDATE agents SET profile_visibility = 'group', labels = ARRAY['before'] WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("start");
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public", "labels": ["after"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        profile_of(&pool, h).await,
+        "group",
+        "the opt-in was not applied"
+    );
+    let labels: Vec<String> = sqlx::query_scalar("SELECT labels FROM agents WHERE id = $1")
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .expect("labels");
+    assert_eq!(
+        labels,
+        vec!["before".to_string()],
+        "the edit was not applied"
+    );
+    // CALIBRATION: the field alone is accepted.
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Review findings correctness#7, leaks#4a, tests#2: a non-privileged
+/// `claims:admin` caller's edit of ANOTHER agent never answers with a name
+/// the rule withholds from it. Today the edit itself moves no row on the
+/// unstamped pool (spec R8) and answers 404; the response is also redacted
+/// on the caller's stamped read, so a later fix of R8 cannot start echoing
+/// the name. CALIBRATION: the admin's GET of the person is nameless (the
+/// admin is not privileged), and the person's own PUT echoes its name.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_admin_edit_of_an_unnamed_person_answers_no_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-unnamed").await;
+    sqlx::query(
+        "UPDATE agents SET display_name = 'Quintessa Unseen', profile_visibility = 'group' \
+          WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("name the person");
+    let (admin, _) = viewer_fixture::seed_agent_with_group(&pool, "put-unnamed-admin").await;
+    let (status, body) = get(&state, admin, &format!("/api/v1/agents/{h}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["display_name"].is_null(),
+        "CALIBRATION: unnamed to the admin: {body}"
+    );
+
+    let (status, body) = put(
+        &state,
+        admin,
+        &["agents:write", "claims:admin"],
+        h,
+        serde_json::json!({"labels": ["edited-by-admin"]}),
+    )
+    .await;
+    assert!(
+        !body.to_string().contains("Quintessa"),
+        "an admin edit echoed a withheld name ({status}): {body}"
+    );
+
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["display_name"], "Quintessa Unseen",
+        "CALIBRATION: self sees it"
+    );
+}
