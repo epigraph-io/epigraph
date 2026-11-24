@@ -31,8 +31,9 @@
 --       (`mass_function_purge_grants_kind_check`).
 --   (2) `epigraph_mf_guard_grant` accepts that kind. `epigraph_mf_guard_consume`
 --       consumes a `retract` grant only for a row whose `retracted_by` is the
---       grant's `granted_by` (which must be set) and whose `retract_reason`
---       is the grant's `reason`. Both stay owned by `epigraph_bba_guard_owner`,
+--       grant's `granted_by` (which must be set), whose `retract_reason` is
+--       the grant's `reason`, and whose `retracted_at` is the transaction's
+--       `now()` (no backdating). Both stay owned by `epigraph_bba_guard_owner`,
 --       SECURITY DEFINER on `pg_catalog, pg_temp`, naming no public object
 --       but the ledger; their owner, ACL and path are unchanged (`CREATE OR
 --       REPLACE` keeps them).
@@ -63,17 +64,25 @@
 -- The grant is consumed before the superuser check, so a definer call on a
 -- superuser session still consumes, and records, its grant.
 --
--- WHAT A SESSION CAN STILL DO, AND WHY THAT IS THE CLAIM (251's residual,
--- now for the mark too): a maintenance login can call
+-- WHAT IS CLOSED: a mark that leaves no audit trail. Every mark by a
+-- non-superuser session now leaves a ledger row no login can remove: the
+-- kind, the row id, the session's own login (`grant_login`, which it cannot
+-- choose), the retractor and reason the grant named, and the row as stored
+-- (`consumed_row`); and the mark is stamped with the transaction's time.
+--
+-- WHAT IS NOT CLOSED (251's residual, now for the mark too; backlog
+-- 03d444a9 stays open for it): a maintenance login can call
 -- `epigraph_mf_guard_grant('retract', ..)` itself (the maintenance-owned
--- definer must be able to) and then mark the row, naming a retractor and a
--- reason in the grant. It could already retract any row it can stamp itself
--- a writer of through the definer. Either way the ledger now holds a row it
--- cannot remove: the kind, the row id, its own login (`grant_login`), the
--- retractor and reason it named, and the row as stored (`consumed_row`). The
--- row's `retracted_by` and `retract_reason` are the grant's, never a value
--- the UPDATE picked on its own. "Unaudited, with any `retracted_by`" is what
--- is closed.
+-- definer must be able to) and then mark the row with a direct UPDATE. The
+-- retractor is then whatever that login named in its own grant, the mark
+-- writes no `security_events` row, and the stored folds that included the
+-- row (`ds_combined_beliefs`) are not cleared as the definer clears them.
+-- Binding the mark to the definer itself does not fit here: the retractor
+-- the definer records is `epigraph_principal_id()`, a setting any session
+-- sets, and a role that alone could grant would still run the
+-- maintenance-owned helpers the definer calls, which any maintenance login
+-- may re-body (251 section 0). It needs the definer's privileged frame made
+-- small enough to audit completely first, as 251 did for the ledger.
 --
 -- NOT CHANGED:
 --   * The migration login, superusers and the owner of `mass_functions` (who
@@ -255,16 +264,20 @@ BEGIN
                       AND c.mf_id = p_id AND c.kind = p_kind
                       AND c.consumed_at IS NULL
                       -- 274: a retract grant admits only the row that names
-                      -- the grant's retractor and reason.
+                      -- the grant's retractor and reason, retracted at this
+                      -- transaction's timestamp (never backdated).
                       AND (c.kind <> 'retract'
                            OR (c.granted_by IS NOT NULL
                                AND (p_row ->> 'retracted_by') = c.granted_by::pg_catalog.text
-                               AND (p_row ->> 'retract_reason') = c.reason)));
+                               AND (p_row ->> 'retract_reason') = c.reason
+                               AND ((p_row ->> 'retracted_at')::pg_catalog.timestamptz)
+                                   = pg_catalog.now())));
     RETURN FOUND;
 END $$;
 COMMENT ON FUNCTION public.epigraph_mf_guard_consume(text, uuid, jsonb) IS
     'Migrations 251 and 274: consumes this transaction''s oldest unconsumed grant of the kind for '
-    'the id (for kind retract, one naming the row''s retracted_by and retract_reason), recording '
+    'the id (for kind retract, one naming the row''s retracted_by and retract_reason, for a row '
+    'retracted at the transaction''s timestamp), recording '
     'the row and session_user; true when it did. The retracted-BBA guards'' only exception. Runs '
     'as epigraph_bba_guard_owner and touches only the ledger.';
 

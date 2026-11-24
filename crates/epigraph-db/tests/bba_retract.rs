@@ -1883,7 +1883,9 @@ async fn a_maintenance_login_cannot_mark_a_bba_retracted_but_the_definer_still_c
 /// maintenance-owned definer must), but the grant admits only the mark that
 /// carries the retractor and the reason the grant names, and the ledger keeps
 /// a row naming the login. A mark naming another retractor, or another reason,
-/// than the login's own grant is refused (RT06) and changes nothing.
+/// than the login's own grant, or one backdated before the transaction, is
+/// refused (RT06) and changes nothing. (The retractor itself is still the
+/// login's choice: 03d444a9's residual, pinned by the CALIBRATION.)
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_self_granted_mark_carries_exactly_the_retractor_and_reason_its_grant_names(
     pool: PgPool,
@@ -1905,6 +1907,32 @@ async fn a_self_granted_mark_carries_exactly_the_retractor_and_reason_its_grant_
             .await
             .expect("the maintenance role executes the ledger's grant function");
         attempts.push(mark_directly(&mut *tx, id, by, reason).await);
+        drop(tx);
+    }
+    // The retractor and reason the grant names, but backdated: the mark must
+    // carry the transaction's own timestamp.
+    {
+        let mut tx = login.begin().await.expect("begin");
+        sqlx::query(GRANT)
+            .bind(id)
+            .bind("granted")
+            .bind(w.owner)
+            .execute(&mut *tx)
+            .await
+            .expect("grant");
+        attempts.push(
+            sqlx::query(
+                "UPDATE mass_functions \
+                    SET retracted_at = now() - interval '30 days', retracted_by = $2, \
+                        retract_reason = 'granted' \
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .bind(w.owner)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected()),
+        );
         drop(tx);
     }
     let state_after_mismatches = retract_columns(&pool, id).await;

@@ -4496,16 +4496,19 @@ restart.
   mark a live BBA retracted directly, with no audit row and a `retracted_by` of its choosing.
   251's ledger takes a third kind, `retract`; `epigraph_mf_guard_grant` accepts it and
   `epigraph_mf_guard_consume` consumes a `retract` grant only for a row whose
-  `retracted_by` is the grant's (non-NULL) `granted_by` and whose `retract_reason` is the
-  grant's `reason` (both stay `epigraph_bba_guard_owner`'s, SECURITY DEFINER on
+  `retracted_by` is the grant's (non-NULL) `granted_by`, whose `retract_reason` is the
+  grant's `reason` and whose `retracted_at` is the transaction's `now()` (both stay `epigraph_bba_guard_owner`'s, SECURITY DEFINER on
   `pg_catalog, pg_temp`, naming no public object but the ledger). The mark arm admits only
   by consuming a `retract` grant with `to_jsonb(NEW)`, or on a SUPERUSER session
   (`session_user` a superuser, who may disable the trigger anyway; test harnesses mark rows
   directly that way). 184's `epigraph_retract_mass_function` writes that grant (its
   principal, its trimmed reason) just before its UPDATE; every other line is 184's, on 190's
-  path. Residual (as 251's): a maintenance login may call the grant function itself and then
-  mark, but the ledger keeps a row it cannot remove naming its login, the retractor, the
-  reason and the row as stored, and the row carries exactly what the grant names.
+  path. What is closed is the UNAUDITED mark. Residual (as 251's; backlog 03d444a9 stays
+  open for it): a maintenance login may call the grant function itself and then mark with a
+  direct UPDATE, naming any retractor in its own grant, with no `security_events` row and no
+  clearing of the stored folds; the ledger keeps a row it cannot remove naming its login, the
+  retractor, the reason and the row as stored. Binding the mark to the definer needs the
+  definer's privileged frame isolated first (251 section 0).
   Preconditions (`55000`, nothing changed): the md5 and `proconfig` of the four bodies it
   re-states are those at 271, and `epigraph_bba_guard_owner_faults()` is `{}` before and
   after; a non-superuser runner is refused `42501`. Pinned by
