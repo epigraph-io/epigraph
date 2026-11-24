@@ -4970,6 +4970,11 @@ mod definer_register_tests {
         // 207: the intake settings' audit trigger. It runs as the session
         // writing the settings row, which only a maintenance session can.
         "epigraph_bug_report_intake_settings_audit",
+        // 282: the role projection edge guard. It MUST run as the caller: it
+        // admits a write when the session is a maintenance member or the
+        // current frame is a maintenance-owned definer, which a definer body
+        // would always be. Its owner is not what it reads.
+        "epigraph_role_projection_edges_guard",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

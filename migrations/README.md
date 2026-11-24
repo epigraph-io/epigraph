@@ -4597,6 +4597,15 @@ restart.
   `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/281-undo.sql`. 278's own
   backfill and OCC02 still match the relationship alone (278 is not edited): **deploy
   pre-check** in the spec, section 17.
+- **282**: `role_projection_edges_maintenance_only` (security review of 278, finding 2). NEW
+  `epigraph_role_projection_edges_guard()` (SECURITY INVOKER on 271's path, maintenance-owned)
+  and three BEFORE triggers on `edges` keyed by WHEN on the projection marker
+  (`source = role_assignments`, `projection = true`): INSERT (NEW carries it), UPDATE (OLD or
+  NEW carries it), DELETE (OLD carries it). Admitted only when `epigraph_bypass()` or
+  `epigraph_definer_bypass()`; otherwise OCC05 (42501). So a writer of the owning team cannot
+  widen, strip, re-time or delete a projection edge, and no application writer can write the
+  marker. The grant / end / bind / unbind re-projection runs as maintenance and passes. Pinned
+  by `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/282-undo.sql`.
 
 ## `-- no-transaction` migrations
 

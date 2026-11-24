@@ -26,6 +26,12 @@
 //!   holder and role). A forged edge of the projection's shape, written by any
 //!   edge writer, is never re-owned by a bind / unbind or by the reconcile
 //!   pass, and never makes a binding change fail.
+//! * Migration 282: a projection edge (any row carrying the marker) is
+//!   written only by a maintenance session or a maintenance-owned definer
+//!   frame. A writer of the owning team cannot widen, strip, re-time or
+//!   delete one, nor write the marker onto a row of its own (OCC05); the
+//!   maintenance verbs (grant, end, bind, unbind) still re-project through
+//!   the guard.
 //!
 //! Two surfaces cannot reach an agent-to-agent edge at all, so they have no
 //! row here: PROV export is claim-rooted (`epigraph-engine/src/export/prov.rs`
@@ -932,6 +938,293 @@ async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
     assert_eq!(d["before"], 1, "only the genuine public projection: {d}");
     assert_eq!(d["rows"], 1, "{d}");
     assert_eq!(d["after"], 0, "{d}");
+}
+
+// ─── migration 282: a projection edge is maintenance-only ────────────────
+
+/// The SQLSTATE and message of a refused write, or None when it succeeded.
+async fn try_write(scoped: &ScopedPool, v: &Viewer, sql: &str, id: Uuid) -> Option<String> {
+    let mut tx = scoped.begin_as(v).await.expect("stamped tx");
+    let r = sqlx::query(sql).bind(id).execute(&mut *tx).await;
+    match r {
+        Ok(done) => {
+            assert_eq!(
+                done.rows_affected(),
+                1,
+                "{sql}: the write must reach the row"
+            );
+            tx.commit().await.expect("commit");
+            None
+        }
+        Err(e) => {
+            let code = e
+                .as_database_error()
+                .and_then(|d| d.code().map(|c| c.to_string()))
+                .unwrap_or_default();
+            Some(format!("{code} {e}"))
+        }
+    }
+}
+
+/// A writer of the team that owns a projection edge cannot widen it, re-own
+/// it, strip or rewrite its marker, re-time it or delete it: each is refused
+/// by the guard (OCC05, 42501) and the row is unchanged. CALIBRATION: the
+/// same session updates and deletes an unmarked edge of the same relationship
+/// owned by the same team, so the refusal is the guard's, not row security's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_team_writer_cannot_widen_reown_or_delete_a_projection_edge(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = person(&pool, "holder").await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "mate").await;
+    let node = seed_role(&pool, "role:edge-test-guard").await;
+    let team = group_of(&pool, "team", &[mate]).await;
+    bind(&pool, team, "role:edge-test-guard").await;
+    let real = grant(&pool, "role:edge-test-guard", h).await;
+    let proj: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(real)
+    .fetch_one(&pool)
+    .await
+    .expect("projection");
+    let snapshot = |pool: PgPool| async move {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                Uuid,
+                Option<Uuid>,
+                serde_json::Value,
+                Option<String>,
+            ),
+        >(
+            "SELECT visibility::text, owner_group_id, declared_owner_group_id, properties, \
+                    valid_to::text FROM edges WHERE id = $1",
+        )
+        .bind(proj)
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot")
+    };
+    let before = snapshot(pool.clone()).await;
+    assert_eq!((before.0.as_str(), before.1), ("group", team), "PREMISE");
+    let v = viewer(&pool, Some(mate)).await;
+
+    for (what, sql) in [
+        (
+            "widen",
+            "UPDATE edges SET visibility = 'public' WHERE id = $1",
+        ),
+        (
+            "strip the marker",
+            "UPDATE edges SET properties = properties - 'projection' WHERE id = $1",
+        ),
+        (
+            "rewrite the role",
+            "UPDATE edges SET properties = properties || '{\"role\": \"role:other\"}' \
+              WHERE id = $1",
+        ),
+        ("re-time", "UPDATE edges SET valid_to = now() WHERE id = $1"),
+        ("delete", "DELETE FROM edges WHERE id = $1"),
+    ] {
+        let err = try_write(&scoped, &v, sql, proj).await;
+        let err = err.unwrap_or_else(|| panic!("{what}: a team writer changed a projection edge"));
+        assert!(
+            err.contains("OCC05") && err.starts_with("42501"),
+            "{what}: {err}"
+        );
+    }
+    // Re-owning was already refused by 260's owner guard, which fires first;
+    // pinned here as a regression check, not as this guard's work.
+    let err = try_write(
+        &scoped,
+        &v,
+        "UPDATE edges SET owner_group_id = '00000000-0000-0000-0000-000000000000' \
+          WHERE id = $1",
+        proj,
+    )
+    .await;
+    assert!(
+        err.is_some(),
+        "re-own: a team writer re-owned a projection edge"
+    );
+    assert_eq!(
+        snapshot(pool.clone()).await,
+        before,
+        "the projection is unchanged"
+    );
+
+    // CALIBRATION: the same writer changes and deletes an UNMARKED edge of the
+    // same relationship that the same team owns.
+    let plain = forge(
+        &pool,
+        mate,
+        node,
+        serde_json::json!({"role": "role:edge-test-guard"}),
+        Some(team),
+    )
+    .await;
+    assert_eq!(
+        try_write(
+            &scoped,
+            &v,
+            "UPDATE edges SET properties = properties || '{\"note\": 1}' WHERE id = $1",
+            plain
+        )
+        .await,
+        None,
+        "CALIBRATION: update"
+    );
+    assert_eq!(
+        try_write(&scoped, &v, "DELETE FROM edges WHERE id = $1", plain).await,
+        None,
+        "CALIBRATION: delete"
+    );
+}
+
+/// A writer of a team cannot write the marker at all: not by INSERTing an
+/// edge that carries it, and not by ADDING it to an edge the team owns (an
+/// UPDATE whose NEW row carries it). So only the audit trigger's definer frame
+/// (or maintenance) ever writes a row that reads as a projection.
+/// CALIBRATION: the same INSERT without the marker succeeds on the same
+/// session, so the refusal is the guard's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_team_writer_cannot_write_the_projection_marker(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "mate").await;
+    let node = seed_role(&pool, "role:edge-test-mark").await;
+    let team = group_of(&pool, "team", &[mate]).await;
+    let v = viewer(&pool, Some(mate)).await;
+    let insert = |props: &'static str| {
+        format!(
+            "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                                properties, visibility, owner_group_id) \
+             SELECT $1, 'agent', '{node}', 'agent', 'OCCUPIES', '{props}'::jsonb, 'group', '{team}'"
+        )
+    };
+    let marked = insert(
+        r#"{"role": "role:edge-test-mark", "source": "role_assignments", "projection": true}"#,
+    );
+    let err = try_write(&scoped, &v, &marked, mate)
+        .await
+        .expect("inserting the marker is refused");
+    assert!(
+        err.contains("OCC05") && err.starts_with("42501"),
+        "insert: {err}"
+    );
+    let plain_sql = insert(r#"{"role": "role:edge-test-mark"}"#);
+    assert_eq!(
+        try_write(&scoped, &v, &plain_sql, mate).await,
+        None,
+        "CALIBRATION: the unmarked insert"
+    );
+
+    let plain = forge(&pool, mate, node, serde_json::json!({}), Some(team)).await;
+    let err = try_write(
+        &scoped,
+        &v,
+        "UPDATE edges SET properties = properties || \
+                '{\"source\": \"role_assignments\", \"projection\": true}' WHERE id = $1",
+        plain,
+    )
+    .await
+    .expect("adding the marker is refused");
+    assert!(
+        err.contains("OCC05") && err.starts_with("42501"),
+        "update: {err}"
+    );
+}
+
+/// The legitimate writers pass the guard: on a real maintenance session
+/// (`session_user` = the maintenance role, not the superuser harness) a grant
+/// projects into the bound team, a bind and an unbind re-own, an end closes
+/// the edge (owner kept), and a maintenance narrowing of `valid_to` lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_maintenance_verbs_still_re_project_through_the_guard(pool: PgPool) {
+    let (h, personal) = person(&pool, "holder").await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "mate").await;
+    seed_role(&pool, "role:edge-test-maint").await;
+    let team = group_of(&pool, "team", &[mate]).await;
+    let (b, a) = fixture::as_role(&pool, "epigraph_maintenance", |mut c| async move {
+        let b: Uuid = sqlx::query_scalar(
+            "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, \
+                                              reason) \
+             VALUES ($1, 'role:edge-test-maint', 'reader', false, 'maint bind') RETURNING id",
+        )
+        .bind(team)
+        .fetch_one(&mut *c)
+        .await
+        .expect("maintenance bind");
+        let a: Uuid = sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role('role:edge-test-maint', $1, \
+                    now() - interval '5 seconds', NULL, NULL, 'maint grant')",
+        )
+        .bind(h)
+        .fetch_one(&mut *c)
+        .await
+        .expect("maintenance grant");
+        (c, (b, a))
+    })
+    .await;
+    assert_eq!(
+        tenancy(&pool, h).await,
+        vec![("group".to_string(), team, Some(team))],
+        "grant"
+    );
+
+    fixture::as_role(&pool, "epigraph_maintenance", |mut c| async move {
+        sqlx::query(
+            "UPDATE group_role_bindings SET revoked_at = now(), revoked_by = session_user, \
+                    revoked_reason = 'maint unbind' WHERE id = $1",
+        )
+        .bind(b)
+        .execute(&mut *c)
+        .await
+        .expect("maintenance unbind");
+        (c, ())
+    })
+    .await;
+    assert_eq!(
+        tenancy(&pool, h).await,
+        vec![("group".to_string(), personal, Some(personal))],
+        "unbind"
+    );
+
+    let narrowed = fixture::as_role(&pool, "epigraph_maintenance", |mut c| async move {
+        sqlx::query(
+            "UPDATE role_assignments SET revoked_at = now(), revoked_by = session_user, \
+                    revoked_reason = 'maint end' WHERE id = $1",
+        )
+        .bind(a)
+        .execute(&mut *c)
+        .await
+        .expect("maintenance end");
+        let n = sqlx::query(
+            "UPDATE edges SET valid_to = valid_to - interval '1 microsecond' \
+              WHERE properties @> jsonb_build_object('assignment_id', $1::text)",
+        )
+        .bind(a)
+        .execute(&mut *c)
+        .await
+        .expect("maintenance narrowing")
+        .rows_affected();
+        (c, n)
+    })
+    .await;
+    assert_eq!(
+        narrowed, 1,
+        "the maintenance narrowing reaches the projection"
+    );
+    let (closed, owner): (bool, Uuid) = sqlx::query_as(
+        "SELECT e.valid_to IS NOT NULL AND e.properties ? 'ended_at', e.owner_group_id \
+           FROM edges e WHERE e.properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .expect("ended projection");
+    assert!(closed, "the end closes the projection");
+    assert_eq!(owner, personal, "the end keeps the owner");
 }
 
 /// 281's precondition: a binding trigger whose body is not 278's is never
