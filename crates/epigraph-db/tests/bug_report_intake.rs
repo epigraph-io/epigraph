@@ -531,8 +531,12 @@ async fn the_list_holds_only_the_callers_intake_reports(pool: PgPool) {
     let ids: Vec<Uuid> = mine.iter().map(|r| r.claim_id).collect();
     assert_eq!(ids, vec![b.claim_id, a.claim_id], "newest first, only mine");
     assert_eq!(mine[0].title.as_deref(), Some("second"));
-    assert!(mine[0].resolved && mine[0].is_current);
-    assert!(mine[1].labels.contains(&"bug".to_string()) && !mine[1].resolved);
+    assert_eq!(
+        (mine[0].resolved, mine[0].is_current),
+        (Some(true), Some(true))
+    );
+    assert!(mine[1].labels.contains(&"bug".to_string()));
+    assert_eq!(mine[1].resolved, Some(false));
 
     let theirs: Vec<Uuid> = list_as(&pool, other)
         .await
@@ -624,14 +628,19 @@ async fn moved_and_earlier_intake_reports_stay_in_the_list(pool: PgPool) {
     assert_eq!(mine[2].title.as_deref(), Some("moved by triage"));
 }
 
-/// A listed report shows the reporter no more than 207 did (review of
-/// backlog e690866c: listing moved reports must not widen the label
+/// A listed report shows the reporter nothing a later owner wrote or did
+/// (review of backlog e690866c: listing moved reports must not widen the
 /// disclosure). While the claim is owned by the CURRENT intake group the row
-/// shows its live title and labels, triage's included, as 207 did. Once
-/// another group owns it, whether triage moved it or the operator named a
-/// different intake group, the row shows only what was filed (title and the
-/// write's labels) plus `resolved`: never a label or title its new owner
+/// shows its live title, labels, `resolved` and `is_current`, triage's
+/// included, as 207 did. Once another group owns it, whether triage moved it
+/// or the operator named a different intake group, the row shows only what
+/// was filed (title and the write's labels), with `resolved` and `is_current`
+/// `None`: never a label, title, resolution or supersession its new owner
 /// wrote.
+///
+/// Verified to fail: with the list's `resolved`/`is_current` arms put back to
+/// `'resolved' = ANY (c.labels)` / `c.is_current` for every row, `m.resolved`
+/// is `Some(true)` and `m.is_current` `Some(false)` below.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(pool: PgPool) {
     let w = world(&pool).await;
@@ -666,11 +675,12 @@ async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(poo
         .await
         .expect("intake triage labels");
     // A private team adopts a report, labels it with an internal reference,
-    // rewrites its title, and resolves it.
+    // rewrites its title, resolves it and retires it (as a supersession does).
     sqlx::query(
         "UPDATE claims SET owner_group_id = $2, \
                 labels = labels || ARRAY['dup-of:internal-ref', 'resolved'], \
-                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"') \
+                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"'), \
+                is_current = false, embedding = NULL, embedding_3072 = NULL \
           WHERE id = $1",
     )
     .bind(moved.claim_id)
@@ -707,13 +717,27 @@ async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(poo
     let cur = row(current.claim_id);
     assert!(cur.labels.contains(&"bug".to_string()), "{:?}", cur.labels);
     assert_eq!(cur.title.as_deref(), Some("in the new intake"));
+    assert_eq!((cur.resolved, cur.is_current), (Some(false), Some(true)));
+    // CALIBRATION: the moved claim really is resolved and retired.
+    let (live_labels, live_current): (Vec<String>, bool) =
+        sqlx::query_as("SELECT labels, is_current FROM claims WHERE id = $1")
+            .bind(moved.claim_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the moved claim");
+    assert!(live_labels.contains(&"resolved".to_string()) && !live_current);
 
-    // Moved to a private team: what was filed plus `resolved`, nothing else.
+    // Moved to a private team: what was filed, nothing else.
     let m = row(moved.claim_id);
-    let mut want = filed.clone();
-    want.push("resolved".into());
-    assert_eq!(m.labels, want, "the new owner's labels are not disclosed");
-    assert!(m.resolved);
+    assert_eq!(m.labels, filed, "the new owner's labels are not disclosed");
+    assert_eq!(
+        m.resolved, None,
+        "the new owner's resolution is not disclosed"
+    );
+    assert_eq!(
+        m.is_current, None,
+        "the new owner's supersession is not disclosed"
+    );
     assert_eq!(
         m.title.as_deref(),
         Some("adopted by a private team"),
@@ -728,7 +752,7 @@ async fn a_report_owned_outside_the_current_intake_shows_only_what_was_filed(poo
     ] {
         let r = row(id);
         assert_eq!(r.labels, filed, "{title}: only what was filed");
-        assert!(!r.resolved);
+        assert_eq!((r.resolved, r.is_current), (None, None), "{title}");
         assert_eq!(r.title.as_deref(), Some(title));
     }
 }

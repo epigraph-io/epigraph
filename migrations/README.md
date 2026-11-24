@@ -4502,21 +4502,24 @@ restart.
   which now lists the caller's markers joined to their claims (author still the caller)
   instead of the claims owned by the CURRENT intake group: a report triage moved out of the
   intake group, or one filed under an intake group the operator replaced, stays listed.
-  What a listed row shows does not widen 207's disclosure: the live title and labels only
-  while the claim is owned by the CURRENT intake group (as 207), otherwise only the marker's
-  filed title and labels plus `resolved`, never a label or title a later owner wrote.
+  What a listed row shows: the live title, labels, `resolved` and `is_current` only while the
+  claim is owned by the CURRENT intake group (as 207), otherwise only the marker's filed
+  title and labels with NULL `resolved` and `is_current`, never a label, title, resolution or
+  supersession a later owner wrote.
   `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
   existing `bug_report.submitted` audit row whose claim is still authored by its agent and
   carries the write's `properties.bug_report` (filed labels rebuilt from the audit row's
-  severity and component; the title from the claim, so a report moved before 272 keeps the
-  title it has now), with `row_security` off (fails closed on a filtered migration login),
+  severity and component; the title from the claim only while it is still owned by the
+  intake group its audit row names, so a report another group owned before 272 gets a NULL
+  title rather than one its new owner may have written), with `row_security` off (fails closed on a filtered migration login),
   after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call
   reads it first, so a call already past that read commits before the backfill). A call that
   STARTS while 272 holds the lock has loaded 211's body and files its report with no marker
-  once 272 commits; `docs/runbooks/272-marker-backfill.sql` (272's backfill, idempotent)
-  closes that. Not decided: the list still shows the labels intake triage writes while a
-  report is in the current intake group (the label-disclosure question, e690866c part 2, is
-  open). Owners and grants re-asserted as 211 does. Pinned by
+  once 272 commits, and the list reads markers only, so that report is not listed at all
+  until `docs/runbooks/272-marker-backfill.sql` (272's backfill, idempotent; a REQUIRED
+  deploy step) marks it. Not decided (e690866c part 2, open): the list still shows the labels
+  intake triage writes while a report is in the current intake group, and whether a report
+  another group owns still exists (a deleted claim drops out of the list). Owners and grants re-asserted as 211 does. Pinned by
   `epigraph-db/tests/bug_report_intake.rs` (`moved_and_earlier_intake_reports_stay_in_the_list`,
   `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`,
   `the_application_role_cannot_read_or_forge_an_intake_marker`) and
@@ -4533,11 +4536,15 @@ restart.
   this change (they read the table: 42P01 below 272), and while NO theme run is in progress (a
   maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
   600 s statement timeout, so 272's ACCESS EXCLUSIVE lock times out after 3 s and the migration
-  fails, safely: re-run it); a minute or more after 272 commits, run
-  `docs/runbooks/272-marker-backfill.sql` once on the migration DSN. The backfill reads
+  fails, safely: re-run it); a minute or more after 272 commits, and before triage moves
+  anything, run `docs/runbooks/272-marker-backfill.sql` once on the migration DSN (REQUIRED).
+  An older binary on 272 fails the whole `list_my_bug_reports` call for a reporter with a
+  report owned outside the current intake group (it decodes the now-NULL `resolved` and
+  `is_current` as booleans): one more reason the binary ships first. The backfill reads
   `security_events` through `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
   on a deployed database is a measurement still to make. A
-  read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
+  login that runs the theme scripts (every scheduled theme job's login, not only a read-only
+  one) needs SELECT on the table, or the job fails with 42501 (docs/deploy.md).
   **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations

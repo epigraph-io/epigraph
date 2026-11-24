@@ -203,7 +203,8 @@ pub async fn submit_bug_report(
 
 /// The caller's own intake reports, newest first: claim id, title,
 /// submitted_at, the claim's current labels (triage's status), whether it is
-/// resolved, and whether it is current.
+/// resolved, and whether it is current (both `null` for a report another
+/// group now owns).
 ///
 /// A principal-less HTTP context (`--allow-unauthenticated-http`) is refused:
 /// it reads as the listener's own agent, and a shared listener credential is
@@ -211,7 +212,7 @@ pub async fn submit_bug_report(
 /// group's information, shown only to the agent that filed it. A report the
 /// operators moved to another group (or one filed under an earlier intake
 /// group) stays listed (migration 272) but shows only what was filed, never
-/// its new owner's labels or title.
+/// its new owner's labels, title, resolution or supersession.
 ///
 /// # Errors
 /// `INVALID_REQUEST` for a principal-less context, when the intake is not

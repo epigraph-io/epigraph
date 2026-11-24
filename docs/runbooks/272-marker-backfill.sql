@@ -6,12 +6,16 @@
 -- report already past that read is in the backfill. A write definer call that
 -- STARTS while 272 holds the lock has already loaded the old (211) body; it
 -- waits on the settings read and, once 272 commits, files its report on that
--- body, with no marker. Such a report drops out of its reporter's list once
--- triage moves it (backlog e690866c). This file is 272's backfill statement,
--- unchanged: it marks every such report and nothing else.
+-- body, with no marker. The 272 list reads markers only, so such a report is
+-- NOT in its reporter's list at all, moved or not, until this file has run
+-- (backlog e690866c). This file is 272's backfill statement, unchanged: it
+-- marks every such report and nothing else.
 --
--- WHEN. Once, a minute or more after 272 commits (every call that loaded the
--- old body has then finished). Running it again changes nothing
+-- WHEN. REQUIRED, once, a minute or more after 272 commits (every call that
+-- loaded the old body has then finished), and before triage moves anything
+-- filed since: like 272's backfill, it copies a report's title only while the
+-- claim is still owned by the intake group it was filed into, so a report
+-- already moved gets a NULL title. Running it again changes nothing
 -- (`ON CONFLICT DO NOTHING`); it is safe at any later time.
 --
 -- WHO. A login whose reads `row_security = off` does not refuse (the
@@ -38,8 +42,15 @@ BEGIN
                 THEN (e.details ->> 'intake_group_id')::uuid
                 ELSE c.owner_group_id END,
            e.created_at,
-           -- The title is only in the claim's properties (see the header).
-           (c.properties -> 'bug_report' ->> 'title'),
+           -- The title is only in the claim's properties, which its owner can
+           -- rewrite, so it is taken only while the claim is still owned by
+           -- the intake group its audit row names (whose triage 207 already
+           -- showed the reporter). A report another group owns by now, or one
+           -- whose audit row names no intake group, gets no title: never a
+           -- title its new owner may have written.
+           CASE WHEN (e.details ->> 'intake_group_id') ~ v_uuid
+                 AND c.owner_group_id = (e.details ->> 'intake_group_id')::uuid
+                THEN (c.properties -> 'bug_report' ->> 'title') END,
            -- The labels the write put on the row, rebuilt from the audit row
            -- (definer-written only, 207 (b)), as the write composes them.
            ARRAY['backlog', 'bug-report', 'intake']::text[]

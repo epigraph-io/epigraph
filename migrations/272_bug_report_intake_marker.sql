@@ -50,8 +50,11 @@
 --       labels the write put on it rebuilt from the audit row's severity and
 --       component, so every report a reporter sees before this migration it
 --       still sees after it. The title can only come from the claim's
---       `properties`, which its owner can rewrite: a report triage had
---       already moved before 272 keeps whatever title it holds now. Read with
+--       `properties`, which its owner can rewrite, so it is copied only while
+--       the claim is still owned by the intake group its audit row names: a
+--       report another group already owned before 272 gets a NULL title (it
+--       is listed with no title, never with one its new owner may have
+--       written; 207 did not list it at all). Read with
 --       row security OFF: on a migration login that row security would
 --       filter, the read fails instead of silently missing rows.
 --       `bug_report_intake_settings` is locked ACCESS EXCLUSIVE first: every
@@ -62,11 +65,14 @@
 --       ONE GAP the lock does not close: a call that STARTS while this
 --       migration holds the lock has already loaded the old (211) body, waits
 --       on the settings read, and resumes on that body once 272 commits, so
---       it files a report with NO marker, after the backfill ran. Such a
---       report is listed while it stays in the intake group (as under 207)
---       and drops out once moved. The operator closes it after deploying by
---       running `docs/runbooks/272-marker-backfill.sql` (this backfill,
---       idempotent) once, a minute or more after 272 commits.
+--       it files a report with NO marker, after the backfill ran. The list
+--       reads markers only, so such a report is NOT listed at all, in the
+--       intake group or out of it, until the marker exists. The operator
+--       closes the gap after deploying by running
+--       `docs/runbooks/272-marker-backfill.sql` (this backfill, idempotent)
+--       once, a minute or more after 272 commits. That step is REQUIRED, not
+--       optional. Run it before triage moves anything: a report already
+--       moved by then is marked with no title (as above).
 --   (c) `epigraph_submit_bug_report`, redefined from 211's body with two
 --       changes: the marker INSERT after the audit row, and the blank test
 --       for the repro and the evidence (backlog 64584278 part 2): an
@@ -88,19 +94,22 @@
 --       `submitted_at` is the marker's (the same `now()` the audit row was
 --       stamped with).
 --
---       WHAT A LISTED REPORT SHOWS does not widen 207's disclosure. While the
---       claim is owned by the CURRENT intake group the row shows its live
---       title and labels, exactly as 207 did. Once another group owns it
---       (triage moved it, or the operator named a different intake group),
---       207 did not list it at all; 272 lists it with only what was filed
---       (the marker's title and labels) and `resolved`/`is_current`, never
---       a label or title its new owner wrote.
+--       WHAT A LISTED REPORT SHOWS. While the claim is owned by the CURRENT
+--       intake group the row shows its live title, labels, `resolved` and
+--       `is_current`, exactly as 207 did. Once another group owns it (triage
+--       moved it, or the operator named a different intake group), 207 did
+--       not list it at all; 272 lists it with only what was filed (the
+--       marker's title and labels) and NULL `resolved` and `is_current`:
+--       whether the new owner resolved or superseded it is activity inside a
+--       group the reporter need not be in, so it is not shown.
 --
--- NOT DECIDED HERE: the labels triage writes while the report is in the
--- current intake group are still shown to the reporter, as 207 showed them.
--- Whether that disclosure is acceptable, or the reporter view should filter
--- triage labels there too, is an open operator question (backlog e690866c
--- part 2).
+-- NOT DECIDED HERE (open operator questions, backlog e690866c part 2):
+--   * the labels triage writes while the report is in the current intake
+--     group are still shown to the reporter, as 207 showed them; whether the
+--     reporter view should filter triage labels there too;
+--   * one fact about a report another group owns still reaches its reporter:
+--     whether the claim still EXISTS (the list joins to it, so a deleted
+--     report drops out). 207 did not list such a report at all.
 --
 -- (c) and (d) keep 172's form: SECURITY DEFINER, owned by
 -- `epigraph_maintenance`, `SET search_path = pg_catalog, pg_temp`, every
@@ -210,8 +219,15 @@ BEGIN
                 THEN (e.details ->> 'intake_group_id')::uuid
                 ELSE c.owner_group_id END,
            e.created_at,
-           -- The title is only in the claim's properties (see the header).
-           (c.properties -> 'bug_report' ->> 'title'),
+           -- The title is only in the claim's properties, which its owner can
+           -- rewrite, so it is taken only while the claim is still owned by
+           -- the intake group its audit row names (whose triage 207 already
+           -- showed the reporter). A report another group owns by now, or one
+           -- whose audit row names no intake group, gets no title: never a
+           -- title its new owner may have written.
+           CASE WHEN (e.details ->> 'intake_group_id') ~ v_uuid
+                 AND c.owner_group_id = (e.details ->> 'intake_group_id')::uuid
+                THEN (c.properties -> 'bug_report' ->> 'title') END,
            -- The labels the write put on the row, rebuilt from the audit row
            -- (definer-written only, 207 (b)), as the write composes them.
            ARRAY['backlog', 'bug-report', 'intake']::text[]
@@ -490,11 +506,12 @@ BEGIN
     -- 272: the reports the caller FILED (its markers), wherever triage has
     -- moved them since and whichever intake group they were filed into; the
     -- claim must still be authored by the caller. Which reports are listed is
-    -- not keyed on `v_group`; what each one SHOWS is: the live title and
-    -- labels only while the claim is owned by the CURRENT intake group (207's
-    -- surface, unchanged), otherwise only what was filed (the marker's title
-    -- and labels) plus `resolved`. A report another group now owns is that
-    -- group's information, and 207 never showed it to the reporter at all.
+    -- not keyed on `v_group`; what each one SHOWS is: the live title, labels,
+    -- `resolved` and `is_current` only while the claim is owned by the
+    -- CURRENT intake group (207's surface, unchanged), otherwise only what
+    -- was filed (the marker's title and labels), with NULL `resolved` and
+    -- `is_current`. A report another group now owns is that group's
+    -- information, and 207 never showed it to the reporter at all.
     RETURN QUERY
     SELECT c.id,
            CASE WHEN c.owner_group_id = v_group
@@ -502,11 +519,10 @@ BEGIN
                 ELSE m.title END,
            m.submitted_at,
            CASE WHEN c.owner_group_id = v_group THEN c.labels
-                WHEN 'resolved' = ANY (c.labels)
-                THEN m.filed_labels || ARRAY['resolved']::text[]
                 ELSE m.filed_labels END,
-           'resolved' = ANY (c.labels),
-           c.is_current
+           CASE WHEN c.owner_group_id = v_group
+                THEN 'resolved' = ANY (c.labels) END,
+           CASE WHEN c.owner_group_id = v_group THEN c.is_current END
       FROM public.bug_report_intake_marks m
       JOIN public.claims c ON c.id = m.claim_id
      WHERE m.reporter_id = v_principal
@@ -518,8 +534,8 @@ COMMENT ON FUNCTION public.epigraph_my_bug_reports(integer) IS
     'Migration 207: the session principal''s own intake reports (claim id, title, '
     'submitted_at, current labels, resolved, is_current), newest first, at most 200. '
     '272: keyed on the intake marker recorded at filing, not on the current intake group; '
-    'a report owned outside the current intake group shows only its filed title and labels '
-    'plus resolved.';
+    'a report owned outside the current intake group shows only its filed title and labels, '
+    'with NULL resolved and is_current.';
 REVOKE EXECUTE ON FUNCTION public.epigraph_my_bug_reports(integer) FROM PUBLIC;
 
 -- `CREATE OR REPLACE` keeps owners and grants; re-asserted, as 211 does, so a

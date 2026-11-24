@@ -1981,7 +1981,7 @@ impl EpiGraphMcpFull {
     }
 
     #[tool(
-        description = "List the bug reports YOU filed with submit_bug_report, newest first: claim_id, title, submitted_at, the report's current labels (how triage has classified it so far), resolved and is_current. Only your own reports filed through the intake are listed, never anything else in the intake group. A report the operators moved out of the intake group (or one filed under an earlier intake group) stays listed, but shows only the title and labels you filed it with, plus resolved. Refused on a listener with no authenticated principal. limit defaults to 50, at most 200."
+        description = "List the bug reports YOU filed with submit_bug_report, newest first: claim_id, title, submitted_at, the report's current labels (how triage has classified it so far), resolved and is_current. Only your own reports filed through the intake are listed, never anything else in the intake group. A report the operators moved out of the intake group (or one filed under an earlier intake group) stays listed, but shows only the title and labels you filed it with; its resolved and is_current are null. Refused on a listener with no authenticated principal. limit defaults to 50, at most 200."
     )]
     async fn list_my_bug_reports(
         &self,

@@ -123,12 +123,19 @@ pub struct BugReportReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BugReportRow {
     pub claim_id: Uuid,
+    /// The live title while the claim is owned by the CURRENT intake group;
+    /// otherwise the title it was filed with (`None` for a report another
+    /// group already owned when migration 272 backfilled its marker).
     pub title: Option<String>,
     pub submitted_at: DateTime<Utc>,
-    /// The claim's labels NOW: triage's changes included.
+    /// The claim's labels NOW (triage's changes included) while it is owned by
+    /// the CURRENT intake group; otherwise only the labels it was filed with.
     pub labels: Vec<String>,
-    pub resolved: bool,
-    pub is_current: bool,
+    /// `None` once another group owns the report (migration 272): whether that
+    /// group resolved it is not the reporter's to see.
+    pub resolved: Option<bool>,
+    /// `None` once another group owns the report, for the same reason.
+    pub is_current: Option<bool>,
 }
 
 /// `None` for an absent optional text or one with nothing visible in it
@@ -263,9 +270,10 @@ impl BugReportRepository {
     /// marker recorded when each report was filed (migration 272), so a
     /// report triage has moved out of the intake group, or one filed under an
     /// earlier intake group, is still listed. While a report is owned by the
-    /// CURRENT intake group its title and labels are the claim's live ones,
-    /// triage's included (as before 272); once another group owns it, only
-    /// what was filed (title, the write's labels) plus `resolved`.
+    /// CURRENT intake group its title, labels, `resolved` and `is_current`
+    /// are the claim's live ones, triage's included (as before 272); once
+    /// another group owns it, only what was filed (title, the write's labels),
+    /// with `resolved` and `is_current` `None`.
     ///
     /// # Errors
     /// [`DbError::Refused`] when the session has no principal (BUG01) or the
@@ -274,7 +282,14 @@ impl BugReportRepository {
         conn: &mut sqlx::PgConnection,
         limit: i32,
     ) -> Result<Vec<BugReportRow>, DbError> {
-        type Row = (Uuid, Option<String>, DateTime<Utc>, Vec<String>, bool, bool);
+        type Row = (
+            Uuid,
+            Option<String>,
+            DateTime<Utc>,
+            Vec<String>,
+            Option<bool>,
+            Option<bool>,
+        );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT claim_id, title, submitted_at, labels, resolved, is_current \
                FROM public.epigraph_my_bug_reports($1)",

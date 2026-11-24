@@ -13,7 +13,10 @@
 //!   claim the reporter authored by another path gets no marker, even when
 //!   an audit row names it, and neither does an audit row whose claim is gone
 //!   or is no longer the reporter's. The filed labels are rebuilt from the
-//!   audit row exactly as the write composed them.
+//!   audit row exactly as the write composed them. The title is copied only
+//!   from a claim still owned by the intake group its audit row names: the
+//!   moved report's new owner rewrote its title before the upgrade, and that
+//!   title never reaches the marker or the list (the marker's title is NULL).
 //! * `the_272_marker_backfill_runbook_marks_a_report_filed_without_one`:
 //!   `docs/runbooks/272-marker-backfill.sql` (272's backfill, for a report a
 //!   call that started during the migration filed on the old body) marks it,
@@ -24,7 +27,9 @@
 //!   restored byte for byte), and a second run changes nothing.
 //!
 //! Verified to fail: with 272's backfill INSERT removed, the first test's
-//! post-upgrade list is empty; with the backfill's `properties ? 'bug_report'`
+//! post-upgrade list is empty; with the backfill's title taken from the claim
+//! whoever owns it (the pre-review expression), the first test's marker and
+//! list carry the new owner's "internal title"; with the backfill's `properties ? 'bug_report'`
 //! condition dropped, the first test sees a marker for the claim authored by
 //! another path; with the undo's re-statement of 207's list dropped, the
 //! undo test names `epigraph_my_bug_reports` in the diff. The runbook test's
@@ -148,7 +153,7 @@ async fn labels_of(pool: &PgPool, claim: Uuid) -> Vec<String> {
         .expect("labels")
 }
 
-async fn list_as(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
+async fn list_rows(pool: &PgPool, agent: Uuid) -> Vec<epigraph_db::BugReportRow> {
     let viewer = Viewer::resolve(pool, agent).await.expect("resolve");
     let scoped = app(pool).await;
     let mut tx = scoped.begin_as(&viewer).await.expect("stamped");
@@ -156,7 +161,15 @@ async fn list_as(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
         .await
         .expect("list");
     tx.rollback().await.expect("rollback");
-    rows.into_iter().map(|r| r.claim_id).collect()
+    rows
+}
+
+async fn list_as(pool: &PgPool, agent: Uuid) -> Vec<Uuid> {
+    list_rows(pool, agent)
+        .await
+        .into_iter()
+        .map(|r| r.claim_id)
+        .collect()
 }
 
 #[sqlx::test(migrations = false)]
@@ -208,13 +221,18 @@ async fn the_272_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("an audit row naming a non-report");
-    // Triage moves the first report before the upgrade: 207's list loses it.
-    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
-        .bind(first.claim_id)
-        .bind(triaged)
-        .execute(&pool)
-        .await
-        .expect("triage moves a report");
+    // A private team adopts the first report before the upgrade and rewrites
+    // its title: 207's list loses it.
+    sqlx::query(
+        "UPDATE claims SET owner_group_id = $2, \
+                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"') \
+          WHERE id = $1",
+    )
+    .bind(first.claim_id)
+    .bind(triaged)
+    .execute(&pool)
+    .await
+    .expect("a private team adopts a report");
     assert_eq!(
         list_as(&pool, reporter).await,
         vec![second.claim_id],
@@ -253,11 +271,12 @@ async fn the_272_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
     assert_eq!(
         filed,
         vec![
-            (first.claim_id, Some("first".into()), plain.clone()),
+            (first.claim_id, None, plain.clone()),
             (second.claim_id, Some("second".into()), second_filed.clone()),
             (theirs.claim_id, Some("theirs".into()), plain),
         ],
-        "title and labels as filed, severity and component rebuilt from the audit row"
+        "title and labels as filed, severity and component rebuilt from the audit row; no \
+         title for the report another group already owned (its title is that group's now)"
     );
     assert_eq!(
         second_filed.len(),
@@ -268,6 +287,16 @@ async fn the_272_backfill_keeps_every_earlier_report_listed(pool: PgPool) {
         list_as(&pool, reporter).await,
         vec![second.claim_id, first.claim_id],
         "after 272 both reports are listed, the moved one included"
+    );
+    let moved = list_rows(&pool, reporter)
+        .await
+        .into_iter()
+        .find(|r| r.claim_id == first.claim_id)
+        .expect("the moved report is listed");
+    assert_eq!(
+        (moved.title, moved.resolved, moved.is_current),
+        (None, None, None),
+        "the moved report shows nothing its new owner wrote"
     );
     assert_eq!(list_as(&pool, other).await, vec![theirs.claim_id]);
 
@@ -382,9 +411,11 @@ async fn the_272_undo_returns_the_catalog_below_272(pool: PgPool) {
 
 /// A report filed on the OLD body after 272's backfill (a write definer call
 /// that started while 272 held its lock resumes on 211's body once 272
-/// commits) has no marker; `docs/runbooks/272-marker-backfill.sql` gives it
-/// the one the backfill would have, and a second run changes nothing. The
-/// runbook is 272's own backfill statement, verbatim.
+/// commits) has no marker, and is NOT listed, even while it is still in the
+/// intake group; `docs/runbooks/272-marker-backfill.sql` gives it the one the
+/// backfill would have, and a second run changes nothing. A second such report
+/// that a private team adopted and retitled before the runbook ran is marked
+/// with no title. The runbook is 272's own backfill statement, verbatim.
 #[sqlx::test(migrations = false)]
 async fn the_272_marker_backfill_runbook_marks_a_report_filed_without_one(pool: PgPool) {
     let runbook = repo_file("docs/runbooks/272-marker-backfill.sql");
@@ -413,6 +444,7 @@ async fn the_272_marker_backfill_runbook_marks_a_report_filed_without_one(pool: 
         .expect("arm");
 
     let raced = submit_as(&pool, reporter, "raced").await;
+    let adopted = submit_as(&pool, reporter, "adopted").await;
     let kept = submit_as(&pool, reporter, "kept").await;
     let written: (Uuid, Uuid, Option<String>, Vec<String>) = sqlx::query_as(
         "SELECT reporter_id, intake_group_id, title, filed_labels \
@@ -423,21 +455,27 @@ async fn the_272_marker_backfill_runbook_marks_a_report_filed_without_one(pool: 
     .await
     .expect("the write's marker");
     // What the old body leaves: the report and its audit row, no marker.
-    sqlx::query("DELETE FROM bug_report_intake_marks WHERE claim_id = $1")
-        .bind(raced.claim_id)
+    sqlx::query("DELETE FROM bug_report_intake_marks WHERE claim_id = ANY($1)")
+        .bind(vec![raced.claim_id, adopted.claim_id])
         .execute(&pool)
         .await
         .expect("as if filed on the old body");
-    sqlx::query("UPDATE claims SET owner_group_id = $2 WHERE id = $1")
-        .bind(raced.claim_id)
-        .bind(triaged)
-        .execute(&pool)
-        .await
-        .expect("triage moves it");
+    // One is adopted by a private team, which rewrites its title, before the
+    // runbook runs; the other is still in the intake group.
+    sqlx::query(
+        "UPDATE claims SET owner_group_id = $2, \
+                properties = jsonb_set(properties, '{bug_report,title}', '\"internal title\"') \
+          WHERE id = $1",
+    )
+    .bind(adopted.claim_id)
+    .bind(triaged)
+    .execute(&pool)
+    .await
+    .expect("a private team adopts it");
     assert_eq!(
         list_as(&pool, reporter).await,
         vec![kept.claim_id],
-        "CALIBRATION: a moved report with no marker is out of the list"
+        "CALIBRATION: a report with no marker is out of the list, in the intake group or not"
     );
 
     for run in ["first", "second"] {
@@ -447,8 +485,8 @@ async fn the_272_marker_backfill_runbook_marks_a_report_filed_without_one(pool: 
             .unwrap_or_else(|e| panic!("the {run} run of the runbook applies: {e}"));
         assert_eq!(
             list_as(&pool, reporter).await,
-            vec![kept.claim_id, raced.claim_id],
-            "after the {run} run the moved report is listed again"
+            vec![kept.claim_id, adopted.claim_id, raced.claim_id],
+            "after the {run} run both unmarked reports are listed"
         );
         let rebuilt: (Uuid, Uuid, Option<String>, Vec<String>) = sqlx::query_as(
             "SELECT reporter_id, intake_group_id, title, filed_labels \
@@ -459,10 +497,20 @@ async fn the_272_marker_backfill_runbook_marks_a_report_filed_without_one(pool: 
         .await
         .expect("the rebuilt marker");
         assert_eq!(rebuilt, written, "the marker the write would have written");
+        let adopted_title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM bug_report_intake_marks WHERE claim_id = $1")
+                .bind(adopted.claim_id)
+                .fetch_one(&pool)
+                .await
+                .expect("the adopted report's marker");
+        assert_eq!(
+            adopted_title, None,
+            "after the {run} run: no title copied from a claim another group owns"
+        );
         let n: i64 = sqlx::query_scalar("SELECT count(*) FROM bug_report_intake_marks")
             .fetch_one(&pool)
             .await
             .expect("count");
-        assert_eq!(n, 2, "after the {run} run: one marker per report, no more");
+        assert_eq!(n, 3, "after the {run} run: one marker per report, no more");
     }
 }
