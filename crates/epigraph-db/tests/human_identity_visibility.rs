@@ -1172,3 +1172,212 @@ async fn migration_273_setter_is_pinned_owned_and_granted(pool: PgPool) {
     assert!(app, "epigraph_app must EXECUTE the setter");
     assert!(!public, "PUBLIC must not EXECUTE the setter");
 }
+
+// ─── T10 / T7: provisioning as 'group' and the reset (migration 274) ──────
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
+fn below(version: i64) -> sqlx::migrate::Migrator {
+    sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATOR
+                .migrations
+                .iter()
+                .filter(|m| m.version < version)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    }
+}
+
+async fn migrate(pool: &PgPool, migrator: &sqlx::migrate::Migrator) -> Result<(), String> {
+    let mut conn = pool.acquire().await.expect("acquire");
+    let r = migrator.run(&mut *conn).await.map_err(|e| e.to_string());
+    sqlx::query("RESET ALL")
+        .execute(&mut *conn)
+        .await
+        .expect("RESET ALL");
+    r
+}
+
+/// The provisioning definer inserts a human principal as `'group'` (so the
+/// value is evidence of consent from the first token) and any other agent as
+/// `'public'`, as before. The ON CONFLICT re-find of a derived row is kept.
+#[sqlx::test(migrations = "../../migrations")]
+async fn provisioning_inserts_humans_as_group_and_others_as_public(pool: PgPool) {
+    for (agent_type, want) in [("human", "group"), ("software_agent", "public")] {
+        let key: Vec<u8> = Uuid::new_v4()
+            .as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(32)
+            .collect();
+        let id: Option<Uuid> =
+            sqlx::query_scalar("SELECT public.epigraph_provision_oauth_agent($1, $2, $3)")
+                .bind(&key)
+                .bind(format!("oauth:{agent_type}"))
+                .bind(agent_type)
+                .fetch_one(&pool)
+                .await
+                .expect("provision");
+        let id = id.expect("a fresh derived key provisions a row");
+        assert_eq!(profile_of(&pool, id).await, want, "{agent_type}");
+        let again: Option<Uuid> =
+            sqlx::query_scalar("SELECT public.epigraph_provision_oauth_agent($1, $2, $3)")
+                .bind(&key)
+                .bind("ignored on the re-find")
+                .bind(agent_type)
+                .fetch_one(&pool)
+                .await
+                .expect("re-find");
+        assert_eq!(
+            again,
+            Some(id),
+            "the ON CONFLICT re-find returns the same row"
+        );
+    }
+}
+
+/// Seed the reset's population on a database migrated below 274: a
+/// registered operator and a provider-client-only person on the column
+/// default (`'public'`), a human already on `'group'`, and a non-human on
+/// `'public'`.
+async fn seed_reset_population(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid) {
+    let (op, _) = named(pool, "Edda Registered").await;
+    fixture::make_human_operator(pool, op).await;
+    let (prov, _) = named(pool, "Finn Provider").await;
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id) \
+         VALUES ($1, 'Finn Provider', 'human', ARRAY['claims:write'], 'active', $2)",
+    )
+    .bind(format!("fixture-provider:{prov}"))
+    .bind(prov)
+    .execute(pool)
+    .await
+    .expect("provider client");
+    let (already, _) = named(pool, "Gita Already").await;
+    fixture::make_human_operator(pool, already).await;
+    set_profile(pool, already, "group").await;
+    let (svc, _) = named(pool, "Plain Software").await;
+    (op, prov, already, svc)
+}
+
+/// Production order: a human on `'public'` before 274 is `'group'` after,
+/// both kinds of evidence; a non-human is untouched; one summary audit row
+/// carries the pre-count, the rows moved and the post-count.
+#[sqlx::test(migrations = false)]
+async fn migration_274_resets_every_human_and_audits_the_counts(pool: PgPool) {
+    migrate(&pool, &below(274)).await.expect("migrate to 273");
+    let (op, prov, already, svc) = seed_reset_population(&pool).await;
+    for a in [op, prov, svc] {
+        assert_eq!(profile_of(&pool, a).await, "public", "PREMISE");
+    }
+    migrate(&pool, &MIGRATOR).await.expect("migrate to head");
+    for (a, want, who) in [
+        (op, "group", "registered operator"),
+        (prov, "group", "provider-client person"),
+        (already, "group", "already group"),
+        (svc, "public", "non-human"),
+    ] {
+        assert_eq!(profile_of(&pool, a).await, want, "{who}");
+    }
+    let audits: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = 'agent.profile_visibility_reset'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audits.len(), 1, "one summary row");
+    let d = &audits[0];
+    assert_eq!(d["migration"], 274);
+    assert_eq!(d["before"], 2, "two humans were public: {d}");
+    assert_eq!(d["rows"], 2, "{d}");
+    assert_eq!(d["after"], 0, "{d}");
+}
+
+/// Finding 11: an UPDATE that moves no row (a runner row security filters)
+/// must fail the migration, not leave every human reading as consented.
+/// Reproduced by a trigger that silently skips the reset's rows.
+#[sqlx::test(migrations = false)]
+async fn migration_274_refuses_when_the_reset_moves_nothing(pool: PgPool) {
+    migrate(&pool, &below(274)).await.expect("migrate to 273");
+    let (op, _, _, _) = seed_reset_population(&pool).await;
+    for stmt in [
+        "CREATE FUNCTION public.test_skip_profile_reset() RETURNS trigger \
+         LANGUAGE plpgsql SET search_path = pg_catalog, public, pg_temp AS $$ \
+         BEGIN IF NEW.profile_visibility IS DISTINCT FROM OLD.profile_visibility THEN \
+         RETURN NULL; END IF; RETURN NEW; END $$",
+        "CREATE TRIGGER test_skip_profile_reset BEFORE UPDATE ON public.agents \
+         FOR EACH ROW EXECUTE FUNCTION public.test_skip_profile_reset()",
+    ] {
+        sqlx::query(stmt).execute(&pool).await.expect(stmt);
+    }
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("a reset that moved nothing must refuse");
+    assert!(err.contains("PVR02"), "post-condition refusal: {err}");
+    assert_eq!(profile_of(&pool, op).await, "public", "rolled back whole");
+}
+
+/// The precondition: a provisioning definer whose body is not 077's is never
+/// overwritten blind.
+#[sqlx::test(migrations = false)]
+async fn migration_274_refuses_over_another_provision_body(pool: PgPool) {
+    migrate(&pool, &below(274)).await.expect("migrate to 273");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_provision_oauth_agent( \
+             p_public_key bytea, p_display_name text, p_agent_type text) \
+         RETURNS uuid LANGUAGE sql SECURITY DEFINER \
+         SET search_path = public, pg_temp AS $$ SELECT NULL::uuid $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("274 must refuse over another body");
+    assert!(err.contains("PVR01"), "precondition refusal: {err}");
+}
+
+/// Finding 14 (spec F4): the column default stays `'public'`, so a new path
+/// that inserts agents could create a human that reads as consented. The
+/// exact set of functions whose body inserts into `public.agents` is pinned:
+/// adding one is a visible change to this list, reviewed for whether it can
+/// create a human principal (it must then insert `'group'`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_functions_that_insert_agents_are_exactly_the_register(pool: PgPool) {
+    let found: Vec<String> = sqlx::query_scalar(
+        "SELECT p.oid::regprocedure::text FROM pg_proc p \
+           JOIN pg_namespace n ON n.oid = p.pronamespace \
+          WHERE n.nspname = 'public' \
+            AND p.prosrc ~* 'insert\\s+into\\s+(public\\.)?agents(\\s|\\()' \
+          ORDER BY 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("catalog");
+    assert_eq!(
+        found, AGENT_INSERTING_FUNCTIONS,
+        "functions that insert agents"
+    );
+}
+
+/// See [`the_functions_that_insert_agents_are_exactly_the_register`]. Only
+/// `epigraph_provision_oauth_agent` can create a human principal (it is the
+/// mint of every OAuth principal, and inserts `'group'` for a human).
+const AGENT_INSERTING_FUNCTIONS: &[&str] = &[
+    // 165 and later: a group role's agent node (`agent_type` role). Never a human
+    // principal: it has no human OAuth client and no registration.
+    "epigraph_define_group_role(text,text,uuid,text,boolean,text)",
+    "epigraph_define_group_role(text,text,uuid,text,text,text)",
+    // 077, re-stated by 274: the OAuth principal mint; a human is 'group'.
+    "epigraph_provision_oauth_agent(bytea,text,text)",
+    // 161 / 166: an LLM agent identity keyed on (model, prompt). Never a human
+    // principal: it is linked to one, it does not become one.
+    "epigraph_register_agent_identity(bytea,uuid,text,text,text,bytea,jsonb)",
+];

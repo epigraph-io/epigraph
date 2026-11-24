@@ -4525,6 +4525,22 @@ restart.
   (`app_role_table_lockdown.rs::agents_identity_columns_are_not_app_updatable`). Pinned by
   `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/273-undo.sql`.
   **Deploy order:** migrate BEFORE a binary with the MCP tool or the PUT field.
+- **274**: `human_profile_visibility_group` (spec section 10, M3). 062 defaulted
+  `agents.profile_visibility` to 'public' and nothing wrote it, so it was never consent; 272's
+  opt-in arm reads it as consent. Precondition PVR01 (55000): `epigraph_provision_oauth_agent`'s
+  body is still 077's (md5; 271 changed proconfig only). Re-states that definer to insert a
+  `p_agent_type = 'human'` principal as 'group' and any other as 'public' (same upsert, same
+  `key_kind = 'derived'` guard), moved to 172's form (it leaves `definer_search_path_ratchet`'s
+  PUBLIC_PATH_REGISTER; HIGH_WATER 191 -> 190); owner and ACL kept. Resets every human
+  principal (272's `epigraph_is_human_principal`) to 'group'; post-condition PVR02 (55000)
+  refuses when any is left, because `agents` is FORCE RLS and a non-superuser, non-maintenance
+  runner's UPDATE moves no row without an error. One `agent.profile_visibility_reset` row with
+  `{before, rows, after}`. The column default stays 'public'; the functions that insert agents
+  are pinned (`the_functions_that_insert_agents_are_exactly_the_register`). Pinned by
+  `epigraph-db/tests/human_identity_visibility.rs` (production order, the zero-row refusal, the
+  precondition). Undo: `docs/runbooks/274-undo.sql` restores 077's body; the reset stays.
+  **Deploy order:** none against the binaries; the reset takes row locks under
+  `lock_timeout = '3s'`.
 
 ## `-- no-transaction` migrations
 
