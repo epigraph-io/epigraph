@@ -1381,3 +1381,119 @@ const AGENT_INSERTING_FUNCTIONS: &[&str] = &[
     // principal: it is linked to one, it does not become one.
     "epigraph_register_agent_identity(bytea,uuid,text,text,text,bytea,jsonb)",
 ];
+
+// ─── part B: the Rust disclosure reader (spec 6.2) ───────────────────────
+
+/// `AgentDisclosureRepository::names` / `disclosure` on a stamped
+/// `epigraph_app` connection: an unnamed human reads as a nameless agent
+/// (`None`), a teammate gets the name (CALIBRATION), a named non-human is
+/// named to everyone, and an unknown id is absent rather than `None`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_rust_reader_names_exactly_what_the_session_may_see(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = human(&pool, "Petra Unseen").await;
+    let (mate, _) = named(&pool, "Petra Teammate").await;
+    let (outsider, _) = named(&pool, "Petra Outsider").await;
+    let (bot, _) = named(&pool, "Petra Service Bot").await;
+    keyed_team(&pool, &[h, mate]).await;
+    let ghost = Uuid::new_v4();
+
+    let read_names = |who: Uuid| {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        async move {
+            let v = viewer(&pool, who).await;
+            let mut read = scoped.read_as(&v).await.expect("read_as");
+            let names = epigraph_db::AgentDisclosureRepository::names(&mut read, &[h, bot, ghost])
+                .await
+                .expect("names");
+            let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[h, bot, ghost])
+                .await
+                .expect("disclosure");
+            (names, d)
+        }
+    };
+    let (names, d) = read_names(outsider).await;
+    assert_eq!(
+        names.get(&h),
+        Some(&None),
+        "unnamed human reads as nameless"
+    );
+    assert_eq!(
+        names.get(&bot),
+        Some(&Some("Petra Service Bot".to_string()))
+    );
+    assert!(!names.contains_key(&ghost), "an unknown id is absent");
+    assert_eq!(
+        d.get(&h).copied(),
+        Some(epigraph_db::Disclosure {
+            named: false,
+            details: false
+        })
+    );
+    let (names, d) = read_names(mate).await;
+    assert_eq!(
+        names.get(&h),
+        Some(&Some("Petra Unseen".to_string())),
+        "CALIBRATION: a teammate sees the name"
+    );
+    assert!(d[&h].named);
+}
+
+/// `names_for_audience` decides for the MAP's audience, never for the
+/// maintenance session that builds the document: the public map does not
+/// name an unnamed human even though the building session would; a team
+/// map whose team H belongs to does. The application role may not call it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_stored_documents_names_follow_its_audience_not_its_builder(pool: PgPool) {
+    use epigraph_db::repos::atlas_map::AtlasMap;
+    let (h, _) = human(&pool, "Quentin Mapped").await;
+    let (mate, _) = named(&pool, "Quentin Teammate").await;
+    let team = keyed_team(&pool, &[h, mate]).await;
+    let (public, for_team, builder) =
+        fixture::as_role(&pool, "epigraph_maintenance", |mut conn| async move {
+            let public = epigraph_db::AgentDisclosureRepository::names_for_audience(
+                &mut conn,
+                &[h],
+                AtlasMap::Public,
+            )
+            .await
+            .expect("public audience");
+            let for_team = epigraph_db::AgentDisclosureRepository::names_for_audience(
+                &mut conn,
+                &[h],
+                AtlasMap::Team(team),
+            )
+            .await
+            .expect("team audience");
+            let builder = epigraph_db::AgentDisclosureRepository::names(&mut conn, &[h])
+                .await
+                .expect("builder session");
+            (conn, (public, for_team, builder))
+        })
+        .await;
+    assert_eq!(public.get(&h), Some(&None), "the public map's audience");
+    assert_eq!(
+        for_team.get(&h),
+        Some(&Some("Quentin Mapped".to_string())),
+        "the team map's audience shares H's team"
+    );
+    assert_eq!(
+        builder.get(&h),
+        Some(&Some("Quentin Mapped".to_string())),
+        "CALIBRATION: the building session itself is privileged, which is why it is never the audience"
+    );
+    let scoped = app_pool(&pool).await;
+    let v = viewer(&pool, mate).await;
+    let mut read = scoped.read_as(&v).await.expect("read_as");
+    let refused = epigraph_db::AgentDisclosureRepository::names_for_audience(
+        &mut read,
+        &[h],
+        AtlasMap::Public,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "the application role must not ask about an arbitrary audience"
+    );
+}

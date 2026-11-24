@@ -2006,6 +2006,28 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          is spent on the stamp.",
     ),
     (
+        "agent_disclosure.rs",
+        "disclosure",
+        "untenanted `agents` (077 `agents_identity` USING (true)); the decision is migration \
+         272's `epigraph_agent_disclosure`, which reads the STAMPED session (principal, groups, \
+         bypass, elevation) as its audience. A viewer argument would only invite a call on a \
+         connection stamped from someone else; an unstamped call is the anonymous outsider.",
+    ),
+    (
+        "agent_disclosure.rs",
+        "names",
+        "untenanted `agents`; the name leaves the database only through `CASE WHEN d.named`, \
+         decided by migration 272's `epigraph_agent_disclosure` on the STAMPED session. The \
+         one output reader of another agent's `display_name`; an unstamped call hides more.",
+    ),
+    (
+        "agent_disclosure.rs",
+        "names_for_audience",
+        "untenanted `agents`; for a stored Atlas document the audience is the MAP's (the public \
+         outsider, or one team's members), passed to 272's explicit-audience core, which only \
+         the maintenance session the builder holds may EXECUTE. Never the building session.",
+    ),
+    (
         "agent.rs",
         "set_profile_visibility_conn",
         "WRITE through 273's definer `epigraph_set_profile_visibility` on a STAMPED \

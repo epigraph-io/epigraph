@@ -95,6 +95,9 @@ pub use repos::PolicyRepository;
 pub use repos::SpeaksFor;
 pub use repos::{admin_act, AdminActRepository, AdminActRow};
 pub use repos::{
+    agent_disclosure, disclosure_lateral_sql, redact_agent, AgentDisclosureRepository, Disclosure,
+};
+pub use repos::{
     agent_identity, AgentIdentityRepository, IdentityRegistered, IdentityRegistration, PromptBlob,
     PromptBlobRead, PromptFile, PromptHistoryCursor, PromptHistoryEntry, PromptHistoryIndexEntry,
     PromptHistoryPage, PromptSnapshot, PromptSnapshotIndex, PROMPT_HISTORY_PAGE_MAX,
