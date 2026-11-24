@@ -684,6 +684,10 @@ pub async fn night_for_map(
                 Ok(doc) => {
                     let computed: BTreeMap<Uuid, ResultTheme> =
                         doc.themes.into_iter().map(|t| (t.theme_id, t)).collect();
+                    // Only `unbuilt` was needed from the first build: free it
+                    // before the second, so two whole-map builds are never
+                    // held at once.
+                    drop(b);
                     let Some(again) =
                         read_and_build(conn, viewer, map, opts.cap, &computed).await?
                     else {
