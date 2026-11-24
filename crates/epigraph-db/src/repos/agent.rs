@@ -425,6 +425,12 @@ pub fn provider_asserted_person_name(
     if name.is_empty() || name.chars().count() > DISPLAY_NAME_MAX_CHARS || name.contains('@') {
         return None;
     }
+    // Defence in depth, kept on purpose: while the '@' arm above stands, every
+    // email address is refused there first, so no test can tell this arm
+    // apart (review finding tests#6, an equivalent mutant). It still refuses
+    // the contact address if that arm is ever relaxed (for a name that
+    // legitimately contains '@'), so the brief's "never copy an email into
+    // display_name" does not rest on one check.
     if legal_contact_email.is_some_and(|e| e.trim().eq_ignore_ascii_case(&name)) {
         return None;
     }
