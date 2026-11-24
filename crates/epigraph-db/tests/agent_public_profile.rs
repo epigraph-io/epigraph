@@ -315,17 +315,32 @@ async fn a_bypass_viewer_sees_everything(pool_opts: PgPoolOptions, conn_opts: Pg
 
     let subject = seed_agent(&pool, "group").await;
 
-    // A maintenance (here: superuser) session is the privileged arm of
-    // migration 272's rule, decided on the session itself.
+    // A maintenance session is the privileged arm of migration 272's rule,
+    // decided on the session itself. The harness login is a superuser, so the
+    // read switches the session to the real `epigraph_maintenance` role
+    // first (review finding tests#8: on the superuser it proved only the
+    // superuser arm).
     let (mut conn, _lease) = scoped
         .unscoped_for_maintenance(SystemReason::SchemaContractTest)
         .await
         .expect("unscoped_for_maintenance");
-
+    sqlx::query("SET SESSION AUTHORIZATION epigraph_maintenance")
+        .execute(&mut *conn)
+        .await
+        .expect("as epigraph_maintenance");
+    let who: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("session_user");
     let profile = AgentRepository::get_public_profile(&mut *conn, subject)
         .await
         .expect("get_public_profile")
         .expect("the agent exists");
+    sqlx::query("RESET SESSION AUTHORIZATION")
+        .execute(&mut *conn)
+        .await
+        .expect("reset");
+    assert_eq!(who, "epigraph_maintenance", "CALIBRATION: the real role");
 
     assert!(
         profile.properties.is_some(),
