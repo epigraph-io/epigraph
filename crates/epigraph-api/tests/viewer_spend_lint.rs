@@ -1023,10 +1023,9 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "abort_plan",
         &[
             "Connection::begin",
-            "PrivatizationRepository::record_plan_audit_conn",
-            "PrivatizationRepository::transition_plan_conn",
             "lifecycle_served",
             "maintenance",
+            "privatization::abort_plan_conn",
             "record_custodial_act",
             "require_plan_authority",
         ],
