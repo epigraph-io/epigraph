@@ -4541,6 +4541,12 @@ restart.
   precondition). Undo: `docs/runbooks/274-undo.sql` restores 077's body; the reset stays.
   **Deploy order:** none against the binaries; the reset takes row locks under
   `lock_timeout = '3s'`.
+- **275**, **276**: `idx_claims_public_by_agent (agent_id) WHERE visibility = 'public'` and
+  `idx_claims_group_by_agent (agent_id, owner_group_id) WHERE visibility <> 'public'`, each a
+  single-statement `-- no-transaction` `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. The probes of
+  272's public-claim and readable-claim arms, one per agent ever bound to a human. Registered
+  in `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked). A failed build leaves
+  an INVALID index that IF NOT EXISTS skips: `DROP INDEX CONCURRENTLY`, then re-apply.
 
 ## `-- no-transaction` migrations
 

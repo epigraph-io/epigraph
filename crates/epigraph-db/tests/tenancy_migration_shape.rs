@@ -48,6 +48,16 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "196_idx_claims_theme_current_tenancy.sql",
         "idx_claims_theme_current_tenancy",
     ),
+    // The two partial indexes 272's claim arms probe per bound agent
+    // (human-identity visibility spec, section 11).
+    (
+        "275_idx_claims_public_by_agent.sql",
+        "idx_claims_public_by_agent",
+    ),
+    (
+        "276_idx_claims_group_by_agent.sql",
+        "idx_claims_group_by_agent",
+    ),
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -208,16 +218,61 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
     }
 
     // Reachable: an explicit `visibility = 'group'` qual.
+    //
+    // 276's `idx_claims_group_by_agent (agent_id, owner_group_id) WHERE
+    // visibility <> 'public'` shares this predicate, so on an EMPTY table (all
+    // costs near zero) the planner may pick it through a skip scan on its
+    // second column, which says nothing about whether idx_claims_group_current
+    // is a candidate. It is hidden inside a rolled-back transaction for this
+    // one EXPLAIN, so the assertion keeps testing what it was written for.
+    sqlx::query("BEGIN")
+        .execute(&mut *conn)
+        .await
+        .expect("begin");
+    sqlx::query("DROP INDEX idx_claims_group_by_agent")
+        .execute(&mut *conn)
+        .await
+        .expect("hide 276's index for this EXPLAIN");
     let plan = explain(
         &mut conn,
         "SELECT id FROM claims WHERE visibility = 'group' \
            AND owner_group_id = '00000000-0000-0000-0000-00000000beef'::uuid",
     )
     .await;
+    sqlx::query("ROLLBACK")
+        .execute(&mut *conn)
+        .await
+        .expect("rollback");
     assert!(
         plan.contains("idx_claims_group_current"),
         "an explicit `visibility = 'group'` qual must reach idx_claims_group_current \
          (this is the D4/PR-18 shape the index exists for). Plan:\n{plan}"
+    );
+
+    // 272's per-bound-agent probes reach 275's and 276's indexes.
+    let plan = explain(
+        &mut conn,
+        "SELECT 1 FROM claims c \
+          WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+            AND c.visibility = 'public' LIMIT 1",
+    )
+    .await;
+    assert!(
+        plan.contains("idx_claims_public_by_agent"),
+        "272's public-claim probe must reach idx_claims_public_by_agent. Plan:\n{plan}"
+    );
+    let plan = explain(
+        &mut conn,
+        "SELECT 1 FROM claims c \
+          WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+            AND c.visibility <> 'public' \
+            AND c.owner_group_id = ANY(ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]) \
+          LIMIT 1",
+    )
+    .await;
+    assert!(
+        plan.contains("idx_claims_group_by_agent"),
+        "272's readable-claim probe must reach idx_claims_group_by_agent. Plan:\n{plan}"
     );
 
     // Also reachable from the `<>` spelling, which `= 'group'` does not admit.
