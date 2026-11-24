@@ -356,14 +356,30 @@ async fn a_stranded_plan_is_aborted_and_reverted_by_the_operator_and_the_drain_e
     );
 }
 
+/// The `purge-sealed-centroids` audit rows, their `details`.
+async fn purge_events(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar(
+        "SELECT details FROM security_events WHERE event_type = $1 ORDER BY created_at",
+    )
+    .bind(epigraph_cli::operator::privatization::PURGE_EVENT)
+    .fetch_all(pool)
+    .await
+    .expect("read the purge audit rows")
+}
+
+const REASON: &str = "clear centroids an earlier seal left";
+
 /// `purge-sealed-centroids` (backlog 06cdffaa's one-off pass, for clusters
 /// a seal emptied before the seal cleared their centroids): without
 /// `--apply` it only lists, and it does so on the maintenance login; on that
 /// login `--apply` is refused by the missing DELETE grant and writes nothing;
-/// as the table owner it deletes exactly the listed row.
+/// a blank `--reason` is refused; as the table owner it deletes exactly the
+/// listed row and writes one audit row naming it and the reason.
 ///
 /// Verified to fail: with the dry run routed to the delete, the row is gone
-/// after the first run (and the maintenance login's run fails on the grant).
+/// after the first run (and the maintenance login's run fails on the grant);
+/// with the audit row's write removed, no `operator.sealed_centroids_purged`
+/// row exists after the applied run.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(pool: PgPool) {
     let world = fx::World::seed(&pool).await;
@@ -407,7 +423,15 @@ async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(
     };
 
     let maint = maintenance_login(&pool).await;
-    let listed = operator(&["privatization", "purge-sealed-centroids"], &maint);
+    let listed = operator(
+        &[
+            "privatization",
+            "purge-sealed-centroids",
+            "--reason",
+            REASON,
+        ],
+        &maint,
+    );
     assert_eq!(listed.code, 0, "{}", listed.show());
     assert!(
         listed
@@ -424,7 +448,13 @@ async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(
     assert_eq!(clusters().await, vec![0, 1], "a dry run deletes nothing");
 
     let refused = operator(
-        &["privatization", "purge-sealed-centroids", "--apply"],
+        &[
+            "privatization",
+            "purge-sealed-centroids",
+            "--reason",
+            REASON,
+            "--apply",
+        ],
         &maint,
     );
     assert_eq!(refused.code, 1, "{}", refused.show());
@@ -436,10 +466,38 @@ async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(
         refused.show()
     );
     assert_eq!(clusters().await, vec![0, 1]);
+    assert!(
+        purge_events(&pool).await.is_empty(),
+        "a dry run and a refused run write no audit row"
+    );
 
     let owner = viewer_fixture::database_url_for(&pool).await;
+    let blank = operator(
+        &[
+            "privatization",
+            "purge-sealed-centroids",
+            "--reason",
+            "  ",
+            "--apply",
+        ],
+        &owner,
+    );
+    assert_eq!(blank.code, 1, "{}", blank.show());
+    assert!(blank.stderr.contains("--reason"), "{}", blank.show());
+    assert_eq!(
+        clusters().await,
+        vec![0, 1],
+        "a blank reason deletes nothing"
+    );
+
     let deleted = operator(
-        &["privatization", "purge-sealed-centroids", "--apply"],
+        &[
+            "privatization",
+            "purge-sealed-centroids",
+            "--reason",
+            REASON,
+            "--apply",
+        ],
         &owner,
     );
     assert_eq!(deleted.code, 0, "{}", deleted.show());
@@ -449,6 +507,15 @@ async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(
         vec![1],
         "only the sealed-only cluster's row goes"
     );
+    let events = purge_events(&pool).await;
+    assert_eq!(events.len(), 1, "one audit row per applied run: {events:?}");
+    assert_eq!(events[0]["reason"], REASON);
+    assert_eq!(events[0]["deleted_count"], 1);
+    assert_eq!(
+        events[0]["deleted"][0]["cluster_run_id"],
+        run_id.to_string()
+    );
+    assert_eq!(events[0]["deleted"][0]["cluster_id"], 0);
 }
 
 /// The revert verb's thresholds are the route's (`instance_authz`), which

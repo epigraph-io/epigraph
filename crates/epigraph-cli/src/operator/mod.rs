@@ -156,9 +156,10 @@
 //!   is aborted. Abort needs the live custodian assignment; revert also needs
 //!   the route's target-group conditions (admin of the group, maturity,
 //!   plurality).
-//! * `privatization purge-sealed-centroids` — list (or, as the table owner
-//!   with `--apply`, delete) the cluster centroids of clusters whose members
-//!   are all sealed, left by a seal before the seal cleared them.
+//! * `privatization purge-sealed-centroids --reason TEXT` — list (or, as the
+//!   table owner with `--apply`, delete and audit) the cluster centroids of
+//!   clusters whose members are all sealed, left by a seal before the seal
+//!   cleared them.
 //!
 //! It follows the `retire_match_candidates` precedent: production graph writes
 //! go through reviewed code, not ad-hoc SQL, and the operator runs it, never an

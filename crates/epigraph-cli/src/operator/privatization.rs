@@ -64,6 +64,7 @@
 
 use anyhow::Context;
 use epigraph_db::repos::privatization::{PlanRow, PrivatizationRepository};
+use epigraph_db::{SecurityEventRepository, SecurityEventRow};
 use epigraph_jobs::privatization::{self as lifecycle, DispatchKind};
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -372,21 +373,31 @@ pub async fn revert(
     })
 }
 
+/// The `security_events.event_type` of an applied centroid pass.
+pub const PURGE_EVENT: &str = "operator.sealed_centroids_purged";
+
 /// The one-off pass of backlog 06cdffaa: the `cluster_centroids` rows whose
 /// clusters' members are all sealed, which a seal before the seal cleared
 /// clusters left. A dry run only READS (it needs no DELETE grant); `apply`
-/// deletes them in one transaction and returns what it deleted.
+/// deletes them and writes one [`PURGE_EVENT`] `security_events` row naming
+/// the deleted `(run, cluster)` pairs, the operator's origin and `reason`, in
+/// one transaction, and returns what it deleted.
 ///
 /// `--apply` needs DELETE on `cluster_centroids`, which migration 070 does not
 /// grant `epigraph_maintenance`; on such a login it fails with `42501` and
 /// writes nothing. Run it as the table owner, as the seal itself runs.
 ///
 /// # Errors
-/// A statement failed (including the missing grant); nothing is written.
+/// A blank `reason` (before any statement), or a statement failed (including
+/// the missing grant); nothing is written.
 pub async fn purge_sealed_centroids(
     conn: &mut PgConnection,
     apply: bool,
+    reason: &str,
 ) -> anyhow::Result<Vec<(Uuid, i32)>> {
+    if reason.trim().is_empty() {
+        anyhow::bail!("--reason must say why (it is recorded in the audit row); nothing was done");
+    }
     if !apply {
         return Ok(PrivatizationRepository::sealed_only_cluster_centroids_conn(conn, None).await?);
     }
@@ -397,6 +408,33 @@ pub async fn purge_sealed_centroids(
             "deleting cluster_centroids rows (a 42501 means this login holds no DELETE on \
                  cluster_centroids: run --apply as the table owner)",
         )?;
+    let details = serde_json::json!({
+        "command": "privatization purge-sealed-centroids",
+        "operator": super::restrict::operator_details(&mut tx).await?,
+        "deleted_count": deleted.len(),
+        "deleted": deleted.iter().map(|(run, cluster)| serde_json::json!({
+            "cluster_run_id": run,
+            "cluster_id": cluster,
+        })).collect::<Vec<_>>(),
+        "reason": reason,
+    });
+    let (client_addr, _) = SecurityEventRepository::connection_origin_conn(&mut tx).await?;
+    SecurityEventRepository::log_conn(
+        &mut tx,
+        &SecurityEventRow {
+            id: Uuid::new_v4(),
+            event_type: PURGE_EVENT.to_string(),
+            agent_id: None,
+            success: Some(true),
+            details,
+            ip_address: client_addr,
+            user_agent: None,
+            correlation_id: None,
+            created_at: chrono::Utc::now(),
+        },
+    )
+    .await
+    .context("writing the audit row")?;
     tx.commit().await.context("commit")?;
     Ok(deleted)
 }

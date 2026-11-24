@@ -145,8 +145,7 @@
 //!         --reason TEXT [--apply]
 //!     epigraph-operator privatization revert --plan <uuid> --actor <uuid> --assignment <uuid> \
 //!         --reason TEXT [--apply --plan-digest b3:<hex>]
-//!     epigraph-operator privatization purge-sealed-centroids [--apply]
-//!     epigraph-operator privatization purge-sealed-centroids [--apply]
+//!     epigraph-operator privatization purge-sealed-centroids --reason TEXT [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
@@ -1556,8 +1555,12 @@ enum PrivatizationAction {
     /// List (or, with `--apply`, delete) the `cluster_centroids` rows of
     /// clusters whose members are all sealed. `--apply` needs DELETE on
     /// `cluster_centroids`, which the maintenance role is not granted: run it
-    /// as the table owner.
+    /// as the table owner. An applied run writes one
+    /// `operator.sealed_centroids_purged` audit row.
     PurgeSealedCentroids {
+        /// Why; recorded in the audit row.
+        #[arg(long)]
+        reason: String,
         /// Delete them. Without it, they are only listed.
         #[arg(long)]
         apply: bool,
@@ -2662,73 +2665,73 @@ async fn main_inner() -> anyhow::Result<i32> {
             }
             Ok(outcome.exit_code())
         }
-        Command::Privatization { action } => {
-            match action {
-                PrivatizationAction::Abort { plan } | PrivatizationAction::Revert { plan, .. }
-                    if plan.reason.trim().is_empty() =>
-                {
-                    anyhow::bail!("--reason must not be blank (plan {})", plan.plan)
-                }
-                PrivatizationAction::Abort { plan } => {
-                    let actor = privatization::Actor {
-                        agent: plan.actor,
-                        assignment: plan.assignment,
-                        reason: plan.reason,
-                    };
-                    let outcome =
-                        privatization::abort(&mut conn, plan.plan, &actor, plan.apply).await?;
-                    println!(
-                        "{}",
-                        privatization::describe(plan.plan, &outcome, plan.apply)
-                    );
-                    if !plan.apply && matches!(outcome, privatization::Outcome::Aborted { .. }) {
-                        println!("DRY RUN: the abort, its audit row and the custodial act were rolled back.");
-                    }
-                    Ok(outcome.exit_code())
-                }
-                PrivatizationAction::Revert { plan, plan_digest } => {
-                    let actor = privatization::Actor {
-                        agent: plan.actor,
-                        assignment: plan.assignment,
-                        reason: plan.reason,
-                    };
-                    let outcome = privatization::revert(
-                        &mut conn,
-                        plan.plan,
-                        &actor,
-                        plan_digest.as_deref(),
-                        plan.apply,
-                    )
-                    .await?;
-                    println!(
-                        "{}",
-                        privatization::describe(plan.plan, &outcome, plan.apply)
-                    );
-                    if !plan.apply && outcome.exit_code() == 0 {
-                        println!(
-                            "DRY RUN: the dispatch event, the state flip, the audit row, the job \
-                             and the custodial act were rolled back."
-                        );
-                    }
-                    Ok(outcome.exit_code())
-                }
-                PrivatizationAction::PurgeSealedCentroids { apply } => {
-                    let rows = privatization::purge_sealed_centroids(&mut conn, apply).await?;
-                    for (run, cluster) in &rows {
-                        println!(
-                            "{}SEALED-ONLY-CENTROID\trun={run}\tcluster={cluster}",
-                            if apply { "DELETED " } else { "" }
-                        );
-                    }
-                    println!(
-                        "{} {} cluster centroid row(s) whose members are all sealed",
-                        if apply { "deleted" } else { "DRY RUN: found" },
-                        rows.len()
-                    );
-                    Ok(0)
-                }
+        Command::Privatization { action } => match action {
+            PrivatizationAction::Abort { plan } | PrivatizationAction::Revert { plan, .. }
+                if plan.reason.trim().is_empty() =>
+            {
+                anyhow::bail!("--reason must not be blank (plan {})", plan.plan)
             }
-        }
+            PrivatizationAction::Abort { plan } => {
+                let actor = privatization::Actor {
+                    agent: plan.actor,
+                    assignment: plan.assignment,
+                    reason: plan.reason,
+                };
+                let outcome =
+                    privatization::abort(&mut conn, plan.plan, &actor, plan.apply).await?;
+                println!(
+                    "{}",
+                    privatization::describe(plan.plan, &outcome, plan.apply)
+                );
+                if !plan.apply && matches!(outcome, privatization::Outcome::Aborted { .. }) {
+                    println!(
+                        "DRY RUN: the abort, its audit row and the custodial act were rolled back."
+                    );
+                }
+                Ok(outcome.exit_code())
+            }
+            PrivatizationAction::Revert { plan, plan_digest } => {
+                let actor = privatization::Actor {
+                    agent: plan.actor,
+                    assignment: plan.assignment,
+                    reason: plan.reason,
+                };
+                let outcome = privatization::revert(
+                    &mut conn,
+                    plan.plan,
+                    &actor,
+                    plan_digest.as_deref(),
+                    plan.apply,
+                )
+                .await?;
+                println!(
+                    "{}",
+                    privatization::describe(plan.plan, &outcome, plan.apply)
+                );
+                if !plan.apply && outcome.exit_code() == 0 {
+                    println!(
+                        "DRY RUN: the dispatch event, the state flip, the audit row, the job \
+                             and the custodial act were rolled back."
+                    );
+                }
+                Ok(outcome.exit_code())
+            }
+            PrivatizationAction::PurgeSealedCentroids { reason, apply } => {
+                let rows = privatization::purge_sealed_centroids(&mut conn, apply, &reason).await?;
+                for (run, cluster) in &rows {
+                    println!(
+                        "{}SEALED-ONLY-CENTROID\trun={run}\tcluster={cluster}",
+                        if apply { "DELETED " } else { "" }
+                    );
+                }
+                println!(
+                    "{} {} cluster centroid row(s) whose members are all sealed",
+                    if apply { "deleted" } else { "DRY RUN: found" },
+                    rows.len()
+                );
+                Ok(0)
+            }
+        },
         Command::RetireLink {
             agent,
             reason,
