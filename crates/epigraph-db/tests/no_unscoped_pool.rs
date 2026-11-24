@@ -860,7 +860,11 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// every write on ONE transaction from the caller's `AppState::write_as`
 /// instead of `state.db_pool.begin()` (`routes/hypothesis.rs` 6 -> 2). No
 /// file reached zero.
-const HIGH_WATER: usize = 165;
+/// 165 -> 164 (backlog 7c2a0b36): `patch_claim`'s non-admin branch runs on
+/// the caller's `AppState::write_as` transaction instead of
+/// `state.db_pool.begin()`, as its admin branch already did
+/// (`routes/claims.rs` 16 -> 15). No file reached zero.
+const HIGH_WATER: usize = 164;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -990,7 +994,10 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 17 -> 16 (backlog 4073bbb6): `patch_claim`'s ownership read moved off
     // `state.db_pool` onto `AppState::read_as` (`ClaimRepository::write_target_of`
     // through the caller's viewer), as `update_labels`'s did in batch H6.
-    ("routes/claims.rs", 16),
+    // 16 -> 15 (backlog 7c2a0b36): `patch_claim`'s non-admin write moved off
+    // `state.db_pool.begin()` onto `AppState::write_as`, the transaction its
+    // admin branch already used.
+    ("routes/claims.rs", 15),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,
