@@ -754,6 +754,11 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   (§11.1, after review). Same signature, owner, ACL, COST and path. Undo:
   `docs/runbooks/279-undo.sql` (277's body).
 
+- **M9 `280_human_evidence_guard_agent_id.sql`** (after review, correctness#5,
+  transactional): HEV01 also refuses re-pointing or unlinking a LINKED human client's
+  `agent_id` (the trigger watches `UPDATE OF client_type, agent_id`); the first link of an
+  unlinked client stays allowed. Undo: `docs/runbooks/280-undo.sql`.
+
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
 §11 run measures insert cost.
@@ -1294,7 +1299,7 @@ silently changed.
   `pending_authored_papers` count is served as computed, as for N. Zeroing it rested on a
   false premise (only a registered person can be named pending) and created a marker.
 - **B17.** The human-evidence row is pinned by a trigger (HEV01, §6.1) rather than only by a
-  ratchet test.
+  ratchet test. After review (correctness#5, migration 280) the pin covers `agent_id` too.
 - **B18.** One evidence helper, `epigraph_is_human_principal`, shared by the rule, the reset
   and the setter.
 - **B19.** The setter has no search_path write window (271 pinned every trigger's path) and

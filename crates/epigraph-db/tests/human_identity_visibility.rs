@@ -808,6 +808,29 @@ async fn the_human_evidence_row_cannot_be_deleted_or_retyped(pool: PgPool) {
         .expect_err("a linked human client must not change type")
         .to_string();
     assert!(msg.contains("HEV01"), "refusal names HEV01: {msg}");
+    // Migration 280 (review finding correctness#5): re-pointing or unlinking
+    // the agent removes the old agent's evidence just as a retype does, and
+    // would name it to everyone (the fail-open direction).
+    let (other, _) = named(&pool, "Rosa Elsewhere").await;
+    for (stmt, what) in [
+        (
+            "UPDATE oauth_clients SET agent_id = $2 WHERE id = $1",
+            "re-point",
+        ),
+        (
+            "UPDATE oauth_clients SET agent_id = NULL WHERE id = $1 AND $2::uuid IS NOT NULL",
+            "unlink",
+        ),
+    ] {
+        let msg = sqlx::query(stmt)
+            .bind(client)
+            .bind(other)
+            .execute(&pool)
+            .await
+            .expect_err(what)
+            .to_string();
+        assert!(msg.contains("HEV01"), "{what}: refusal names HEV01: {msg}");
+    }
 
     // An unlinked human client, and a linked service client, are unaffected.
     let unlinked: Uuid = sqlx::query_scalar(
@@ -826,6 +849,22 @@ async fn the_human_evidence_row_cannot_be_deleted_or_retyped(pool: PgPool) {
     .execute(&pool)
     .await
     .expect("an unlinked client may be retyped");
+    // CALIBRATION for 280: the first link of an unlinked human client (what
+    // `epigraph_oauth_client_link_agent` does) stays allowed.
+    let fresh: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, status) \
+         VALUES ($1, 'fresh', 'human', ARRAY['claims:read'], 'active') RETURNING id",
+    )
+    .bind(format!("fresh-{}", Uuid::new_v4()))
+    .fetch_one(&pool)
+    .await
+    .expect("fresh human client");
+    sqlx::query("UPDATE oauth_clients SET agent_id = $2 WHERE id = $1 AND agent_id IS NULL")
+        .bind(fresh)
+        .bind(other)
+        .execute(&pool)
+        .await
+        .expect("an unlinked human client may be linked");
     let n = sqlx::query("DELETE FROM oauth_clients WHERE id = $1")
         .bind(unlinked)
         .execute(&pool)
