@@ -4503,8 +4503,16 @@ restart.
   `epigraph-db/tests/membership_planner_estimates.rs` (the body's generic-plan cost on the
   seeded shape is under 100000; the catalog estimate is 1 and `operator_links` is still keyed
   on `agent_id`); both fail below 275. Undo: `docs/runbooks/275-undo.sql`. **Deploy order:**
-  none against the binaries; apply whenever. After it, a database running `jit = off` as a
-  mitigation can turn JIT back on once `EXPLAIN` of the body shows a cost under 100000.
+  none against the binaries; apply whenever. 275 lowers the estimate but does not by itself
+  clear a database-wide `jit = off` mitigation: the body's cost after 275 still grows linearly
+  with the live role bindings (315k at 300 bindings on the test shape), and the calling query
+  or another body in the chain can still cross the threshold. Before turning JIT back on, in
+  order: (1) `EXPLAIN (GENERIC_PLAN)` the role-derived body on the target database, as the
+  test does (independent of the `jit` setting); (2) in one maintenance or superuser session
+  (236 answers `epigraph_live_memberships` only for the session principal, maintenance or a
+  superuser), time `SELECT * FROM public.epigraph_live_memberships('<agent>')` once with
+  `SET jit = on` and once with `SET jit = off`; (3) reset the database-wide `jit = off` only
+  when the call with JIT on takes under 50 ms.
 
 ## `-- no-transaction` migrations
 

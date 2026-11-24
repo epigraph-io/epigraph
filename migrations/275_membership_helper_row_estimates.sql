@@ -1,5 +1,8 @@
--- 275: `epigraph_operator_actor` declares `ROWS 1`, so the membership resolve
--- plans under `jit_above_cost` (backlog 8377cf18).
+-- 275: `epigraph_operator_actor` declares `ROWS 1`, cutting the planner's
+-- estimate for the membership resolve by the candidate ratio (backlog
+-- 8377cf18). It brings the role-derived body under `jit_above_cost` on the
+-- tested shape, but the margin shrinks as live role bindings grow; see
+-- DEPLOY below before lifting a `jit = off` mitigation.
 --
 -- EVIDENCE
 -- `epigraph_live_memberships(agent)` (236) reads
@@ -53,6 +56,22 @@
 -- database where it does not. A LOWER-numbered migration that re-states it
 -- and is applied after 275 in production would reset it unseen by a
 -- version-ordered test database.
+--
+-- DEPLOY
+-- No order against the binaries. 275 alone does not prove that a database
+-- running `jit = off` can turn JIT back on: the body's cost after 275 still
+-- grows linearly with live role bindings (315k at 300 bindings on the test
+-- shape, above 100000), and the calling query or another body in the chain
+-- can cross the threshold too. Before resetting `jit = off`, in order:
+--   1. `EXPLAIN (GENERIC_PLAN)` the role-derived body on that database, as
+--      the test does (this does not depend on the `jit` setting);
+--   2. in one maintenance or superuser session (236 answers
+--      `epigraph_live_memberships` only for the session principal,
+--      maintenance or a superuser), time
+--      `SELECT * FROM public.epigraph_live_memberships('<agent>')` with
+--      `SET jit = on` and again with `SET jit = off`;
+--   3. reset the database-wide `jit = off` only when the call with JIT on
+--      takes under 50 ms.
 --
 -- UNDO: `docs/runbooks/275-undo.sql` (back to the default `ROWS 1000`).
 SET LOCAL lock_timeout = '3s';
