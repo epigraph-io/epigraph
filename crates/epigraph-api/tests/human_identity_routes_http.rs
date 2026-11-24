@@ -440,3 +440,55 @@ async fn a_graph_query_cannot_match_an_unnamed_humans_profile(pool: PgPool) {
         );
     }
 }
+
+/// Row H2: the graph builder (`load_subgraph_conn`, behind
+/// `POST /api/v1/graph/query` and `graph_full`) gives an unnamed human's
+/// node no `display_name` and the `id[..8]` label a nameless agent gets; a
+/// teammate sees the name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, n) = h_and_n(&pool, "Ottilie Graphed").await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "teammate").await;
+    team_of(&pool, &[h, mate]).await;
+    let node = |who: Uuid, id: Uuid| {
+        let state = state.clone();
+        async move {
+            let (st, body) = call(
+                &state,
+                who,
+                Method::POST,
+                "/api/v1/graph/query",
+                &["claims:read"],
+                Some(serde_json::json!({ "query": "MATCH (a:agent) RETURN * LIMIT 200" })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            let n = body["nodes"]
+                .as_array()
+                .expect("nodes")
+                .iter()
+                .find(|x| x["id"] == id.to_string())
+                .cloned()
+                .unwrap_or_else(|| panic!("{id} in the graph: {body}"));
+            (
+                n["display_name"].clone(),
+                n["label"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .replace(&id.to_string()[..8], "<id>"),
+            )
+        }
+    };
+    assert_eq!(
+        node(outsider, h).await,
+        node(outsider, n).await,
+        "H's node reads as N's"
+    );
+    assert_eq!(
+        node(mate, h).await.0,
+        serde_json::json!("Ottilie Graphed"),
+        "CALIBRATION"
+    );
+}

@@ -1540,7 +1540,10 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // no SQL: the acquire is mechanical and unstamped (graph_query.rs is an
     // unconverted no_unscoped_pool.rs site); every projection in
-    // load_subgraph_conn splices the viewer except `agents` (untenanted).
+    // load_subgraph_conn splices the viewer except `agents` (untenanted), whose
+    // names it reads through migration 272's disclosure on the caller's
+    // connection (`AgentDisclosureRepository::names`, a definer that applies
+    // its own audience: the session stamp; an unstamped call is the outsider).
     (
         "graph_query_utils.rs",
         "load_subgraph",
@@ -1549,7 +1552,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "graph_query_utils.rs",
         "load_subgraph_conn",
-        &["sqlx::query_as(SELECT).fetch_all"],
+        &["AgentDisclosureRepository::names"],
     ),
     // stamped: the plan read on the actor's own stamped connection; the 404 is
     // migration 087's SELECT policy.

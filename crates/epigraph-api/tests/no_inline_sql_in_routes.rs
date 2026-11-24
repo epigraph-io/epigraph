@@ -106,7 +106,6 @@ const REGISTER: &[(&str, usize)] = &[
     ("experiment_loop.rs", 2),
     ("graph.rs", 8),
     ("graph_neighborhood.rs", 1),
-    ("graph_query_utils.rs", 1),
     ("hypothesis.rs", 11),
     ("papers.rs", 4),
     ("policies.rs", 4),
@@ -146,7 +145,7 @@ const REGISTER: &[(&str, usize)] = &[
 /// when its priors and alternative-set reads moved into
 /// `FactorRepository::bp_priors` / `bp_alternative_sets`, both spending the
 /// caller's viewer (finding F-SHARD4-A2, `computation.rs` 8 -> 6).
-const HIGH_WATER: usize = 84;
+const HIGH_WATER: usize = 83;
 
 /// The token that marks an inline query. `sqlx::query`, `sqlx::query_as`,
 /// `sqlx::query_scalar` and their `!` macro forms all start with it. Same

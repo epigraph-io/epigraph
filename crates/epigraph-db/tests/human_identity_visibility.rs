@@ -1894,3 +1894,37 @@ async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
         "a teammate shares a live group with H, the profile rule's group arm"
     );
 }
+
+/// T1, row H1: the ego hydration labels an unnamed human exactly as it
+/// labels a nameless agent (the `short_id` fallback), and a teammate's
+/// with the name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_ego_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Theodora Egoless").await;
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    let hydrate = |who: Uuid| {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        async move {
+            let v = viewer(&pool, who).await;
+            let mut c = scoped.read_as(&v).await.expect("read_as");
+            epigraph_db::EgoRepository::hydrate(&mut c, &v, &[h, n])
+                .await
+                .expect("hydrate")
+        }
+    };
+    let out = hydrate(outsider).await;
+    let label = |id: Uuid, list: &[epigraph_db::EgoEntity]| {
+        let e = list.iter().find(|e| e.id == id).expect("hydrated");
+        (
+            e.entity_type.clone(),
+            e.label.replace(&id.to_string()[..8], "<id>"),
+        )
+    };
+    assert_eq!(label(h, &out), label(n, &out), "H's ego node reads as N's");
+    let mine = hydrate(mate).await;
+    assert_eq!(label(h, &mine).1, "Theodora Egoless", "CALIBRATION");
+}

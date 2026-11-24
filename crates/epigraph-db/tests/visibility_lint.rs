@@ -5429,7 +5429,10 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     ("ego.rs", "edges", &["Self::untenanted_entity_types"]),
     // untenanted: `agents` display names; the claim, evidence, trace and (since migration 246
     // gave `papers` tenancy) paper reads are spliced.
-    ("ego.rs", "hydrate", &["sqlx::query_as(SELECT).fetch_all"]),
+    // untenanted / stamped: the agent nodes' names through migration 272's
+    // disclosure on the caller's stamped connection (a definer that applies
+    // its own audience).
+    ("ego.rs", "hydrate", &["AgentDisclosureRepository::names"]),
     // exempt: a write path in EXPECTED_EXEMPTIONS.
     ("evidence.rs", "delete", &["sqlx::query!(WITH).fetch_one"]),
     // write: the evidence insert, its tenancy dedup probe and its link edge, all for a parent
