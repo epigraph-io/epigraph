@@ -106,7 +106,8 @@ of up to 100 claims, not between pages.
 
 A claim's panel has a **Provenance** section, from the kernel's `authored_by`
 block on `GET /claims/{id}`, which `/bff/atlas/claim/{id}` reads once the
-claim's context has loaded. For a claim that a document's ingest created, it
+claim's context has loaded (or reuses as its fallback when the context read
+fails; a refused claim is never read again). For a claim that a document's ingest created, it
 shows the document (linked only through a DOI) and its authors. Authors who
 are still awaiting countersignature, and authors a later ingest added, are
 listed apart and never as authors. It also shows the ingestion note: by whom,
