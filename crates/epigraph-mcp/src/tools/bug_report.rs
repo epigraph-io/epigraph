@@ -207,8 +207,11 @@ pub async fn submit_bug_report(
 ///
 /// A principal-less HTTP context (`--allow-unauthenticated-http`) is refused:
 /// it reads as the listener's own agent, and a shared listener credential is
-/// not a reporter. The labels triage puts on a report are the intake group's
-/// information, shown only to the agent that filed it.
+/// not a reporter. The labels intake triage puts on a report are the intake
+/// group's information, shown only to the agent that filed it. A report the
+/// operators moved to another group (or one filed under an earlier intake
+/// group) stays listed (migration 272) but shows only what was filed, never
+/// its new owner's labels or title.
 ///
 /// # Errors
 /// `INVALID_REQUEST` for a principal-less context, when the intake is not

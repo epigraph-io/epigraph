@@ -4489,6 +4489,50 @@ restart.
   one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
   235, then 271, then the rest (production's order) and fails on one that breaks either
   rule.
+- **272**: public `bug_report_intake_marker` (backlog e690866c). Adds
+  `bug_report_intake_marks` (claim id PK, reporter, the intake group the report was filed
+  into, `submitted_at`, the filed title and labels; no row security, no foreign keys; the
+  application role holds NOTHING on it, the maintenance role SELECT and INSERT; a
+  `tenancy_exempt` row declares it, since its `claim_id` puts it in 069's generated
+  protected set, with `reviewed_by` 'PENDING'), written by
+  `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
+  SECURITY DEFINER from 211's body (one added INSERT) and 207's `epigraph_my_bug_reports`,
+  which now lists the caller's markers joined to their claims (author still the caller)
+  instead of the claims owned by the CURRENT intake group: a report triage moved out of the
+  intake group, or one filed under an intake group the operator replaced, stays listed.
+  What a listed row shows does not widen 207's disclosure: the live title and labels only
+  while the claim is owned by the CURRENT intake group (as 207), otherwise only the marker's
+  filed title and labels plus `resolved`, never a label or title a later owner wrote.
+  `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
+  existing `bug_report.submitted` audit row whose claim is still authored by its agent and
+  carries the write's `properties.bug_report` (filed labels rebuilt from the audit row's
+  severity and component; the title from the claim, so a report moved before 272 keeps the
+  title it has now), with `row_security` off (fails closed on a filtered migration login),
+  after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call
+  reads it first, so a call already past that read commits before the backfill). A call that
+  STARTS while 272 holds the lock has loaded 211's body and files its report with no marker
+  once 272 commits; `docs/runbooks/272-marker-backfill.sql` (272's backfill, idempotent)
+  closes that. Not decided: the list still shows the labels intake triage writes while a
+  report is in the current intake group (the label-disclosure question, e690866c part 2, is
+  open). Owners and grants re-asserted as 211 does. Pinned by
+  `epigraph-db/tests/bug_report_intake.rs` (`moved_and_earlier_intake_reports_stay_in_the_list`,
+  `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`,
+  `the_application_role_cannot_read_or_forge_an_intake_marker`) and
+  `bug_report_intake_marker.rs` (the backfill across an upgrade from 271, the rerun runbook,
+  the undo, including the `tenancy_exempt` row) and `tenancy_coverage.rs` (the registry
+  constants); the intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
+  this file. Undo: `docs/runbooks/272-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 272). Checked before claiming: no migration on main or an origin branch
+  carries a `272`. **Deploy order:** migrate before running the theme scripts of
+  this change (they read the table: 42P01 below 272), and while NO theme run is in progress (a
+  maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
+  600 s statement timeout, so 272's ACCESS EXCLUSIVE lock times out after 3 s and the migration
+  fails, safely: re-run it); a minute or more after 272 commits, run
+  `docs/runbooks/272-marker-backfill.sql` once on the migration DSN. The backfill reads
+  `security_events` through `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
+  on a deployed database is a measurement still to make. A
+  read-only login that runs the theme scripts needs SELECT on the table (docs/deploy.md).
+  **Applied to throwaway databases only, NOT to any deployed database.**
 
 ## `-- no-transaction` migrations
 
