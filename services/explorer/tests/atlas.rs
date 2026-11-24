@@ -3060,11 +3060,6 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
     }
 }
 
-/// A theme's panel offers Sources and Timeline (P3b, P3c) from the page's
-/// `data-sources-url` and `data-timeline-url`, through the tested rules in
-/// static/atlas_views.js, and the timeline lane is SVG built element by
-/// element (the parse-free rule of `atlas_js_never_parses_strings_as_code_or_html`
-/// still holds for the whole file).
 /// The claim panel shows the BFF's provenance section through the pure rows
 /// of `atlas_views.js`, and links only through the checked helpers.
 #[test]
@@ -3104,6 +3099,11 @@ fn atlas_js_claim_panel_shows_provenance() {
     );
 }
 
+/// A theme's panel offers Sources and Timeline (P3b, P3c) from the page's
+/// `data-sources-url` and `data-timeline-url`, through the tested rules in
+/// static/atlas_views.js, and the timeline lane is SVG built element by
+/// element (the parse-free rule of `atlas_js_never_parses_strings_as_code_or_html`
+/// still holds for the whole file).
 #[test]
 fn atlas_js_theme_panel_offers_sources_and_timeline() {
     let js = include_str!("../static/atlas.js");
