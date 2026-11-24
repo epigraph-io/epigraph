@@ -902,19 +902,26 @@ async fn whoever_can_read_a_claim_sees_its_filer_and_human_named(pool: PgPool) {
     let (gone_svc, gone_client) = allowance_bound(&pool, h, "sana-gone-svc").await;
 
     let (mate, _) = named(&pool, "Tito Groupmate").await;
+    let (old_mate, _) = named(&pool, "Vera Oldgroup").await;
     let (outsider, _) = named(&pool, "Uma Uninvolved").await;
-    // A team of the mate and the bots, NOT of H.
-    let g = keyed_team(&pool, &[mate, live_bot, old_bot, svc, gone_svc]).await;
+    // A team of the mate and the LIVE-bound agents, NOT of H; and a separate
+    // team of `old_mate` and the agents whose binding is later retired /
+    // revoked, in which no live-bound agent of H files (review finding
+    // tests#3b: otherwise a live bot's claim in the same group names H to the
+    // reader, and the matrix cannot tell whether an ENDED binding still
+    // traces to H).
+    let g = keyed_team(&pool, &[mate, live_bot, svc]).await;
+    let g_old = keyed_team(&pool, &[old_mate, old_bot, gone_svc]).await;
     let other = keyed_team(&pool, &[outsider]).await;
 
     let mut seeded = 0;
-    for (filer, tag) in [
-        (live_bot, "live link"),
-        (old_bot, "retired link"),
-        (svc, "live allowance"),
-        (gone_svc, "revoked allowance"),
+    for (filer, group, tag) in [
+        (live_bot, g, "live link"),
+        (old_bot, g_old, "retired link"),
+        (svc, g, "live allowance"),
+        (gone_svc, g_old, "revoked allowance"),
     ] {
-        fixture::seed_group_claim(&pool, filer, g, &format!("group claim via {tag}")).await;
+        fixture::seed_group_claim(&pool, filer, group, &format!("group claim via {tag}")).await;
         seeded += 1;
     }
     let sup = fixture::seed_group_claim(&pool, h, g, "a superseded group claim by H").await;
@@ -929,7 +936,7 @@ async fn whoever_can_read_a_claim_sees_its_filer_and_human_named(pool: PgPool) {
     let _ = svc_client;
 
     let mut readable_total = 0;
-    for who in [mate, outsider, h, live_bot] {
+    for who in [mate, old_mate, outsider, h, live_bot] {
         let v = viewer(&pool, who).await;
         let rows: Vec<(Uuid, Uuid, Option<Uuid>)> = {
             let mut read = scoped.read_as(&v).await.expect("read_as");
@@ -963,6 +970,10 @@ async fn whoever_can_read_a_claim_sees_its_filer_and_human_named(pool: PgPool) {
     // CALIBRATION: the property is not vacuous: the mate reads H's bound
     // agents' claims, and the outsider does not see H named.
     assert!(named_to(&pool, &scoped, mate, h).await);
+    assert!(
+        named_to(&pool, &scoped, old_mate, h).await,
+        "only an ENDED binding's claim traces H to this reader"
+    );
     assert!(!named_to(&pool, &scoped, outsider, h).await);
 }
 
