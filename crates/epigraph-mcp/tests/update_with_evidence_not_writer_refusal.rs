@@ -23,7 +23,10 @@
 //!   same refusal, labels unchanged;
 //! * on stdio, the server's agent as a group reader: the same refusal;
 //! * calibration: the same call by a WRITER of the group lands, so the refusal
-//!   is the caller's role in the owning group and not the claim's shape.
+//!   is the caller's role in the owning group and not the claim's shape;
+//! * the same refusal and calibration on a TEAM group (migration 164's keyless
+//!   `did:epigraph:group:` shape), whose memberships are live only for a human
+//!   operator (or an agent under one), so the team machinery is exercised.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -70,6 +73,24 @@ async fn app_role_server(pool: &PgPool) -> (EpiGraphMcpFull, Uuid) {
 /// agent's reader row here is live and the claim is readable to it.
 async fn shared_group(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     fixture::seed_agent_with_group(pool, label).await
+}
+
+/// A keyless team group in migration 164's shape, seeded on the superuser
+/// pool (which the verbs' triggers admit), with `admin` as its admin.
+async fn team_group(pool: &PgPool, admin: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO groups (id, display_name, did_key, public_key, kind, created_by_agent_id) \
+         VALUES ($1, $2, 'did:epigraph:group:' || $1::text, ''::bytea, 'team', $3)",
+    )
+    .bind(id)
+    .bind(format!("1c93eec8 team {id}"))
+    .bind(admin)
+    .execute(pool)
+    .await
+    .expect("seed a team group");
+    add_member(pool, id, admin, "admin").await;
+    id
 }
 
 async fn add_member(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
@@ -246,6 +267,52 @@ async fn a_group_writer_attaches_evidence(pool: PgPool) {
     update_with_evidence(&server, &caller_viewer, params(claim, &[]), Some(&token))
         .await
         .expect("CALIBRATION: a group writer attaches evidence");
+    let (_, _, evidence, bbas) = state_of(&pool, claim).await;
+    assert_eq!(evidence, 1, "calibration: the evidence landed");
+    assert!(bbas >= 1, "calibration: its BBA landed");
+}
+
+/// A team group: the caller is a human operator (so its team membership is
+/// live) holding only a READER row. The same named refusal, nothing written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn http_team_reader_is_a_named_refusal(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (owner, _) = fixture::seed_agent_with_group(&pool, "uwe-nw-team-owner").await;
+    fixture::make_human_operator(&pool, owner).await;
+    let team = team_group(&pool, owner).await;
+    let claim = group_claim(&pool, owner, team).await;
+    let (caller, token, _) = seed_caller(&pool, &["claims:write"]).await;
+    fixture::make_human_operator(&pool, caller).await;
+    add_member(&pool, team, caller, "reader").await;
+    let caller_viewer = viewer(&pool, caller).await;
+    let before = state_of(&pool, claim).await;
+
+    let e = update_with_evidence(&server, &caller_viewer, params(claim, &[]), Some(&token))
+        .await
+        .expect_err("a team reader cannot attach evidence to the team's claim");
+    assert_named_refusal(&e, claim, team, "http team reader");
+    assert_eq!(state_of(&pool, claim).await, before, "nothing written");
+}
+
+/// Calibration for the team arm: a human operator holding a WRITER row in the
+/// same kind of team group attaches the same evidence, so the team membership
+/// is live (the claim is read, not "not found") and the refusal above is the
+/// reader role.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_team_writer_attaches_evidence(pool: PgPool) {
+    let (server, _) = app_role_server(&pool).await;
+    let (owner, _) = fixture::seed_agent_with_group(&pool, "uwe-nw-team-cal-owner").await;
+    fixture::make_human_operator(&pool, owner).await;
+    let team = team_group(&pool, owner).await;
+    let claim = group_claim(&pool, owner, team).await;
+    let (caller, token, _) = seed_caller(&pool, &["claims:write"]).await;
+    fixture::make_human_operator(&pool, caller).await;
+    add_member(&pool, team, caller, "writer").await;
+    let caller_viewer = viewer(&pool, caller).await;
+
+    update_with_evidence(&server, &caller_viewer, params(claim, &[]), Some(&token))
+        .await
+        .expect("CALIBRATION: a team writer attaches evidence");
     let (_, _, evidence, bbas) = state_of(&pool, claim).await;
     assert_eq!(evidence, 1, "calibration: the evidence landed");
     assert!(bbas >= 1, "calibration: its BBA landed");
