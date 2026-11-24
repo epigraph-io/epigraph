@@ -28,6 +28,18 @@ Commands:
             (`compute` prints the digest of its own result, which always
             matches itself: it is not a review.)
   reverse   Restores exactly what a manifest's apply changed.
+  offbox    export, then the operator's off-box COMMAND, then apply, in one
+            run (the nightly's hook, `atlas_nightly --theme-cap-split`):
+            COMMAND is run as `COMMAND theme-cap EXPORT_DIR RESULT_FILE`
+            with a cleared environment (PATH, HOME and LANG only: never a
+            database URL), the export is deleted once it returns, and the
+            result is applied as `apply` does with every structural check
+            (`--cap` is both the export's and apply's cap; the result must
+            name exactly the exported themes). It is not checked against a
+            reviewed plan (there is none: no UMAP on the box); the manifest
+            records `review: "offbox-command"`, and `reverse` undoes it.
+            `scripts/atlas_offbox_compute.py` is a reference COMMAND that
+            computes in place.
 
 What apply writes, per theme:
   * The largest part keeps the theme's id; every other part becomes a new
@@ -123,6 +135,9 @@ import json
 import os
 import pathlib
 import re
+import shutil
+import stat
+import subprocess
 import sys
 import urllib.parse
 import uuid
@@ -398,6 +413,8 @@ REVIEW_PLAN_FILE = "reviewed-plan"
 REVIEW_DIGEST = "expect-digest"
 REVIEW_IS_PLAN = "result-is-the-plan"
 REVIEW_NONE = "unreviewed"
+# The nightly's off-box hook (`offbox`): structural checks only, recorded as such.
+REVIEW_OFFBOX = "offbox-command"
 
 
 def review_digest(result, reviewed_plan=None, expect_digest=None, unreviewed=False):
@@ -530,6 +547,74 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
         conn.rollback()
         raise
     return manifest
+
+
+# ── offbox (the nightly's hook) ─────────────────────────────────────────────
+
+OFFBOX_KIND = "theme-cap"
+# The only variables the off-box command inherits.
+OFFBOX_KEPT_ENV = ("PATH", "HOME", "LANG")
+
+
+def offbox_env():
+    """The off-box command's whole environment: OFFBOX_KEPT_ENV from ours, so
+    no database URL or other credential of this process reaches it."""
+    return {k: os.environ[k] for k in OFFBOX_KEPT_ENV if k in os.environ}
+
+
+def check_private_dir(path):
+    """Refuse a work directory that is missing, a symlink, not a directory,
+    or open to group or other: the export holds embeddings."""
+    path = pathlib.Path(path)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"{path} is not a directory (a symlink is refused too)")
+    if st.st_mode & 0o077:
+        raise ValueError(f"{path} has mode {st.st_mode & 0o777:o}: it holds embeddings, so it "
+                         "must be owner-only (chmod 700)")
+
+
+def run_offbox_command(command, export_dir, result_path, timeout):
+    """`command theme-cap export_dir result_path`, cleared environment, no
+    stdin, stdout discarded (ours is the JSON report), killed at `timeout`."""
+    subprocess.run([str(command), OFFBOX_KIND, str(export_dir), str(result_path)],
+                   env=offbox_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   timeout=timeout, check=True, start_new_session=True)
+
+
+def offbox_split(conn, command, work_dir, manifest_path, cap=core.DEFAULT_CAP,
+                 seed=core.DEFAULT_SEED, theme_ids=None, timeout=3600):
+    """Export the over-cap themes into `work_dir`, run the off-box `command`
+    on the export, delete the export, and apply the result. Returns
+    (manifest, exported theme ids); the manifest has no themes when nothing
+    was over the cap or nothing needed splitting."""
+    check_private_dir(work_dir)
+    work_dir = pathlib.Path(work_dir)
+    export_dir = work_dir / "export"
+    result_path = work_dir / "result.json"
+    for p in (export_dir, result_path):
+        if os.path.lexists(p):
+            raise ValueError(f"{p} already exists: give offbox a fresh work directory")
+    try:
+        index = export(conn, export_dir, cap, seed, theme_ids)
+        exported = sorted(t["theme_id"] for t in index["themes"])
+        if not exported:
+            return {"format": MANIFEST_FORMAT, "themes": [], "split_run": None,
+                    "parts_digest": None, "review": REVIEW_OFFBOX}, []
+        run_offbox_command(command, export_dir, result_path, timeout)
+    finally:
+        # The embeddings never outlive the call, whatever it returned.
+        shutil.rmtree(export_dir, ignore_errors=True)
+    result = json.loads(result_path.read_text())
+    if not isinstance(result, dict) or result.get("format") != core.RESULT_FORMAT:
+        raise ValueError(f"the off-box result is not a {core.RESULT_FORMAT} result; nothing "
+                         "was written")
+    named = sorted(str(t.get("theme_id")) for t in result.get("themes") or [])
+    if named != exported:
+        raise ValueError(f"the off-box result names themes {named}, not the exported "
+                         f"{exported}; nothing was written")
+    manifest = apply_result(conn, result, manifest_path, max_cap=cap, review=REVIEW_OFFBOX)
+    return manifest, exported
 
 
 # ── reverse ─────────────────────────────────────────────────────────────────
@@ -671,6 +756,19 @@ def main(argv=None):
                           help="apply a result that is not a plan without checking it against "
                                "a reviewed plan")
 
+    sp = sub.add_parser("offbox", help="export, run the off-box command, apply (the nightly "
+                                       "hook); writes a manifest")
+    db_args(sp)
+    select_args(sp)
+    sp.add_argument("--command", dest="command_path", required=True,
+                    help="run as COMMAND theme-cap EXPORT_DIR RESULT_FILE, cleared environment")
+    sp.add_argument("--work-dir", required=True,
+                    help="an owner-only directory for the export (deleted after) and result")
+    sp.add_argument("--manifest", default=None,
+                    help="manifest to create (default <work-dir>/manifest.json)")
+    sp.add_argument("--timeout", type=int, default=3600,
+                    help="seconds the command may take (default %(default)s)")
+
     sp = sub.add_parser("reverse", help="restore what an apply changed")
     db_args(sp)
     sp.add_argument("--manifest", required=True)
@@ -732,6 +830,22 @@ def main(argv=None):
                               "parts_digest": manifest["parts_digest"],
                               "checked_against_review": expect_digest is not None,
                               "review": review,
+                              "themes": [{"parent_id": t["parent_id"],
+                                          "kept": len(t["kept_claim_ids"]),
+                                          "new_parts": [{"theme_id": n["theme_id"],
+                                                         "claims": len(n["claim_ids"])}
+                                                        for n in t["new_parts"]]}
+                                         for t in manifest["themes"]]}))
+        elif args.command == "offbox":
+            mpath = args.manifest or str(pathlib.Path(args.work_dir) / "manifest.json")
+            manifest, exported = offbox_split(conn, args.command_path, args.work_dir, mpath,
+                                              args.cap, args.seed, args.theme_id, args.timeout)
+            print(json.dumps({"status": "applied" if manifest["themes"] else "nothing to split",
+                              "exported": exported,
+                              "manifest": mpath if manifest["themes"] else None,
+                              "split_run": manifest["split_run"],
+                              "parts_digest": manifest["parts_digest"],
+                              "review": REVIEW_OFFBOX,
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],
