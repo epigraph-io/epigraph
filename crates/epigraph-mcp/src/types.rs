@@ -3536,7 +3536,7 @@ pub struct InviteToGroupParams {
     #[schemars(description = "UUID of the team group (you must be a live admin of it).")]
     pub group_id: String,
     #[schemars(
-        description = "UUID of the Person to invite: a registered human operator's own agent id, not an agent they operate."
+        description = "UUID of the Person to invite: their own agent id, not an agent they operate. The invite does not check that it is a person; only a registered Person can accept."
     )]
     pub agent_id: String,
     #[schemars(

@@ -4618,6 +4618,15 @@ restart.
   (`a_public_profile_without_recorded_consent_names_no_one`,
   `the_consent_stamp_is_the_setters_alone`, the PCN01 refusal). Undo:
   `docs/runbooks/283-undo.sql`.
+- **284**: `team_invite_no_human_oracle` (operator ruling C10; spec R11). Precondition TIV01
+  (55000): the invite is still 263's (md5). `epigraph_invite_to_team_group` re-stated without
+  the `epigraph_is_human_operator(invitee)` refusal: TGP03 now refuses only an id naming no
+  agent, a role's node or a registered system identity (each visible to every reader), so the
+  invite answers alike for a person, a named or unnamed one, and a non-person. Accept is
+  unchanged and already refuses any caller that is not a registered person (TGP01): the
+  refusal moved there. Pinned by `epigraph-db/tests/person_team_groups.rs`
+  (`an_invitation_answers_alike_whoever_the_invitee_is`), `epigraph-api/tests/team_groups_http.rs`,
+  `epigraph-mcp/tests/team_groups_app_role.rs`. Undo: `docs/runbooks/284-undo.sql`.
 
 ## `-- no-transaction` migrations
 

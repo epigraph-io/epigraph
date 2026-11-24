@@ -122,6 +122,19 @@ async fn operated(pool: &PgPool, operator: Uuid, label: &str) -> Uuid {
     agent
 }
 
+/// A role's graph node (`agent_type = 'role'`), whose kind is public.
+async fn role_node(pool: &PgPool, key: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO agents (public_key, display_name, agent_type, role, labels) \
+         VALUES (uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $1, 'role', \
+                 'custom', ARRAY['role']) RETURNING id",
+    )
+    .bind(format!("role:{key}"))
+    .fetch_one(pool)
+    .await
+    .expect("role node")
+}
+
 async fn live_rows(pool: &PgPool, group: Uuid, agent: Uuid) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM group_memberships \
@@ -316,7 +329,7 @@ async fn each_refusal_answers_by_its_kind_with_nothing_written(pool: PgPool) {
     let a = human(&pool, "ref-a").await;
     let b = human(&pool, "ref-b").await;
     let outsider = human(&pool, "ref-out").await;
-    let agent = operated(&pool, b, "ref-agent").await;
+    let role = role_node(&pool, "ref-role").await;
     let (_, body) = post(
         addr,
         "/api/v1/groups/team",
@@ -372,10 +385,13 @@ async fn each_refusal_answers_by_its_kind_with_nothing_written(pool: PgPool) {
             None,
         ),
         (
-            "invitee not a Person",
+            // Since migration 284 (operator ruling C10) only a role's node
+            // or a system identity, whose kind every reader sees, is refused
+            // as an invitee; whether an id is a person is never answered.
+            "invitee a role's node",
             invite.clone(),
             a,
-            json!({"agent_id": agent}),
+            json!({"agent_id": role}),
             400,
             Some("TGP03"),
         ),
@@ -517,4 +533,68 @@ async fn an_operated_agent_cannot_act_for_its_human(pool: PgPool) {
     );
     assert_eq!(live_rows(&pool, group, b).await, 0);
     assert_eq!(live_rows(&pool, group, b_agent).await, 0);
+}
+
+/// Operator ruling C10 (migration 284; spec R11): `POST
+/// /api/v1/groups/:id/invitations` answers a team admin IDENTICALLY for a
+/// person and for an agent a person operates (201 with the same body modulo
+/// ids; a repeat 409 TGP04 with the same body modulo ids), so it no longer
+/// tells "is this id a registered human?". The refusal is at accept time: the
+/// agent is refused (403) and joins nothing; the person accepts
+/// (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_invite_answers_alike_for_a_person_and_an_agent(pool: PgPool) {
+    let (addr, _stop) = spawn_app(&pool).await;
+    let a = human(&pool, "alike-a").await;
+    let b = human(&pool, "alike-b").await;
+    let c = human(&pool, "alike-c").await;
+    let agent = operated(&pool, c, "alike-agent").await;
+    let (_, body) = post(
+        addr,
+        "/api/v1/groups/team",
+        a,
+        json!({"name": "Synthetic Alike"}),
+    )
+    .await;
+    let group = id_of(&body, "group_id");
+    let invite = format!("/api/v1/groups/{group}/invitations");
+    let masked = |v: &Value, who: Uuid| -> String {
+        let mut v = v.clone();
+        if let Some(o) = v.as_object_mut() {
+            o.remove("invitation_id");
+        }
+        v.to_string().replace(&who.to_string(), "<invitee>")
+    };
+
+    let (st_b, body_b) = post(addr, &invite, a, json!({"agent_id": b})).await;
+    let (st_g, body_g) = post(addr, &invite, a, json!({"agent_id": agent})).await;
+    assert_eq!((st_b, st_g), (201, 201), "{body_b} / {body_g}");
+    assert_eq!(masked(&body_b, b), masked(&body_g, agent));
+    let (st_b2, again_b) = post(addr, &invite, a, json!({"agent_id": b})).await;
+    let (st_g2, again_g) = post(addr, &invite, a, json!({"agent_id": agent})).await;
+    assert_eq!((st_b2, st_g2), (409, 409), "{again_b} / {again_g}");
+    assert_eq!(code_in(&again_g).as_deref(), Some("TGP04"), "{again_g}");
+    assert_eq!(masked(&again_b, b), masked(&again_g, agent));
+
+    let to_agent = id_of(&body_g, "invitation_id");
+    let (status, got) = post(
+        addr,
+        &format!("/api/v1/group-invitations/{to_agent}/accept"),
+        agent,
+        json!({}),
+    )
+    .await;
+    // 403: an operated agent's own token carries no HTTP authority, and the
+    // definer would refuse it TGP01 (pinned in person_team_groups.rs).
+    assert_eq!(status, 403, "{got}");
+    assert_eq!(live_rows(&pool, group, agent).await, 0);
+    let to_b = id_of(&body_b, "invitation_id");
+    let (status, got) = post(
+        addr,
+        &format!("/api/v1/group-invitations/{to_b}/accept"),
+        b,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "CALIBRATION: the person accepts: {got}");
 }
