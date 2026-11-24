@@ -4664,6 +4664,25 @@ restart.
   single-statement `-- no-transaction` file; 286 and 287 supersede them (same predicates,
   `created_at` appended). Registered in `tenancy_migration_shape.rs::DROPPED_INDEX_MIGRATIONS`.
   Undo: re-run 275 / 276.
+- **291**-**294**: the partial indexes of 295's arm (operator ruling C6), each a
+  single-statement `-- no-transaction` `CREATE INDEX CONCURRENTLY IF NOT EXISTS`:
+  `idx_evidence_public_by_signer (signer_id, created_at)`,
+  `idx_challenges_public_by_challenger (challenger_id, created_at)` and
+  `idx_mass_functions_public_by_source (source_agent_id, created_at)`, each `WHERE visibility =
+  'public'`; `idx_edges_public_ingest_records_by_ingester ((properties ->> 'ingested_by'),
+  created_at) WHERE relationship = 'ingested_claim' AND visibility = 'public'`. Registered in
+  `tenancy_migration_shape.rs::INDEX_MIGRATIONS`, where each probe's plan is pinned.
+- **295**: `disclosure_every_public_assertion` (operator ruling C6). Precondition PAK01 (55000):
+  the core is still 288's (md5). Re-states `epigraph_agent_disclosure_for` with one arm after the
+  public-claim arm: a PUBLIC row by an agent of B(H), at or after its binding start (288), of
+  evidence (`signer_id`: the table has no author column), a challenge (`challenger_id`), a BBA
+  (`source_agent_id`; a retracted one still counts) or an ingest record (`edges`
+  `paper -ingested_claim-> claim` whose `properties.ingested_by` is the agent and whose
+  `ingest_written.by` marker names the same agent). Public rows only. Pinned by
+  `human_identity_visibility.rs` (`a_public_assertion_of_every_kind_names_the_human`,
+  `an_assertion_of_any_kind_from_before_the_binding_never_names_the_human`, the PAK01 refusal)
+  and `claim_authored_by.rs::a_human_ingesters_public_record_names_it_to_every_reader`. Undo:
+  `docs/runbooks/295-undo.sql` (288's body).
 
 ## `-- no-transaction` migrations
 

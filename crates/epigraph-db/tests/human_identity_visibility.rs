@@ -823,6 +823,212 @@ async fn an_assertion_after_the_binding_names_the_human_after_the_binding_ends(p
     );
 }
 
+// ─── C6: public assertions of every kind (operator ruling) ──────────────
+
+/// The kinds of public assertion besides a claim that operator ruling C6 counts
+/// for H, each keyed on the column HEAD records its asserting agent in.
+#[derive(Debug, Clone, Copy)]
+enum Assertion {
+    /// `evidence.signer_id`: the table has no author column, so the agent that
+    /// signed the row is the one that asserted it.
+    Evidence,
+    /// `challenges.challenger_id`.
+    Challenge,
+    /// `mass_functions.source_agent_id` (a BBA).
+    MassFunction,
+    /// `edges` `paper -ingested_claim-> claim`, `properties.ingested_by`, marked
+    /// by the same ingest (`properties.ingest_written.by`).
+    IngestRecord,
+}
+
+const ASSERTIONS: [Assertion; 4] = [
+    Assertion::Evidence,
+    Assertion::Challenge,
+    Assertion::MassFunction,
+    Assertion::IngestRecord,
+];
+
+/// A public paper (explicit tenancy: `papers` refuses an undeclared insert).
+async fn public_paper(pool: &PgPool, doi: &str) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO papers (doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'A Fixture Paper', 'public', $2) RETURNING id",
+    )
+    .bind(doi)
+    .bind(fixture::world_group(pool).await)
+    .fetch_one(pool)
+    .await
+    .expect("public paper")
+}
+
+/// One PUBLIC assertion of `kind` by `agent`, on a public claim an unbound
+/// stranger filed (so no claim arm can name H). Returns `(table, row id)`.
+/// CALIBRATION: the stored row is `'public'` (the tenancy triggers decide it).
+async fn assert_publicly(pool: &PgPool, kind: Assertion, agent: Uuid) -> (&'static str, Uuid) {
+    let (stranger, _) = named(pool, &format!("stranger {}", Uuid::new_v4())).await;
+    let claim = fixture::seed_public_claim(
+        pool,
+        stranger,
+        &format!("a stranger's public claim {}", Uuid::new_v4()),
+    )
+    .await;
+    let (table, id): (&'static str, Uuid) = match kind {
+        Assertion::Evidence => {
+            let hash: Vec<u8> = Uuid::new_v4().as_bytes().repeat(2);
+            let sig: Vec<u8> = Uuid::new_v4().as_bytes().repeat(4);
+            let id = sqlx::query_scalar(
+                "INSERT INTO evidence (claim_id, evidence_type, content_hash, signature, \
+                                       signer_id) \
+                 VALUES ($1, 'testimony', $2, $3, $4) RETURNING id",
+            )
+            .bind(claim)
+            .bind(&hash)
+            .bind(&sig)
+            .bind(agent)
+            .fetch_one(pool)
+            .await
+            .expect("signed evidence");
+            ("evidence", id)
+        }
+        Assertion::Challenge => {
+            let id = sqlx::query_scalar(
+                "INSERT INTO challenges (claim_id, challenger_id, challenge_type, explanation, \
+                                         state) \
+                 VALUES ($1, $2, 'factual', 'a challenge', 'pending') RETURNING id",
+            )
+            .bind(claim)
+            .bind(agent)
+            .fetch_one(pool)
+            .await
+            .expect("challenge");
+            ("challenges", id)
+        }
+        Assertion::MassFunction => {
+            let frame: Uuid = sqlx::query_scalar(
+                "INSERT INTO frames (name, hypotheses) VALUES ($1, ARRAY['h0','h1']::text[]) \
+                 RETURNING id",
+            )
+            .bind(format!("visibility-frame-{}", Uuid::new_v4()))
+            .fetch_one(pool)
+            .await
+            .expect("frame");
+            let id = sqlx::query_scalar(
+                "INSERT INTO mass_functions (claim_id, frame_id, source_agent_id, masses) \
+                 VALUES ($1, $2, $3, '{\"0\": 0.5, \"0,1\": 0.5}'::jsonb) RETURNING id",
+            )
+            .bind(claim)
+            .bind(frame)
+            .bind(agent)
+            .fetch_one(pool)
+            .await
+            .expect("mass function");
+            ("mass_functions", id)
+        }
+        Assertion::IngestRecord => {
+            let paper = public_paper(pool, &format!("10.9999/visibility.{}", Uuid::new_v4())).await;
+            let mut tx = pool.begin().await.expect("begin");
+            sqlx::query("SELECT pg_catalog.set_config('epigraph.ingest_written_edge', 'on', true)")
+                .execute(&mut *tx)
+                .await
+                .expect("declare the ingest's write");
+            let id = sqlx::query_scalar(
+                "INSERT INTO edges (source_id, source_type, target_id, target_type, \
+                                    relationship, properties) \
+                 VALUES ($1, 'paper', $2, 'claim', 'ingested_claim', \
+                         jsonb_build_object('ingested_by', $3::text, 'created_claim', false, \
+                                            'tool', 'ingest_document', \
+                                            'ingest_written', jsonb_build_object( \
+                                                'tool', 'ingest_document', 'by', $3::text))) \
+                 RETURNING id",
+            )
+            .bind(paper)
+            .bind(claim)
+            .bind(agent)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("ingest record");
+            tx.commit().await.expect("commit");
+            ("edges", id)
+        }
+    };
+    let visibility: String = sqlx::query_scalar(&format!(
+        "SELECT visibility::text FROM public.{table} WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("visibility");
+    assert_eq!(
+        visibility, "public",
+        "CALIBRATION: the {kind:?} row is stored public"
+    );
+    (table, id)
+}
+
+/// Operator ruling C6: a public assertion of ANY kind by H or by an agent bound
+/// to H names H, as a public claim does: evidence it signed, a challenge it
+/// raised, a BBA it stated, an ingest record of its document ingest. Each is
+/// checked alone (on a stranger's claim, so no claim arm holds), by H itself
+/// and by a linked agent after its link began, then after the link is retired.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_assertion_of_every_kind_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Bruno Bystander").await;
+    for kind in ASSERTIONS {
+        // By H itself.
+        let (h, _) = human(&pool, &format!("Person {kind:?} Self")).await;
+        assert!(
+            !named_to(&pool, &scoped, outsider, h).await,
+            "CALIBRATION: {kind:?}: unnamed before"
+        );
+        assert_publicly(&pool, kind, h).await;
+        assert!(
+            named_to(&pool, &scoped, outsider, h).await,
+            "{kind:?}: a public assertion by the person names it"
+        );
+        assert!(
+            named_to_guest(&pool, &scoped, h).await,
+            "{kind:?}: and to the guest viewer"
+        );
+
+        // By a linked agent, after the link began; sticky after retirement.
+        let (h2, _) = human(&pool, &format!("Person {kind:?} Linked")).await;
+        let (bot, _) = named(&pool, &format!("bot {kind:?}")).await;
+        link(&pool, bot, h2).await;
+        assert_publicly(&pool, kind, bot).await;
+        retire_link(&pool, bot).await;
+        assert!(
+            named_to(&pool, &scoped, outsider, h2).await,
+            "{kind:?}: a linked agent's public assertion names its human after the retire"
+        );
+    }
+}
+
+/// C6 is windowed as C5 is: an assertion of any kind that a bound agent made
+/// BEFORE its binding to H began never names H. The same agent's assertion
+/// after the binding does (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assertion_of_any_kind_from_before_the_binding_never_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Carla Curious").await;
+    for kind in ASSERTIONS {
+        let (h, _) = human(&pool, &format!("Person {kind:?} Late")).await;
+        let (bot, _) = named(&pool, &format!("early bot {kind:?}")).await;
+        let (table, row) = assert_publicly(&pool, kind, bot).await;
+        backdate(&pool, table, row).await;
+        link(&pool, bot, h).await;
+        assert!(
+            !named_to(&pool, &scoped, outsider, h).await,
+            "{kind:?}: an assertion from before the link must not name the human"
+        );
+        assert_publicly(&pool, kind, bot).await;
+        assert!(
+            named_to(&pool, &scoped, outsider, h).await,
+            "CALIBRATION: {kind:?}: the same agent's assertion after the link names it"
+        );
+    }
+}
+
 // ─── T8: a stranger cannot unhide H ──────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1738,6 +1944,36 @@ async fn migration_288_refuses_over_another_core_body(pool: PgPool) {
     .await
     .expect("core source");
     assert!(!src.contains("v_since"), "nothing was changed");
+}
+
+/// 295 (C6) re-states 288's core; over any other body it refuses (PAK01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_295_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(295)).await.expect("migrate to 294");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("295 must refuse over another body");
+    assert!(err.contains("PAK01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(!src.contains("ingested_claim"), "nothing was changed");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

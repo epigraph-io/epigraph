@@ -60,6 +60,24 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "287_idx_claims_group_by_agent_since.sql",
         "idx_claims_group_by_agent_since",
     ),
+    // The per-bound-agent probes of 295's arm for every other kind of public
+    // assertion (operator ruling C6).
+    (
+        "291_idx_evidence_public_by_signer.sql",
+        "idx_evidence_public_by_signer",
+    ),
+    (
+        "292_idx_challenges_public_by_challenger.sql",
+        "idx_challenges_public_by_challenger",
+    ),
+    (
+        "293_idx_mass_functions_public_by_source.sql",
+        "idx_mass_functions_public_by_source",
+    ),
+    (
+        "294_idx_edges_public_ingest_records_by_ingester.sql",
+        "idx_edges_public_ingest_records_by_ingester",
+    ),
 ];
 
 /// `-- no-transaction` index files whose index no longer exists at head: 275 and
@@ -319,6 +337,49 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
         "288's readable-claim probe must reach idx_claims_group_by_agent_since with the \
          binding start as an index bound. Plan:\n{plan}"
     );
+
+    // 295's probes for every other kind of public assertion (C6) reach 291-294's
+    // indexes, each with the binding start in the index condition.
+    for (probe, index) in [
+        (
+            "SELECT 1 FROM evidence e \
+              WHERE e.signer_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+                AND e.visibility = 'public' \
+                AND e.created_at >= '2026-01-01'::timestamptz LIMIT 1",
+            "idx_evidence_public_by_signer",
+        ),
+        (
+            "SELECT 1 FROM challenges ch \
+              WHERE ch.challenger_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+                AND ch.visibility = 'public' \
+                AND ch.created_at >= '2026-01-01'::timestamptz LIMIT 1",
+            "idx_challenges_public_by_challenger",
+        ),
+        (
+            "SELECT 1 FROM mass_functions m \
+              WHERE m.source_agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+                AND m.visibility = 'public' \
+                AND m.created_at >= '2026-01-01'::timestamptz LIMIT 1",
+            "idx_mass_functions_public_by_source",
+        ),
+        (
+            "SELECT 1 FROM edges r \
+              WHERE (r.properties ->> 'ingested_by') = '00000000-0000-0000-0000-00000000feed' \
+                AND r.relationship = 'ingested_claim' \
+                AND r.visibility = 'public' \
+                AND r.created_at >= '2026-01-01'::timestamptz \
+                AND (r.properties -> 'ingest_written' ->> 'by') = (r.properties ->> 'ingested_by') \
+              LIMIT 1",
+            "idx_edges_public_ingest_records_by_ingester",
+        ),
+    ] {
+        let plan = explain(&mut conn, probe).await;
+        assert!(
+            plan.contains(index) && plan.contains("created_at >="),
+            "295's probe must reach {index} with the binding start as an index bound. \
+             Plan:\n{plan}"
+        );
+    }
 
     // Also reachable from the `<>` spelling, which `= 'group'` does not admit.
     let plan = explain(

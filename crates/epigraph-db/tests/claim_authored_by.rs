@@ -1733,14 +1733,18 @@ async fn group_profile(pool: &PgPool, agent: Uuid) {
     .expect("group profile");
 }
 
-/// Row D1: a human that INGESTED a claim it did not file (its ingest is no
-/// claim, so no arm names it) is listed among the ingesters by id without
-/// its name to an outsider, under the `oauth:<client row id>` placeholder a
-/// nameless service principal carries (operator ruling C7); a teammate sees
-/// the name (CALIBRATION). The filer, which the reader can read a claim of,
-/// stays named.
+/// Row D1, after operator ruling C6: a human that INGESTED a claim it did not
+/// file is listed among the ingesters, and its PUBLIC ingest record is a
+/// public assertion of its own, so it is NAMED to an outsider (migration 295).
+/// Before C6 the record named no one and the outsider got the C7 placeholder;
+/// a marked public record the outsider can read now always names its
+/// ingester, so that case no longer exists on this surface. CALIBRATION: with
+/// the record made non-public (a privatized record, which the outsider cannot
+/// read and so is not listed), the ingest no longer names the person, and the
+/// outsider reads it unnamed (`oauth:<client row id>`) on its card. A teammate
+/// sees the name throughout. The filer stays named.
 #[sqlx::test(migrations = "../../migrations")]
-async fn an_unnamed_human_ingester_is_listed_by_id_without_its_name(pool: PgPool) {
+async fn a_human_ingesters_public_record_names_it_to_every_reader(pool: PgPool) {
     let scoped = app_scoped(&pool).await;
     let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider").await;
     let (filer, _) = fixture::seed_agent_with_group(&pool, "filer").await;
@@ -1795,15 +1799,44 @@ async fn an_unnamed_human_ingester_is_listed_by_id_without_its_name(pool: PgPool
         .await
         .expect("the fixture's one client");
     assert_eq!(
-        ingester_name(&out),
-        Some(format!("oauth:{client}")),
-        "an outsider gets no name: the placeholder a nameless service principal carries (C7)"
+        ingester_name(&out).as_deref(),
+        Some("Gwendolyn Ingest"),
+        "a public ingest record names its ingesting human to an outsider (C6)"
     );
     let mine = claim_block_as_filed(&pool, &scoped, mate, claim, filer).await;
     assert_eq!(
         ingester_name(&mine).as_deref(),
         Some("Gwendolyn Ingest"),
         "CALIBRATION: a teammate sees the name"
+    );
+
+    // CALIBRATION: without the public record, nothing names the person to the
+    // outsider; it reads as the placeholder a nameless service principal
+    // carries (C7).
+    sqlx::query(
+        "UPDATE edges SET visibility = 'group', owner_group_id = $2, co_owner_group_id = NULL \
+          WHERE relationship = 'ingested_claim' AND target_id = $1",
+    )
+    .bind(claim)
+    .bind(team)
+    .execute(&pool)
+    .await
+    .expect("make the record non-public");
+    let names = {
+        let v = epigraph_db::visibility::Viewer::resolve(&pool, outsider)
+            .await
+            .expect("viewer");
+        let mut read = scoped.read_as(&v).await.expect("read_as");
+        let n = epigraph_db::AgentDisclosureRepository::names(&mut read, &[ingesting_human])
+            .await
+            .expect("names");
+        read.commit().await.expect("finish");
+        n
+    };
+    assert_eq!(
+        names.get(&ingesting_human).cloned().flatten(),
+        Some(format!("oauth:{client}")),
+        "with no public assertion the outsider gets the placeholder (C7)"
     );
 }
 
