@@ -1005,9 +1005,12 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 bad_mass.0
             );
 
-            // Check frames have hypotheses
+            // Check frames have hypotheses. `frames.hypotheses` is `text[]`,
+            // so its size is `cardinality` (0 for an empty array, where
+            // `array_length` would be NULL); `jsonb_array_length` was refused
+            // by Postgres on every call (backlog 06385b31).
             let bad_frames: (i64,) = sqlx::query_as(
-                "SELECT COUNT(*) FROM frames WHERE hypotheses IS NULL OR jsonb_array_length(hypotheses) = 0"
+                "SELECT COUNT(*) FROM frames WHERE hypotheses IS NULL OR cardinality(hypotheses) = 0",
             )
             .fetch_one(&pool)
             .await
@@ -1420,8 +1423,10 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                         cluster_claims.len()
                     );
                 } else {
-                    // Create frame
-                    let hyp_json = serde_json::to_value(&hypotheses).unwrap();
+                    // Create frame. `frames.hypotheses` is `text[]`
+                    // (migration 001), so the names bind as a `Vec<String>`;
+                    // a `serde_json::Value` binds as `jsonb`, which Postgres
+                    // refused on every insert (backlog 06385b31).
                     // Tenancy declaration (PR-16): same as
                     // `FrameRepository::create` -- an instance-wide hypothesis
                     // space with no parent and no author.
@@ -1430,7 +1435,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                          VALUES ($1, $2, $3, $4) RETURNING id",
                     )
                     .bind(&frame_name)
-                    .bind(&hyp_json)
+                    .bind(&hypotheses)
                     .bind(epigraph_core::TenancyDecl::instance_wide().visibility_bind())
                     .bind(epigraph_core::TenancyDecl::instance_wide().owner_group_bind())
                     .fetch_one(&pool)
