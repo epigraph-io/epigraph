@@ -4489,6 +4489,29 @@ restart.
   one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
   235, then 271, then the rest (production's order) and fails on one that breaks either
   rule.
+- **272**: `human_identity_disclosure` (spec
+  `docs/superpowers/specs/2026-11-24-human-identity-visibility-design.md` sections 3, 4 and
+  6.1). Adds the ONE predicate deciding whether a human principal's name is shown to a viewer;
+  no surface calls it yet. `epigraph_is_human_principal(agent)`: the structural, status-free
+  human evidence (a linked `client_type = 'human'` OAuth client, or a `human_operators` row;
+  never `agents.agent_type`). `epigraph_agent_disclosure_for(target, principal, groups,
+  privileged)`: THE rule, returning `(named, details)`. A non-human is always named and its
+  details follow today's profile rule; a human is named when privileged, self, opted in
+  (`profile_visibility = 'public'`), sharing an active team or community with the viewer
+  (H's side through 236's `epigraph_live_memberships_unbound`), or when some agent ever bound
+  to it (live or retired link, live or revoked 149 allowance) filed a public claim, or a
+  group claim in a group the viewer reads; its details are `named AND` the profile rule. The
+  claim arms are forced `LATERAL ... LIMIT 1` probes per bound agent. Session wrappers
+  `epigraph_agent_disclosure(target)` and `epigraph_human_named_to_viewer(target)` read the
+  stamped `epigraph.principal_id` / `epigraph.group_ids`, `epigraph_bypass()` and
+  `epigraph_is_elevated()`. All four on 172's form, owned by `epigraph_maintenance`, PUBLIC
+  revoked; only the two wrappers granted to `epigraph_app`; `COST 1000` on the core and both
+  wrappers. Also `idx_author_binding_clients_operator`, and the trigger
+  `epigraph_oauth_clients_human_evidence_guard` (HEV01, 55000): a linked human client is
+  never deleted or retyped, because it is the evidence that fails OPEN if lost. Fails CLOSED
+  under a non-member owner (no binding, membership or group claim is read). Pinned by
+  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/272-undo.sql`.
+  **Deploy order:** migrate BEFORE a binary that calls the wrappers (42883 without them).
 
 ## `-- no-transaction` migrations
 

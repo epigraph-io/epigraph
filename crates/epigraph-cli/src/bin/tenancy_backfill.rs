@@ -2847,6 +2847,19 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Under a non-member owner it reads no row: fail CLOSED, no attachment
     // shown.
     ("epigraph_disclosed_role_attachments", 269),
+    // 272, the human-identity disclosure predicate. The core reads the FORCEd
+    // `operator_links`, `claims` and `group_memberships` through
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner it
+    // reads no binding, membership or group claim: a human is named only by
+    // its own public claim, self or opt-in (fail CLOSED, fewer names shown).
+    // The evidence helper reads `oauth_clients` (no policy) and
+    // `human_operators` (granted to maintenance): under a non-member owner
+    // without that grant it raises, which fails every read loudly. The two
+    // wrappers delegate to the core.
+    ("epigraph_is_human_principal", 272),
+    ("epigraph_agent_disclosure_for", 272),
+    ("epigraph_agent_disclosure", 272),
+    ("epigraph_human_named_to_viewer", 272),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4044,6 +4057,31 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "epigraph_disclosed_role_attachments",
         "public.epigraph_disclosed_role_attachments(uuid[])",
         true,
+    ),
+    // 272: the human-identity disclosure session wrappers, called on the
+    // request DSN by every surface that names an agent; without the grant
+    // every such read is 42501. The core and the evidence helper are
+    // maintenance-only: an application-callable explicit audience would be a
+    // membership oracle.
+    (
+        "epigraph_agent_disclosure",
+        "public.epigraph_agent_disclosure(uuid)",
+        true,
+    ),
+    (
+        "epigraph_human_named_to_viewer",
+        "public.epigraph_human_named_to_viewer(uuid)",
+        true,
+    ),
+    (
+        "epigraph_agent_disclosure_for",
+        "public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)",
+        false,
+    ),
+    (
+        "epigraph_is_human_principal",
+        "public.epigraph_is_human_principal(uuid)",
+        false,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
