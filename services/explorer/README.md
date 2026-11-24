@@ -102,9 +102,22 @@ offered: the picked map, not the viewer's layout, decides what a theme shows,
 and a map-scoped read for them does not exist yet. Their rules are pure
 functions in `static/atlas_views.js`, tested with
 `node --test js-tests/atlas_views.test.cjs`. Links are drawn within each page
-of up to 100 claims, not between pages. Not built yet: the zoomable Sources and
-Timeline tabs of the design (lanes per source, `x…`/`tc-` deep links), the
-provenance panel's `authored_by` and ingestion notes, and tours.
+of up to 100 claims, not between pages.
+
+A claim's panel has a **Provenance** section, from the kernel's `authored_by`
+block on `GET /claims/{id}`, which `/bff/atlas/claim/{id}` reads once the
+claim's context has loaded. For a claim that a document's ingest created, it
+shows the document (linked only through a DOI) and its authors. Authors who
+are still awaiting countersignature, and authors a later ingest added, are
+listed apart and never as authors. It also shows the ingestion note: by whom,
+using which model, and on what date. For a claim an agent filed directly, it
+names the human, then the agent. Both kinds end with the filing date and the
+other documents that recorded the claim. The model and the prompt snapshot
+appear only when the kernel shows them to this viewer. An API without the
+block leaves the section unavailable, and the rest of the panel is unaffected.
+The rules are `provenanceRows` in `static/atlas_views.js`. Not built yet: the
+zoomable Sources and Timeline tabs of the design (lanes per source,
+`x…`/`tc-` deep links), people behind agents in Sources, and tours.
 
 The Atlas draws on a canvas with a few d3 modules (`d3-color`,
 `d3-interpolate`, `d3-ease`, `d3-hierarchy`, `d3-dispatch`, `d3-timer`,
