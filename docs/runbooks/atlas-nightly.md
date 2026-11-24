@@ -13,9 +13,11 @@ Nothing in the repository installs it. Every step below is an operator step.
    as `ClaimThemeRepository::assign_unthemed_batch` does; the dry run's
    `themes.unthemed_embedded` counts the same set) to its nearest theme
    centroid. Themes over
-   W1's member cap (default 2,000) are REPORTED under `themes.over_cap`, never
-   split: the theme split stays W1's operator-run tool
-   (`scripts/theme_cap_split.py`, off-box compute).
+   W1's member cap (default 2,000) are REPORTED under `themes.over_cap`.
+   Without the off-box hook (below) they are never split here: the theme
+   split stays W1's operator-run tool (`scripts/theme_cap_split.py`, off-box
+   compute). With the hook and `--theme-cap-split`, they are split through
+   it before the maps are read (`themes.split`).
 2. **Maps.** For every map with a finished run (or each `--map`), in one
    REPEATABLE READ snapshot:
    - updates each theme's "by meaning" tree (a new claim joins the leaf with
@@ -40,7 +42,82 @@ Nothing in the repository installs it. Every step below is an operator step.
    (`"status": "unchanged"`).
 
 No UMAP or k-means runs on the box. A theme new to a map that does not fit
-one leaf is `unbuilt` until an operator builds the map (below).
+one leaf is `unbuilt` until an operator builds the map (below), or, with the
+off-box hook, has its meaning tree computed off the box and is built the same
+night (the map's `offbox`).
+
+## The off-box hook (optional)
+
+The clustering the box does not run can go through ONE command you provide,
+the same off-box step as the operator tools, on ids and embeddings only
+(backlog 691d283a). Off by default; turn it on with:
+
+```bash
+atlas_nightly --apply --offbox-command /usr/local/lib/epigraph/offbox \
+  --offbox-dir /var/lib/epigraph-atlas/offbox \
+  [--theme-cap-split /opt/epigraph/scripts/theme_cap_split.py [--python python3]] \
+  [--offbox-timeout-secs 3600]
+```
+
+The command is run as
+
+```text
+<command> theme-cap     <export-dir> <result-file>   # W1: split the over-cap themes
+<command> atlas-meaning <export-dir> <result-file>   # W4: a new theme's meaning tree
+```
+
+and must write `<result-file>` and exit 0. `scripts/atlas_offbox_compute.py`
+is a reference command that computes in place (it needs numpy, scikit-learn
+and umap-learn, no database). On a box without UMAP, point
+`--offbox-command` at a wrapper that copies `<export-dir>` to a compute host,
+runs `atlas_offbox_compute.py` there with the same three arguments, and
+copies the result back.
+
+What the box keeps:
+- The command gets a CLEARED environment (`PATH`, `HOME`, `LANG` only): never
+  `DATABASE_URL`, `MAINTENANCE_DATABASE_URL` or another credential. Give the
+  wrapper what it needs (an SSH key, a host name) through its own files.
+- The export (claim ids and embeddings; for `atlas-meaning` also per-theme
+  attachment integers; no text, no agent or evidence id, no tenancy) is
+  written owner-only under `--offbox-dir`, which must exist and be
+  owner-only (`chmod 700`), and is DELETED as soon as the command returns,
+  whatever it returned.
+- The command runs in its own process group with no stdin and its stdout
+  discarded; its stderr goes to the journal. At `--offbox-timeout-secs` the
+  group is killed and the call counts as failed.
+- A dry run (no `--apply`) exports nothing and runs nothing; it reports
+  `themes.split.would_split` and each map's `offbox.would_compute`.
+
+Every result is checked on the box as an operator's result is:
+- `theme-cap` runs through `theme_cap_split.py offbox`: its export, the
+  command, then its apply with every structural check (parts exactly the live
+  members, under the cap, the result naming exactly the exported themes, one
+  transaction). It is NOT checked against a reviewed plan (there is none
+  without UMAP on the box): the manifest records `review: "offbox-command"`.
+  The manifest stays in the call's directory under `--offbox-dir`
+  (`themes.split.report.manifest`); undo a nightly split with
+  `theme_cap_split.py reverse --manifest <it>`. Keep those manifests.
+- `atlas-meaning`: the tree must be for this map and hierarchy, at most this
+  cap, name exactly the exported themes, and pass W4's `check_tree` against
+  the theme's members at build time (every id the minted one, the leaves
+  exactly the members). A theme whose members changed since the export stays
+  `unbuilt` with `offbox_tree_refused` (the next night computes it again).
+  The links tree of the new theme is then built on the box from it, as the
+  nightly updates every other theme's.
+
+A split's new parts are new themes on every map that draws them; when one
+does not fit a leaf, the same night computes its meaning tree through the
+hook, so the split does not hide them. A part filled exactly to the cap by
+the unembedded placement (`theme_cap_core.unembedded_slots`) goes over it at
+the next assignment, so expect such a theme to be split again on a later
+night.
+
+A failed call (the command exits non-zero, times out, or returns a result the
+checks refuse) is reported (`themes.split.status` or a map's
+`offbox.status` is `failed`, with the error), the night still builds and
+writes every map it can, and the exit status is 1 so the alert fires. The
+whole night, off-box calls included, must fit the service's
+`TimeoutStartSec=` window; raise it when you enable the hook.
 
 ### The summary
 
@@ -63,7 +140,15 @@ newer run was published while the night ran; nothing was written) or
   one of its agents and evidence rows are still drawn, only the weakest
   edges among them are not;
 - `layout.relaid` (the levels laid out again) and `naming.renamed` (the
-  levels whose naming input changed), `naming.report.calls`.
+  levels whose naming input changed), `naming.report.calls`;
+- `offbox` (only with the hook, when the map had an `unbuilt` theme):
+  `status` `computed` (with `still_unbuilt`), `failed` (with `error`) or
+  `dry_run` (`would_compute`).
+
+At the top level, `themes.split` (only with `--theme-cap-split`, when a theme
+is over the cap): `status` `applied` (the script's `report`, and
+`still_over_cap` after it), `failed` (with `error`) or `dry_run`
+(`would_split`).
 
 A theme whose update FAILS does not fail the night. A leaf over the edge
 limit no longer fails one (above: several claims are split, one claim is
@@ -84,7 +169,8 @@ NOT clear it (the build would store the same leaf again): file the error
 file the error.
 
 Exit codes: 0 when every map was written, unchanged, skipped or a dry run;
-1 when a map failed or the night refused to start (the timer's alert fires);
+1 when a map failed, a configured off-box call failed, or the night refused
+to start (the timer's alert fires);
 2 for an argument error; 75 when another copy (the timer's, or an
 operator's) holds the nightly lock: NOTHING ran, it prints `{"locked": true}`
 and says so on stderr; retry once the other copy has finished. The service
