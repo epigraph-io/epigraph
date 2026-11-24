@@ -4489,6 +4489,24 @@ restart.
   one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
   235, then 271, then the rest (production's order) and fails on one that breaks either
   rule.
+- **276**: public `agent_prompt_history_blob` (backlog aaaf3cad). Adds the SECURITY DEFINER
+  `epigraph_agent_prompt_history_blob(agent, blob_hash) RETURNS TABLE(content bytea)`:
+  161's prompt-history gate (its admin assignment and refusal token for token, AID06 for a
+  refused caller, checked BEFORE the key is looked at; 22004 for a NULL agent or key), 161's
+  64-generation walk reduced to its members, and 161's per-member `readable` mark; it returns
+  the one stored zstd frame for the key when a readable member's snapshot names it (fetched
+  by primary key, no other blob read), else no row. Owned by `epigraph_maintenance` on
+  `pg_catalog, pg_temp`, EXECUTE granted to `epigraph_app` and `epigraph_maintenance`
+  (guarded). GET /api/v1/agents/:id/prompt-history/blobs/:hash reads through it instead of
+  161's whole-lineage `epigraph_agent_prompt_history`, which fetched every file of the
+  lineage for one (six blob rows for one file of a four-file, three-generation lineage; now
+  one). 161's definer is unchanged. Pinned by `epigraph-db/tests/prompt_history_blob_definer.rs`
+  (blob rows fetched per read, counted in `pg_stat_xact_user_tables` and calibrated against
+  161; catalog shape; gate, mark and walk-bound text and caller parity with 161; every key
+  answered as 161 answers it; NULL refusals; the undo) and
+  `epigraph-api/tests/agent_prompt_history_route.rs`. Undo: `docs/runbooks/276-undo.sql`.
+  **Deploy order:** migrate BEFORE the binary that reads files through it (without it every
+  file read is a 500, 42883); an older binary ignores it.
 
 ## `-- no-transaction` migrations
 

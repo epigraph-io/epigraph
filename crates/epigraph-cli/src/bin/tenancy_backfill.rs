@@ -2223,6 +2223,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // nothing and has no lineage" (quiet, the stake that makes the owner a
     // control here).
     ("epigraph_agent_prompt_history_meta", 268),
+    // 276 (backlog aaaf3cad), the one-file prompt-history read behind 161's
+    // gate, for GET /api/v1/agents/:id/prompt-history/blobs/:hash. It reads
+    // the FORCEd `agent_succession`, `agent_prompt_snapshots` and
+    // `agent_prompt_blobs`, whose read policy admits only
+    // `epigraph_definer_bypass()`: under a non-member owner it sees no
+    // snapshot, so every file read answers "no readable snapshot names it"
+    // (a 404; quiet, the stake that makes the owner a control here).
+    ("epigraph_agent_prompt_history_blob", 276),
     // 115, owner-scoped DELETE. Two fail CLOSED under a non-member owner: the
     // writability helper's read of `claims` / `evidence` is RLS-filtered (a node
     // the session cannot see answers false, which it would anyway), and the
@@ -4050,6 +4058,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_agent_prompt_history_meta",
         "public.epigraph_agent_prompt_history_meta(uuid, integer, uuid, timestamptz, uuid, integer)",
+        true,
+    ),
+    // 276: the prompt-history file read calls it on the request DSN; without
+    // the grant every file read is 42501.
+    (
+        "epigraph_agent_prompt_history_blob",
+        "public.epigraph_agent_prompt_history_blob(uuid, bytea)",
         true,
     ),
     // 267: every edge withdrawal on the application role
