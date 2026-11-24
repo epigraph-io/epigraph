@@ -2524,7 +2524,7 @@ pub async fn patch_claim(
     let (before_labels, after_labels, before_props, after_props, before_trace, after_trace) =
         if admin_path {
             let w = ClaimRepository::admin_patch_claim_conn(
-                &mut *tx,
+                &mut tx,
                 epigraph_db::AdminToken {
                     client_id: auth.client_id,
                     jti: auth.jti,
@@ -2554,7 +2554,7 @@ pub async fn patch_claim(
                 remove_labels: request.remove_labels.clone().unwrap_or_default(),
             };
             let diff = epigraph_db::ClaimRepository::patch_claim_atomic_conn(
-                &mut *tx,
+                &mut tx,
                 claim_id,
                 &patch_input,
             )
@@ -2600,7 +2600,7 @@ pub async fn patch_claim(
         };
 
     // ── 8. Re-fetch updated claim (for response) ─────────────────────────────
-    let updated_claim = ClaimRepository::get_by_id_conn(&mut *tx, &viewer, claim_id)
+    let updated_claim = ClaimRepository::get_by_id_conn(&mut tx, &viewer, claim_id)
         .await
         .map_err(|e| ApiError::DatabaseError {
             message: e.to_string(),
@@ -2653,7 +2653,7 @@ pub async fn patch_claim(
     // ── 11. Append provenance — fail hard, inside transaction ────────────────
     let principal_id = auth.owner_id.unwrap_or(auth.client_id);
     ProvenanceRepository::append_conn(
-        &mut *tx,
+        &mut tx,
         "claim",
         id,
         "patch",
