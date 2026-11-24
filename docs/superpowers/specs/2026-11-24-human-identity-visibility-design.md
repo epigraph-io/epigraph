@@ -1431,6 +1431,12 @@ Not covered by part B (open):
 - **C7** stays the brief's literal `display_name: null` (option (b)); the main session's
   measurement of nameless non-human agents is still owed to the operator.
 - **C12** (above): the worst-case budget.
+- **After review (tests#5), residual:** MCP `query_paper`, MCP `get_claim`'s `authored_by`,
+  PROV export and `SourceOverviewRepository::agents` have no tool- or route-level H-vs-N
+  test; each is a thin wrapper over a builder tested at the database level
+  (`list_authors_by`, the `claim_authored_by` tests), and PROV, sources and the leaderboard
+  derive agents from claims the caller reads, so the readable-claim / public-claim arms name
+  them and the redaction is near-unreachable there.
 
 ## 17. Deploy notes
 
@@ -1510,3 +1516,26 @@ now says it; "Part" is where the change is built.
 
 Rejected outright: none. Revision 1's `refusal_codes.rs` registration (§8) was wrong and is
 replaced by a local mapper; that is a correction, not a finding.
+
+## 19. Implementation review resolution (round 2, after part B)
+
+Three reviews of the implementation (correctness / migrations / security, leak sweep, tests)
+raised 25 findings. Dispositions; none was rejected outright.
+
+| Finding | Disposition | Where |
+|---|---|---|
+| correctness#1, leaks#1, tests#1 (BLOCKING) role-holding `OCCUPIES` edges world-readable | Fixed: migration 278, team-only owner rule, bind/unbind re-own, backfill. One deviation, the fix agent's call: a holder with no personal group gets one minted instead of a refusal (§16.A3) | §7 K1, §10 M7 |
+| correctness#2, leaks#2 (BLOCKING) `hide_pending` marker | Fixed: the count is served to every reader; the premise was false | §5, §7 A2, B16 |
+| correctness#3 (MAJOR) role-derived arm cost | Fixed: migration 279, arm last plus a cheap probe pinned equal to 249; measured 617 -> 28 ms | §10 M8, §11.1 |
+| correctness#4, leaks#3 DB-layer real-name storage | Recorded: [OPEN] C13 | §16.C13 |
+| correctness#5 HEV01 `agent_id` | Fixed: migration 280 | §10 M9 |
+| correctness#6 274's boot cost | Recorded (274 not edited) | §17 |
+| correctness#7, leaks#4a, tests#2 `update_agent` | Fixed: mixed body 400; response redacted | §7 C5 |
+| correctness#8 unattributable opt-in | Recorded: no correlation GUC on HEAD | §15.R9 |
+| correctness#9 `find_agent` text | Fixed | §7 I1 |
+| leaks#4 lint blind spots | Fixed: RETURNING and `profile_visibility` scanned; `agent_type` left out with the reason | §16a |
+| leaks#5 TGP03 | Unchanged by design; [OPEN] C10 stays visible | §15.R11 |
+| tests#3, #3b, #4, #5, #8, #8b | Fixed by new or strengthened tests (tests#5's remaining tool-level rows recorded as residual, §16a) | §16a |
+| tests#6 equivalent mutant | Kept as defence in depth, commented | §9.2 |
+| tests#7 perf harness | Recorded: a measurement harness, not a gate | §11.1 |
+| tests#9 pinned-test audit | No defect; the MCP fixture asymmetry is commented | - |
