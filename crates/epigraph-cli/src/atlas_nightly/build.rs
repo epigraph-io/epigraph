@@ -30,7 +30,9 @@ use crate::atlas_links::graph::{
 };
 use crate::atlas_meaning::docs::level_documents_with_switch;
 use crate::atlas_meaning::files::ResultTheme;
-use crate::atlas_meaning::tree::{check_tree, map_key, resolve_tree, MeaningTree, NodeBody};
+use crate::atlas_meaning::tree::{
+    check_tree, map_key, resolve_tree, MeaningTree, NodeBody, WireGroup, WireKind,
+};
 use crate::atlas_naming::backend::NameBackend;
 use crate::atlas_naming::build::{read_member_texts, read_previous};
 use crate::atlas_naming::name::{name_levels, plan_samples, NamingOptions, NamingRecord};
@@ -116,9 +118,29 @@ struct BuiltTheme {
 enum ThemeOutcome {
     Built(BuiltTheme),
     /// A theme new to the map that does not fit one leaf, with no tree
-    /// computed off the box for it (or one that no longer checks against its
-    /// members, with why).
-    Unbuilt(usize, Option<String>),
+    /// computed off the box for it (or one W4's check refused, with why).
+    Unbuilt(usize, Option<Refused>),
+}
+
+/// Why W4's check refused a tree the off-box command returned.
+struct Refused {
+    why: String,
+    /// The tree's leaves are not the theme's members now: a claim arrived or
+    /// left since the export (churn; the next night computes it again).
+    /// Otherwise the leaves are exactly the members and the TREE is wrong
+    /// (an id that is not the minted one, a bad shape): the command is
+    /// broken, and the night must say so.
+    members_changed: bool,
+}
+
+/// The claims under the leaves of an off-box tree, as the tree states them
+/// (unchecked).
+fn leaf_claims_of(groups: &[WireGroup]) -> BTreeSet<Uuid> {
+    groups
+        .iter()
+        .filter(|g| g.kind == WireKind::Leaf)
+        .flat_map(|g| g.members.iter().flatten().copied())
+        .collect()
 }
 
 fn db_hierarchy(h: Hierarchy) -> AtlasHierarchy {
@@ -282,10 +304,18 @@ async fn build_theme(
         // The off-box tree, checked exactly as an operator's result is: every
         // id the minted one, the leaves exactly the members now. A member
         // that arrived or left since the export fails the check, and the
-        // theme stays unbuilt (the next night computes it again).
+        // theme stays unbuilt (the next night computes it again); a tree
+        // whose leaves ARE the members but that still fails is malformed,
+        // which the caller reports as a failed call.
         match check_tree(map, AtlasHierarchy::Meaning, theme, &c.groups, &member_set) {
             Ok(t) => (shape_of(&t), ids.len(), 0),
-            Err(e) => return Ok(ThemeOutcome::Unbuilt(ids.len(), Some(format!("{e:#}")))),
+            Err(e) => {
+                let refused = Refused {
+                    why: format!("{e:#}"),
+                    members_changed: leaf_claims_of(&c.groups) != member_set,
+                };
+                return Ok(ThemeOutcome::Unbuilt(ids.len(), Some(refused)));
+            }
         }
     } else {
         return Ok(ThemeOutcome::Unbuilt(ids.len(), None));
@@ -544,8 +574,9 @@ async fn read_and_build(
                     "reason": "new to the map and over one leaf: configure the off-box hook \
                                (--offbox-command) or build it with atlas_meaning and atlas_links \
                                (operator)"});
-                if let Some(why) = why {
-                    row["offbox_tree_refused"] = json!(why);
+                if let Some(r) = why {
+                    row["offbox_tree_refused"] = json!(r.why);
+                    row["offbox_members_changed"] = json!(r.members_changed);
                 }
                 unbuilt.push(row);
             }
@@ -660,8 +691,19 @@ pub async fn night_for_map(
                     };
                     b = again;
                     let left = unbuilt_theme_ids(&b.themes);
-                    offbox_report = json!({"status": "computed", "themes": unbuilt,
-                                           "still_unbuilt": left});
+                    let malformed = malformed_offbox_trees(&b.themes);
+                    offbox_report = if malformed.is_empty() {
+                        json!({"status": "computed", "themes": unbuilt, "still_unbuilt": left})
+                    } else {
+                        // Leaves exactly the members, yet W4's check refused
+                        // the tree: the command is broken (not churn), so the
+                        // call failed and the night's alert must fire.
+                        json!({"status": "failed", "themes": unbuilt, "still_unbuilt": left,
+                               "malformed": malformed,
+                               "error": "the off-box command returned trees W4's check refuses \
+                                         although their leaves are exactly the members (see \
+                                         offbox_tree_refused)"})
+                    };
                 }
                 Err(e) => {
                     offbox_report = json!({"status": "failed", "themes": unbuilt,
@@ -834,6 +876,21 @@ fn unbuilt_theme_ids(themes: &Value) -> Vec<Uuid> {
         .map(|a| {
             a.iter()
                 .filter_map(|t| serde_json::from_value(t["theme_id"].clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `unbuilt` themes of a map's theme report whose off-box tree W4's
+/// check refused although its leaves were exactly the members (a malformed
+/// tree, not churn).
+fn malformed_offbox_trees(themes: &Value) -> Vec<Value> {
+    themes["unbuilt"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|t| t["offbox_members_changed"] == json!(false))
+                .map(|t| t["theme_id"].clone())
                 .collect()
         })
         .unwrap_or_default()

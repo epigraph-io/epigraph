@@ -108,7 +108,12 @@ Every result is checked on the box as an operator's result is:
   cap, name exactly the exported themes, and pass W4's `check_tree` against
   the theme's members at build time (every id the minted one, the leaves
   exactly the members). A theme whose members changed since the export stays
-  `unbuilt` with `offbox_tree_refused` (the next night computes it again).
+  `unbuilt` with `offbox_tree_refused` and `offbox_members_changed: true`
+  (the next night computes it again; this is not a failure). A tree whose
+  leaves ARE the members but that the check still refuses (an id that is not
+  the minted one, a bad shape: a compute host on another version) has
+  `offbox_members_changed: false`, and the map's `offbox.status` is `failed`
+  with the themes under `malformed`.
   The links tree of the new theme is then built on the box from it, as the
   nightly updates every other theme's.
 
@@ -120,7 +125,8 @@ the next assignment, so expect such a theme to be split again on a later
 night.
 
 A failed call (the command exits non-zero, times out, or returns a result the
-checks refuse) is reported (`themes.split.status` or a map's
+checks refuse; a member that changed during the call is not a failure) is
+reported (`themes.split.status` or a map's
 `offbox.status` is `failed`, with the error), the night still builds and
 writes every map it can, and the exit status is 1 so the alert fires. The
 whole night, off-box calls included, must fit the service's

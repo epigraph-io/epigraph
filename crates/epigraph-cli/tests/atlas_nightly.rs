@@ -2026,6 +2026,16 @@ fn result_file(
     theme: Uuid,
     parts: &[BTreeSet<Uuid>],
 ) -> std::path::PathBuf {
+    result_file_of(dir, map, theme, flat(map, M, theme, parts))
+}
+
+/// A result file holding `groups` as `theme`'s tree.
+fn result_file_of(
+    dir: &std::path::Path,
+    map: AtlasMap,
+    theme: Uuid,
+    groups: Vec<WireGroup>,
+) -> std::path::PathBuf {
     let doc = ResultDoc {
         format: "atlas-meaning-result/1".to_string(),
         map: map_key(map),
@@ -2036,7 +2046,7 @@ fn result_file(
         themes: vec![ResultTheme {
             theme_id: theme,
             id_chunk_cuts: 0,
-            groups: flat(map, M, theme, parts),
+            groups,
         }],
     };
     let path = dir.join("prepared.json");
@@ -2184,11 +2194,15 @@ async fn an_offbox_tree_that_does_not_match_the_members_leaves_the_theme_unbuilt
         serde_json::json!([tn]),
         "{r:#}"
     );
+    // Churn, not a broken command: reported, no alert (`night` asserts the
+    // night is ok).
+    assert_eq!(r["offbox"]["status"], "computed", "{r:#}");
     let unbuilt = r["themes"]["unbuilt"].as_array().unwrap();
     assert!(
         unbuilt[0]["offbox_tree_refused"].as_str().is_some(),
         "{r:#}"
     );
+    assert_eq!(unbuilt[0]["offbox_members_changed"], true, "{r:#}");
     let after = levels(&pool, latest(&pool, a_map).await).await;
     assert!(!after.contains_key(&("meaning".to_string(), root_id(a_map, M, tn))));
     assert!(after.contains_key(&("meaning".to_string(), root_id(a_map, M, c.t2))));
@@ -2322,6 +2336,58 @@ async fn themes_over_the_cap_are_split_through_the_theme_cap_script(pool: PgPool
     for m in s["maps"].as_array().unwrap() {
         assert_ne!(m["status"], "failed", "{s:#}");
     }
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// Review finding 1: a tree whose leaves ARE the members but that W4's check
+/// still refuses (here a leaf id that is not the minted one, as from a
+/// compute host on another version) is a broken command, not churn: the
+/// map's call is `failed` and the night's status fails, so the alert fires
+/// instead of the theme staying unbuilt silently every night. The rest of
+/// the map is still written.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_offbox_tree_with_wrong_ids_fails_the_night(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let parts = vec![set(&members[..30]), set(&members[30..])];
+    let mut groups = flat(a_map, M, tn, &parts);
+    // Re-id the second leaf consistently (the root's children follow), so
+    // only the minted-id check fails; the leaves still cover the members.
+    let wrong = Uuid::new_v4();
+    let old = groups[2].id;
+    groups[2].id = wrong;
+    for k in groups[0].children.as_mut().unwrap() {
+        if *k == old {
+            *k = wrong;
+        }
+    }
+    let cmd = fake_command(&dir, &result_file_of(&dir, a_map, tn, groups));
+    let o = NightOptions {
+        offbox: Some(offbox(cmd, work.clone())),
+        ..opts()
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let (summary, ok) = run_night(&mut conn, &viewer, &namer(), &o).await.unwrap();
+    assert!(
+        !ok,
+        "a malformed off-box tree must fail the night: {summary:#}"
+    );
+    let r = map_report(&summary, a_map);
+    assert_eq!(r["status"], "written", "{r:#}");
+    assert_eq!(r["offbox"]["status"], "failed", "{r:#}");
+    assert_eq!(r["offbox"]["malformed"], serde_json::json!([tn]), "{r:#}");
+    let unbuilt = r["themes"]["unbuilt"].as_array().unwrap();
+    assert_eq!(unbuilt[0]["offbox_members_changed"], false, "{r:#}");
+    let after = levels(&pool, latest(&pool, a_map).await).await;
+    assert!(!after.contains_key(&("meaning".to_string(), root_id(a_map, M, tn))));
+    assert!(after.contains_key(&("meaning".to_string(), root_id(a_map, M, c.t2))));
     for d in [&dir, &work] {
         std::fs::remove_dir_all(d).ok();
     }
