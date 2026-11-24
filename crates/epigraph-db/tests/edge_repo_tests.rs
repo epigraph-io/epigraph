@@ -10,7 +10,7 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
     // Set up real source (paper) and target (claim) so the edge-validation
     // trigger doesn't reject the insert.
     let paper_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.1234/idem",
         Some("Idempotency"),
         None,
@@ -64,7 +64,7 @@ async fn create_if_not_exists_is_idempotent(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_if_not_exists_distinguishes_by_relationship(pool: PgPool) {
     let paper_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.1234/rel",
         Some("Relationship"),
         None,

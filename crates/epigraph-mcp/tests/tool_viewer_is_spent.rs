@@ -1207,17 +1207,19 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `ClaimRepository::update_trace_id_conn`,
     // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
     // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
-    // `EvidenceRepository::create`, `PaperRepository::get_or_create`,
+    // `EvidenceRepository::create`, `PaperRepository::get_or_create_stored`,
     // `ReasoningTraceRepository::create`,
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
     // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
     // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
-    // migration 246 `PaperRepository::get_or_create` writes `papers` in the ingest's declared
-    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
+    // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
+    // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`; since
+    // backlog b995f117 it is the only write of that row on the detached path too. The body of
+    // `do_ingest_document_reporting` (a thin wrapper now, with no SQL of its own).
     (
         "ingestion.rs",
-        "do_ingest_document_reporting",
+        "ingest_document_walk_reporting",
         &[
             "ClaimIngestRepository::record_signed_conn",
             "ClaimIngestRepository::record_signed_conn",
@@ -1228,7 +1230,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_if_absent_including_retracted_signed_conn",
             "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
             "EvidenceRepository::create",
-            "PaperRepository::get_or_create",
+            "PaperRepository::get_or_create_stored",
             "PaperRepository::licence",
             "ReasoningTraceRepository::create",
             "begin_ingest_tx",
@@ -1248,13 +1250,13 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // `ClaimRepository::update_trace_id_conn`,
     // `EdgeRepository::create_if_absent_including_retracted_signed_conn`,
     // `EdgeRepository::create_processed_by_stamp_if_absent_signed_conn`,
-    // `EvidenceRepository::create`, `PaperRepository::get_or_create`,
+    // `EvidenceRepository::create`, `PaperRepository::get_or_create_stored`,
     // `ReasoningTraceRepository::create`,
     // `epigraph_db::create_ingest_written_edge_if_absent_conn`, `label_resolved_claim`,
     // `persist_planned_claim`; opener: `begin_ingest_tx`; authority:
     // `resolve_ingest_visibility`; stamped: `PaperRepository::licence`, read by the id the
     // write returned on the same stamped transaction; no SQL: `spawn_ingest_embeds`. Since
-    // migration 246 `PaperRepository::get_or_create` writes `papers` in the ingest's declared
+    // migration 246 `PaperRepository::get_or_create_stored` writes `papers` in the ingest's declared
     // scope on that stamped transaction (`begin_ingest_tx`), not on `server.pool`.
     (
         "ingestion.rs",
@@ -1268,7 +1270,7 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_if_absent_including_retracted_signed_conn",
             "EdgeRepository::create_processed_by_stamp_if_absent_signed_conn",
             "EvidenceRepository::create",
-            "PaperRepository::get_or_create",
+            "PaperRepository::get_or_create_stored",
             "PaperRepository::licence",
             "ReasoningTraceRepository::create",
             "begin_ingest_tx",
@@ -1282,26 +1284,16 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
             "spawn_ingest_embeds",
         ],
     ),
-    // write: `PaperRepository::get_or_create` (migration 246: the ingest's declared scope, on its
-    // stamped transaction); opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`.
-    (
-        "ingestion.rs",
-        "ensure_paper_node",
-        &[
-            "PaperRepository::get_or_create",
-            "begin_ingest_tx",
-            "resolve_ingest_visibility",
-        ],
-    ),
     // opener: `begin_ingest_tx`; authority: `resolve_ingest_visibility`; stamped:
-    // `PaperRepository::find_in_scope`, the `papers` row of the ingest's own declared scope on its
-    // stamped transaction (forced row security since migration 246); it returns an id the write
-    // would reuse, never another scope's row.
+    // `PaperRepository::planned`, the `papers` row of the ingest's own declared scope on its
+    // stamped transaction (forced row security since migration 246); it returns the id the write
+    // would reuse, never another scope's row, or the id a new row is to take (derived for a public
+    // row, random for a group's copy), read-only.
     (
         "ingestion.rs",
         "preflight_write_authority",
         &[
-            "PaperRepository::find_in_scope",
+            "PaperRepository::planned",
             "begin_ingest_tx",
             "resolve_ingest_visibility",
         ],

@@ -221,7 +221,7 @@ async fn register(
     decl: TenancyDecl,
 ) -> Result<Uuid, epigraph_db::DbError> {
     let mut tx = w.scoped.begin_as(viewer).await.expect("stamped tx");
-    let id = PaperRepository::get_or_create(&mut *tx, doi, Some("a title"), None, decl).await?;
+    let id = PaperRepository::get_or_create(&mut tx, doi, Some("a title"), None, decl).await?;
     tx.commit().await.expect("commit");
     Ok(id)
 }
@@ -319,6 +319,147 @@ async fn every_public_writer_converges_on_one_public_row(pool: PgPool) {
     assert_ne!(private, first);
     assert_eq!(visible(&w, &w.a, doi).await, vec![private, first]);
     assert_eq!(visible(&w, &w.s, doi).await, vec![first]);
+}
+
+// ── The id of a new row: public derived, private random ──
+//
+// A new PUBLIC row's id is derived from the document key
+// (`public_paper_id`), so a detached ingest can announce it before its walk
+// commits and a retry gets the same id. A group's PRIVATE copy gets a random
+// id: since 246 the document can have a public row too, and one primary key
+// cannot hold both; and an id computable from the key would let anyone name a
+// group's copy and probe whether the group holds the document.
+
+/// The public row's id is the document-derived one, the same under every
+/// spelling and every public writer, and a re-ingest returns it again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_public_rows_id_is_derived_from_the_key_and_stable_across_re_ingest(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let w = app_world(&pool).await;
+    let doi = "10.5555/derived-public";
+    let first = register(&w, &w.a, doi, TenancyDecl::public(w.g))
+        .await
+        .expect("a's public paper");
+    assert_eq!(
+        first,
+        public_paper_id(doi),
+        "a new public row takes the derived id"
+    );
+    assert_eq!(
+        register(&w, &w.a, doi, TenancyDecl::public(w.g))
+            .await
+            .expect("a's re-ingest"),
+        first,
+        "a re-ingest returns the same public row"
+    );
+    assert_eq!(
+        register(
+            &w,
+            &w.b,
+            &format!("https://doi.org/{doi}"),
+            TenancyDecl::public(w.h),
+        )
+        .await
+        .expect("b's public ingest under another spelling"),
+        first,
+        "another writer and spelling converge on the same derived id"
+    );
+}
+
+/// A group's private copy of a document that already has a public row is
+/// inserted beside it (and the other way round): no primary-key collision with
+/// the public row's derived id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_copy_of_a_public_paper_ingests_without_a_key_collision(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let w = app_world(&pool).await;
+    // Public first, then the private copy.
+    let doi = "10.5555/public-then-private";
+    let public = register(&w, &w.a, doi, TenancyDecl::public(w.g))
+        .await
+        .expect("the public row");
+    let private = register(&w, &w.a, doi, TenancyDecl::group(w.g))
+        .await
+        .expect("a private copy beside a public row must not collide with its id");
+    assert_ne!(private, public);
+    assert_eq!(public, public_paper_id(doi));
+    assert_eq!(tenancy(&pool, private).await, ("group".into(), w.g));
+
+    // Private first, then the public row.
+    let doi = "10.5555/private-then-public";
+    let private = register(&w, &w.b, doi, TenancyDecl::group(w.h))
+        .await
+        .expect("b's private copy");
+    let public = register(&w, &w.a, doi, TenancyDecl::public(w.g))
+        .await
+        .expect("a public row beside a private copy must not collide with its id");
+    assert_ne!(private, public);
+    assert_eq!(public, public_paper_id(doi));
+    assert_eq!(visible(&w, &w.s, doi).await, vec![public]);
+}
+
+/// A private copy's id cannot be computed from the document key: it is not
+/// the derived public id, two groups' copies differ, and it is a random
+/// (version 4) id. Once created it is stable for its group.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_private_copys_id_is_not_derivable_from_the_document_key(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let w = app_world(&pool).await;
+    let doi = "10.5555/private-only";
+    let pa = register(&w, &w.a, doi, TenancyDecl::group(w.g))
+        .await
+        .expect("a's private copy");
+    let pb = register(&w, &w.b, doi, TenancyDecl::group(w.h))
+        .await
+        .expect("b's private copy");
+    for id in [pa, pb] {
+        assert_ne!(
+            id,
+            public_paper_id(doi),
+            "a private id is not the key-derived id"
+        );
+        assert_eq!(id.get_version_num(), 4, "a private id is random: {id}");
+    }
+    assert_ne!(pa, pb, "two groups' copies have unrelated ids");
+    assert_eq!(
+        register(&w, &w.a, doi, TenancyDecl::group(w.g))
+            .await
+            .expect("a again"),
+        pa,
+        "a group's re-ingest returns its own copy"
+    );
+
+    // The planned id of a copy not yet written is random per call too.
+    let mut tx = w.scoped.begin_as(&w.a).await.expect("stamped tx");
+    let absent = "10.5555/private-planned";
+    let p1 = PaperRepository::planned(&mut *tx, absent, None, TenancyDecl::group(w.g))
+        .await
+        .expect("planned");
+    let p2 = PaperRepository::planned(&mut *tx, absent, None, TenancyDecl::group(w.g))
+        .await
+        .expect("planned");
+    assert!(!p1.exists && !p2.exists);
+    assert_ne!(p1.id, p2.id, "a planned private id is random, not computed");
+    assert_ne!(p1.id, public_paper_id(absent));
+    // And the walk inserts the copy under the planned id it is handed.
+    let stored = PaperRepository::get_or_create_stored(
+        &mut tx,
+        absent,
+        None,
+        None,
+        TenancyDecl::group(w.g),
+        Some(p1.id),
+    )
+    .await
+    .expect("insert the planned copy");
+    assert_eq!(
+        stored.id, p1.id,
+        "the copy is inserted under the announced id"
+    );
+    tx.rollback().await.expect("rollback");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

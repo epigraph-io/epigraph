@@ -18,7 +18,8 @@
 //!   `paper_id`, and an empty `query_paper`, exactly as for an unknown DOI.
 //! * Two agents' private ingests of one DOI give two rows; their public
 //!   ingests share one (the control: a public ingest behaves as before).
-//! * The queued entry point writes the row with the ingest's tenancy too.
+//! * The queued entry point's walk writes the row with the ingest's tenancy
+//!   too, under the random id its answer announced.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
@@ -312,19 +313,30 @@ async fn the_queued_entry_point_writes_the_paper_with_the_ingests_tenancy(pool: 
         .expect("paper_id")
         .parse()
         .expect("uuid");
-    let visibility: String =
-        sqlx::query_scalar("SELECT visibility::text FROM papers WHERE id = $1")
-            .bind(paper)
-            .fetch_one(&pool)
-            .await
-            .expect("paper row");
-    assert_eq!(
-        visibility, "group",
-        "the eager papers row of a private ingest is the group's, not world-readable"
+    // The row is written by the detached walk, on its own transaction
+    // (backlog b995f117): nothing is committed before it.
+    assert!(
+        server
+            .background_tasks()
+            .wait_idle(std::time::Duration::from_secs(60))
+            .await,
+        "the detached walk did not finish"
     );
-    // Let the detached walk finish before the database is dropped.
-    server
-        .background_tasks()
-        .wait_idle(std::time::Duration::from_secs(30))
-        .await;
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, visibility::text FROM papers WHERE doi = $1")
+            .bind(doi)
+            .fetch_all(&pool)
+            .await
+            .expect("paper rows");
+    assert_eq!(
+        rows,
+        vec![(paper, "group".to_string())],
+        "one papers row, the group's (not world-readable), under the id the queued answer \
+         announced: the walk inserts the private copy under the random id the handler chose"
+    );
+    assert_ne!(
+        paper,
+        epigraph_db::repos::paper::public_paper_id(doi),
+        "a private copy's id is not derivable from the document key"
+    );
 }

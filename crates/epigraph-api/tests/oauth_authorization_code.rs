@@ -1502,6 +1502,7 @@ async fn dcr_accepts_loopback_redirects_for_native_clients(pool: PgPool) {
     for uri in [
         CODEX_CALLBACK,                           // Codex default: live port in the URI
         "http://127.0.0.1/callback/Xq3vT0aBk9Lm", // Codex configured callback: no port
+        "http://127.0.0.1:53682/callback",        // Codex: bare /callback on the live port
         "http://[::1]:53682/callback",            // IPv6 loopback listener
     ] {
         let (status, body) = post_json2(
@@ -1857,4 +1858,439 @@ async fn consent_names_the_configured_origin(pool: PgPool) {
         body.contains("https://explorer.example.test") && body.contains(&email),
         "the page names the origin that receives access: {body}"
     );
+}
+
+// ── 76691fdd: ChatGPT as a hosted MCP client + RFC 9207 issuer identification ─
+
+/// ChatGPT's dynamic-registration callback when the authorization server
+/// advertises RFC 9207 issuer identification.
+const CHATGPT_REDIRECT: &str = "https://chatgpt.com/connector_platform_oauth_redirect";
+/// ChatGPT's per-connector callback form (one opaque id segment).
+const CHATGPT_CALLBACK: &str = "https://chatgpt.com/connector/oauth/cb_Test-01";
+
+fn chatgpt_dcr_body(redirect_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "client_name": "ChatGPT",
+        "redirect_uris": [redirect_uri],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none"
+    })
+}
+
+/// Both ChatGPT callback forms register as a public client, and the
+/// registration locks the exact URI.
+///
+/// Catches: the hosted allowlist not knowing ChatGPT (the registration is
+/// refused with 400).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_accepts_chatgpt_callbacks(pool: PgPool) {
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    for uri in [CHATGPT_REDIRECT, CHATGPT_CALLBACK] {
+        let (status, body) =
+            post_json2(app.clone(), "/oauth/register", chatgpt_dcr_body(uri)).await;
+        assert_eq!(status, StatusCode::CREATED, "{uri} must register: {body}");
+        assert_eq!(body["redirect_uris"][0], uri, "{body}");
+        assert!(
+            body["client_secret"].is_null(),
+            "a public client gets no secret: {body}"
+        );
+    }
+}
+
+/// Only the two exact ChatGPT callback shapes are hosted. Each look-alike is
+/// refused by the allowlist before any database access (dummy-DB app).
+///
+/// Catches: a ChatGPT entry matched by host or prefix (`chatgpt.com/` or
+/// `chatgpt.com/connector/oauth/` followed by anything) instead of exactly.
+#[tokio::test]
+async fn dcr_rejects_chatgpt_lookalikes() {
+    for uri in [
+        "https://chatgpt.com.evil.example/connector_platform_oauth_redirect",
+        "https://chatgpt.com:8443/connector_platform_oauth_redirect",
+        "https://chatgpt.com:443/connector_platform_oauth_redirect",
+        "http://chatgpt.com/connector_platform_oauth_redirect",
+        "https://CHATGPT.com/connector_platform_oauth_redirect",
+        "https://user@chatgpt.com/connector_platform_oauth_redirect",
+        "https://chatgpt.com@evil.example/connector_platform_oauth_redirect",
+        "https://chatgpt.com/connector_platform_oauth_redirect#frag",
+        "https://chatgpt.com/connector_platform_oauth_redirect?x=1",
+        "https://chatgpt.com/connector_platform_oauth_redirect/",
+        "https://chatgpt.com/connector_platform_oauth_redirect_evil",
+        "https://chatgpt.com/connector/oauth/",
+        "https://chatgpt.com/connector/oauth/a/b",
+        "https://chatgpt.com/connector/oauth/a/",
+        "https://chatgpt.com/connector/oauth/a?x=1",
+        "https://chatgpt.com/connector/oauth/a#frag",
+        "https://chatgpt.com/connector/oauth/a%2Fb",
+        "https://chatgpt.com/connector/oauth/..",
+        "https://chatgpt.com/connector/oauth/a.b",
+        "https://chatgpt.com:8443/connector/oauth/a",
+        "https://user@chatgpt.com/connector/oauth/a",
+        "https://chatgpt.com/other/callback",
+        "https://chatgpt.com/",
+    ] {
+        let (status, _body) = post_json2(app(), "/oauth/register", chatgpt_dcr_body(uri)).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{uri} is not a ChatGPT callback and must be refused, got {status}"
+        );
+    }
+}
+
+/// The consent page for either ChatGPT callback names ChatGPT, which the server
+/// matched, and never Claude; claude.ai keeps its wording.
+///
+/// Catches: a ChatGPT sign-in presented as Claude's (both hosted under one
+/// label), or as an anonymous application.
+#[sqlx::test(migrations = "../../migrations")]
+async fn consent_names_chatgpt_for_a_chatgpt_redirect(pool: PgPool) {
+    for uri in [CHATGPT_REDIRECT, CHATGPT_CALLBACK] {
+        let (body, email) = consent_page_for(&pool, uri).await;
+        assert!(
+            body.contains("Authorize ChatGPT") && body.contains(&email),
+            "{uri}: the page names ChatGPT and the signed-in user: {body}"
+        );
+        assert!(
+            !body.contains("Claude"),
+            "{uri}: not presented as Claude: {body}"
+        );
+    }
+    let (body, _email) = consent_page_for(&pool, REDIRECT_URI).await;
+    assert!(body.contains("Authorize Claude"), "{body}");
+}
+
+/// Pull `name="ticket" value="…"` out of a rendered consent page.
+fn consent_ticket(page: &str) -> String {
+    let after = page
+        .split_once(r#"name="ticket" value=""#)
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("no consent ticket in: {page}"));
+    after.split('"').next().unwrap_or_default().to_string()
+}
+
+/// POST a real `application/x-www-form-urlencoded` body (what a hosted MCP
+/// client sends to the token endpoint).
+async fn post_urlencoded(
+    app: axum::Router,
+    uri: &str,
+    pairs: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    use axum::http::header;
+    let body: String = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs.iter().copied())
+        .finish();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// A router with a Google provider whose token endpoint returns an ID token for
+/// a fresh user, configured with `origins`. Returns the fixture (its mock
+/// server must outlive the requests) and the user's email.
+async fn app_signing_in_a_user(
+    pool: &PgPool,
+    origins: RedirectOrigins,
+) -> (axum::Router, ProviderFixture, String) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let fx = ProviderFixture::new().await;
+    let now = Utc::now().timestamp();
+    let unique = Uuid::new_v4().simple().to_string();
+    let email = format!("chatgpt-{unique}@example.test");
+    let id_token = fx.sign(&serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": "test-google-audience",
+        "sub": format!("chatgpt-{unique}"),
+        "email": email,
+        "email_verified": true,
+        "iat": now,
+        "exp": now + 600,
+    }));
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "id_token": id_token })),
+        )
+        .mount(&fx.mock_server)
+        .await;
+    let mut cfg = google_cfg(&fx.jwks_url);
+    cfg.token_endpoint = Some(format!("{}/token", fx.mock_server.uri()));
+    let provider = Arc::new(
+        GoogleProvider::from_config(&cfg, JwksCache::new()).expect("build GoogleProvider"),
+    );
+    let mut registry = ProviderRegistry::empty();
+    registry
+        .register(
+            provider.clone() as Arc<dyn epigraph_api::oauth::providers::ExternalIdentityProvider>,
+            Some(provider as Arc<dyn epigraph_api::oauth::providers::OidcRedirectFlow>),
+        )
+        .expect("register google");
+    let app = create_router(
+        AppState::with_db(pool.clone(), config())
+            .with_providers(Arc::new(registry))
+            .with_oauth_redirect_origins(origins),
+    );
+    (app, fx, email)
+}
+
+/// The whole sign-in a ChatGPT connector performs, against one server:
+/// dynamic registration as a public client, `/oauth/authorize` with PKCE S256
+/// and an RFC 8707 `resource`, the identity provider's callback, consent, and
+/// the code redeemed at `/oauth/token` with the verifier and no secret. The
+/// consent page names ChatGPT (never Claude), and the authorization response
+/// carries the client's `state` and the RFC 9207 `iss`, equal to the issuer
+/// the metadata document advertises.
+///
+/// Catches: ChatGPT's callback refused at registration; a hosted ChatGPT
+/// sign-in presented as Claude's; an authorization response without `iss`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn chatgpt_signs_in_as_a_public_pkce_client(pool: PgPool) {
+    chatgpt_sign_in(&pool, RedirectOrigins::default(), CHATGPT_REDIRECT).await;
+}
+
+/// The same sign-in on a server whose operator ALSO lists
+/// `https://chatgpt.com` as a redirect origin (the interim setting): the
+/// hosted entry still wins, so the page still names ChatGPT.
+#[sqlx::test(migrations = "../../migrations")]
+async fn chatgpt_signs_in_with_chatgpt_also_a_configured_origin(pool: PgPool) {
+    let origins = RedirectOrigins::parse(Some("https://chatgpt.com")).expect("a valid origin");
+    chatgpt_sign_in(&pool, origins, CHATGPT_CALLBACK).await;
+}
+
+async fn chatgpt_sign_in(pool: &PgPool, origins: RedirectOrigins, redirect_uri: &str) {
+    let (app, _fx, email) = app_signing_in_a_user(pool, origins).await;
+
+    // 1. Dynamic client registration.
+    let (status, reg) = post_json2(
+        app.clone(),
+        "/oauth/register",
+        chatgpt_dcr_body(redirect_uri),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "registration: {reg}");
+    let client_id = reg["client_id"].as_str().expect("client_id").to_string();
+
+    // 2. /oauth/authorize, as ChatGPT sends it (resource indicator included).
+    let encoded: String = url::form_urlencoded::byte_serialize(redirect_uri.as_bytes()).collect();
+    let resource: String =
+        url::form_urlencoded::byte_serialize(b"https://test.example/mcp").collect();
+    let (status, loc) = get_redirect(
+        app.clone(),
+        &format!(
+            "/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={encoded}\
+             &code_challenge={}&code_challenge_method=S256&state=chatgpt-state&scope=claims%3Aread\
+             &resource={resource}",
+            pkce_challenge(VERIFIER)
+        ),
+    )
+    .await;
+    assert!(
+        status == StatusCode::SEE_OTHER || status == StatusCode::FOUND,
+        "authorize continues to the identity provider, got {status}"
+    );
+    let google = url::Url::parse(&loc.expect("a Location")).expect("an absolute URL");
+    let google_state = google
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .expect("the identity provider redirect carries a state");
+
+    // 3. The identity provider returns; the consent page names ChatGPT.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "/oauth/callback?code=google-code&state={google_state}"
+        ))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "the consent page renders");
+    let page = resp.into_body().collect().await.unwrap().to_bytes();
+    let page = String::from_utf8_lossy(&page).into_owned();
+    assert!(
+        page.contains("Authorize ChatGPT") && page.contains(&email),
+        "the page names ChatGPT and the signed-in user: {page}"
+    );
+    assert!(
+        !page.contains("Claude"),
+        "a ChatGPT sign-in must not be presented as Claude: {page}"
+    );
+
+    // 4. Consent: the authorization response goes to the exact registered URI.
+    let ticket = consent_ticket(&page);
+    let (status, loc, _) =
+        post_consent(app.clone(), &format!("ticket={ticket}&decision=allow")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let back = url::Url::parse(&loc.expect("a Location")).expect("an absolute URL");
+    let params: std::collections::HashMap<String, String> =
+        back.query_pairs().into_owned().collect();
+    let mut without_query = back.clone();
+    without_query.set_query(None);
+    assert_eq!(without_query.as_str(), redirect_uri);
+    assert_eq!(
+        params.get("state").map(String::as_str),
+        Some("chatgpt-state")
+    );
+    let (_, meta) = get_json(app.clone(), "/.well-known/oauth-authorization-server").await;
+    assert_eq!(
+        params.get("iss").map(String::as_str),
+        meta["issuer"].as_str(),
+        "RFC 9207: the response's iss is the metadata issuer: {back}"
+    );
+    let code = params.get("code").expect("a code").clone();
+
+    // 5. Token: public client, PKCE verifier, no secret, form-encoded.
+    let (status, tok) = post_urlencoded(
+        app.clone(),
+        "/oauth/token",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &code),
+            ("code_verifier", VERIFIER),
+            ("redirect_uri", redirect_uri),
+            ("client_id", &client_id),
+            ("resource", "https://test.example/mcp"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the code redeems: {tok}");
+    assert!(
+        tok["access_token"].as_str().is_some_and(|t| !t.is_empty()),
+        "{tok}"
+    );
+    assert_eq!(tok["scope"], "claims:read", "{tok}");
+
+    // 6. Refresh: ChatGPT keeps the connection alive by refreshing, as the same
+    // public client (its DCR `client_id`, no secret, the same `resource`).
+    let refresh = tok["refresh_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| panic!("a public PKCE client gets a refresh token: {tok}"))
+        .to_string();
+    let (status, refreshed) = post_urlencoded(
+        app,
+        "/oauth/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+            ("resource", "https://test.example/mcp"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refresh token redeems: {refreshed}"
+    );
+    assert!(
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "{refreshed}"
+    );
+    assert!(
+        refreshed["refresh_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty() && t != refresh),
+        "the refresh rotates to a new token: {refreshed}"
+    );
+    assert_eq!(refreshed["scope"], "claims:read", "{refreshed}");
+}
+
+/// The server's config with `public_base_url` = `base`.
+fn config_with_base(base: &str) -> ApiConfig {
+    ApiConfig {
+        public_base_url: base.to_string(),
+        ..config()
+    }
+}
+
+/// RFC 9207: every authorization response (Allow and Deny alike) carries
+/// `iss`, equal to the `issuer` the metadata document advertises, and the
+/// metadata says so. A configured base URL with a trailing slash is the same
+/// issuer in both places.
+///
+/// Catches: `iss` missing from either response; an `iss` that drifts from the
+/// metadata `issuer` (for example a trailing slash kept on one side only); the
+/// metadata flag missing, which makes a conforming client ignore `iss`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorization_responses_identify_the_issuer(pool: PgPool) {
+    let state = AppState::with_db(pool.clone(), config_with_base("https://test.example/"))
+        .with_providers(Arc::new(ProviderRegistry::default()));
+    let app = create_router(state);
+
+    let (_, meta) = get_json(app.clone(), "/.well-known/oauth-authorization-server").await;
+    assert_eq!(meta["issuer"], "https://test.example");
+    assert_eq!(
+        meta["authorization_response_iss_parameter_supported"],
+        Value::Bool(true),
+        "{meta}"
+    );
+
+    let scopes = vec!["claims:read".to_string()];
+    let (client_id, client_uuid) = seed_active_human_client(&pool, &scopes).await;
+    for decision in ["allow", "deny"] {
+        let ticket =
+            seed_consent_session(&pool, &client_id, client_uuid, &scopes, "iss-state").await;
+        let (status, loc, _) =
+            post_consent(app.clone(), &format!("ticket={ticket}&decision={decision}")).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{decision}");
+        let back = url::Url::parse(&loc.expect("a Location")).expect("an absolute URL");
+        let params: std::collections::HashMap<String, String> =
+            back.query_pairs().into_owned().collect();
+        assert_eq!(
+            params.get("iss").map(String::as_str),
+            Some("https://test.example"),
+            "{decision}: {back}"
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("iss-state"));
+    }
+
+    // RFC 9728 section 3: the protected resource names this same issuer as its
+    // authorization server, which is where a client discovers the issuer it
+    // then holds `iss` to.
+    let (_, prm) = get_json(app, "/.well-known/oauth-protected-resource").await;
+    assert_eq!(prm["authorization_servers"][0], meta["issuer"], "{prm}");
+}
+
+/// RFC 7591 section 2 makes `client_name` OPTIONAL. A dynamic registration
+/// without one gets a server-chosen name (the consent page names the client
+/// by its validated callback, never by this field); a legacy EpiGraph
+/// registration (one that names a `client_type`) still has to supply it.
+///
+/// Catches: a hosted client whose registration omits the name refused before
+/// any of the allowlist runs (axum's JSON extractor 422).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_without_a_client_name_registers(pool: PgPool) {
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    let mut body = chatgpt_dcr_body(CHATGPT_REDIRECT);
+    body.as_object_mut().unwrap().remove("client_name");
+    let (status, reg) = post_json2(app.clone(), "/oauth/register", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    assert!(
+        reg["client_name"].as_str().is_some_and(|n| !n.is_empty()),
+        "the server names the client: {reg}"
+    );
+
+    let (status, reg) = post_json2(
+        app,
+        "/oauth/register",
+        serde_json::json!({ "client_type": "human", "redirect_uris": [CHATGPT_REDIRECT] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reg}");
 }
