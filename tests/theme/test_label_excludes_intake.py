@@ -116,6 +116,69 @@ def test_the_theme_label_sample_leaves_out_intake_reports(db, script_db, seed_ag
         _cleanup(db, ids, group)
 
 
+def test_a_moved_or_earlier_intake_report_stays_out_of_the_theme_label_sample(
+    db, script_db, seed_agent
+):
+    """Backlog e690866c: the exclusion keys on the intake marker recorded when the
+    report was filed (migration 272), not only on the intake group configured
+    now. One report triage moved to another group, one filed under an intake
+    group the operator has since replaced: neither is owned by the current
+    intake group, so 207's rule alone sampled both again."""
+    moved_text = "intake-exclusion report moved by triage zebra-quartz"
+    earlier_text = "intake-exclusion report under the old intake zebra-quartz"
+    with db.cursor() as cur:
+        old_intake = _group(cur, seed_agent)
+        triaged = _group(cur, seed_agent)
+        new_intake = _group(cur, seed_agent)
+        cur.execute(
+            "INSERT INTO claim_themes (label, description, claim_count, centroid) "
+            "VALUES ('auto-1', '', 3, %s::vector) RETURNING id",
+            (make_embedding(3),),
+        )
+        theme = cur.fetchone()[0]
+        public = _claim(cur, seed_agent, PUBLIC_TEXT, theme_id=theme)
+        moved = _claim(cur, seed_agent, moved_text, theme_id=theme, owner=triaged)
+        earlier = _claim(cur, seed_agent, earlier_text, theme_id=theme, owner=old_intake)
+        _configure(cur, new_intake)
+    ids = [public, moved, earlier]
+    # Committed: the sampler reads on its own connection, as the script's login.
+    db.commit()
+
+    def sampled():
+        [t] = [t for t in L.load_themes_with_samples(script_db) if t["id"] == str(theme)]
+        script_db.rollback()
+        return sorted(s["content"] for s in t["samples"])
+
+    try:
+        # CALIBRATION: with no marker, neither is owned by the current intake
+        # group, so the current-group rule alone samples both.
+        assert sampled() == sorted([PUBLIC_TEXT, moved_text, earlier_text])
+        with db.cursor() as cur:
+            for claim in (moved, earlier):
+                cur.execute(
+                    "INSERT INTO bug_report_intake_marks "
+                    "(claim_id, reporter_id, intake_group_id, submitted_at, filed_labels) "
+                    "VALUES (%s, %s, %s, now(), ARRAY['backlog', 'bug-report', 'intake'])",
+                    (claim, seed_agent, old_intake),
+                )
+        db.commit()
+        assert sampled() == [PUBLIC_TEXT]
+    finally:
+        db.rollback()
+        with db.cursor() as cur:
+            cur.execute(
+                "DELETE FROM bug_report_intake_marks WHERE claim_id::text = ANY(%s)", (ids,)
+            )
+        db.commit()
+        _cleanup(db, ids, new_intake)
+        with db.cursor() as cur:
+            cur.execute("SET LOCAL epigraph.allow_group_delete = 'yes'")
+            cur.execute(
+                "DELETE FROM groups WHERE id = ANY(%s::uuid[])", ([old_intake, triaged],)
+            )
+        db.commit()
+
+
 def test_cluster_labels_leave_out_intake_reports(db, script_db, seed_agent):
     with db.cursor() as cur:
         group = _group(cur, seed_agent)
