@@ -131,11 +131,14 @@ pub struct BugReportRow {
     pub is_current: bool,
 }
 
-/// `None` for an absent or whitespace-only optional text, else the text as
-/// given. The definer applies the same rule, so the content both compose is
-/// the same.
+/// `None` for an absent optional text or one with nothing visible in it
+/// ([`is_blank`]: whitespace, format, control and blank filler characters
+/// only), else the text as given. The definer applies the same rule
+/// (migration 272: `c_invisible`, as for the title and description), so the
+/// content both compose is the same byte for byte (BUG05 otherwise), and the
+/// evidence digest is the stored evidence text's.
 fn present(s: Option<&str>) -> Option<&str> {
-    s.filter(|t| !t.trim().is_empty())
+    s.filter(|t| !is_blank(t))
 }
 
 impl BugReportInput {
@@ -326,6 +329,29 @@ mod tests {
         assert_eq!(r.evidence_text(), "D");
         r.evidence = Some("log".into());
         assert_eq!(r.evidence_text(), "log");
+    }
+
+    #[test]
+    fn an_invisible_only_repro_or_evidence_is_absent() {
+        // Backlog 64584278 part 2: the same blank rule as the title and
+        // description (BUG04), not whitespace alone, so the content the
+        // definer composes (and refuses with BUG05 if it differs) agrees.
+        let r = BugReportInput {
+            title: "T".into(),
+            description: "D".into(),
+            repro: Some("\u{200B}\u{2060}".into()),
+            evidence: Some("\u{FEFF}\u{3164}".into()),
+            ..Default::default()
+        };
+        assert_eq!(r.content(), "T\n\nD", "an invisible-only repro is no repro");
+        assert_eq!(r.evidence_text(), "D", "an invisible-only evidence is none");
+        assert_eq!(present(r.repro.as_deref()), None);
+        assert_eq!(present(r.evidence.as_deref()), None);
+        assert_eq!(
+            present(Some("a\u{200B}")),
+            Some("a\u{200B}"),
+            "visible text is kept as given"
+        );
     }
 
     #[test]

@@ -4496,7 +4496,9 @@ restart.
   `tenancy_exempt` row declares it, since its `claim_id` puts it in 069's generated
   protected set, with `reviewed_by` 'PENDING'), written by
   `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
-  SECURITY DEFINER from 211's body (one added INSERT) and 207's `epigraph_my_bug_reports`,
+  SECURITY DEFINER from 211's body (one added INSERT; and an invisible-only repro or evidence,
+  `c_invisible`, is now absent as an invisible-only title is refused, backlog 64584278, with
+  the server's `bug_report::present` changed to match) and 207's `epigraph_my_bug_reports`,
   which now lists the caller's markers joined to their claims (author still the caller)
   instead of the claims owned by the CURRENT intake group: a report triage moved out of the
   intake group, or one filed under an intake group the operator replaced, stays listed.
@@ -4523,7 +4525,11 @@ restart.
   constants); the intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
   this file. Undo: `docs/runbooks/272-undo.sql` (tested: run twice, it returns the `public`
   catalog to below 272). Checked before claiming: no migration on main or an origin branch
-  carries a `272`. **Deploy order:** migrate before running the theme scripts of
+  carries a `272`. **Deploy order:** the MCP binary of this change ships with or BEFORE the
+  migration (an older binary's invisible-only repro is refused BUG05 by 272's body; the new
+  binary on 211's body composes what 211 does; an older binary's invisible-only EVIDENCE is
+  not refused but stored as the description under the digest of the invisible text, silently,
+  so the binary must not trail the migration); migrate before running the theme scripts of
   this change (they read the table: 42P01 below 272), and while NO theme run is in progress (a
   maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
   600 s statement timeout, so 272's ACCESS EXCLUSIVE lock times out after 3 s and the migration
