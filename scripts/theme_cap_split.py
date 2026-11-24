@@ -101,9 +101,15 @@ the parts, never read from either file. `--unreviewed` applies such a result
 unchecked, and the output and manifest record which of these it was
 (`review`).
 
-After an apply, Atlas layouts (`atlas_layout_themes`) and graph neighbourhoods
-of a split theme are stale until rebuilt. `reverse` deletes the new parts'
-rows, and rows that reference them cascade.
+After an apply, and after a reverse, the derived rows of the touched themes
+are stale until rebuilt (backlog 30633061): the newest clustering run still
+files the moved claims under their old theme's graph neighbourhoods and has
+none for the new parts, and the newest Atlas layout run has no position for
+the parts (it reads `stale`). Both commands print, and the manifest records,
+`touched_theme_ids` (every parent and every new part), and print the REQUIRED
+follow-up steps (`REBUILD_STEPS`; docs/runbooks/atlas-nightly.md, "After a
+theme-cap split"). `reverse` deletes the new parts' rows, and rows that
+reference them cascade.
 
 Usage:
     MAINTENANCE_DATABASE_URL=... python3 scripts/theme_cap_split.py plan --out plan.json
@@ -341,6 +347,26 @@ def _commit(conn):
     conn.commit()
 
 
+# What an apply or a reverse leaves stale, and the steps that rebuild it
+# (docs/runbooks/atlas-nightly.md, "After a theme-cap split").
+REBUILD_STEPS = [
+    "rebuild_theme_neighborhoods --manifest <manifest> --apply",
+    "python3 scripts/label_themes_llm.py --neighborhoods",
+    "atlas_layout --apply",
+]
+
+
+def touched_theme_ids(manifest):
+    """Every theme a manifest's apply changed (each parent and each new part),
+    sorted: the themes whose graph neighbourhoods and Atlas layout rows must
+    be rebuilt after the apply, and again after its reverse."""
+    ids = set()
+    for t in manifest.get("themes", []):
+        ids.add(t["parent_id"])
+        ids.update(p["theme_id"] for p in t["new_parts"])
+    return sorted(ids)
+
+
 def _parent_path(props):
     if isinstance(props.get("split_path"), list):
         return list(props["split_path"])
@@ -524,6 +550,7 @@ def apply_result(conn, result, manifest_path, max_cap=core.DEFAULT_CAP, expect_d
         if not manifest["themes"]:
             conn.rollback()
             return manifest
+        manifest["touched_theme_ids"] = touched_theme_ids(manifest)
         _write_json_new(manifest_path, manifest)
         _commit(conn)
     except BaseException:
@@ -732,6 +759,8 @@ def main(argv=None):
                               "parts_digest": manifest["parts_digest"],
                               "checked_against_review": expect_digest is not None,
                               "review": review,
+                              "touched_theme_ids": manifest.get("touched_theme_ids", []),
+                              "rebuild_next": REBUILD_STEPS if manifest["themes"] else [],
                               "themes": [{"parent_id": t["parent_id"],
                                           "kept": len(t["kept_claim_ids"]),
                                           "new_parts": [{"theme_id": n["theme_id"],
@@ -741,7 +770,9 @@ def main(argv=None):
         elif args.command == "reverse":
             manifest = json.loads(pathlib.Path(args.manifest).read_text())
             print(json.dumps({"status": "reversed",
-                              "themes": reverse_manifest(conn, manifest, args.allow_drift)}))
+                              "themes": reverse_manifest(conn, manifest, args.allow_drift),
+                              "touched_theme_ids": touched_theme_ids(manifest),
+                              "rebuild_next": REBUILD_STEPS}))
     finally:
         conn.close()
     return 0
