@@ -1628,6 +1628,11 @@ async fn claim_panel_provenance_degrades_alone() {
             "Who filed this claim is not available from this EpiGraph API yet.",
         ),
         (text_plain(500, "boom"), ""),
+        // The context read already showed the claim readable; a 403 or 404
+        // on this second read degrades the section alone and says nothing
+        // of the upstream message.
+        (forbidden(), ""),
+        (not_found("Claim", C1), ""),
     ] {
         let app = spawn().await;
         mount_dir(&app, "tok", dir_default()).await;
@@ -1654,7 +1659,13 @@ async fn claim_panel_provenance_degrades_alone() {
         assert_eq!(b["claim"]["content"], "The centre claim.");
         assert_eq!(b["provenance"]["status"], "unavailable");
         let reason = b["provenance"]["reason"].as_str().unwrap();
-        assert!(!reason.is_empty() && !reason.contains("boom"), "{reason}");
+        assert!(
+            !reason.is_empty()
+                && !reason.contains("boom")
+                && !reason.contains("not a member")
+                && !reason.contains("with ID"),
+            "{reason}"
+        );
         if !want.is_empty() {
             assert_eq!(reason, want);
         }
