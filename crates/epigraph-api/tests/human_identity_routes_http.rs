@@ -384,3 +384,59 @@ async fn an_unnamed_humans_authorship_edge_carries_no_spelling_of_its_name(pool:
         "a non-human keeps it: {p}"
     );
 }
+
+/// Row H6 (finding L5): a graph-query predicate on an agent's `properties`
+/// (`full_name`, `email`) is a matcher on a profile detail; it never returns
+/// an unnamed human to an outsider, and returns it to a teammate
+/// (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_graph_query_cannot_match_an_unnamed_humans_profile(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _n) = h_and_n(&pool, "Seraphine Queried").await;
+    sqlx::query(
+        "UPDATE agents SET properties = '{\"full_name\": \"Seraphine Queried\", \
+                                          \"email\": \"seraphine@example.invalid\"}'::jsonb \
+          WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("properties");
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "teammate").await;
+    team_of(&pool, &[h, mate]).await;
+    let hits = |who: Uuid, q: &'static str| {
+        let state = state.clone();
+        async move {
+            let (st, body) = call(
+                &state,
+                who,
+                Method::POST,
+                "/api/v1/graph/query",
+                &["claims:read"],
+                Some(serde_json::json!({ "query": q })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{q}: {body}");
+            body["nodes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|n| n["id"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        }
+    };
+    for q in [
+        "MATCH (a:agent) WHERE a.full_name = 'Seraphine Queried' RETURN *",
+        "MATCH (a:agent) WHERE a.email = 'seraphine@example.invalid' RETURN *",
+    ] {
+        assert!(
+            !hits(outsider, q).await.contains(&h.to_string()),
+            "{q}: an outsider matched the unnamed human"
+        );
+        assert!(
+            hits(mate, q).await.contains(&h.to_string()),
+            "{q}: CALIBRATION, a teammate matches"
+        );
+    }
+}
