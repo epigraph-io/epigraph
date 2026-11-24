@@ -2847,6 +2847,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Under a non-member owner it reads no row: fail CLOSED, no attachment
     // shown.
     ("epigraph_disclosed_role_attachments", 269),
+    // 273, one group's live explicit roster, answered to a session whose
+    // stamp holds the group. Its reads of the FORCEd `group_memberships`,
+    // `groups` and `author_binding_clients` are admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner the
+    // member scan is filtered to the caller's own view and a lapse check reads
+    // no allowance, so a lapsed allowlisted row may count again: the owner is
+    // load-bearing.
+    ("epigraph_group_live_roster", 273),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4043,6 +4051,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_disclosed_role_attachments",
         "public.epigraph_disclosed_role_attachments(uuid[])",
+        true,
+    ),
+    // 273: `GET /api/v1/groups/:id` and the profile detail check call it on
+    // the request DSN; without the grant both are 42501.
+    (
+        "epigraph_group_live_roster",
+        "public.epigraph_group_live_roster(uuid)",
         true,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
