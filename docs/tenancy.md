@@ -1413,10 +1413,16 @@ database functions these commands call:
   belongs to a registered human operator, so revoking a client allowance or a
   human's registration (or suspending its human client) ends the member's
   claim reads and writes (everything decided from its resolved viewer) at its
-  next resolve. The row itself stays until `group-member remove` revokes it,
-  and the REST group routes that read the roster table directly (the
-  group-admin check, group info) still see it until then; the roster itself
-  stays closed to them;
+  next resolve. The row itself stays until `group-member remove` revokes it.
+  The REST group-admin check, group info (its membership gate, member list and
+  `member_count`), the group-scoped claim gates and the profile detail check
+  decide from the live set too, so a lapsed member is refused or left out
+  there at once (member lists through migration 273's
+  `epigraph_group_live_roster`, answered only to a session whose stamp holds
+  the group); a few readers still count the raw row until it is revoked: the
+  REST last-admin guard, the database-side admin checks, and the admin counts
+  of instance administration and privatization approval. The roster itself
+  stays closed to the REST routes;
 * the last-admin rule counts only admins that are still registered humans;
 * each audit row also carries `actor`: the CLI's tool, command, version and
   process identity (real and login uid), since `session_user` is a shared
@@ -1492,11 +1498,16 @@ inside a transaction opened before it, whatever the session's stamp says
 
 Two consequences to know:
 
-* readers of the roster TABLE itself (the REST group routes, the consolidate
-  act's membership test, a profile's detail check) see explicit rows only, so
-  a derived member is refused there; use `group-roster` to see who holds a
-  group through its bindings (`MEMBER` lines) next to its explicit rows
-  (`DIRECT` lines);
+* the CALLER's own membership checks (the REST group-admin check and group
+  info's gate, the group-scoped claim reads, the encrypted-claim submit, the
+  consolidate act's membership test) decide from the live set, so a derived
+  member is a member there (never an admin: a binding grants `reader` or
+  `writer` only; a reader's sealed submit is refused 403). Readers that list
+  OTHER members (group info's member list and `member_count`, a profile's
+  detail check, agent search cards and the ORCID/ROR matcher) read migration
+  273's live EXPLICIT roster, so a derived member is not listed and is not a
+  groupmate there. Use `group-roster` to see who holds a group through its
+  bindings (`MEMBER` lines) next to its explicit rows (`DIRECT` lines);
 * an explicit membership is never granted on the strength of a derived one:
   `group-member add` of a teammate's agent still requires the teammate's own
   explicit writer row (GRP03), so no explicit row outlives a window.
