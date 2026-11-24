@@ -1,0 +1,26 @@
+-- no-transaction
+--
+-- Operator ruling C5 (spec docs/superpowers/specs/
+-- 2026-11-24-human-identity-visibility-design.md, sections 4, 11 and 16.R):
+-- a public claim names the human H only when it was created at or after its
+-- agent's binding to H began. 288's public-claim arm therefore probes, once
+-- per agent bound to H, `c.agent_id = b.agent_id AND c.visibility = 'public'
+-- AND c.created_at >= b.since LIMIT 1`.
+--
+-- 275's `(agent_id) WHERE visibility = 'public'` cannot bound that probe: for
+-- an agent with many public claims all filed BEFORE its binding it walks every
+-- one of them with a heap check on created_at. With created_at as the second
+-- key the probe is one descent to the first row at or after the start.
+-- 289 drops 275's index once 288 no longer probes it.
+--
+-- The predicate is written `visibility = 'public'` exactly as the arm writes
+-- it (partial-index implication is proved syntactically).
+--
+-- INVALID-INDEX TRAP: a cancelled or failed CONCURRENTLY build leaves an
+-- INVALID index of this name, and IF NOT EXISTS then skips it on a re-run.
+-- Recovery: DROP INDEX CONCURRENTLY idx_claims_public_by_agent_since, re-apply.
+--
+-- Exactly one statement (see 275).
+-- Undo: DROP INDEX CONCURRENTLY IF EXISTS public.idx_claims_public_by_agent_since
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_claims_public_by_agent_since
+    ON public.claims (agent_id, created_at) WHERE visibility = 'public';

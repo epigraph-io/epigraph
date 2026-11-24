@@ -4640,6 +4640,30 @@ restart.
   derivation), `agent_name_disclosure_lint.rs::no_name_decision_falls_back_to_null`, and the
   H-vs-N tests across REST and MCP. Undo: `docs/runbooks/285-undo.sql` (after rolling back the
   binaries).
+- **286**, **287**: `idx_claims_public_by_agent_since (agent_id, created_at) WHERE visibility =
+  'public'` and `idx_claims_group_by_agent_since (agent_id, owner_group_id, created_at) WHERE
+  visibility <> 'public'` (operator ruling C5), each a single-statement `-- no-transaction`
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS`: 288's windowed claim probes, one descent per bound
+  agent to its first claim at or after its binding start. Registered in
+  `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked; the probes' plans are
+  pinned there). A failed build leaves an INVALID index that IF NOT EXISTS skips: `DROP INDEX
+  CONCURRENTLY`, then re-apply.
+- **288**: `disclosure_binding_window_start` (operator ruling C5). Precondition BWS01 (55000):
+  the core is still 283's (md5). Re-states `epigraph_agent_disclosure_for`: B(H) carries each
+  agent's binding START (H itself `-infinity`; a bound agent the earliest of its link's
+  `created_at` and its allowances' `added_at` for H), and the public-claim and readable-claim
+  arms count only a claim with `created_at >= start`. No end bound: retiring or revoking never
+  un-names. A link recorded retired (107 / 123's legacy links) does NOT reach back before its
+  creation here, unlike 199's `epigraph_operator_bound_at`. Pinned by
+  `human_identity_visibility.rs` (`an_assertion_from_before_the_binding_never_names_the_human`,
+  `an_assertion_after_the_binding_names_the_human_after_the_binding_ends`, the BWS01 refusal).
+  Undo: `docs/runbooks/288-undo.sql` (283's body; re-apply 275 and 276 first). **Deploy
+  note:** a human named today only by public claims its agents filed before their binding
+  (legacy-linked authors) becomes unnamed to outsiders (spec section 17).
+- **289**, **290**: `DROP INDEX CONCURRENTLY IF EXISTS` of 275's and 276's indexes, each a
+  single-statement `-- no-transaction` file; 286 and 287 supersede them (same predicates,
+  `created_at` appended). Registered in `tenancy_migration_shape.rs::DROPPED_INDEX_MIGRATIONS`.
+  Undo: re-run 275 / 276.
 
 ## `-- no-transaction` migrations
 

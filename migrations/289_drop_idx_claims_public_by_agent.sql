@@ -1,0 +1,12 @@
+-- no-transaction
+--
+-- 275's `idx_claims_public_by_agent (agent_id) WHERE visibility = 'public'` is
+-- superseded by 286's `(agent_id, created_at)` index with the same predicate:
+-- 288's windowed public-claim arm probes the new one, and a leading-column
+-- probe that does not bound created_at is served by it as well. Keeping both
+-- would only add a second index write to every public claim insert (spec
+-- section 11.1 measured +15-60 % for 275 and 276 together).
+--
+-- Exactly one statement (see 275).
+-- Undo: re-run 275 (CREATE INDEX CONCURRENTLY IF NOT EXISTS ...).
+DROP INDEX CONCURRENTLY IF EXISTS public.idx_claims_public_by_agent;

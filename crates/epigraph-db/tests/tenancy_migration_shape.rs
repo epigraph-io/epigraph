@@ -48,16 +48,29 @@ const INDEX_MIGRATIONS: &[(&str, &str)] = &[
         "196_idx_claims_theme_current_tenancy.sql",
         "idx_claims_theme_current_tenancy",
     ),
-    // The two partial indexes 272's claim arms probe per bound agent
-    // (human-identity visibility spec, section 11).
+    // The two partial indexes the disclosure core's claim arms probe per bound
+    // agent from its binding start (human-identity visibility spec, section
+    // 11; operator ruling C5). They supersede 275's and 276's, which 289 and
+    // 290 drop (`the_superseded_claim_arm_indexes_are_dropped`).
     (
-        "275_idx_claims_public_by_agent.sql",
-        "idx_claims_public_by_agent",
+        "286_idx_claims_public_by_agent_since.sql",
+        "idx_claims_public_by_agent_since",
     ),
     (
-        "276_idx_claims_group_by_agent.sql",
-        "idx_claims_group_by_agent",
+        "287_idx_claims_group_by_agent_since.sql",
+        "idx_claims_group_by_agent_since",
     ),
+];
+
+/// `-- no-transaction` index files whose index no longer exists at head: 275 and
+/// 276 created the claim-arm indexes 289 and 290 drop (superseded by 286 and
+/// 287, operator ruling C5). Each is still one CONCURRENTLY statement, so the
+/// one-statement lint reads them; validity is not checked (there is no index).
+const DROPPED_INDEX_MIGRATIONS: &[&str] = &[
+    "275_idx_claims_public_by_agent.sql",
+    "276_idx_claims_group_by_agent.sql",
+    "289_drop_idx_claims_public_by_agent.sql",
+    "290_drop_idx_claims_group_by_agent.sql",
 ];
 
 /// The tier-A set migration 062 widens. Duplicated here on purpose: a test that
@@ -154,6 +167,32 @@ async fn no_transaction_is_honoured_and_every_index_is_valid(pool: PgPool) {
     );
 }
 
+/// 289 and 290 drop 275's and 276's claim-arm indexes, which 286's and 287's
+/// (the same predicates, `created_at` appended) supersede: only the windowed
+/// pair is left to maintain on every claim insert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_superseded_claim_arm_indexes_are_dropped(pool: PgPool) {
+    for index in ["idx_claims_public_by_agent", "idx_claims_group_by_agent"] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert_eq!(found, None, "{index} must be dropped (289 / 290)");
+    }
+    for index in [
+        "idx_claims_public_by_agent_since",
+        "idx_claims_group_by_agent_since",
+    ] {
+        let found: Option<String> = sqlx::query_scalar("SELECT to_regclass('public.' || $1)::text")
+            .bind(index)
+            .fetch_one(&pool)
+            .await
+            .expect("to_regclass");
+        assert!(found.is_some(), "CALIBRATION: {index} exists");
+    }
+}
+
 /// The three partial tenancy indexes must all spell their predicate the SAME
 /// way, and it must be `<> 'public'`.
 ///
@@ -219,20 +258,21 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
 
     // Reachable: an explicit `visibility = 'group'` qual.
     //
-    // 276's `idx_claims_group_by_agent (agent_id, owner_group_id) WHERE
-    // visibility <> 'public'` shares this predicate, so on an EMPTY table (all
-    // costs near zero) the planner may pick it through a skip scan on its
-    // second column, which says nothing about whether idx_claims_group_current
-    // is a candidate. It is hidden inside a rolled-back transaction for this
-    // one EXPLAIN, so the assertion keeps testing what it was written for.
+    // 287's `idx_claims_group_by_agent_since (agent_id, owner_group_id,
+    // created_at) WHERE visibility <> 'public'` shares this predicate, so on an
+    // EMPTY table (all costs near zero) the planner may pick it through a skip
+    // scan on its second column, which says nothing about whether
+    // idx_claims_group_current is a candidate. It is hidden inside a
+    // rolled-back transaction for this one EXPLAIN, so the assertion keeps
+    // testing what it was written for.
     sqlx::query("BEGIN")
         .execute(&mut *conn)
         .await
         .expect("begin");
-    sqlx::query("DROP INDEX idx_claims_group_by_agent")
+    sqlx::query("DROP INDEX idx_claims_group_by_agent_since")
         .execute(&mut *conn)
         .await
-        .expect("hide 276's index for this EXPLAIN");
+        .expect("hide 287's index for this EXPLAIN");
     let plan = explain(
         &mut conn,
         "SELECT id FROM claims WHERE visibility = 'group' \
@@ -249,30 +289,35 @@ async fn the_partial_tenancy_indexes_serve_an_explicit_visibility_qual(pool: PgP
          (this is the D4/PR-18 shape the index exists for). Plan:\n{plan}"
     );
 
-    // 272's per-bound-agent probes reach 275's and 276's indexes.
+    // 288's per-bound-agent probes, windowed from the binding start (C5),
+    // reach 286's and 287's indexes with created_at in the index condition.
     let plan = explain(
         &mut conn,
         "SELECT 1 FROM claims c \
           WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
-            AND c.visibility = 'public' LIMIT 1",
+            AND c.visibility = 'public' \
+            AND c.created_at >= '2026-01-01'::timestamptz LIMIT 1",
     )
     .await;
     assert!(
-        plan.contains("idx_claims_public_by_agent"),
-        "272's public-claim probe must reach idx_claims_public_by_agent. Plan:\n{plan}"
+        plan.contains("idx_claims_public_by_agent_since") && plan.contains("created_at >="),
+        "288's public-claim probe must reach idx_claims_public_by_agent_since with the \
+         binding start as an index bound. Plan:\n{plan}"
     );
     let plan = explain(
         &mut conn,
         "SELECT 1 FROM claims c \
           WHERE c.agent_id = '00000000-0000-0000-0000-00000000feed'::uuid \
+            AND c.owner_group_id = '00000000-0000-0000-0000-00000000beef'::uuid \
             AND c.visibility <> 'public' \
-            AND c.owner_group_id = ANY(ARRAY['00000000-0000-0000-0000-00000000beef'::uuid]) \
+            AND c.created_at >= '2026-01-01'::timestamptz \
           LIMIT 1",
     )
     .await;
     assert!(
-        plan.contains("idx_claims_group_by_agent"),
-        "272's readable-claim probe must reach idx_claims_group_by_agent. Plan:\n{plan}"
+        plan.contains("idx_claims_group_by_agent_since") && plan.contains("created_at >="),
+        "288's readable-claim probe must reach idx_claims_group_by_agent_since with the \
+         binding start as an index bound. Plan:\n{plan}"
     );
 
     // Also reachable from the `<>` spelling, which `= 'group'` does not admit.
@@ -440,11 +485,12 @@ fn no_transaction_files_contain_exactly_one_statement() {
 
     assert_eq!(
         checked,
-        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len(),
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len() + DROPPED_INDEX_MIGRATIONS.len(),
         "expected exactly {} `-- no-transaction` migrations (063-066, 073, 126, 196); found \
          {checked}. Adding one is fine — add it to INDEX_MIGRATIONS so its index validity \
-         is checked too, or to POLICY_ARM_MIGRATIONS if it has that shape.",
-        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len()
+         is checked too, to POLICY_ARM_MIGRATIONS if it has that shape, or to \
+         DROPPED_INDEX_MIGRATIONS if it drops an index (or created one a later file drops).",
+        INDEX_MIGRATIONS.len() + POLICY_ARM_MIGRATIONS.len() + DROPPED_INDEX_MIGRATIONS.len()
     );
 }
 

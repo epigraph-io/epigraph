@@ -691,6 +691,138 @@ async fn a_readable_group_claim_names_the_human_to_its_readers_only(pool: PgPool
     );
 }
 
+// ─── C5: the binding window's START (operator ruling) ───────────────────
+
+/// Move a seeded row's `created_at` a day into the past, so it is unmistakably
+/// older than any binding the test then writes (`now()` of a later statement).
+async fn backdate(pool: &PgPool, table: &str, id: Uuid) {
+    let moved = sqlx::query(&format!(
+        "UPDATE public.{table} SET created_at = now() - interval '1 day' WHERE id = $1"
+    ))
+    .bind(id)
+    .execute(pool)
+    .await
+    .expect("backdate");
+    assert_eq!(
+        moved.rows_affected(),
+        1,
+        "CALIBRATION: backdated one {table} row"
+    );
+}
+
+/// Operator ruling C5: an assertion counts for H only if it was created at or
+/// after its agent's binding to H began. An agent's public claim, and its
+/// readable group claim, filed BEFORE the agent was linked (107) or allowed
+/// (149) for H never name H, before or after the binding is retired. H's own
+/// claims have no binding to start, so a backdated one still names H
+/// (CALIBRATION, with an after-binding claim by the same agents in
+/// `an_assertion_after_the_binding_names_the_human_after_the_binding_ends`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assertion_from_before_the_binding_never_names_the_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Pia Passerby").await;
+
+    // A link: the bot's public claim predates the link.
+    let (h1, _) = human(&pool, "Rolf Relinked").await;
+    let (bot, _) = named(&pool, "rolf-bot").await;
+    let early = fixture::seed_public_claim(&pool, bot, "a public claim before the link").await;
+    backdate(&pool, "claims", early).await;
+    link(&pool, bot, h1).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h1).await,
+        "a public claim filed before the link must not name the human"
+    );
+    assert!(
+        !named_to_guest(&pool, &scoped, h1).await,
+        "nor to the guest viewer"
+    );
+    retire_link(&pool, bot).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h1).await,
+        "retiring the link does not make a pre-link claim count"
+    );
+
+    // An allowance: the service's public claim predates its allowance.
+    let (h2, _) = human(&pool, "Sara Sanctioned").await;
+    let (svc, _client) = allowance_bound(&pool, h2, "sara-service").await;
+    let early = fixture::seed_public_claim(&pool, svc, "a public claim before the allowance").await;
+    backdate(&pool, "claims", early).await;
+    assert!(
+        !named_to(&pool, &scoped, outsider, h2).await,
+        "a public claim filed before the allowance must not name the human"
+    );
+
+    // The readable-claim arm is windowed too: a group claim the reader reads,
+    // filed before the bot's link, does not name H to the reader.
+    let (h3, _) = human(&pool, "Tove Teamless").await;
+    let (bot3, _) = named(&pool, "tove-bot").await;
+    let (reader, _) = named(&pool, "Ugo Reader").await;
+    let g = keyed_team(&pool, &[reader, bot3]).await;
+    let early = fixture::seed_group_claim(&pool, bot3, g, "a group claim before the link").await;
+    backdate(&pool, "claims", early).await;
+    link(&pool, bot3, h3).await;
+    assert!(
+        !named_to(&pool, &scoped, reader, h3).await,
+        "a readable group claim filed before the link must not name the human"
+    );
+
+    // CALIBRATION: H's own claim needs no binding; backdated, it still names H.
+    let (h4, _) = human(&pool, "Vera Veteran").await;
+    let own = fixture::seed_public_claim(&pool, h4, "a public claim by the person").await;
+    backdate(&pool, "claims", own).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h4).await,
+        "a human's own public claim names it whenever it was filed"
+    );
+}
+
+/// C5's other half: an assertion made at or after the binding began keeps
+/// naming H after the link is retired or the allowance revoked (sticky), and
+/// an earlier claim of the same agent does not stop it. Calibrates
+/// `an_assertion_from_before_the_binding_never_names_the_human`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_assertion_after_the_binding_names_the_human_after_the_binding_ends(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Wim Watcher").await;
+
+    let (h1, _) = human(&pool, "Xena Linked").await;
+    let (bot, _) = named(&pool, "xena-bot").await;
+    let early = fixture::seed_public_claim(&pool, bot, "xena-bot before the link").await;
+    backdate(&pool, "claims", early).await;
+    link(&pool, bot, h1).await;
+    fixture::seed_public_claim(&pool, bot, "xena-bot after the link").await;
+    retire_link(&pool, bot).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h1).await,
+        "a public claim filed while linked names the human after the link is retired"
+    );
+
+    let (h2, _) = human(&pool, "Yusuf Allowed").await;
+    let (svc, client) = allowance_bound(&pool, h2, "yusuf-service").await;
+    fixture::seed_public_claim(&pool, svc, "yusuf-service while allowed").await;
+    revoke_allowance(&pool, client).await;
+    assert!(
+        named_to(&pool, &scoped, outsider, h2).await,
+        "a public claim filed while allowed names the human after the revocation"
+    );
+
+    let (h3, _) = human(&pool, "Zora Grouped").await;
+    let (bot3, _) = named(&pool, "zora-bot").await;
+    let (reader, _) = named(&pool, "Abel Reader").await;
+    let g = keyed_team(&pool, &[reader, bot3]).await;
+    link(&pool, bot3, h3).await;
+    fixture::seed_group_claim(&pool, bot3, g, "zora-bot group claim after the link").await;
+    retire_link(&pool, bot3).await;
+    assert!(
+        named_to(&pool, &scoped, reader, h3).await,
+        "a readable group claim filed while linked names the human to its reader"
+    );
+    assert!(
+        !named_to(&pool, &scoped, outsider, h3).await,
+        "CALIBRATION: and to no one outside the group"
+    );
+}
+
 // ─── T8: a stranger cannot unhide H ──────────────────────────────────────
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -1576,6 +1708,36 @@ async fn migration_283_refuses_over_another_core_or_setter_body(pool: PgPool) {
     .await
     .expect("column lookup");
     assert_eq!(column, None, "nothing was changed");
+}
+
+/// 288 (C5) re-states 283's core; over any other body it refuses (BWS01) with
+/// nothing changed.
+#[sqlx::test(migrations = false)]
+async fn migration_288_refuses_over_another_core_body(pool: PgPool) {
+    migrate(&pool, &below(288)).await.expect("migrate to 287");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_agent_disclosure_for( \
+             p_target uuid, p_principal uuid, p_groups uuid[], p_privileged boolean) \
+         RETURNS TABLE (named boolean, details boolean) \
+         LANGUAGE plpgsql STABLE SECURITY DEFINER COST 1000 \
+         SET search_path = pg_catalog, pg_temp AS $$ \
+         BEGIN RETURN QUERY SELECT false, false; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("288 must refuse over another body");
+    assert!(err.contains("BWS01"), "precondition refusal: {err}");
+    let src: String = sqlx::query_scalar(
+        "SELECT prosrc FROM pg_proc \
+          WHERE oid = to_regprocedure('public.epigraph_agent_disclosure_for(uuid, uuid, uuid[], boolean)')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("core source");
+    assert!(!src.contains("v_since"), "nothing was changed");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
