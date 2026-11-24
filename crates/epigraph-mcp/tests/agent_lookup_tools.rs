@@ -149,6 +149,12 @@ async fn every_reader_sees_the_operator_humans_id_and_its_name_by_the_rule(pool:
     );
     drop(conn);
 
+    // The bound agent (`linked`) gets Null here, while the DB-level twin
+    // (`agent_lookup.rs::the_operator_humans_id_is_shown_to_every_reader_and_its_name_by_the_rule`)
+    // names the human to its bound agent: consistent, because this fixture
+    // gives the human NO team (a bound agent reads its operator's teams, 234,
+    // and the DB twin adds one), so no arm names the human to its bot here
+    // (review finding tests#9).
     for (who, name) in [
         (outsider, serde_json::Value::Null),
         (linked, serde_json::Value::Null),
@@ -177,6 +183,44 @@ async fn every_reader_sees_the_operator_humans_id_and_its_name_by_the_rule(pool:
             .any(|h| h["id"] == human.to_string());
         assert_eq!(found, !name.is_null(), "{who}: {r}");
     }
+}
+
+/// Review finding tests#5: through the TOOLS (not only the shared card
+/// builder), an outsider's `get_agent` card of an unnamed human equals its
+/// card of a nameless non-human N modulo id and timestamp, and `find_agent`
+/// by the person's name finds nothing; the person itself sees and finds its
+/// name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_tools_show_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let server = app_server(&pool).await;
+    let (outsider, _) = named(&pool, "tool outsider").await;
+    let (h, _) = named(&pool, "Octavia Veilstone").await;
+    fixture::make_human_operator(&pool, h).await;
+    let (n, _) = fixture::seed_agent_with_group(&pool, "tool nameless").await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = ANY($1)")
+        .bind(vec![h, n])
+        .execute(&pool)
+        .await
+        .expect("group profiles");
+    let shape = |mut v: Value| {
+        let o = v.as_object_mut().expect("object");
+        o.insert("id".into(), serde_json::json!("<id>"));
+        o.insert("created_at".into(), serde_json::json!("<t>"));
+        v
+    };
+    let card_h = get(&server, &pool, outsider, h).await;
+    let card_n = get(&server, &pool, outsider, n).await;
+    assert!(card_h["display_name"].is_null(), "{card_h}");
+    assert_eq!(shape(card_h), shape(card_n), "get_agent: H reads as N");
+    let r = find(&server, &pool, outsider, "Octavia Veilstone").await;
+    assert!(
+        !r.to_string().contains(&h.to_string()) && !r.to_string().contains("Octavia"),
+        "find_agent found an unnamed human by name: {r}"
+    );
+    let mine = get(&server, &pool, h, h).await;
+    assert_eq!(mine["display_name"], "Octavia Veilstone", "CALIBRATION");
+    let r = find(&server, &pool, h, "Octavia Veilstone").await;
+    assert!(r.to_string().contains(&h.to_string()), "CALIBRATION: {r}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
