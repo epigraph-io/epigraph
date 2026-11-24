@@ -88,17 +88,17 @@ async fn seed_agent(pool: &PgPool, name: &str) -> Uuid {
 }
 
 fn token(agent_id: Uuid) -> String {
+    token_with_scopes(agent_id, &["groups:write", "groups:admin", "groups:read"])
+}
+
+fn token_with_scopes(agent_id: Uuid, scopes: &[&str]) -> String {
     let secret = std::env::var("EPIGRAPH_JWT_SECRET")
         .unwrap_or_else(|_| "epigraph-dev-secret-change-in-production!!".to_string());
     let cfg = epigraph_api::oauth::JwtConfig::from_secret(secret.as_bytes());
     let (t, _jti) = cfg
         .issue_access_token(
             Uuid::new_v4(),
-            vec![
-                "groups:write".to_string(),
-                "groups:admin".to_string(),
-                "groups:read".to_string(),
-            ],
+            scopes.iter().map(|s| s.to_string()).collect(),
             "agent",
             None,
             Some(agent_id),
@@ -116,10 +116,20 @@ async fn send(
     as_agent: Uuid,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    send_with_token(app, method, uri, &token(as_agent), body).await
+}
+
+async fn send_with_token(
+    app: axum::Router,
+    method: Method,
+    uri: &str,
+    bearer: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::AUTHORIZATION, format!("Bearer {}", token(as_agent)));
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
     let req = match body {
         Some(b) => req
             .header(header::CONTENT_TYPE, "application/json")
@@ -1064,5 +1074,176 @@ async fn a_role_holder_reads_the_group_until_its_assignment_ends(pool: PgPool) {
         status,
         StatusCode::OK,
         "POSITIVE CONTROL: the owner still reads"
+    );
+}
+
+/// The router with the STAMPED pool on the application role but the raw
+/// `db_pool` on the harness superuser: the RLS-exempt raw pool that
+/// `routes/claims.rs`'s module doc says the encrypted submit's pre-write reads
+/// (membership gate, current epoch) rely on. On a raw pool that is ALSO the
+/// application role, the epoch read sees no `group_key_epochs` row, so a
+/// member the gate admits is answered 400 before the write is reached (a
+/// separate, older defect); the membership gate itself answers the same on
+/// both shapes, because it reads a `SECURITY DEFINER`.
+async fn rls_exempt_raw_router(pool: &PgPool) -> axum::Router {
+    let url = viewer_fixture::database_url_for(pool).await;
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut state = AppState::with_db(pool.clone(), ApiConfig::default());
+    state.scoped = Some(scoped);
+    create_router(state)
+}
+
+/// `POST /api/v1/claims` for a `fully_private` claim sealed into `group`, as
+/// `agent`, with a `claims:write` token. The ciphertext is opaque to the
+/// server, so a placeholder is a well-formed request.
+async fn submit_sealed_claim(
+    app: axum::Router,
+    agent: Uuid,
+    group: Uuid,
+    epoch: i32,
+) -> (StatusCode, Value) {
+    send_with_token(
+        app,
+        Method::POST,
+        "/api/v1/claims",
+        &token_with_scopes(agent, &["claims:write", "claims:read"]),
+        Some(json!({
+            "content": format!("sealed claim {}", Uuid::new_v4()),
+            "agent_id": agent,
+            "privacy_tier": "fully_private",
+            "group_id": group,
+            "encrypted_content": "AAAA",
+            "encryption_epoch": epoch,
+        })),
+    )
+    .await
+}
+
+/// Rows a sealed submit into `group` left behind: `(claims, claim_encryption)`,
+/// read on the superuser pool.
+async fn sealed_rows_in(pool: &PgPool, group: Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM claims WHERE owner_group_id = $1), \
+                (SELECT count(*) FROM claim_encryption WHERE group_id = $1)",
+    )
+    .bind(group)
+    .fetch_one(pool)
+    .await
+    .expect("count sealed rows")
+}
+
+/// A member DERIVED from a role bound to a keyed team group at `reader`
+/// (migration 165, no roster row) now passes `create_claim_core`'s
+/// encrypted-submit membership gate, which reads `epigraph_live_memberships`
+/// since backlog f712db53, exactly as an EXPLICIT reader always has. Neither
+/// may write: both are refused 403 by the gate's ROLE arm, on both router
+/// shapes, and no `claims` or `claim_encryption` row lands. Before that arm an
+/// explicit reader reached the stamped insert, which row security refused as a
+/// 500; the derived reader was refused as a non-member. A stranger is still
+/// refused as a non-member, and an explicit writer's identical request lands.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_derived_reader_is_refused_a_sealed_submit_like_an_explicit_reader(pool: PgPool) {
+    const GATE: &str = "Agent is not a member of the specified group";
+    let (admin, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-sealed-admin").await;
+    let (explicit, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-sealed-reader").await;
+    let (holder, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-sealed-holder").await;
+    let (stranger, _) =
+        viewer_fixture::seed_human_operator(&pool, "f712db53-sealed-stranger").await;
+    let group = seeded_group(&pool, admin, "f712db53-sealed-group").await;
+    seed_member(&pool, group, explicit, "reader").await;
+    let role = "role:synthetic-sealed-reader";
+    viewer_fixture::bind_new_role_to_group(&pool, role, group, "reader", false).await;
+    viewer_fixture::grant_role_now(&pool, role, holder).await;
+
+    assert!(
+        !viewer_fixture::has_unrevoked_row(&pool, group, holder).await,
+        "PREMISE: the holder holds no roster row"
+    );
+    let (_, epoch) = group_mark_and_epoch(&pool, group).await;
+    assert_eq!(
+        epoch.as_deref(),
+        Some("active"),
+        "PREMISE: the group's epoch 0 is active"
+    );
+
+    const READER: &str = "needs writer or admin";
+    // The full application-role shape: the derived reader gets the explicit
+    // reader's answer, past the membership arm.
+    let (explicit_status, explicit_body) =
+        submit_sealed_claim(app_role_router(&pool).await, explicit, group, 0).await;
+    let (holder_status, holder_body) =
+        submit_sealed_claim(app_role_router(&pool).await, holder, group, 0).await;
+    assert!(
+        !holder_body.to_string().contains(GATE),
+        "app role: the derived reader passes the membership gate: {holder_body}"
+    );
+    assert_eq!(
+        (holder_status, holder_body.get("message")),
+        (explicit_status, explicit_body.get("message")),
+        "app role: the derived reader gets the explicit reader's answer"
+    );
+    assert_eq!(
+        holder_status,
+        StatusCode::FORBIDDEN,
+        "app role: {holder_body}"
+    );
+    assert!(
+        holder_body.to_string().contains(READER),
+        "app role: refused by the role arm: {holder_body}"
+    );
+
+    // The RLS-exempt raw pool: the pre-write reads pass, so the WRITE decides.
+    let (status, body) =
+        submit_sealed_claim(rls_exempt_raw_router(&pool).await, stranger, group, 0).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "stranger: {body}");
+    assert!(
+        body.to_string().contains(GATE),
+        "stranger: refused by the gate: {body}"
+    );
+    let (writer, _) = viewer_fixture::seed_human_operator(&pool, "f712db53-sealed-writer").await;
+    seed_member(&pool, group, writer, "writer").await;
+    let (status, body) =
+        submit_sealed_claim(rls_exempt_raw_router(&pool).await, writer, group, 0).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POSITIVE CONTROL: an explicit writer: {body}"
+    );
+    let landed = sealed_rows_in(&pool, group).await;
+    assert_eq!(
+        landed,
+        (1, 1),
+        "POSITIVE CONTROL: the writer's sealed claim landed"
+    );
+    let (explicit_status, explicit_body) =
+        submit_sealed_claim(rls_exempt_raw_router(&pool).await, explicit, group, 0).await;
+    let (holder_status, holder_body) =
+        submit_sealed_claim(rls_exempt_raw_router(&pool).await, holder, group, 0).await;
+    assert!(
+        !holder_body.to_string().contains(GATE),
+        "the derived reader passes the membership gate (the raw roster read refused it there): \
+         {holder_body}"
+    );
+    for (who, status, body) in [
+        ("explicit reader", explicit_status, &explicit_body),
+        ("derived reader", holder_status, &holder_body),
+    ] {
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{who}: a reader's sealed submit is a 403, not the insert's row-security 500: {body}"
+        );
+        assert!(
+            body.to_string().contains(READER),
+            "{who}: refused by the role arm: {body}"
+        );
+    }
+    assert_eq!(
+        sealed_rows_in(&pool, group).await,
+        landed,
+        "no reader's claims or claim_encryption row landed"
     );
 }

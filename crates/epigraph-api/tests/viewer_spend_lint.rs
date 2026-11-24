@@ -1412,7 +1412,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // viewed, so each helper's own body is measured and reviewed here.
     //
     // claims.rs::create_claim_core (POST /claims, /claims/batch). untenanted:
-    // the CALLER's own LIVE membership of the group it asks to encrypt into
+    // the CALLER's own LIVE role in the group it asks to encrypt into
     // (the authenticated id, never the body; asked on a `read_as` connection
     // stamped from this viewer, backlog f712db53), then that group's current key epoch,
     // read only after the membership check passed; the author's agent row.
@@ -1448,7 +1448,7 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "EdgeRepository::create_signed",
             "EdgeRepository::create_signed_conn",
             "GroupKeyEpochRepository::get_current_epoch",
-            "GroupMembershipRepository::is_member_conn",
+            "GroupMembershipRepository::get_member_role_conn",
             "Viewer::resolve",
             "db_pool.acquire",
             "provenance::record_provenance",
