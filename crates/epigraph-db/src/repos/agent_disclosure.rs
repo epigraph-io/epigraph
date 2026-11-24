@@ -15,9 +15,12 @@
 //!   claim by an agent ever bound to it, or a claim the caller can read by one);
 //!   its `details` are `named AND` the profile rule.
 //!
-//! An UNNAMED human must read exactly as a nameless non-human agent does:
-//! `display_name` null, ORCID / ROR null, no human evidence, never a
-//! distinguishable absence. The id is never withheld.
+//! An UNNAMED human must read exactly as a nameless OAuth service principal
+//! does (operator ruling C7): its name is that principal's placeholder,
+//! `oauth:<client row id>` of its own provisioning client (migration 285's
+//! `epigraph_unnamed_agent_name`, called in the ELSE of every disclosure
+//! decision), ORCID / ROR null, no human evidence, never a distinguishable
+//! absence. The id is never withheld.
 //!
 //! # The audience is the SESSION
 //!
@@ -49,7 +52,7 @@ use crate::repos::atlas_map::AtlasMap;
 use crate::repos::edge::EdgeRow;
 
 /// What the caller may see of one agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Disclosure {
     /// The agent's `display_name` may be shown (and matched).
     pub named: bool,
@@ -57,6 +60,11 @@ pub struct Disclosure {
     /// its profile) may be shown (and matched). Never true when `named` is
     /// false.
     pub details: bool,
+    /// When NOT `named`: the name the agent is shown under instead, the
+    /// `oauth:<client row id>` placeholder a nameless service principal
+    /// carries (migration 285, operator ruling C7), or `None` for an agent
+    /// with no OAuth client. Always `None` when `named`.
+    pub unnamed_as: Option<String>,
 }
 
 /// The `CROSS JOIN LATERAL` that decides disclosure for the agent row aliased
@@ -68,13 +76,15 @@ pub fn disclosure_lateral_sql(alias: &str) -> String {
     format!("CROSS JOIN LATERAL public.epigraph_agent_disclosure({alias}.id) d_{alias}")
 }
 
-/// Null what `d` does not admit on a whole `Agent` row (the REST agent
-/// routes serialize these): the name when not `named`, ORCID and ROR when not
-/// `details`. `labels` are not identity (an unnamed human and a nameless
-/// service principal carry the same provisioning label).
+/// Redact what `d` does not admit on a whole `Agent` row (the REST agent
+/// routes serialize these): the name when not `named` becomes the placeholder
+/// a nameless service principal shows (`d.unnamed_as`, operator ruling C7),
+/// ORCID and ROR when not `details` become null. `labels` are not identity
+/// and are not redacted: an unnamed human and a nameless service principal
+/// carry the same provisioning label (`oauth-principal`, 274's mint).
 pub fn redact_agent(agent: &mut epigraph_core::Agent, d: Disclosure) {
     if !d.named {
-        agent.display_name = None;
+        agent.display_name = d.unnamed_as;
     }
     if !d.details {
         agent.orcid = None;
@@ -122,8 +132,10 @@ impl AgentDisclosureRepository {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let rows: Vec<(Uuid, bool, bool)> = sqlx::query_as(
-            "SELECT a.id, d.named, d.details \
+        let rows: Vec<(Uuid, bool, bool, Option<String>)> = sqlx::query_as(
+            "SELECT a.id, d.named, d.details, \
+                    CASE WHEN d.named THEN NULL \
+                         ELSE public.epigraph_unnamed_agent_name(a.id) END \
                FROM agents a \
               CROSS JOIN LATERAL public.epigraph_agent_disclosure(a.id) d \
               WHERE a.id = ANY($1::uuid[])",
@@ -133,13 +145,24 @@ impl AgentDisclosureRepository {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, named, details)| (id, Disclosure { named, details }))
+            .map(|(id, named, details, unnamed_as)| {
+                (
+                    id,
+                    Disclosure {
+                        named,
+                        details,
+                        unnamed_as,
+                    },
+                )
+            })
             .collect())
     }
 
-    /// The `display_name` of each of `ids` that names an agent, or `None`
-    /// when it has none or the session may not see it (an unnamed human),
-    /// decided on the session `conn` is stamped as. Unknown ids are absent.
+    /// The name each of `ids` that names an agent is shown under, decided on
+    /// the session `conn` is stamped as: its `display_name` when `named`,
+    /// else (an unnamed human) the `oauth:<client row id>` placeholder a
+    /// nameless service principal carries (migration 285); `None` when it has
+    /// neither. Unknown ids are absent.
     ///
     /// # Errors
     /// `DbError::QueryFailed` if the read fails.
@@ -151,7 +174,8 @@ impl AgentDisclosureRepository {
             return Ok(HashMap::new());
         }
         let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
-            "SELECT a.id, CASE WHEN d.named THEN a.display_name END \
+            "SELECT a.id, CASE WHEN d.named THEN a.display_name \
+                               ELSE public.epigraph_unnamed_agent_name(a.id) END \
                FROM agents a \
               CROSS JOIN LATERAL public.epigraph_agent_disclosure(a.id) d \
               WHERE a.id = ANY($1::uuid[])",
@@ -224,7 +248,8 @@ impl AgentDisclosureRepository {
             AtlasMap::Team(t) => vec![t],
         };
         let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
-            "SELECT a.id, CASE WHEN d.named THEN a.display_name END \
+            "SELECT a.id, CASE WHEN d.named THEN a.display_name \
+                               ELSE public.epigraph_unnamed_agent_name(a.id) END \
                FROM agents a \
               CROSS JOIN LATERAL public.epigraph_agent_disclosure_for( \
                          a.id, NULL::uuid, $2::uuid[], false) d \
@@ -275,21 +300,37 @@ mod tests {
             Disclosure {
                 named: true,
                 details: false,
+                unnamed_as: None,
             },
         );
         assert_eq!(named_only.display_name.as_deref(), Some("Ada Example"));
         assert_eq!(named_only.orcid, None);
         assert_eq!(named_only.ror_id, None);
         let mut hidden = agent.clone();
-        redact_agent(&mut hidden, Disclosure::default());
-        assert_eq!(hidden.display_name, None);
+        redact_agent(
+            &mut hidden,
+            Disclosure {
+                unnamed_as: Some("oauth:00000000-0000-0000-0000-000000000001".into()),
+                ..Disclosure::default()
+            },
+        );
+        assert_eq!(
+            hidden.display_name.as_deref(),
+            Some("oauth:00000000-0000-0000-0000-000000000001"),
+            "an unnamed agent is shown under its placeholder (C7)"
+        );
+        assert_eq!((hidden.orcid, hidden.ror_id), (None, None));
         assert_eq!(hidden.labels, agent.labels, "labels are not identity");
+        let mut no_client = agent.clone();
+        redact_agent(&mut no_client, Disclosure::default());
+        assert_eq!(no_client.display_name, None, "no client, no placeholder");
         let mut all = agent.clone();
         redact_agent(
             &mut all,
             Disclosure {
                 named: true,
                 details: true,
+                unnamed_as: None,
             },
         );
         assert_eq!(all.orcid, agent.orcid);

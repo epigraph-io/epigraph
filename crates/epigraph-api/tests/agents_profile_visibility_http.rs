@@ -407,8 +407,9 @@ async fn put_profile_visibility_mixed_with_an_edit_is_refused_whole(pool: PgPool
 /// the rule withholds from it. Today the edit itself moves no row on the
 /// unstamped pool (spec R8) and answers 404; the response is also redacted
 /// on the caller's stamped read, so a later fix of R8 cannot start echoing
-/// the name. CALIBRATION: the admin's GET of the person is nameless (the
-/// admin is not privileged), and the person's own PUT echoes its name.
+/// the name. CALIBRATION: the admin's GET of the person shows only the
+/// `oauth:<client row id>` placeholder (operator ruling C7; the admin is not
+/// privileged), and the person's own PUT echoes its name.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_admin_edit_of_an_unnamed_person_answers_no_name(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -424,9 +425,15 @@ async fn an_admin_edit_of_an_unnamed_person_answers_no_name(pool: PgPool) {
     let (admin, _) = viewer_fixture::seed_agent_with_group(&pool, "put-unnamed-admin").await;
     let (status, body) = get(&state, admin, &format!("/api/v1/agents/{h}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(
-        body["display_name"].is_null(),
-        "CALIBRATION: unnamed to the admin: {body}"
+    let client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .expect("the fixture's one client");
+    assert_eq!(
+        body["display_name"],
+        format!("oauth:{client}"),
+        "CALIBRATION: unnamed to the admin, shown under the placeholder (C7): {body}"
     );
 
     let (status, body) = put(

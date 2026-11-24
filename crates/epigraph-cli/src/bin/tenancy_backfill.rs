@@ -4975,6 +4975,11 @@ mod definer_register_tests {
         // current frame is a maintenance-owned definer, which a definer body
         // would always be. Its owner is not what it reads.
         "epigraph_role_projection_edges_guard",
+        // 285 (operator ruling C7): the placeholder name an unnamed human is
+        // shown under. It reads only `oauth_clients` (no row policy; the
+        // application and maintenance roles both SELECT it), as its caller;
+        // its owner changes no answer.
+        "epigraph_unnamed_agent_name",
     ];
 
     /// `SECURITY DEFINER` bodies re-owned ONLY by migrations at or below 110,

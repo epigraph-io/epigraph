@@ -1734,8 +1734,9 @@ async fn group_profile(pool: &PgPool, agent: Uuid) {
 }
 
 /// Row D1: a human that INGESTED a claim it did not file (its ingest is no
-/// claim, so no arm names it) is listed among the ingesters by id with no
-/// name to an outsider, exactly as a nameless ingester is; a teammate sees
+/// claim, so no arm names it) is listed among the ingesters by id without
+/// its name to an outsider, under the `oauth:<client row id>` placeholder a
+/// nameless service principal carries (operator ruling C7); a teammate sees
 /// the name (CALIBRATION). The filer, which the reader can read a claim of,
 /// stays named.
 #[sqlx::test(migrations = "../../migrations")]
@@ -1788,7 +1789,16 @@ async fn an_unnamed_human_ingester_is_listed_by_id_without_its_name(pool: PgPool
         i.agent.display_name.clone()
     };
     let out = claim_block_as_filed(&pool, &scoped, outsider, claim, filer).await;
-    assert_eq!(ingester_name(&out), None, "an outsider gets no name");
+    let client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(ingesting_human)
+        .fetch_one(&pool)
+        .await
+        .expect("the fixture's one client");
+    assert_eq!(
+        ingester_name(&out),
+        Some(format!("oauth:{client}")),
+        "an outsider gets no name: the placeholder a nameless service principal carries (C7)"
+    );
     let mine = claim_block_as_filed(&pool, &scoped, mate, claim, filer).await;
     assert_eq!(
         ingester_name(&mine).as_deref(),

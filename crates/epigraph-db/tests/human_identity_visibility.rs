@@ -1638,9 +1638,10 @@ const AGENT_INSERTING_FUNCTIONS: &[&str] = &[
 // ─── part B: the Rust disclosure reader (spec 6.2) ───────────────────────
 
 /// `AgentDisclosureRepository::names` / `disclosure` on a stamped
-/// `epigraph_app` connection: an unnamed human reads as a nameless agent
-/// (`None`), a teammate gets the name (CALIBRATION), a named non-human is
-/// named to everyone, and an unknown id is absent rather than `None`.
+/// `epigraph_app` connection: an unnamed human reads as a nameless service
+/// principal (its `oauth:<client row id>` placeholder, operator ruling C7), a
+/// teammate gets the name (CALIBRATION), a named non-human is named to
+/// everyone, and an unknown id is absent rather than `None`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_rust_reader_names_exactly_what_the_session_may_see(pool: PgPool) {
     let scoped = app_pool(&pool).await;
@@ -1667,10 +1668,16 @@ async fn the_rust_reader_names_exactly_what_the_session_may_see(pool: PgPool) {
         }
     };
     let (names, d) = read_names(outsider).await;
+    let placeholder: String =
+        sqlx::query_scalar("SELECT 'oauth:' || id::text FROM oauth_clients WHERE agent_id = $1")
+            .bind(h)
+            .fetch_one(&pool)
+            .await
+            .expect("the fixture's one client");
     assert_eq!(
         names.get(&h),
-        Some(&None),
-        "unnamed human reads as nameless"
+        Some(&Some(placeholder.clone())),
+        "unnamed human reads as a nameless service principal"
     );
     assert_eq!(
         names.get(&bot),
@@ -1678,11 +1685,16 @@ async fn the_rust_reader_names_exactly_what_the_session_may_see(pool: PgPool) {
     );
     assert!(!names.contains_key(&ghost), "an unknown id is absent");
     assert_eq!(
-        d.get(&h).copied(),
+        d.get(&h).cloned(),
         Some(epigraph_db::Disclosure {
             named: false,
-            details: false
+            details: false,
+            unnamed_as: Some(placeholder),
         })
+    );
+    assert_eq!(
+        d[&bot].unnamed_as, None,
+        "a named agent carries no placeholder"
     );
     let (names, d) = read_names(mate).await;
     assert_eq!(
@@ -1725,7 +1737,17 @@ async fn a_stored_documents_names_follow_its_audience_not_its_builder(pool: PgPo
             (conn, (public, for_team, builder))
         })
         .await;
-    assert_eq!(public.get(&h), Some(&None), "the public map's audience");
+    let placeholder: String =
+        sqlx::query_scalar("SELECT 'oauth:' || id::text FROM oauth_clients WHERE agent_id = $1")
+            .bind(h)
+            .fetch_one(&pool)
+            .await
+            .expect("the fixture's one client");
+    assert_eq!(
+        public.get(&h),
+        Some(&Some(placeholder)),
+        "the public map's audience sees the placeholder (C7)"
+    );
     assert_eq!(
         for_team.get(&h),
         Some(&Some("Quentin Mapped".to_string())),
@@ -1785,9 +1807,10 @@ async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
 }
 
 /// T1's pair: H, a provider-provisioned person under its real name, and N, a
-/// production-shaped nameless non-human: a service principal provisioned the
-/// same way, its placeholder name then nulled (C7 option (b), the brief's
-/// literal "display_name null", implemented until the operator rules).
+/// production-shaped nameless OAuth service principal, provisioned the same
+/// way and left exactly as `ensure_for_client` mints it: named
+/// `oauth:<client row id>`, profile `'public'`, label `oauth-principal`
+/// (operator ruling C7: an unnamed human reads as THIS, not as a null name).
 async fn h_and_n(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let h = provisioned(pool, "human", name).await;
     let shown: Option<String> = sqlx::query_scalar("SELECT display_name FROM agents WHERE id = $1")
@@ -1801,23 +1824,51 @@ async fn h_and_n(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
         "CALIBRATION: H carries its real name"
     );
     let n = provisioned(pool, "service", "fixture service").await;
-    sqlx::query("UPDATE agents SET display_name = NULL WHERE id = $1")
-        .bind(n)
-        .execute(pool)
-        .await
-        .expect("nameless N");
-    // N's profile as T1 defines it: 'group', no ORCID / ROR.
-    set_profile(pool, n, "group").await;
+    let n_client = client_of(pool, n).await;
+    let minted: Option<String> =
+        sqlx::query_scalar("SELECT display_name FROM agents WHERE id = $1")
+            .bind(n)
+            .fetch_one(pool)
+            .await
+            .expect("name");
+    assert_eq!(
+        minted,
+        Some(format!("oauth:{n_client}")),
+        "CALIBRATION: N is the nameless service principal ensure_for_client mints"
+    );
     (h, n)
 }
 
+/// The ONE OAuth client a provisioned fixture principal is linked to (the
+/// client `ensure_for_client` was called with), read from the link, not from
+/// the placeholder function under test.
+async fn client_of(pool: &PgPool, agent: Uuid) -> Uuid {
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    assert_eq!(rows.len(), 1, "a provisioned fixture has one client");
+    rows[0]
+}
+
+/// The name an unnamed provisioned principal must be shown under: what
+/// `ensure_for_client` names a service principal, `oauth:<client row id>`.
+async fn placeholder_of(pool: &PgPool, agent: Uuid) -> String {
+    format!("oauth:{}", client_of(pool, agent).await)
+}
+
 /// A card's JSON with the fields that legitimately differ between H and N
-/// (identity and timestamp) replaced.
-fn card_shape(card: &epigraph_db::AgentCard) -> serde_json::Value {
+/// (identity, timestamp, and the client row id inside the `oauth:`
+/// placeholder each is shown under) replaced.
+fn card_shape(card: &epigraph_db::AgentCard, placeholder: &str) -> serde_json::Value {
     let mut v = serde_json::to_value(card).expect("card json");
     let o = v.as_object_mut().expect("object");
     o.insert("id".into(), serde_json::json!("<id>"));
     o.insert("created_at".into(), serde_json::json!("<t>"));
+    if o.get("display_name") == Some(&serde_json::json!(placeholder)) {
+        o.insert("display_name".into(), serde_json::json!("oauth:<client>"));
+    }
     v
 }
 
@@ -1873,15 +1924,28 @@ async fn an_unnamed_humans_card_is_a_nameless_agents_card(pool: PgPool) {
     let (bot, _) = named(&pool, "quell-bot").await;
     link(&pool, bot, h).await;
 
+    let (ph, pn) = (
+        placeholder_of(&pool, h).await,
+        placeholder_of(&pool, n).await,
+    );
     for who in [Some(outsider), None] {
         let c = cards_by(&pool, &scoped, who, &[h, n, bot]).await;
         assert_eq!(
-            card_shape(&c[0]),
-            card_shape(&c[1]),
+            c[0].display_name.as_deref(),
+            Some(ph.as_str()),
+            "{who:?}: C7, H is shown under its own placeholder"
+        );
+        assert_eq!(
+            card_shape(&c[0], &ph),
+            card_shape(&c[1], &pn),
             "{who:?}: H reads as N"
         );
         let oh = c[2].operator_human.as_ref().expect("bot's human id shown");
-        assert_eq!((oh.id, oh.display_name.as_deref()), (h, None), "{who:?}");
+        assert_eq!(
+            (oh.id, oh.display_name.as_deref()),
+            (h, Some(ph.as_str())),
+            "{who:?}: the bot's human is shown under the placeholder too"
+        );
     }
     let c = cards_by(&pool, &scoped, Some(mate), &[h, bot]).await;
     assert_eq!(
@@ -1956,13 +2020,18 @@ async fn a_pending_naming_reads_the_same_on_an_unnamed_human_and_a_nameless_agen
         c[0].counts,
         c[1].counts
     );
+    let (ph, pn) = (
+        placeholder_of(&pool, h).await,
+        placeholder_of(&pool, n).await,
+    );
     assert_eq!(
-        c[0].display_name, None,
+        c[0].display_name.as_deref(),
+        Some(ph.as_str()),
         "CALIBRATION: H is unnamed to the outsider"
     );
     assert_eq!(
-        card_shape(&c[0]),
-        card_shape(&c[1]),
+        card_shape(&c[0], &ph),
+        card_shape(&c[1], &pn),
         "H with a pending naming reads as N with the same pending naming"
     );
 }
@@ -1997,6 +2066,142 @@ async fn an_unnamed_human_is_never_found_by_name_or_identifier(pool: PgPool) {
         assert!(
             r.results.iter().any(|x| x.card.id == h),
             "{q}: CALIBRATION, a teammate finds H"
+        );
+    }
+}
+
+/// Operator ruling C7, row A1: a nameless service principal is FOUND by its
+/// `oauth:<client row id>` name (exact and prefix), so an unnamed human must
+/// be found by its own placeholder the same way, with the same tier, score
+/// and shown name (modulo the client row id), and still never by its real
+/// name. A teammate, to whom H is named, finds H by its real name and not by
+/// the placeholder (CALIBRATION: the placeholder row is the unnamed reading
+/// only). The ingest's same-name candidates list H under its placeholder as
+/// they list N under N's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_human_is_found_by_its_placeholder_as_a_service_principal_is(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Severine Placeheld").await;
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    let (ph, pn) = (
+        placeholder_of(&pool, h).await,
+        placeholder_of(&pool, n).await,
+    );
+    let hit_shape = |r: &epigraph_db::FindAgentResult, id: Uuid, p: &str| {
+        // The trigram score of a prefix depends on the uuid's own letters, for
+        // N as for H, so it is not compared; the tier and the card are.
+        r.results.iter().find(|x| x.card.id == id).map(|x| {
+            (
+                serde_json::to_value(x.tier).expect("tier"),
+                card_shape(&x.card, p),
+            )
+        })
+    };
+    // exact: the whole placeholder; prefix: `oauth:` and the first 13 chars
+    // of the client row id.
+    for (qh, qn) in [
+        (ph.clone(), pn.clone()),
+        (ph[..19].to_string(), pn[..19].to_string()),
+    ] {
+        let rh = find_by(&pool, &scoped, outsider, &qh, None).await;
+        let rn = find_by(&pool, &scoped, outsider, &qn, None).await;
+        let (sh, sn) = (hit_shape(&rh, h, &ph), hit_shape(&rn, n, &pn));
+        assert!(sn.is_some(), "CALIBRATION: {qn} finds N: {rn:?}");
+        assert_eq!(sh, sn, "{qh}: H is found as N is");
+    }
+    let r = find_by(&pool, &scoped, outsider, "Severine Placeheld", None).await;
+    assert!(
+        r.results.iter().all(|x| x.card.id != h),
+        "never by its name"
+    );
+    let r = find_by(&pool, &scoped, mate, &ph, None).await;
+    assert!(
+        r.results.iter().all(|x| x.card.id != h),
+        "CALIBRATION: a teammate reads the real name, not the placeholder"
+    );
+    let r = find_by(&pool, &scoped, mate, "Severine Placeheld", None).await;
+    assert!(r.results.iter().any(|x| x.card.id == h), "CALIBRATION");
+
+    let v = viewer(&pool, outsider).await;
+    let mut c = scoped.read_as(&v).await.expect("read_as");
+    let found = epigraph_db::AgentLookupRepository::exact_name_candidates(
+        &mut c,
+        &[ph.clone(), pn.clone()],
+        &[Uuid::nil(), Uuid::nil()],
+        10,
+    )
+    .await
+    .expect("candidates");
+    let ids = |i: usize| found[i].0.iter().map(|m| m.agent_id).collect::<Vec<_>>();
+    assert_eq!(
+        (ids(0), found[0].1),
+        (vec![h], 1),
+        "H listed under its placeholder"
+    );
+    assert_eq!((ids(1), found[1].1), (vec![n], 1), "as N under N's");
+}
+
+/// Operator ruling C7: the placeholder an unnamed human is shown under is
+/// checkable as a service principal's is. For N, migration 285's
+/// `epigraph_unnamed_agent_name` spells exactly the name `ensure_for_client`
+/// stored. For H and for N, the client row id inside the name derives the
+/// agent's public key (`blake3::derive_key("epigraph-oauth-client", ..)`, the
+/// derivation `ensure_for_client` uses), so H's placeholder names its
+/// PROVISIONING client: one a later client linked to H would fail the check.
+/// A second client linked to H afterwards does not move it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_humans_placeholder_is_its_provisioning_clients(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Wilhelmina Derived").await;
+    let stored: String = sqlx::query_scalar("SELECT display_name FROM agents WHERE id = $1")
+        .bind(n)
+        .fetch_one(&pool)
+        .await
+        .expect("N's name");
+    let spelled: Option<String> =
+        sqlx::query_scalar("SELECT public.epigraph_unnamed_agent_name($1)")
+            .bind(n)
+            .fetch_one(&pool)
+            .await
+            .expect("placeholder");
+    assert_eq!(spelled.as_deref(), Some(stored.as_str()), "one spelling");
+
+    // A later client linked to H (a second sign-in method, say).
+    sqlx::query(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, created_at) \
+         VALUES ($1, 'later', 'human', ARRAY['claims:write'], 'active', $2, \
+                 now() + interval '1 minute')",
+    )
+    .bind(format!("fixtureprovider:later-{h}"))
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("a later client");
+
+    let (outsider, _) = named(&pool, "someone else").await;
+    let v = viewer(&pool, outsider).await;
+    let mut c = scoped.read_as(&v).await.expect("read_as");
+    let names = epigraph_db::AgentDisclosureRepository::names(&mut c, &[h, n])
+        .await
+        .expect("names");
+    for id in [h, n] {
+        let shown = names[&id].clone().expect("a placeholder");
+        let client: Uuid = shown
+            .strip_prefix("oauth:")
+            .and_then(|u| u.parse().ok())
+            .unwrap_or_else(|| panic!("{shown} is oauth:<uuid>"));
+        let key: Vec<u8> = sqlx::query_scalar("SELECT public_key FROM agents WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("key");
+        assert_eq!(
+            key,
+            blake3::derive_key("epigraph-oauth-client", client.as_bytes()).to_vec(),
+            "{id}: the shown client derives the agent's key"
         );
     }
 }
@@ -2073,8 +2278,9 @@ async fn same_name_candidates_neither_list_nor_count_an_unnamed_human(pool: PgPo
     assert!(list.iter().any(|m| m.agent_id == h));
 }
 
-/// Row A5: the ingest's explicit-author report names an unnamed human with
-/// no name; the internal checks are unchanged.
+/// Row A5: the ingest's explicit-author report names an unnamed human under
+/// its `oauth:<client row id>` placeholder (operator ruling C7); the
+/// internal checks are unchanged.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_explicit_authors_reported_name_follows_the_rule(pool: PgPool) {
     let scoped = app_pool(&pool).await;
@@ -2086,7 +2292,11 @@ async fn an_explicit_authors_reported_name_follows_the_rule(pool: PgPool) {
         .await
         .expect("author_nodes");
     assert_eq!(nodes.len(), 1, "the node is still returned");
-    assert_eq!(nodes[0].display_name, None);
+    assert_eq!(
+        nodes[0].display_name,
+        Some(placeholder_of(&pool, h).await),
+        "C7: reported under its placeholder"
+    );
     drop(c);
     let v = viewer(&pool, h).await;
     let mut c = scoped.read_as(&v).await.expect("read_as");
@@ -2162,8 +2372,11 @@ async fn the_name_match_calls_the_predicate_once_per_match(pool: PgPool) {
 }
 
 /// T1, row B1: `get_public_profile` of an unnamed human, to an outsider,
-/// equals N's apart from id and key: no name, no `profile_visibility`, no
-/// properties / ORCID / ROR. A teammate sees the name (CALIBRATION).
+/// equals N's (a production-shaped nameless service principal) apart from id,
+/// key and the client row id in the placeholder: the placeholder name, key
+/// kind `derived`, a `'public'` profile with N's empty properties and no
+/// ORCID / ROR (operator ruling C7), whatever H's row holds. A teammate sees
+/// the name (CALIBRATION).
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
     let scoped = app_pool(&pool).await;
@@ -2191,9 +2404,16 @@ async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
                 .expect("exists")
         }
     };
+    let (ph, pn) = (
+        placeholder_of(&pool, h).await,
+        placeholder_of(&pool, n).await,
+    );
     let shape = |p: epigraph_db::repos::agent::AgentPublicProfile| {
         (
-            p.display_name,
+            p.display_name.map(|x| {
+                x.replace(&ph, "oauth:<client>")
+                    .replace(&pn, "oauth:<client>")
+            }),
             p.key_kind,
             p.profile_visibility,
             p.properties,
@@ -2201,9 +2421,18 @@ async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
             p.ror_id,
         )
     };
+    let theirs = profile(outsider, n).await;
+    assert_eq!(
+        (
+            theirs.profile_visibility.as_deref(),
+            theirs.properties.clone()
+        ),
+        (Some("public"), Some(serde_json::json!({}))),
+        "CALIBRATION: N is a minted service principal"
+    );
     assert_eq!(
         shape(profile(outsider, h).await),
-        shape(profile(outsider, n).await),
+        shape(theirs),
         "H's profile reads as N's"
     );
     let mine = profile(mate, h).await;
@@ -2220,8 +2449,8 @@ async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
 }
 
 /// T1, row H1: the ego hydration labels an unnamed human exactly as it
-/// labels a nameless agent (the `short_id` fallback), and a teammate's
-/// with the name (CALIBRATION).
+/// labels a nameless service principal (under the `oauth:` placeholder,
+/// operator ruling C7), and a teammate's with the name (CALIBRATION).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_ego_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
     let scoped = app_pool(&pool).await;
@@ -2241,11 +2470,18 @@ async fn the_ego_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) 
         }
     };
     let out = hydrate(outsider).await;
+    let (ph, pn) = (
+        placeholder_of(&pool, h).await,
+        placeholder_of(&pool, n).await,
+    );
     let label = |id: Uuid, list: &[epigraph_db::EgoEntity]| {
         let e = list.iter().find(|e| e.id == id).expect("hydrated");
         (
             e.entity_type.clone(),
-            e.label.replace(&id.to_string()[..8], "<id>"),
+            e.label
+                .replace(&ph, "oauth:<client>")
+                .replace(&pn, "oauth:<client>")
+                .replace(&id.to_string()[..8], "<id>"),
         )
     };
     assert_eq!(label(h, &out), label(n, &out), "H's ego node reads as N's");

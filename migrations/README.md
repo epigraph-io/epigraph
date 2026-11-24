@@ -4627,6 +4627,19 @@ restart.
   refusal moved there. Pinned by `epigraph-db/tests/person_team_groups.rs`
   (`an_invitation_answers_alike_whoever_the_invitee_is`), `epigraph-api/tests/team_groups_http.rs`,
   `epigraph-mcp/tests/team_groups_app_role.rs`. Undo: `docs/runbooks/284-undo.sql`.
+- **285**: `unnamed_agent_placeholder_name` (operator ruling C7). NEW
+  `epigraph_unnamed_agent_name(agent) -> text`: `'oauth:' || <id of the agent's earliest linked
+  oauth_clients row>`, the provisioning client, so the name is the one a nameless OAuth service
+  principal carries and its uuid derives the agent's key as a service principal's does; NULL
+  with no client. SECURITY INVOKER `LANGUAGE sql STABLE`, every name qualified (reads only
+  `oauth_clients`, which carries no row policy and both roles SELECT), maintenance-owned,
+  EXECUTE for the application role. Every surface's name decision ends `ELSE
+  public.epigraph_unnamed_agent_name(<alias>.id) END` instead of NULL, and the matchers find an
+  unnamed human by that placeholder as they find a service principal. Pinned by
+  `epigraph-db/tests/human_identity_visibility.rs` (placeholder search, provisioning-client
+  derivation), `agent_name_disclosure_lint.rs::no_name_decision_falls_back_to_null`, and the
+  H-vs-N tests across REST and MCP. Undo: `docs/runbooks/285-undo.sql` (after rolling back the
+  binaries).
 
 ## `-- no-transaction` migrations
 

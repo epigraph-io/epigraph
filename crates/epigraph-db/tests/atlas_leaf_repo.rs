@@ -1303,8 +1303,9 @@ async fn claim_truth_values_read_only_the_claims_the_map_may_draw(pool: PgPool) 
 /// Spec 2026-11-24 human identity, row H3: a stored leaf document is read by
 /// the MAP's audience, so an unnamed human is labelled for that audience,
 /// never for the privileged session that builds it: no name on the public
-/// map; its name on the map of a team it belongs to (CALIBRATION, the team
-/// arm for a member of that team).
+/// map (the `oauth:<client row id>` placeholder, operator ruling C7); its
+/// name on the map of a team it belongs to (CALIBRATION, the team arm for a
+/// member of that team).
 #[sqlx::test(migrations = "../../migrations")]
 async fn node_labels_name_a_human_only_for_a_map_audience_that_may_see_it(pool: PgPool) {
     let t = team(&pool, "team-of-the-human").await;
@@ -1333,10 +1334,16 @@ async fn node_labels_name_a_human_only_for_a_map_audience_that_may_see_it(pool: 
         AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Public, &[h], &[])
             .await
             .expect("node_labels");
+    let client: Uuid = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(h)
+        .fetch_one(&pool)
+        .await
+        .expect("the fixture's one client");
     assert_eq!(
-        public.get(&h),
-        None,
-        "the public map's audience gets no name"
+        public.get(&h).map(String::as_str),
+        Some(format!("oauth:{client}").as_str()),
+        "the public map's audience gets no name, only the placeholder a nameless service \
+         principal carries (operator ruling C7)"
     );
     let (team_map, _) =
         AtlasLeafRepository::node_labels(&mut conn, &system, AtlasMap::Team(t), &[h], &[])

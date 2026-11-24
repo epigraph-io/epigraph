@@ -667,3 +667,66 @@ fn the_scanner_sees_aliased_unaliased_and_gated_shapes() {
         r#"{ sqlx::query("SELECT a.id /* , a.display_name */ FROM agents a") }"#
     )));
 }
+
+/// Operator ruling C7 (migration 285): wherever a statement decides an
+/// agent's name by the disclosure rule, the unnamed reading is the
+/// `oauth:<client row id>` placeholder a nameless service principal carries,
+/// never NULL (a null name on an OAuth principal marked exactly the hidden
+/// humans). So no live SQL in `crates/*/src` may end a name decision with
+/// `THEN <alias>.display_name END`: every such `CASE` carries
+/// `ELSE public.epigraph_unnamed_agent_name(<alias>.id) END`.
+#[test]
+fn no_name_decision_falls_back_to_null() {
+    fn offenders(sql: &str) -> usize {
+        let mut n = 0;
+        let mut from = 0;
+        while let Some(rel) = sql[from..].find(".display_name end") {
+            let at = from + rel;
+            from = at + 1;
+            let before = sql[..at].trim_end();
+            let alias_start = before
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |i| i + 1);
+            if before[..alias_start].trim_end().ends_with("then") {
+                n += 1;
+            }
+        }
+        n
+    }
+    // The scanner on planted shapes: the old fallback is seen, the ruled one
+    // and an unrelated `END` are not.
+    assert_eq!(
+        offenders(&sql_of(
+            r#"{ sqlx::query("SELECT CASE WHEN d.named THEN a.display_name END FROM agents a") }"#
+        )),
+        1
+    );
+    assert_eq!(
+        offenders(&sql_of(
+            r#"{ sqlx::query("SELECT CASE WHEN d.named THEN a.display_name \
+                ELSE public.epigraph_unnamed_agent_name(a.id) END FROM agents a") }"#
+        )),
+        0
+    );
+    let mut found = Vec::new();
+    let mut scanned = 0usize;
+    for (file, src) in sources() {
+        for (name, body) in fns(&src) {
+            let sql = sql_of(&body);
+            if sql.contains("display_name") {
+                scanned += 1;
+            }
+            if offenders(&sql) > 0 {
+                found.push(format!("{file}::{name}"));
+            }
+        }
+    }
+    assert!(
+        scanned >= 10,
+        "CALIBRATION: the scan saw only {scanned} functions naming display_name"
+    );
+    assert!(
+        found.is_empty(),
+        "these name decisions fall back to NULL instead of the placeholder (C7): {found:?}"
+    );
+}

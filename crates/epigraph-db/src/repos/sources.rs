@@ -434,7 +434,9 @@ impl SourceOverviewRepository {
             &format!(
                 "SELECT s.id, s.k, \
                         left(CASE WHEN public.epigraph_human_named_to_viewer(s.id) \
-                                  THEN s.display_name END, {SOURCE_TEXT_MAX}) AS display_name, \
+                                  THEN s.display_name \
+                                  ELSE public.epigraph_unnamed_agent_name(s.id) END, \
+                             {SOURCE_TEXT_MAX}) AS display_name, \
                         s.n \
                    FROM (SELECT a.id, a.id::text AS k, a.display_name, \
                                 COUNT(*) AS n \

@@ -149,6 +149,19 @@ fn shape(card: &AgentCard) -> serde_json::Value {
     v
 }
 
+/// The name an unnamed human is shown under (operator ruling C7): the
+/// `oauth:<client row id>` placeholder of the ONE client
+/// `fixture::make_human_operator` links to it, read from the link.
+async fn placeholder(pool: &PgPool, human: Uuid) -> String {
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(human)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    assert_eq!(rows.len(), 1, "the fixture links one client");
+    format!("oauth:{}", rows[0])
+}
+
 fn ids(r: &epigraph_db::FindAgentResult) -> Vec<Uuid> {
     r.results.iter().map(|h| h.card.id).collect()
 }
@@ -497,18 +510,21 @@ async fn the_operator_humans_id_is_shown_to_every_reader_and_its_name_by_the_rul
         "CALIBRATION: the card names the binding epigraph_human_of names"
     );
 
+    // An outsider sees the human under the placeholder a nameless service
+    // principal carries (operator ruling C7), never its name.
+    let hidden = placeholder(&pool, human).await;
     for (who, name) in [
-        (outsider, None),
+        (outsider, hidden.as_str()),
         // The bound agent reads its operator's teams (migration 234), so the
         // team arm names the human to it once the human has a team.
-        (linked, Some("Talia Brennick")),
-        (human, Some("Talia Brennick")),
-        (teammate, Some("Talia Brennick")),
+        (linked, "Talia Brennick"),
+        (human, "Talia Brennick"),
+        (teammate, "Talia Brennick"),
     ] {
         let c = card_as(&pool, who, linked).await;
         let h = c.operator_human.as_ref().expect("operator_human shown");
         assert_eq!(h.id, human, "{who}: the id is never withheld");
-        assert_eq!(h.display_name.as_deref(), name, "{who}");
+        assert_eq!(h.display_name.as_deref(), Some(name), "{who}");
         assert_eq!(c.kind, AgentKind::LlmAgent);
         assert!(c.kind_evidence.contains(&"bound_to_visible_human"));
     }
@@ -2333,8 +2349,8 @@ async fn a_human_some_agent_is_bound_to_reads_as_human_to_every_reader_it_is_nam
             .await
             .operator_human
             .map(|h| (h.id, h.display_name)),
-        Some((h_hidden, None)),
-        "the id, never the name"
+        Some((h_hidden, Some(placeholder(&pool, h_hidden).await))),
+        "the id, never the name: the placeholder (C7)"
     );
 }
 
@@ -2552,10 +2568,11 @@ async fn migration_269_attachments_refuse_more_than_200_agents(pool: PgPool) {
 
 /// `PaperRepository::list_authors_by` (MCP `query_paper`, REST papers, the
 /// `authored_by` literature block, the sources paper kind) lists a human
-/// author a stranger's ingest named with NO name to an outsider, exactly as
-/// it lists a nameless author node, and with its name to a teammate
-/// (CALIBRATION); position and role are the ingester's edge data and show
-/// alike.
+/// author a stranger's ingest named WITHOUT its name to an outsider, under the
+/// `oauth:<client row id>` placeholder a nameless service principal carries
+/// (operator ruling C7), and with its name to a teammate (CALIBRATION); role
+/// and affiliations are the ingester's edge data and show as for a nameless
+/// author node.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_paper_lists_an_unnamed_human_author_without_its_name(pool: PgPool) {
     let (outsider, _) = named(&pool, "outsider").await;
@@ -2602,18 +2619,14 @@ async fn a_paper_lists_an_unnamed_human_author_without_its_name(pool: PgPool) {
         .iter()
         .find(|r| r.agent_id == nameless)
         .expect("N listed");
-    assert_eq!(h.display_name, None, "an outsider gets no name");
     assert_eq!(
-        (
-            h.display_name.clone(),
-            h.role.clone(),
-            h.affiliations.clone()
-        ),
-        (
-            n.display_name.clone(),
-            n.role.clone(),
-            n.affiliations.clone()
-        )
+        h.display_name,
+        Some(placeholder(&pool, human).await),
+        "an outsider gets the placeholder a nameless service principal carries (C7), not the name"
+    );
+    assert_eq!(
+        (h.role.clone(), h.affiliations.clone()),
+        (n.role.clone(), n.affiliations.clone())
     );
     let rows = list(mate).await;
     let h = rows.iter().find(|r| r.agent_id == human).expect("H listed");

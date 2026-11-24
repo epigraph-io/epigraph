@@ -2790,6 +2790,16 @@ impl AgentRepository {
     /// it, or is privileged; for a human, also only when named). An unstamped
     /// application session reads as the anonymous outsider.
     ///
+    /// An UNNAMED human reads exactly as a nameless OAuth service principal
+    /// (operator ruling C7): such a principal's profile is `'public'` (274's
+    /// mint) with the column default `{}` for properties and no ORCID / ROR,
+    /// so the unnamed human is shown under its `oauth:<client row id>`
+    /// placeholder (migration 285) with `profile_visibility = 'public'`,
+    /// `properties = {}` and null ORCID / ROR, whatever its row holds. Its
+    /// `key_kind` is its own: a provider-provisioned person is `derived`, as
+    /// the service principal is (a registered operator holding a real key is
+    /// the residual the spec records).
+    ///
     /// The decision is made in SQL, in the same round trip as the row, so there
     /// is no window in which the caller holds the PII and has not yet decided
     /// whether it may show it.
@@ -2819,11 +2829,14 @@ impl AgentRepository {
         let row: Option<Row> = sqlx::query_as(
             r#"
             SELECT a.id,
-                   CASE WHEN d.named THEN a.display_name END,
+                   CASE WHEN d.named THEN a.display_name
+                        ELSE public.epigraph_unnamed_agent_name(a.id) END,
                    a.public_key,
                    a.key_kind,
-                   CASE WHEN d.details THEN a.profile_visibility END,
-                   CASE WHEN d.details THEN a.properties END,
+                   CASE WHEN NOT d.named THEN 'public'
+                        WHEN d.details THEN a.profile_visibility END,
+                   CASE WHEN NOT d.named THEN '{}'::jsonb
+                        WHEN d.details THEN a.properties END,
                    CASE WHEN d.details THEN a.orcid END,
                    CASE WHEN d.details THEN a.ror_id END
             FROM agents a

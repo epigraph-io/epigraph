@@ -116,19 +116,26 @@ async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
 }
 
 /// H (a provider-provisioned person under its real name, profile `group` as
-/// migration 274 provisions it) and N (a service principal provisioned the
-/// same way, then nameless with a `group` profile: C7 option (b)).
+/// migration 274 provisions it) and N (a production-shaped nameless OAuth
+/// service principal, left exactly as `ensure_for_client` mints it:
+/// `oauth:<client row id>`, profile `public`, label `oauth-principal`).
+/// Operator ruling C7: an unnamed H reads as THIS N on every surface.
 async fn h_and_n(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
     let h = provisioned(pool, "human", name).await;
     let n = provisioned(pool, "service", "fixture service").await;
-    sqlx::query(
-        "UPDATE agents SET display_name = NULL, profile_visibility = 'group' WHERE id = $1",
-    )
-    .bind(n)
-    .execute(pool)
-    .await
-    .expect("nameless N");
     (h, n)
+}
+
+/// The one OAuth client a provisioned fixture is linked to, read from the
+/// link (not from the placeholder function under test).
+async fn client_of(pool: &PgPool, agent: Uuid) -> Uuid {
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    assert_eq!(rows.len(), 1, "a provisioned fixture has one client");
+    rows[0]
 }
 
 async fn team_of(pool: &PgPool, members: &[Uuid]) -> Uuid {
@@ -196,11 +203,22 @@ fn masked(v: &Value, subs: &[(String, &str)]) -> Value {
     }
 }
 
+/// The masks for one agent's body: its id, its key and, for a provisioned
+/// principal, the client row id inside its `oauth:` placeholder name.
 async fn subs_for(pool: &PgPool, agent: Uuid) -> Vec<(String, &'static str)> {
-    vec![
+    let mut subs = vec![
         (agent.to_string(), "<id>"),
         (public_key_hex(pool, agent).await, "<key>"),
-    ]
+    ];
+    let clients: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM oauth_clients WHERE agent_id = $1")
+        .bind(agent)
+        .fetch_all(pool)
+        .await
+        .expect("linked clients");
+    for c in clients {
+        subs.push((c.to_string(), "<client>"));
+    }
+    subs
 }
 
 /// C1, C2, C3: `GET /api/v1/agents/:id`, `GET /agents/:id`,
@@ -293,7 +311,11 @@ async fn a_create_find_hit_reads_back_no_name_it_may_not_see(pool: PgPool) {
     let (st, body) = post(outsider).await;
     assert_eq!(st, StatusCode::OK, "{body}");
     assert_eq!(body["id"], h.to_string(), "the find-hit is H: {body}");
-    assert_eq!(body["display_name"], Value::Null, "{body}");
+    assert_eq!(
+        body["display_name"],
+        Value::from(format!("oauth:{}", client_of(&pool, h).await)),
+        "C7: shown as a nameless service principal: {body}"
+    );
     let (_, body) = post(mate).await;
     assert_eq!(
         body["display_name"], "Marisol Unheard",
@@ -443,8 +465,9 @@ async fn a_graph_query_cannot_match_an_unnamed_humans_profile(pool: PgPool) {
 
 /// Row H2: the graph builder (`load_subgraph_conn`, behind
 /// `POST /api/v1/graph/query` and `graph_full`) gives an unnamed human's
-/// node no `display_name` and the `id[..8]` label a nameless agent gets; a
-/// teammate sees the name (CALIBRATION).
+/// node the `display_name` and label a nameless service principal's gets
+/// (its `oauth:` placeholder, operator ruling C7); a teammate sees the name
+/// (CALIBRATION).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -452,8 +475,10 @@ async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool
     let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider").await;
     let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "teammate").await;
     team_of(&pool, &[h, mate]).await;
+    let (sh, sn) = (subs_for(&pool, h).await, subs_for(&pool, n).await);
     let node = |who: Uuid, id: Uuid| {
         let state = state.clone();
+        let subs = if id == h { sh.clone() } else { sn.clone() };
         async move {
             let (st, body) = call(
                 &state,
@@ -473,8 +498,8 @@ async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool
                 .cloned()
                 .unwrap_or_else(|| panic!("{id} in the graph: {body}"));
             (
-                n["display_name"].clone(),
-                n["label"]
+                masked(&n["display_name"], &subs),
+                masked(&n["label"], &subs)
                     .as_str()
                     .unwrap_or_default()
                     .replace(&id.to_string()[..8], "<id>"),
@@ -495,9 +520,9 @@ async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool
 
 /// Rows F1, F2, F3: the political surfaces answer an outsider about an
 /// unnamed human exactly as about N: `GET /api/v1/agents/:id/epistemic-profile`
-/// and `GET /api/v1/agents/compare` (no name), and a claim's genealogy names
-/// an `AMPLIFIED_BY` human with no name; a teammate gets the name
-/// (CALIBRATION).
+/// and `GET /api/v1/agents/compare` (each under its `oauth:` placeholder,
+/// operator ruling C7), and a claim's genealogy names an `AMPLIFIED_BY` human
+/// only by its placeholder; a teammate gets the name (CALIBRATION).
 #[sqlx::test(migrations = "../../migrations")]
 async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
     let state = app_role_state(&pool).await;
@@ -553,9 +578,14 @@ async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: 
             (name_of(h), name_of(n), name_of(svc))
         }
     };
+    let (name_h, name_n, name_svc) = compare_names(outsider).await;
     assert_eq!(
-        compare_names(outsider).await,
-        (Value::Null, Value::Null, Value::from("Plain Named Service")),
+        (masked(&name_h, &sh), masked(&name_n, &sn), name_svc),
+        (
+            Value::from("oauth:<client>"),
+            Value::from("oauth:<client>"),
+            Value::from("Plain Named Service")
+        ),
         "compare, outsider"
     );
     assert_eq!(
@@ -591,9 +621,14 @@ async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: 
             body.to_string()
         }
     };
+    let outsiders = gen(outsider).await;
     assert!(
-        !gen(outsider).await.contains("Cosima Amplified"),
+        !outsiders.contains("Cosima Amplified"),
         "the genealogy named an unnamed human"
+    );
+    assert!(
+        outsiders.contains(&format!("oauth:{}", client_of(&pool, h).await)),
+        "C7: the genealogy shows H's placeholder: {outsiders}"
     );
     assert!(
         gen(mate).await.contains("Cosima Amplified"),

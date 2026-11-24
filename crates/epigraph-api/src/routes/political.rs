@@ -359,7 +359,7 @@ pub async fn epistemic_profile(
     // The name as the caller may see it (migration 272, on this stamped
     // connection; spec 7 row F1).
     let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
-    epigraph_db::redact_agent(&mut agent, d.get(&id).copied().unwrap_or_default());
+    epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
     // Fetch claims
     let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
@@ -511,7 +511,7 @@ pub async fn compare_agents(
         };
         // As `epistemic_profile` (spec 7 row F2).
         let d = epigraph_db::AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
-        epigraph_db::redact_agent(&mut agent, d.get(&id).copied().unwrap_or_default());
+        epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
         let claims = PoliticalRepository::get_agent_profile_claims(&mut *read, &viewer, id).await?;
         let claim_count = claims.len();

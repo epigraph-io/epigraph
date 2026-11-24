@@ -406,11 +406,11 @@ pub async fn create_agent(
         let mut read = scoped_read(&state, &viewer, "create_agent").await?;
         let d = AgentDisclosureRepository::disclosure(&mut read, &[new_agent_id])
             .await?
-            .get(&new_agent_id)
-            .copied()
+            .remove(&new_agent_id)
             .unwrap_or_default();
         if !d.named {
-            created_agent.display_name = None;
+            // Shown as a nameless service principal is (operator ruling C7).
+            created_agent.display_name = d.unnamed_as;
         }
     }
     let mut response: AgentResponse = created_agent.into();
@@ -454,8 +454,10 @@ pub async fn create_agent(
 ///
 /// GET /agents/:id
 ///
-/// Returns agent information including their public key. `display_name` is
-/// null for a human principal the caller may not see named, and `orcid` /
+/// Returns agent information including their public key. `display_name` is,
+/// for a human principal the caller may not see named, the `oauth:<client
+/// row id>` placeholder a nameless service principal carries (operator
+/// ruling C7), and `orcid` /
 /// `ror_id` are profile DETAILS, null unless the caller may see the agent's
 /// profile: both decided by migration 272's `epigraph_agent_disclosure` on the
 /// caller's stamped connection (`epigraph_db::AgentDisclosureRepository`, the
@@ -504,16 +506,17 @@ async fn scoped_read<'s>(
     })
 }
 
-/// The agent as the caller may see it: `display_name` nulled when not
-/// `named`, `orcid` / `ror_id` when not `details`. An id missing from `d`
-/// (never true for a row just read) is treated as fully hidden: the fail
-/// direction is closed.
+/// The agent as the caller may see it: `display_name` replaced by the
+/// placeholder a nameless service principal carries when not `named`
+/// (operator ruling C7), `orcid` / `ror_id` nulled when not `details`. An id
+/// missing from `d` (never true for a row just read) is treated as fully
+/// hidden: the fail direction is closed.
 #[cfg(feature = "db")]
 fn redact_profile(
     mut agent: Agent,
     d: &std::collections::HashMap<Uuid, epigraph_db::Disclosure>,
 ) -> AgentResponse {
-    let disclosure = d.get(&Uuid::from(agent.id)).copied().unwrap_or_default();
+    let disclosure = d.get(&Uuid::from(agent.id)).cloned().unwrap_or_default();
     epigraph_db::redact_agent(&mut agent, disclosure);
     agent.into()
 }
@@ -792,7 +795,7 @@ pub async fn get_agent_reputation(
     // connection): an unnamed human's reputation reads as a nameless agent's.
     let mut agent = agent;
     let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
-    epigraph_db::redact_agent(&mut agent, d.get(&id).copied().unwrap_or_default());
+    epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());
 
     // 3. Convert claims into ClaimOutcome structs
     let now = chrono::Utc::now();
