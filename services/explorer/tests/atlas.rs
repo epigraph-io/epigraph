@@ -1690,6 +1690,94 @@ async fn claim_panel_provenance_degrades_alone() {
     assert_eq!(res.json()["error"], "session_expired");
 }
 
+/// An author at every clip length, of control characters (each escaped to
+/// six bytes in JSON).
+fn heavy_author(i: usize) -> Value {
+    let label = "\u{1}".repeat(160);
+    json!({"id": format!("00000000-0000-0000-0000-{i:012}"), "display_name": label,
+           "role": "\u{1}".repeat(40), "affiliations": [label, label, label], "position": 0,
+           "pending_countersign": false, "named_by": null, "added_by": null})
+}
+
+/// A document with 50 heavy authors (the kernel's limit) in its primary list
+/// and, when `all_lists`, 50 more in each of its pending and added lists.
+fn heavy_document(i: usize, all_lists: bool) -> Value {
+    let list = |from: usize| -> Vec<Value> {
+        (0..50).map(|j| heavy_author(i * 1000 + from + j)).collect()
+    };
+    let more = |from: usize| if all_lists { list(from) } else { vec![] };
+    json!({"paper": {"id": format!("00000000-0000-0000-0000-{:012}", 900_000 + i),
+                     "doi": "10.1/x", "title": "\u{1}".repeat(300)},
+           "authors": list(0), "pending_authors": more(100),
+           "added_authors": more(200), "authors_truncated": all_lists})
+}
+
+#[tokio::test]
+async fn claim_panel_survives_a_worst_case_provenance_block() {
+    // Ten corroborating documents, each with the kernel's 50 authors whose
+    // names escape to six bytes a character: carried whole, they push the
+    // panel over the atlas body cap and fail it for every viewer.
+    let app = spawn().await;
+    mount_dir(&app, "tok", dir_default()).await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/context"),
+        ok(context_json()),
+    )
+    .await;
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}/placement"),
+        ok(placement_json(C1, Some(T), shared_layout())),
+    )
+    .await;
+    let docs: Vec<Value> = (1..=10).map(|i| heavy_document(i, false)).collect();
+    mount_get(
+        &app,
+        &format!("/api/v1/claims/{C1}"),
+        ok(json!({
+            "id": C1, "content": "The centre claim.", "created_at": "2026-11-01T10:00:00Z",
+            "authored_by": {
+                "source": "literature",
+                "paper": heavy_document(0, true),
+                "ingested_by": {"agent": {"id": AGENT, "display_name": "ingest-bot"},
+                                "human": null, "prompt_snapshot": null},
+                "corroborated_by": docs, "corroborated_by_truncated": false,
+                "ingesters": [], "ingesters_truncated": false
+            }
+        })),
+    )
+    .await;
+    let sid = app.sign_in("tok");
+    let res = app
+        .get_as(&format!("/explorer/bff/atlas/claim/{C1}"), &sid)
+        .await;
+    let head: String = res.body.chars().take(300).collect();
+    assert_eq!(res.status, StatusCode::OK, "{head}");
+    let b = res.json();
+    assert_eq!(b["ring"]["status"], "ok");
+    assert_eq!(
+        b["provenance"]["status"], "ok",
+        "the section fits its budget"
+    );
+    let p = &b["provenance"]["data"];
+    let names: usize = ["authors", "pending_authors", "added_authors"]
+        .iter()
+        .map(|k| p["paper"][k].as_array().unwrap().len())
+        .sum();
+    assert_eq!(names, 50, "the creating document carries 50 names in all");
+    assert_eq!(
+        p["paper"]["authors"].as_array().unwrap().len(),
+        50,
+        "primary first"
+    );
+    assert_eq!(p["paper"]["authors_truncated"], true);
+    for d in p["corroborated_by"].as_array().unwrap() {
+        assert!(d.get("authors").is_none(), "{d}");
+        assert!(d.get("pending_authors").is_none(), "{d}");
+    }
+}
+
 #[tokio::test]
 async fn claim_panel_fallback_reuses_its_claim_read_for_provenance() {
     let app = spawn().await;

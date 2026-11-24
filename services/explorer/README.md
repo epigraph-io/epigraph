@@ -113,7 +113,11 @@ are still awaiting countersignature, and authors a later ingest added, are
 listed apart and never as authors. It also shows the ingestion note: by whom,
 using which model, and on what date. For a claim an agent filed directly, it
 names the human, then the agent. Both kinds end with the filing date and the
-other documents that recorded the claim. The model and the prompt snapshot
+other documents that recorded the claim (by title and DOI only). The
+creating document carries at most 50 names across its three author lists,
+primary authors first, and a row says when names were left out. The whole
+section stays under a byte budget, so long names degrade this section rather
+than the panel. The model and the prompt snapshot
 appear only when the kernel shows them to this viewer. An API without the
 block leaves the section unavailable, and the rest of the panel is unaffected.
 The rules are `provenanceRows` in `static/atlas_views.js`. Not built yet: the
