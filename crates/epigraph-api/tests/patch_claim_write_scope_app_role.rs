@@ -91,10 +91,10 @@ fn auth(agent: Uuid) -> Option<Extension<AuthContext>> {
     }))
 }
 
-/// The author with its OAuth client. The client's id IS the agent's (as
-/// `AgentRepository::ensure_for_client` makes it), so the ownership gate's
-/// principal is the claim's author and the provenance row's `submitted_by` /
-/// `principal_id` foreign keys to `oauth_clients` hold.
+/// The author with its OAuth client. The fixture gives the client the
+/// agent's own id, so `require_owner_or_admin`'s principal (the token's
+/// `owner_id`) is the claim's author, and the provenance row's
+/// `submitted_by` / `principal_id` foreign keys to `oauth_clients` hold.
 async fn seed_author(pool: &PgPool, label: &str) -> (Uuid, Uuid) {
     let (agent, group) = seed_agent_with_group(pool, label).await;
     sqlx::query(
