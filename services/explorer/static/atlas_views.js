@@ -371,9 +371,12 @@
       if (!doc) return null;
       const paper = p.paper;
       push('Source', [doc]);
-      push('Authors', peopleParts(paper.authors, paper.authors_truncated === true));
+      push('Authors', peopleParts(paper.authors, false));
       push('Named, awaiting confirmation', peopleParts(paper.pending_authors, false));
       push('Added by a later ingest', peopleParts(paper.added_authors, false));
+      // The cut flag covers the three lists together, so it gets its own row:
+      // on one list's row it could read as people that list does not have.
+      if (paper.authors_truncated === true) push('Not all names shown', [part('Some names on this document are not listed here.')]);
       const by = filerParts(p.ingested_by);
       if (by.length) {
         const when = dayLabel(p.ingested_at);

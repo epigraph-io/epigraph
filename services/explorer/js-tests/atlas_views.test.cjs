@@ -190,9 +190,10 @@ const literature = () => ({
 test('provenance: a document-made claim lists its authors apart from pending and added ones', () => {
   const rows = V.provenanceRows(literature());
   assert.deepEqual(rows.map((r) => r.title), [
-    'Source', 'Authors', 'Named, awaiting confirmation', 'Added by a later ingest', 'Ingested', 'Filed', 'Also recorded in',
+    'Source', 'Authors', 'Named, awaiting confirmation', 'Added by a later ingest', 'Not all names shown', 'Ingested', 'Filed',
+    'Also recorded in',
   ]);
-  assert.equal(flat(rowOf(rows, 'Authors')), 'Ada, Bo (editor) and others');
+  assert.equal(flat(rowOf(rows, 'Authors')), 'Ada, Bo (editor)');
   assert.ok(!flat(rowOf(rows, 'Authors')).includes('Pending'), 'a pending author is never an author');
   assert.ok(!flat(rowOf(rows, 'Authors')).includes('Added'), 'an added author is never an author');
   assert.equal(flat(rowOf(rows, 'Named, awaiting confirmation')), 'Pending Pat');
@@ -206,6 +207,21 @@ test('provenance: a document-made claim lists its authors apart from pending and
   for (const p of rowOf(rows, 'Authors').parts.filter((x) => x.href)) {
     assert.ok(p.href.startsWith('/explorer/agent/') && !p.external, p.href);
   }
+});
+
+test('provenance: a cut author list never suggests more primary authors', () => {
+  // The kernel's flag covers primary, pending and added names together: a
+  // paper with three primary authors and many pending ones sets it too.
+  const body = literature();
+  body.paper.authors = [person(2, 'Ada'), person(3, 'Bo'), person(11, 'Cy')];
+  body.paper.added_authors = [];
+  const rows = V.provenanceRows(body);
+  assert.equal(flat(rowOf(rows, 'Authors')), 'Ada, Bo, Cy');
+  for (const r of rows) assert.ok(!flat(r).includes('and others'), r.title);
+  assert.equal(flat(rowOf(rows, 'Not all names shown')), 'Some names on this document are not listed here.');
+  assert.ok(rows.findIndex((r) => r.title === 'Not all names shown') > rows.findIndex((r) => r.title === 'Named, awaiting confirmation'));
+  body.paper.authors_truncated = false;
+  assert.equal(rowOf(V.provenanceRows(body), 'Not all names shown'), undefined, 'an uncut list has no note');
 });
 
 test('provenance: an agent claim names human, agent, then what the viewer may see', () => {
