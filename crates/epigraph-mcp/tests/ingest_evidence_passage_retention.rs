@@ -59,7 +59,7 @@ async fn make_server(pool: PgPool) -> EpiGraphMcpFull {
 /// is the maintenance role. The application role cannot write the column.
 async fn set_licence(pool: &PgPool, doi: &str, title: &str, licence: &str) {
     let paper_id = PaperRepository::get_or_create(
-        pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some(title),
         None,
@@ -284,7 +284,7 @@ async fn spine_ingest_retains_passage_under_open_licence(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn blank_licence_is_refused(pool: PgPool) {
     let paper_id = PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         "10.9999/b60-blank",
         Some("Blank"),
         None,

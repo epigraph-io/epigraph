@@ -513,7 +513,7 @@ async fn ensure_paper_node(
         .owner_decl(agent_id, "ingest_document", &resolution)
         .await?;
     let id = PaperRepository::get_or_create(
-        &mut *tx,
+        &mut tx,
         doi,
         Some(&extraction.source.title),
         extraction.source.journal.as_deref(),
@@ -1596,7 +1596,7 @@ pub async fn do_ingest_document_reporting(
         .await?;
     // ── 2. Get-or-create the paper node, in the declared scope ──
     let paper_id = PaperRepository::get_or_create(
-        &mut *tx,
+        &mut tx,
         &doi,
         Some(&paper_title),
         extraction.source.journal.as_deref(),
@@ -2620,7 +2620,7 @@ pub async fn do_ingest_document_spine(
         .await?;
     // ── 1. Get-or-create the paper node, in the declared scope ──
     let paper_id = PaperRepository::get_or_create(
-        &mut *tx,
+        &mut tx,
         &doi,
         Some(&paper_title),
         extraction.source.journal.as_deref(),
@@ -3095,7 +3095,7 @@ mod tests {
 
         // Create the paper without a processed_by edge → still not ingested.
         let paper_id = PaperRepository::get_or_create(
-            &pool,
+            &mut pool.acquire().await.expect("acquire"),
             doi,
             Some("test"),
             None,

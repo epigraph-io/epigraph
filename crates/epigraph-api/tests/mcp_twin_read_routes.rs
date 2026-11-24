@@ -331,7 +331,7 @@ async fn already_ingested_twin_answers_and_refuses_as_the_tool(pool: PgPool) {
     // declared scope): both callers can read the row, so only the
     // group-private stamp below separates their answers.
     let paper = epigraph_db::PaperRepository::get_or_create(
-        &pool,
+        &mut pool.acquire().await.expect("acquire"),
         doi,
         Some("t"),
         None,
