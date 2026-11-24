@@ -108,6 +108,43 @@ async fn seen(pool: &PgPool, scoped: &ScopedPool, who: Option<Uuid>, holder: Uui
     [listed, by_source, sub, usize::from(types > 0)]
 }
 
+/// The ROSTER read from the role node's side: how many projection edges
+/// INTO `node` `who` reads through `get_by_target` (MCP `get_neighborhood` on
+/// the role node) and `list_filtered(target_id)` (REST
+/// `GET /api/v1/edges?target_id=`). These answer "every holder of role X".
+async fn roster_seen(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    who: Option<Uuid>,
+    node: Uuid,
+) -> [usize; 2] {
+    let v = viewer(pool, who).await;
+    let mut read = scoped.read_as(&v).await.expect("read_as");
+    let is_rel = |r: &str| r.eq_ignore_ascii_case(REL);
+    let by_target = epigraph_db::EdgeRepository::get_by_target(&mut *read, &v, node, "agent")
+        .await
+        .expect("get_by_target")
+        .iter()
+        .filter(|e| is_rel(&e.relationship))
+        .count();
+    let listed = epigraph_db::EdgeRepository::list_filtered(
+        &mut *read,
+        &v,
+        None,
+        Some(node),
+        Some(REL),
+        None,
+        None,
+        100,
+    )
+    .await
+    .expect("list_filtered by target")
+    .iter()
+    .filter(|e| is_rel(&e.relationship))
+    .count();
+    [by_target, listed]
+}
+
 const NONE: [usize; 4] = [0, 0, 0, 0];
 const ONE: [usize; 4] = [1, 1, 1, 1];
 
@@ -252,7 +289,7 @@ async fn a_bound_roles_edge_is_read_by_the_team_and_the_holder_only(pool: PgPool
     let (h, _) = person(&pool, "holder").await;
     let (mate, _) = fixture::seed_agent_with_group(&pool, "mate").await;
     let (outsider, _) = fixture::seed_agent_with_group(&pool, "outsider").await;
-    seed_role(&pool, "role:edge-test-a").await;
+    let node = seed_role(&pool, "role:edge-test-a").await;
     let team = group_of(&pool, "team", &[mate]).await;
     bind(&pool, team, "role:edge-test-a").await;
     grant(&pool, "role:edge-test-a", h).await;
@@ -270,6 +307,22 @@ async fn a_bound_roles_edge_is_read_by_the_team_and_the_holder_only(pool: PgPool
     assert_eq!(seen(&pool, &scoped, None, h).await, NONE, "guest");
     assert_eq!(seen(&pool, &scoped, Some(mate), h).await, ONE, "teammate");
     assert_eq!(seen(&pool, &scoped, Some(h), h).await, ONE, "holder");
+    // The roster, read from the role node's side.
+    assert_eq!(
+        roster_seen(&pool, &scoped, Some(outsider), node).await,
+        [0, 0],
+        "outsider roster"
+    );
+    assert_eq!(
+        roster_seen(&pool, &scoped, None, node).await,
+        [0, 0],
+        "guest roster"
+    );
+    assert_eq!(
+        roster_seen(&pool, &scoped, Some(mate), node).await,
+        [1, 1],
+        "teammate roster"
+    );
 }
 
 /// A role bound to no group, or to two: the holder's personal group owns the
