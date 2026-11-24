@@ -2393,6 +2393,64 @@ async fn an_offbox_tree_with_wrong_ids_fails_the_night(pool: PgPool) {
     }
 }
 
+/// Review finding 7 (ordering half): the split of the over-cap themes runs,
+/// and has finished, BEFORE any map is read, so the parts it creates are new
+/// themes the same night's map step builds through the meaning hook. The
+/// fake meaning command refuses to run unless the split already ran, and the
+/// new theme is built.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_split_runs_before_the_maps_build_new_themes_through_the_hook(pool: PgPool) {
+    let (_scoped, viewer) = fixture::bypass(&pool).await;
+    let c = Corpus::new(&pool).await;
+    build_all(&pool, &viewer, &c).await;
+    let (tn, members) = new_theme_over_one_leaf(&pool, &c).await;
+    let a_map = AtlasMap::Team(c.a_team);
+    let dir = private_dir();
+    let work = private_dir();
+    let parts = vec![set(&members[..30]), set(&members[30..])];
+    let result = result_file(&dir, a_map, tn, &parts);
+    let d = dir.display();
+    let cmd = dir.join("offbox.sh");
+    script(
+        &cmd,
+        &format!(
+            "[ -f {d}/split-ran ] || exit 4\ntouch {d}/meaning-ran\ncp {} \"$3\"",
+            result.display()
+        ),
+    );
+    let python = dir.join("python.sh");
+    script(
+        &python,
+        &format!(
+            "[ -f {d}/meaning-ran ] && exit 5\ntouch {d}/split-ran\n\
+             echo '{{\"status\": \"applied\", \"manifest\": \"m.json\"}}'"
+        ),
+    );
+    let mut hook = offbox(cmd, work.clone());
+    hook.theme_cap_split = Some(ThemeCapSplit {
+        python,
+        script: std::path::PathBuf::from("theme_cap_split.py"),
+    });
+    // t1 holds 85 current members: over a cap of 80.
+    let o = NightOptions {
+        theme_cap: 80,
+        offbox: Some(hook),
+        ..opts()
+    };
+    let s = night(&pool, &viewer, &namer(), &o).await;
+    assert_eq!(s["themes"]["split"]["status"], "applied", "{s:#}");
+    let r = map_report(&s, a_map);
+    assert_eq!(r["offbox"]["status"], "computed", "{r:#}");
+    assert!(
+        ids_of(&r["themes"]["built"]).contains(&serde_json::json!(tn)),
+        "{r:#}"
+    );
+    assert!(dir.join("split-ran").exists() && dir.join("meaning-ran").exists());
+    for d in [&dir, &work] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
 /// Review finding 6: the summary carries the script's own status, so a run
 /// that split nothing is not reported as `applied`.
 #[sqlx::test(migrations = "../../migrations")]
