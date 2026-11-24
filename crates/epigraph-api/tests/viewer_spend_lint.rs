@@ -192,15 +192,42 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     ),
     // untenanted: the agent row; its claims are read through the viewer.
     ("agents.rs", "agent_claims", &["AgentRepository::get_by_id"]),
+    // stamped: `AgentDisclosureRepository::disclosure` runs on the handler's
+    // `read_as(viewer)` connection and migration 272's
+    // `epigraph_agent_disclosure` decides on that stamp (a definer that
+    // applies its own audience), so the viewer is spent on the stamp.
     (
         "agents.rs",
         "get_agent_reputation",
-        &["AgentRepository::get_by_id"],
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+        ],
     ),
-    // untenanted: the agent rows (`agents` is USING (true)); their ORCID / ROR
-    // id are nulled through the viewer (`profile_details_visible`, backlog
-    // 761c2b05).
-    ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    // untenanted: the agent rows (`agents` is USING (true)); their name, ORCID
+    // and ROR id are nulled through the stamped disclosure (migration 272,
+    // `AgentDisclosureRepository::disclosure` on `read_as(viewer)`).
+    (
+        "agents.rs",
+        "get_agent",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+        ],
+    ),
+    // `create_agent` takes a viewer only for a find-hit's NAME: the stamped
+    // disclosure (as `get_agent`) on `read_as(viewer)`. The create itself and
+    // the optional login client are the pre-existing writes on the pool,
+    // gated by `agents:write` / `claims:admin` as before.
+    (
+        "agents.rs",
+        "create_agent",
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::create_or_get_declaring",
+            "OAuthClientRepository::create",
+        ],
+    ),
     // `update_agent` takes a viewer only for the profile opt-in (migration
     // 273): `set_profile_visibility_conn` runs on `AppState::write_as(viewer)`,
     // a transaction STAMPED from it, and writes the stamped principal's own
@@ -225,6 +252,8 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
         "agents.rs",
         "list_agents",
         &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentDisclosureRepository::disclosure",
             "AgentRepository::count",
             "AgentRepository::count_by_label",
             "AgentRepository::get_by_public_key",

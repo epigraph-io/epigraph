@@ -40,6 +40,41 @@ use uuid::Uuid;
 // fixtures
 // ---------------------------------------------------------------------------
 
+/// `get_public_profile` as `viewer` reads it: on an `epigraph_app` connection
+/// stamped from `viewer` (`read_as`), because the decision is migration 272's
+/// `epigraph_agent_disclosure`, which reads the STAMPED session. On the
+/// superuser pool `epigraph_bypass()` holds and every detail would show.
+async fn profile_as(
+    pool: &PgPool,
+    viewer: &Viewer,
+    id: Uuid,
+) -> Option<epigraph_db::repos::agent::AgentPublicProfile> {
+    let url = {
+        let db: String = sqlx::query_scalar("SELECT current_database()")
+            .fetch_one(pool)
+            .await
+            .expect("db name");
+        let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+        let prefix = base
+            .split_once('?')
+            .map_or(base.as_str(), |(a, _)| a)
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("DATABASE_URL must carry a database path")
+            .0
+            .to_string();
+        format!("{prefix}/{db}")
+    };
+    let scoped =
+        ScopedPool::connect_downgraded_for_tests(&url, SessionGucMode::Session, "epigraph_app")
+            .await
+            .expect("app-role ScopedPool");
+    let mut read = scoped.read_as(viewer).await.expect("read_as");
+    AgentRepository::get_public_profile(&mut *read, id)
+        .await
+        .expect("get_public_profile")
+}
+
 /// A unique, `orcid_format`-valid ORCID derived from an agent id.
 fn orcid_for(id: Uuid) -> String {
     let d = format!("{:016}", (id.as_u128() % 10_u128.pow(16)) as u64);
@@ -126,13 +161,12 @@ async fn a_public_profile_is_visible_to_a_stranger(pool: PgPool) {
     let stranger = seed_agent(&pool, "public").await;
 
     let viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
 
     assert_eq!(profile.id, subject);
-    assert_eq!(profile.profile_visibility, "public");
+    assert_eq!(profile.profile_visibility.as_deref(), Some("public"));
     assert!(profile.properties.is_some(), "public means public");
     assert!(profile.orcid.is_some());
     assert!(profile.ror_id.is_some());
@@ -144,9 +178,8 @@ async fn a_group_profile_is_opaque_to_a_stranger(pool: PgPool) {
     let stranger = seed_agent(&pool, "public").await;
 
     let viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
 
     // The four always-present fields. `agents` is Tier-B: the ROW stays
@@ -158,7 +191,9 @@ async fn a_group_profile_is_opaque_to_a_stranger(pool: PgPool) {
     );
     assert_eq!(profile.public_key.len(), 32);
     assert_eq!(profile.key_kind, "ed25519");
-    assert_eq!(profile.profile_visibility, "group");
+    // Shown only with the details (spec B1): an unnamed human's `group`
+    // would otherwise be a marker a nameless agent does not carry.
+    assert_eq!(profile.profile_visibility, None);
 
     // And the three that are not.
     assert!(
@@ -174,9 +209,8 @@ async fn an_agent_can_always_see_its_own_profile(pool: PgPool) {
     let subject = seed_agent(&pool, "group").await;
 
     let viewer = Viewer::resolve(&pool, subject).await.expect("resolve");
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
 
     assert!(
@@ -195,9 +229,8 @@ async fn a_shared_live_group_reveals_the_profile(pool: PgPool) {
     seed_membership(&pool, shared, colleague, false).await;
 
     let viewer = Viewer::resolve(&pool, colleague).await.expect("resolve");
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
 
     assert!(
@@ -224,9 +257,8 @@ async fn a_revoked_membership_does_not_reveal_the_profile(pool: PgPool) {
         "precondition: the revoked membership is not in the viewer's group set"
     );
 
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
     assert!(
         profile.properties.is_none(),
@@ -247,9 +279,8 @@ async fn the_subjects_membership_must_also_be_live(pool: PgPool) {
     let viewer = Viewer::resolve(&pool, colleague).await.expect("resolve");
     assert_eq!(viewer.group_bind(), Some(&[shared][..]));
 
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, subject)
+    let profile = profile_as(&pool, &viewer, subject)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
     assert!(
         profile.properties.is_none(),
@@ -284,13 +315,14 @@ async fn a_bypass_viewer_sees_everything(pool_opts: PgPoolOptions, conn_opts: Pg
 
     let subject = seed_agent(&pool, "group").await;
 
-    let (_conn, lease) = scoped
+    // A maintenance (here: superuser) session is the privileged arm of
+    // migration 272's rule, decided on the session itself.
+    let (mut conn, _lease) = scoped
         .unscoped_for_maintenance(SystemReason::SchemaContractTest)
         .await
         .expect("unscoped_for_maintenance");
-    let bypass = Viewer::system(&lease, SystemReason::SchemaContractTest);
 
-    let profile = AgentRepository::get_public_profile(&pool, &bypass, subject)
+    let profile = AgentRepository::get_public_profile(&mut *conn, subject)
         .await
         .expect("get_public_profile")
         .expect("the agent exists");
@@ -308,9 +340,7 @@ async fn an_unknown_agent_is_none_not_an_error(pool: PgPool) {
     let caller = seed_agent(&pool, "public").await;
     let viewer = Viewer::resolve(&pool, caller).await.expect("resolve");
 
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, Uuid::new_v4())
-        .await
-        .expect("an unknown id is not an error");
+    let profile = profile_as(&pool, &viewer, Uuid::new_v4()).await;
     assert!(profile.is_none());
 }
 
@@ -334,9 +364,8 @@ async fn key_kind_is_projected_verbatim(pool: PgPool) {
     let stranger = seed_agent(&pool, "public").await;
     let viewer = Viewer::resolve(&pool, stranger).await.expect("resolve");
 
-    let profile = AgentRepository::get_public_profile(&pool, &viewer, id)
+    let profile = profile_as(&pool, &viewer, id)
         .await
-        .expect("get_public_profile")
         .expect("the agent exists");
 
     assert_eq!(

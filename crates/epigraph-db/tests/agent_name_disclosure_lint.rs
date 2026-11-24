@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 /// Functions whose identity read decides disclosure in the statement itself.
 /// Each must name one of [`DISCLOSURE_CALLS`] in its live SQL.
 const GATED: &[(&str, &str)] = &[
+    ("epigraph-db/src/repos/agent.rs", "get_public_profile"),
     ("epigraph-db/src/repos/agent_lookup.rs", "author_nodes"),
     ("epigraph-db/src/repos/agent_lookup.rs", "cards_inner"),
     (
@@ -183,7 +184,6 @@ const PENDING: &[(&str, &str)] = &[
         "epigraph-api/src/routes/graph_query_utils.rs",
         "load_subgraph_conn",
     ),
-    ("epigraph-db/src/repos/agent.rs", "get_public_profile"),
     ("epigraph-db/src/repos/atlas_leaf.rs", "node_labels"),
     ("epigraph-db/src/repos/authored_by.rs", "display_names"),
     ("epigraph-db/src/repos/ego.rs", "hydrate"),

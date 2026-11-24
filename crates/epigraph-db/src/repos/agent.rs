@@ -234,8 +234,8 @@ pub struct CapabilityFilter {
     pub privileged_access: Option<bool>,
 }
 
-/// A Tier-B projection of one `agents` row, narrowed to what a given
-/// [`crate::visibility::Viewer`] may see.
+/// A Tier-B projection of one `agents` row, narrowed to what the reading
+/// session may see (migration 272's `epigraph_agent_disclosure`).
 ///
 /// See [`AgentRepository::get_public_profile`] for the rule. The four
 /// always-present fields are the ones authorship rendering needs; the three
@@ -324,9 +324,10 @@ pub struct AgentPublicProfile {
     /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
     /// placeholder to a signature check.
     pub key_kind: String,
-    /// `public` or `group` (migration 062). Always returned so a caller can say
-    /// *why* the detail fields are empty without a second query.
-    pub profile_visibility: String,
+    /// `public` or `group` (migration 062), shown only with the details: an
+    /// unnamed human's `group` would otherwise be a marker no nameless agent
+    /// carries (spec 2026-11-24-human-identity-visibility-design.md, B1).
+    pub profile_visibility: Option<String>,
     /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
     /// the viewer is not entitled to it.
     pub properties: Option<JsonValue>,
@@ -890,12 +891,10 @@ impl AgentRepository {
     /// universally readable and PostgreSQL has no column-level RLS to narrow
     /// it." That migration names THIS function explicitly among the ones which
     /// "take no `Viewer` and return the full row". The compensating projection —
-    /// `profile_visibility` gating `properties`, `orcid` and `ror_id` — lives in
-    /// [`Self::get_public_profile`], and the residual is already on record as
-    /// `D-PR17-agent-projection-enforced-at-one-call-site`. The agent-lookup
-    /// card and matcher (`agent_lookup.rs`) spell the same rule in their own
-    /// statements; `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
-    /// keeps the three one text.
+    /// the name and `properties`, `orcid`, `ror_id` gated by migration 272's
+    /// disclosure rule — is applied by every caller that serializes the row
+    /// (`epigraph_db::redact_agent` / `AgentDisclosureRepository::disclosure`),
+    /// and `agent_name_disclosure_lint.rs` lists the callers it reviewed.
     /// Stamping the session GUCs on this read changes no row either way; the
     /// value of the widening is entirely in the SIBLING statement it lets share
     /// the connection.
@@ -2764,34 +2763,26 @@ impl AgentRepository {
         .await?)
     }
 
-    /// Tier-B projection of one agent, filtered by what `viewer` may see.
+    /// Tier-B projection of one agent, filtered by what the reading session
+    /// may see.
     ///
     /// `agents` is deliberately **not** a tenancy-partitioned table: authorship
     /// must render on a public claim, so the row itself stays readable and
     /// migration 077's policy on it is `USING (true)` with an explicit
     /// `-- VISIBILITY-EXEMPT:` marker. What is *not* universally readable is the
     /// PII the row carries — `agents.properties` holds `full_name`, `orcid`,
-    /// `affiliations` and `email` (migration 001).
+    /// `affiliations` and `email` (migration 001) — and, for a human principal,
+    /// the name itself.
     ///
     /// PostgreSQL has no column-level RLS, so the narrowing is a **repo-layer
-    /// projection**: `id`, `display_name`, `public_key` and `key_kind` are
-    /// always returned; [`AgentPublicProfile::properties`], `orcid` and `ror_id`
-    /// are `None` unless one of three things holds —
-    ///
-    /// 1. `profile_visibility = 'public'` (migration 062's default), or
-    /// 2. the viewer **is** this agent, or
-    /// 3. the viewer shares a live group with it.
-    ///
-    /// A bypass viewer sees everything, as everywhere else.
-    ///
-    /// The same rule is spelled in two more statements, the agent-lookup card
-    /// and matcher (`agent_lookup.rs::cards_inner` / `match_ranked`), because
-    /// `visibility_lint.rs` requires each viewer-taking statement to carry its
-    /// predicate text. Change all three together:
-    /// `visibility_lint.rs::the_agent_profile_rule_is_one_text_at_every_site`
-    /// fails while their text or bind order differs, and
-    /// `agent_lookup.rs::the_three_copies_of_the_profile_rule_decide_alike`
-    /// (epigraph-db tests) while their decisions do.
+    /// projection**, decided by migration 272's `epigraph_agent_disclosure` on
+    /// the session `executor` is stamped as (`read_as` from the caller's
+    /// viewer): `id`, `public_key` and `key_kind` are always returned;
+    /// `display_name` only when `named`; [`AgentPublicProfile::properties`],
+    /// `orcid`, `ror_id` and `profile_visibility` only when `details` (the
+    /// profile is public, the session IS the agent, shares a live group with
+    /// it, or is privileged; for a human, also only when named). An unstamped
+    /// application session reads as the anonymous outsider.
     ///
     /// The decision is made in SQL, in the same round trip as the row, so there
     /// is no window in which the caller holds the PII and has not yet decided
@@ -2803,10 +2794,9 @@ impl AgentRepository {
     ///
     /// # Errors
     /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(executor, viewer))]
+    #[instrument(skip(executor))]
     pub async fn get_public_profile<'e, E: sqlx::PgExecutor<'e>>(
         executor: E,
-        viewer: &crate::visibility::Viewer,
         id: Uuid,
     ) -> Result<Option<AgentPublicProfile>, DbError> {
         type Row = (
@@ -2814,9 +2804,8 @@ impl AgentRepository {
             Option<String>,
             Vec<u8>,
             String,
-            String,
-            bool,
-            JsonValue,
+            Option<String>,
+            Option<JsonValue>,
             Option<String>,
             Option<String>,
         );
@@ -2824,29 +2813,19 @@ impl AgentRepository {
         let row: Option<Row> = sqlx::query_as(
             r#"
             SELECT a.id,
-                   a.display_name,
+                   CASE WHEN d.named THEN a.display_name END,
                    a.public_key,
                    a.key_kind,
-                   a.profile_visibility,
-                   (   $4::bool
-                    OR a.profile_visibility = 'public'
-                    OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                    OR EXISTS (SELECT 1 FROM group_memberships gm
-                                WHERE gm.agent_id = a.id
-                                  AND gm.revoked_at IS NULL
-                                  AND gm.group_id = ANY($3::uuid[]))
-                   ) AS may_see_details,
-                   a.properties,
-                   a.orcid,
-                   a.ror_id
+                   CASE WHEN d.details THEN a.profile_visibility END,
+                   CASE WHEN d.details THEN a.properties END,
+                   CASE WHEN d.details THEN a.orcid END,
+                   CASE WHEN d.details THEN a.ror_id END
             FROM agents a
+            CROSS JOIN LATERAL public.epigraph_agent_disclosure(a.id) d
             WHERE a.id = $1
             "#,
         )
         .bind(id)
-        .bind(viewer.principal())
-        .bind(viewer.group_bind().unwrap_or(&[]))
-        .bind(viewer.bypass_bind())
         .fetch_optional(executor)
         .await?;
 
@@ -2857,7 +2836,6 @@ impl AgentRepository {
                 public_key,
                 key_kind,
                 profile_visibility,
-                may_see_details,
                 properties,
                 orcid,
                 ror_id,
@@ -2867,9 +2845,9 @@ impl AgentRepository {
                 public_key,
                 key_kind,
                 profile_visibility,
-                properties: may_see_details.then_some(properties),
-                orcid: if may_see_details { orcid } else { None },
-                ror_id: if may_see_details { ror_id } else { None },
+                properties,
+                orcid,
+                ror_id,
             },
         ))
     }
@@ -2904,52 +2882,6 @@ impl AgentRepository {
             profile_visibility,
             named_to_everyone,
         })
-    }
-
-    /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,
-    /// `properties`) `viewer` may see, by [`Self::get_public_profile`]'s rule:
-    /// a bypass viewer, a `public` profile, the viewer itself, or a live group
-    /// membership the viewer shares. Ids that name no agent are absent.
-    ///
-    /// For the routes that read whole `Agent` rows (`GET /api/v1/agents` and
-    /// `/api/v1/agents/:id`) and must null the detail fields themselves
-    /// (backlog 761c2b05): one round trip for a whole page. Run it on a
-    /// connection stamped from `viewer` (`AppState::read_as`): the shared-group
-    /// arm reads `group_memberships`, which row security hides on an unstamped
-    /// connection, so a raw-pool call answers "not visible" for a shared group.
-    ///
-    /// # Errors
-    /// Returns `DbError::QueryFailed` if the query fails.
-    #[instrument(skip(executor, viewer, ids))]
-    pub async fn profile_details_visible<'e, E: sqlx::PgExecutor<'e>>(
-        executor: E,
-        viewer: &crate::visibility::Viewer,
-        ids: &[Uuid],
-    ) -> Result<std::collections::HashSet<Uuid>, DbError> {
-        if ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
-            r#"
-            SELECT a.id
-            FROM agents a
-            WHERE a.id = ANY($1::uuid[])
-              AND (   $4::bool
-                   OR a.profile_visibility = 'public'
-                   OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                   OR EXISTS (SELECT 1 FROM group_memberships gm
-                               WHERE gm.agent_id = a.id
-                                 AND gm.revoked_at IS NULL
-                                 AND gm.group_id = ANY($3::uuid[])))
-            "#,
-        )
-        .bind(ids)
-        .bind(viewer.principal())
-        .bind(viewer.group_bind().unwrap_or(&[]))
-        .bind(viewer.bypass_bind())
-        .fetch_all(executor)
-        .await?;
-        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// The agent's public key, but **only** when it is a real Ed25519 verifier.

@@ -11,8 +11,8 @@
 //!   Every "unnamed" assertion is paired with a CALIBRATION that the same
 //!   target is named to some viewer the rule admits, so no test passes by
 //!   redacting everyone.
-//! * Non-human targets decide `details` exactly as today's profile rule
-//!   (`AgentRepository::profile_details_visible`) does (T11).
+//! * Non-human targets decide `details` exactly as the profile rule every
+//!   surface applied before migration 272 did (T11).
 //! * The fail directions: a non-member, NOSUPERUSER owner of the core reads no
 //!   binding and names no one through a bound agent's claim (T10); the
 //!   human-evidence row cannot be deleted or retyped (HEV01).
@@ -304,15 +304,18 @@ async fn a_human_with_no_arm_is_unnamed_to_outsiders_and_named_to_itself(pool: P
 // ─── T11: non-human targets decide as today ──────────────────────────────
 
 /// For a non-human target, `named` is always true and `details` equals
-/// today's profile rule (`AgentRepository::profile_details_visible`) over the
-/// profile x self x shared-group matrix. A `'group'`-profile service is still
-/// NAMED to an outsider: the new rule redacts humans only.
+/// the profile rule every surface applied before migration 272 (a public
+/// profile, or a live group shared with the reader; spelled out here as the
+/// expected truth table, since `AgentRepository::profile_details_visible`,
+/// the old copy, was folded into the predicate) over the profile x
+/// shared-group matrix. A `'group'`-profile service is still NAMED to an
+/// outsider: the new rule redacts humans only.
 #[sqlx::test(migrations = "../../migrations")]
 async fn non_human_targets_are_named_and_details_follow_todays_rule(pool: PgPool) {
     let scoped = app_pool(&pool).await;
     let (outsider, _) = named(&pool, "Rhea Reader").await;
     let (peer, _) = named(&pool, "Saul Peer").await;
-    let mut targets = Vec::new();
+    let mut targets: Vec<(Uuid, bool, bool)> = Vec::new();
     for profile in ["public", "group"] {
         for shares in [false, true] {
             let (t, _) = named(&pool, &format!("svc {profile} {shares}")).await;
@@ -320,24 +323,19 @@ async fn non_human_targets_are_named_and_details_follow_todays_rule(pool: PgPool
             if shares {
                 keyed_team(&pool, &[t, peer]).await;
             }
-            targets.push(t);
+            targets.push((t, profile == "public", shares));
         }
     }
     let mut checked = 0;
     for who in [outsider, peer] {
         let v = viewer(&pool, who).await;
-        let mut read = scoped.read_as(&v).await.expect("read_as");
-        let today = epigraph_db::AgentRepository::profile_details_visible(&mut *read, &v, &targets)
-            .await
-            .expect("today's rule");
-        drop(read);
-        for t in &targets {
+        for (t, public, shares) in &targets {
+            let expected = *public || (who == peer && *shares);
             let (n, d) = disclosure(&scoped, &v, *t).await;
             assert!(n, "a non-human agent must be named to every reader");
             assert_eq!(
-                d,
-                today.contains(t),
-                "details for non-human {t} as {who} must equal today's profile rule"
+                d, expected,
+                "details for non-human {t} as {who} must equal the profile rule"
             );
             checked += 1;
         }
@@ -349,7 +347,7 @@ async fn non_human_targets_are_named_and_details_follow_todays_rule(pool: PgPool
     let v = viewer(&pool, outsider).await;
     let answers: std::collections::BTreeSet<bool> = {
         let mut s = std::collections::BTreeSet::new();
-        for t in &targets {
+        for (t, _, _) in &targets {
             s.insert(disclosure(&scoped, &v, *t).await.1);
         }
         s
@@ -1836,5 +1834,63 @@ async fn the_name_match_calls_the_predicate_once_per_match(pool: PgPool) {
         (4..=8).contains(&calls),
         "the predicate ran {calls} times for 4 matches over 300+ agents: it was pushed into \
          the agents scan"
+    );
+}
+
+/// T1, row B1: `get_public_profile` of an unnamed human, to an outsider,
+/// equals N's apart from id and key: no name, no `profile_visibility`, no
+/// properties / ORCID / ROR. A teammate sees the name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_humans_public_profile_is_a_nameless_agents(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Odette Profiled").await;
+    sqlx::query(
+        "UPDATE agents SET properties = '{\"full_name\": \"Odette Profiled\"}'::jsonb, \
+                orcid = '0000-0002-0000-0077' WHERE id = $1",
+    )
+    .bind(h)
+    .execute(&pool)
+    .await
+    .expect("details");
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    let profile = |who: Uuid, id: Uuid| {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        async move {
+            let v = viewer(&pool, who).await;
+            let mut c = scoped.read_as(&v).await.expect("read_as");
+            epigraph_db::AgentRepository::get_public_profile(&mut *c, id)
+                .await
+                .expect("profile")
+                .expect("exists")
+        }
+    };
+    let shape = |p: epigraph_db::repos::agent::AgentPublicProfile| {
+        (
+            p.display_name,
+            p.key_kind,
+            p.profile_visibility,
+            p.properties,
+            p.orcid,
+            p.ror_id,
+        )
+    };
+    assert_eq!(
+        shape(profile(outsider, h).await),
+        shape(profile(outsider, n).await),
+        "H's profile reads as N's"
+    );
+    let mine = profile(mate, h).await;
+    assert_eq!(
+        mine.display_name.as_deref(),
+        Some("Odette Profiled"),
+        "CALIBRATION"
+    );
+    assert_eq!(
+        mine.orcid.as_deref(),
+        Some("0000-0002-0000-0077"),
+        "a teammate shares a live group with H, the profile rule's group arm"
     );
 }

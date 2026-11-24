@@ -2115,7 +2115,7 @@ async fn profile_decisions(
     subject: Uuid,
     orcid: &str,
 ) -> [bool; 3] {
-    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, viewer, subject)
+    let profile = epigraph_db::AgentRepository::get_public_profile(&mut *conn, subject)
         .await
         .expect("get_public_profile")
         .expect("subject exists");

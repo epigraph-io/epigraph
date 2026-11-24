@@ -506,6 +506,9 @@ async fn post_agents_refuses_a_reserved_key(pool: PgPool) {
         let r = epigraph_api::routes::agents::create_agent(
             State(state.clone()),
             Some(Extension(auth.clone())),
+            epigraph_api::middleware::bearer::ViewerExtractor(
+                viewer_fixture::public_viewer(&pool).await,
+            ),
             Json(req),
         )
         .await;
