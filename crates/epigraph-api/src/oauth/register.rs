@@ -11,7 +11,12 @@ use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
-    pub client_name: String,
+    /// RFC 7591 section 2: OPTIONAL for a dynamic registration, which gets
+    /// [`DCR_DEFAULT_CLIENT_NAME`] without one (the consent page names a client
+    /// by its validated redirect, never by this self-chosen field). Required
+    /// for a legacy registration that names a `client_type`.
+    #[serde(default)]
+    pub client_name: Option<String>,
     /// EpiGraph-native client class. Optional so RFC 7591 DCR clients (claude.ai)
     /// that send only redirect_uris + response_types=["code"] are accepted as a
     /// public authorization_code 'human' client.
@@ -52,6 +57,9 @@ pub struct RegisterResponse {
     pub redirect_uris: Option<Vec<String>>,
     pub message: String,
 }
+
+/// The name a dynamic registration without `client_name` is stored under.
+pub const DCR_DEFAULT_CLIENT_NAME: &str = "Dynamically registered client";
 
 /// Default read-only scopes for DCR public clients and pending service clients.
 ///
@@ -112,6 +120,16 @@ pub async fn register_endpoint(
             message: "redirect_uris is required for dynamic client registration".to_string(),
         });
     }
+
+    let client_name = match req.client_name.clone() {
+        Some(name) => name,
+        None if is_dcr => DCR_DEFAULT_CLIENT_NAME.to_string(),
+        None => {
+            return Err(ApiError::BadRequest {
+                message: "client_name is required when client_type is given".to_string(),
+            })
+        }
+    };
 
     // Admin-only scopes (elevation plan EL-9). Registration grants a fixed
     // set (never one of these) whatever `scope` asks for; a request that NAMES
@@ -214,7 +232,7 @@ pub async fn register_endpoint(
                 Json(RegisterResponse {
                     client_id,
                     client_secret: None,
-                    client_name: req.client_name,
+                    client_name,
                     client_type: row.client_type.clone(),
                     status: row.status.clone(),
                     allowed_scopes: row.allowed_scopes.clone(),
@@ -294,7 +312,7 @@ pub async fn register_endpoint(
             secret_hash_bytes
                 .as_ref()
                 .map(|h: &blake3::Hash| h.as_bytes() as &[u8]),
-            &req.client_name,
+            &client_name,
             client_type,
             &allowed_scopes,
             &granted_scopes,
@@ -337,7 +355,7 @@ pub async fn register_endpoint(
         Json(RegisterResponse {
             client_id,
             client_secret,
-            client_name: req.client_name,
+            client_name,
             client_type: client_type.to_string(),
             status: status.to_string(),
             allowed_scopes,

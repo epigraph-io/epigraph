@@ -2223,3 +2223,31 @@ async fn authorization_responses_identify_the_issuer(pool: PgPool) {
         assert_eq!(params.get("state").map(String::as_str), Some("iss-state"));
     }
 }
+
+/// RFC 7591 section 2 makes `client_name` OPTIONAL. A dynamic registration
+/// without one gets a server-chosen name (the consent page names the client
+/// by its validated callback, never by this field); a legacy EpiGraph
+/// registration (one that names a `client_type`) still has to supply it.
+///
+/// Catches: a hosted client whose registration omits the name refused before
+/// any of the allowlist runs (axum's JSON extractor 422).
+#[sqlx::test(migrations = "../../migrations")]
+async fn dcr_without_a_client_name_registers(pool: PgPool) {
+    let app = create_router(AppState::with_db(pool.clone(), config()));
+    let mut body = chatgpt_dcr_body(CHATGPT_REDIRECT);
+    body.as_object_mut().unwrap().remove("client_name");
+    let (status, reg) = post_json2(app.clone(), "/oauth/register", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{reg}");
+    assert!(
+        reg["client_name"].as_str().is_some_and(|n| !n.is_empty()),
+        "the server names the client: {reg}"
+    );
+
+    let (status, reg) = post_json2(
+        app,
+        "/oauth/register",
+        serde_json::json!({ "client_type": "human", "redirect_uris": [CHATGPT_REDIRECT] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reg}");
+}
