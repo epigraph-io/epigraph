@@ -233,3 +233,120 @@ async fn the_public_key_lookup_redacts_a_private_profile_like_the_list(pool: PgP
     );
     assert_eq!(row["ror_id"], "03yrm5c26", "the agent itself: {row}");
 }
+
+// ─── PUT /api/v1/agents/:id { profile_visibility } (migration 273) ───────
+
+async fn put(
+    state: &AppState,
+    caller: Uuid,
+    scopes: &[&str],
+    id: Uuid,
+    body: Value,
+) -> (StatusCode, Value) {
+    let token = common::mint_token_with_agent(scopes, caller);
+    let resp = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/agents/{id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = resp.status();
+    let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+async fn profile_of(pool: &PgPool, agent: Uuid) -> String {
+    sqlx::query_scalar("SELECT profile_visibility FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("profile")
+}
+
+/// A person sets their own profile visibility with the PUT field alone; the
+/// set is audited. `claims:admin` does not let anyone else set it (self only,
+/// "set BY H"), a non-person caller is refused by the definer (PVS05), and a
+/// value other than public / group is a 400. No refusal changes anything.
+#[sqlx::test(migrations = "../../migrations")]
+async fn put_profile_visibility_is_self_service_for_a_person_only(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = viewer_fixture::seed_human_operator(&pool, "put-person").await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("start from group");
+
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "public"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["id"], h.to_string(), "{body}");
+    assert_eq!(profile_of(&pool, h).await, "public");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events \
+          WHERE event_type = 'agent.profile_visibility_set' AND agent_id = $1",
+    )
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audited, 1);
+
+    // An admin may edit other agents' records, but never this field.
+    let (admin, _) = viewer_fixture::seed_agent_with_group(&pool, "put-admin").await;
+    let (status, body) = put(
+        &state,
+        admin,
+        &["agents:write", "claims:admin"],
+        h,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        profile_of(&pool, h).await,
+        "public",
+        "an admin cannot set it"
+    );
+
+    // A non-person caller on its own record: the definer refuses (PVS05).
+    let (bot, _) = viewer_fixture::seed_agent_with_group(&pool, "put-bot").await;
+    let before = profile_of(&pool, bot).await;
+    let (status, body) = put(
+        &state,
+        bot,
+        &["agents:write"],
+        bot,
+        serde_json::json!({"profile_visibility": "group"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(profile_of(&pool, bot).await, before, "nothing changed");
+
+    // A value the column does not admit.
+    let (status, body) = put(
+        &state,
+        h,
+        &["agents:write"],
+        h,
+        serde_json::json!({"profile_visibility": "team"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(profile_of(&pool, h).await, "public", "nothing changed");
+}

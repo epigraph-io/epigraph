@@ -999,6 +999,13 @@ pub struct UpdateAgentRequest {
     pub ror_id: Option<String>,
     /// Reserved for future use
     pub properties: Option<serde_json::Value>,
+    /// Whether the caller's OWN name is shown to everyone: `"public"` or
+    /// `"group"` (migration 273, human-identity visibility spec section 8).
+    /// Accepted only on the caller's own record, `claims:admin` included, and
+    /// only from a person (a human principal); written through the audited
+    /// self-service definer on a viewer-stamped transaction.
+    #[serde(default)]
+    pub profile_visibility: Option<String>,
 }
 
 /// Update an existing agent
@@ -1013,9 +1020,15 @@ pub struct UpdateAgentRequest {
 /// - 401 Unauthorized: Missing or invalid Bearer token
 /// - 403 Forbidden: Missing scope or caller is not the target agent
 /// - 404 Not Found: Agent does not exist
+///
+/// `profile_visibility` (`"public"` | `"group"`) is self only: 403 when `:id`
+/// is not the caller, even for `claims:admin`, and 403 (PVS05) when the caller
+/// is not a person; 400 for another value. A request carrying only that field
+/// writes nothing else.
 #[cfg(feature = "db")]
 pub async fn update_agent(
     State(state): State<AppState>,
+    ViewerExtractor(viewer): ViewerExtractor,
     auth_ctx: Option<axum::Extension<crate::middleware::bearer::AuthContext>>,
     Path(id): Path<Uuid>,
     Json(request): Json<UpdateAgentRequest>,
@@ -1034,6 +1047,23 @@ pub async fn update_agent(
         });
     }
 
+    // The profile opt-in is the person's own act ("set BY H"): no admin arm.
+    // Checked before anything is written.
+    let profile = match request.profile_visibility.as_deref() {
+        None => None,
+        Some(_) if auth.agent_id != Some(id) => {
+            return Err(ApiError::Forbidden {
+                reason: "profile_visibility is set only on your own record, by you".into(),
+            });
+        }
+        Some(raw) => Some(epigraph_db::ProfileVisibility::parse(raw).ok_or_else(|| {
+            ApiError::ValidationError {
+                field: "profile_visibility".to_string(),
+                reason: format!("{raw:?} is neither 'public' nor 'group'"),
+            }
+        })?),
+    };
+
     let agent_id = AgentId::from_uuid(id);
 
     // Fetch existing agent (404 if not found)
@@ -1043,6 +1073,12 @@ pub async fn update_agent(
             entity: "Agent".to_string(),
             id: id.to_string(),
         })?;
+
+    let profile_only = profile.is_some()
+        && request.display_name.is_none()
+        && request.labels.is_none()
+        && request.orcid.is_none()
+        && request.ror_id.is_none();
 
     // Apply partial updates
     if let Some(display_name) = request.display_name {
@@ -1058,7 +1094,21 @@ pub async fn update_agent(
         agent.ror_id = Some(ror_id);
     }
 
-    let updated = AgentRepository::update(&state.db_pool, &agent).await?;
+    let updated = if profile_only {
+        agent
+    } else {
+        AgentRepository::update(&state.db_pool, &agent).await?
+    };
+
+    // Migration 273's definer, on a transaction stamped from the caller: the
+    // target is the stamped principal, which is `id` (checked above).
+    if let Some(visibility) = profile {
+        let mut tx = state.write_as(&viewer, "update_agent").await?;
+        AgentRepository::set_profile_visibility_conn(&mut tx, visibility).await?;
+        tx.commit().await.map_err(|e| ApiError::InternalError {
+            message: format!("Failed to commit the profile visibility: {e}"),
+        })?;
+    }
 
     // Record provenance when OAuth2-authenticated
     if let Some(axum::Extension(ref auth)) = auth_ctx {

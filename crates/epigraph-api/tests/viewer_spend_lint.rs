@@ -201,6 +201,23 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     // id are nulled through the viewer (`profile_details_visible`, backlog
     // 761c2b05).
     ("agents.rs", "get_agent", &["AgentRepository::get_by_id"]),
+    // `update_agent` takes a viewer only for the profile opt-in (migration
+    // 273): `set_profile_visibility_conn` runs on `AppState::write_as(viewer)`,
+    // a transaction STAMPED from it, and writes the stamped principal's own
+    // row, so the viewer is spent on the stamp. untenanted: the agent row
+    // (`get_by_id`) and the pre-existing profile-column write (`update`, on the
+    // pool, self or `claims:admin` as before; spec section 15.R8);
+    // `record_provenance` is the request's own audit row.
+    (
+        "agents.rs",
+        "update_agent",
+        &[
+            "AgentRepository::get_by_id",
+            "AgentRepository::set_profile_visibility_conn",
+            "AgentRepository::update",
+            "provenance::record_provenance",
+        ],
+    ),
     // untenanted, as `get_agent`: `get_by_public_key` (backlog 8946be59) reads
     // the one agent row holding the key on the caller's stamped read, and
     // that row's ORCID / ROR id are nulled through the viewer like the list's.
