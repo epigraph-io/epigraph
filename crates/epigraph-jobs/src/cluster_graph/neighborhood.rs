@@ -35,7 +35,7 @@
 
 use std::collections::HashMap;
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::louvain::{louvain, LouvainInput};
@@ -124,7 +124,7 @@ pub async fn run_theme_neighborhoods(
     };
 
     for theme in themes {
-        if let Err(e) = run_one_theme(pool, run_id, theme.id, cfg).await {
+        if let Err(e) = run_one_theme_tx(pool, run_id, theme.id, cfg).await {
             tracing::warn!(
                 theme_id = %theme.id,
                 error = ?e,
@@ -135,9 +135,205 @@ pub async fn run_theme_neighborhoods(
     Ok(())
 }
 
-/// Run the neighborhood detection pass for a single theme.
-async fn run_one_theme(
+/// One rebuilt theme: the neighbourhoods and member claims it holds in the
+/// run after [`rebuild_theme_neighborhoods_in_run`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ThemeRebuild {
+    pub theme_id: Uuid,
+    pub neighborhoods: i64,
+    pub members: i64,
+}
+
+/// What [`rebuild_theme_neighborhoods_in_run`] did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RebuildReport {
+    pub run_id: Uuid,
+    /// Every theme rebuilt, the requested ones and the ones pulled in (see
+    /// [`themes_to_rebuild`]), in id order.
+    pub rebuilt: Vec<ThemeRebuild>,
+    /// Requested ids with no `claim_themes` row (e.g. the parts a
+    /// `theme_cap_split.py reverse` deleted). Their rows in the run were
+    /// already removed with the theme (`ON DELETE CASCADE`).
+    pub missing: Vec<Uuid>,
+}
+
+/// The themes a rebuild of `theme_ids` in run `run_id` must cover.
+///
+/// `claim_neighborhood_membership` is keyed `(run_id, claim_id)`: a claim has
+/// one neighbourhood per run. A claim that moved to another theme after the
+/// run (a `scripts/theme_cap_split.py` apply or reverse) keeps its membership
+/// under its OLD theme's neighbourhood, so its new theme cannot be rebuilt
+/// alone: its insert would collide, and the old theme would keep listing it.
+/// This returns `theme_ids` plus every theme whose neighbourhoods in the run
+/// hold a claim now in the set, repeated until nothing is added, sorted.
+///
+/// # Errors
+/// Returns the database error.
+pub async fn themes_to_rebuild(
+    conn: &mut PgConnection,
+    run_id: Uuid,
+    theme_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let mut set: std::collections::BTreeSet<Uuid> = theme_ids.iter().copied().collect();
+    loop {
+        let current: Vec<Uuid> = set.iter().copied().collect();
+        let more: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT n.theme_id
+             FROM claim_neighborhood_membership m
+             JOIN graph_neighborhoods n ON n.id = m.neighborhood_id AND n.run_id = m.run_id
+             JOIN claims c ON c.id = m.claim_id
+             WHERE m.run_id = $1 AND c.theme_id = ANY($2) AND NOT (n.theme_id = ANY($2))",
+        )
+        .bind(run_id)
+        .bind(&current)
+        .fetch_all(&mut *conn)
+        .await?;
+        if more.is_empty() {
+            return Ok(set.into_iter().collect());
+        }
+        set.extend(more);
+    }
+}
+
+/// Rebuild the neighbourhood rows of `theme_ids` inside the EXISTING run
+/// `run_id`, in one transaction (backlog 30633061).
+///
+/// A theme split (`scripts/theme_cap_split.py apply`) moves claims from a
+/// parent theme to new parts after the run was built: the readers
+/// (`GraphViewRepository::theme_neighborhoods`, `/graph/neighborhoods/...`)
+/// serve the newest run, in which the parent's neighbourhoods still hold the
+/// moved claims and the parts have none. Re-running the per-theme pass over
+/// those themes does not repair it (the moved claims' memberships collide,
+/// and [`run_theme_neighborhoods`] logs and skips the theme). This deletes the
+/// `graph_neighborhoods` rows of every theme in [`themes_to_rebuild`] in the
+/// run (their memberships and neighbourhood edges cascade, migration 026) and
+/// runs the pass for each of them that still exists. Unlike
+/// [`run_theme_neighborhoods`], an error in any theme fails the whole rebuild
+/// and nothing is written. New rows carry the placeholder labels; name them
+/// with `scripts/label_themes_llm.py --neighborhoods`.
+///
+/// The caller serializes against the clustering job (whose retention sweep
+/// deletes old runs): see [`rebuild_theme_neighborhoods_latest`].
+///
+/// # Errors
+/// Returns the database error; the transaction is rolled back.
+pub async fn rebuild_theme_neighborhoods_in_run(
     pool: &PgPool,
+    run_id: Uuid,
+    cfg: &Config,
+    theme_ids: &[Uuid],
+) -> Result<RebuildReport, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let set = themes_to_rebuild(&mut tx, run_id, theme_ids).await?;
+    sqlx::query("DELETE FROM graph_neighborhoods WHERE run_id = $1 AND theme_id = ANY($2)")
+        .bind(run_id)
+        .bind(&set)
+        .execute(&mut *tx)
+        .await?;
+    let existing: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM claim_themes WHERE id = ANY($1) ORDER BY id")
+            .bind(&set)
+            .fetch_all(&mut *tx)
+            .await?;
+    for theme_id in &existing {
+        run_one_theme(&mut tx, run_id, *theme_id, cfg).await?;
+    }
+    let counts: Vec<(Uuid, i64, i64)> = sqlx::query_as(
+        "SELECT n.theme_id, COUNT(DISTINCT n.id), COUNT(m.claim_id)
+         FROM graph_neighborhoods n
+         LEFT JOIN claim_neighborhood_membership m
+           ON m.neighborhood_id = n.id AND m.run_id = n.run_id
+         WHERE n.run_id = $1 AND n.theme_id = ANY($2)
+         GROUP BY n.theme_id",
+    )
+    .bind(run_id)
+    .bind(&existing)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let counts: HashMap<Uuid, (i64, i64)> =
+        counts.into_iter().map(|(t, n, m)| (t, (n, m))).collect();
+    let rebuilt = existing
+        .iter()
+        .map(|t| {
+            let (neighborhoods, members) = counts.get(t).copied().unwrap_or((0, 0));
+            ThemeRebuild {
+                theme_id: *t,
+                neighborhoods,
+                members,
+            }
+        })
+        .collect();
+    let missing = theme_ids
+        .iter()
+        .filter(|t| !existing.contains(t))
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(RebuildReport {
+        run_id,
+        rebuilt,
+        missing,
+    })
+}
+
+/// The outcome of [`rebuild_theme_neighborhoods_latest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestRebuild {
+    /// Another clustering run or rebuild holds the lock; nothing was done.
+    Locked,
+    /// No Louvain run exists yet; there is nothing to rebuild.
+    NoRun,
+    Rebuilt(RebuildReport),
+}
+
+/// [`rebuild_theme_neighborhoods_in_run`] on the run the readers serve
+/// (`ClusterRunRepository::latest`), holding the clustering job's lock
+/// (`CLUSTER_GRAPH_LOCK_KEY`), so a concurrent `ClusterGraph` can neither
+/// publish a newer run during the rebuild nor sweep the run being rebuilt.
+///
+/// # Errors
+/// `JobError::ProcessingFailed` on a database error (nothing is written).
+pub async fn rebuild_theme_neighborhoods_latest(
+    pool: &PgPool,
+    cfg: &Config,
+    theme_ids: &[Uuid],
+) -> Result<LatestRebuild, crate::JobError> {
+    let failed = |e: String| crate::JobError::ProcessingFailed { message: e };
+    let outcome = crate::run_serialized(pool, crate::CLUSTER_GRAPH_LOCK_KEY, async {
+        let Some(run) = epigraph_db::ClusterRunRepository::latest(pool)
+            .await
+            .map_err(|e| failed(e.to_string()))?
+        else {
+            return Ok(LatestRebuild::NoRun);
+        };
+        rebuild_theme_neighborhoods_in_run(pool, run.run_id, cfg, theme_ids)
+            .await
+            .map(LatestRebuild::Rebuilt)
+            .map_err(|e| failed(e.to_string()))
+    })
+    .await?;
+    Ok(outcome.unwrap_or(LatestRebuild::Locked))
+}
+
+/// One theme's pass in its own transaction: its neighbourhoods, memberships
+/// and neighbourhood edges are written together or not at all.
+async fn run_one_theme_tx(
+    pool: &PgPool,
+    run_id: Uuid,
+    theme_id: Uuid,
+    cfg: &Config,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    run_one_theme(&mut tx, run_id, theme_id, cfg).await?;
+    tx.commit().await
+}
+
+/// Run the neighborhood detection pass for a single theme, on `conn` (the
+/// caller owns the transaction).
+async fn run_one_theme(
+    conn: &mut PgConnection,
     run_id: Uuid,
     theme_id: Uuid,
     cfg: &Config,
@@ -160,7 +356,7 @@ async fn run_one_theme(
         "#,
     )
     .bind(theme_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     if atoms.is_empty() {
@@ -185,12 +381,12 @@ async fn run_one_theme(
         "#,
     )
     .bind(&atom_ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     // Below threshold: emit a single synthetic neighborhood.
     if atoms.len() < cfg.skip_threshold_nodes || edges.len() < cfg.skip_threshold_edges {
-        return write_single_neighborhood(pool, run_id, theme_id, &atoms).await;
+        return write_single_neighborhood(conn, run_id, theme_id, &atoms).await;
     }
 
     // Map UUIDs → dense u32 indices for Louvain.
@@ -217,20 +413,19 @@ async fn run_one_theme(
     })
     .map_err(|e| sqlx::Error::Protocol(format!("louvain: {e}")))?;
 
-    write_neighborhoods(pool, run_id, theme_id, &atoms, &result.assignments).await?;
-    write_neighborhood_edges(pool, run_id, theme_id).await?;
+    write_neighborhoods(conn, run_id, theme_id, &atoms, &result.assignments).await?;
+    write_neighborhood_edges(conn, run_id, theme_id).await?;
     Ok(())
 }
 
 /// Emit a single neighborhood containing all atoms (used when the subgraph is
 /// too small for Louvain to be meaningful).
 async fn write_single_neighborhood(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     run_id: Uuid,
     theme_id: Uuid,
     atoms: &[AtomRow],
 ) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
     let neighborhood_id = Uuid::new_v4();
     let (mean_betp, dominant_frame) = aggregate_neighborhood(atoms, |_| true);
 
@@ -245,7 +440,7 @@ async fn write_single_neighborhood(
     .bind(atoms.len() as i32)
     .bind(mean_betp)
     .bind(dominant_frame)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
 
     for a in atoms {
@@ -256,15 +451,15 @@ async fn write_single_neighborhood(
         .bind(run_id)
         .bind(a.id)
         .bind(neighborhood_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     }
-    tx.commit().await
+    Ok(())
 }
 
 /// Write Louvain community results to the neighborhoods tables.
 async fn write_neighborhoods(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     run_id: Uuid,
     theme_id: Uuid,
     atoms: &[AtomRow],
@@ -275,7 +470,6 @@ async fn write_neighborhoods(
         groups.entry(*comm).or_default().push(idx);
     }
 
-    let mut tx = pool.begin().await?;
     for (n_idx, (comm, members)) in groups.iter().enumerate() {
         let neighborhood_id = Uuid::new_v4();
         let (mean_betp, dominant_frame) = aggregate_neighborhood(atoms, |i| members.contains(&i));
@@ -299,7 +493,7 @@ async fn write_neighborhoods(
         .bind(members.len() as i32)
         .bind(mean_betp)
         .bind(dominant_frame)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
 
         for &m in members {
@@ -310,14 +504,14 @@ async fn write_neighborhoods(
             .bind(run_id)
             .bind(atoms[m].id)
             .bind(neighborhood_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await?;
         }
 
         // Suppress unused-variable warning for comm — only used as map key.
         let _ = comm;
     }
-    tx.commit().await
+    Ok(())
 }
 
 /// Compute inter-neighborhood edges by summing forward_strength of all
@@ -331,7 +525,7 @@ async fn write_neighborhoods(
 /// row (not once per aggregate call), avoiding the double-evaluation that a
 /// correlated subquery inside `SUM(...)` would cause.
 async fn write_neighborhood_edges(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     run_id: Uuid,
     theme_id: Uuid,
 ) -> Result<(), sqlx::Error> {
@@ -359,7 +553,7 @@ async fn write_neighborhood_edges(
     )
     .bind(run_id)
     .bind(theme_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
