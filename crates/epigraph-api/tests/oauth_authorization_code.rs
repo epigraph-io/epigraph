@@ -1502,6 +1502,7 @@ async fn dcr_accepts_loopback_redirects_for_native_clients(pool: PgPool) {
     for uri in [
         CODEX_CALLBACK,                           // Codex default: live port in the URI
         "http://127.0.0.1/callback/Xq3vT0aBk9Lm", // Codex configured callback: no port
+        "http://127.0.0.1:53682/callback",        // Codex: bare /callback on the live port
         "http://[::1]:53682/callback",            // IPv6 loopback listener
     ] {
         let (status, body) = post_json2(
