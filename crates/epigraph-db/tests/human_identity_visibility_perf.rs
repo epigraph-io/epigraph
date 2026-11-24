@@ -466,7 +466,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     .expect("app pool");
     let viewer = Viewer::resolve(&pool, v).await.expect("viewer");
     let mut read = scoped.read_as(&viewer).await.expect("read_as");
-    exec(&mut *read, "BEGIN").await;
+    exec(&mut read, "BEGIN").await;
     let cards: Vec<Uuid> = bound.iter().take(200).copied().collect();
     let t = Instant::now();
     let out = epigraph_db::AgentLookupRepository::cards(&mut read, &viewer, &cards)
@@ -480,12 +480,12 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     .fetch_one(&mut *read)
     .await
     .expect("calls");
-    exec(&mut *read, "ROLLBACK").await;
+    exec(&mut read, "ROLLBACK").await;
     println!(
         "\n200-card read: {} cards in {cards_ms:.1} ms, epigraph_agent_disclosure calls {n_cards}",
         out.len()
     );
-    exec(&mut *read, "BEGIN").await;
+    exec(&mut read, "BEGIN").await;
     let t = Instant::now();
     let found = epigraph_db::AgentLookupRepository::match_by_name(&mut read, "pe", 200)
         .await
@@ -504,7 +504,7 @@ async fn measure_the_disclosure_predicate(pool: PgPool) {
     .fetch_one(&mut *read)
     .await
     .expect("raw");
-    exec(&mut *read, "ROLLBACK").await;
+    exec(&mut read, "ROLLBACK").await;
     println!(
         "two-character prefix 'pe': {} returned in {find_ms:.1} ms, raw name matches \
          {raw_matches}, epigraph_agent_disclosure calls {n_find}",
