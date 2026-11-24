@@ -1402,7 +1402,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 let frame_name = format!(
                     "Auto-frame-{}: {}",
                     cluster_idx,
-                    &representative[..representative.len().min(60)]
+                    prefix_on_char_boundary(representative, 60)
                 );
 
                 // Generate hypothesis names from top 2-3 claims
@@ -1410,7 +1410,7 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                     .iter()
                     .take(3)
                     .map(|(_, _, content): &(usize, &Uuid, &str)| {
-                        content[..content.len().min(80)].to_string()
+                        prefix_on_char_boundary(content, 80).to_string()
                     })
                     .collect();
 
@@ -1483,6 +1483,18 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
 // =============================================================================
 // UTILITIES
 // =============================================================================
+
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a
+/// character boundary. A plain `&s[..max_bytes]` panics when that offset falls
+/// inside a multi-byte character, which aborted `create-frames` on the first
+/// cluster whose claim text had one there.
+fn prefix_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 fn fmt_opt(v: Option<f64>) -> String {
     v.map_or_else(|| "-".to_string(), |x| format!("{x:.3}"))

@@ -206,3 +206,57 @@ async fn create_frames_then_validate_end_to_end(pool: PgPool) {
         validated.show()
     );
 }
+
+/// A claim whose text has a multi-byte character across byte 60 or 80 is
+/// still named and listed. `create-frames` cuts a frame name to 60 bytes and a
+/// hypothesis to 80; it used to slice at exactly those byte offsets, which
+/// panics inside a UTF-8 character, so one non-ASCII claim in a cluster
+/// aborted the whole run. Each cut now backs off to a character boundary.
+///
+/// Verified to fail: with the byte slices restored, `create-frames` exits 101
+/// ("byte index 60 is not a char boundary").
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_frames_cuts_names_on_a_character_boundary(pool: PgPool) {
+    let agent = seed_agent(&pool).await;
+    // A 17-byte ASCII prefix, then two-byte characters: they start on odd
+    // offsets, so bytes 60 and 80 both fall inside one.
+    let accented = "\u{e9}".repeat(40);
+    for (axis, label) in [(0usize, "u"), (10usize, "v")] {
+        for j in 0..3u8 {
+            let content = format!("dekg utf8 {label} m{j} a {accented}");
+            assert_eq!(content.find('\u{e9}'), Some(17), "prefix is 17 bytes");
+            let emb = embedding(axis, f32::from(j) * 0.01);
+            seed_claim(&pool, agent, &content, &emb).await;
+        }
+    }
+    let url = fixture::database_url_for(&pool).await;
+
+    let created = dekg(&[
+        "migrate",
+        "create-frames",
+        "--db-url",
+        &url,
+        "--k-min",
+        "2",
+        "--k-max",
+        "2",
+        "--min-claims",
+        "3",
+    ]);
+    assert_eq!(created.code, 0, "create-frames must finish\n{}", created.show());
+
+    let frames: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT name, hypotheses FROM frames WHERE name LIKE 'Auto-frame-%' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("read auto frames");
+    assert_eq!(frames.len(), 2, "{frames:?}");
+    for (name, hypotheses) in &frames {
+        let body = name.split_once(": ").map_or("", |(_, b)| b);
+        assert_eq!(body.len(), 59, "name cut back to the boundary at 59: {name:?}");
+        for h in hypotheses {
+            assert_eq!(h.len(), 79, "hypothesis cut back to the boundary at 79: {h:?}");
+        }
+    }
+}
