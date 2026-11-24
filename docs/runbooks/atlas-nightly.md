@@ -121,6 +121,45 @@ splits are W3's id-order fallback, not a clustering. A standalone
 `atlas_meaning apply --apply` is refused once a map has a links run (it
 would hide it).
 
+## After a theme-cap split (W1): required rebuilds
+
+`scripts/theme_cap_split.py apply` moves claims from each split parent to
+new parts. The rows derived from theme membership are built per run, so
+nothing in the apply updates them, and they stay wrong until rebuilt
+(backlog 30633061):
+- **graph neighbourhoods** (`graph_neighborhoods`, served from the newest
+  clustering run): the moved claims are still filed under the parent's
+  neighbourhoods, and the parts have none;
+- **the shared Atlas layout** (`atlas_layout_themes`, the newest layout run):
+  the parts have no position (the run reads `stale`) and the parent's sits
+  where its whole-theme centroid was.
+
+Apply prints, and its manifest records, `touched_theme_ids` (every parent and
+every new part) and `rebuild_next`. Run these, in order, right after the
+apply, with the maintenance DSN in the environment as above:
+
+```bash
+rebuild_theme_neighborhoods --manifest theme-cap-manifest-<UTC>.json          # dry run: the run and themes
+rebuild_theme_neighborhoods --manifest theme-cap-manifest-<UTC>.json --apply
+python3 scripts/label_themes_llm.py --neighborhoods   # the rebuilt rows carry placeholder labels
+atlas_layout --apply
+```
+
+`rebuild_theme_neighborhoods --apply` rebuilds the named themes, and any theme
+whose neighbourhoods still hold one of their claims, inside the newest
+clustering run, in one transaction, under the clustering job's lock. It exits
+75 and writes nothing while a `ClusterGraph` run holds that lock: retry once it
+has finished. A `ClusterGraph` run that finishes after the apply rebuilds every
+theme anyway, so the step can be skipped only when one has.
+
+After `theme_cap_split.py reverse --manifest M`, run the same steps with the
+same manifest: the parts are gone (reported under `missing`) and the parent
+is rebuilt with the claims it got back.
+
+The nightly sees the parts as new themes of every map that draws them: one
+that does not fit a single leaf is `unbuilt` until an operator builds the map
+(above).
+
 ## Dry run
 
 Every command runs with the maintenance DSN in the environment, never on the
