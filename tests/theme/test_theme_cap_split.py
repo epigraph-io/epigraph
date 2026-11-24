@@ -267,6 +267,15 @@ def test_apply_and_reverse_name_every_theme_whose_derived_rows_are_stale(db, see
     assert reversed_["touched_theme_ids"] == stale
     assert reversed_["rebuild_next"] == S.REBUILD_STEPS
 
+    # A second reverse of the same manifest changes nothing, so it must not
+    # ask for a whole-graph re-cluster.
+    out, _ = _run(["reverse", "--database-url", script_dsn(), "--manifest", str(manifest)])
+
+    again = json.loads(out)
+    assert {t["status"] for t in again["themes"]} == {"nothing to reverse"}, \
+        "CALIBRATION: the second reverse is a no-op"
+    assert again["rebuild_next"] == []
+
 
 def _intake_group(cur, agent_id):
     gid = str(uuid.uuid4())

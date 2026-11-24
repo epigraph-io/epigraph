@@ -772,10 +772,15 @@ def main(argv=None):
                                          for t in manifest["themes"]]}))
         elif args.command == "reverse":
             manifest = json.loads(pathlib.Path(args.manifest).read_text())
+            statuses = reverse_manifest(conn, manifest, args.allow_drift)
+            # Only a reverse that changed something leaves derived rows stale:
+            # "nothing to reverse" (an apply that never committed, or a second
+            # reverse) asks for no whole-graph re-cluster.
+            changed = any(s["status"] in ("reversed", "reversed with drift") for s in statuses)
             print(json.dumps({"status": "reversed",
-                              "themes": reverse_manifest(conn, manifest, args.allow_drift),
+                              "themes": statuses,
                               "touched_theme_ids": touched_theme_ids(manifest),
-                              "rebuild_next": REBUILD_STEPS}))
+                              "rebuild_next": REBUILD_STEPS if changed else []}))
     finally:
         conn.close()
     return 0
