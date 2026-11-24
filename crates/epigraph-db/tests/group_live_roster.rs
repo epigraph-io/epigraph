@@ -230,9 +230,11 @@ async fn a_session_outside_the_group_reads_no_roster(pool: PgPool) {
 }
 
 /// The roster's copy of the twin's direct arm decides like the twin: for every
-/// unrevoked row in a verb-made team (live and lapsed), a keyed team made
-/// outside the verbs (no lapse rule), and a personal group, the row is listed
-/// exactly when `epigraph_live_memberships_unbound(agent)` answers the group.
+/// unrevoked row in a verb-made team (live and lapsed, 164), a keyed team made
+/// outside the verbs (no lapse rule), and a personal group (its owner's row,
+/// live, and an allowlisted agent's row after its allowance was revoked,
+/// lapsed by 235), the row is listed exactly when
+/// `epigraph_live_memberships_unbound(agent)` answers the group.
 /// No agent here holds a derived membership of these groups, so the twin's
 /// derived arm adds nothing to compare.
 #[sqlx::test(migrations = "../../migrations")]
@@ -269,6 +271,63 @@ async fn the_roster_decides_each_row_like_the_unbound_twin(pool: PgPool) {
         .await
         .expect("keyed team row");
     }
+
+    // 235's shape: an agent with a writer row in `plain`'s PERSONAL group and
+    // an allowance naming `plain` that has since been REVOKED. The revoked row
+    // still names the owner, so the row lapses (the agent's live human is no
+    // longer the owner). Planted past the allowlist's guard (replica mode), as
+    // `author_binding_allowlist.rs` does.
+    let (allowlisted, _) = fixture::seed_agent_with_group(&pool, "parity-allowlisted").await;
+    sqlx::query(
+        "INSERT INTO group_memberships (group_id, agent_id, wrapped_key_share, epoch, role) \
+         VALUES ($1, $2, ''::bytea, 0, 'writer')",
+    )
+    .bind(personal)
+    .bind(allowlisted)
+    .execute(&pool)
+    .await
+    .expect("the allowlisted agent's personal-group row");
+    let client: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, agent_id, legal_entity_name, legal_contact_email) \
+         VALUES ($1, 'fixture allowlisted service', 'service', ARRAY['claims:write'], \
+                 'active', $2, 'Fixture Org', 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(format!("fixture-allowlisted-{allowlisted}"))
+    .bind(allowlisted)
+    .fetch_one(&pool)
+    .await
+    .expect("the allowlisted agent's client");
+    let mut tx = pool.begin().await.expect("begin");
+    sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await
+        .expect("replica");
+    sqlx::query(
+        "INSERT INTO author_binding_clients (client_id, agent_id, operator_id, reason, \
+                                             revoked_at, revoked_by, revoked_reason) \
+         VALUES ($1, $2, $3, 'planted', now(), 'planted', 'planted')",
+    )
+    .bind(client)
+    .bind(allowlisted)
+    .bind(plain)
+    .execute(&mut *tx)
+    .await
+    .expect("plant a revoked allowance");
+    tx.commit().await.expect("commit");
+    let twin_allowlisted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM public.epigraph_live_memberships_unbound($1) \
+          WHERE group_id = $2)",
+    )
+    .bind(allowlisted)
+    .bind(personal)
+    .fetch_one(&pool)
+    .await
+    .expect("twin");
+    assert!(
+        !twin_allowlisted,
+        "PREMISE: the twin lapses the allowlisted agent's personal-group row (235)"
+    );
 
     let mut lapsed_seen = false;
     for group in [verb, keyed, personal] {
