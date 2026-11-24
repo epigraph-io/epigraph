@@ -2,7 +2,8 @@
 //!
 //! A [`BeliefProfile`] holds every number (and every policy switch) that
 //! shapes a belief value: the evidence-type weights and aliases, the locality
-//! factors, the unknown-type fallback, the methodology and journal tables, the
+//! factors, the unknown-type fallback, the methodology, journal and section
+//! tier tables, the
 //! combination and classifier thresholds, the edge-factor open-world default,
 //! the gate constants, and the parameters later slices of the atom-level
 //! belief program will consume (class weights, the testimonial ceiling and
@@ -105,10 +106,16 @@
 //!   the profile hash does not cover them. The sheaf
 //!   tools also select a second named set (`regulatory`), which a move must
 //!   reconcile with the profile's own naming.
-//! - *Section tier weights* (`calibration.toml` `[section_tier_weights]`,
-//!   read by [`crate::bba::build_bba_directed`] on the REST assess write
-//!   path). Configurable through the calibration but not hashed; they belong
-//!   in [`CalibrationTables`] beside the methodology and journal tables.
+//!
+//! **Carried since backlog 5274ad05:**
+//! - *Section tier weights* (`calibration.toml` `[section_tier_weights]`) are
+//!   [`CalibrationTables::section_tier_weights`], hashed with the methodology
+//!   and journal tables, with [`BeliefProfile::section_tier_weight`] mirroring
+//!   the calibration lookup. Like those tables, their consumer (the REST
+//!   assess write path, [`crate::bba::build_bba_directed`]) still reads the
+//!   calibration, which the profile is built from; a frame or perspective
+//!   override of them moves the hash but no stored BBA until that path takes
+//!   a profile.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -154,6 +161,9 @@ pub mod defaults {
     /// Methodology profile `[support, against, ignorance]` when neither the
     /// methodology, its alias, nor a `default` row is in the table.
     pub const METHODOLOGY_FALLBACK: [f64; 3] = [0.50, 0.08, 0.42];
+    /// Section tier retention for a section the table does not name: keep
+    /// all of the informative mass (no discount).
+    pub const DEFAULT_SECTION_TIER_WEIGHT: f64 = 1.0;
     /// Fraction of a source's `Pl − Bel` taken as open-world mass when the
     /// source row has no stored `open_world_mass`.
     pub const OPEN_WORLD_FRACTION_DEFAULT: f64 = 0.5;
@@ -239,8 +249,11 @@ pub struct CombinationParams {
 }
 
 /// The calibration tables BBA construction reads: methodology profiles,
-/// journal reliability. Carried and hashed here so a later slice can apply
-/// them at fold time (the reported class weighting).
+/// journal reliability, section tier weights. Carried and hashed here so a
+/// later slice can apply them at fold time (the reported class weighting);
+/// the REST assess write path still reads them from the calibration
+/// ([`crate::bba::build_bba_directed`]), so today an override of one moves
+/// the profile hash without moving a stored BBA.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CalibrationTables {
@@ -253,6 +266,12 @@ pub struct CalibrationTables {
     /// Profile used when no methodology row (nor `default`) matches.
     // belief-profile: allow-literal (array length of a mass triplet)
     pub methodology_fallback: [f64; 3],
+    /// Section tier (lower case) -> retention fraction of the informative
+    /// mass (the rest shifts to theta): `calibration.toml`
+    /// `[section_tier_weights]`.
+    pub section_tier_weights: BTreeMap<String, f64>,
+    /// Retention for a section the table does not name.
+    pub default_section_tier_weight: f64,
 }
 
 /// Edge-factor (epistemic edge → BBA) write parameters.
@@ -589,6 +608,8 @@ impl BeliefProfile {
                 methodology_profiles: BTreeMap::new(),
                 methodology_aliases: BTreeMap::new(),
                 methodology_fallback: d::METHODOLOGY_FALLBACK,
+                section_tier_weights: BTreeMap::new(),
+                default_section_tier_weight: d::DEFAULT_SECTION_TIER_WEIGHT,
             },
             edge_factor: EdgeFactorParams {
                 open_world_fraction_default: d::OPEN_WORLD_FRACTION_DEFAULT,
@@ -656,6 +677,7 @@ impl BeliefProfile {
         p.tables.journal_reliability = to_btree(&cal.journal_reliability);
         p.tables.methodology_profiles = to_btree(&cal.methodology_profiles);
         p.tables.methodology_aliases = to_btree(&cal.methodology_aliases);
+        p.tables.section_tier_weights = to_btree(&cal.section_tier_weights);
         p.classifier = ClassifierParams {
             nei_threshold: cal.classifier_thresholds.nei_threshold,
             support_threshold: cal.classifier_thresholds.support_threshold,
@@ -819,6 +841,17 @@ impl BeliefProfile {
         let [support, against, ignorance] = *p;
         (support, against, ignorance)
     }
+
+    /// Section tier retention: the lower-cased section's row, else the
+    /// default. Same rule as [`CalibrationConfig::get_section_tier_weight`].
+    #[must_use]
+    pub fn section_tier_weight(&self, section: &str) -> f64 {
+        let t = &self.tables;
+        t.section_tier_weights
+            .get(&section.to_lowercase())
+            .copied()
+            .unwrap_or(t.default_section_tier_weight)
+    }
 }
 
 /// The evidence types an override object names under
@@ -967,6 +1000,7 @@ mod tests {
         assert_eq!(p.gates.confirmed_score, 0.75);
         assert_eq!(p.tables.methodology_fallback, [0.50, 0.08, 0.42]);
         assert_eq!(p.tables.default_journal_reliability, 0.78);
+        assert_eq!(p.tables.default_section_tier_weight, 1.0);
         assert_eq!(p.construction.simple_support_mass_min, 0.01);
         assert_eq!(p.construction.simple_support_mass_max, 0.99);
         assert_eq!(p.construction.truth_seed_min, 0.005);
@@ -1118,6 +1152,23 @@ mod tests {
                 p.methodology_profile(m),
                 cal.get_methodology_profile(m),
                 "{m}"
+            );
+        }
+        // Every section the calibration names, a mixed-case spelling, and
+        // sections it does not name (the no-discount default).
+        assert!(
+            !cal.section_tier_weights.is_empty(),
+            "the calibration carries section tier weights"
+        );
+        let named: Vec<&str> = cal.section_tier_weights.keys().map(String::as_str).collect();
+        for section in named
+            .into_iter()
+            .chain(["Introduction", "RESULTS", "appendix", ""])
+        {
+            assert_eq!(
+                p.section_tier_weight(section).to_bits(),
+                cal.get_section_tier_weight(section).to_bits(),
+                "{section}"
             );
         }
     }
