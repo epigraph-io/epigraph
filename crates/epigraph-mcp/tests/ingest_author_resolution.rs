@@ -2555,3 +2555,75 @@ async fn a_trace_less_claim_the_ingester_filed_itself_is_found_never_created(poo
     );
     assert_eq!(creator_doi(&pool, id).await, None);
 }
+
+/// Row A6 (finding L3): a stranger's name-only re-ingest that spells an
+/// UNNAMED person's name exactly is not told which id an earlier ingester
+/// attached under that spelling: the same-spelling half of
+/// `also_at_position` lists only agents named to the re-ingester. The
+/// person's authorship sits at ANOTHER position, so the same-position half
+/// (the accepted DOI-plus-position exposure) cannot list it either way.
+/// CALIBRATION: once the person opts in, the same re-ingest lists it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_name_only_reingest_cannot_find_an_unnamed_person_by_spelling(pool: PgPool) {
+    let attacher = app_role_server(&pool).await;
+    let name = "Philippa Unlisted";
+    let person = human_named(&pool, name).await;
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(person)
+        .execute(&pool)
+        .await
+        .expect("group profile");
+    let reingest = |doi: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let viewer = fixture::public_viewer(&pool).await;
+            let stranger = app_role_server(&pool).await;
+            let json = text(
+                &tools::ingestion::do_ingest_document(
+                    &stranger,
+                    &viewer,
+                    &doc(doi, json!([{"name": name}])),
+                    None,
+                    epigraph_core::VisibilityChoice::Public,
+                )
+                .await
+                .expect("the stranger's re-ingest"),
+            );
+            json["authors"][0]["also_at_position"].clone()
+        }
+    };
+
+    let doi = "10.9999/unnamed-by-spelling";
+    ingest_wait(
+        &attacher,
+        &pool,
+        doc(
+            doi,
+            json!([{"name": "Someone Else"}, {"name": name, "agent_id": person.to_string()}]),
+        ),
+    )
+    .await;
+    let also = reingest(doi).await;
+    assert!(
+        !also
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v == &json!(person.to_string())),
+        "the spelling found the unnamed person: {also}"
+    );
+
+    sqlx::query("UPDATE agents SET profile_visibility = 'public' WHERE id = $1")
+        .bind(person)
+        .execute(&pool)
+        .await
+        .expect("opt in");
+    let also = reingest(doi).await;
+    assert!(
+        also.as_array()
+            .into_iter()
+            .flatten()
+            .any(|v| v == &json!(person.to_string())),
+        "CALIBRATION: a named person is reported by spelling: {also}"
+    );
+}

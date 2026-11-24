@@ -1176,11 +1176,14 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     // write: `AgentRepository::create_seed_derived_conn`; authority: `attributions`,
     // `check_explicit_author_ids`; untenanted: `AgentLookupRepository::author_nodes`,
     // `AgentLookupRepository::exact_name_candidates`, `AgentRepository::get_by_public_key`,
-    // `SystemAgentRepository::registered_agent_ids`.
+    // `SystemAgentRepository::registered_agent_ids`; stamped:
+    // `AgentDisclosureRepository::disclosure` (migration 272's rule on the walk's
+    // stamped transaction, a definer that applies its own audience).
     (
         "ingest_authors.rs",
         "resolve_document_authors",
         &[
+            "AgentDisclosureRepository::disclosure",
             "AgentLookupRepository::author_nodes",
             "AgentLookupRepository::exact_name_candidates",
             "AgentRepository::create_seed_derived_conn",
