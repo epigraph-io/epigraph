@@ -5911,17 +5911,35 @@ pub async fn spliced(conn: &mut PgConnection, viewer: &Viewer) -> R {
 /// `epigraph_agent_disclosure`, which every identity reader calls
 /// (`agent_name_disclosure_lint.rs` keeps that list). No repo statement may
 /// spell it again: any live-SQL `profile_visibility = 'public'` is a copy.
-#[test]
-fn no_repo_statement_spells_the_agent_profile_rule() {
+/// Does this function body's LIVE SQL spell the profile rule's public arm?
+fn spells_profile_rule(body: &str) -> bool {
     let probe: String = "profile_visibility = 'public'"
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
+    let (_, live_sql) = spend_views(body);
+    let sql: String = live_sql.chars().filter(|c| !c.is_whitespace()).collect();
+    sql.contains(&probe)
+}
+
+#[test]
+fn no_repo_statement_spells_the_agent_profile_rule() {
+    let fns = repo_fns();
+    // CALIBRATION (review finding tests#8b): the scan reaches the repo layer,
+    // including the disclosure reader this rule moved into, so an empty
+    // result is not a scanner that matched nothing.
+    assert!(
+        fns.len() > 200,
+        "repo_fns() found only {} functions: the scan is not reaching the repo layer",
+        fns.len()
+    );
+    assert!(
+        fns.iter().any(|f| f.name == "cards_inner"),
+        "CALIBRATION: repo_fns() reaches agent_lookup.rs::cards_inner"
+    );
     let mut copies: Vec<String> = Vec::new();
-    for f in repo_fns() {
-        let (_, live_sql) = spend_views(&f.body);
-        let sql: String = live_sql.chars().filter(|c| !c.is_whitespace()).collect();
-        if sql.contains(&probe) {
+    for f in fns {
+        if spells_profile_rule(&f.body) {
             copies.push(format!("{}::{}", f.file, f.name));
         }
     }
@@ -5932,4 +5950,21 @@ fn no_repo_statement_spells_the_agent_profile_rule() {
         "these repo statements spell the agent profile rule instead of calling migration \
          272's `epigraph_agent_disclosure`: {copies:?}"
     );
+}
+
+/// The probe of [`no_repo_statement_spells_the_agent_profile_rule`] is not
+/// vacuous (review finding tests#8b): a planted copy, in any whitespace, is
+/// found through the same `spend_views` + probe path; the same text in a
+/// Rust comment is not live SQL and is not.
+#[test]
+fn the_profile_rule_probe_finds_a_planted_copy() {
+    assert!(spells_profile_rule(
+        r#"{ sqlx::query("SELECT a.id FROM agents a WHERE a.profile_visibility   =  'public' OR $1") }"#
+    ));
+    assert!(spells_profile_rule(
+        "{ sqlx::query(\"SELECT 1 FROM agents a WHERE a.profile_visibility='public'\") }"
+    ));
+    assert!(!spells_profile_rule(
+        "{ // profile_visibility = 'public' was the old rule\n sqlx::query(\"SELECT 1\") }"
+    ));
 }
