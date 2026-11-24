@@ -12,6 +12,8 @@
 //! * a freshly registered `client_type:"agent"` client is `pending` with zero
 //!   granted scopes and cannot obtain a token at all.
 
+mod viewer_fixture;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
@@ -1066,6 +1068,40 @@ async fn a_provider_human_principal_is_named_as_the_provider_asserted(pool: PgPo
         leaked, 0,
         "provisioning wrote the person's name into an event"
     );
+}
+
+/// Production mints on the APPLICATION role (`oauth/token.rs` on the request
+/// DSN), not on the harness superuser: the name read must work there, or
+/// every first sign-in of a person fails.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_provider_human_is_named_when_minted_on_the_application_role(pool: PgPool) {
+    let row = seed_client(
+        &pool,
+        "google:subject-app-role",
+        "human",
+        "Cora Approle",
+        Some("cora.approle@example.test"),
+    )
+    .await;
+    let app = viewer_fixture::downgraded_pool(&pool, "epigraph_app").await;
+    let mut tx = app.begin().await.expect("begin");
+    let who: String = sqlx::query_scalar("SELECT session_user::text")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("session_user");
+    assert_eq!(who, "epigraph_app", "CALIBRATION: minted on the app role");
+    let agent = epigraph_db::AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client on the application role");
+    tx.commit().await.expect("commit");
+    let (name, profile): (Option<String>, String) =
+        sqlx::query_as("SELECT display_name, profile_visibility FROM agents WHERE id = $1")
+            .bind(agent.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("agent row");
+    assert_eq!(name.as_deref(), Some("Cora Approle"));
+    assert_eq!(profile, "group");
 }
 
 /// The email guard: `provision.rs` stores `identity.name.unwrap_or(email)` as
