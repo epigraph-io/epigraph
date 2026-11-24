@@ -1623,6 +1623,27 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "privatization.rs",
+        "sealed_only_cluster_centroids_conn",
+        "READ of `claim_clusters`, `claim_encryption` and `cluster_centroids`, projecting \
+         `(cluster_run_id, cluster_id)` pairs only, no vector and no claim id. It answers which \
+         centroid rows are projections of sealed vectors alone (backlog 06cdffaa), and a \
+         viewer-filtered answer is the failure it exists to prevent: a cluster whose members a \
+         viewer cannot read would look empty and keep its centroid. `cluster_centroids` carries \
+         no tenancy and no policy; its callers are the seal's maintenance transaction and the \
+         operator's one-off pass on the maintenance DSN.",
+    ),
+    (
+        "privatization.rs",
+        "delete_sealed_only_cluster_centroids_conn",
+        "WRITE: DELETEs the `cluster_centroids` rows `sealed_only_cluster_centroids_conn` reports, \
+         with the same CTE text, from a table with no tenancy column and no policy. Called by \
+         `seal_claims_conn` (step 2c) inside the seal's maintenance transaction, bounded to the \
+         claims it sealed, and by the operator's one-off pass under `--apply`. A viewer has no \
+         predicate to contribute: the rows are derived aggregates, removed because their every \
+         member is sealed, whoever can read the members.",
+    ),
+    (
+        "privatization.rs",
         "unseal_manifest_page_conn",
         "READ of `claim_encryption`, `claim_version_encryption` and `evidence_encryption`, which \
          carry `group_id` but no `visibility`, and whose projection is CIPHERTEXT bound to a key \
