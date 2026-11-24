@@ -2966,6 +2966,45 @@ fn atlas_js_cold_claim_link_asks_the_claim_leaf_route() {
 /// static/atlas_views.js, and the timeline lane is SVG built element by
 /// element (the parse-free rule of `atlas_js_never_parses_strings_as_code_or_html`
 /// still holds for the whole file).
+/// The claim panel shows the BFF's provenance section through the pure rows
+/// of `atlas_views.js`, and links only through the checked helpers.
+#[test]
+fn atlas_js_claim_panel_shows_provenance() {
+    let js = include_str!("../static/atlas.js");
+    let body = |name: &str| -> &str {
+        let start = js.find(name).unwrap_or_else(|| panic!("{name}"));
+        &js[start..start + js[start..].find("\n  }\n").expect("its end")]
+    };
+    let panel = body("function showClaimPanel(");
+    let prov = panel
+        .find("if (body.provenance) provenanceSection(body.provenance);")
+        .expect("the claim panel draws the provenance section");
+    assert!(
+        prov < panel.find("section('Linked claims')").unwrap(),
+        "provenance sits above the linked claims"
+    );
+    let section = body("function provenanceSection(");
+    for needed in [
+        "if (prov.status !== 'ok') {",
+        "unavailable(box, prov.reason, null);",
+        "VIEWS ? VIEWS.provenanceRows(prov.data) : null",
+        "const href = doiHref(part.href);",
+        "p.appendChild(link(part.href, part.text));",
+        "document.createTextNode(part.text)",
+    ] {
+        assert!(section.contains(needed), "provenanceSection: {needed}");
+    }
+    for banned in ["innerHTML", ".style", "insertAdjacentHTML", "outerHTML"] {
+        assert!(!section.contains(banned), "provenanceSection uses {banned}");
+    }
+    assert_eq!(js.matches("VIEWS.provenanceRows(").count(), 1);
+    let views = include_str!("../static/atlas_views.js");
+    assert!(
+        views.contains("    provenanceRows,\n"),
+        "atlas_views.js exports provenanceRows"
+    );
+}
+
 #[test]
 fn atlas_js_theme_panel_offers_sources_and_timeline() {
     let js = include_str!("../static/atlas.js");

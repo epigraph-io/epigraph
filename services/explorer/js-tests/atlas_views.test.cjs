@@ -161,3 +161,84 @@ test('later pages append each claim and link once', () => {
   assert.equal(V.dayLabel('2026-03-12T23:00:00Z'), '12 Mar 2026');
   assert.equal(V.dayLabel('soon'), '');
 });
+
+// ---- provenance (the claim panel's section from /bff/atlas/claim) ---------
+
+const person = (n, name) => ({ id: id(n), name, href: '/explorer/agent/' + id(n) });
+const flat = (row) => row.parts.map((p) => p.text).join('');
+const rowOf = (rows, title) => rows.find((r) => r.title === title);
+
+const literature = () => ({
+  source: 'literature',
+  filed_at: '2026-11-01T10:00:00Z',
+  ingested_at: '2026-10-31T09:00:00Z',
+  paper: {
+    id: id(1), doi: '10.1/x', doi_href: 'https://doi.org/10.1/x', title: 'A paper',
+    authors: [person(2, 'Ada'), Object.assign(person(3, 'Bo'), { role: 'editor' })],
+    pending_authors: [person(4, 'Pending Pat')],
+    added_authors: [person(5, 'Added Al')],
+    authors_truncated: true,
+  },
+  ingested_by: { agent: person(6, 'ingest-bot'), human: person(7, 'Hal'), model: 'model-x', prompt_snapshot_id: id(8) },
+  corroborated_by: [
+    { id: id(9), doi: 'urn:epigraph:doc:k', doi_href: null, title: null },
+    { id: id(10), doi: '10.2/y', doi_href: 'https://doi.org/10.2/y', title: 'Other' },
+  ],
+  corroborated_by_truncated: false,
+});
+
+test('provenance: a document-made claim lists its authors apart from pending and added ones', () => {
+  const rows = V.provenanceRows(literature());
+  assert.deepEqual(rows.map((r) => r.title), [
+    'Source', 'Authors', 'Named, awaiting confirmation', 'Added by a later ingest', 'Ingested', 'Filed', 'Also recorded in',
+  ]);
+  assert.equal(flat(rowOf(rows, 'Authors')), 'Ada, Bo (editor) and others');
+  assert.ok(!flat(rowOf(rows, 'Authors')).includes('Pending'), 'a pending author is never an author');
+  assert.ok(!flat(rowOf(rows, 'Authors')).includes('Added'), 'an added author is never an author');
+  assert.equal(flat(rowOf(rows, 'Named, awaiting confirmation')), 'Pending Pat');
+  assert.equal(flat(rowOf(rows, 'Ingested')), 'by Hal via ingest-bot, using model-x, prompt snapshot 0b9a5a4e on 31 Oct 2026');
+  assert.equal(flat(rowOf(rows, 'Filed')), '1 Nov 2026');
+  const src = rowOf(rows, 'Source').parts[0];
+  assert.deepEqual(src, { text: 'A paper', href: 'https://doi.org/10.1/x', external: true });
+  const also = rowOf(rows, 'Also recorded in').parts;
+  assert.deepEqual(also[0], { text: 'urn:epigraph:doc:k', href: null, external: false }, 'a non-DOI key is text only');
+  assert.equal(also[2].href, 'https://doi.org/10.2/y');
+  for (const p of rowOf(rows, 'Authors').parts.filter((x) => x.href)) {
+    assert.ok(p.href.startsWith('/explorer/agent/') && !p.external, p.href);
+  }
+});
+
+test('provenance: an agent claim names human, agent, then what the viewer may see', () => {
+  const rows = V.provenanceRows({
+    source: 'agent',
+    filed_at: '2026-11-01T10:00:00Z',
+    filed_by: { agent: person(6, 'bot'), human: null, model: null, prompt_snapshot_id: null },
+    corroborated_by: [],
+    corroborated_by_truncated: false,
+  });
+  assert.deepEqual(rows.map((r) => r.title), ['Filed by', 'Filed']);
+  assert.equal(flat(rows[0]), 'bot', 'no human, model or snapshot is invented');
+  const withAll = V.provenanceRows({
+    source: 'agent',
+    filed_by: { agent: person(6, null), human: person(7, 'Hal'), model: 'm', prompt_snapshot_id: id(8) },
+  });
+  assert.equal(flat(withAll[0]), 'Hal via Unnamed agent, using m, prompt snapshot 0b9a5a4e');
+});
+
+test('provenance: unsafe links and unknown bodies are refused', () => {
+  const body = literature();
+  body.paper.doi_href = 'javascript:alert(1)';
+  body.ingested_by.agent.href = 'https://evil.example/agent';
+  body.ingested_by.human.href = '//evil.example/x';
+  body.corroborated_by[1].doi_href = 'https://evil.example/10.2/y';
+  const rows = V.provenanceRows(body);
+  assert.equal(rowOf(rows, 'Source').parts[0].href, null);
+  for (const p of rowOf(rows, 'Ingested').parts) assert.equal(p.href, null, p.text);
+  for (const p of rowOf(rows, 'Also recorded in').parts) assert.equal(p.href, null, p.text);
+  for (const bad of [null, 'x', {}, { source: 'dataset' }, { source: 'literature', paper: { id: 'nope' } }]) {
+    assert.equal(V.provenanceRows(bad), null, JSON.stringify(bad));
+  }
+  // An empty corroborating list and no date leave their rows out.
+  const bare = V.provenanceRows({ source: 'agent', filed_by: { agent: person(6, 'bot') } });
+  assert.deepEqual(bare.map((r) => r.title), ['Filed by']);
+});

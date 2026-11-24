@@ -14,6 +14,12 @@
  *   UTC. Arcs join linked claims of the lane, from the earlier claim to the
  *   later one; their tone comes from the relationship (support or oppose),
  *   never from a belief figure. Colour (truth_value) stays atlas.js's.
+ * - Provenance (the claim panel's section from /bff/atlas/claim): rows of
+ *   text and links. Who filed the claim reads human, then agent, then model
+ *   and prompt snapshot. A claim a document's ingest created lists that
+ *   document's authors as its authors; pending and later-added authors get
+ *   rows of their own and are never listed as authors. A document links out
+ *   only through a doi.org URL and a person only to a same-origin path.
  */
 (function (global, factory) {
   'use strict';
@@ -289,6 +295,101 @@
     return out;
   }
 
+  // ---- provenance ----------------------------------------------------------
+
+  /** A link or text part of a provenance row. */
+  function part(textValue, href, external) {
+    return { text: textValue, href: href || null, external: !!(href && external) };
+  }
+
+  function personPart(p, fallback) {
+    if (!p || typeof p !== 'object' || !uuid(p.id)) return null;
+    return part(text(p.name) || fallback, localHref(p.href), false);
+  }
+
+  function documentPart(d) {
+    if (!d || typeof d !== 'object' || !uuid(d.id)) return null;
+    const href = typeof d.doi_href === 'string' && DOI_HREF_RE.test(d.doi_href) ? d.doi_href : null;
+    return part(text(d.title) || text(d.doi) || 'Untitled document', href, true);
+  }
+
+  /** Comma-separated people as parts; ' and others' when cut. */
+  function peopleParts(list, truncated) {
+    const out = [];
+    for (const a of Array.isArray(list) ? list : []) {
+      const p = personPart(a, 'Unnamed author');
+      if (!p) continue;
+      if (out.length) out.push(part(', '));
+      out.push(p);
+      if (text(a.role)) out.push(part(' (' + text(a.role) + ')'));
+    }
+    if (out.length && truncated) out.push(part(' and others'));
+    return out;
+  }
+
+  /** human via agent, using model, prompt snapshot <8 hex>; each part only when given. */
+  function filerParts(f) {
+    if (!f || typeof f !== 'object') return [];
+    const agent = personPart(f.agent, 'Unnamed agent');
+    const human = personPart(f.human, 'Unnamed person');
+    const out = [];
+    if (human) out.push(human);
+    if (human && agent) out.push(part(' via '));
+    if (agent) out.push(agent);
+    if (!out.length) return out;
+    if (text(f.model)) out.push(part(', using ' + text(f.model)));
+    if (uuid(f.prompt_snapshot_id)) out.push(part(', prompt snapshot ' + f.prompt_snapshot_id.slice(0, 8)));
+    return out;
+  }
+
+  function documentsParts(list, truncated) {
+    const out = [];
+    for (const d of Array.isArray(list) ? list : []) {
+      const p = documentPart(d);
+      if (!p) continue;
+      if (out.length) out.push(part('; '));
+      out.push(p);
+    }
+    if (out.length && truncated) out.push(part('; and more'));
+    return out;
+  }
+
+  /**
+   * The rows of the claim panel's provenance section, from the `data` of its
+   * `provenance` section: [{title, parts: [{text, href, external}]}], or
+   * null for a body this build does not know. A row with nothing to show is
+   * left out.
+   */
+  function provenanceRows(p) {
+    if (!p || typeof p !== 'object') return null;
+    const rows = [];
+    const push = (title, parts) => {
+      if (parts && parts.length) rows.push({ title, parts });
+    };
+    if (p.source === 'literature') {
+      const doc = documentPart(p.paper);
+      if (!doc) return null;
+      const paper = p.paper;
+      push('Source', [doc]);
+      push('Authors', peopleParts(paper.authors, paper.authors_truncated === true));
+      push('Named, awaiting confirmation', peopleParts(paper.pending_authors, false));
+      push('Added by a later ingest', peopleParts(paper.added_authors, false));
+      const by = filerParts(p.ingested_by);
+      if (by.length) {
+        const when = dayLabel(p.ingested_at);
+        push('Ingested', [part('by ')].concat(by, when ? [part(' on ' + when)] : []));
+      }
+    } else if (p.source === 'agent') {
+      push('Filed by', filerParts(p.filed_by));
+    } else {
+      return null;
+    }
+    const filed = dayLabel(p.filed_at);
+    if (filed) push('Filed', [part(filed)]);
+    push('Also recorded in', documentsParts(p.corroborated_by, p.corroborated_by_truncated === true));
+    return rows;
+  }
+
   /** "12 Mar 2026" for a filing time, in UTC; '' when unreadable. */
   function dayLabel(iso) {
     const t = time(iso);
@@ -310,5 +411,6 @@
     timelineLayout,
     mergePages,
     dayLabel,
+    provenanceRows,
   };
 });
