@@ -2015,7 +2015,7 @@ pub async fn list_edges(
     // GET-then-POST guards work. Replaces the legacy first-non-null
     // cascade. Per #65: source_type defaults to None (not "claim") so
     // callers querying non-claim sources don't get silently filtered.
-    let rows = EdgeRepository::list_filtered(
+    let mut rows = EdgeRepository::list_filtered(
         &mut *read,
         &viewer,
         params.source_id,
@@ -2026,6 +2026,10 @@ pub async fn list_edges(
         1000,
     )
     .await?;
+    // An unnamed human's explicit `authored` edge carries the extraction's
+    // spelling of its name: withheld from a caller the person is not named
+    // to (migration 272, on this stamped connection; spec 7 rows E2 / E3).
+    epigraph_db::AgentDisclosureRepository::redact_authored_edges(&mut read, &mut rows).await?;
 
     // No endpoint re-check. `list_filtered` is spliced with `&viewer`, and
     // PR-13 made an edge's own tenancy the MEET of its two endpoints, so an
@@ -2144,10 +2148,12 @@ pub async fn claim_neighborhood(
 
     // Deduplicate edges by ID
     let mut seen_edge_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let deduped: Vec<_> = all_edges
+    let mut deduped: Vec<_> = all_edges
         .into_iter()
         .filter(|e| seen_edge_ids.insert(e.id))
         .collect();
+    // As in `list_edges`: an unnamed human's `authored` edge keeps no name.
+    epigraph_db::AgentDisclosureRepository::redact_authored_edges(&mut read, &mut deduped).await?;
 
     // Every `get_by_source`/`get_by_target` hop above was spliced with
     // `&viewer`, so an edge onto an unreadable claim never entered `deduped`

@@ -2079,6 +2079,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     ),
     (
         "agent_disclosure.rs",
+        "redact_authored_edges",
+        "untenanted `agents`: strips the spelling of a name from agent `authored` edges the \
+         caller already read under its viewer's splice, deciding through migration 272's \
+         `epigraph_agent_disclosure` on the STAMPED session; reads no edge itself.",
+    ),
+    (
+        "agent_disclosure.rs",
         "names_for_audience",
         "untenanted `agents`; for a stored Atlas document the audience is the MAP's (the public \
          outsider, or one team's members), passed to 272's explicit-audience core, which only \

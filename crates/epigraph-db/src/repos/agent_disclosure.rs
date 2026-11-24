@@ -42,8 +42,11 @@ use std::collections::HashMap;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use serde_json::Value as JsonValue;
+
 use crate::errors::DbError;
 use crate::repos::atlas_map::AtlasMap;
+use crate::repos::edge::EdgeRow;
 
 /// What the caller may see of one agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,6 +80,28 @@ pub fn redact_agent(agent: &mut epigraph_core::Agent, d: Disclosure) {
         agent.orcid = None;
         agent.ror_id = None;
     }
+}
+
+/// The `authored` edge properties that spell the author's name: the
+/// extraction's spelling ([`crate::repos::paper::AUTHORED_NAME_KEY`]) and the
+/// retracted name-derived node it replaced
+/// ([`crate::repos::paper::AUTHORED_REPLACES_KEY`], whose `display_name` is
+/// the name). Both sit on an edge whose source is the person's own id, and
+/// agent-endpoint edges are world-readable (migration 120), so they are
+/// withheld wherever the person is unnamed (spec 7, rows E2 / E3).
+pub const AUTHORED_IDENTITY_KEYS: [&str; 2] = [
+    crate::repos::paper::AUTHORED_NAME_KEY,
+    crate::repos::paper::AUTHORED_REPLACES_KEY,
+];
+
+/// Does this edge carry an author's spelling of a name on an agent's
+/// `authored` edge?
+fn carries_author_identity(source_type: &str, relationship: &str, props: &JsonValue) -> bool {
+    source_type == "agent"
+        && relationship == "authored"
+        && AUTHORED_IDENTITY_KEYS
+            .iter()
+            .any(|k| props.get(*k).is_some())
 }
 
 /// Disclosure reads. See the module doc: every call runs on a stamped
@@ -137,6 +162,43 @@ impl AgentDisclosureRepository {
         Ok(rows.into_iter().collect())
     }
 
+    /// Remove [`AUTHORED_IDENTITY_KEYS`] from every agent `authored` edge in
+    /// `edges` whose agent the session may not see named, in place. The edge
+    /// itself, its endpoints, `position`, `role` and `affiliations` (OPEN C8)
+    /// are unchanged. One disclosure read for the whole set, only when some
+    /// edge carries a key.
+    ///
+    /// # Errors
+    /// `DbError::QueryFailed` if the read fails.
+    pub async fn redact_authored_edges(
+        conn: &mut PgConnection,
+        edges: &mut [EdgeRow],
+    ) -> Result<(), DbError> {
+        let mut ids: Vec<Uuid> = edges
+            .iter()
+            .filter(|e| carries_author_identity(&e.source_type, &e.relationship, &e.properties))
+            .map(|e| e.source_id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let d = Self::disclosure(conn, &ids).await?;
+        for e in edges.iter_mut() {
+            if carries_author_identity(&e.source_type, &e.relationship, &e.properties)
+                && !d.get(&e.source_id).is_some_and(|x| x.named)
+            {
+                if let Some(o) = e.properties.as_object_mut() {
+                    for k in AUTHORED_IDENTITY_KEYS {
+                        o.remove(k);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// [`Self::names`] for a stored document served to `map`'s whole
     /// audience rather than to the session that builds it: the public map is
     /// read by the anonymous outsider, a team map by a member of that team
@@ -179,6 +241,19 @@ impl AgentDisclosureRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_agents_authored_edge_with_a_name_key_is_a_candidate() {
+        let named = serde_json::json!({"author_name": "A", "position": 0});
+        let replaced = serde_json::json!({"replaces_author": "x"});
+        let plain = serde_json::json!({"position": 0});
+        assert!(carries_author_identity("agent", "authored", &named));
+        assert!(carries_author_identity("agent", "authored", &replaced));
+        assert!(!carries_author_identity("agent", "authored", &plain));
+        assert!(!carries_author_identity("claim", "authored", &named));
+        assert!(!carries_author_identity("agent", "asserts", &named));
+        assert_eq!(AUTHORED_IDENTITY_KEYS, ["author_name", "replaces_author"]);
+    }
 
     #[test]
     fn the_lateral_names_its_alias() {

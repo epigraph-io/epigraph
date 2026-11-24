@@ -204,6 +204,20 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
             "AgentRepository::get_by_id",
         ],
     ),
+    // stamped: an unnamed human's `authored` edges lose the spelling of its name
+    // through migration 272's disclosure, decided on the handler's
+    // `read_as(viewer)` connection (a definer that applies its own audience);
+    // the edges themselves were read under the viewer's splice.
+    (
+        "edges.rs",
+        "claim_neighborhood",
+        &["AgentDisclosureRepository::redact_authored_edges"],
+    ),
+    (
+        "edges.rs",
+        "list_edges",
+        &["AgentDisclosureRepository::redact_authored_edges"],
+    ),
     // untenanted: the agent rows (`agents` is USING (true)); their name, ORCID
     // and ROR id are nulled through the stamped disclosure (migration 272,
     // `AgentDisclosureRepository::disclosure` on `read_as(viewer)`).

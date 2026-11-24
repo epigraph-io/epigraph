@@ -300,3 +300,87 @@ async fn a_create_find_hit_reads_back_no_name_it_may_not_see(pool: PgPool) {
         "CALIBRATION: {body}"
     );
 }
+
+/// An explicit `authored` edge from `author` to a new paper, as `ingester`'s
+/// document ingest writes it when it attaches an existing agent: the
+/// extraction's spelling (`author_name`) and the name-derived node it
+/// replaced (`replaces_author`). Returns the paper.
+async fn explicit_authorship(pool: &PgPool, ingester: Uuid, author: Uuid, name: &str) -> Uuid {
+    let paper: Uuid =
+        sqlx::query_scalar("INSERT INTO papers (doi, title) VALUES ($1, 'T') RETURNING id")
+            .bind(format!(
+                "10.0000/human-identity.{}",
+                Uuid::new_v4().simple()
+            ))
+            .fetch_one(pool)
+            .await
+            .expect("paper");
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::create_ingest_written_edge_if_absent_conn(
+        &mut conn,
+        None,
+        "ingest_document",
+        ingester,
+        author,
+        "agent",
+        paper,
+        "paper",
+        "authored",
+        Some(serde_json::json!({
+            "position": 0,
+            "role": "author",
+            "explicit_agent_id": true,
+            "author_name": name,
+            "replaces_author": Uuid::new_v4().to_string(),
+        })),
+    )
+    .await
+    .expect("authored edge");
+    paper
+}
+
+/// Rows E2 / E3: `GET /api/v1/edges` serves an unnamed human's explicit
+/// `authored` edge without `author_name` or `replaces_author` to an
+/// outsider; position and role stay. A teammate gets both keys
+/// (CALIBRATION), and a non-human agent's same edge keeps them (the rule
+/// redacts humans only).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_humans_authorship_edge_carries_no_spelling_of_its_name(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, n) = h_and_n(&pool, "Leocadia Spelled").await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "teammate").await;
+    let (ingester, _) = viewer_fixture::seed_agent_with_group(&pool, "ingester").await;
+    team_of(&pool, &[h, mate]).await;
+    explicit_authorship(&pool, ingester, h, "Leocadia Spelled").await;
+    explicit_authorship(&pool, ingester, n, "A Service Spelling").await;
+
+    let edge_of = |who: Uuid, agent: Uuid| {
+        let state = state.clone();
+        async move {
+            let (st, body) = get(
+                &state,
+                who,
+                &format!("/api/v1/edges?source_id={agent}&relationship=authored"),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            let edges = body.as_array().expect("edges").clone();
+            assert_eq!(edges.len(), 1, "{body}");
+            edges[0]["properties"].clone()
+        }
+    };
+    let p = edge_of(outsider, h).await;
+    assert!(p.get("author_name").is_none(), "{p}");
+    assert!(p.get("replaces_author").is_none(), "{p}");
+    assert_eq!(p["position"], 0, "the edge's other data stays: {p}");
+    assert_eq!(p["role"], "author");
+    let p = edge_of(mate, h).await;
+    assert_eq!(p["author_name"], "Leocadia Spelled", "CALIBRATION: {p}");
+    assert!(p.get("replaces_author").is_some(), "CALIBRATION: {p}");
+    let p = edge_of(outsider, n).await;
+    assert_eq!(
+        p["author_name"], "A Service Spelling",
+        "a non-human keeps it: {p}"
+    );
+}
