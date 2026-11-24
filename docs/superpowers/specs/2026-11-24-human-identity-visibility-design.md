@@ -1192,7 +1192,16 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **R9. Trust boundary.** `agents` stays world-readable to the application role (077 §9). A
   holder of the application DSN reads names directly, and can self-stamp to probe the session
   wrapper. This is the trust class of 236 and 269. The rule is enforced at every application
-  surface, not as a database read boundary.
+  surface, not as a database read boundary. Where the real name is stored is **[OPEN] C13**.
+  After review (correctness#8): the same holder can stamp `epigraph.principal_id` and call
+  273's setter for ANY human, which persists an opt-in and names that person to everyone.
+  It amplifies an exposure the holder already has (it can read the name) rather than
+  creating one. The setter's audit row records only `session_user` (always the application
+  login through the API), and HEAD has no request-correlation GUC to add (the only stamped
+  ids are the principal, the groups, and an elevated session's `elevation_id` /
+  `family_id`), so **an opt-in is not attributable below the API**: a forged one cannot be
+  told apart from a real one afterwards. Adding a correlation stamp (OAuth client id or
+  token jti) to every stamped connection is a follow-up, not built here.
 - **R10.** Events `actor_id` is out of scope by ruling. Guest routes were confirmed to drop
   agent identity (§7.J). Event PAYLOADS are covered (§7.J, §14).
 - **R11. `invite_to_group` answers "is this id a registered human?"** (finding L4).
@@ -1340,7 +1349,33 @@ Each item states the behaviour implemented until the operator rules.
   primary-key probe per viewer group (C9's mechanism, for groups); (b) cap the arm at
   the viewer's groups that are teams or communities (narrows the orchestrator's call A1);
   (c) accept the cost for this population size. Implemented: none (277 only made the
-  plan stable); the operator rules.
+  plan stable; 279 removed the separate 0.6 s role-derived cost, §11.1); the operator
+  rules.
+- **C13. (After review: correctness#4, leaks#3, brief addendum.) Where the real name is
+  stored.** Measured on HEAD: `oauth_clients.client_name` is NOT more restricted than
+  `agents.display_name` for the database logins. 070 grants `SELECT` on every `public`
+  table to the application and maintenance roles, 077 gives `oauth_clients` no row policy,
+  no migration revokes `SELECT` on it (118 revokes only UPDATE / DELETE / TRUNCATE), and
+  `agents_identity` is `FOR SELECT ... USING (true)`; `epigraph_app` and
+  `epigraph_maintenance` are the only login roles the migrations provision, and
+  `ensure_for_client` itself reads `client_name` on the application role. So every login
+  that can read `agents.display_name` could already read the provider name. What widens is
+  the number of code paths that read the column ungated: (a) the maintenance-DSN operator
+  CLIs (`analyze_graph::main`, `dekg::handle_migrate`, `cache_owner_audit::audit_edges`,
+  `backfill_markers::signers_statement`, `system_agent::identity`,
+  `mass_function::untyped_provenance_page`: the lint's ALLOWED register); (b) the whole-row
+  fetchers on the application role (`AgentRepository::get_by_id` / `get_by_public_key` /
+  `list` / `list_by_label`, each serializing caller redacting; `update_agent` since review);
+  (c) any holder of the application DSN, agent containers included (R9); (d) operator
+  scripts (`scripts/evidential_clustering.py` filters on the column, serves nothing). No SQL
+  function returns another agent's `display_name` to the application, and no tracing macro
+  logs it. **Decision as built:** the real name lives in `agents.display_name`, gated at
+  every application surface; the database layer is no wider than `oauth_clients` already
+  is. **Alternative:** keep the `oauth:<client row id>` placeholder in `display_name` and
+  resolve the name through the predicate from a restricted source; `oauth_clients` is not
+  such a source today, so it would need its own row policy or a new maintenance-only table.
+  Implemented: as built; the operator decides.
+
 
 ## 16a. Part B implementation notes (deviations and what was not covered)
 
@@ -1402,6 +1437,12 @@ Not covered by part B (open):
 - Migrations apply at API boot. M4 and M5 build concurrently.
 - Rollout order: the API (which migrates) deploys before any binary that calls the new
   functions; part A's binaries call the setter only from the new routes and the new tool.
+- M3's reset (274) evaluates `epigraph_is_human_principal` (a definer with a SET clause,
+  never inlined: two index probes plus call overhead) for every agent whose profile is not
+  'group', three times (before-count, UPDATE, after-count). Nearly every agent is 'public',
+  so the boot migration's time scales with the whole `agents` table x3 (review
+  correctness#6). It runs once; 274 is not edited (the standing rule), so a NEW migration
+  could not improve it. Expect it on the deploy that applies 274.
 - M3's reset takes row locks under `lock_timeout = '3s'`. A long `ensure_for_client`
   transaction holding a human row fails the boot migration; the API restarts and retries.
 - After M4 and M5: `SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid` must
