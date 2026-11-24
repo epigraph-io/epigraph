@@ -1497,3 +1497,344 @@ async fn a_stored_documents_names_follow_its_audience_not_its_builder(pool: PgPo
         "the application role must not ask about an arbitrary audience"
     );
 }
+
+// ─── part B: agent lookup (spec 7, rows A1-A5; T1) ───────────────────────
+
+/// An `oauth_clients` row of `client_type` linked through the REAL
+/// provisioning path (`AgentRepository::ensure_for_client`, which calls
+/// migration 077/274's `epigraph_provision_oauth_agent`), as a token mint
+/// does. A `human` client is given a provider-form id (`<provider>:<subject>`)
+/// so the provider-asserted name is adopted (spec 9).
+async fn provisioned(pool: &PgPool, client_type: &str, name: &str) -> Uuid {
+    let client_id = if client_type == "human" {
+        format!("fixtureprovider:{}", Uuid::new_v4().simple())
+    } else {
+        format!("epigraph_{}", Uuid::new_v4().simple())
+    };
+    let row: Uuid = sqlx::query_scalar(
+        "INSERT INTO oauth_clients (client_id, client_name, client_type, allowed_scopes, \
+                                    status, legal_entity_name, legal_contact_email) \
+         VALUES ($1, $2, $3, ARRAY['claims:write'], 'active', 'Fixture Org', \
+                 'fixture@example.invalid') RETURNING id",
+    )
+    .bind(&client_id)
+    .bind(name)
+    .bind(client_type)
+    .fetch_one(pool)
+    .await
+    .expect("client row");
+    let mut tx = pool.begin().await.expect("begin");
+    let agent = epigraph_db::AgentRepository::ensure_for_client(&mut tx, row)
+        .await
+        .expect("ensure_for_client");
+    tx.commit().await.expect("commit");
+    agent.into()
+}
+
+/// T1's pair: H, a provider-provisioned person under its real name, and N, a
+/// production-shaped nameless non-human: a service principal provisioned the
+/// same way, its placeholder name then nulled (C7 option (b), the brief's
+/// literal "display_name null", implemented until the operator rules).
+async fn h_and_n(pool: &PgPool, name: &str) -> (Uuid, Uuid) {
+    let h = provisioned(pool, "human", name).await;
+    let shown: Option<String> = sqlx::query_scalar("SELECT display_name FROM agents WHERE id = $1")
+        .bind(h)
+        .fetch_one(pool)
+        .await
+        .expect("name");
+    assert_eq!(
+        shown.as_deref(),
+        Some(name),
+        "CALIBRATION: H carries its real name"
+    );
+    let n = provisioned(pool, "service", "fixture service").await;
+    sqlx::query("UPDATE agents SET display_name = NULL WHERE id = $1")
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("nameless N");
+    // N's profile as T1 defines it: 'group', no ORCID / ROR.
+    set_profile(pool, n, "group").await;
+    (h, n)
+}
+
+/// A card's JSON with the fields that legitimately differ between H and N
+/// (identity and timestamp) replaced.
+fn card_shape(card: &epigraph_db::AgentCard) -> serde_json::Value {
+    let mut v = serde_json::to_value(card).expect("card json");
+    let o = v.as_object_mut().expect("object");
+    o.insert("id".into(), serde_json::json!("<id>"));
+    o.insert("created_at".into(), serde_json::json!("<t>"));
+    v
+}
+
+async fn cards_by(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    who: Option<Uuid>,
+    ids: &[Uuid],
+) -> Vec<epigraph_db::AgentCard> {
+    let v = match who {
+        Some(w) => viewer(pool, w).await,
+        None => fixture::public_viewer(pool).await,
+    };
+    let mut read = scoped.read_as(&v).await.expect("read_as");
+    epigraph_db::AgentLookupRepository::cards(&mut read, &v, ids)
+        .await
+        .expect("cards")
+}
+
+async fn find_by(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    who: Uuid,
+    q: &str,
+    kind: Option<&str>,
+) -> epigraph_db::FindAgentResult {
+    let v = viewer(pool, who).await;
+    let mut read = scoped.read_as(&v).await.expect("read_as");
+    let q = epigraph_db::FindAgentQuery::new(q, kind, None, Some(25)).expect("query");
+    epigraph_db::AgentLookupRepository::find(&mut read, &v, &q)
+        .await
+        .expect("find")
+}
+
+/// T1, rows A2 / A3: an outsider's and the guest's card of an unnamed human
+/// equal their card of N modulo id and timestamp, the bound LLM agent's
+/// `operator_human` shows H's id with no name; a teammate sees the name
+/// (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_humans_card_is_a_nameless_agents_card(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Rosalind Quell").await;
+    let (outsider, _) = named(&pool, "Rosalind Outsider").await;
+    let (mate, _) = named(&pool, "Rosalind Teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    // H is a registered operator too (registration is in play), and
+    // operates an agent: the reverse binding is human evidence.
+    sqlx::query("INSERT INTO human_operators (agent_id, reason) VALUES ($1, 'fixture')")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("register H");
+    let (bot, _) = named(&pool, "quell-bot").await;
+    link(&pool, bot, h).await;
+
+    for who in [Some(outsider), None] {
+        let c = cards_by(&pool, &scoped, who, &[h, n, bot]).await;
+        assert_eq!(
+            card_shape(&c[0]),
+            card_shape(&c[1]),
+            "{who:?}: H reads as N"
+        );
+        let oh = c[2].operator_human.as_ref().expect("bot's human id shown");
+        assert_eq!((oh.id, oh.display_name.as_deref()), (h, None), "{who:?}");
+    }
+    let c = cards_by(&pool, &scoped, Some(mate), &[h, bot]).await;
+    assert_eq!(
+        c[0].display_name.as_deref(),
+        Some("Rosalind Quell"),
+        "CALIBRATION"
+    );
+    assert_eq!(c[0].kind, epigraph_db::AgentKind::Human, "CALIBRATION");
+    assert_eq!(
+        c[1].operator_human
+            .as_ref()
+            .and_then(|h| h.display_name.as_deref()),
+        Some("Rosalind Quell")
+    );
+}
+
+/// T1, row A1: an unnamed human is never FOUND, by exact name, prefix,
+/// trigram or ORCID, and a kind filter does not surface it; a teammate finds
+/// it (CALIBRATION). ORCID is matched only on `details`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_human_is_never_found_by_name_or_identifier(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _n) = h_and_n(&pool, "Rosalind Quell").await;
+    sqlx::query("UPDATE agents SET orcid = '0000-0002-0000-0099' WHERE id = $1")
+        .bind(h)
+        .execute(&pool)
+        .await
+        .expect("orcid");
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    for q in [
+        "Rosalind Quell",
+        "rosalind",
+        "Rosalnd Quell",
+        "0000-0002-0000-0099",
+    ] {
+        let r = find_by(&pool, &scoped, outsider, q, None).await;
+        assert!(
+            r.results.iter().all(|x| x.card.id != h),
+            "{q}: an outsider found the unnamed human"
+        );
+        let r = find_by(&pool, &scoped, mate, q, None).await;
+        assert!(
+            r.results.iter().any(|x| x.card.id == h),
+            "{q}: CALIBRATION, a teammate finds H"
+        );
+    }
+}
+
+/// Rows A1 truncation (findings L6, 3): the disclosure filter runs BEFORE
+/// the candidate pool is cut. Exactly `CANDIDATE_POOL` visible agents named
+/// like H, plus H: the outsider's search reports `candidates_truncated:
+/// false` (H takes no slot); the teammate's, which also matches H, reports
+/// true (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unnamed_human_takes_no_candidate_slot(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _n) = h_and_n(&pool, "Decoy Target").await;
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    sqlx::query(
+        "INSERT INTO agents (public_key, display_name) \
+         SELECT pg_catalog.decode(pg_catalog.md5(g::text || 'a') || pg_catalog.md5(g::text || 'b'), \
+                                  'hex'), 'Decoy Target' \
+           FROM pg_catalog.generate_series(1, $1::int) g",
+    )
+    .bind(i32::try_from(epigraph_db::agent_lookup::CANDIDATE_POOL).expect("pool"))
+    .execute(&pool)
+    .await
+    .expect("decoys");
+    let r = find_by(&pool, &scoped, outsider, "Decoy Target", None).await;
+    assert!(
+        !r.candidates_truncated,
+        "H moved the outsider's truncation flag"
+    );
+    assert!(r.results.iter().all(|x| x.card.id != h));
+    let r = find_by(&pool, &scoped, mate, "Decoy Target", None).await;
+    assert!(
+        r.candidates_truncated,
+        "CALIBRATION: H is a 201st match to a teammate"
+    );
+}
+
+/// Row A4: the ingest's same-name candidates neither list nor count an
+/// unnamed human; a teammate's do (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn same_name_candidates_neither_list_nor_count_an_unnamed_human(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _n) = h_and_n(&pool, "Twin Name").await;
+    let (other, _) = named(&pool, "Twin Name").await;
+    let (outsider, _) = named(&pool, "someone else").await;
+    let (mate, _) = named(&pool, "a teammate").await;
+    keyed_team(&pool, &[h, mate]).await;
+    let names = vec!["Twin Name".to_string()];
+    let attached = vec![Uuid::nil()];
+    let read = |who: Uuid| {
+        let pool = pool.clone();
+        let scoped = &scoped;
+        let names = names.clone();
+        let attached = attached.clone();
+        async move {
+            let v = viewer(&pool, who).await;
+            let mut c = scoped.read_as(&v).await.expect("read_as");
+            epigraph_db::AgentLookupRepository::exact_name_candidates(&mut c, &names, &attached, 10)
+                .await
+                .expect("candidates")
+                .remove(0)
+        }
+    };
+    let (list, total) = read(outsider).await;
+    assert_eq!(
+        list.iter().map(|m| m.agent_id).collect::<Vec<_>>(),
+        vec![other]
+    );
+    assert_eq!(total, 1, "the hidden match is not counted");
+    let (list, total) = read(mate).await;
+    assert_eq!(total, 2, "CALIBRATION");
+    assert!(list.iter().any(|m| m.agent_id == h));
+}
+
+/// Row A5: the ingest's explicit-author report names an unnamed human with
+/// no name; the internal checks are unchanged.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_explicit_authors_reported_name_follows_the_rule(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _n) = h_and_n(&pool, "Ines Explicit").await;
+    let (outsider, _) = named(&pool, "someone else").await;
+    let v = viewer(&pool, outsider).await;
+    let mut c = scoped.read_as(&v).await.expect("read_as");
+    let nodes = epigraph_db::AgentLookupRepository::author_nodes(&mut c, &[h])
+        .await
+        .expect("author_nodes");
+    assert_eq!(nodes.len(), 1, "the node is still returned");
+    assert_eq!(nodes[0].display_name, None);
+    drop(c);
+    let v = viewer(&pool, h).await;
+    let mut c = scoped.read_as(&v).await.expect("read_as");
+    let nodes = epigraph_db::AgentLookupRepository::author_nodes(&mut c, &[h])
+        .await
+        .expect("author_nodes");
+    assert_eq!(
+        nodes[0].display_name.as_deref(),
+        Some("Ines Explicit"),
+        "CALIBRATION"
+    );
+}
+
+/// The A1 placement, measured: the disclosure predicate runs once per RAW
+/// name match, never once per agent in the table (findings L6, 3; advisor
+/// row-count trap). Counted with `track_functions = 'all'` in the reading
+/// transaction (`pg_stat_xact_user_functions`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_name_match_calls_the_predicate_once_per_match(pool: PgPool) {
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("db");
+    sqlx::query(&format!(
+        "ALTER DATABASE \"{db}\" SET track_functions = 'all'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("track_functions");
+    // 300 unrelated agents and 4 that match.
+    sqlx::query(
+        "INSERT INTO agents (public_key, display_name) \
+         SELECT pg_catalog.decode(pg_catalog.md5(g::text || 'x') || pg_catalog.md5(g::text || 'y'), \
+                                  'hex'), 'unrelated ' || g \
+           FROM pg_catalog.generate_series(1, 300) g",
+    )
+    .execute(&pool)
+    .await
+    .expect("population");
+    for _ in 0..4 {
+        named(&pool, "Quillon Probe").await;
+    }
+    let (asker, _) = named(&pool, "asker").await;
+    let scoped = app_pool(&pool).await;
+    let v = viewer(&pool, asker).await;
+    let mut c = scoped.read_as(&v).await.expect("read_as");
+    sqlx::query("BEGIN").execute(&mut *c).await.expect("begin");
+    let tracked: String = sqlx::query_scalar("SHOW track_functions")
+        .fetch_one(&mut *c)
+        .await
+        .expect("show");
+    assert_eq!(tracked, "all", "CALIBRATION: calls are counted");
+    let found = epigraph_db::AgentLookupRepository::match_by_name(&mut c, "Quillon Probe", 50)
+        .await
+        .expect("match");
+    assert_eq!(found.len(), 4, "CALIBRATION: the four match");
+    let calls: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(calls), 0)::bigint FROM pg_stat_xact_user_functions \
+          WHERE funcname = 'epigraph_agent_disclosure'",
+    )
+    .fetch_one(&mut *c)
+    .await
+    .expect("calls");
+    sqlx::query("ROLLBACK")
+        .execute(&mut *c)
+        .await
+        .expect("rollback");
+    assert!(
+        (4..=8).contains(&calls),
+        "the predicate ran {calls} times for 4 matches over 300+ agents: it was pushed into \
+         the agents scan"
+    );
+}

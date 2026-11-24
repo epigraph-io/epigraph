@@ -224,6 +224,63 @@ fn spends_viewer(body: &str) -> bool {
     })
 }
 
+/// Viewer-taking repo fns whose agent-identity statement is filtered by
+/// migration 272's `epigraph_agent_disclosure` on the caller's STAMPED
+/// session rather than by a predicate over the viewer's binds, as
+/// `(file, fn)`: an exact register, not a marker any fn may cite.
+///
+/// The disclosure rule (spec 2026-11-24-human-identity-visibility-design.md,
+/// section 6) reads the session settings `read_as` / `begin_as` stamp from
+/// the caller's viewer; an application-callable form taking the audience as
+/// binds would be a membership oracle, so it is maintenance-only, and these
+/// statements cannot spell the predicate over `$N` binds. A fn here passes
+/// the spend check only while its body carries the disclosure call
+/// ([`spends_through_disclosure`]) AND it is registered, so a new site is a
+/// visible diff, and a registered site that drops the call fails.
+const DISCLOSURE_SITES: &[(&str, &str)] = &[("agent_lookup.rs", "cards_inner")];
+
+/// The spellings of the disclosure call: the SQL function, or the Rust helper
+/// that writes its lateral.
+const DISCLOSURE_CALL_MARKERS: &[&str] = &["epigraph_agent_disclosure(", "disclosure_lateral_sql("];
+
+fn spends_through_disclosure(f: &ViewerFn) -> bool {
+    let (code, live_sql) = spend_views(&f.body);
+    DISCLOSURE_SITES
+        .iter()
+        .any(|(file, name)| f.file == *file && f.name == *name)
+        && DISCLOSURE_CALL_MARKERS
+            .iter()
+            .any(|m| live_sql.contains(m) || code.contains(m))
+}
+
+/// The disclosure register is exactly the viewer-taking fns that rely on it:
+/// each registered fn carries the call and spends its viewer no other way.
+#[test]
+fn the_disclosure_register_is_exactly_the_sites_that_rely_on_it() {
+    let fns = viewer_taking_fns();
+    let mut relying: Vec<(String, String)> = fns
+        .iter()
+        .filter(|f| {
+            (f.body.contains("sqlx::query") || f.body.contains("sqlx::raw_sql"))
+                && !spends_viewer(&f.body)
+                && !f.body.contains(EXEMPT_MARKER)
+                && spends_through_disclosure(f)
+        })
+        .map(|f| (f.file.clone(), f.name.clone()))
+        .collect();
+    relying.sort();
+    let mut want: Vec<(String, String)> = DISCLOSURE_SITES
+        .iter()
+        .map(|(f, n)| ((*f).to_string(), (*n).to_string()))
+        .collect();
+    want.sort();
+    assert_eq!(
+        relying, want,
+        "DISCLOSURE_SITES must name exactly the viewer-taking fns whose only spend is the \
+         stamped disclosure call"
+    );
+}
+
 /// One line per viewer-taking fn that runs SQL, does not spend its viewer and
 /// carries no [`EXEMPT_MARKER`] — the verdict
 /// [`every_viewer_taking_repo_fn_that_runs_sql_spends_the_viewer`] asserts empty.
@@ -234,7 +291,7 @@ fn unspent_offenders(fns: &[ViewerFn]) -> Vec<String> {
             // Delegating wrapper: the callee is subject to this same lint.
             continue;
         }
-        let spends = spends_viewer(&f.body);
+        let spends = spends_viewer(&f.body) || spends_through_disclosure(f);
         let exempt = f.body.contains(EXEMPT_MARKER);
         if !spends && !exempt {
             offenders.push(format!("  {}:{} — {}", f.file, f.line, f.name));
@@ -2284,10 +2341,10 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
     (
         "agent_lookup.rs",
         "author_nodes",
-        "READ of `agents` identity columns (id, display_name, agent_type, public_key) by id for \
-         the document ingest's explicit-author check, plus migration 148's `system_agents` \
-         registry (no row security, app-readable). `agents_identity` is USING (true) and \
-         GET /api/v1/agents/:id answers for any id: no tenancy columns, nothing to filter.",
+        "READ of `agents` (id, agent_type, public_key; display_name only where migration 272's \
+         `epigraph_agent_disclosure` admits the STAMPED ingest session) by id for the document \
+         ingest's explicit-author check, plus migration 148's `system_agents` registry (no row \
+         security). No tenancy columns; the name's audience is the session, not a viewer bind.",
     ),
     (
         "agent_lookup.rs",
@@ -2312,10 +2369,25 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "agent_lookup.rs",
         "exact_name_candidates",
         "READ of `agents` (id, display_name, created_at, agent_type, public_key) by folded-name \
-         equality, excluding migration 148's `system_agents` rows (no row security): the \
-         document ingest's same-name author candidates. `agents_identity` is USING (true), only \
-         the public identity columns are returned and no ORCID / ROR tier is used, so no fact \
-         depends on the caller and there is nothing for a Viewer to add.",
+         equality, excluding migration 148's `system_agents` rows: the document ingest's \
+         same-name author candidates. A match the STAMPED ingest session may not name (migration \
+         272's `epigraph_human_named_to_viewer`) is dropped before it is ranked or counted; no \
+         tenancy columns, and the audience is the session, so there is no Viewer to add.",
+    ),
+    (
+        "agent_lookup.rs",
+        "match_by_name",
+        "delegates to `match_ranked` (below): the name matcher over `agents`, which has no \
+         tenancy columns; whether a candidate's name or ORCID / ROR may match is decided by \
+         migration 272's `epigraph_agent_disclosure` on the STAMPED session the caller passes.",
+    ),
+    (
+        "agent_lookup.rs",
+        "match_ranked",
+        "READ of `agents` by folded name / ORCID / ROR: untenanted (077 `agents_identity` USING \
+         (true)); each raw match is kept only on a tier migration 272's `epigraph_agent_disclosure` \
+         admits on the STAMPED session (`named` for the name tiers, `details` for ORCID / ROR), \
+         before the LIMIT. The audience is the session; a viewer bind would be a second source.",
     ),
     (
         "system_agent.rs",
@@ -5110,28 +5182,24 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
         "profile_details_visible",
         &["sqlx::query_as(SELECT).fetch_all"],
     ),
-    // untenanted: the card rows (`agents`, gated per detail by `details_ok`, computed from the
-    // viewer's principal, groups and bypass binds, as in `get_public_profile`),
-    // `disclosed_roles` (the role-assignment definer), `disclosed_attachments` (269's
-    // role-attachment definer, which decides on the session in its body) and the operator
-    // humans' `agents` display names, for the carded agents.
+    // untenanted: the name matcher over `agents`, whose tiers migration 272's
+    // `epigraph_agent_disclosure` (a definer that applies its own audience) gates on the
+    // STAMPED session `find` reads on; the viewer reaches the cards and counts it calls next.
+    ("agent_lookup.rs", "find", &["Self::match_ranked"]),
+    // untenanted: the card rows (`agents`, the name gated by `named` and each detail by
+    // `details`, both from migration 272's `epigraph_agent_disclosure` on the STAMPED session,
+    // a definer that applies its own audience), `disclosed_roles` (the role-assignment
+    // definer), `disclosed_attachments` (269's role-attachment definer, which decides on the
+    // session in its body) and the operator humans' names through the one disclosure reader.
     (
         "agent_lookup.rs",
         "cards_inner",
         &[
+            "AgentDisclosureRepository::names",
             "Self::disclosed_attachments",
             "Self::disclosed_roles",
             "sqlx::query_as(SELECT).fetch_all",
-            "sqlx::query_as(SELECT).fetch_all",
         ],
-    ),
-    // untenanted: ranks `agents` by name, returning only the public identity columns (id,
-    // display name, created_at); the ORCID / ROR tiers match only where `details_ok`
-    // (viewer's principal, groups and bypass binds) admits the agent's details.
-    (
-        "agent_lookup.rs",
-        "match_ranked",
-        &["sqlx::query_as(WITH).fetch_all"],
     ),
     // untenanted: `atlas_layout_regions` and the region bundle rows; each is kept only where
     // `visible_themes` (spliced) admits a theme.
@@ -5849,8 +5917,9 @@ const PROFILE_RULE_SITES: &[(&str, &str)] = &[
     // Backlog 761c2b05: the ORCID / ROR redaction of `GET /api/v1/agents`
     // and `GET /api/v1/agents/:id`.
     ("agent.rs", "profile_details_visible"),
-    ("agent_lookup.rs", "cards_inner"),
-    ("agent_lookup.rs", "match_ranked"),
+    // `agent_lookup.rs::cards_inner` and `::match_ranked` decide on migration
+    // 272's `epigraph_agent_disclosure` since the human-identity change (see
+    // DISCLOSURE_SITES); they carry no copy of the rule.
 ];
 
 /// The one text of the rule, over the agent alias `a`, binding the caller's

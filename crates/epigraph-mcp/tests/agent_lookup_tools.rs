@@ -123,11 +123,22 @@ async fn get_agent_names_the_agent_that_filed_a_claim(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
+async fn every_reader_sees_the_operator_humans_id_and_its_name_by_the_rule(pool: PgPool) {
+    // Was `every_reader_sees_the_operator_human_through_both_tools`, which
+    // pinned the human's NAME to every reader. Since the human-identity rule
+    // (migration 272) the id is still on every reader's card, and the name
+    // only on the cards of readers the rule admits: here the human itself.
     let server = app_server(&pool).await;
     let (outsider, _) = named(&pool, "outsider").await;
     let (human, _) = named(&pool, "Talia Brennick").await;
     fixture::make_human_operator(&pool, human).await;
+    // As provisioning writes a person since migration 274; the column
+    // default 'public' would read as the person's opt-in.
+    sqlx::query("UPDATE agents SET profile_visibility = 'group' WHERE id = $1")
+        .bind(human)
+        .execute(&pool)
+        .await
+        .expect("group profile");
     let (linked, _) = named(&pool, "helper-bot").await;
     let mut conn = pool.acquire().await.expect("acquire");
     assert!(
@@ -138,10 +149,17 @@ async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
     );
     drop(conn);
 
-    for who in [outsider, linked, human] {
+    for (who, name) in [
+        (outsider, serde_json::Value::Null),
+        (linked, serde_json::Value::Null),
+        (human, serde_json::json!("Talia Brennick")),
+    ] {
         let card = get(&server, &pool, who, linked).await;
         assert_eq!(card["operator_human"]["id"], human.to_string(), "{card}");
-        assert_eq!(card["operator_human"]["display_name"], "Talia Brennick");
+        assert_eq!(
+            card["operator_human"]["display_name"], name,
+            "{who}: {card}"
+        );
         assert_eq!(card["kind"], "llm_agent");
         let r = find(&server, &pool, who, "helper-bot").await;
         assert_eq!(
@@ -149,6 +167,15 @@ async fn every_reader_sees_the_operator_human_through_both_tools(pool: PgPool) {
             human.to_string(),
             "{r}"
         );
+        assert_eq!(r["results"][0]["operator_human"]["display_name"], name);
+        // The human itself is found by name only by readers it is named to.
+        let r = find(&server, &pool, who, "Talia Brennick").await;
+        let found = r["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .any(|h| h["id"] == human.to_string());
+        assert_eq!(found, !name.is_null(), "{who}: {r}");
     }
 }
 

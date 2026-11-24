@@ -41,6 +41,13 @@ use std::path::{Path, PathBuf};
 /// Functions whose identity read decides disclosure in the statement itself.
 /// Each must name one of [`DISCLOSURE_CALLS`] in its live SQL.
 const GATED: &[(&str, &str)] = &[
+    ("epigraph-db/src/repos/agent_lookup.rs", "author_nodes"),
+    ("epigraph-db/src/repos/agent_lookup.rs", "cards_inner"),
+    (
+        "epigraph-db/src/repos/agent_lookup.rs",
+        "exact_name_candidates",
+    ),
+    ("epigraph-db/src/repos/agent_lookup.rs", "match_ranked"),
     ("epigraph-db/src/repos/agent_disclosure.rs", "names"),
     (
         "epigraph-db/src/repos/agent_disclosure.rs",
@@ -177,13 +184,6 @@ const PENDING: &[(&str, &str)] = &[
         "load_subgraph_conn",
     ),
     ("epigraph-db/src/repos/agent.rs", "get_public_profile"),
-    ("epigraph-db/src/repos/agent_lookup.rs", "author_nodes"),
-    ("epigraph-db/src/repos/agent_lookup.rs", "cards_inner"),
-    (
-        "epigraph-db/src/repos/agent_lookup.rs",
-        "exact_name_candidates",
-    ),
-    ("epigraph-db/src/repos/agent_lookup.rs", "match_ranked"),
     ("epigraph-db/src/repos/atlas_leaf.rs", "node_labels"),
     ("epigraph-db/src/repos/authored_by.rs", "display_names"),
     ("epigraph-db/src/repos/ego.rs", "hydrate"),
@@ -500,7 +500,14 @@ fn measure() -> Vec<(String, String, String)> {
         for (name, body) in fns(&src) {
             let sql = sql_of(&body);
             if reads_identity(&sql) {
-                found.push((file.clone(), name, sql));
+                // The lateral helper writes the call into the statement; keep
+                // its spelling so GATED can see it.
+                let marker = if body.contains("disclosure_lateral_sql(") {
+                    " epigraph_agent_disclosure("
+                } else {
+                    ""
+                };
+                found.push((file.clone(), name, format!("{sql}{marker}")));
             }
         }
     }
