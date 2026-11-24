@@ -1287,9 +1287,12 @@ async fn handle_migrate(action: MigrateCmd) -> Result<()> {
                 if dry_run { " (DRY RUN)" } else { "" }
             );
 
-            // 1. Fetch claims with embeddings
+            // 1. Fetch claims with embeddings. pgvector casts `vector` to
+            //    `real[]` directly; going through `::text` handed Postgres
+            //    pgvector's `[..]` rendering, which array input refuses as a
+            //    malformed literal on every row (backlog 06385b31).
             let rows: Vec<(Uuid, String, Vec<f32>)> = sqlx::query_as(
-                r#"SELECT id, content, embedding::text::float4[]
+                r#"SELECT id, content, embedding::real[]
                    FROM claims
                    WHERE embedding IS NOT NULL
                    ORDER BY id"#,
