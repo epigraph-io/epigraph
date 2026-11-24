@@ -355,3 +355,98 @@ async fn a_stranded_plan_is_aborted_and_reverted_by_the_operator_and_the_drain_e
         "the revert un-applied the applied item"
     );
 }
+
+/// `purge-sealed-centroids` (backlog 06cdffaa's one-off pass, for clusters
+/// a seal emptied before the seal cleared their centroids): without
+/// `--apply` it only lists, and it does so on the maintenance login; on that
+/// login `--apply` is refused by the missing DELETE grant and writes nothing;
+/// as the table owner it deletes exactly the listed row.
+///
+/// Verified to fail: with the dry run routed to the delete, the row is gone
+/// after the first run (and the maintenance login's run fails on the grant).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_centroid_pass_lists_by_default_and_deletes_only_as_the_table_owner(pool: PgPool) {
+    let world = fx::World::seed(&pool).await;
+    let sealed =
+        viewer_fixture::seed_group_claim(&pool, world.actor, world.target_group, "sealed").await;
+    let kept =
+        viewer_fixture::seed_group_claim(&pool, world.actor, world.target_group, "kept").await;
+    fx::encrypt_claim(&pool, sealed, world.target_group).await;
+    let run_id = Uuid::new_v4();
+    for (claim, cluster) in [(sealed, 0), (kept, 1)] {
+        sqlx::query(
+            "INSERT INTO claim_clusters (claim_id, cluster_id, centroid_distance, \
+                second_centroid_dist, boundary_ratio, silhouette_score, cluster_run_id) \
+             VALUES ($1, $2, 0.1, 0.2, 0.5, 0.5, $3)",
+        )
+        .bind(claim)
+        .bind(cluster)
+        .bind(run_id)
+        .execute(&pool)
+        .await
+        .expect("seed the membership");
+        sqlx::query(
+            "INSERT INTO cluster_centroids (cluster_run_id, cluster_id, umap_centroid) \
+             VALUES ($1, $2, array_fill(0.5::real, ARRAY[32])::vector)",
+        )
+        .bind(run_id)
+        .bind(cluster)
+        .execute(&pool)
+        .await
+        .expect("seed the centroid");
+    }
+    let clusters = || async {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT cluster_id FROM cluster_centroids WHERE cluster_run_id = $1 \
+              ORDER BY cluster_id",
+        )
+        .bind(run_id)
+        .fetch_all(&pool)
+        .await
+        .expect("read the centroids")
+    };
+
+    let maint = maintenance_login(&pool).await;
+    let listed = operator(&["privatization", "purge-sealed-centroids"], &maint);
+    assert_eq!(listed.code, 0, "{}", listed.show());
+    assert!(
+        listed
+            .stdout
+            .contains(&format!("SEALED-ONLY-CENTROID\trun={run_id}\tcluster=0")),
+        "{}",
+        listed.show()
+    );
+    assert!(
+        listed.stdout.contains("DRY RUN: found 1"),
+        "{}",
+        listed.show()
+    );
+    assert_eq!(clusters().await, vec![0, 1], "a dry run deletes nothing");
+
+    let refused = operator(
+        &["privatization", "purge-sealed-centroids", "--apply"],
+        &maint,
+    );
+    assert_eq!(refused.code, 1, "{}", refused.show());
+    assert!(
+        refused
+            .stderr
+            .contains("permission denied for table cluster_centroids"),
+        "{}",
+        refused.show()
+    );
+    assert_eq!(clusters().await, vec![0, 1]);
+
+    let owner = viewer_fixture::database_url_for(&pool).await;
+    let deleted = operator(
+        &["privatization", "purge-sealed-centroids", "--apply"],
+        &owner,
+    );
+    assert_eq!(deleted.code, 0, "{}", deleted.show());
+    assert!(deleted.stdout.contains("deleted 1"), "{}", deleted.show());
+    assert_eq!(
+        clusters().await,
+        vec![1],
+        "only the sealed-only cluster's row goes"
+    );
+}

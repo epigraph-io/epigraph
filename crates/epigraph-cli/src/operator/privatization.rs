@@ -1,5 +1,6 @@
-//! `privatization abort|revert`: the operator's recovery path for a
-//! privatization plan (backlog bb682f72).
+//! `privatization abort|revert|purge-sealed-centroids`: the operator's
+//! recovery path for a privatization plan, and the one-off pass for cluster
+//! centroids an earlier seal left (backlogs bb682f72, 06cdffaa).
 //!
 //! # Why an operator verb
 //!
@@ -287,4 +288,33 @@ pub async fn revert(
     } else {
         Outcome::RevertWouldDispatch { from_state, digest }
     })
+}
+
+/// The one-off pass of backlog 06cdffaa: the `cluster_centroids` rows whose
+/// clusters' members are all sealed, which a seal before the seal cleared
+/// clusters left. A dry run only READS (it needs no DELETE grant); `apply`
+/// deletes them in one transaction and returns what it deleted.
+///
+/// `--apply` needs DELETE on `cluster_centroids`, which migration 070 does not
+/// grant `epigraph_maintenance`; on such a login it fails with `42501` and
+/// writes nothing. Run it as the table owner, as the seal itself runs.
+///
+/// # Errors
+/// A statement failed (including the missing grant); nothing is written.
+pub async fn purge_sealed_centroids(
+    conn: &mut PgConnection,
+    apply: bool,
+) -> anyhow::Result<Vec<(Uuid, i32)>> {
+    if !apply {
+        return Ok(PrivatizationRepository::sealed_only_cluster_centroids_conn(conn, None).await?);
+    }
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    let deleted = PrivatizationRepository::delete_sealed_only_cluster_centroids_conn(&mut tx, None)
+        .await
+        .context(
+            "deleting cluster_centroids rows (a 42501 means this login holds no DELETE on \
+                 cluster_centroids: run --apply as the table owner)",
+        )?;
+    tx.commit().await.context("commit")?;
+    Ok(deleted)
 }

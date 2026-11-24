@@ -145,6 +145,8 @@
 //!         --reason TEXT [--apply]
 //!     epigraph-operator privatization revert --plan <uuid> --actor <uuid> --assignment <uuid> \
 //!         --reason TEXT [--apply --plan-digest b3:<hex>]
+//!     epigraph-operator privatization purge-sealed-centroids [--apply]
+//!     epigraph-operator privatization purge-sealed-centroids [--apply]
 
 use clap::{Parser, Subcommand};
 use epigraph_cli::operator::{
@@ -661,8 +663,10 @@ enum Command {
         apply: bool,
     },
     /// Recover a privatization plan (backlog bb682f72): `abort` a running or
-    /// stranded one (`drain_jobs` exit 5), then `revert` it. Each is a dry run
-    /// without `--apply`.
+    /// stranded one (`drain_jobs` exit 5), then `revert` it; or
+    /// `purge-sealed-centroids`, the one-off pass for cluster centroids an
+    /// earlier seal left (backlog 06cdffaa). Each is a dry run without
+    /// `--apply`.
     Privatization {
         #[command(subcommand)]
         action: PrivatizationAction,
@@ -1548,6 +1552,15 @@ enum PrivatizationAction {
         /// The plan's digest (`b3:<hex>`), echoed back.
         #[arg(long)]
         plan_digest: Option<String>,
+    },
+    /// List (or, with `--apply`, delete) the `cluster_centroids` rows of
+    /// clusters whose members are all sealed. `--apply` needs DELETE on
+    /// `cluster_centroids`, which the maintenance role is not granted: run it
+    /// as the table owner.
+    PurgeSealedCentroids {
+        /// Delete them. Without it, they are only listed.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -2698,6 +2711,21 @@ async fn main_inner() -> anyhow::Result<i32> {
                         );
                     }
                     Ok(outcome.exit_code())
+                }
+                PrivatizationAction::PurgeSealedCentroids { apply } => {
+                    let rows = privatization::purge_sealed_centroids(&mut conn, apply).await?;
+                    for (run, cluster) in &rows {
+                        println!(
+                            "{}SEALED-ONLY-CENTROID\trun={run}\tcluster={cluster}",
+                            if apply { "DELETED " } else { "" }
+                        );
+                    }
+                    println!(
+                        "{} {} cluster centroid row(s) whose members are all sealed",
+                        if apply { "deleted" } else { "DRY RUN: found" },
+                        rows.len()
+                    );
+                    Ok(0)
                 }
             }
         }
