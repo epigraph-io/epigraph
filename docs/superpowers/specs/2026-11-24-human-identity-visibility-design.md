@@ -237,7 +237,7 @@ The card set is therefore internally inconsistent for an outsider who looks at b
 The approved rule accepts this.
 
 `operator_human` is **not** the only id-level human signal. The others are recorded in §15
-(R1 `OCCUPIES`, R7, R11 the TGP03 invite oracle, R12 world-readable `OPERATED_BY` edges,
+(R7, R11 the TGP03 invite oracle, R12 world-readable `OPERATED_BY` edges,
 R13 timing, R14 assessment-slot BBAs). The pending-papers count (L11) is served as
 computed to every reader, for H as for N (§7 row A2). Revision 2 zeroed it for an unnamed
 H on the premise that "a pending explicit attachment exists only for a registered person";
@@ -492,6 +492,14 @@ The other political handlers (`position_timeline`, `originated_claims`, `inflati
 | I2 | New tool `set_profile_visibility` (§8) and its `scope_map.rs` row | None. | **Part A.** Added. |
 | I3 | `epigraph-mcp/src/errors.rs::db_caller_error` (`OperatorScopeRefused { .. } ... message: Cow::from(e.to_string())`), fed by 122's `epigraph_require_attributable` (`'OPL02: agent % writes a claim attributed to %, which belongs to human operator %, ...'`) (finding L8) | MCP forwards the raw database text, which names "belongs to human operator <id>". REST already maps it to fixed text (`epigraph-api/src/errors.rs`). | Map OPL01 and OPL02 in MCP to the same fixed text REST uses; keep the ids in the log. **PLAUSIBLE:** which MCP tool lets a caller choose `claims.agent_id` other than the writer (the supersede and attribution paths are the candidates) is re-verified in part B; if none can, the row becomes a §15 entry. |
 
+### K. Role-holding projection edges (operator ruling 2026-11-24, after review)
+
+Operator: "Make the OCCUPIES role edges team-only too." Moved here from §15.R1 and §7.J.
+
+| # | Site | Today | Change |
+|---|---|---|---|
+| K1 | `migrations/130_pending_admin_acts.sql::epigraph_role_assignments_audit` (the only `OCCUPIES` writer on HEAD; 123's body re-stated by 130), its revoke/expiry arm, `group_role_bindings` changes, and every existing row | `holder -OCCUPIES-> role node` written `('public', world)` with `properties.role`: an outsider reads "this id holds role X" on `list_edges`, `get_neighborhood` / `traverse`, graph query and `graph_full`, while the card shows `roles: []`. | Migration 278 (§10 M7): owner = the role's single live binding's group when it is an active team/community, else the holder's personal group **[ORCHESTRATOR'S CALL, §16.A2]**; the personal group is minted by 105's function when absent **[FIX AGENT'S CALL, §16.A3]**; a bind/unbind re-owns the role's edges; every existing row is backfilled. Read surfaces are unchanged (edge row security already filters a `group` edge). The ego view and PROV export cannot reach an agent-to-agent edge (claim-centred / claim-rooted). |
+
 ### J. Re-verified: no change
 
 | Site | Why no change |
@@ -503,7 +511,7 @@ The other political handlers (`position_timeline`, `originated_claims`, `inflati
 | `routes/belief.rs` (`SELECT properties FROM agents` for `competence_scopes`) | Internal computation; not returned. |
 | `person_team_group.rs` / `routes/team_groups.rs` / `tools/team_groups.rs` | Group names and `invited_by` as an id only (see §15.R6). |
 | CLI operator tools (`operator/system_agent.rs`, `bin/dekg.rs`, `bin/analyze_graph.rs`, `cache_owner_audit.rs`, `mass_function.rs::untyped_provenance_page` via `evidence_type_backfill`) | Maintenance, operator-facing: the privileged arm. |
-| Events `actor_id`; world-readable `OCCUPIES` edges | Out of scope by ruling (§15). |
+| Events `actor_id` | Out of scope by ruling (§15). The `OCCUPIES` edges were here until the operator's 2026-11-24 ruling; they are now row K1. |
 | `epigraph-db/src/repos/agent.rs` create tail (`"agent.registered", Some(id), &serde_json::json!({"agent_id": id, "display_name": display_name,`) | Human principals are created by `epigraph_provision_oauth_agent`, which emits no event, so no real name reaches `events` (no row policy) today. Pinned by §12.T7 (provisioning a provider human writes no `events` row containing the name) and by the lint (§14). |
 | `services/explorer/src/ttl.rs::ResponseCache` | 60 s per-session cache keyed by `RequestAuth::cache_key`: delays an opt-out by up to 60 s, never crosses sessions. Note only. |
 | `scripts/label_themes_llm.py` (`COALESCE(a.display_name, 'unknown') AS agent`) | Samples public claims only, whose filers the public-claim arm names, so it is consistent today. Part B drops the cosmetic agent column (finding L13); stored labels are a stale derivative (§15.F2). |
@@ -724,6 +732,21 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   the core with the same answers after the section 11.1 measurement (team arm per viewer
   group, role derivation only for a bound group, public-claim arm first, readable probe
   per agent x group). Undo: `docs/runbooks/277-undo.sql`.
+
+- **M7 `278_role_edges_team_only.sql`** (after review, operator ruling 2026-11-24,
+  transactional): md5 precondition `OCC01` on 130's audit body; NEW
+  `epigraph_role_edge_owner(text, uuid)` (172's path, maintenance-owned, not
+  application-callable); `epigraph_role_assignments_audit` re-stated with the projection
+  `('group', owner)` (its `public, pg_temp` path kept, so `PUBLIC_PATH_REGISTER` is
+  unchanged); NEW AFTER trigger `group_role_bindings_reown_role_edges` (bind/unbind re-owns);
+  backfill of every existing row with the declaration columns written, a
+  `security_events` summary `edges.role_edges_team_only` {migration, before, rows, after},
+  and post-condition `OCC02` (FORCE RLS would make a non-privileged runner move 0 rows).
+  Registers: `edge_writer_signing_ratchet` DB site moves 130 -> 278; `tenancy_backfill.rs`
+  DEFERRED (both new functions at 278), OPERATOR_FUNCTION_GRANTS (owner rule, `false`),
+  GRANT_EXEMPT_TRIGGERS (the re-own trigger); `custodian_role.rs`'s catalog ratchet admits
+  the re-own trigger as a second projection maintainer. Undo:
+  `docs/runbooks/278-undo.sql` (130's body back; the backfill is not reversed).
 
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
@@ -1100,8 +1123,10 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 
 ## 15. Residuals and out-of-scope follow-ups (recorded, not built)
 
-- **R1. `OCCUPIES` edges** that role grants project (123) are world-readable. They say "this id
-  holds role X", not a name. The operator question is still open. Out of scope by ruling.
+- **R1. (Closed by the operator's 2026-11-24 ruling; now §7 row K1, migration 278.)** The
+  `OCCUPIES` edges role grants project are team-only. Residual: a later change of a bound
+  group's `status` or `kind` does not re-own its edges (a suspended team's members stop
+  reading through it anyway; a group's kind does not change after creation, 108).
 - **R2. Group-admin authority can unhide H with no consent step** (findings 1, L15). The four
   paths are listed in §4: a keyed team created on demand plus a direct add (admin-tier:
   `groups:admin` is in `ADMIN_ONLY_SCOPES`), a community add by any live member holding
@@ -1153,7 +1178,7 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   `epigraph-mcp/src/server.rs::record_auth_lineage`. They persist after a retire (when the
   card shows `operator_human: null`), so they still say "this id is an operator", and the
   MCP auth-lineage edges from the server agent list every principal that used it. Id-level
-  markers, out of scope pending a ruling, next to R1.
+  markers, out of scope pending a ruling (R1, the role edges, was ruled team-only).
 - **R13. Timing** (findings L10, 19). A human evaluation costs up to the 10 ms budget, a
   non-human about 0.2 ms, so an outsider who times `GET /api/v1/agents/:id` can separate
   human ids from others, unbound humans included, even when the output is byte-identical.
@@ -1193,6 +1218,18 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 ### A. Orchestrator's call (recorded in the brief as such)
 
 - **A1.** The readable-claim arm: V can read any claim attributed to B(H), so H is named to V.
+- **A2.** (Brief addendum 2.) A role bound to no group, or to more than one live group, or
+  whose one binding is not an active team/community, has its `OCCUPIES` edges owned by the
+  HOLDER's personal group (visible to the holder, maintenance and elevated sessions only).
+  No multi-owner edge is invented.
+- **A3. (Fix agent's call, after review correctness#1.)** The review asked that a holder with
+  NO personal group be refused (the grant and the backfill RAISE). Registration as a human
+  operator does not guarantee a personal group, so a RAISE could fail a boot migration over
+  a holder that simply never had one, which the main session cannot pre-measure from a
+  subagent. 278 instead mints it through 105's `epigraph_ensure_personal_group` (found by
+  its `did:epigraph:personal:` key): never the world group, and 105's RVK01 (only revoked
+  personal rows) and RVK02 (a squatted key) still refuse with nothing written. Tested both
+  ways (`role_edges_team_only.rs::a_missing_personal_group_is_minted_and_a_revoked_one_refuses`).
 
 Not a call by anyone below the operator, recorded here so it is not mistaken for one: the
 `operator_human` trade-off (§5) is operator-approved behaviour, kept as approved and not
@@ -1337,6 +1374,11 @@ Not covered by part B (open):
   migration is re-applied (finding 15).
 - The undo runbooks are paired with a binary rollback: a binary that calls a dropped function
   fails.
+- M7 (278) mints a personal group for any role holder that has none, and refuses the boot
+  migration (RVK01 / RVK02) for a holder whose personal membership is only revoked or whose
+  personal key is squatted. Pre-check on the maintenance DSN before deploy: every live or
+  ended `role_assignments.holder_person_id` has a live row in the group whose `did_key` is
+  `did:epigraph:personal:<holder>`, or no such group at all.
 - After deploy, rebuild the Atlas leaf levels: run the Atlas nightly builder once, outside its
   schedule. Previously stored documents carry names built under a bypass viewer.
 - MCP stdio clients pin their binary. Restart them so that the find_agent and get_agent text,

@@ -2866,6 +2866,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // (the owner). Under a non-member owner `agents_self_update` still admits
     // the principal's own row; the helper's EXECUTE is what fails, loudly.
     ("epigraph_set_profile_visibility", 273),
+    // 278, the team-only owner of a role's projection edges and the binding
+    // trigger that re-owns them. Both read the FORCEd `group_role_bindings`
+    // and `groups` and write the FORCEd `edges` (and, through 105's mint, the
+    // holder's personal group) through `epigraph_definer_bypass()` (the
+    // owner). Under a non-member owner the binding read sees no row, so every
+    // edge falls to the holder's personal group (fail CLOSED, narrower), and
+    // the edge UPDATE moves nothing (the binding change keeps the old owner:
+    // quiet, the stake this entry reports).
+    ("epigraph_role_edge_owner", 278),
+    ("epigraph_group_role_bindings_reown_role_edges", 278),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4095,6 +4105,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "epigraph_set_profile_visibility",
         "public.epigraph_set_profile_visibility(text)",
         true,
+    ),
+    // 278: the role projection's owner rule is called only by the two
+    // maintenance-owned triggers; an application-callable one would answer
+    // "which group is role X bound to" (a binding oracle).
+    (
+        "epigraph_role_edge_owner",
+        "public.epigraph_role_edge_owner(text, uuid)",
+        false,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
@@ -5864,6 +5882,8 @@ mod definer_register_tests {
         "epigraph_events_assessment_guard",
         // 260: the edge declaration recorder.
         "epigraph_edges_record_declaration",
+        // 278: the binding trigger that re-owns a role's projection edges.
+        "epigraph_group_role_bindings_reown_role_edges",
     ];
 
     /// The function names [`OPERATOR_FUNCTION_GRANTS`] checks, read from each
