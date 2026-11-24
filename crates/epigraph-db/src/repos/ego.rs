@@ -492,8 +492,9 @@ impl EgoRepository {
         // `EXPECTED_EXEMPTIONS`, which is an exact set reserved for functions
         // that filter NOTHING.
         // Names through migration 272's rule on the caller's stamped
-        // connection: an unnamed human gets the same fallback label a
-        // nameless agent gets (spec 7 row H1).
+        // connection: an unnamed human gets its `oauth:<client row id>`
+        // placeholder, the label a nameless service principal gets (spec 7
+        // row H1, operator ruling C7).
         let mut agents: Vec<(Uuid, Option<String>)> =
             crate::repos::agent_disclosure::AgentDisclosureRepository::names(&mut *conn, ids)
                 .await?

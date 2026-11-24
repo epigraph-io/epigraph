@@ -16,7 +16,8 @@
 //!   and to anyone who can read a claim it (or an agent ever bound to it)
 //!   filed, so the filer of a claim the caller reads, and the filer's human,
 //!   are always named; an ingester that did not file it, or an author, may
-//!   read `display_name: null`.
+//!   read its `oauth:<client row id>` placeholder instead (migration 285,
+//!   operator ruling C7: as a nameless service principal reads).
 //! * **`human`** `{id, display_name}`: every reader of the claim. The human
 //!   the agent was BOUND to when it filed the claim (`created_at`), read from
 //!   the binding RECORD through migration 199's `epigraph_operator_bound_at`:

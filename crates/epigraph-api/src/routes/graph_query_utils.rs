@@ -140,8 +140,9 @@ pub async fn load_subgraph_conn(
 
     // 3. Fetch agents
     // Names through migration 272's rule on this stamped connection: an
-    // unnamed human gets the `id[..8]` label a nameless agent gets (spec 7
-    // row H2). Ordered by id so the node list does not depend on a map.
+    // unnamed human gets its `oauth:<client row id>` placeholder, the name
+    // and label a nameless service principal gets (spec 7 row H2, operator
+    // ruling C7). Ordered by id so the node list does not depend on a map.
     let mut agent_rows: Vec<AgentGraphRow> =
         epigraph_db::AgentDisclosureRepository::names(&mut *conn, &node_ids)
             .await

@@ -1152,8 +1152,9 @@ impl AtlasLeafRepository {
 
     /// The raw label text of a leaf's agent and evidence nodes (Atlas W9's
     /// real leaves): each agent's `display_name` as the MAP's audience may see
-    /// it (migration 272; an unnamed human is absent, as a nameless agent
-    /// is), and each evidence row's `raw_content`, else its `evidence_type`,
+    /// it (migration 272; an unnamed human is labelled by its
+    /// `oauth:<client row id>` placeholder, as a nameless service principal
+    /// is, operator ruling C7), and each evidence row's `raw_content`, else its `evidence_type`,
     /// for the rows `map` may draw. Run it on the maintenance session (the
     /// explicit-audience core is maintenance-only). An agent with no visible
     /// display name, and an evidence id the map may not draw, are absent; the

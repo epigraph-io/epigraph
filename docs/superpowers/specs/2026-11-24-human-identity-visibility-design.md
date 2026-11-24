@@ -1354,6 +1354,12 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
     whose client is not linked to it) is shown with a null name.
   - The placeholder rows make every name search evaluate the placeholder once per human
     principal (an index probe of `oauth_clients` each); not measured against the §11 budget.
+  - Graph query (`graph_view.rs::graph_query_node_ids`, row H6) keeps an agent anchor that a
+    condition touches only on `details`, which an unnamed human lacks and a minted service
+    principal has. Checked: the conditions on an agent anchor are `properties->>'<name>'`
+    comparisons (and `truth_value`, which `agents` lacks), and a minted principal's
+    properties are `{}`, so no condition selects it either; the two do not separate. A
+    service principal whose properties were later written would.
 - **F1.** Author nodes from ingested literature and git authors are not human principals.
   Their names are public-source names, and they stay named.
 - **F2.** Stale derivatives (finding L13): stored Atlas leaf documents built before deploy

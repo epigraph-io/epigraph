@@ -792,7 +792,8 @@ pub async fn get_agent_reputation(
     let claims = ClaimRepository::get_by_agent(&mut *read, &viewer, agent_id).await?;
 
     // The name as the caller may see it (migration 272, on this stamped
-    // connection): an unnamed human's reputation reads as a nameless agent's.
+    // connection): an unnamed human's reputation reads as a nameless service
+    // principal's (its `oauth:<client row id>` placeholder, ruling C7).
     let mut agent = agent;
     let d = AgentDisclosureRepository::disclosure(&mut read, &[id]).await?;
     epigraph_db::redact_agent(&mut agent, d.get(&id).cloned().unwrap_or_default());

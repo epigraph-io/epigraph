@@ -324,9 +324,10 @@ pub struct AgentPublicProfile {
     /// cannot tell a real verifier from the BLAKE3 placeholder will feed the
     /// placeholder to a signature check.
     pub key_kind: String,
-    /// `public` or `group` (migration 062), shown only with the details: an
-    /// unnamed human's `group` would otherwise be a marker no nameless agent
-    /// carries (spec 2026-11-24-human-identity-visibility-design.md, B1).
+    /// `public` or `group` (migration 062), shown only with the details; an
+    /// unnamed human shows `public`, as a minted nameless service principal
+    /// does (spec 2026-11-24-human-identity-visibility-design.md, B1, ruling
+    /// C7).
     pub profile_visibility: Option<String>,
     /// `agents.properties` — `full_name`, `affiliations`, `email`. `None` when
     /// the viewer is not entitled to it.
