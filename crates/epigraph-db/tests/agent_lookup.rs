@@ -2543,3 +2543,81 @@ async fn migration_269_attachments_refuse_more_than_200_agents(pool: PgPool) {
         .expect("200 ids accepted");
     assert!(ok.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Paper author listings (spec 2026-11-24 human identity, row E1)
+// ---------------------------------------------------------------------------
+
+/// `PaperRepository::list_authors_by` (MCP `query_paper`, REST papers, the
+/// `authored_by` literature block, the sources paper kind) lists a human
+/// author a stranger's ingest named with NO name to an outsider, exactly as
+/// it lists a nameless author node, and with its name to a teammate
+/// (CALIBRATION); position and role are the ingester's edge data and show
+/// alike.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_paper_lists_an_unnamed_human_author_without_its_name(pool: PgPool) {
+    let (outsider, _) = named(&pool, "outsider").await;
+    let (stranger, _) = named(&pool, "stranger").await;
+    let (human, _) = named_human(&pool, "Ysolde Authored").await;
+    let (mate, _) = named(&pool, "ysolde-teammate").await;
+    team_of(&pool, &[human, mate]).await;
+    // A nameless author node at the next position, for the comparison.
+    let (nameless, _) = named(&pool, "placeholder").await;
+    sqlx::query("UPDATE agents SET display_name = NULL WHERE id = $1")
+        .bind(nameless)
+        .execute(&pool)
+        .await
+        .expect("nameless");
+    let p = paper(&pool, "10.9999/lookup.unnamed-author.1").await;
+    for (who, pos) in [(human, 0), (nameless, 1)] {
+        assert!(
+            ingest_edge_as_any(
+                &pool,
+                stranger,
+                (who, "agent"),
+                (p, "paper"),
+                "authored",
+                Some(serde_json::json!({"position": pos, "role": "author"})),
+            )
+            .await
+        );
+    }
+    let list = |who: Uuid| {
+        let pool = pool.clone();
+        async move {
+            let scoped = app_pool(&pool).await;
+            let v = viewer(&pool, who).await;
+            let mut read = scoped.read_as(&v).await.expect("read_as");
+            epigraph_db::PaperRepository::list_authors_by(&mut *read, &v, p, stranger, 10)
+                .await
+                .expect("list_authors_by")
+        }
+    };
+    let rows = list(outsider).await;
+    assert_eq!(rows.len(), 2, "both authorships listed: {rows:?}");
+    let h = rows.iter().find(|r| r.agent_id == human).expect("H listed");
+    let n = rows
+        .iter()
+        .find(|r| r.agent_id == nameless)
+        .expect("N listed");
+    assert_eq!(h.display_name, None, "an outsider gets no name");
+    assert_eq!(
+        (
+            h.display_name.clone(),
+            h.role.clone(),
+            h.affiliations.clone()
+        ),
+        (
+            n.display_name.clone(),
+            n.role.clone(),
+            n.affiliations.clone()
+        )
+    );
+    let rows = list(mate).await;
+    let h = rows.iter().find(|r| r.agent_id == human).expect("H listed");
+    assert_eq!(
+        h.display_name.as_deref(),
+        Some("Ysolde Authored"),
+        "CALIBRATION"
+    );
+}

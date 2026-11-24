@@ -3268,14 +3268,6 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          `p_open = true` to read only the attested model for the run-token grant, which never \
          returns it; a change to the audience ruling must re-check it.)",
     ),
-    (
-        "authored_by.rs",
-        "display_names",
-        "READ of `id, display_name` from the untenanted `agents` table (077's `agents_identity` \
-         policy shows every session every row; no `visibility` / `owner_group_id`), the two \
-         fields `GET /api/v1/agents/:id` answers for any id. Private; called only with ids its \
-         viewer-taking callers already resolved.",
-    ),
 ];
 
 /// A connection-taking repo fn must spend a viewer, or say in writing why it
@@ -5257,13 +5249,21 @@ const REVIEWED_CALLS: &[(&str, &str, &[&str])] = &[
     (
         "authored_by.rs",
         "for_claim",
-        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+        &[
+            "AgentDisclosureRepository::names",
+            "Self::bound_at",
+            "Self::snapshot_at",
+        ],
     ),
     // untenanted: as `for_claim`.
     (
         "authored_by.rs",
         "for_paper_ingests",
-        &["Self::bound_at", "Self::display_names", "Self::snapshot_at"],
+        &[
+            "AgentDisclosureRepository::names",
+            "Self::bound_at",
+            "Self::snapshot_at",
+        ],
     ),
     // write: the advisory lock on (content hash, agent) and the strict insert; the existing-row
     // probe takes the viewer.

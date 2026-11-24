@@ -1380,10 +1380,14 @@ pub type BoundedAuthorListings =
 
 /// The columns [`PaperRepository::list_authors`] and
 /// [`PaperRepository::list_authors_bounded`] read for one `authored` edge
-/// `e` from agent `a`, in [`AuthorListingRow`] order.
+/// `e` from agent `a`, in [`AuthorListingRow`] order. The author's name is
+/// read through migration 272's `epigraph_human_named_to_viewer` on the
+/// stamped session: an unnamed human author is listed with no name, as a
+/// nameless agent is; its position, role and affiliations are the
+/// ingester's edge data and shown as for any author.
 fn author_listing_columns() -> String {
     format!(
-        "a.id, a.display_name, \
+        "a.id, CASE WHEN public.epigraph_human_named_to_viewer(a.id) THEN a.display_name END, \
          CASE WHEN e.properties ->> 'position' ~ '^[0-9]{{1,9}}$' \
               THEN (e.properties ->> 'position')::bigint END, \
          COALESCE(e.properties ->> 'role', 'author'), \
