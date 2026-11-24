@@ -1059,14 +1059,14 @@ async fn enrich_workflow_result(
     }
 
     let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
-    let use_count = val
-        .get("use_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let success_count = val
-        .get("success_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
+    // The run counters come from the persisted runs, not from the claim's
+    // content (backlog b2ac99f2): see `flat_workflow_run_counts`.
+    let (use_count, success_count) = flat_workflow_run_counts(&mut *conn, viewer, workflow_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(workflow_id = %workflow_id, "flat workflow run counts failed: {e}");
+            (0, 0)
+        });
     let generation = val
         .get("generation")
         .and_then(serde_json::Value::as_i64)
@@ -1130,6 +1130,30 @@ async fn enrich_workflow_result(
         evolved_steps: None,
         latest_generation: None,
     })
+}
+
+/// A flat workflow claim's run counters `(use_count, success_count)`: every
+/// `behavioral_executions` row recorded for it, and the successful ones, as
+/// `viewer` reads them (backlog b2ac99f2).
+///
+/// A flat workflow claim is signed, immutable content, so a counter kept
+/// inside that content can never move: `report_workflow_outcome` used to add
+/// one to the content's `use_count` for its answer and persist nothing, so
+/// every flat workflow reported `use_count` 0 in `find_workflow` and
+/// `total_uses` 1 on every report. Each flat report records one
+/// `behavioral_executions` row keyed on the claim id (MCP best-effort after
+/// its commit, REST in the same transaction), so that table is the persisted
+/// history both readers now count. Run it on `viewer`'s STAMPED
+/// connection (the callee's parent filter and the table's row security).
+async fn flat_workflow_run_counts(
+    conn: &mut sqlx::PgConnection,
+    viewer: &epigraph_db::visibility::Viewer,
+    workflow_id: uuid::Uuid,
+) -> Result<(i64, i64), epigraph_db::DbError> {
+    let (successes, total) =
+        BehavioralExecutionRepository::success_stats(&mut *conn, viewer, workflow_id, i64::MAX)
+            .await?;
+    Ok((total, successes))
 }
 
 pub async fn report_workflow_outcome(
@@ -1431,20 +1455,16 @@ pub async fn report_workflow_outcome(
         .await
         .map_err(internal_error)?;
     }
+    // The run counters this call answers (`total_uses`, `success_rate`): the
+    // workflow's persisted runs before this report
+    // (`flat_workflow_run_counts`, backlog b2ac99f2), read on this stamped
+    // transaction, plus this report, whose run row is written below.
+    let (prior_uses, prior_successes) = flat_workflow_run_counts(&mut tx, viewer, workflow_id)
+        .await
+        .map_err(internal_error)?;
+    let use_count = prior_uses + 1;
+    let success_count = prior_successes + i64::from(params.success);
     tx.commit().await.map_err(internal_error)?;
-
-    // Update use counts in workflow JSON
-    let val: serde_json::Value = serde_json::from_str(&claim.content).unwrap_or_default();
-    let use_count = val
-        .get("use_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + 1;
-    let success_count = val
-        .get("success_count")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        + i64::from(params.success);
 
     // ── Behavioral execution row (best-effort) ──────────────────────────
     // Derive goal text: prefer agent-supplied, fall back to workflow claim goal.
