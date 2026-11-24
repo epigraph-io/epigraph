@@ -1009,6 +1009,56 @@ async fn planned_predicts_what_get_or_create_stored_stores(pool: PgPool) {
     assert_eq!(created.id, public_paper_id("10.1234/planned-absent"));
 }
 
+/// A row that holds a document's derived public id but that the public scope
+/// lookup cannot find (here another document's GROUP row, which a writer
+/// able to insert `id` could plant) must not block that document's public row
+/// for good: the insert falls back to a random id, and a re-ingest converges
+/// on the row it created. Before the fallback every public ingest of the
+/// document failed with `InvalidData`, and the error named the hidden row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_squatted_derived_id_does_not_block_the_public_row(pool: PgPool) {
+    use epigraph_db::repos::paper::public_paper_id;
+
+    let (_, g) = fixture::seed_agent_with_group(&pool, "derived-id-squat").await;
+    let bare = "10.5555/repo-squatted-id";
+    sqlx::query(
+        "INSERT INTO papers (id, doi, title, visibility, owner_group_id) \
+         VALUES ($1, 'junk', 'squat', 'group', $2)",
+    )
+    .bind(public_paper_id(bare))
+    .bind(g)
+    .execute(&pool)
+    .await
+    .expect("plant a group row under the derived id");
+
+    let public = epigraph_core::TenancyDecl::instance_wide();
+    let first = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        bare,
+        Some("Real"),
+        None,
+        public,
+    )
+    .await
+    .expect("a squatted derived id must not fail the public ingest");
+    assert_ne!(first, public_paper_id(bare), "the squat keeps its row");
+    let again = PaperRepository::get_or_create(
+        &mut pool.acquire().await.expect("acquire"),
+        &format!("https://doi.org/{bare}"),
+        None,
+        None,
+        public,
+    )
+    .await
+    .expect("re-ingest");
+    assert_eq!(again, first, "a re-ingest converges on the fallback row");
+    assert_eq!(
+        rows_ending_in(&pool, "repo-squatted-id").await,
+        vec![(first, bare.to_string())],
+        "one public row, under the canonical key"
+    );
+}
+
 /// A group copy never takes the id derived from the document key, even when
 /// a caller passes it as `group_copy_id`: that id is the public row's, and a
 /// group copy under it would be computable from the key (the probe the id

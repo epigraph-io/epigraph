@@ -149,7 +149,11 @@ impl PaperRepository {
     /// # The id of a new row
     ///
     /// A new PUBLIC row takes [`public_paper_id`], derived from the document
-    /// key, whatever `group_copy_id` says. A new GROUP row takes
+    /// key, whatever `group_copy_id` says, unless that id is already held by
+    /// a row this scope's lookup cannot find (another document's row, or a
+    /// row moved out of the public scope): the insert then falls back to a
+    /// random id rather than failing for good, and a detached ingest's
+    /// announced id differs from the stored one. A new GROUP row takes
     /// `group_copy_id` when given (the random id [`Self::planned`] chose and a
     /// detached ingest already announced), else a fresh random one: never an
     /// id derivable from the key (see [`public_paper_id`]), so a
@@ -186,8 +190,7 @@ impl PaperRepository {
     /// has no parent to inherit from. `DbError::QueryFailed` if the statement
     /// fails, including a row-security refusal (42501) for an owner group the
     /// session does not write. `DbError::InvalidData` if the insert collided
-    /// with a row its second run still cannot find (an id taken by another
-    /// document's row).
+    /// on every id it tried with a row its re-runs still cannot find.
     #[instrument(skip(conn))]
     pub async fn get_or_create_stored(
         conn: &mut sqlx::PgConnection,
@@ -240,27 +243,41 @@ impl PaperRepository {
             "#,
             first = document_key_first_in_sql("id", 1, &in_scope_predicate(5, 6)),
         );
-        // Twice at most: the second run is the race loser's (see above).
-        for _ in 0..2 {
-            let row: Option<(Uuid, Option<String>)> = sqlx::query_as(&sql)
-                .bind(&spellings)
-                .bind(&canonical)
-                .bind(title)
-                .bind(journal)
-                .bind(visibility)
-                .bind(owner)
-                .bind(new_id)
-                .fetch_optional(&mut *conn)
-                .await?;
-            if let Some((id, title)) = row {
-                return Ok(StoredPaper { id, title });
+        // Each id is tried twice: the second run is the race loser's (see
+        // above). A public insert whose derived id is held by a row its scope
+        // lookup cannot see (another document's row, or a row moved out of
+        // the public scope) falls back to a random id, so that row cannot
+        // block the document's public row for good; that is the one case in
+        // which a new public row does not take the derived id.
+        let fallback = (visibility == "public").then(Uuid::new_v4);
+        for id in [Some(new_id), fallback].into_iter().flatten() {
+            for _ in 0..2 {
+                let row: Option<(Uuid, Option<String>)> = sqlx::query_as(&sql)
+                    .bind(&spellings)
+                    .bind(&canonical)
+                    .bind(title)
+                    .bind(journal)
+                    .bind(visibility)
+                    .bind(owner)
+                    .bind(id)
+                    .fetch_optional(&mut *conn)
+                    .await?;
+                if let Some((id, title)) = row {
+                    return Ok(StoredPaper { id, title });
+                }
+            }
+            if fallback.is_some_and(|f| f != id) {
+                tracing::warn!(
+                    "papers: a new public row's derived id is held by a row outside its \
+                     scope lookup; inserting it under a random id"
+                );
             }
         }
+        // Generic on purpose: which row holds the id is not the caller's to learn.
         Err(DbError::InvalidData {
             reason: format!(
-                "papers: inserting document key {canonical:?} collided with a row that a \
-                 re-read of its scope does not find (its id {new_id} is taken by another \
-                 document's row)"
+                "papers: could not insert or find the row of document key {canonical:?} \
+                 in the declared scope"
             ),
         })
     }
