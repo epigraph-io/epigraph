@@ -4521,7 +4521,8 @@ restart.
   `bba_retract.rs` and `epigraph-cli`'s `operator_delete_frames.rs` now discount the
   fixture retraction's `retract` grant where they count ledger rows. Undo:
   `docs/runbooks/274-undo.sql` (restores the four bodies; keeps the widened CHECK and every
-  `retract` row; undo 274 BEFORE 251 or 194, whose undos drop what 274's definer writes).
+  `retract` row; undo 274 BEFORE 251 or 194, whose undos drop what 274's definer writes;
+  `251-undo.sql` and `194-undo.sql` refuse, 55000, while 274's definer is in place).
   Slot assigned by the 2026-11-24 backlog triage; checked before claiming: no migration on
   main or any origin branch carries a `274`. **Deploy order:** none against the binaries
   (same definer signature and answer). A tool that marked rows directly on the maintenance

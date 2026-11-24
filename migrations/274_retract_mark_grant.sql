@@ -133,7 +133,8 @@
 --
 -- UNDO: `docs/runbooks/274-undo.sql`. Undo 274 BEFORE 251 or 194 if either
 -- is undone: 251's undo drops `epigraph_mf_guard_grant` and 194's drops the
--- ledger, both of which 274's retract definer writes through.
+-- ledger, both of which 274's retract definer writes through. Both of those
+-- runbooks refuse (55000, nothing changed) while 274's definer is in place.
 --
 -- Slot 274 was assigned by the 2026-11-24 backlog triage. Checked before
 -- claiming: no migration on main or on any origin branch carries a `274`,

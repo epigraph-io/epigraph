@@ -11,7 +11,8 @@
 -- ORDER: undo 274 BEFORE 251 or 194. 251's undo drops
 -- `epigraph_mf_guard_grant` and 194's drops the ledger, both of which 274's
 -- retract definer writes through; this file puts back 184's definer, which
--- uses neither.
+-- uses neither. Both of those runbooks refuse (55000, nothing changed) while
+-- 274's definer is in place.
 --
 -- WHAT IT DOES
 --   * Restores, byte for byte with `CREATE OR REPLACE` (never DROP, which
