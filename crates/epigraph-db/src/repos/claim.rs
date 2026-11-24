@@ -1525,6 +1525,44 @@ async fn require_privileged_session(
     })
 }
 
+/// Before a replacement cascade re-points edges onto `destination`, take the
+/// step lineage lock of `destination` in SHARE mode
+/// (`WorkflowRepository::lock_step_lineage_shared`, keyed on its
+/// `COALESCE(step_lineage_id, id)`), held to the end of the cascade's
+/// transaction (backlog 449a2afb).
+///
+/// # Why
+///
+/// The `evolve_step` gates hold the caller to workflow authority over every
+/// workflow that executes the parent's step lineage, read under the lineage's
+/// EXCLUSIVE lock (`WorkflowRepository::lock_step_lineage_for_evolve`). Every
+/// `executes` INSERT takes the same key in share mode first (bf2e9aa6), but a
+/// cascade does not insert its edges: it re-points them with `UPDATE edges SET
+/// target_id`, so a workflow's `executes` edge moved onto a member of the
+/// lineage by a supersede, a dedup, a merge or an un-mark used to land beside
+/// an evolve's authority read without either waiting for the other, and the
+/// evolve then changed what that workflow runs without authority over it.
+/// With this lock the two serialize: a cascade waits for an evolve in flight
+/// on the destination's lineage, and an evolve waits for a cascade in flight,
+/// then reads the re-pointed edge.
+///
+/// Taken unconditionally, not only when an `executes` edge is about to move:
+/// whether one is depends on rows a concurrent writer can commit between such
+/// a check and the UPDATE. Each cascade re-points onto ONE destination, so it
+/// takes one key and there is no lock order to keep between keys. Every
+/// caller runs on the privileged maintenance session (or the privileged
+/// one-transaction form), whose row security reads the destination, so the
+/// key is its true lineage. The cascades run after the act's transaction has
+/// committed (the request paths acquire the maintenance session before, and
+/// use it after, the commit), so an `evolve_step(supersedes)` no longer holds
+/// its exclusive lock when its own cascade takes this one.
+async fn lock_repoint_destination(
+    conn: &mut sqlx::PgConnection,
+    destination: Uuid,
+) -> Result<(), DbError> {
+    crate::repos::workflow::WorkflowRepository::lock_step_lineage_shared(conn, destination).await
+}
+
 /// The two edge-migration statements of a supersession, unchecked: the
 /// callers ([`ClaimRepository::supersede_conn`],
 /// [`ClaimRepository::migrate_superseded_edges_conn`]) establish the privilege
@@ -1588,6 +1626,9 @@ async fn migrate_superseded_edges(
             reason: format!("no replacement named for {old_uuid}; refusing to migrate its edges"),
         });
     };
+    // The incoming re-point below can move a workflow's `executes` edge onto
+    // `onto`'s step lineage: serialize with an `evolve_step` of that lineage.
+    lock_repoint_destination(&mut *conn, onto).await?;
     let weakening: Vec<String> = crate::repos::edge::WEAKENING_RELATIONSHIPS
         .iter()
         .map(|s| (*s).to_string())
@@ -13404,6 +13445,9 @@ async fn migrate_consolidated_edges(
     merged_id: Uuid,
     source_ids: &[Uuid],
 ) -> Result<ConsolidateEdgeMigration, DbError> {
+    // The survivors' re-point below can move a workflow's `executes` edge onto
+    // the merged claim's step lineage: serialize with an `evolve_step` of it.
+    lock_repoint_destination(&mut *tx, merged_id).await?;
     let unique: std::collections::HashSet<Uuid> = source_ids.iter().copied().collect();
     // Collect every LIVE non-supersedes edge (either spelling: a legacy
     // upper-case `SUPERSEDES` is lineage too, SPEC §5.1) touching a source,
@@ -14165,6 +14209,10 @@ async fn repair_marked_duplicate(
     // is workflow-sourced, so only the incoming retarget below meets one
     // today; the outgoing clauses and the claim-sourced incoming collision
     // guard cover a claim-sourced `executes`, which the edges table accepts.
+    //
+    // That incoming retarget can move a workflow's `executes` edge onto the
+    // canonical's step lineage: serialize with an `evolve_step` of it first.
+    lock_repoint_destination(&mut *conn, canon_uuid).await?;
     let frozen = non_public_frozen_relationships(&mut *conn, dup_uuid).await?;
     // Agents' authorship of the duplicate and act-marked edges stay on it
     // (ruling R-133, as in `migrate_superseded_edges`), and so do the
@@ -14849,6 +14897,9 @@ async fn reverse_marked_duplicate(
         });
     };
     let chain: Vec<Uuid> = canonical_chain.to_vec();
+    // The re-target back below can move a workflow's `executes` edge onto the
+    // duplicate's step lineage: serialize with an `evolve_step` of it.
+    lock_repoint_destination(&mut *conn, dup_uuid).await?;
     let mut out = DedupReversal::default();
     let mut drifted: Vec<Uuid> = Vec::new();
     let note_drift = |asked: &[Uuid], done: &[Uuid], drifted: &mut Vec<Uuid>| {

@@ -2202,6 +2202,15 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          writer's own transaction. Reads nothing back and returns nothing.",
     ),
     (
+        "claim.rs",
+        "lock_repoint_destination",
+        "WRITE-PATH LOCK (backlog 449a2afb), private to the replacement cascades (supersede, \
+         dedup repair, merge, un-mark reversal): before they re-point edges onto a claim, \
+         `WorkflowRepository::lock_step_lineage_shared` on that destination, on the cascade's \
+         own privileged transaction, so a re-pointed `executes` edge serializes against an \
+         `evolve_step` of the destination's lineage. Reads nothing back and returns nothing.",
+    ),
+    (
         "workflow.rs",
         "lock_step_lineage_for_evolve",
         "WRITE-PATH LOCK (backlog bf2e9aa6), not a disclosure: the evolve's own `FOR UPDATE` of \
