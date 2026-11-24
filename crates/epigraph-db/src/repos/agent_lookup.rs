@@ -653,9 +653,9 @@ impl AgentLookupRepository {
                         {fold_name} AS fname, \
                         ($4::bool OR a.profile_visibility = 'public' \
                            OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-                           OR EXISTS (SELECT 1 FROM group_memberships gm \
-                                       WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
-                                         AND gm.group_id = ANY($3::uuid[]))) AS details_ok, \
+                           OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
+                                CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)) \
+                          AS details_ok, \
                         {ident_orcid} AS orcid_k, {ident_ror} AS ror_k \
                    FROM agents a \
              ), ranked AS ( \
@@ -767,9 +767,9 @@ impl AgentLookupRepository {
                JOIN agents a ON a.id = u.id \
               CROSS JOIN LATERAL (SELECT COALESCE(($4::bool OR a.profile_visibility = 'public' \
                      OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-                     OR EXISTS (SELECT 1 FROM group_memberships gm \
-                                 WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
-                                   AND gm.group_id = ANY($3::uuid[]))), false) AS details_ok) d \
+                     OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
+                          CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)), \
+                     false) AS details_ok) d \
               CROSS JOIN LATERAL (SELECT {binding} AS human) h \
               ORDER BY u.ord",
             binding = operator_binding_sql("a.id"),

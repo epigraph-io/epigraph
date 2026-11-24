@@ -2128,12 +2128,16 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // control here.
     ("epigraph_refuse_sealed_claim_vector", 212),
     ("epigraph_refuse_sealed_evidence_vector", 212),
-    // 207, the bug-report intake. The write fails LOUD under a non-member
-    // owner: its inserts into the FORCEd `claims`, `reasoning_traces` and
-    // `evidence` are refused by their WITH CHECK (the owner no longer passes
-    // `epigraph_definer_bypass()`), so no report is filed. The reporter's list
-    // fails SILENTLY: its reads of the FORCEd `security_events` and `claims`
-    // admit no row, so every reporter sees an empty list.
+    // 207, the bug-report intake (both bodies re-stated by 272). The write
+    // fails LOUD under a non-member owner: its inserts into the FORCEd
+    // `claims`, `reasoning_traces` and `evidence` are refused by their WITH
+    // CHECK (the owner no longer passes `epigraph_definer_bypass()`), and
+    // under an owner without INSERT on 272's `bug_report_intake_marks` its
+    // marker INSERT is refused (42501), so no report is filed. Since 272 the
+    // reporter's list reads that marker table (no grant but the maintenance
+    // role's), so under an owner without SELECT on it, `epigraph_app` for
+    // one, it fails LOUD too (42501), where 207's read of the FORCEd
+    // `security_events` admitted no row.
     ("epigraph_submit_bug_report", 207),
     ("epigraph_my_bug_reports", 207),
     // 207's caller gate (shared by the write and the preflight). Under a
@@ -2847,6 +2851,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // Under a non-member owner it reads no row: fail CLOSED, no attachment
     // shown.
     ("epigraph_disclosed_role_attachments", 269),
+    // 273, one group's live explicit roster, answered to a session whose
+    // stamp holds the group. Its reads of the FORCEd `group_memberships`,
+    // `groups` and `author_binding_clients` are admitted by
+    // `epigraph_definer_bypass()` (the owner). Under a non-member owner the
+    // member scan is filtered to the caller's own view and a lapse check reads
+    // no allowance, so a lapsed allowlisted row may count again: the owner is
+    // load-bearing.
+    ("epigraph_group_live_roster", 273),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4043,6 +4055,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_disclosed_role_attachments",
         "public.epigraph_disclosed_role_attachments(uuid[])",
+        true,
+    ),
+    // 273: group info, the agent routes and `find_agent` / `get_agent` call it
+    // on the request DSN; without the grant each is 42501.
+    (
+        "epigraph_group_live_roster",
+        "public.epigraph_group_live_roster(uuid)",
         true,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without

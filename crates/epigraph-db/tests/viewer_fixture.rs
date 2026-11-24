@@ -1058,3 +1058,146 @@ pub async fn assert_stale_guard_refuses_the_app_role(pool: &PgPool, candidate: U
         "CALIBRATION: the refusal must be the guard's MC01, not a permission error: {e}"
     );
 }
+
+// =====================================================================
+// Role-derived and lapsed group membership (migrations 164, 165, 235).
+//
+// Every call below goes through the REAL maintenance verb on a session whose
+// `session_user` is `epigraph_maintenance` ([`as_role`]), so the guards and
+// audit triggers run exactly as the operator CLI's call does.
+// =====================================================================
+
+/// A keyless TEAM group made by migration 164's verb
+/// (`epigraph_create_team_group`), administered by `admin`, which must be a
+/// registered human ([`seed_human_operator`]). Its `did_key` is in the verbs'
+/// `did:epigraph:group:` namespace, so its rows LAPSE when their human stops
+/// being a live human operator ([`revoke_human_operator`]).
+pub async fn verb_team_group(pool: &PgPool, name: &str, admin: Uuid) -> Uuid {
+    let name = name.to_string();
+    as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let g = sqlx::query_scalar("SELECT public.epigraph_create_team_group($1, $2, $3)")
+            .bind(name)
+            .bind(admin)
+            .bind("fixture team group")
+            .fetch_one(&mut *conn)
+            .await;
+        (conn, g)
+    })
+    .await
+    .expect("the maintenance role creates the team group")
+}
+
+/// Add `agent` to a verb-made team group at `role` (164's
+/// `epigraph_team_group_add_member`).
+pub async fn verb_team_group_add(pool: &PgPool, group: Uuid, agent: Uuid, role: &str) {
+    let role = role.to_string();
+    let r: Result<Vec<sqlx::postgres::PgRow>, sqlx::Error> =
+        as_role(pool, "epigraph_maintenance", |mut conn| async move {
+            let r =
+                sqlx::query("SELECT * FROM public.epigraph_team_group_add_member($1, $2, $3, $4)")
+                    .bind(group)
+                    .bind(agent)
+                    .bind(role)
+                    .bind("fixture team member")
+                    .fetch_all(&mut *conn)
+                    .await;
+            (conn, r)
+        })
+        .await;
+    r.expect("the maintenance role adds the team member");
+}
+
+/// Define a new non-elevating catalog role `key` and bind it to `group` at
+/// `member_role` (165's `epigraph_define_group_role`). Returns the binding id.
+pub async fn bind_new_role_to_group(
+    pool: &PgPool,
+    key: &str,
+    group: Uuid,
+    member_role: &str,
+    include_agents: bool,
+) -> Uuid {
+    let (key, member_role) = (key.to_string(), member_role.to_string());
+    as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let b =
+            sqlx::query_scalar("SELECT public.epigraph_define_group_role($1, $2, $3, $4, $5, $6)")
+                .bind(key)
+                .bind("fixture team role")
+                .bind(group)
+                .bind(member_role)
+                .bind(include_agents)
+                .bind("fixture binding")
+                .fetch_one(&mut *conn)
+                .await;
+        (conn, b)
+    })
+    .await
+    .expect("the maintenance role defines and binds the role")
+}
+
+/// Grant `role` to the registered human `holder`, open-ended from now (123's
+/// `epigraph_grant_role`; no custodian exists in a fixture, so no grantor is
+/// named). Returns the assignment id, for [`end_role_assignment`].
+pub async fn grant_role_now(pool: &PgPool, role: &str, holder: Uuid) -> Uuid {
+    let role = role.to_string();
+    as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let id = sqlx::query_scalar(
+            "SELECT public.epigraph_grant_role($1, $2, now(), NULL, NULL, 'fixture grant')",
+        )
+        .bind(role)
+        .bind(holder)
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, id)
+    })
+    .await
+    .expect("the maintenance role grants the role")
+}
+
+/// End a role assignment now (123's `epigraph_end_role_assignment`): every
+/// membership derived from it lapses at the next viewer resolve.
+pub async fn end_role_assignment(pool: &PgPool, assignment: Uuid) {
+    let ended: bool = as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar("SELECT public.epigraph_end_role_assignment($1, $2)")
+            .bind(assignment)
+            .bind("fixture end")
+            .fetch_one(&mut *conn)
+            .await;
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance role ends the assignment");
+    assert!(ended, "PREMISE: the assignment was live");
+}
+
+/// Revoke `human`'s registration (`epigraph_revoke_human_operator`). Its rows
+/// in verb-made team groups LAPSE (164's conjunct in
+/// `epigraph_live_memberships`) while the rows themselves stay unrevoked.
+pub async fn revoke_human_operator(pool: &PgPool, human: Uuid) {
+    let revoked: bool = as_role(pool, "epigraph_maintenance", |mut conn| async move {
+        let r = sqlx::query_scalar(
+            "SELECT revoked_now FROM public.epigraph_revoke_human_operator($1, $2)",
+        )
+        .bind(human)
+        .bind("fixture revoke")
+        .fetch_one(&mut *conn)
+        .await;
+        (conn, r)
+    })
+    .await
+    .expect("the maintenance role revokes the registration");
+    assert!(revoked, "PREMISE: the registration was live");
+}
+
+/// Whether `agent` holds an UNREVOKED `group_memberships` row in `group`, read
+/// on the harness superuser pool: the raw roster row a lapse leaves in place.
+pub async fn has_unrevoked_row(pool: &PgPool, group: Uuid, agent: Uuid) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM group_memberships \
+          WHERE group_id = $1 AND agent_id = $2 AND revoked_at IS NULL)",
+    )
+    .bind(group)
+    .bind(agent)
+    .fetch_one(pool)
+    .await
+    .expect("read the raw roster row")
+}

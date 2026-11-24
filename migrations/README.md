@@ -4489,6 +4489,87 @@ restart.
   one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
   235, then 271, then the rest (production's order) and fails on one that breaks either
   rule.
+- **272**: public `bug_report_intake_marker` (backlog e690866c). Adds
+  `bug_report_intake_marks` (claim id PK, reporter, the intake group the report was filed
+  into, `submitted_at`, the filed title and labels; no row security, no foreign keys; the
+  application role holds NOTHING on it, the maintenance role SELECT and INSERT; a
+  `tenancy_exempt` row declares it, since its `claim_id` puts it in 069's generated
+  protected set, with `reviewed_by` 'PENDING'), written by
+  `epigraph_submit_bug_report` in the report's own statement sequence. Redefines that
+  SECURITY DEFINER from 211's body (one added INSERT; and an invisible-only repro or evidence,
+  `c_invisible`, is now absent as an invisible-only title is refused, backlog 64584278, with
+  the server's `bug_report::present` changed to match) and 207's `epigraph_my_bug_reports`,
+  which now lists the caller's markers joined to their claims (author still the caller)
+  instead of the claims owned by the CURRENT intake group: a report triage moved out of the
+  intake group, or one filed under an intake group the operator replaced, stays listed.
+  What a listed row shows: the live title, labels, `resolved` and `is_current` only while the
+  claim is owned by the CURRENT intake group (as 207), otherwise only the marker's filed
+  title and labels with NULL `resolved` and `is_current`, never a label, title, resolution or
+  supersession a later owner wrote.
+  `scripts/theme_lib.py::not_intake_owned` keys on the same marker. Backfills one marker per
+  existing `bug_report.submitted` audit row whose claim is still authored by its agent and
+  carries the write's `properties.bug_report` (filed labels rebuilt from the audit row's
+  severity and component; the title from the claim only while it is still owned by the
+  intake group its audit row names, so a report another group owned before 272 gets a NULL
+  title rather than one its new owner may have written), with `row_security` off (fails closed on a filtered migration login),
+  after an ACCESS EXCLUSIVE lock on `bug_report_intake_settings` (every write definer call
+  reads it first, so a call already past that read commits before the backfill). A call that
+  STARTS while 272 holds the lock has loaded 211's body and files its report with no marker
+  once 272 commits, and the list reads markers only, so that report is not listed at all
+  until `docs/runbooks/272-marker-backfill.sql` (272's backfill, idempotent; a REQUIRED
+  deploy step) marks it. Not decided (e690866c part 2, open): the list still shows the labels
+  intake triage writes while a report is in the current intake group, and whether a report
+  another group owns still exists (a deleted claim drops out of the list). Owners and grants re-asserted as 211 does. Pinned by
+  `epigraph-db/tests/bug_report_intake.rs` (`moved_and_earlier_intake_reports_stay_in_the_list`,
+  `a_report_owned_outside_the_current_intake_shows_only_what_was_filed`,
+  `the_application_role_cannot_read_or_forge_an_intake_marker`) and
+  `bug_report_intake_marker.rs` (the backfill across an upgrade from 271, the rerun runbook,
+  the undo, including the `tenancy_exempt` row) and `tenancy_coverage.rs` (the registry
+  constants); the intake's edge stays registered `Unsigned` in `edge_writer_signing_ratchet.rs`, now against
+  this file. Undo: `docs/runbooks/272-undo.sql` (tested: run twice, it returns the `public`
+  catalog to below 272). Checked before claiming: no migration on main or an origin branch
+  carries a `272`. **Deploy order:** the MCP binary of this change ships with or BEFORE the
+  migration (an older binary's invisible-only repro is refused BUG05 by 272's body; the new
+  binary on 211's body composes what 211 does; an older binary's invisible-only EVIDENCE is
+  not refused but stored as the description under the digest of the invisible text, silently,
+  so the binary must not trail the migration); migrate before running the theme scripts of
+  this change (they read the table: 42P01 below 272), and while NO theme run is in progress (a
+  maintenance-DSN theme transaction holds a lock on `bug_report_intake_settings` for up to its
+  600 s statement timeout, so 272's ACCESS EXCLUSIVE lock times out after 3 s and the migration
+  fails, safely: re-run it); a minute or more after 272 commits, and before triage moves
+  anything, run `docs/runbooks/272-marker-backfill.sql` once on the migration DSN (REQUIRED).
+  An older binary on 272 fails the whole `list_my_bug_reports` call for a reporter with a
+  report owned outside the current intake group (it decodes the now-NULL `resolved` and
+  `is_current` as booleans): one more reason the binary ships first. The backfill reads
+  `security_events` through `idx_security_events_type` and probes `claims` by index (EXPLAIN on a throwaway); its cost
+  on a deployed database is a measurement still to make. A
+  login that runs the theme scripts (every scheduled theme job's login, not only a read-only
+  one) needs SELECT on the table, or the job fails with 42501 (docs/deploy.md).
+  **Applied to throwaway databases only, NOT to any deployed database.**
+- **273**: `group_live_roster` (backlogs 93ed2ec3, f712db53). Adds
+  `epigraph_group_live_roster(group) -> (agent_id, role)`: the unrevoked `group_memberships` rows
+  of ONE group that still count under 164's rule (a verb-made team group's row counts while its
+  human is a live human operator) and 235's (a personal-group row of an allowlisted agent lapses
+  with the allowance), one per member, `role` as stored. It answers only when the group is in the
+  session's stamped group set (`epigraph_session_groups()`), or on a maintenance or superuser
+  session; otherwise no row. That is the authority 077's `group_memberships_tenancy` already
+  accepts for reading those rows, so the result is a subset of a plain `SELECT` on the same
+  connection: the function adds only the lapse filter, whose reads the application role lacks.
+  A member derived from a role binding (165) has no row and is NOT listed (165's "no roster
+  oracle"; readers that ask about the caller use 236's bound `epigraph_live_memberships` on a
+  connection stamped with the caller). Why: since 236 that read answers only for the session
+  principal, so asking it about each member of a roster answered every other member "not
+  live" on the application role. The direct arm is a copy of 236's
+  `epigraph_live_memberships_unbound`; the file refuses (55000) over any other twin body (md5 of
+  `prosrc`), and `epigraph-db/tests/group_live_roster.rs` pins the same md5 at head and checks
+  both answer alike. `ROWS 20 COST 50` (backlog 8377cf18). 172's form (`pg_catalog, pg_temp`),
+  owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded; `tenancy_backfill`
+  registers it). Pinned by `epigraph-db/tests/group_live_roster.rs` (every gate arm on the
+  application role through `Viewer::resolve` + `read_as`; the subset; the parity; the catalog).
+  Undo: `docs/runbooks/273-undo.sql`. **Deploy order:** migrate BEFORE the API and MCP
+  binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
+  /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
+  `get_agent`, and answers 42883 there without it.
 
 ## `-- no-transaction` migrations
 

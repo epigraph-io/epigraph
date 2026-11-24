@@ -123,19 +123,29 @@ pub struct BugReportReceipt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BugReportRow {
     pub claim_id: Uuid,
+    /// The live title while the claim is owned by the CURRENT intake group;
+    /// otherwise the title it was filed with (`None` for a report another
+    /// group already owned when migration 272 backfilled its marker).
     pub title: Option<String>,
     pub submitted_at: DateTime<Utc>,
-    /// The claim's labels NOW: triage's changes included.
+    /// The claim's labels NOW (triage's changes included) while it is owned by
+    /// the CURRENT intake group; otherwise only the labels it was filed with.
     pub labels: Vec<String>,
-    pub resolved: bool,
-    pub is_current: bool,
+    /// `None` once another group owns the report (migration 272): whether that
+    /// group resolved it is not the reporter's to see.
+    pub resolved: Option<bool>,
+    /// `None` once another group owns the report, for the same reason.
+    pub is_current: Option<bool>,
 }
 
-/// `None` for an absent or whitespace-only optional text, else the text as
-/// given. The definer applies the same rule, so the content both compose is
-/// the same.
+/// `None` for an absent optional text or one with nothing visible in it
+/// ([`is_blank`]: whitespace, format, control and blank filler characters
+/// only), else the text as given. The definer applies the same rule
+/// (migration 272: `c_invisible`, as for the title and description), so the
+/// content both compose is the same byte for byte (BUG05 otherwise), and the
+/// evidence digest is the stored evidence text's.
 fn present(s: Option<&str>) -> Option<&str> {
-    s.filter(|t| !t.trim().is_empty())
+    s.filter(|t| !is_blank(t))
 }
 
 impl BugReportInput {
@@ -256,7 +266,14 @@ impl BugReportRepository {
     }
 
     /// The stamped principal's own intake reports, newest first, at most
-    /// `limit` (clamped to 1..=200 by the definer).
+    /// `limit` (clamped to 1..=200 by the definer). Keyed on the intake
+    /// marker recorded when each report was filed (migration 272), so a
+    /// report triage has moved out of the intake group, or one filed under an
+    /// earlier intake group, is still listed. While a report is owned by the
+    /// CURRENT intake group its title, labels, `resolved` and `is_current`
+    /// are the claim's live ones, triage's included (as before 272); once
+    /// another group owns it, only what was filed (title, the write's labels),
+    /// with `resolved` and `is_current` `None`.
     ///
     /// # Errors
     /// [`DbError::Refused`] when the session has no principal (BUG01) or the
@@ -265,7 +282,14 @@ impl BugReportRepository {
         conn: &mut sqlx::PgConnection,
         limit: i32,
     ) -> Result<Vec<BugReportRow>, DbError> {
-        type Row = (Uuid, Option<String>, DateTime<Utc>, Vec<String>, bool, bool);
+        type Row = (
+            Uuid,
+            Option<String>,
+            DateTime<Utc>,
+            Vec<String>,
+            Option<bool>,
+            Option<bool>,
+        );
         let rows: Vec<Row> = sqlx::query_as(
             "SELECT claim_id, title, submitted_at, labels, resolved, is_current \
                FROM public.epigraph_my_bug_reports($1)",
@@ -320,6 +344,29 @@ mod tests {
         assert_eq!(r.evidence_text(), "D");
         r.evidence = Some("log".into());
         assert_eq!(r.evidence_text(), "log");
+    }
+
+    #[test]
+    fn an_invisible_only_repro_or_evidence_is_absent() {
+        // Backlog 64584278 part 2: the same blank rule as the title and
+        // description (BUG04), not whitespace alone, so the content the
+        // definer composes (and refuses with BUG05 if it differs) agrees.
+        let r = BugReportInput {
+            title: "T".into(),
+            description: "D".into(),
+            repro: Some("\u{200B}\u{2060}".into()),
+            evidence: Some("\u{FEFF}\u{3164}".into()),
+            ..Default::default()
+        };
+        assert_eq!(r.content(), "T\n\nD", "an invisible-only repro is no repro");
+        assert_eq!(r.evidence_text(), "D", "an invisible-only evidence is none");
+        assert_eq!(present(r.repro.as_deref()), None);
+        assert_eq!(present(r.evidence.as_deref()), None);
+        assert_eq!(
+            present(Some("a\u{200B}")),
+            Some("a\u{200B}"),
+            "visible text is kept as given"
+        );
     }
 
     #[test]

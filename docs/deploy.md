@@ -1227,6 +1227,35 @@ grep -rlE 'postgres(ql)?://[a-z_]+:[a-z_]+@' scripts/
 creates none of those logins. Always set `MAINTENANCE_DATABASE_URL` (or
 `DATABASE_URL`) explicitly when you run a script.
 
+**Every login that runs the theme scripts needs two grants.** Every theme
+label path (`label_themes_llm.py`, including `--dry-run`, `cluster_claims.py`,
+`evidential_clustering.py`, `refine_clusters.py`,
+`seed_themes_from_textbooks.py`, `anchor_papers_to_themes.py`) filters its
+label samples through `scripts/theme_lib.py::not_intake_owned` (directly or
+through `public_label_source`), which reads the bug-report intake's
+two tables: `bug_report_intake_settings` (migration 207) and
+`bug_report_intake_marks` (migration 272). The maintenance role already holds
+SELECT on both. Any login outside it fails such a query with 42501, and the
+run stops (fail-closed: it never samples without the exclusion): a read-only
+role you created for dry runs, and equally a SCHEDULED theme job whose login is
+not the maintenance role. `epigraph_app`, for one, holds SELECT on the settings
+table (207) but nothing on the marker table, so a job on an application-role
+login that passed before 272 fails every label query after it. Before
+deploying 272, check which login every scheduled theme job uses; move such a
+job to the maintenance DSN, or grant a dedicated read-only login both tables,
+on the migration (superuser) DSN:
+
+```sql
+GRANT SELECT ON public.bug_report_intake_settings TO <readonly_login>;
+GRANT SELECT ON public.bug_report_intake_marks TO <readonly_login>;  -- 272 and later
+```
+
+Grant nothing else on `bug_report_intake_marks`, and never grant it to
+`epigraph_app`: it records which agent filed which report, which the
+application role is deliberately not given (272). Below migration 272 the
+second statement fails with 42P01; run the first alone. The theme scripts of a
+build that includes 272 need the database migrated to 272 first.
+
 ## 6. Session settings and connection poolers
 
 ### `EPIGRAPH_SESSION_GUC_MODE`
