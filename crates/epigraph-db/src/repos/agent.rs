@@ -243,6 +243,77 @@ pub struct CapabilityFilter {
 /// agent's PII, which is **indistinguishable from the agent simply not having
 /// set them** — deliberately, so the projection is not itself an oracle for
 /// "this agent has a private profile".
+/// A human principal's own choice of who sees its name (migration 273): the
+/// two values 062's CHECK admits on `agents.profile_visibility`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileVisibility {
+    /// The name is shown to everyone.
+    Public,
+    /// The name is shown only to the readers 272's rule admits (teammates,
+    /// readers of the person's claims, and everyone once an agent ever bound
+    /// to the person filed a public claim).
+    Group,
+}
+
+impl ProfileVisibility {
+    /// The stored spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Group => "group",
+        }
+    }
+
+    /// Parse the stored spelling; `None` for anything else.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "public" => Some(Self::Public),
+            "group" => Some(Self::Group),
+            _ => None,
+        }
+    }
+}
+
+/// What [`AgentRepository::set_profile_visibility_conn`] changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileVisibilitySet {
+    /// The value before the call.
+    pub previous: String,
+    /// The value after the call.
+    pub profile_visibility: String,
+    /// Whether an anonymous outsider sees the principal's name after the
+    /// call. True for `'public'`, and also for `'group'` while an agent ever
+    /// bound to the principal has a public claim ("no anonymous claims").
+    pub named_to_everyone: bool,
+}
+
+/// Map migration 273's refusals to designed refusals (the VIS pattern,
+/// `claim_visibility.rs::map_vis_error`). `refusal_codes.rs` is pinned to
+/// migration 176's codes, so the PVS codes are mapped here instead.
+fn map_profile_visibility_error(e: sqlx::Error) -> DbError {
+    if let sqlx::Error::Database(db) = &e {
+        let msg = db.message();
+        let kind = if msg.starts_with("PVS01") || msg.starts_with("PVS05") {
+            Some(crate::errors::RefusalKind::Authority)
+        } else if msg.starts_with("PVS02") {
+            Some(crate::errors::RefusalKind::Input)
+        } else if msg.starts_with("PVS04") {
+            Some(crate::errors::RefusalKind::State)
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return DbError::Refused {
+                kind,
+                message: msg.to_string(),
+            };
+        }
+    }
+    DbError::from(e)
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentPublicProfile {
     pub id: Uuid,
@@ -2701,6 +2772,38 @@ impl AgentRepository {
                 ror_id: if may_see_details { ror_id } else { None },
             },
         ))
+    }
+
+    /// Set the SESSION PRINCIPAL's own `profile_visibility` through migration
+    /// 273's definer `epigraph_set_profile_visibility`, on `conn` (which must
+    /// be stamped from the caller's viewer). Only a human principal may; the
+    /// target is always the principal, never an argument. One
+    /// `agent.profile_visibility_set` audit row per successful call.
+    ///
+    /// # Errors
+    /// `DbError::Refused`: `Authority` with no principal (PVS01) or for a
+    /// principal that is not a person (PVS05: an operated agent, a service);
+    /// `Input` for a value the CHECK does not admit (PVS02, unreachable from
+    /// [`ProfileVisibility`]); `State` if the row did not move (PVS04).
+    /// Nothing is changed on any of them. `DbError::QueryFailed` otherwise.
+    pub async fn set_profile_visibility_conn(
+        conn: &mut sqlx::PgConnection,
+        visibility: ProfileVisibility,
+    ) -> Result<ProfileVisibilitySet, DbError> {
+        let (previous, profile_visibility, named_to_everyone): (Option<String>, String, bool) =
+            sqlx::query_as(
+                "SELECT previous, profile_visibility, named_to_everyone \
+                   FROM public.epigraph_set_profile_visibility($1)",
+            )
+            .bind(visibility.as_str())
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(map_profile_visibility_error)?;
+        Ok(ProfileVisibilitySet {
+            previous: previous.unwrap_or_default(),
+            profile_visibility,
+            named_to_everyone,
+        })
     }
 
     /// The ids among `ids` whose profile DETAILS (`orcid`, `ror_id`,

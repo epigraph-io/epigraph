@@ -4512,6 +4512,19 @@ restart.
   under a non-member owner (no binding, membership or group claim is read). Pinned by
   `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/272-undo.sql`.
   **Deploy order:** migrate BEFORE a binary that calls the wrappers (42883 without them).
+- **273**: `profile_visibility_setter` (spec section 8). `epigraph_set_profile_visibility(value)`:
+  the session principal sets its OWN `agents.profile_visibility` ('public' | 'group'), which
+  272's opt-in arm reads as consent. Self only, no operator or admin arm. Refusals change
+  nothing: PVS01 (42501) no principal, PVS02 (22023) another value, PVS05 (42501) the
+  principal is not a human principal (an operated agent or a service), PVS04 (55000) the row
+  did not move. Returns `(previous, profile_visibility, named_to_everyone)`, the last from
+  272's core with an empty audience, so opting out while a bound agent's public claim exists
+  answers true. One `agent.profile_visibility_set` audit row per call. On 172's form with no
+  write window (271 pinned every trigger's path), owned by `epigraph_maintenance`, EXECUTE to
+  `epigraph_app` only. The column stays outside 118's app UPDATE grant
+  (`app_role_table_lockdown.rs::agents_identity_columns_are_not_app_updatable`). Pinned by
+  `epigraph-db/tests/human_identity_visibility.rs`. Undo: `docs/runbooks/273-undo.sql`.
+  **Deploy order:** migrate BEFORE a binary with the MCP tool or the PUT field.
 
 ## `-- no-transaction` migrations
 

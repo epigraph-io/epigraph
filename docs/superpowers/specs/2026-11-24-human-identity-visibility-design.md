@@ -1008,7 +1008,7 @@ one says why.
 | `no_unscoped_pool` | C4 and C5 gain stamped connections; no new unscoped site. |
 | `cargo check -p epigraph-api --no-default-features` | The new route fields sit behind `db`. |
 | `viewer_spend_lint` | New `&Viewer` parameters are spent. |
-| `visibility_lint` | `PROFILE_RULE_SITES` is replaced. `EXPECTED_EXEMPTIONS` gains nothing: the new reads take no viewer, and `agents` is not `tier_a`. |
+| `visibility_lint` | `PROFILE_RULE_SITES` is replaced (part B). `EXPECTED_EXEMPTIONS` gains nothing: the new reads take no viewer, and `agents` is not `tier_a`. `CONN_WITHOUT_VIEWER` gains `agent.rs::set_profile_visibility_conn` (part A): a write through 273's definer on a stamped transaction, as `set_agent_default_conn` is. |
 | `definer_search_path_ratchet` | See §10. |
 | `app_role_table_lockdown` | See §10. |
 | `edge_writer_signing_ratchet` | Unaffected: no edge writer changes. E2 changes the edge READ projection (part B), which this ratchet does not cover; E3's tests do. |

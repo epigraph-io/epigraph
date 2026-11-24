@@ -2006,6 +2006,13 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
          is spent on the stamp.",
     ),
     (
+        "agent.rs",
+        "set_profile_visibility_conn",
+        "WRITE through 273's definer `epigraph_set_profile_visibility` on a STAMPED \
+         transaction: the session principal's OWN `profile_visibility`, never an argument's; \
+         only a human principal may (PVS01 / PVS05), audited. The viewer is spent on the stamp.",
+    ),
+    (
         "claim_visibility.rs",
         "publicize_conn",
         "WRITE through 206's definer `epigraph_publicize_claims` on a STAMPED transaction: the \

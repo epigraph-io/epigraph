@@ -969,3 +969,206 @@ async fn a_retired_link_cannot_be_repointed_and_keeps_naming_its_human(pool: PgP
         "and never the human it was not bound to"
     );
 }
+
+// ─── T5: the self-service setter (migration 273) ─────────────────────────
+
+/// Set `profile` as the principal `who`, on an `epigraph_app` transaction
+/// stamped from `who`'s viewer, through the repository function the MCP tool
+/// and the REST route call. Commits on success.
+async fn set_as(
+    pool: &PgPool,
+    scoped: &ScopedPool,
+    who: Uuid,
+    profile: epigraph_db::ProfileVisibility,
+) -> Result<epigraph_db::ProfileVisibilitySet, epigraph_db::DbError> {
+    let v = viewer(pool, who).await;
+    let mut tx = scoped.begin_as(&v).await.expect("begin_as");
+    let r = epigraph_db::AgentRepository::set_profile_visibility_conn(&mut tx, profile).await;
+    if r.is_ok() {
+        tx.commit().await.expect("commit");
+    }
+    r
+}
+
+async fn profile_of(pool: &PgPool, agent: Uuid) -> String {
+    sqlx::query_scalar("SELECT profile_visibility FROM agents WHERE id = $1")
+        .bind(agent)
+        .fetch_one(pool)
+        .await
+        .expect("profile")
+}
+
+fn refusal_kind(r: Result<epigraph_db::ProfileVisibilitySet, epigraph_db::DbError>) -> String {
+    match r {
+        Err(epigraph_db::DbError::Refused { kind, message }) => format!("{kind:?} {message}"),
+        other => panic!("expected a designed refusal, got {other:?}"),
+    }
+}
+
+/// A human sets its own profile public: an outsider then sees it named; the
+/// answer reports the previous value and that everyone sees the name; one
+/// audit row per call. Setting it back to `'group'` hides it again when no
+/// other arm holds, and `named_to_everyone` says so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_human_sets_its_own_profile_and_is_told_the_effective_state(pool: PgPool) {
+    use epigraph_db::ProfileVisibility::{Group, Public};
+    let scoped = app_pool(&pool).await;
+    let (outsider, _) = named(&pool, "Ada Bystander").await;
+    let (h, _) = human(&pool, "Bram Optin").await;
+
+    let set = set_as(&pool, &scoped, h, Public).await.expect("opt in");
+    assert_eq!(set.previous, "group");
+    assert_eq!(set.profile_visibility, "public");
+    assert!(
+        set.named_to_everyone,
+        "a public profile is named to everyone"
+    );
+    assert!(
+        named_to(&pool, &scoped, outsider, h).await,
+        "opted in: named"
+    );
+
+    let set = set_as(&pool, &scoped, h, Group).await.expect("opt out");
+    assert_eq!(
+        (set.previous.as_str(), set.profile_visibility.as_str()),
+        ("public", "group")
+    );
+    assert!(
+        !set.named_to_everyone,
+        "nothing else names H, so the answer must say so"
+    );
+    assert!(
+        !named_to(&pool, &scoped, outsider, h).await,
+        "opted out: unnamed"
+    );
+
+    let audits: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
+        "SELECT agent_id, details FROM security_events \
+          WHERE event_type = 'agent.profile_visibility_set' ORDER BY created_at",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit rows");
+    assert_eq!(audits.len(), 2, "one audit row per call");
+    assert!(audits.iter().all(|(a, _)| *a == h), "attributed to H");
+    assert_eq!(audits[0].1["previous"], "group");
+    assert_eq!(audits[0].1["profile_visibility"], "public");
+    assert_eq!(audits[1].1["previous"], "public");
+}
+
+/// Finding 17: setting `'group'` while a public claim of B(H) exists is
+/// truthful: the name is still shown to everyone, and the answer says so.
+#[sqlx::test(migrations = "../../migrations")]
+async fn opting_out_with_a_public_claim_reports_the_name_is_still_public(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = human(&pool, "Cleo Accountable").await;
+    let (bot, _) = named(&pool, "cleo-bot").await;
+    link(&pool, bot, h).await;
+    fixture::seed_public_claim(&pool, bot, "cleo's bot said this publicly").await;
+    let set = set_as(&pool, &scoped, h, epigraph_db::ProfileVisibility::Group)
+        .await
+        .expect("set group");
+    assert!(
+        set.named_to_everyone,
+        "a public claim of a bound agent names H whatever the profile"
+    );
+}
+
+/// Refusals, each changing nothing: a non-human principal (a service, an
+/// operated bot) is PVS05 (finding 17); no principal is PVS01; a value other
+/// than public / group is PVS02.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_setter_refuses_non_humans_anonymous_callers_and_bad_values(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = human(&pool, "Dmitri Owner").await;
+    let (bot, _) = named(&pool, "dmitri-bot").await;
+    link(&pool, bot, h).await;
+    let (svc, _) = named(&pool, "Plain Service").await;
+    set_profile(&pool, svc, "group").await;
+
+    for (who, label) in [(bot, "operated bot"), (svc, "service")] {
+        let msg =
+            refusal_kind(set_as(&pool, &scoped, who, epigraph_db::ProfileVisibility::Public).await);
+        assert!(
+            msg.starts_with("Authority PVS05"),
+            "{label}: expected PVS05 authority, got {msg}"
+        );
+    }
+    assert_eq!(profile_of(&pool, svc).await, "group", "nothing changed");
+    assert_eq!(
+        profile_of(&pool, h).await,
+        "group",
+        "nor on the bot's human"
+    );
+
+    // The guest viewer's stamp (the nil principal): not a person.
+    let guest = fixture::public_viewer(&pool).await;
+    let mut tx = scoped.begin_as(&guest).await.expect("begin_as guest");
+    let r = epigraph_db::AgentRepository::set_profile_visibility_conn(
+        &mut tx,
+        epigraph_db::ProfileVisibility::Public,
+    )
+    .await;
+    drop(tx);
+    let msg = refusal_kind(r);
+    assert!(msg.starts_with("Authority PVS05"), "guest: {msg}");
+
+    // No principal at all: an unstamped application session.
+    let r = fixture::as_role(&pool, "epigraph_app", |mut conn| async move {
+        let r = epigraph_db::AgentRepository::set_profile_visibility_conn(
+            &mut conn,
+            epigraph_db::ProfileVisibility::Public,
+        )
+        .await;
+        (conn, r)
+    })
+    .await;
+    let msg = refusal_kind(r);
+    assert!(msg.starts_with("Authority PVS01"), "unstamped: {msg}");
+
+    // A value the CHECK does not admit, through raw SQL (the Rust enum
+    // cannot express it).
+    let v = viewer(&pool, h).await;
+    let mut tx = scoped.begin_as(&v).await.expect("begin_as");
+    let err = sqlx::query("SELECT * FROM public.epigraph_set_profile_visibility('team')")
+        .execute(&mut *tx)
+        .await
+        .expect_err("'team' is not a profile value")
+        .to_string();
+    drop(tx);
+    assert!(err.contains("PVS02"), "bad value: {err}");
+    assert_eq!(profile_of(&pool, h).await, "group", "nothing changed");
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM security_events WHERE event_type = 'agent.profile_visibility_set'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(audits, 0, "a refused call writes no audit row");
+}
+
+/// 273's catalog: SECURITY DEFINER on `pg_catalog, pg_temp`, owned by
+/// maintenance, EXECUTE for the application role and not for PUBLIC.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_273_setter_is_pinned_owned_and_granted(pool: PgPool) {
+    let sig = "public.epigraph_set_profile_visibility(text)";
+    let (secdef, owner, config, app, public): (bool, String, Vec<String>, bool, bool) =
+        sqlx::query_as(
+            "SELECT p.prosecdef, pg_get_userbyid(p.proowner)::text, \
+                    COALESCE(p.proconfig, '{}'::text[]), \
+                    has_function_privilege('epigraph_app', p.oid, 'EXECUTE'), \
+                    p.proacl IS NULL OR EXISTS (SELECT 1 FROM aclexplode(p.proacl) a \
+                                                 WHERE a.grantee = 0 \
+                                                   AND a.privilege_type = 'EXECUTE') \
+               FROM pg_proc p WHERE p.oid = $1::text::regprocedure",
+        )
+        .bind(sig)
+        .fetch_one(&pool)
+        .await
+        .expect("catalog");
+    assert!(secdef);
+    assert_eq!(owner, "epigraph_maintenance");
+    assert_eq!(config, vec!["search_path=pg_catalog, pg_temp".to_string()]);
+    assert!(app, "epigraph_app must EXECUTE the setter");
+    assert!(!public, "PUBLIC must not EXECUTE the setter");
+}

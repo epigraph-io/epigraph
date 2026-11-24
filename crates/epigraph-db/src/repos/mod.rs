@@ -121,8 +121,8 @@ pub use admin_scope_enforcement::{
 };
 pub use agent::{
     AgentCapabilitiesRow, AgentIdentityRow, AgentPublicProfile, AgentRepository, AuthorOperator,
-    CapabilityFilter, OperatorLink, OperatorLinkOutcome, RetiredLinkOutcome, RoleAgentRunGate,
-    SpeaksFor,
+    CapabilityFilter, OperatorLink, OperatorLinkOutcome, ProfileVisibility, ProfileVisibilitySet,
+    RetiredLinkOutcome, RoleAgentRunGate, SpeaksFor,
 };
 pub use agent::{
     DelegationLive, RunTokens, SignerAgentType, KEY_KIND_SEED_DERIVED, RUN_TOKENS_ENV,

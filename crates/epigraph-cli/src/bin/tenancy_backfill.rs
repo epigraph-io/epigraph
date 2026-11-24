@@ -2860,6 +2860,12 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     ("epigraph_agent_disclosure_for", 272),
     ("epigraph_agent_disclosure", 272),
     ("epigraph_human_named_to_viewer", 272),
+    // 273, the self-service profile setter. It reads `oauth_clients` and
+    // `human_operators` through 272's evidence helper and writes the
+    // principal's own `agents` row, admitted by `epigraph_definer_bypass()`
+    // (the owner). Under a non-member owner `agents_self_update` still admits
+    // the principal's own row; the helper's EXECUTE is what fails, loudly.
+    ("epigraph_set_profile_visibility", 273),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4082,6 +4088,13 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
         "epigraph_is_human_principal",
         "public.epigraph_is_human_principal(uuid)",
         false,
+    ),
+    // 273: the MCP tool set_profile_visibility and PUT /api/v1/agents/:id call
+    // it on the request DSN; without the grant every opt-in is 42501.
+    (
+        "epigraph_set_profile_visibility",
+        "public.epigraph_set_profile_visibility(text)",
+        true,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
     // the grant every listing is 42501.
