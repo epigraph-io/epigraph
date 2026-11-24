@@ -2206,9 +2206,11 @@ const CONN_WITHOUT_VIEWER: &[(&str, &str, &str)] = &[
         "lock_repoint_destination",
         "WRITE-PATH LOCK (backlog 449a2afb), private to the replacement cascades (supersede, \
          dedup repair, merge, un-mark reversal): before they re-point edges onto a claim, \
-         `WorkflowRepository::lock_step_lineage_shared` on that destination, on the cascade's \
-         own privileged transaction, so a re-pointed `executes` edge serializes against an \
-         `evolve_step` of the destination's lineage. Reads nothing back and returns nothing.",
+         `FOR KEY SHARE` on that destination's row and then \
+         `WorkflowRepository::lock_step_lineage_shared` on it (an evolve's row-then-key order), \
+         on the cascade's own privileged transaction, so a re-pointed `executes` edge serializes \
+         against an `evolve_step` of the destination's lineage. Reads nothing back and returns \
+         nothing.",
     ),
     (
         "workflow.rs",

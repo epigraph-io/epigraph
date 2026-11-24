@@ -1556,10 +1556,40 @@ async fn require_privileged_session(
 /// committed (the request paths acquire the maintenance session before, and
 /// use it after, the commit), so an `evolve_step(supersedes)` no longer holds
 /// its exclusive lock when its own cascade takes this one.
+///
+/// # Row before key
+///
+/// The destination's claims row is locked `FOR KEY SHARE` BEFORE the key, the
+/// order an evolve takes them in (`lock_step_lineage_for_evolve`: the parent's
+/// row `FOR UPDATE`, then the key). A cascade body can take that row lock
+/// later anyway: the dedup repair binds the canonical to the duplicate's
+/// frames (`INSERT INTO claim_frames`) and moves BBAs onto it, and each
+/// foreign-key check takes `FOR KEY SHARE` on the canonical's row. Taken after
+/// the key, that deadlocked an evolve whose parent IS the destination: the
+/// cascade held the key and waited for the row, the evolve held the row and
+/// waited for the key, and Postgres aborted one of them (review of 449a2afb).
+/// Taken first, the cascade waits for the evolve's row lock and holds no key
+/// meanwhile, and an evolve arriving later waits for the cascade on the row.
+/// `FOR KEY SHARE` is the mode the foreign-key checks take: it conflicts with
+/// the evolve's `FOR UPDATE` and with nothing a plain `UPDATE` of a non-key
+/// column takes, so it blocks no writer the body's own checks would not.
 async fn lock_repoint_destination(
     conn: &mut sqlx::PgConnection,
     destination: Uuid,
 ) -> Result<(), DbError> {
+    let row: Option<i32> = sqlx::query_scalar(
+        r#"-- VISIBILITY-EXEMPT: WRITE path, on the privileged maintenance connection; locks the cascade's destination row, returns nothing to a caller.
+         SELECT 1 FROM claims WHERE id = $1 FOR KEY SHARE"#,
+    )
+    .bind(destination)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if row.is_none() {
+        return Err(DbError::NotFound {
+            entity: "Claim".to_string(),
+            id: destination,
+        });
+    }
     crate::repos::workflow::WorkflowRepository::lock_step_lineage_shared(conn, destination).await
 }
 

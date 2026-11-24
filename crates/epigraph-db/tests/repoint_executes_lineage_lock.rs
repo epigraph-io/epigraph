@@ -15,15 +15,19 @@
 //! Each test puts the cascade's DESTINATION in a lineage and has the evolve
 //! lock a DIFFERENT member of it, so the only thing the cascade can wait on is
 //! the lineage's advisory key (not a row lock). The cascade must queue on that
-//! key while the evolve is open, then move the edge once it commits. The last
-//! test takes the other order: an evolve that starts while a cascade is in
-//! flight waits for it, then counts the re-pointed workflow.
+//! key while the evolve is open, then move the edge once it commits. One test
+//! takes the other order: an evolve that starts while a cascade is in flight
+//! waits for it, then counts the re-pointed workflow. The last has the evolve
+//! lock the destination ITSELF, whose row the dedup repair's foreign-key
+//! checks lock too: the two must not deadlock.
 
 #[path = "viewer_fixture.rs"]
 mod fixture;
 
 use epigraph_core::{ClaimId, TruthValue};
-use epigraph_db::{ClaimRepository, ConsolidateMode, WorkflowRepository};
+use epigraph_db::{
+    ClaimRepository, ConsolidateMode, FrameRepository, MassFunctionRepository, WorkflowRepository,
+};
 use sqlx::PgPool;
 use std::time::Duration;
 use uuid::Uuid;
@@ -422,5 +426,156 @@ async fn an_evolve_waits_for_a_cascade_in_flight_then_counts_the_repointed_workf
         set,
         vec![workflow],
         "the evolve's authority set includes the re-pointed workflow"
+    );
+}
+
+async fn lock_waiters(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() \
+         AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read pg_stat_activity")
+}
+
+async fn wait_for_lock_waiters(pool: &PgPool, n: i64, what: &str) {
+    for _ in 0..400 {
+        if lock_waiters(pool).await >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("{what}: expected {n} sessions waiting on a lock");
+}
+
+/// The evolve's parent IS the cascade's destination, and the dedup repair
+/// binds that canonical to the duplicate's frame and pools the duplicate's
+/// BBA onto it: two foreign-key checks that take `FOR KEY SHARE` on the
+/// canonical's row. With the lineage key taken before that row lock, the
+/// cascade held the key and waited for the row while the evolve held the row
+/// (`FOR UPDATE`) and waited for the key, and Postgres aborted one of them
+/// ("deadlock detected", review of 449a2afb).
+///
+/// The interleaving is forced: a test transaction holds the duplicate's
+/// `executes` edge row, so the cascade stops at its re-point after taking its
+/// locks; the evolve then starts on the canonical; then the edge is released.
+/// Both must finish, in some order, without error.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dedup_repair_does_not_deadlock_an_evolve_of_the_canonical_itself(pool: PgPool) {
+    let (agent, _) = fixture::seed_agent_with_group(&pool, "repoint-no-deadlock").await;
+    let workflow = seed_workflow(&pool).await;
+    let dup = seed_step(&pool, agent, "no-deadlock: the duplicate step").await;
+    let canonical = seed_step(&pool, agent, "no-deadlock: the canonical step").await;
+    let edge = seed_executes(&pool, workflow, dup).await;
+    lineage_with(&pool, agent, canonical).await;
+
+    // A frame and a BBA on the duplicate only, so the repair copies the
+    // binding onto the canonical and pools the BBA there.
+    let frame = FrameRepository::create(
+        &pool,
+        "repoint lock frame",
+        Some("repoint lock fixture"),
+        &["TRUE".to_string(), "FALSE".to_string()],
+    )
+    .await
+    .expect("seed frame")
+    .id;
+    FrameRepository::assign_claim(&pool, dup, frame, Some(0))
+        .await
+        .expect("bind the duplicate only");
+    let bba = MassFunctionRepository::store_with_perspective(
+        &pool,
+        dup,
+        frame,
+        Some(agent),
+        None,
+        &serde_json::json!({"0": 0.6, "0,1": 0.4}),
+        None,
+        Some("auto_wire"),
+        None,
+        None,
+        "unknown",
+        None,
+    )
+    .await
+    .expect("seed the duplicate's BBA");
+
+    let mut tx = pool.begin().await.unwrap();
+    ClaimRepository::mark_duplicate_act_conn(
+        &mut tx,
+        ClaimId::from_uuid(dup),
+        ClaimId::from_uuid(canonical),
+    )
+    .await
+    .expect("dedup act");
+    tx.commit().await.unwrap();
+
+    // Hold the edge the cascade re-points, so it stops there with its
+    // destination locks taken.
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM edges WHERE id = $1 FOR UPDATE")
+        .bind(edge)
+        .execute(&mut *gate)
+        .await
+        .expect("hold the executes edge");
+
+    let p = pool.clone();
+    let cascade = tokio::spawn(async move {
+        fixture::as_role(&p, "epigraph_maintenance", |mut conn| async move {
+            let r = ClaimRepository::repair_marked_duplicate_conn(
+                &mut conn,
+                ClaimId::from_uuid(dup),
+                ClaimId::from_uuid(canonical),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+            (conn, r)
+        })
+        .await
+    });
+    wait_for_lock_waiters(&pool, 1, "the cascade stops at the held edge").await;
+
+    let epool = pool.clone();
+    let evolve = tokio::spawn(async move {
+        let mut c = epool.begin().await.map_err(|e| e.to_string())?;
+        let locked = WorkflowRepository::lock_step_lineage_for_evolve(&mut c, canonical)
+            .await
+            .map_err(|e| e.to_string())?;
+        c.commit().await.map_err(|e| e.to_string())?;
+        Ok::<bool, String>(locked)
+    });
+    wait_for_lock_waiters(&pool, 2, "the evolve of the canonical queues").await;
+    assert!(!cascade.is_finished() && !evolve.is_finished());
+
+    gate.rollback().await.unwrap();
+    let cascade = tokio::time::timeout(CASCADE_DEADLINE, cascade)
+        .await
+        .expect("the cascade finishes")
+        .unwrap();
+    let evolve = tokio::time::timeout(CASCADE_DEADLINE, evolve)
+        .await
+        .expect("the evolve finishes")
+        .unwrap();
+    assert_eq!(cascade, Ok(()), "the dedup repair is not aborted");
+    assert_eq!(
+        evolve,
+        Ok(true),
+        "the evolve of the canonical is not aborted"
+    );
+    assert_eq!(
+        target_of(&pool, edge).await,
+        canonical,
+        "the executes edge moved onto the canonical"
+    );
+    let bba_claim: Uuid = sqlx::query_scalar("SELECT claim_id FROM mass_functions WHERE id = $1")
+        .bind(bba)
+        .fetch_one(&pool)
+        .await
+        .expect("bba");
+    assert_eq!(
+        bba_claim, canonical,
+        "fixture: the repair pooled the BBA (a foreign-key check on the canonical's row)"
     );
 }
