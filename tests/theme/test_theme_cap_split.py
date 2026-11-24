@@ -834,3 +834,20 @@ def test_offbox_refuses_a_work_directory_others_can_read(db, seed_agent, tmp_pat
         _run(_offbox_argv(cmd, work))
 
     assert not (log / "args").exists() and not (work / "export").exists()
+
+
+def test_offbox_command_past_the_timeout_is_killed_with_its_group(tmp_path):
+    """A wrapper that backgrounds a copy (or an ssh) must not outlive the
+    timeout: the command's whole process group is killed."""
+    import time
+
+    marker = tmp_path / "survived"
+    cmd = tmp_path / "slow.sh"
+    cmd.write_text(f"#!/bin/sh\n(sleep 2; touch {marker}) &\nsleep 30\n")
+    cmd.chmod(0o700)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        S.run_offbox_command(cmd, tmp_path / "export", tmp_path / "result.json", timeout=1)
+    assert time.monotonic() - started < 5
+    time.sleep(3)
+    assert not marker.exists(), "a process of the command's group outlived the timeout"

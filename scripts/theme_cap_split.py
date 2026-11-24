@@ -130,12 +130,14 @@ Usage:
         --reviewed-plan plan.json --manifest manifest.json
 """
 import argparse
+import contextlib
 import datetime
 import json
 import os
 import pathlib
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -576,10 +578,23 @@ def check_private_dir(path):
 
 def run_offbox_command(command, export_dir, result_path, timeout):
     """`command theme-cap export_dir result_path`, cleared environment, no
-    stdin, stdout discarded (ours is the JSON report), killed at `timeout`."""
-    subprocess.run([str(command), OFFBOX_KIND, str(export_dir), str(result_path)],
-                   env=offbox_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                   timeout=timeout, check=True, start_new_session=True)
+    stdin, stdout discarded (ours is the JSON report). It runs in its own
+    session, and at `timeout` (or if we are interrupted) its WHOLE process
+    group is killed, so a wrapper's background copy or ssh cannot outlive it.
+    Raises subprocess.TimeoutExpired or CalledProcessError."""
+    argv = [str(command), OFFBOX_KIND, str(export_dir), str(result_path)]
+    proc = subprocess.Popen(argv, env=offbox_env(), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, start_new_session=True)
+    try:
+        code = proc.wait(timeout=timeout)
+    except BaseException:
+        # The leader is not reaped yet, so its pid is still the group's id.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise
+    if code != 0:
+        raise subprocess.CalledProcessError(code, argv)
 
 
 def offbox_split(conn, command, work_dir, manifest_path, cap=core.DEFAULT_CAP,
