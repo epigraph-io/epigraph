@@ -139,7 +139,8 @@ theme's neighbourhood rows (they leave only with their run), so a split's
 neighbourhoods are rebuilt by a new `ClusterGraph` run, which covers every
 theme. Apply prints, and its manifest records, `touched_theme_ids` (every
 parent and every new part) and `rebuild_next`. Run these, in order, right
-after the apply, with the maintenance DSN in the environment as above:
+after the apply, with the maintenance DSN in the environment (as in "Dry
+run" below):
 
 ```bash
 enqueue_job --job '{"ClusterGraph":{"resolution":1.0,"retain_runs":3}}' --unique
