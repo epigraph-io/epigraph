@@ -1718,7 +1718,11 @@ pub async fn update_with_evidence(
         epigraph_db::EvidenceEdge::new(Some(server.edge_signing_key().await?), params.supports),
     )
     .await
-    .map_err(internal_error)?;
+    // A claim this caller can read but not write (not public, so not
+    // migration 114's attach): the evidence inherits the claim's group and
+    // row security refuses it. A named refusal, not an internal error
+    // (backlog 1c93eec8); `tx` is dropped, so nothing is written.
+    .map_err(|e| evidence_insert_error(e, claim_id))?;
 
     let before = claim.truth_value.value();
     let strength = params.strength.clamp(0.0, 1.0);
@@ -2871,6 +2875,73 @@ async fn gate_retirement_label(
     Ok(Some(grant))
 }
 
+/// Whether `e` is the database's UNCODED row-security refusal of a write to
+/// `table` (`42501`, "new row violates row-level security policy ... for table
+/// \"<table>\""): a tenancy `WITH CHECK` refused the stamp. A CODED `42501` a
+/// trigger raises (a designed refusal with its own text), or a row-security
+/// refusal on any OTHER table, is not this.
+fn refused_by_row_security_on(e: &epigraph_db::DbError, table: &str) -> bool {
+    matches!(
+        e,
+        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
+            if d.code().as_deref() == Some("42501")
+                && d.message().starts_with("new row violates row-level security policy")
+                && d.message().ends_with(&format!("for table \"{table}\""))
+    )
+}
+
+/// The `data.rule` of [`evidence_not_writer`].
+pub const EVIDENCE_NOT_WRITER_RULE: &str = "evidence_requires_claim_group_writer";
+
+/// The named refusal for `update_with_evidence` on a claim the caller can read
+/// but whose owning group its stamp cannot write (backlog 1c93eec8): a claim
+/// that is not public (so migration 114's non-owner attach does not apply)
+/// in a group where the caller is, say, a reader.
+///
+/// The evidence row inherits the claim's group, so the database refuses its
+/// INSERT with an uncoded `42501`, before the DS wiring or the truth write
+/// run. That is a denial of authority, so it is `INVALID_REQUEST` like
+/// [`label_not_writer`], not the `INTERNAL_ERROR` a server fault takes: no
+/// retry of the same request can succeed. It does not name the owning group,
+/// and unlike [`label_not_writer`] it names no admin path, because this tool
+/// has none.
+fn evidence_not_writer(claim_id: Uuid) -> McpError {
+    McpError {
+        code: ErrorCode::INVALID_REQUEST,
+        message: std::borrow::Cow::from(format!(
+            "cannot attach evidence to claim {claim_id}: the claim is not public and is owned \
+             by a group this write's identity holds no live writer or admin membership in, so \
+             the database refused the write; nothing was written. Attach it as a writer of \
+             that group"
+        )),
+        data: Some(serde_json::json!({
+            "error": "not_writer",
+            "rule": EVIDENCE_NOT_WRITER_RULE,
+            "claim_id": claim_id,
+            "retryable": false,
+        })),
+    }
+}
+
+/// Map the error of `update_with_evidence`'s evidence INSERT: the uncoded
+/// row-security refusal on `evidence` is [`evidence_not_writer`]; everything
+/// else keeps [`internal_error`], so a coded refusal or a fault still reaches
+/// the caller as it did before.
+fn evidence_insert_error(e: epigraph_db::DbError, claim_id: Uuid) -> McpError {
+    if refused_by_row_security_on(&e, "evidence") {
+        tracing::warn!(
+            target: "tenancy.scoped_write",
+            claim_id = %claim_id,
+            tool = "update_with_evidence",
+            error = %e,
+            "evidence write refused by row security: the claim's owning group is not in the \
+             stamp's writable set; nothing was written"
+        );
+        return evidence_not_writer(claim_id);
+    }
+    internal_error(e)
+}
+
 /// The `data.rule` of [`label_not_writer`].
 pub const LABEL_NOT_WRITER_RULE: &str = "label_requires_claim_group_writer";
 
@@ -2920,14 +2991,7 @@ fn label_not_writer(claim_id: Uuid, action: &str) -> McpError {
 /// writable set, so it changes the ANSWER only, never which writes are
 /// admitted: the database's own decision stays the one that counts.
 fn label_write_error(e: epigraph_db::DbError, claim_id: Uuid, action: &str) -> McpError {
-    let refused_by_row_security = matches!(
-        &e,
-        epigraph_db::DbError::QueryFailed { source: sqlx::Error::Database(d) }
-            if d.code().as_deref() == Some("42501")
-                && d.message().starts_with("new row violates row-level security policy")
-                && d.message().ends_with("for table \"claims\"")
-    );
-    if refused_by_row_security {
+    if refused_by_row_security_on(&e, "claims") {
         tracing::warn!(
             target: "tenancy.scoped_write",
             claim_id = %claim_id,
