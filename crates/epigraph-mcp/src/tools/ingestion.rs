@@ -286,7 +286,12 @@ pub async fn ingest_document(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id, atomicity))
+    success_json(&queued_response(
+        &doi,
+        paper.title.as_deref().unwrap_or(&title),
+        paper_id,
+        atomicity,
+    ))
 }
 
 /// Synchronous write-authority preflight for the two DETACHED ingest entry
@@ -450,7 +455,12 @@ pub async fn ingest_document_inline(
             );
         }
     });
-    success_json(&queued_response(&doi, &title, paper_id, atomicity))
+    success_json(&queued_response(
+        &doi,
+        paper.title.as_deref().unwrap_or(&title),
+        paper_id,
+        atomicity,
+    ))
 }
 
 /// The `wait: true` arm of the two detached ingest handlers: run the walk IN
@@ -597,7 +607,8 @@ fn queued_response(
          until the walk commits, and a document that never appears means the walk failed \
          (see the server log); resubmit with wait=true to see the error. Confirm the writes \
          landed by query_paper's claim_count rising, not with check_already_ingested, which is \
-         already true after ingest_document_spine or any earlier ingest of this document.",
+         already true after ingest_document_spine or any earlier ingest of this document. \
+         `title` is the title the papers row holds, which an earlier ingest may have set.",
     );
     if is_synthetic_key(doi) {
         note.push_str(
@@ -1618,6 +1629,10 @@ async fn ingest_document_walk_reporting(
     .await
     .map_err(internal_error)?;
     let paper_id = paper.id;
+    // The title the row HOLDS, for the response only (backlog 288801f8): the
+    // upsert is fill-only, so a re-ingest under another title keeps the stored
+    // one. Evidence text and provenance keep the extraction's.
+    let stored_title = paper.title.unwrap_or_else(|| paper_title.clone());
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -2187,7 +2202,7 @@ async fn ingest_document_walk_reporting(
     };
     let result = success_json(&IngestDocumentResponse {
         paper_id: paper_id.to_string(),
-        paper_title,
+        paper_title: stored_title,
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,
@@ -2644,6 +2659,8 @@ pub async fn do_ingest_document_spine(
     .await
     .map_err(internal_error)?;
     let paper_id = paper.id;
+    // The stored title, for the response only (backlog 288801f8).
+    let stored_title = paper.title.unwrap_or_else(|| paper_title.clone());
     // The source's recorded licence decides whether evidence may keep the
     // verbatim passage (backlog 8709d128). Read once, from the row, never
     // from the extraction.
@@ -3054,7 +3071,7 @@ pub async fn do_ingest_document_spine(
 
     success_json(&IngestDocumentSpineResponse {
         paper_id: paper_id.to_string(),
-        paper_title,
+        paper_title: stored_title,
         synthesized_key: is_synthetic_key(&doi),
         doi,
         authors: author_responses,

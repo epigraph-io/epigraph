@@ -1845,3 +1845,111 @@ async fn spine_walk_that_fails_leaves_no_paper_row(pool: PgPool) {
         "a spine walk that fails must leave no papers row behind"
     );
 }
+
+// ── Backlog 288801f8 (part 2): responses report the STORED title ──
+
+/// The papers upsert is fill-only (62ce37ca), so a re-ingest under a different
+/// title keeps the stored one. Both the detached `queued` answer and the
+/// wait-mode walk result used to echo the caller's title, misreporting what the
+/// row holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_responses_report_the_stored_title_not_the_callers(pool: PgPool) {
+    const STORED: &str = "The Title Already Stored";
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, $2)")
+        .bind(SMOKE_DOI)
+        .bind(STORED)
+        .execute(&pool)
+        .await
+        .expect("seed the stored paper");
+
+    let queued = ingest_document_inline(&server, &viewer, inline_params(None), None)
+        .await
+        .expect("queued");
+    let queued: serde_json::Value =
+        serde_json::from_str(&result_text(&queued)).expect("queued JSON");
+    drain(&server).await;
+    assert_eq!(queued["title"], STORED, "queued answer: {queued}");
+
+    let waited = ingest_document_inline(&server, &viewer, inline_params(Some(true)), None)
+        .await
+        .expect("the wait-mode walk succeeds");
+    let waited: serde_json::Value = serde_json::from_str(&result_text(&waited)).expect("walk JSON");
+    assert_eq!(waited["paper_title"], STORED, "walk result: {waited}");
+
+    let title: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE doi = $1")
+        .bind(SMOKE_DOI)
+        .fetch_one(&pool)
+        .await
+        .expect("read the row");
+    assert_eq!(
+        title.as_deref(),
+        Some(STORED),
+        "fill-only: the row keeps its title"
+    );
+}
+
+/// Same for the spine core's response, and the detached answer predicts a NULL
+/// stored title the way the upsert fills it (with the caller's).
+#[sqlx::test(migrations = "../../migrations")]
+async fn spine_response_reports_the_stored_title_and_a_null_title_is_filled(pool: PgPool) {
+    const STORED: &str = "Spine Stored Title";
+    let viewer = fixture::public_viewer(&pool).await;
+    let server = make_server(pool.clone()).await;
+    sqlx::query("INSERT INTO papers (doi, title) VALUES ($1, $2), ($3, NULL)")
+        .bind(SMOKE_DOI)
+        .bind(STORED)
+        .bind("10.1234/null-title")
+        .execute(&pool)
+        .await
+        .expect("seed the stored papers");
+
+    let extraction: DocumentExtraction = serde_json::from_str(FIXTURE).expect("fixture parses");
+    let spine = do_ingest_document_spine(
+        &server,
+        &viewer,
+        &extraction,
+        None,
+        epigraph_core::VisibilityChoice::Public,
+    )
+    .await
+    .expect("the spine walk succeeds");
+    let spine: serde_json::Value = serde_json::from_str(&result_text(&spine)).expect("JSON");
+    assert_eq!(spine["paper_title"], STORED, "spine result: {spine}");
+
+    let mut null_titled: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture");
+    null_titled["source"]["doi"] = serde_json::json!("10.1234/null-title");
+    // Its own title, so its document-scoped nodes do not converge on the first's.
+    null_titled["source"]["title"] = serde_json::json!("Null Title Filled Paper");
+    let queued = ingest_document_inline(
+        &server,
+        &viewer,
+        IngestDocumentInlineParams {
+            extraction: serde_json::from_value(null_titled).expect("fixture parses"),
+            wait: None,
+            visibility: Some("public".to_string()),
+            group_id: None,
+        },
+        None,
+    )
+    .await
+    .expect("queued");
+    let queued: serde_json::Value =
+        serde_json::from_str(&result_text(&queued)).expect("queued JSON");
+    drain(&server).await;
+    let filled: Option<String> = sqlx::query_scalar("SELECT title FROM papers WHERE doi = $1")
+        .bind("10.1234/null-title")
+        .fetch_one(&pool)
+        .await
+        .expect("read the row");
+    assert_eq!(
+        filled.as_deref(),
+        Some("Null Title Filled Paper"),
+        "fill-only fills a NULL title"
+    );
+    assert_eq!(
+        queued["title"], "Null Title Filled Paper",
+        "the queued answer predicts the filled title: {queued}"
+    );
+}
