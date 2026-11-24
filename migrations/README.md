@@ -4547,6 +4547,16 @@ restart.
   272's public-claim and readable-claim arms, one per agent ever bound to a human. Registered
   in `tenancy_migration_shape.rs::INDEX_MIGRATIONS` (validity checked). A failed build leaves
   an INVALID index that IF NOT EXISTS skips: `DROP INDEX CONCURRENTLY`, then re-apply.
+- **277**: `disclosure_team_arm_without_the_twin`. Re-states 272's
+  `epigraph_agent_disclosure_for` (CREATE OR REPLACE: owner, ACL kept; COST 1000 and 172's
+  path restated) with the SAME answers and a cheaper evaluation, after
+  `epigraph-db/tests/human_identity_visibility_perf.rs` measured ~600 ms per human
+  evaluation, almost all in 249's `epigraph_role_derived_memberships` reached through 236's
+  twin: the team arm now probes the target's live rows in the viewer's own groups (236's
+  verb-made-group condition kept) and calls the role derivation only when a viewer group
+  carries a `group_role_bindings` row; the viewer-free public-claim arm runs before it.
+  Pinned by `epigraph-db/tests/human_identity_visibility.rs` (every arm, unchanged). Undo:
+  `docs/runbooks/277-undo.sql` restores 272's body.
 
 ## `-- no-transaction` migrations
 

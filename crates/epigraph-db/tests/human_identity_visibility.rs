@@ -746,10 +746,14 @@ async fn a_non_member_owner_of_the_core_fails_closed(pool: PgPool) {
         format!(
             "GRANT SELECT ON public.agents, public.oauth_clients, public.human_operators, \
              public.group_memberships, public.groups, public.operator_links, \
-             public.author_binding_clients, public.claims TO {role}"
+             public.author_binding_clients, public.claims, public.group_role_bindings \
+             TO {role}"
         ),
+        // The team arm's role derivation (277 calls 249's function directly;
+        // 272 reached it through 236's twin).
         format!(
-            "GRANT EXECUTE ON FUNCTION public.epigraph_live_memberships_unbound(uuid) TO {role}"
+            "GRANT EXECUTE ON FUNCTION \
+             public.epigraph_role_derived_memberships(uuid, timestamptz) TO {role}"
         ),
         format!("ALTER FUNCTION public.epigraph_is_human_principal(uuid) OWNER TO {role}"),
         format!(
@@ -1927,4 +1931,104 @@ async fn the_ego_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool) 
     assert_eq!(label(h, &out), label(n, &out), "H's ego node reads as N's");
     let mine = hydrate(mate).await;
     assert_eq!(label(h, &mine).1, "Theodora Egoless", "CALIBRATION");
+}
+
+// ─── T3: the team arm through a ROLE-derived membership (165 / 249) ──────
+
+async fn seed_role(pool: &PgPool, key: &str) {
+    let node = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO agents (id, public_key, display_name, agent_type, role, labels) \
+         VALUES ($1, uuid_send(gen_random_uuid()) || uuid_send(gen_random_uuid()), $2, 'role', \
+                 'custom', ARRAY['role'])",
+    )
+    .bind(node)
+    .bind(key)
+    .execute(pool)
+    .await
+    .expect("role node");
+    sqlx::query(
+        "INSERT INTO platform_roles (key, elevates, reads_audit, role_node_id, description) \
+         VALUES ($1, false, false, $2, 'visibility test role')",
+    )
+    .bind(key)
+    .bind(node)
+    .execute(pool)
+    .await
+    .expect("platform role");
+}
+
+async fn grant_role(pool: &PgPool, role: &str, holder: Uuid) {
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT public.epigraph_grant_role($1, $2, now() - interval '5 seconds', NULL, NULL, \
+                'visibility test grant')",
+    )
+    .bind(role)
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .expect("grant role");
+}
+
+async fn bind_role(pool: &PgPool, group: Uuid, role: &str) {
+    sqlx::query(
+        "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, reason) \
+         VALUES ($1, $2, 'reader', false, 'visibility test binding')",
+    )
+    .bind(group)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("group role binding");
+}
+
+/// T3 (spec 12): a teammate through a ROLE is a teammate, in both
+/// directions. H holds role X bound to team G and V is a direct member of G:
+/// H is named to V. Mirror: H is a direct member of G2 and V holds role Y
+/// bound to G2 (V's resolved viewer carries G2): named. CALIBRATION: before
+/// the grants neither sees H. This is the path migration 277 reaches without
+/// 236's twin (the role derivation is consulted only for a bound group).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_role_derived_teammate_sees_the_human_in_both_directions(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, _) = human(&pool, "Rosamund Roleheld").await;
+    let (v, _) = named(&pool, "Role Reader").await;
+    seed_role(&pool, "role:hiv-test-x").await;
+    seed_role(&pool, "role:hiv-test-y").await;
+
+    // Direction 1: H's side is role-derived.
+    let g = keyed_team(&pool, &[v]).await;
+    bind_role(&pool, g, "role:hiv-test-x").await;
+    assert!(
+        !named_to(&pool, &scoped, v, h).await,
+        "CALIBRATION: no grant yet, no arm"
+    );
+    grant_role(&pool, "role:hiv-test-x", h).await;
+    assert!(
+        named_to(&pool, &scoped, v, h).await,
+        "H holds the role bound to V's team: a teammate"
+    );
+
+    // Direction 2: V's side is role-derived.
+    let (h2, _) = human(&pool, "Rosamund Direct").await;
+    let (v2, _) = named(&pool, "Role Holder Reader").await;
+    fixture::make_human_operator(&pool, v2).await;
+    let g2 = keyed_team(&pool, &[h2]).await;
+    bind_role(&pool, g2, "role:hiv-test-y").await;
+    assert!(
+        !named_to(&pool, &scoped, v2, h2).await,
+        "CALIBRATION: no grant yet"
+    );
+    grant_role(&pool, "role:hiv-test-y", v2).await;
+    assert!(
+        viewer(&pool, v2)
+            .await
+            .group_bind()
+            .is_some_and(|gs| gs.contains(&g2)),
+        "CALIBRATION: the role-derived group is in V's resolved set"
+    );
+    assert!(
+        named_to(&pool, &scoped, v2, h2).await,
+        "V holds the role bound to H's team: a teammate"
+    );
 }
