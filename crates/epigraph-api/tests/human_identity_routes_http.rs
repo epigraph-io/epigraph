@@ -519,21 +519,50 @@ async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: 
     let (_, mine) = get(&state, mate, &route(h)).await;
     assert_eq!(mine["display_name"], "Cosima Amplified", "CALIBRATION");
 
-    let (_, cmp) = get(
-        &state,
-        outsider,
-        &format!("/api/v1/agents/compare?ids={h},{n}"),
-    )
-    .await;
-    let names: Vec<Value> = cmp
-        .as_array()
-        .or_else(|| cmp["agents"].as_array())
-        .or_else(|| cmp["profiles"].as_array())
-        .unwrap_or_else(|| panic!("compare body: {cmp}"))
-        .iter()
-        .map(|p| p["display_name"].clone())
-        .collect();
-    assert_eq!(names, vec![Value::Null, Value::Null], "compare: {cmp}");
+    // Compare (review finding tests#3): H reads as N to the outsider, while a
+    // NAMED non-human keeps its name in the same response and the teammate
+    // gets H's name, so a mutant nulling every name fails.
+    let (svc, _) = viewer_fixture::seed_agent_with_group(&pool, "named service").await;
+    sqlx::query("UPDATE agents SET display_name = 'Plain Named Service' WHERE id = $1")
+        .bind(svc)
+        .execute(&pool)
+        .await
+        .expect("name the service");
+    let compare_names = |who: Uuid| {
+        let state = state.clone();
+        async move {
+            let (st, cmp) = get(
+                &state,
+                who,
+                &format!("/api/v1/agents/compare?ids={h},{n},{svc}"),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{cmp}");
+            let list = cmp
+                .as_array()
+                .or_else(|| cmp["agents"].as_array())
+                .or_else(|| cmp["profiles"].as_array())
+                .unwrap_or_else(|| panic!("compare body: {cmp}"))
+                .clone();
+            let name_of = |id: Uuid| {
+                list.iter()
+                    .find(|p| p["agent_id"] == id.to_string() || p["id"] == id.to_string())
+                    .unwrap_or_else(|| panic!("{id} in compare: {list:?}"))["display_name"]
+                    .clone()
+            };
+            (name_of(h), name_of(n), name_of(svc))
+        }
+    };
+    assert_eq!(
+        compare_names(outsider).await,
+        (Value::Null, Value::Null, Value::from("Plain Named Service")),
+        "compare, outsider"
+    );
+    assert_eq!(
+        compare_names(mate).await.0,
+        Value::from("Cosima Amplified"),
+        "CALIBRATION: compare, teammate"
+    );
 
     // Genealogy: a public claim amplified by H (an edge a stranger may write
     // names nobody; the edge is world-readable as agent-endpoint edges are).
@@ -569,5 +598,133 @@ async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: 
     assert!(
         gen(mate).await.contains("Cosima Amplified"),
         "CALIBRATION: a teammate sees the name"
+    );
+}
+
+/// Review finding tests#3: the inflation leaderboard
+/// (`PoliticalRepository::get_inflation_leaderboard`) lists only agents with
+/// claims the caller reads, and names each through the rule. H filed two
+/// group claims in its team: the teammate sees H listed BY NAME; the outsider
+/// does not see H at all (it reads none of H's claims), while a public filer
+/// is listed by name to the outsider (so the projection is not nulled for
+/// everyone).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_leaderboard_names_exactly_the_filers_the_caller_reads(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, _) = h_and_n(&pool, "Leander Inflated").await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "lb outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "lb teammate").await;
+    let team = team_of(&pool, &[h, mate]).await;
+    let (filer, _) = viewer_fixture::seed_agent_with_group(&pool, "lb public filer").await;
+    sqlx::query("UPDATE agents SET display_name = 'Public Inflator' WHERE id = $1")
+        .bind(filer)
+        .execute(&pool)
+        .await
+        .expect("name the filer");
+    for i in 0..2 {
+        let c = viewer_fixture::seed_group_claim(&pool, h, team, &format!("h inflated {i}")).await;
+        let p = viewer_fixture::seed_public_claim(&pool, filer, &format!("p inflated {i}")).await;
+        sqlx::query(
+            "UPDATE claims SET properties = jsonb_build_object('inflation_factor', 1.5) \
+              WHERE id = ANY($1)",
+        )
+        .bind(vec![c, p])
+        .execute(&pool)
+        .await
+        .expect("inflation factor");
+    }
+    let board = |who: Uuid| {
+        let state = state.clone();
+        async move {
+            let (st, body) = get(&state, who, "/api/v1/inflation-index/leaderboard").await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            body.as_array().cloned().unwrap_or_else(|| panic!("{body}"))
+        }
+    };
+    let entry = |rows: &[Value], id: Uuid| {
+        rows.iter()
+            .find(|r| r["agent_id"] == id.to_string())
+            .cloned()
+    };
+    let out = board(outsider).await;
+    assert!(
+        entry(&out, h).is_none(),
+        "the outsider reads none of H's claims: {out:?}"
+    );
+    assert!(
+        !Value::Array(out.clone()).to_string().contains("Leander"),
+        "the leaderboard named an unnamed human: {out:?}"
+    );
+    assert_eq!(
+        entry(&out, filer).expect("the public filer is listed")["display_name"],
+        "Public Inflator",
+        "CALIBRATION: a public filer is named to the outsider"
+    );
+    let mine = board(mate).await;
+    assert_eq!(
+        entry(&mine, h).expect("the teammate reads H's claims")["display_name"],
+        "Leander Inflated",
+        "the teammate sees H named"
+    );
+}
+
+/// Review finding tests#5: REST `GET /api/v1/agents/search` (named by the
+/// brief) does not find an unnamed human by name, and `GET /api/v1/agents?label=`
+/// serves H's item exactly as N's (both provisioned principals carry
+/// `oauth-principal`); a teammate finds and sees the name (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_and_label_listing_show_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, n) = h_and_n(&pool, "Philippa Searchless").await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "search outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "search teammate").await;
+    team_of(&pool, &[h, mate]).await;
+
+    let search = "/api/v1/agents/search?name=Philippa%20Searchless";
+    let (st, body) = get(&state, outsider, search).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        !body.to_string().contains(&h.to_string()) && !body.to_string().contains("Philippa"),
+        "search found an unnamed human by name: {body}"
+    );
+    let (st, body) = get(&state, mate, search).await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert!(
+        body.to_string().contains(&h.to_string()),
+        "CALIBRATION: {body}"
+    );
+
+    let (sh, sn) = (subs_for(&pool, h).await, subs_for(&pool, n).await);
+    let (st, page) = get(
+        &state,
+        outsider,
+        "/api/v1/agents?label=oauth-principal&limit=100",
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{page}");
+    let item = |page: &Value, id: Uuid| {
+        page["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("items: {page}"))
+            .iter()
+            .find(|i| i["id"] == id.to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} listed: {page}"))
+    };
+    assert_eq!(
+        masked(&item(&page, h), &sh),
+        masked(&item(&page, n), &sn),
+        "?label=: H's item reads as N's"
+    );
+    let (_, page) = get(
+        &state,
+        mate,
+        "/api/v1/agents?label=oauth-principal&limit=100",
+    )
+    .await;
+    assert_eq!(
+        item(&page, h)["display_name"],
+        "Philippa Searchless",
+        "CALIBRATION"
     );
 }
