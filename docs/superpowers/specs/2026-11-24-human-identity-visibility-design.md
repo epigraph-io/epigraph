@@ -716,6 +716,11 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   `owner_group_id = ANY(...)` as array keys), and cannot be mistaken for a group-partition
   scan. It covers the minority partition, as 063 does.
 
+- **M6 `277_disclosure_team_arm_without_the_twin.sql`** (part B, transactional): re-states
+  the core with the same answers after the section 11.1 measurement (team arm per viewer
+  group, role derivation only for a bound group, public-claim arm first, readable probe
+  per agent x group). Undo: `docs/runbooks/277-undo.sql`.
+
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
 §11 run measures insert cost.
@@ -813,6 +818,62 @@ Registrations the PR must make (re-measure each list on HEAD):
   `claims` (visibility becomes `'public'`) and on binding inserts, which makes the public arm
   one primary-key probe. It changes R4 / B13 (privatizing would no longer un-name H), so it
   needs the operator's ruling (**[OPEN] C9**) before it is built.
+
+### 11.1 Measured (part B)
+
+Run with `cargo test -p epigraph-db --test human_identity_visibility_perf -- --ignored
+--nocapture` on a throwaway test database on a shared CI host, so wall times are noisy
+(the same read varied up to 4x between runs); figures are ranges over the runs made.
+Shape: one human H (provider-client evidence, profile `'group'`) with 1,500 operator-linked
+agents that filed 150,000 group claims in a group the viewer does not read, no public
+claim; (a) 1,000,000 group claims by another agent in the viewer's group; (b) 1,000,000
+public claims by another agent; (c) 10,000 operators with one link each; (d) the viewer
+in 30 groups. `ANALYZE`d after a `session_replication_role = replica` bulk load.
+
+Generic plans of the core's body statements (`plan_cache_mode = force_generic_plan`, six
+executions, under `SET ROLE epigraph_maintenance` so the FORCEd policies apply as in the
+definer frame):
+
+| Statement | Plan | Time |
+|---|---|---|
+| B(H) | `idx_operator_links_operator` (1,500 rows); `author_binding_clients` seq scan (empty table) | 0.2-0.3 ms |
+| public-claim arm | nested loop over `unnest(B)`, `Index Only Scan using idx_claims_public_by_agent`, 1,501 loops, 4.5k buffers | 0.8-1.2 ms |
+| readable-claim arm, 272 form (`owner_group_id = ANY`) | UNSTABLE: `idx_claims_group_by_agent` in some runs (18 ms, 135k buffers), `idx_claims_agent_id` + filter in others (52-74 ms) | 18-74 ms |
+| readable-claim arm, 277 form (per agent x group) | `Index Scan using idx_claims_group_by_agent`, Index Cond `agent_id = b.agent_id AND owner_group_id = vg.group_id`, 45,030 loops, 135k buffers | 30-43 ms |
+| team arm, 272 form (236's twin) | `Function Scan on epigraph_live_memberships_unbound`; nearly all of it is 249's `epigraph_role_derived_memberships` (575-585 ms with no `group_role_bindings` row) | 583-816 ms |
+
+No plan scans `claims` sequentially. Whole-core wall time (one local round trip
+included), 25 evaluations each:
+
+| Case | 272 | 277 |
+|---|---|---|
+| human, no arm holds (worst case) | p50 623-635 ms | p50 20-38 ms, max 26-129 ms |
+| human, one public claim by the LAST bound agent | p50 596-658 ms | p50 1.2-1.5 ms |
+| non-human target | p50 0.4 ms | p50 0.2-0.4 ms, max 1.5-4 ms |
+
+Call counts (`track_functions = 'all'`, `pg_stat_xact_user_functions`, application role,
+stamped as the viewer): a 200-card read calls `epigraph_agent_disclosure` 201 times (once
+per card, once for the operator human's name); a two-character prefix search (`'pe'`)
+calls it once per raw name match (1,502 matches, 1,502 calls; one run 1,703) over 21,506
+agents, never once per agent (A1's MATERIALIZED fence). Wall time: 200-card read 0.5-2.4
+s, prefix search 0.3-0.6 s, both dominated by per-card / per-match work that exists
+without this change only partly; the prefix search pays one predicate call per match by
+design (the filter must precede the pool LIMIT).
+
+Insert cost of 275 / 276: 20,000 group claims took 754-970 ms with both partial indexes
+and 600-662 ms without (triggers off, so the difference is the indexes): +15-60 %.
+
+**Verdict against the budget (blocking, reported, not waived).**
+
+- Non-human: within the 0.2 ms p50 target at the low end of the range.
+- Human, a public claim exists: 1.2-1.5 ms, within 10 ms.
+- Human, worst case: 20-38 ms p50 after 277, OVER the 10 ms budget. The cost is the
+  readable-claim arm, |B(H)| x |viewer groups| index descents (45,030 here). Migration
+  277 removed the 600 ms team-arm cost and the plan instability, and cannot remove this
+  one without changing the data model: **[OPEN] C12** below.
+
+`human_identity_visibility_perf.rs` asserts only what it can state exactly (no `claims`
+sequential scan; calls per match well under the table); it prints the rest.
 
 ## 12. Test plan
 
@@ -1197,6 +1258,66 @@ Each item states the behaviour implemented until the operator rules.
   Implemented: unchanged.
 - **C11.** A `profile_public_consented_at` column in place of relying on the reset (F4,
   finding 14). Implemented: the brief's reset plus `'group'` at provisioning.
+- **C12.** (Part B, measured.) The readable-claim arm's worst case is over the 10 ms
+  budget (section 11.1: 20-38 ms p50 for a human with 1,500 bound agents and a viewer in
+  30 groups). Options, each a data-model change: (a) a per-human marker of the groups
+  B(H) has filed non-public claims in (`human_claim_groups(human_id, group_id)`,
+  maintained by a trigger on `claims` and on binding inserts), making the arm one
+  primary-key probe per viewer group (C9's mechanism, for groups); (b) cap the arm at
+  the viewer's groups that are teams or communities (narrows the orchestrator's call A1);
+  (c) accept the cost for this population size. Implemented: none (277 only made the
+  plan stable); the operator rules.
+
+## 16a. Part B implementation notes (deviations and what was not covered)
+
+Each deviation below is a choice made during part B, recorded so it is not mistaken for
+the text above.
+
+- **B9 deviated: the shared fixture is unchanged.** `viewer_fixture.rs::make_human_operator`
+  is `#[path]`-included by 136 test files across four crates; changing its profile would
+  have made every one a touched target. The tests that assert a human's visibility set
+  `profile_visibility = 'group'` themselves (`agent_lookup.rs::named_human`,
+  `human_identity_visibility.rs::human`, the MCP and authored-by tests that pin the rule),
+  so none passes by the column default's "consent".
+- **`AgentLookupRepository::match_by_name` lost its `&Viewer`.** The decision reads the
+  stamped session; a viewer argument the statement no longer used would have been a
+  second, unspent source of the audience. `find` and `cards` keep theirs (counts and the
+  self/admin registration arm still read it).
+- **The spend lint (`visibility_lint.rs`)** admits the stamped disclosure as a viewer
+  spend only through an exact register, `DISCLOSURE_SITES` (today `cards_inner`), never as
+  a free marker; `PROFILE_RULE_SITES` became `no_repo_statement_spells_the_agent_profile_rule`.
+- **`agent_name_disclosure_lint.rs`** (section 14) scans every `crates/*/src` function's
+  string-literal SQL for an identity column read off `agents` and pins GATED / ALLOWED;
+  its PENDING register is empty. Limits: it is textual, so a statement whose table is a
+  format argument (`graph_view.rs::graph_query_node_ids`, H6) is guarded by its HTTP test,
+  not by the lint; it does not scan `events` payload builders (L14 stays pinned by T7 only).
+- **A bound agent reads its operator's teams (234)**, so once H has a team, H's own bot is
+  NAMED H through the team arm; `an_operated_agent_sees_its_human_exactly_as_an_outsider_does`
+  stays true only while H has no team (as that test builds it).
+- **I3: only OPL02 is mapped to fixed text.** OPL01 names only the unbound agent (the
+  caller's write identity or the author it named), never a human, and two MCP tests pin
+  that the refusal names that agent for the caller's fix.
+- **E3 surfaces re-verified on this head:** edge `properties` reach a caller through REST
+  `list_edges` and `claim_neighborhood` (both redacted); MCP `get_neighborhood` / `traverse`
+  return no properties; `graph_full` / graph query take only `strength` and `prov_type`;
+  `agent_claims` serves `ATTRIBUTED_TO` edge properties (no name key is written there);
+  `create_edge` / `patch_edge` echo the writer's own row.
+- **C4 (`create_agent`)** now takes a `ViewerExtractor` (never `Option<..>`, per
+  `middleware/bearer.rs`), so a token that names no principal is refused 401 on that route
+  as on every viewer route.
+- **G1** reads names through the rule; every exported filer filed a claim the caller reads,
+  so no observable change is expected, and no new test beyond the export suite was added.
+
+Not covered by part B (open):
+
+- **L13** (`scripts/label_themes_llm.py`'s cosmetic `agent` column) is not dropped; it
+  samples public claims only, whose filers the rule names.
+- **T8's four admin paths** and **T13 over every surface** are pinned at the predicate
+  (part A); part B adds T2 on the `authored_by` block, not a full viewer x claim matrix per
+  surface.
+- **C7** stays the brief's literal `display_name: null` (option (b)); the main session's
+  measurement of nameless non-human agents is still owed to the operator.
+- **C12** (above): the worst-case budget.
 
 ## 17. Deploy notes
 
