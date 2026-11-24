@@ -381,7 +381,8 @@ impl PoliticalRepository {
         let sql = viewer.splice(
             r#"
             SELECT e.id AS edge_id, e.target_id AS agent_id,
-                   a.display_name AS agent_name,
+                   CASE WHEN public.epigraph_human_named_to_viewer(a.id)
+                        THEN a.display_name END AS agent_name,
                    e.relationship, e.properties,
                    e.created_at AS edge_created_at
             FROM edges e
@@ -498,17 +499,22 @@ impl PoliticalRepository {
     ) -> Result<Vec<(Uuid, Option<String>, f64, i64)>, DbError> {
         let sql = viewer.splice(
             r#"
-            SELECT c.agent_id, a.display_name,
-                   AVG((c.properties->>'inflation_factor')::FLOAT) AS mean_inflation,
-                   COUNT(*) AS claim_count
-            FROM claims c
-            JOIN agents a ON a.id = c.agent_id
-            WHERE c.properties ? 'inflation_factor'
-              /* {VISIBILITY:c} */
-            GROUP BY c.agent_id, a.display_name
-            HAVING COUNT(*) >= 2
-            ORDER BY mean_inflation DESC
-            LIMIT 20
+            SELECT s.agent_id,
+                   CASE WHEN public.epigraph_human_named_to_viewer(s.agent_id)
+                        THEN a.display_name END,
+                   s.mean_inflation, s.claim_count
+            FROM (SELECT c.agent_id,
+                         AVG((c.properties->>'inflation_factor')::FLOAT) AS mean_inflation,
+                         COUNT(*) AS claim_count
+                    FROM claims c
+                   WHERE c.properties ? 'inflation_factor'
+                     /* {VISIBILITY:c} */
+                   GROUP BY c.agent_id
+                  HAVING COUNT(*) >= 2
+                   ORDER BY mean_inflation DESC
+                   LIMIT 20) s
+            JOIN agents a ON a.id = s.agent_id
+            ORDER BY s.mean_inflation DESC
             "#,
             1,
         );

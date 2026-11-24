@@ -41,6 +41,11 @@ use std::path::{Path, PathBuf};
 /// Functions whose identity read decides disclosure in the statement itself.
 /// Each must name one of [`DISCLOSURE_CALLS`] in its live SQL.
 const GATED: &[(&str, &str)] = &[
+    ("epigraph-db/src/repos/political.rs", "get_claim_genealogy"),
+    (
+        "epigraph-db/src/repos/political.rs",
+        "get_inflation_leaderboard",
+    ),
     ("epigraph-db/src/repos/sources.rs", "agents"),
     ("epigraph-db/src/repos/paper.rs", "author_listing_columns"),
     ("epigraph-db/src/repos/agent.rs", "get_public_profile"),
@@ -181,14 +186,7 @@ const ALLOWED: &[(&str, &str, &str)] = &[
 ];
 
 /// Surfaces still to convert (part B of the change). Must shrink to empty.
-const PENDING: &[(&str, &str)] = &[
-    ("epigraph-db/src/repos/atlas_leaf.rs", "node_labels"),
-    ("epigraph-db/src/repos/political.rs", "get_claim_genealogy"),
-    (
-        "epigraph-db/src/repos/political.rs",
-        "get_inflation_leaderboard",
-    ),
-];
+const PENDING: &[(&str, &str)] = &[("epigraph-db/src/repos/atlas_leaf.rs", "node_labels")];
 
 const IDENTITY_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id", "properties"];
 const BARE_COLUMNS: &[&str] = &["display_name", "orcid", "ror_id"];

@@ -492,3 +492,82 @@ async fn the_graph_view_labels_an_unnamed_human_as_a_nameless_agent(pool: PgPool
         "CALIBRATION"
     );
 }
+
+/// Rows F1, F2, F3: the political surfaces answer an outsider about an
+/// unnamed human exactly as about N: `GET /api/v1/agents/:id/epistemic-profile`
+/// and `GET /api/v1/agents/compare` (no name), and a claim's genealogy names
+/// an `AMPLIFIED_BY` human with no name; a teammate gets the name
+/// (CALIBRATION).
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_political_surfaces_show_an_unnamed_human_as_a_nameless_agent(pool: PgPool) {
+    let state = app_role_state(&pool).await;
+    let (h, n) = h_and_n(&pool, "Cosima Amplified").await;
+    let (outsider, _) = viewer_fixture::seed_agent_with_group(&pool, "outsider").await;
+    let (mate, _) = viewer_fixture::seed_agent_with_group(&pool, "teammate").await;
+    team_of(&pool, &[h, mate]).await;
+    let (sh, sn) = (subs_for(&pool, h).await, subs_for(&pool, n).await);
+
+    let route = |id: Uuid| format!("/api/v1/agents/{id}/epistemic-profile");
+    let (st, body_h) = get(&state, outsider, &route(h)).await;
+    assert_eq!(st, StatusCode::OK, "{body_h}");
+    let (_, body_n) = get(&state, outsider, &route(n)).await;
+    assert_eq!(
+        masked(&body_h, &sh),
+        masked(&body_n, &sn),
+        "epistemic profile"
+    );
+    let (_, mine) = get(&state, mate, &route(h)).await;
+    assert_eq!(mine["display_name"], "Cosima Amplified", "CALIBRATION");
+
+    let (_, cmp) = get(
+        &state,
+        outsider,
+        &format!("/api/v1/agents/compare?ids={h},{n}"),
+    )
+    .await;
+    let names: Vec<Value> = cmp
+        .as_array()
+        .or_else(|| cmp["agents"].as_array())
+        .or_else(|| cmp["profiles"].as_array())
+        .unwrap_or_else(|| panic!("compare body: {cmp}"))
+        .iter()
+        .map(|p| p["display_name"].clone())
+        .collect();
+    assert_eq!(names, vec![Value::Null, Value::Null], "compare: {cmp}");
+
+    // Genealogy: a public claim amplified by H (an edge a stranger may write
+    // names nobody; the edge is world-readable as agent-endpoint edges are).
+    let (filer, _) = viewer_fixture::seed_agent_with_group(&pool, "filer").await;
+    let claim = viewer_fixture::seed_public_claim(&pool, filer, "an amplified claim").await;
+    let mut conn = pool.acquire().await.expect("conn");
+    epigraph_db::EdgeRepository::create_if_not_exists_conn(
+        &mut conn,
+        claim,
+        "claim",
+        h,
+        "agent",
+        "AMPLIFIED_BY",
+        Some(serde_json::json!({})),
+        None,
+        None,
+    )
+    .await
+    .expect("amplified-by edge");
+    drop(conn);
+    let gen = |who: Uuid| {
+        let state = state.clone();
+        async move {
+            let (st, body) = get(&state, who, &format!("/api/v1/claims/{claim}/genealogy")).await;
+            assert_eq!(st, StatusCode::OK, "{body}");
+            body.to_string()
+        }
+    };
+    assert!(
+        !gen(outsider).await.contains("Cosima Amplified"),
+        "the genealogy named an unnamed human"
+    );
+    assert!(
+        gen(mate).await.contains("Cosima Amplified"),
+        "CALIBRATION: a teammate sees the name"
+    );
+}

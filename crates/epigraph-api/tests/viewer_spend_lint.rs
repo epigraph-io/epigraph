@@ -1055,12 +1055,24 @@ const REVIEWED: &[(&str, &str, &[&str])] = &[
     (
         "political.rs",
         "compare_agents",
-        &["AgentRepository::get_by_id"],
+        // stamped: the agent's name through migration 272's disclosure on the
+        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
     ),
     (
         "political.rs",
         "epistemic_profile",
-        &["AgentRepository::get_by_id"],
+        // stamped: the agent's name through migration 272's disclosure on the
+        // handler's `read_as(viewer)` connection; `redact_agent` is pure.
+        &[
+            "AgentDisclosureRepository::disclosure",
+            "AgentRepository::get_by_id",
+            "epigraph_db::redact_agent",
+        ],
     ),
     (
         "political.rs",
