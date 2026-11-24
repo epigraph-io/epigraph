@@ -2154,7 +2154,7 @@ async fn chatgpt_sign_in(pool: &PgPool, origins: RedirectOrigins, redirect_uri: 
 
     // 5. Token: public client, PKCE verifier, no secret, form-encoded.
     let (status, tok) = post_urlencoded(
-        app,
+        app.clone(),
         "/oauth/token",
         &[
             ("grant_type", "authorization_code"),
@@ -2172,6 +2172,43 @@ async fn chatgpt_sign_in(pool: &PgPool, origins: RedirectOrigins, redirect_uri: 
         "{tok}"
     );
     assert_eq!(tok["scope"], "claims:read", "{tok}");
+
+    // 6. Refresh: ChatGPT keeps the connection alive by refreshing, as the same
+    // public client (its DCR `client_id`, no secret, the same `resource`).
+    let refresh = tok["refresh_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| panic!("a public PKCE client gets a refresh token: {tok}"))
+        .to_string();
+    let (status, refreshed) = post_urlencoded(
+        app,
+        "/oauth/token",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &refresh),
+            ("client_id", &client_id),
+            ("resource", "https://test.example/mcp"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refresh token redeems: {refreshed}"
+    );
+    assert!(
+        refreshed["access_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "{refreshed}"
+    );
+    assert!(
+        refreshed["refresh_token"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty() && t != refresh),
+        "the refresh rotates to a new token: {refreshed}"
+    );
+    assert_eq!(refreshed["scope"], "claims:read", "{refreshed}");
 }
 
 /// The server's config with `public_base_url` = `base`.
