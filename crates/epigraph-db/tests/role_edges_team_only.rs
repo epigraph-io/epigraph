@@ -21,6 +21,11 @@
 //!   `(visibility, owner, declared owner)`, so no later re-meet of the two
 //!   public endpoints widens it.
 //! * The migration's precondition (OCC01) and post-condition (OCC02).
+//! * Migration 281: only a GENUINE projection is re-owned (the marker the audit
+//!   trigger writes, joined to its `role_assignments` row by assignment id,
+//!   holder and role). A forged edge of the projection's shape, written by any
+//!   edge writer, is never re-owned by a bind / unbind or by the reconcile
+//!   pass, and never makes a binding change fail.
 //!
 //! Two surfaces cannot reach an agent-to-agent edge at all, so they have no
 //! row here: PROV export is claim-rooted (`epigraph-engine/src/export/prov.rs`
@@ -643,14 +648,16 @@ async fn migration_278_refuses_over_another_audit_body(pool: PgPool) {
     assert!(err.contains("OCC01"), "precondition refusal: {err}");
 }
 
-/// 278's functions: owned by the maintenance role, on 172's path, EXECUTE
-/// revoked from PUBLIC and not granted to the application role (an
-/// application-callable owner rule would be a binding oracle).
+/// 278's and 281's functions: owned by the maintenance role, on 172's path,
+/// EXECUTE revoked from PUBLIC and not granted to the application role (an
+/// application-callable owner rule would be a binding oracle; an
+/// application-callable re-own would drive personal-group mints).
 #[sqlx::test(migrations = "../../migrations")]
 async fn migration_278_functions_are_pinned_owned_and_not_app_callable(pool: PgPool) {
     for sig in [
         "public.epigraph_role_edge_owner(text, uuid)",
         "public.epigraph_group_role_bindings_reown_role_edges()",
+        "public.epigraph_reown_role_projection_edges(text)",
     ] {
         let row: (String, bool, Vec<String>, bool) = sqlx::query_as(
             "SELECT pg_get_userbyid(p.proowner)::text, p.prosecdef, \
@@ -671,4 +678,277 @@ async fn migration_278_functions_are_pinned_owned_and_not_app_callable(pool: PgP
         );
         assert!(!row.3, "{sig} must not be executable by epigraph_app");
     }
+}
+
+// ─── migration 281: only a genuine projection is re-owned ────────────────
+
+/// An edge of the projection's shape written by an ordinary edge writer (the
+/// superuser stands in for any writer: what is under test is the row's shape,
+/// not who may write it). Both endpoints are agents, so it lands
+/// `('public', world)` unless `owner` declares a group.
+async fn forge(
+    pool: &PgPool,
+    source: Uuid,
+    node: Uuid,
+    props: serde_json::Value,
+    owner: Option<Uuid>,
+) -> Uuid {
+    let (vis, g) = match owner {
+        Some(g) => ("group", g),
+        None => ("public", Uuid::nil()),
+    };
+    sqlx::query_scalar(
+        "INSERT INTO edges (source_id, source_type, target_id, target_type, relationship, \
+                            properties, visibility, owner_group_id) \
+         VALUES ($1, 'agent', $2, 'agent', 'OCCUPIES', $3, $4, $5) RETURNING id",
+    )
+    .bind(source)
+    .bind(node)
+    .bind(props)
+    .bind(vis)
+    .bind(g)
+    .fetch_one(pool)
+    .await
+    .expect("forged edge")
+}
+
+/// `(visibility, owner, declared owner)` of one edge, read on the superuser pool.
+async fn edge_tenancy(pool: &PgPool, id: Uuid) -> (String, Uuid, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, declared_owner_group_id FROM edges WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .expect("edge tenancy")
+}
+
+async fn personal_groups_of(pool: &PgPool, agent: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM groups WHERE did_key = $1")
+        .bind(format!("did:epigraph:personal:{agent}"))
+        .fetch_one(pool)
+        .await
+        .expect("count personal groups")
+}
+
+/// The forged rows one test plants against role `role` (node `node`) and the
+/// genuine assignment `real` of holder `h`:
+/// * the holder's own `{role}` edge with no marker;
+/// * a `{role}` edge from an agent whose only personal row is REVOKED (105's
+///   RVK01 refuses a mint for it: 278's re-own called the owner rule for it and
+///   failed the whole binding change);
+/// * the full marker with an assignment id no `role_assignments` row has, from
+///   an agent with NO personal group (278 minted one for it);
+/// * the full marker naming the REAL assignment from another agent.
+struct Forged {
+    ids: Vec<Uuid>,
+    no_group: Uuid,
+}
+
+async fn plant_forgeries(pool: &PgPool, role: &str, node: Uuid, h: Uuid, real: Uuid) -> Forged {
+    let (revoked, revoked_personal) = fixture::seed_agent_with_group(pool, "forger revoked").await;
+    sqlx::query(
+        "UPDATE group_memberships SET revoked_at = now() WHERE group_id = $1 AND agent_id = $2",
+    )
+    .bind(revoked_personal)
+    .bind(revoked)
+    .execute(pool)
+    .await
+    .expect("revoke the forger's personal row");
+    let no_group = Uuid::new_v4();
+    let pk: Vec<u8> = no_group
+        .as_bytes()
+        .iter()
+        .copied()
+        .cycle()
+        .take(32)
+        .collect();
+    sqlx::query("INSERT INTO agents (id, public_key, agent_type) VALUES ($1, $2, 'system')")
+        .bind(no_group)
+        .bind(&pk)
+        .execute(pool)
+        .await
+        .expect("agent with no personal group");
+    let (other, _) = fixture::seed_agent_with_group(pool, "forger other").await;
+    let marker = |assignment: String| {
+        serde_json::json!({"assignment_id": assignment, "role": role,
+                           "source": "role_assignments", "projection": true})
+    };
+    let ids = vec![
+        forge(pool, h, node, serde_json::json!({"role": role}), None).await,
+        forge(pool, revoked, node, serde_json::json!({"role": role}), None).await,
+        forge(
+            pool,
+            no_group,
+            node,
+            marker(Uuid::new_v4().to_string()),
+            None,
+        )
+        .await,
+        forge(pool, other, node, marker(real.to_string()), None).await,
+    ];
+    Forged { ids, no_group }
+}
+
+/// A bind and an unbind re-own the genuine projection only. Every forged row
+/// keeps exactly the tenancy its writer gave it, no personal group is minted
+/// for a forger, and a forger whose personal group is revoked does not make
+/// the binding change fail.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_role_edge_is_never_reowned_and_never_blocks_a_binding_change(pool: PgPool) {
+    let (h, personal) = person(&pool, "holder").await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "mate").await;
+    let node = seed_role(&pool, "role:edge-test-forged").await;
+    let team = group_of(&pool, "team", &[mate]).await;
+    let real = grant(&pool, "role:edge-test-forged", h).await;
+    let genuine: Uuid = sqlx::query_scalar(
+        "SELECT id FROM edges WHERE properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(real)
+    .fetch_one(&pool)
+    .await
+    .expect("the genuine projection");
+    let forged = plant_forgeries(&pool, "role:edge-test-forged", node, h, real).await;
+    let mut before = Vec::new();
+    for id in &forged.ids {
+        before.push(edge_tenancy(&pool, *id).await);
+    }
+    assert!(
+        before.iter().all(|t| t.0 == "public"),
+        "PREMISE: forged public"
+    );
+
+    let b = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO group_role_bindings (group_id, role, member_role, include_agents, reason) \
+         VALUES ($1, 'role:edge-test-forged', 'reader', false, 'forged edge test') RETURNING id",
+    )
+    .bind(team)
+    .fetch_one(&pool)
+    .await
+    .expect("a bind succeeds whatever forged rows exist");
+    assert_eq!(
+        edge_tenancy(&pool, genuine).await,
+        ("group".to_string(), team, Some(team)),
+        "CALIBRATION: the genuine projection moves into the team"
+    );
+    for (id, was) in forged.ids.iter().zip(&before) {
+        assert_eq!(
+            &edge_tenancy(&pool, *id).await,
+            was,
+            "bind re-owned forged {id}"
+        );
+    }
+
+    sqlx::query(
+        "UPDATE group_role_bindings SET revoked_at = now(), revoked_by = session_user, \
+                revoked_reason = 'forged edge test unbind' WHERE id = $1",
+    )
+    .bind(b)
+    .execute(&pool)
+    .await
+    .expect("an unbind succeeds whatever forged rows exist");
+    assert_eq!(
+        edge_tenancy(&pool, genuine).await,
+        ("group".to_string(), personal, Some(personal)),
+        "CALIBRATION: the genuine projection moves back to the holder"
+    );
+    for (id, was) in forged.ids.iter().zip(&before) {
+        assert_eq!(
+            &edge_tenancy(&pool, *id).await,
+            was,
+            "unbind re-owned forged {id}"
+        );
+    }
+    assert_eq!(
+        personal_groups_of(&pool, forged.no_group).await,
+        0,
+        "no personal group is minted for a forger"
+    );
+}
+
+/// 281's reconcile pass, from 280: a genuine projection left public is
+/// re-owned by the rule; forged rows are neither moved nor counted, and a
+/// forged public row does not trip the post-condition. One summary row with
+/// the count shape.
+#[sqlx::test(migrations = false)]
+async fn migration_281_reconciles_genuine_projections_only(pool: PgPool) {
+    migrate(&pool, &below(281)).await.expect("migrate to 280");
+    let (h, _) = person(&pool, "below holder").await;
+    let (mate, _) = fixture::seed_agent_with_group(&pool, "below mate").await;
+    let node = seed_role(&pool, "role:edge-test-reconcile").await;
+    let team = group_of(&pool, "team", &[mate]).await;
+    bind(&pool, team, "role:edge-test-reconcile").await;
+    let real = grant(&pool, "role:edge-test-reconcile", h).await;
+    // A genuine projection left public (a row written before 278, or widened
+    // since): the reconcile pass must catch it.
+    sqlx::query(
+        "UPDATE edges SET visibility = 'public', owner_group_id = $2, \
+                declared_owner_group_id = NULL \
+          WHERE properties @> jsonb_build_object('assignment_id', $1::text)",
+    )
+    .bind(real)
+    .bind(Uuid::nil())
+    .execute(&pool)
+    .await
+    .expect("widen the genuine projection below 281");
+    assert_eq!(tenancy(&pool, h).await[0].0, "public", "PREMISE");
+    let forged = plant_forgeries(&pool, "role:edge-test-reconcile", node, h, real).await;
+    let mut before = Vec::new();
+    for id in &forged.ids {
+        before.push(edge_tenancy(&pool, *id).await);
+    }
+
+    migrate(&pool, &MIGRATOR).await.expect("migrate to head");
+
+    let genuine: (String, Uuid, Option<Uuid>) = sqlx::query_as(
+        "SELECT visibility::text, owner_group_id, declared_owner_group_id FROM edges \
+          WHERE properties @> jsonb_build_object('assignment_id', $1::text) \
+            AND source_id = $2",
+    )
+    .bind(real)
+    .bind(h)
+    .fetch_one(&pool)
+    .await
+    .expect("genuine");
+    assert_eq!(genuine, ("group".to_string(), team, Some(team)));
+    for (id, was) in forged.ids.iter().zip(&before) {
+        assert_eq!(
+            &edge_tenancy(&pool, *id).await,
+            was,
+            "reconcile moved forged {id}"
+        );
+    }
+    assert_eq!(personal_groups_of(&pool, forged.no_group).await, 0);
+    let audits: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT details FROM security_events \
+          WHERE event_type = 'edges.role_projection_edges_reconciled'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(audits.len(), 1, "one summary row");
+    let d = &audits[0];
+    assert_eq!(d["migration"], 281);
+    assert_eq!(d["before"], 1, "only the genuine public projection: {d}");
+    assert_eq!(d["rows"], 1, "{d}");
+    assert_eq!(d["after"], 0, "{d}");
+}
+
+/// 281's precondition: a binding trigger whose body is not 278's is never
+/// overwritten blind.
+#[sqlx::test(migrations = false)]
+async fn migration_281_refuses_over_another_binding_trigger_body(pool: PgPool) {
+    migrate(&pool, &below(281)).await.expect("migrate to 280");
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION public.epigraph_group_role_bindings_reown_role_edges() \
+         RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER \
+         SET search_path = pg_catalog, pg_temp AS $$ BEGIN RETURN NULL; END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("another body");
+    let err = migrate(&pool, &MIGRATOR)
+        .await
+        .expect_err("281 must refuse over another body");
+    assert!(err.contains("OCC03"), "precondition refusal: {err}");
 }

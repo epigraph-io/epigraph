@@ -4583,6 +4583,20 @@ restart.
   to also refuse re-pointing or unlinking a LINKED human client's `agent_id`, and the trigger
   watches `UPDATE OF client_type, agent_id`; the first link of an unlinked client stays
   allowed. Undo: `docs/runbooks/280-undo.sql`.
+- **281**: `role_edges_genuine_projections_only` (security review of 278, finding 1).
+  Precondition OCC03 (55000): the binding trigger's body is still 278's (md5). NEW
+  `epigraph_reown_role_projection_edges(role)` (NULL: every role) re-owns by 278's rule only a
+  GENUINE projection: the audit trigger's marker (`source = role_assignments`,
+  `projection = true`) AND a `role_assignments` row with that `assignment_id`, the edge's
+  source as holder and the edge's role. 278's binding trigger is re-stated to call it, so a
+  forged edge of the projection's shape is never re-owned and never fails a bind / unbind
+  (278 minted a personal group for its source, or raised RVK01 for one with only revoked rows).
+  A reconcile pass over every role, one `edges.role_projection_edges_reconciled` summary
+  `{before, rows, after}` counting genuine projections only, post-condition OCC04 (55000).
+  On 172's form, maintenance-owned, not application-callable. Pinned by
+  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/281-undo.sql`. 278's own
+  backfill and OCC02 still match the relationship alone (278 is not edited): **deploy
+  pre-check** in the spec, section 17.
 
 ## `-- no-transaction` migrations
 

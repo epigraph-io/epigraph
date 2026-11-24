@@ -2876,6 +2876,14 @@ const DEFERRED_DEFINER_FUNCTIONS: &[(&str, i64)] = &[
     // quiet, the stake this entry reports).
     ("epigraph_role_edge_owner", 278),
     ("epigraph_group_role_bindings_reown_role_edges", 278),
+    // 281, the re-own of a role's GENUINE projection edges (joined to their
+    // `role_assignments` row), called by the binding trigger above and by
+    // 281's reconcile pass. Reads the FORCEd `role_assignments` and writes the
+    // FORCEd `edges` through `epigraph_definer_bypass()` (the owner). Under a
+    // non-member owner the join sees no assignment and nothing is re-owned
+    // (quiet: a binding change keeps the old owner, the stake 278's entries
+    // already report).
+    ("epigraph_reown_role_projection_edges", 281),
 ];
 
 /// Registered definers that a LATER migration re-owns from
@@ -4112,6 +4120,14 @@ const OPERATOR_FUNCTION_GRANTS: &[(&str, &str, bool)] = &[
     (
         "epigraph_role_edge_owner",
         "public.epigraph_role_edge_owner(text, uuid)",
+        false,
+    ),
+    // 281: the genuine-projection re-own is called only by the binding
+    // trigger; an application-callable one would let any session drive
+    // personal-group mints and re-own every role's projections.
+    (
+        "epigraph_reown_role_projection_edges",
+        "public.epigraph_reown_role_projection_edges(text)",
         false,
     ),
     // 268: the prompt-history listing calls it on the request DSN; without
