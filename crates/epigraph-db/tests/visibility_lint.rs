@@ -5850,12 +5850,14 @@ const PROFILE_RULE_SITES: &[(&str, &str)] = &[
 /// `COALESCE(..., false)`: harmless, because every operand is non-NULL
 /// (`$4` is a bound bool, `agents.profile_visibility` is NOT NULL since
 /// migration 062, `$2::uuid IS NOT NULL AND ...` is false for a NULL
-/// principal and `EXISTS` is never NULL).
+/// principal and the `IN` is never NULL: the roster's `agent_id` is a NOT
+/// NULL column). The groupmate arm reads migration 273's live roster of each
+/// of the caller's groups (backlog f712db53), not the raw roster, so a lapsed
+/// row is not a groupmate.
 const PROFILE_RULE: &str = "($4::bool OR a.profile_visibility = 'public' \
      OR ($2::uuid IS NOT NULL AND a.id = $2::uuid) \
-     OR EXISTS (SELECT 1 FROM group_memberships gm \
-                 WHERE gm.agent_id = a.id AND gm.revoked_at IS NULL \
-                   AND gm.group_id = ANY($3::uuid[])))";
+     OR a.id IN (SELECT r.agent_id FROM unnest($3::uuid[]) vg(id) \
+                 CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r))";
 
 /// The binds that give [`PROFILE_RULE`]'s placeholders their meaning, in
 /// order, right after the statement's one other bind (`$1`).

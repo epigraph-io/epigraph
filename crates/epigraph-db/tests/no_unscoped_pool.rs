@@ -860,7 +860,10 @@ const EXEMPT: &[(&str, usize, &str)] = &[
 /// every write on ONE transaction from the caller's `AppState::write_as`
 /// instead of `state.db_pool.begin()` (`routes/hypothesis.rs` 6 -> 2). No
 /// file reached zero.
-const HIGH_WATER: usize = 165;
+/// 165 -> 162 (backlog f712db53): the three group membership gates in
+/// `routes/claims.rs` (16 -> 13) moved onto the caller's stamped connection.
+/// No file reached zero.
+const HIGH_WATER: usize = 162;
 /// Companion ceiling on the file count. See [`HIGH_WATER`].
 ///
 /// Shard 4 converted 19 sites and did NOT move this: none of its three files
@@ -990,7 +993,13 @@ const UNCONVERTED: &[(&str, usize)] = &[
     // 17 -> 16 (backlog 4073bbb6): `patch_claim`'s ownership read moved off
     // `state.db_pool` onto `AppState::read_as` (`ClaimRepository::write_target_of`
     // through the caller's viewer), as `update_labels`'s did in batch H6.
-    ("routes/claims.rs", 16),
+    // 16 -> 13 (backlog f712db53): the three group membership gates
+    // (`get_claim`, `list_claims` and `create_claim_core`'s sealed submit)
+    // moved off `state.db_pool` onto the caller's stamped connection
+    // (`GroupMembershipRepository::is_member_conn`), the only shape in which
+    // migration 236's principal-bound live-membership definer answers on the
+    // application role. The SITE-level decline described above is retired.
+    ("routes/claims.rs", 13),
     // `routes/claims_query.rs` was 5 and is GONE, not zeroed: PR-28, conversion
     // shard 2, moved all five onto `AppState::read_as`. Same rule as
     // `routes/lineage.rs` below — `measure()` only ever emits non-zero entries,

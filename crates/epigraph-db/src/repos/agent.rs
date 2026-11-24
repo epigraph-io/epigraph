@@ -2609,7 +2609,18 @@ impl AgentRepository {
     ///
     /// 1. `profile_visibility = 'public'` (migration 062's default), or
     /// 2. the viewer **is** this agent, or
-    /// 3. the viewer shares a live group with it.
+    /// 3. the viewer shares a live group with it: the agent holds a row that
+    ///    still COUNTS in a group of the viewer's set, by migration 273's
+    ///    `epigraph_group_live_roster` (backlog f712db53). An unrevoked row
+    ///    that has LAPSED (migrations 164 and 235) does not count. A member
+    ///    DERIVED from a role binding (migration 165) holds no row, so it is
+    ///    not recognised as a groupmate here (the roster lists no derived
+    ///    member: no roster oracle); its own profile still shows to itself.
+    ///    The roster answers only for groups in the connection's stamp, so
+    ///    run this on a connection stamped from `viewer` (`read_as`); on any
+    ///    other connection this arm answers no groupmate (fail-closed). The
+    ///    subquery is uncorrelated, so it is evaluated once per statement
+    ///    (a hashed subplan), not once per agent.
     ///
     /// A bypass viewer sees everything, as everywhere else.
     ///
@@ -2660,10 +2671,9 @@ impl AgentRepository {
                    (   $4::bool
                     OR a.profile_visibility = 'public'
                     OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                    OR EXISTS (SELECT 1 FROM group_memberships gm
-                                WHERE gm.agent_id = a.id
-                                  AND gm.revoked_at IS NULL
-                                  AND gm.group_id = ANY($3::uuid[]))
+                    OR a.id IN (SELECT r.agent_id
+                                  FROM unnest($3::uuid[]) vg(id)
+                                  CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r)
                    ) AS may_see_details,
                    a.properties,
                    a.orcid,
@@ -2734,10 +2744,9 @@ impl AgentRepository {
               AND (   $4::bool
                    OR a.profile_visibility = 'public'
                    OR ($2::uuid IS NOT NULL AND a.id = $2::uuid)
-                   OR EXISTS (SELECT 1 FROM group_memberships gm
-                               WHERE gm.agent_id = a.id
-                                 AND gm.revoked_at IS NULL
-                                 AND gm.group_id = ANY($3::uuid[])))
+                   OR a.id IN (SELECT r.agent_id
+                                 FROM unnest($3::uuid[]) vg(id)
+                                 CROSS JOIN LATERAL public.epigraph_group_live_roster(vg.id) r))
             "#,
         )
         .bind(ids)

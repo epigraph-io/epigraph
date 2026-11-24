@@ -4546,6 +4546,30 @@ restart.
   login that runs the theme scripts (every scheduled theme job's login, not only a read-only
   one) needs SELECT on the table, or the job fails with 42501 (docs/deploy.md).
   **Applied to throwaway databases only, NOT to any deployed database.**
+- **273**: `group_live_roster` (backlogs 93ed2ec3, f712db53). Adds
+  `epigraph_group_live_roster(group) -> (agent_id, role)`: the unrevoked `group_memberships` rows
+  of ONE group that still count under 164's rule (a verb-made team group's row counts while its
+  human is a live human operator) and 235's (a personal-group row of an allowlisted agent lapses
+  with the allowance), one per member, `role` as stored. It answers only when the group is in the
+  session's stamped group set (`epigraph_session_groups()`), or on a maintenance or superuser
+  session; otherwise no row. That is the authority 077's `group_memberships_tenancy` already
+  accepts for reading those rows, so the result is a subset of a plain `SELECT` on the same
+  connection: the function adds only the lapse filter, whose reads the application role lacks.
+  A member derived from a role binding (165) has no row and is NOT listed (165's "no roster
+  oracle"; readers that ask about the caller use 236's bound `epigraph_live_memberships` on a
+  connection stamped with the caller). Why: since 236 that read answers only for the session
+  principal, so asking it about each member of a roster answered every other member "not
+  live" on the application role. The direct arm is a copy of 236's
+  `epigraph_live_memberships_unbound`; the file refuses (55000) over any other twin body (md5 of
+  `prosrc`), and `epigraph-db/tests/group_live_roster.rs` pins the same md5 at head and checks
+  both answer alike. `ROWS 20 COST 50` (backlog 8377cf18). 172's form (`pg_catalog, pg_temp`),
+  owned by `epigraph_maintenance`, EXECUTE granted to `epigraph_app` (guarded; `tenancy_backfill`
+  registers it). Pinned by `epigraph-db/tests/group_live_roster.rs` (every gate arm on the
+  application role through `Viewer::resolve` + `read_as`; the subset; the parity; the catalog).
+  Undo: `docs/runbooks/273-undo.sql`. **Deploy order:** migrate BEFORE the API and MCP
+  binaries: a binary built with 273 calls it from `GET /api/v1/groups/:id`, `GET
+  /api/v1/agents`, `GET /api/v1/agents/:id`, `GET /api/v1/agents/search` and MCP `find_agent` /
+  `get_agent`, and answers 42883 there without it.
 
 ## `-- no-transaction` migrations
 

@@ -13162,6 +13162,16 @@ impl ClaimRepository {
         // Membership, not write-role: role-granularity is `writable_bind`'s
         // job and arrives with 16b. Refusing a non-member is strictly stronger
         // than the nothing that stood here before.
+        //
+        // "Live" is `epigraph_live_memberships(acting agent)`, the definer
+        // `Viewer::resolve` reads (backlog f712db53): a member derived from a
+        // role binding (migration 165) holds no row and IS a member; an
+        // unrevoked row that has lapsed (migrations 164, 235) is NOT. The raw
+        // roster read this replaced refused the first and admitted the second.
+        // The request path runs this on a transaction stamped from the acting
+        // agent's own viewer, whose principal is the agent asked about (the
+        // only shape in which migration 236's bound definer answers on the
+        // application role); a privileged session answers for any agent.
         let private_owners: Vec<Uuid> = source_tenancy
             .iter()
             .filter(|(_, v)| *v == epigraph_core::Visibility::Group)
@@ -13171,8 +13181,8 @@ impl ClaimRepository {
             .collect();
         if !private_owners.is_empty() {
             let member_of: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT group_id FROM group_memberships \
-                  WHERE agent_id = $1 AND group_id = ANY($2) AND revoked_at IS NULL",
+                "SELECT DISTINCT group_id FROM public.epigraph_live_memberships($1) \
+                  WHERE group_id = ANY($2)",
             )
             .bind(acting_agent_id)
             .bind(&private_owners)
