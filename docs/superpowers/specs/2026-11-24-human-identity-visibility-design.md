@@ -6,7 +6,8 @@ head; the PR must re-verify each one again at commit time (§7 says how).
 
 Section 16 lists every decision in this spec that the operator did not make directly. Each
 one is marked either **[ORCHESTRATOR'S CALL]** or **[SPEC AUTHOR'S CALL]**. Items marked
-**[OPEN]** need a ruling before or during implementation.
+**[OPEN]** need a ruling before or during implementation. The operator's rulings of
+2026-11-24 on the open items are in §16.R; an item ruled there is marked **[RULED]**.
 
 **Revision 2.** Two adversarial reviews (a leak hunt, findings L1-L15, and an
 accountability / migration-safety / performance review, findings 1-20) were resolved into
@@ -128,7 +129,8 @@ Consequences that follow directly from the rule and that the PR must state in it
   - Claims carry the filing principal's id, so a stranger's claim that mentions H names
     nobody but the stranger.
 - **Holders of group-admin authority CAN make H NAMED without H's consent.** Revision 1
-  said only one exception existed; there are four (§15.R2, ruling **[OPEN] C3**):
+  said only one exception existed; there are four (§15.R2; **[RULED] C3**: accepted as built,
+  §16.R):
   1. A holder of `groups:write` creates a keyed team (`routes/groups.rs::create_group`,
      `GroupRepository::create_with_admin_conn` inserts `kind = 'team'`). With `groups:admin`
      it then adds H directly (`routes/groups.rs::add_member`; 077's `group_memberships_tenancy`
@@ -143,7 +145,8 @@ Consequences that follow directly from the rule and that the PR must state in it
   4. An admin of the team that owns a group claim filed by B(H) publicizes it
      (`epigraph_publicize_claims`, 242, refuses only non-humans and non-admins). The
      public-claim arm then names H to everyone. This one is accountability-positive (the
-     claim is now public, so it must be traceable) and is ruled separately (**[OPEN] C4**).
+     claim is now public, so it must be traceable) and is ruled separately (**[RULED] C4**:
+     yes, as built, §16.R).
 
   §12.T8 pins each of the four with the behaviour implemented now: the approved rule read
   literally ("team members"), option (a) of C3.
@@ -178,10 +181,13 @@ Consequences that follow directly from the rule and that the PR must state in it
 
 ## 5. The indistinguishability contract
 
-For an UNNAMED human, every surface yields exactly what it yields for **N**: a nameless,
-non-human agent with no human evidence, whose profile is `'group'` and has no ORCID or ROR.
+For an UNNAMED human, every surface yields exactly what it yields for **N**: a nameless
+OAuth service principal exactly as `ensure_for_client` mints it, named
+`oauth:<client row id>`, profile `'public'`, label `oauth-principal`, no human evidence and no
+ORCID or ROR (**[RULED] C7**, §16.R; revision 2 and part B used a null-named N with a
+`'group'` profile, which the ruling replaced).
 
-**The null name is itself a marker on a real instance (findings L1 and 20; [OPEN] C7).**
+**The null name was itself a marker on a real instance (findings L1 and 20; [RULED] C7).**
 `ensure_for_client` names every non-human OAuth principal `oauth:<client row id>`, never
 null. A null-named agent exists in production only when `POST /api/v1/agents` omits the
 name. So an `oauth-principal` agent with a null name and `kind: unknown` is, in practice, a
@@ -195,41 +201,61 @@ options put to the operator:
 - (b) keep `display_name: null`, as the brief says, and record the marker and the
   list-by-label enumeration as known.
 
-Part B implements (b), the brief's literal text, until the operator rules, and must not
-switch silently. The main session (not a subagent) measures how many nameless derived
-non-human agents exist on the instance and puts the number to the operator with C7.
-Whichever is ruled, T1's N is built **production-shaped**: through `ensure_for_client` with
-a `service` client, then given whatever name the ruling assigns (null under (b), the
-placeholder under (a)). The comparison includes `labels`, and `properties` on B1.
+Part B implemented (b), the brief's literal text. **The operator ruled (a)** (§16.R, C7),
+and migration 285 implements it: NEW `epigraph_unnamed_agent_name(agent)` =
+`'oauth:' || <id of the agent's EARLIEST linked oauth_clients row>`, the one SQL spelling of
+the placeholder, called in the ELSE of every name decision (`CASE WHEN named THEN
+display_name ELSE epigraph_unnamed_agent_name(id) END`). The earliest linked client is the
+provisioning one (`ensure_for_client` derives the principal's key from the client it is
+minted for and links it in the same transaction), so the uuid in an unnamed H's name derives
+H's public key by `blake3::derive_key("epigraph-oauth-client", ..)` exactly as a service
+principal's does; a later client linked to H does not move it. T1's N is
+**production-shaped**: minted by `ensure_for_client` for a `service` client and left as
+minted. The comparisons mask the client row id inside each `oauth:` name, and include
+`labels`, and `properties` on B1.
 
 Concretely:
 
-- `display_name` is null. Where a surface substitutes a fallback label (ego `short_id`, graph
-  `id[..8]`, papers `""`), it substitutes the same fallback it uses for N.
+- `display_name` is the placeholder `oauth:<client row id of H's provisioning client>`, on
+  every surface that names an agent (cards, `operator_human`, `authored_by`, paper authors,
+  political surfaces, PROV, ego, graph, Atlas, sources, the REST whole-row routes through
+  `Disclosure::unnamed_as`). A human principal with no linked OAuth client would read as a
+  null-named agent (§15.R16). A source ratchet
+  (`agent_name_disclosure_lint.rs::no_name_decision_falls_back_to_null`) refuses a new name
+  decision that falls back to NULL.
 - `kind` is `unknown`, and `kind_evidence` holds none of `registered_human_operator`,
   `holds_disclosed_role` or `operator_of_bound_agent`.
 - `roles` is `[]`: non-elevating assignments are hidden too. `role_attachments` is `[]`.
-- `orcid` and `ror_id` are null, and so are `properties` and `profile_visibility` in
-  `get_public_profile` (§7, row B1).
-- H is never found by name, prefix, trigram, ORCID or ROR, and never listed as a same-name
-  candidate. Not being found is what happens for N, which has no name to match.
+- `orcid` and `ror_id` are null. In `get_public_profile` (§7, row B1) `profile_visibility` is
+  `'public'` and `properties` is `{}`, what a minted service principal shows (its profile is
+  `'public'` from 274's mint, its properties the column default), whatever H's row holds.
+  `key_kind` is H's own: `derived` for a provider-provisioned person, as for N.
+- `labels` are not redacted: H and N both carry 274's provisioning label `oauth-principal`,
+  so `GET /api/v1/agents?label=oauth-principal` lists both alike. Redacting labels while
+  `?label=` filters raw rows would itself be a marker.
+- H is never found by its name, prefix, trigram, ORCID or ROR, and never listed as a
+  same-name candidate under its name. It IS found by its placeholder (exact, prefix,
+  trigram, and as a same-name candidate), as N is by N's: the matchers carry each human
+  principal's placeholder row and keep it exactly when the session may NOT see the real name
+  (`d.named <> alt`). A reader H is named to finds H by its name only.
 - There is no "hidden" marker, no distinguishable 404, and no absence. The **id is never
   withheld**:
-  - `operator_human` on a bound LLM agent's card becomes `{id: H, display_name: null}`;
-  - `authored_by.*.human` becomes `{id, display_name: null}`;
+  - `operator_human` on a bound LLM agent's card becomes `{id: H, display_name:
+    "oauth:<client row id>"}`;
+  - `authored_by.*.human` becomes `{id, display_name: "oauth:<client row id>"}`;
   - `GET /api/v1/agents/:id` still answers 200.
 - Every output is computed from the redacted value. For example, `derived_key_evidence` is
   fed the redacted name, so no output depends on the hidden name.
 
-"Byte-identical" in the tests means equal after replacing H's and N's `id`, `public_key` and
-`created_at` with placeholders. Viewer-scoped counts are data, not identity: N's fixture is
+"Byte-identical" in the tests means equal after replacing H's and N's `id`, `public_key`,
+`created_at` and the client row id inside each `oauth:` name with placeholders. Viewer-scoped counts are data, not identity: N's fixture is
 given the same edges when a test compares counts.
 
 **Known trade-off, recorded and NOT changed (operator-approved behaviour).** The approved rule
 keeps three things:
 
-1. `operator_human: {id, display_name: null}` still tells an outsider "this id is some
-   human".
+1. `operator_human: {id, display_name: "oauth:<client row id>"}` still tells an outsider
+   "this id is some human" (the field exists only for a human binding).
 2. The bound LLM agent's `kind_evidence` still contains `bound_to_visible_human`.
 3. An unnamed H's own card reads `kind: unknown`.
 
@@ -237,8 +263,8 @@ The card set is therefore internally inconsistent for an outsider who looks at b
 The approved rule accepts this.
 
 `operator_human` is **not** the only id-level human signal. The others are recorded in §15
-(R7, R11 the TGP03 invite oracle, R12 world-readable `OPERATED_BY` edges,
-R13 timing, R14 assessment-slot BBAs). The pending-papers count (L11) is served as
+(R7, R12 world-readable `OPERATED_BY` edges, R13 timing, R14 assessment-slot BBAs, R16 the
+C7 residuals; R11, the TGP03 invite oracle, is closed by C10). The pending-papers count (L11) is served as
 computed to every reader, for H as for N (§7 row A2). Revision 2 zeroed it for an unnamed
 H on the premise that "a pending explicit attachment exists only for a registered person";
 that premise is false (`ingest_authors.rs::check_explicit_author_ids` has no human gate,
@@ -782,6 +808,24 @@ SHAPE / WHAT IT TRUSTS / UNDO in 269's style.
   when `epigraph_bypass()` or `epigraph_definer_bypass()`, otherwise `OCC05` (42501). An
   INVOKER on purpose: a definer's frame is its owner and would admit everyone. Registered in
   `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo: `docs/runbooks/282-undo.sql`.
+- **M12 `283_profile_public_consent.sql`** (operator ruling C11, transactional):
+  precondition PCN01 (55000) that the core is 279's and the setter 273's (md5). NEW column
+  `agents.profile_public_consented_at timestamptz` (no backfill) and CHECK
+  `agents_profile_public_consent_check` (a stamp only on a `'public'` profile; added NOT VALID,
+  then VALIDATEd). No application column privilege. The core is re-stated so that, for a
+  HUMAN principal, the profile term is `'public' AND consented` in the opt-in arm and in the
+  details rule; the setter stamps `now()` on `'public'` and clears it on `'group'`. Undo:
+  `docs/runbooks/283-undo.sql`.
+- **M13 `284_team_invite_no_human_oracle.sql`** (operator ruling C10, transactional):
+  precondition TIV01 (55000) that the invite is 263's (md5). `epigraph_invite_to_team_group`
+  re-stated without the `epigraph_is_human_operator(invitee)` refusal; TGP03 now refuses only
+  an id naming no agent, a role's node or a registered system identity. Accept unchanged (it
+  refuses a caller that is not a registered person, TGP01). Undo: `docs/runbooks/284-undo.sql`.
+- **M14 `285_unnamed_agent_placeholder_name.sql`** (operator ruling C7, transactional): NEW
+  `epigraph_unnamed_agent_name(uuid) -> text`, SECURITY INVOKER `LANGUAGE sql STABLE`, every
+  name qualified, reading only `oauth_clients`; maintenance-owned, EXECUTE for
+  `epigraph_app`; registered in `tenancy_backfill.rs`'s INVOKER_EXEMPT. Undo:
+  `docs/runbooks/285-undo.sql` (after rolling back the binaries that call it).
 
 Write amplification: M4 and M5 add two partial indexes to the hottest write table, beside
 HEAD's `idx_claims_agent_id`, `idx_claims_agent_created` and `idx_claims_group_current`. The
@@ -932,7 +976,8 @@ and 600-662 ms without (triggers off, so the difference is the indexes): +15-60 
 - Human, worst case: 20-38 ms p50 after 277, OVER the 10 ms budget. The cost is the
   readable-claim arm, |B(H)| x |viewer groups| index descents (45,030 here). Migration
   277 removed the 600 ms team-arm cost and the plan instability, and cannot remove this
-  one without changing the data model: **[OPEN] C12** below.
+  one without changing the data model: **[RULED] C12**, the cost is accepted for this
+  population (§16.R).
 
 `human_identity_visibility_perf.rs` asserts only what it can state exactly (no `claims`
 sequential scan; calls per match well under the table); it prints the rest. It is an
@@ -972,9 +1017,11 @@ Each test also carries a CALIBRATION assertion that H is named to T, so a test c
 by redacting everyone.
 
 - **T1. Indistinguishability, per surface.** O's output for H equals O's output for N, modulo
-  id, public key and created_at; `labels`, and `properties` on B1, are compared too. N is
-  production-shaped (§5). Surfaces:
-  - A1: H's exact name, prefix and ORCID all return no H;
+  id, public key, created_at and the client row id inside each `oauth:` name; `labels`, and
+  `properties` on B1, are compared too. N is a production-shaped nameless OAuth service
+  principal, as minted (§5, ruling C7). Surfaces:
+  - A1: H's exact name, prefix and ORCID all return no H; H's placeholder (exact and prefix)
+    finds H exactly as N's finds N (C7);
   - A1 truncation (findings L6, 3): 200 decoy agents an attacker registers with H's exact
     name, plus H: `candidates_truncated` is false and the decoy page is identical to the page
     without H; a query matched by exactly `CANDIDATE_POOL` visible agents plus H gives
@@ -1111,7 +1158,8 @@ one says why.
   non-teammate is updated, or names the arm that admits it.
 - `agent_lookup.rs::the_operator_human_is_shown_to_every_reader`: the id is still shown to
   every reader, and the name is now shown only under §4. Rename it to say so. Assert an
-  outsider gets `display_name: null` and a teammate gets the name.
+  outsider gets the `oauth:<client row id>` placeholder (ruling C7; `display_name: null`
+  before it) and a teammate gets the name.
 - `agent_lookup.rs::an_operated_agent_sees_its_human_exactly_as_an_outsider_does`: the
   bot-equals-outsider equality stays. The expected result changes: the search for the
   humans' shared name returns no human for either viewer. T4 adds the after-a-claim case.
@@ -1221,13 +1269,13 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   `groups:admin` is in `ADMIN_ONLY_SCOPES`), a community add by any live member holding
   `groups:admin` (`routes/community.rs` writes the same `group_memberships` row under the
   weaker "live member" rule), any group admin's INSERT through 077's WITH CHECK, and a
-  publicize of a B(H) group claim. Neither is a stranger-level leak. Options for **[OPEN] C3**:
-  (a) accept literal "team members" and record that `groups:admin` can unhide anyone (what
-  is implemented now); (b) count H-side team memberships only when H consented or a
-  maintenance act wrote them (164 verbs, a 263 accepted invite), which needs a provenance
-  column on `group_memberships` or a `security_events` join, i.e. a schema change; (c)
-  exclude keyed (`did:key:`) groups and communities from the H side. The publicize path is
-  **[OPEN] C4**, ruled separately because it is accountability-positive.
+  publicize of a B(H) group claim. Neither is a stranger-level leak. The options put to the
+  operator for C3 were: (a) accept literal "team members" and record that `groups:admin` can
+  unhide anyone; (b) count H-side team memberships only when H consented or a maintenance act
+  wrote them (164 verbs, a 263 accepted invite), which needs a provenance column on
+  `group_memberships` or a `security_events` join, i.e. a schema change; (c) exclude keyed
+  (`did:key:`) groups and communities from the H side. **[RULED] C3: (a)**, as built
+  (§16.R). The publicize path is **[RULED] C4: yes**, as built (§16.R).
 - **R3. A public DOI plus an author position re-identifies an unnamed author.** The paper text
   names its authors. An authorship edge is not a claim, so it does not name H. For a
   countersigned authorship (H's own act), whether it should count as a claim needs a ruling.
@@ -1250,7 +1298,10 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **R9. Trust boundary.** `agents` stays world-readable to the application role (077 §9). A
   holder of the application DSN reads names directly, and can self-stamp to probe the session
   wrapper. This is the trust class of 236 and 269. The rule is enforced at every application
-  surface, not as a database read boundary. Where the real name is stored is **[OPEN] C13**.
+  surface, not as a database read boundary. Where the real name is stored is **[RULED]
+  C13**: in `agents.display_name`, on the operator's stated threat model that direct database
+  logins are secured maintenance only (§16.R). How the application-role DSN is distributed
+  (agent containers hold it today) is the follow-up that premise needs, out of scope here.
   After review (correctness#8): the same holder can stamp `epigraph.principal_id` and call
   273's setter for ANY human, which persists an opt-in and names that person to everyone.
   It amplifies an exposure the holder already has (it can read the name) rather than
@@ -1262,15 +1313,18 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   token jti) to every stamped connection is a follow-up, not built here.
 - **R10.** Events `actor_id` is out of scope by ruling. Guest routes were confirmed to drop
   agent identity (§7.J). Event PAYLOADS are covered (§7.J, §14).
-- **R11. `invite_to_group` answers "is this id a registered human?"** (finding L4).
+- **R11. (Closed by [RULED] C10, migration 284.) `invite_to_group` answered "is this id a
+  registered human?"** (finding L4). History:
   263's `epigraph_invite_to_team_group` raises `TGP03: agent % is not a registered human
   operator` for a non-human invitee, and the text reaches REST and MCP. TGP01 requires the
   caller to be a registered human operator, so the attacker is an onboarded insider, but the
   oracle classifies humans who share no team with the attacker and who have no bound agent,
-  which the `operator_human` trade-off does not cover. **[OPEN] C10**: (a) accept any
+  which the `operator_human` trade-off does not cover. The options were (a) accept any
   non-role, non-system invitee and refuse a non-human only at accept time, which no non-human
-  can reach; (b) keep it as an explicit residual with the operator's sign-off. Unchanged
-  until ruled.
+  can reach; (b) keep it as an explicit residual with the operator's sign-off. The operator
+  ruled to fix it (§16.R); 284 implements (a). Residual: TGP04 still tells the admin that the
+  invitee is already a member or already invited to the admin's own group (a roster the admin
+  reads anyway), and an invitation to a non-person stays `pending` for ever.
 - **R12. World-readable `OPERATED_BY` edges** (finding L7): 107's `epigraph_link_operator`,
   `epigraph_link_retired_agent`, 116's shared-signer retire, and
   `epigraph-mcp/src/server.rs::record_auth_lineage`. They persist after a retire (when the
@@ -1289,6 +1343,17 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
 - **R15. An LLM driving H's own session can call `set_profile_visibility`** (finding 17), for
   example under prompt injection, and publish H's name. The REST route is the deliberate
   path; the MCP tool exists because the brief asks for it. The setter is audited.
+- **R16. C7 residuals** (operator ruling C7, migration 285). An unnamed human reads as a
+  minted nameless service principal only as far as its own row allows:
+  - `key_kind`: a provider-provisioned person is `derived`, as a service principal is; a
+    registered operator holding a real Ed25519 key (`key_kind = 'ed25519'`) shows that, which
+    no OAuth service principal does, and its placeholder's uuid does not derive its key.
+  - `labels`: shown as stored. Both carry 274's `oauth-principal`; a label the person or an
+    admin writes later is shown as written.
+  - A human principal with no linked OAuth client (evidence only a `human_operators` row
+    whose client is not linked to it) is shown with a null name.
+  - The placeholder rows make every name search evaluate the placeholder once per human
+    principal (an index probe of `oauth_clients` each); not measured against the §11 budget.
 - **F1.** Author nodes from ingested literature and git authors are not human principals.
   Their names are public-source names, and they stay named.
 - **F2.** Stale derivatives (finding L13): stored Atlas leaf documents built before deploy
@@ -1306,7 +1371,9 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   change. The alternative, a `profile_public_consented_at` column written only by the
   setter (opt-in reads `'public' AND consented_at IS NOT NULL`), makes consent literal and
   the reset's completeness non-critical; it departs from the brief's prescribed reset, so it
-  is **[OPEN] C11**.
+  was put to the operator as C11. **[RULED] C11: yes**; migration 283 adds the column, the
+  setter writes it, and the opt-in arm (and a human's details rule) requires it, so a
+  `'public'` left by any other path is not consent. Closed.
 - **F5.** Have `provision.rs` stop storing an email as `client_name`, and carry the asserted
   name explicitly.
 - **F6.** (Revision 1: "if E2 is deferred".) Closed: E2 is resolved in this PR (part B).
@@ -1380,7 +1447,57 @@ silently changed.
   and the setter.
 - **B19.** The setter has no search_path write window (271 pinned every trigger's path) and
   returns `named_to_everyone`.
-- **B20.** Part B implements the brief's literal `display_name: null` until C7 is ruled.
+- **B20. (Superseded by [RULED] C7.)** Part B implemented the brief's literal
+  `display_name: null` until C7 was ruled; migration 285 replaces it with the placeholder.
+
+### R. Ruled by the operator (2026-11-24)
+
+The operator's answer, verbatim: "1. Sure, use your recommendation. 2. accept. 3. accept.
+Direct database logins are supposed to be secured maintenance only. 4. Accept. c2, c4, c5,
+c6, c10, c11 use your recommendations". The numbered answers are, in the order they were put:
+1 = C7, 2 = C3, 3 = C13, 4 = C12. C2, C5 and C6 are ruled in the same answer and are
+implemented separately (they stay listed under C until then); C8 was not ruled and stays
+open.
+
+- **C3. Third-party unhide through group-admin authority** (§4, §15.R2). Ruled: accept
+  option (a), the literal reading ("team members"), as built. A holder of group-admin
+  authority who adds H to a team or community names H to that group's members. Pinned by
+  §12.T8.
+- **C4. A team admin's publicize of a B(H) group claim** (§4, path 4). Ruled: yes, as built:
+  a publicized claim of B(H) names H to everyone through the public-claim arm.
+- **C7. The null-name marker** (findings L1, 20; §5). Ruled: redact an UNNAMED human's
+  `display_name` to the `oauth:<client row id>` placeholder a nameless service principal
+  shows, not null; labels, properties and kind must match such a principal so
+  `?label=oauth-principal` and every other listing cannot separate them; the
+  indistinguishability tests compare against a production-shaped nameless OAuth service
+  principal. Implemented: migration 285 (`epigraph_unnamed_agent_name`, the earliest linked
+  client's id) in the ELSE of every name decision, `Disclosure::unnamed_as` for the REST
+  whole-row redaction, the matchers' placeholder rows, `get_public_profile`'s `'public'` /
+  `{}`; labels shown as stored (both carry `oauth-principal`). Residuals: §15.R16.
+- **C10. The TGP03 invite oracle** (§15.R11). Ruled: fix it; the invite answers identically
+  whether or not the target is a human (or named), and the refusal moves to accept time.
+  Implemented: migration 284 (option (a)); accept already refused a non-person (TGP01).
+  Pinned by `person_team_groups.rs::an_invitation_answers_alike_whoever_the_invitee_is`,
+  `team_groups_http.rs::an_invite_answers_alike_for_a_person_and_an_agent` and the MCP
+  parity test.
+- **C11. A consent column** (§15.F4, finding 14). Ruled: yes: add
+  `profile_public_consented_at timestamptz`, set by the self-service setter on opt-in and
+  cleared on opt-out; the opt-in arm requires `profile_visibility = 'public' AND
+  consented_at IS NOT NULL`; backfill nothing (no one has consented yet). Implemented:
+  migration 283; the same consent term also gates a human's details rule, and a CHECK keeps
+  a stamp only on a `'public'` profile. Pinned by
+  `human_identity_visibility.rs::a_public_profile_without_recorded_consent_names_no_one` and
+  `::the_consent_stamp_is_the_setters_alone`.
+- **C12. The readable-claim arm's worst-case cost** (§11.1: 20-38 ms p50 for a human with
+  1,500 bound agents and a viewer in 30 groups, over the 10 ms budget). Ruled: accept option
+  (c), the cost, for this population. Nothing built; options (a) and (b) are not pursued.
+- **C13. Where the real name is stored** (§15.R9; review correctness#4, leaks#3). Ruled:
+  accept storage in `agents.display_name`, as built. **Stated threat model (the operator's
+  premise):** "Direct database logins are supposed to be secured maintenance only." The
+  database layer is therefore not a disclosure boundary for the name; every application
+  surface is. **Out-of-scope follow-up:** the application-role DSN is distributed today
+  beyond maintenance (agent containers hold it, §15.R9), so the premise needs that
+  distribution narrowed; that is a deployment change, not part of this PR.
 
 ### C. Open, needs a ruling
 
@@ -1389,60 +1506,14 @@ Each item states the behaviour implemented until the operator rules.
 - **C1. (Closed in revision 2.)** E2 is redacted in this PR, `replaces` included (finding L2).
 - **C2.** R3: whether a countersigned authorship of a readable paper should name H as a claim
   does. Implemented: it does not.
-- **C3.** Third-party unhide through group-admin authority (§4, R2): options (a) / (b) / (c).
-  Implemented: (a), the literal reading.
-- **C4.** Whether a team admin's publicize of a B(H) group claim may name H to everyone.
-  Implemented: yes (the public-claim arm reads current visibility).
 - **C5.** Key the public-claim arm on the binding window (`bound_at`) instead of "ever bound"
   (findings L9, 7). This narrows approved rule text, so only the operator can make it.
   Implemented: "ever bound".
 - **C6.** Whether "no anonymous claims" covers public ingest records (finding 6).
   Implemented: no.
-- **C7.** The null-name marker (findings L1, 20): redact to the `oauth:<client row id>`
-  placeholder, or keep null. Implemented: null (the brief's text); the main session measures
-  the nameless non-human population first.
 - **C8.** Whether an explicit `authored` edge's `affiliations` is identity, to be redacted with
   `author_name`. Implemented: shown as for N.
 - **C9.** The sticky public-claim marker table, only if the §11 budget is missed.
-- **C10.** The TGP03 invite oracle (R11): accept-time refusal or a signed-off residual.
-  Implemented: unchanged.
-- **C11.** A `profile_public_consented_at` column in place of relying on the reset (F4,
-  finding 14). Implemented: the brief's reset plus `'group'` at provisioning.
-- **C12.** (Part B, measured.) The readable-claim arm's worst case is over the 10 ms
-  budget (section 11.1: 20-38 ms p50 for a human with 1,500 bound agents and a viewer in
-  30 groups). Options, each a data-model change: (a) a per-human marker of the groups
-  B(H) has filed non-public claims in (`human_claim_groups(human_id, group_id)`,
-  maintained by a trigger on `claims` and on binding inserts), making the arm one
-  primary-key probe per viewer group (C9's mechanism, for groups); (b) cap the arm at
-  the viewer's groups that are teams or communities (narrows the orchestrator's call A1);
-  (c) accept the cost for this population size. Implemented: none (277 only made the
-  plan stable; 279 removed the separate 0.6 s role-derived cost, §11.1); the operator
-  rules.
-- **C13. (After review: correctness#4, leaks#3, brief addendum.) Where the real name is
-  stored.** Measured on HEAD: `oauth_clients.client_name` is NOT more restricted than
-  `agents.display_name` for the database logins. 070 grants `SELECT` on every `public`
-  table to the application and maintenance roles, 077 gives `oauth_clients` no row policy,
-  no migration revokes `SELECT` on it (118 revokes only UPDATE / DELETE / TRUNCATE), and
-  `agents_identity` is `FOR SELECT ... USING (true)`; `epigraph_app` and
-  `epigraph_maintenance` are the only login roles the migrations provision, and
-  `ensure_for_client` itself reads `client_name` on the application role. So every login
-  that can read `agents.display_name` could already read the provider name. What widens is
-  the number of code paths that read the column ungated: (a) the maintenance-DSN operator
-  CLIs (`analyze_graph::main`, `dekg::handle_migrate`, `cache_owner_audit::audit_edges`,
-  `backfill_markers::signers_statement`, `system_agent::identity`,
-  `mass_function::untyped_provenance_page`: the lint's ALLOWED register); (b) the whole-row
-  fetchers on the application role (`AgentRepository::get_by_id` / `get_by_public_key` /
-  `list` / `list_by_label`, each serializing caller redacting; `update_agent` since review);
-  (c) any holder of the application DSN, agent containers included (R9); (d) operator
-  scripts (`scripts/evidential_clustering.py` filters on the column, serves nothing). No SQL
-  function returns another agent's `display_name` to the application, and no tracing macro
-  logs it. **Decision as built:** the real name lives in `agents.display_name`, gated at
-  every application surface; the database layer is no wider than `oauth_clients` already
-  is. **Alternative:** keep the `oauth:<client row id>` placeholder in `display_name` and
-  resolve the name through the predicate from a restricted source; `oauth_clients` is not
-  such a source today, so it would need its own row policy or a new maintenance-only table.
-  Implemented: as built; the operator decides.
-
 
 ## 16a. Part B implementation notes (deviations and what was not covered)
 
@@ -1495,9 +1566,9 @@ Not covered by part B (open):
 - **T8's four admin paths** and **T13 over every surface** are pinned at the predicate
   (part A); part B adds T2 on the `authored_by` block, not a full viewer x claim matrix per
   surface.
-- **C7** stays the brief's literal `display_name: null` (option (b)); the main session's
-  measurement of nameless non-human agents is still owed to the operator.
-- **C12** (above): the worst-case budget.
+- **C7** was the brief's literal `display_name: null` (option (b)) in part B; ruled since
+  (§16.R) and replaced by the placeholder (migration 285).
+- **C12** (§16.R): the worst-case budget, accepted by the operator.
 - **After review (tests#5), residual:** MCP `query_paper`, MCP `get_claim`'s `authored_by`,
   PROV export and `SourceOverviewRepository::agents` have no tool- or route-level H-vs-N
   test; each is a thin wrapper over a builder tested at the database level
@@ -1541,6 +1612,16 @@ Not covered by part B (open):
   schedule. Previously stored documents carry names built under a bypass viewer.
 - MCP stdio clients pin their binary. Restart them so that the find_agent and get_agent text,
   and the new tool, are served.
+- M12-M14 (283-285, the operator's 2026-11-24 rulings) apply at API boot after 282. 283's
+  CHECK is added NOT VALID (a brief ACCESS EXCLUSIVE lock under `lock_timeout = '3s'`) and
+  then VALIDATEd (every row is NULL); 283 and 284 refuse (PCN01 / TIV01) over a core, setter
+  or invite body other than the one they re-state. 285 must be applied before any binary of
+  this branch serves a request: every name decision calls `epigraph_unnamed_agent_name`, so
+  an API built here against a database without 285 fails every agent-naming read (42883).
+  Migrations apply at API boot, so this holds by construction for the API; a separately
+  deployed MCP binary must not start before the API's boot has applied 285.
+- 284 changes what a team invite answers: an invitation to any agent but a role's node or a
+  system identity is written `pending`; only a registered person can accept one.
 
 ## 18. Critique resolution (revision 2)
 
@@ -1549,10 +1630,10 @@ now says it; "Part" is where the change is built.
 
 | Finding | Disposition | Where | Part |
 |---|---|---|---|
-| L1 null name is a marker; `?label=oauth-principal` enumerates | **[OPEN] C7**, brief's null kept; N rebuilt production-shaped; labels and properties compared | §5, §12.T1 | B |
+| L1 null name is a marker; `?label=oauth-principal` enumerates | **[RULED] C7**: the placeholder name (migration 285); N production-shaped as minted; labels and properties compared | §5, §12.T1, §16.R | B, rulings |
 | L2 `author_name` and `replaces` on `authored` edges | Accepted: resolved now, not deferred (C1 closed) | §7 E2, E3 | B |
 | L3 `same_spelling` name-to-id oracle | Accepted: the `declined` half is gated | §7 A6, §12.T1 | B |
-| L4 TGP03 invite oracle | **[OPEN] C10**, recorded as a residual | §15.R11 | - |
+| L4 TGP03 invite oracle | **[RULED] C10**: fixed, refusal at accept time (migration 284) | §15.R11, §16.R | rulings |
 | L5 GQL matches `properties` | Accepted: anchor rows gated before LIMIT; lint scope | §7 H6, §14 | B |
 | L6 drop before LIMIT and truncation | Accepted: normative placement plus decoy test | §7 A1, A4, §12.T1 | B |
 | L7 `OPERATED_BY` edges | Accepted as residual; §5 no longer says `operator_human` is the only signal | §5, §15.R12 | - |
@@ -1565,7 +1646,7 @@ now says it; "Part" is where the change is built.
 | L14 `agent.registered` payload | Accepted: T7 assertion; lint scope | §7.J, §12.T7, §14 | A (T7), B (lint) |
 | L15 R2 narrower than written | Accepted, merged into R2 | §15.R2 | - |
 | L16 re-verifications | Cited | §7 A4, §7.J | - |
-| 1 third-party unhide paths | Accepted: §4 corrected, R2 widened, T8 pins; **[OPEN] C3**, C4 | §4, §15.R2, §12.T8 | B (T8) |
+| 1 third-party unhide paths | Accepted: §4 corrected, R2 widened, T8 pins; **[RULED] C3** (a), C4 yes | §4, §15.R2, §12.T8, §16.R | B (T8) |
 | 2 perf gate cannot be evaluated | Accepted: forced LATERAL probes; auto_explain / generic plans; four extra shapes; call counts | §6.1, §11 | A (SQL), B (measurement) |
 | 3 A1/A4 filter in SQL | Accepted (same as L6) | §7 A1, A4 | B |
 | 4 COST on the wrappers | Accepted | §6.1 | A |
@@ -1579,13 +1660,13 @@ now says it; "Part" is where the change is built.
 | 11 reset can move zero rows; split M1 | Accepted: post-condition, counts, lock note, split into M1-M3 | §10, §17 | A |
 | 12 `profile_visibility` app-updatable; R8 premise | Accepted: lockdown test; R8 rewritten | §10, §15.R8, §7 C5 | A |
 | 13 lock-function DROP + CREATE avoidable | Accepted: B7 reversed, revision 1's M2 dropped | §9.3, §16.B7 | A |
-| 14 column default fails open | Partly: catalog insert-path pin accepted; consent column **[OPEN] C11** | §15.F4, §12.T10 | A |
+| 14 column default fails open | Catalog insert-path pin accepted; consent column **[RULED] C11** (migration 283) | §15.F4, §12.T10, §16.R | A, rulings |
 | 15 index trap, registration, key order | Accepted | §10, §17 | A |
 | 16 budget at risk; `author_binding_clients` index | Accepted: index added; fallback listed (C9) | §6.1, §10, §11 | A |
 | 17 setter: non-humans, truthful text, LLM residual | Accepted: PVS05, `named_to_everyone`, description, R15 | §8, §15.R15 | A |
 | 18 email guard hardening | Accepted: `Cf` rejected; local part and R9 recorded | §9.2 | A |
 | 19 timing | Accepted (same as L10) | §15.R13 | - |
-| 20 N may have no counterpart | **[OPEN] C7** (same as L1); measured by the main session | §5 | - |
+| 20 N may have no counterpart | **[RULED] C7** (same as L1): N is a minted service principal | §5, §16.R | rulings |
 | minor: T6 tenancy | Accepted | §12.T6 | B |
 | minor: 206 write window | Re-verified: not needed after 271; omitted (B19) | §8 | A |
 | minor: undo needs a binary rollback | Accepted | §10, §17 | - |
@@ -1603,14 +1684,14 @@ raised 25 findings. Dispositions; none was rejected outright.
 | correctness#1, leaks#1, tests#1 (BLOCKING) role-holding `OCCUPIES` edges world-readable | Fixed: migration 278, team-only owner rule, bind/unbind re-own, backfill. One deviation, the fix agent's call: a holder with no personal group gets one minted instead of a refusal (§16.A3) | §7 K1, §10 M7 |
 | correctness#2, leaks#2 (BLOCKING) `hide_pending` marker | Fixed: the count is served to every reader; the premise was false | §5, §7 A2, B16 |
 | correctness#3 (MAJOR) role-derived arm cost | Fixed: migration 279, arm last plus a cheap probe pinned equal to 249; measured 617 -> 28 ms | §10 M8, §11.1 |
-| correctness#4, leaks#3 DB-layer real-name storage | Recorded: [OPEN] C13 | §16.C13 |
+| correctness#4, leaks#3 DB-layer real-name storage | **[RULED] C13**: as built, on the operator's threat model; DSN distribution is a follow-up | §16.R |
 | correctness#5 HEV01 `agent_id` | Fixed: migration 280 | §10 M9 |
 | correctness#6 274's boot cost | Recorded (274 not edited) | §17 |
 | correctness#7, leaks#4a, tests#2 `update_agent` | Fixed: mixed body 400; response redacted | §7 C5 |
 | correctness#8 unattributable opt-in | Recorded: no correlation GUC on HEAD | §15.R9 |
 | correctness#9 `find_agent` text | Fixed | §7 I1 |
 | leaks#4 lint blind spots | Fixed: RETURNING and `profile_visibility` scanned; `agent_type` left out with the reason | §16a |
-| leaks#5 TGP03 | Unchanged by design; [OPEN] C10 stays visible | §15.R11 |
+| leaks#5 TGP03 | **[RULED] C10**: fixed by migration 284 | §15.R11, §16.R |
 | tests#3, #3b, #4, #5, #8, #8b | Fixed by new or strengthened tests (tests#5's remaining tool-level rows recorded as residual, §16a) | §16a |
 | tests#6 equivalent mutant | Kept as defence in depth, commented | §9.2 |
 | tests#7 perf harness | Recorded: a measurement harness, not a gate | §11.1 |
