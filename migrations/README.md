@@ -4557,6 +4557,32 @@ restart.
   carries a `group_role_bindings` row; the viewer-free public-claim arm runs before it.
   Pinned by `epigraph-db/tests/human_identity_visibility.rs` (every arm, unchanged). Undo:
   `docs/runbooks/277-undo.sql` restores 272's body.
+- **278**: `role_edges_team_only` (spec section 7 row K1; operator ruling: the role edges are
+  team-only). Precondition OCC01 (55000): `epigraph_role_assignments_audit`'s body is still
+  130's (md5). NEW `epigraph_role_edge_owner(role, holder)`: the role's single live
+  `group_role_bindings` group when it is an active team/community, else the holder's personal
+  group, minted by 105's `epigraph_ensure_personal_group` when absent (RVK01 / RVK02 still
+  refuse; never the world group). The audit trigger is re-stated to write each projection
+  `('group', owner)` (path `public, pg_temp` kept, owner and ACL kept); NEW AFTER trigger
+  `group_role_bindings_reown_role_edges` re-owns a role's projection edges on bind / unbind;
+  every existing projection edge is backfilled (declaration columns written, as 260's recorder
+  does on INSERT), one `edges.role_edges_team_only` summary `{before, rows, after}`, and
+  post-condition OCC02 (55000) because `edges` is FORCE RLS. Both new functions on 172's form,
+  maintenance-owned, not application-callable. Pinned by
+  `epigraph-db/tests/role_edges_team_only.rs`. Undo: `docs/runbooks/278-undo.sql` (130's body;
+  the backfill stays). **Deploy pre-check:** no role holder with only revoked personal rows.
+- **279**: `disclosure_role_derived_arm_last`. Precondition DAO01 (55000): the core is still
+  277's (md5). Re-states `epigraph_agent_disclosure_for` (same answers): the readable-claim arm
+  now precedes the role-derived arm, and for a target linked as nobody's agent and holding no
+  allowance the role-derived arm is one binding probe per viewer group (249's window and
+  `epigraph_live_role_assignment`) instead of 249's call; otherwise 249's call as before.
+  Measured 617 -> 28 ms p50 for a viewer in a role-bound group. Pinned by
+  `human_identity_visibility.rs::the_cheap_role_probe_answers_as_249_does`. Undo:
+  `docs/runbooks/279-undo.sql` restores 277's body.
+- **280**: `human_evidence_guard_agent_id`. Re-states 272's HEV01 guard (INVOKER, 271's path)
+  to also refuse re-pointing or unlinking a LINKED human client's `agent_id`, and the trigger
+  watches `UPDATE OF client_type, agent_id`; the first link of an unlinked client stays
+  allowed. Undo: `docs/runbooks/280-undo.sql`.
 
 ## `-- no-transaction` migrations
 

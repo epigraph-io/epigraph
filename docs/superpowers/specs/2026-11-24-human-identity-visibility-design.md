@@ -1158,6 +1158,14 @@ A missed or future surface fails CI, not review. This answers "enumerate all sur
   `OCCUPIES` edges role grants project are team-only. Residual: a later change of a bound
   group's `status` or `kind` does not re-own its edges (a suspended team's members stop
   reading through it anyway; a group's kind does not change after creation, 108).
+  Residual: a grant concurrent with an unbind of the same role can leave the new edge owned by
+  the ex-team (under READ COMMITTED the unbind's re-own UPDATE cannot see the uncommitted
+  INSERT); both are maintenance acts. 278's backfill, re-own and OCC02 match on
+  `relationship = 'OCCUPIES'` alone: measured, no other writer can create one (REST
+  `create_edge`'s `VALID_RELATIONSHIPS` and the MCP link tools' sets exclude it; the
+  projection trigger is the only database writer). 278 adds a DATABASE-side caller of 105's
+  personal-group mint, which `personal_group_mint_ratchet.rs` (a Rust-caller inventory) does
+  not list.
 - **R2. Group-admin authority can unhide H with no consent step** (findings 1, L15). The four
   paths are listed in §4: a keyed team created on demand plus a direct add (admin-tier:
   `groups:admin` is in `ADMIN_ONLY_SCOPES`), a community add by any live member holding
