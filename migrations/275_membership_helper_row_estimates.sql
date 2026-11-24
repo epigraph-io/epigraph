@@ -1,0 +1,60 @@
+-- 275: `epigraph_operator_actor` declares `ROWS 1`, so the membership resolve
+-- plans under `jit_above_cost` (backlog 8377cf18).
+--
+-- EVIDENCE
+-- `epigraph_live_memberships(agent)` (236) reads
+-- `epigraph_live_memberships_unbound`, whose role-derived arm is
+-- `epigraph_role_derived_memberships(agent, at)` (249's body). That body
+-- builds its `candidates` CTE from the agent itself, from
+-- `epigraph_operator_actor(agent)` (107) and from
+-- `epigraph_allowlisted_operator(agent)` (149). `epigraph_operator_actor` is a
+-- set-returning SQL function with no `ROWS` clause, so the planner takes
+-- PostgreSQL's default of 1000 rows for it: 1,002 candidates instead of 3.
+-- Every candidate is joined with the live role bindings, and each pair is
+-- costed with a role-assignment call and a correlated recursive subplan, so
+-- the body's estimated total cost passes `jit_above_cost` (default 100000)
+-- and both jit inline and optimize thresholds (default 500000). Every
+-- membership resolve then JIT-compiles the plan: the item measured about 1 s
+-- per call, almost all of it JIT, against about 25 ms with JIT off, for a
+-- call that returns a handful of rows.
+--
+-- Measured on a test database with a production-sized shape (2,000 active
+-- groups, analyzed), the generic plan of the role-derived body (how
+-- PostgreSQL 16 plans a non-inlined SQL function's body) costs 334 times less
+-- with `ROWS 1` at every binding count tried (5 to 300 live bindings): for
+-- example 8.9M before and 26.7k after at 40 bindings. The old/new ratio is
+-- the candidate count, 1,002 / 3.
+--
+-- CHANGE (estimate only)
+-- `ALTER FUNCTION public.epigraph_operator_actor(uuid) ROWS 1`. The estimate
+-- is exact, not a guess: the function reads `operator_links` by `agent_id`,
+-- the table's primary key, so it returns at most one row.
+-- An `ALTER FUNCTION` changes only `prorows`. No body (`prosrc`), owner,
+-- ACL, volatility, security mode or `search_path` moves, so the md5-of-body
+-- preconditions in other migrations still hold and 271's rule is untouched.
+--
+-- NOT CHANGED HERE
+-- * `epigraph_allowlisted_operator(uuid)` returns a scalar `uuid`, not a set.
+--   The planner already estimates it at one row (`ROWS` does not apply to it).
+-- * `epigraph_role_derived_memberships`, `epigraph_live_memberships_unbound`
+--   and `epigraph_live_memberships` keep the default 1000. Each one's own body
+--   plans cheaply already (the role-derived arm is a single function scan in
+--   the unbound body). `epigraph_live_memberships` is what the row-level
+--   policies call, so a new estimate there would re-plan every policy-gated
+--   read; that change needs its own measurement.
+-- * The bodies. Rewriting the role-derived body to cost its cheap arms first
+--   would widen the margin further, but it is a `CREATE OR REPLACE` that
+--   other open work also touches. This file only states an estimate.
+--
+-- RULE FOR LATER MIGRATIONS
+-- A `CREATE OR REPLACE FUNCTION` resets `ROWS` to 1000 unless it restates it.
+-- A later re-statement of `epigraph_operator_actor` must say `ROWS 1`.
+-- `crates/epigraph-db/tests/membership_planner_estimates.rs` fails on a
+-- database where it does not. A LOWER-numbered migration that re-states it
+-- and is applied after 275 in production would reset it unseen by a
+-- version-ordered test database.
+--
+-- UNDO: `docs/runbooks/275-undo.sql` (back to the default `ROWS 1000`).
+SET LOCAL lock_timeout = '3s';
+
+ALTER FUNCTION public.epigraph_operator_actor(uuid) ROWS 1;

@@ -4489,6 +4489,22 @@ restart.
   one; `a_lower_migration_applied_after_271_keeps_both_rules` applies everything up to
   235, then 271, then the rest (production's order) and fails on one that breaks either
   rule.
+- **275**: public `membership_helper_row_estimates` (backlog 8377cf18). `ALTER FUNCTION
+  public.epigraph_operator_actor(uuid) ROWS 1`, nothing else. The function reads
+  `operator_links` by its primary key (`agent_id`), so one row is exact; with the default
+  1000, `epigraph_role_derived_memberships`' `candidates` CTE was estimated at 1,002 rows
+  instead of 3 and its body planned above `jit_above_cost`, so every
+  `epigraph_live_memberships` call JIT-compiled (about 1 s per call). On a production-sized
+  test shape the body's generic plan costs 334 times less (8.9M before, 26.7k after at 40 live
+  role bindings). `epigraph_allowlisted_operator` is scalar (already one row) and is not
+  touched; the three membership set-returning functions keep 1000 (see the header). Only
+  `prorows` moves: no body, owner, ACL or path. A later `CREATE OR REPLACE` of
+  `epigraph_operator_actor` must restate `ROWS 1`. Pinned by
+  `epigraph-db/tests/membership_planner_estimates.rs` (the body's generic-plan cost on the
+  seeded shape is under 100000; the catalog estimate is 1 and `operator_links` is still keyed
+  on `agent_id`); both fail below 275. Undo: `docs/runbooks/275-undo.sql`. **Deploy order:**
+  none against the binaries; apply whenever. After it, a database running `jit = off` as a
+  mitigation can turn JIT back on once `EXPLAIN` of the body shows a cost under 100000.
 
 ## `-- no-transaction` migrations
 
