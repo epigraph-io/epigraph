@@ -511,11 +511,6 @@ pub struct AgentCard {
     pub operator_human: Option<AgentRef>,
     pub created_at: DateTime<Utc>,
     pub counts: CardCounts,
-    /// Whether the session may see this agent's name (migration 272): kept
-    /// off the wire, so it is never itself a "hidden" marker; `find` reads it
-    /// to withhold the pending-authorship count of an unnamed human.
-    #[serde(skip)]
-    named: bool,
 }
 
 /// An agent the document ingest may be asked to attach as an author
@@ -919,17 +914,12 @@ impl AgentLookupRepository {
                     display_name: human_names.get(&h).cloned().flatten(),
                 }),
                 created_at,
-                counts: counts
-                    .get(&id)
-                    .copied()
-                    .map(|c| if named { c } else { hide_pending(c) })
-                    .unwrap_or(CardCounts {
-                        authored_papers: 0,
-                        pending_authored_papers: 0,
-                        asserted_claims: 0,
-                        capped: false,
-                    }),
-                named,
+                counts: counts.get(&id).copied().unwrap_or(CardCounts {
+                    authored_papers: 0,
+                    pending_authored_papers: 0,
+                    asserted_claims: 0,
+                    capped: false,
+                }),
             });
         }
         Ok(out)
@@ -1160,7 +1150,7 @@ impl AgentLookupRepository {
             let counts = Self::counts(conn, viewer, &survivors).await?;
             for hit in &mut results {
                 if let Some(c) = counts.get(&hit.card.id) {
-                    hit.card.counts = if hit.card.named { *c } else { hide_pending(*c) };
+                    hit.card.counts = *c;
                 }
             }
         }
@@ -1325,17 +1315,6 @@ impl AgentLookupRepository {
                 )
             })
             .collect())
-    }
-}
-
-/// The counts an UNNAMED agent shows: a pending authorship (an ingester
-/// named the agent, awaiting its countersignature) exists only for a
-/// registered person, so its count is human evidence and reads 0, as for an
-/// agent no ingester ever named (spec 7, A2; finding L11).
-const fn hide_pending(c: CardCounts) -> CardCounts {
-    CardCounts {
-        pending_authored_papers: 0,
-        ..c
     }
 }
 

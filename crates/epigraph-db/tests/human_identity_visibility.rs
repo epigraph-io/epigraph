@@ -1647,6 +1647,75 @@ async fn an_unnamed_humans_card_is_a_nameless_agents_card(pool: PgPool) {
     );
 }
 
+/// T1, row A2, the pending count (review findings leaks#2 / correctness#2):
+/// an ingester may name ANY agent as a document's author
+/// (`check_explicit_author_ids` has no human gate), so a pending authorship
+/// is the ingester's word, not human evidence. An outsider's cards of an
+/// unnamed H and of N carrying the SAME pending `authored` edge (from the
+/// same stranger, on papers of the same shape) are byte-identical modulo id,
+/// counts included: `pending_authored_papers` is 1 on both and `capped`
+/// agrees. The first cut zeroed it for an unnamed human only, so `0` marked
+/// exactly the hidden humans; that mutant fails the equality here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pending_naming_reads_the_same_on_an_unnamed_human_and_a_nameless_agent(pool: PgPool) {
+    let scoped = app_pool(&pool).await;
+    let (h, n) = h_and_n(&pool, "Ottoline Pendle").await;
+    let (outsider, _) = named(&pool, "Pendle Outsider").await;
+    let (stranger, _) = named(&pool, "Pendle Ingester").await;
+    for (who, doi) in [(h, "10.9999/hiv.pending.h"), (n, "10.9999/hiv.pending.n")] {
+        let paper = Uuid::new_v4();
+        sqlx::query("INSERT INTO papers (id, doi, title) VALUES ($1, $2, 'A Fixture Paper')")
+            .bind(paper)
+            .bind(doi)
+            .execute(&pool)
+            .await
+            .expect("paper");
+        let v = viewer(&pool, stranger).await;
+        let mut tx = scoped.begin_as(&v).await.expect("stamped tx");
+        epigraph_db::create_ingest_written_edge_if_absent_conn(
+            &mut tx,
+            None,
+            "ingest_document",
+            stranger,
+            who,
+            "agent",
+            paper,
+            "paper",
+            "authored",
+            Some(serde_json::json!({
+                "position": 0,
+                "role": "author",
+                "explicit_agent_id": true,
+                "pending_countersign": true,
+                "ingested_by": stranger.to_string(),
+            })),
+        )
+        .await
+        .expect("pending authored edge");
+        tx.commit().await.expect("commit");
+    }
+    let c = cards_by(&pool, &scoped, Some(outsider), &[h, n]).await;
+    assert_eq!(
+        (
+            c[0].counts.pending_authored_papers,
+            c[1].counts.pending_authored_papers
+        ),
+        (1, 1),
+        "CALIBRATION: both carry one pending naming: {:?} / {:?}",
+        c[0].counts,
+        c[1].counts
+    );
+    assert_eq!(
+        c[0].display_name, None,
+        "CALIBRATION: H is unnamed to the outsider"
+    );
+    assert_eq!(
+        card_shape(&c[0]),
+        card_shape(&c[1]),
+        "H with a pending naming reads as N with the same pending naming"
+    );
+}
+
 /// T1, row A1: an unnamed human is never FOUND, by exact name, prefix,
 /// trigram or ORCID, and a kind filter does not surface it; a teammate finds
 /// it (CALIBRATION). ORCID is matched only on `details`.

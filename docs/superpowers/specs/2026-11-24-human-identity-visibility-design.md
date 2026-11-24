@@ -238,8 +238,12 @@ The approved rule accepts this.
 
 `operator_human` is **not** the only id-level human signal. The others are recorded in §15
 (R1 `OCCUPIES`, R7, R11 the TGP03 invite oracle, R12 world-readable `OPERATED_BY` edges,
-R13 timing, R14 assessment-slot BBAs). The pending-papers count (L11) is zeroed when H is
-unnamed (§7 row A2), because its existence is kind evidence.
+R13 timing, R14 assessment-slot BBAs). The pending-papers count (L11) is served as
+computed to every reader, for H as for N (§7 row A2). Revision 2 zeroed it for an unnamed
+H on the premise that "a pending explicit attachment exists only for a registered person";
+that premise is false (`ingest_authors.rs::check_explicit_author_ids` has no human gate,
+so an ingester may name any non-system, non-role agent), and zeroing it for unnamed humans
+only made `0` a hidden-human marker (review findings leaks#2, correctness#2).
 
 ## 6. The single shared predicate
 
@@ -410,7 +414,7 @@ are relative to `crates/`.
 | # | Site | Today | Change |
 |---|---|---|---|
 | A1 | `AgentLookupRepository::match_ranked` (MCP `find_agent`, REST `GET /api/v1/agents/search`, and `match_by_name` for the ingest author path) | Matches `fold_sql("a.display_name")` for every agent. The ORCID and ROR tiers use a copy of the details rule (`details_ok`, "`$4::bool OR a.profile_visibility = 'public'`"). | **Normative placement** (findings L6, 3): the disclosure predicate is a `WHERE` qual of the `ranked` level, after the raw name and identifier match quals (never in `cand`, which scans every agent), so it is evaluated before `ORDER BY ... LIMIT $6`. A candidate whose name tier is not `named`, or whose identifier tier is not `details`, never takes a pool slot, never shifts a rank, and is never counted: `find`'s `candidates_truncated` (`matches.len() > pool`) counts survivors only. Dropping after the fetch (in `find` or `cards_inner`) is forbidden: 200 decoy agents named like H would otherwise flip the flag. The `details_ok` copy is deleted. |
-| A2 | `AgentLookupRepository::cards_inner` (`card`, `cards`, `find`) | Raw `a.display_name`. `details_ok` copy for ORCID, ROR and `llm_model_visible`. Arms `holds_disclosed_role` and `operator_of_bound_agent` shown to every reader. Roles from 198 shown to every reader. | Uses the `disclosure_lateral_sql("a")` lateral. `display_name` becomes `CASE WHEN d.named`, and ORCID, ROR and llm_model use `d.details`. When not named: `operates_bound_agent`, roles and attachments are emptied, so `kind` falls to `unknown`, and `counts.pending_papers` is reported as 0 (finding L11: a pending explicit attachment exists only for a registered person, so its existence is kind evidence). `kind_evidence` and `derived_key_evidence` are computed from the redacted name. |
+| A2 | `AgentLookupRepository::cards_inner` (`card`, `cards`, `find`) | Raw `a.display_name`. `details_ok` copy for ORCID, ROR and `llm_model_visible`. Arms `holds_disclosed_role` and `operator_of_bound_agent` shown to every reader. Roles from 198 shown to every reader. | Uses the `disclosure_lateral_sql("a")` lateral. `display_name` becomes `CASE WHEN d.named`, and ORCID, ROR and llm_model use `d.details`. When not named: `operates_bound_agent`, roles and attachments are emptied, so `kind` falls to `unknown`. `counts.pending_authored_papers` is served as computed, to every reader (finding L11 re-decided after review: an ingester can name ANY agent pending, so the count is not human evidence, and hiding it for unnamed humans only was itself the marker; review findings leaks#2, correctness#2). `kind_evidence` and `derived_key_evidence` are computed from the redacted name. |
 | A3 | `cards_inner` step 3 ("The bound humans' names", `SELECT id, display_name FROM agents`) | `operator_human.display_name` shown to every reader. | `AgentDisclosureRepository::names`. The `operator_human.id` is unchanged. |
 | A4 | `AgentLookupRepository::exact_name_candidates` (MCP ingest `candidates`) | Folded-equal names, viewer-free ("nothing here depends on the caller's viewer"). | Adds `AND public.epigraph_human_named_to_viewer(c.id)` as a qual of `m`'s `WHERE`, after the `fname` join, so it is evaluated only for matches. There `pg_catalog.count(*) OVER (PARTITION BY q.ord)` counts only survivors, so the ingest's `candidates_truncated` is safe (finding L16). The doc text changes: the result now depends on the caller's stamped session (the ingest transaction is stamped). |
 | A5 | `AgentLookupRepository::author_nodes` (ingest report `display_name` of an explicit author) | Raw `a.display_name`. | The name returned for output goes through `names`. The internal checks (role node, system, reserved key, public key) are unchanged. |
@@ -1223,7 +1227,9 @@ silently changed.
   confirmation.
 - **B15.** Only `claims.agent_id` counts for the public-claim and readable-claim arms; ingest
   records, evidence, challenges and BBAs filed by B(H) do not name H (§4; C6 is open).
-- **B16.** An unnamed human's `pending_papers` count reads 0 (§7 row A2, finding L11).
+- **B16. (Reversed after review, leaks#2 / correctness#2.)** An unnamed human's
+  `pending_authored_papers` count is served as computed, as for N. Zeroing it rested on a
+  false premise (only a registered person can be named pending) and created a marker.
 - **B17.** The human-evidence row is pinned by a trigger (HEV01, §6.1) rather than only by a
   ratchet test.
 - **B18.** One evidence helper, `epigraph_is_human_principal`, shared by the rule, the reset
@@ -1353,7 +1359,7 @@ now says it; "Part" is where the change is built.
 | L8 MCP forwards OPL text | Accepted (reachability PLAUSIBLE, re-verified in part B) | §7 I3 | B |
 | L9 binding window | **[OPEN] C5**: narrows approved text; consequence recorded | §4, §16.C5 | - |
 | L10 timing | Accepted as residual | §15.R13 | - |
-| L11 pending count | Accepted: zeroed when unnamed (B16) | §7 A2 | B |
+| L11 pending count | Accepted in revision 2 (zeroed when unnamed), REVERSED after review: the premise was false and the zero was a marker; served to all (B16) | §7 A2 | B |
 | L12 assessment-slot BBAs | Accepted as residual | §15.R14 | - |
 | L13 stored derivatives | Accepted: theme labeller added to F2; agent column dropped | §7.J, §15.F2 | B |
 | L14 `agent.registered` payload | Accepted: T7 assertion; lint scope | §7.J, §12.T7, §14 | A (T7), B (lint) |

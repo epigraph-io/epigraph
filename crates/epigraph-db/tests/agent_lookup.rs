@@ -1794,12 +1794,14 @@ async fn a_pending_authorship_is_reported_apart_and_backs_no_claim(pool: PgPool)
     )
     .await;
 
-    // The person sees the pending naming. To a reader the person is not
-    // named to (an outsider, and the stranger whose ingest named it: an
-    // ingest is not a claim), the pending count is human evidence (only a
-    // registered person is ever named pending) and reads 0, as for an agent
-    // nobody named (spec 7 row A2, finding L11).
-    for (who, pending) in [(human, 1), (outsider, 0), (stranger, 0)] {
+    // Every reader sees the pending naming, the person unnamed to it
+    // included. A pending authorship is an ingester's word about ANY agent
+    // (`check_explicit_author_ids` has no human gate), so it is not human
+    // evidence; withholding it from an unnamed person only (the branch's
+    // first cut, `hide_pending`) made `0` a hidden-human marker (review
+    // findings leaks#2 / correctness#2). The H-vs-N comparison is
+    // `human_identity_visibility.rs::a_pending_naming_reads_the_same_on_an_unnamed_human_and_a_nameless_agent`.
+    for (who, pending) in [(human, 1), (outsider, 1), (stranger, 1)] {
         let card = card_as(&pool, who, human).await;
         let k = counts_json(&card);
         assert_eq!(k["authored_papers"], 0, "{who}: {k}");
@@ -2048,21 +2050,14 @@ async fn a_persons_own_authorship_outranks_a_strangers_pending_naming(pool: PgPo
         })),
     )
     .await;
-    // Read by the person itself: to an outsider an unnamed person's pending
-    // count reads 0 (spec 7 row A2), which would hide the calibration.
-    let k = card_as(&pool, human, human).await.counts;
+    // Read by an outsider the person is not named to: the pending count is
+    // the ingester's word and is shown to every reader (no hidden-human
+    // marker; review findings leaks#2 / correctness#2).
+    let k = card_as(&pool, outsider, human).await.counts;
     assert_eq!(
         (k.authored_papers, k.pending_authored_papers),
         (0, 1),
         "CALIBRATION: the stranger's naming is pending"
-    );
-    assert_eq!(
-        card_as(&pool, outsider, human)
-            .await
-            .counts
-            .pending_authored_papers,
-        0,
-        "an unnamed person's pending count is withheld from an outsider"
     );
 
     // The person's own ingest of the same paper.
